@@ -1,4 +1,4 @@
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { createReadStream } = require('node:fs');
 const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
@@ -187,12 +187,32 @@ const collectExtraEntries = async (repo, requested, entries) => {
   await visit(root);
 };
 
+// Stream git stdout through a hash instead of buffering it via execFile's
+// maxBuffer. A sufficiently large tracked/staged diff can exceed the
+// execFile maxBuffer and throw, which used to reject the closeout workflow
+// before any evidence report was written. Streaming keeps memory bounded.
+const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
+  const hash = createHash('sha256');
+  const child = spawn('git', args, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stdout.on('data', (chunk) => hash.update(chunk));
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+  child.on('error', reject);
+  child.on('close', (code) => {
+    if (code !== 0) {
+      reject(new Error(`git ${args.join(' ')} exited ${code}: ${stderr.trim()}`));
+      return;
+    }
+    resolve(hash.digest('hex'));
+  });
+});
+
 const workingTreeFingerprint = async (repo, extraPaths = []) => {
-  const [diff, untracked] = await Promise.all([
-    gitBuffer(repo, ['diff', '--binary', '--no-ext-diff', 'HEAD']),
+  const [diffHash, untracked] = await Promise.all([
+    hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', 'HEAD']),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
-  const entries = [{ path: '__tracked_diff__', hash: hashBytes(diff) }];
+  const entries = [{ path: '__tracked_diff__', hash: diffHash }];
   for (const file of untracked) {
     const absolute = path.join(repo, file);
     // Guard untracked symlinks before hashing: a validation command may leave
