@@ -3,7 +3,10 @@ set -euo pipefail
 
 target="both"
 force="false"
-home_path="${HOME}"
+# Use parameter expansion with default so an unset HOME (common in stripped
+# containers, service accounts, and some CI contexts) does not abort the
+# script under `set -u` before --home can be parsed. Validate after parsing.
+home_path="${HOME:-}"
 
 while (($#)); do
   case "$1" in
@@ -27,6 +30,11 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ -z "$home_path" ]]; then
+  echo "HOME is not set; pass --home <path>" >&2
+  exit 2
+fi
 
 case "$target" in
   codex) destinations=("$home_path/.codex/skills/debug") ;;

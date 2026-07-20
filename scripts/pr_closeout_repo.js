@@ -1,5 +1,6 @@
 const { execFile } = require('node:child_process');
 const { createHash } = require('node:crypto');
+const { createReadStream } = require('node:fs');
 const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
 const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
@@ -113,6 +114,17 @@ const scanTouchedSuppressions = async (repo, files) => {
 
 const hashBytes = (value) => createHash('sha256').update(value).digest('hex');
 
+// Stream the file through the hash instead of materializing the entire
+// contents in memory. The fingerprint runs several times per closeout (initial
+// tree, before/after GitHub verification, final seal), and a single large
+// untracked artifact is enough to spike memory if readFile() is used.
+const hashFile = async (absolute) => {
+  const hash = createHash('sha256');
+  const stream = createReadStream(absolute);
+  for await (const chunk of stream) hash.update(chunk);
+  return hash.digest('hex');
+};
+
 const resolveExtraPath = (repo, requested) => {
   if (!requested || path.isAbsolute(requested)) throw new Error(`Reproducibility path must be repository-relative: ${requested}`);
   const absolute = path.resolve(repo, requested);
@@ -148,7 +160,7 @@ const collectExtraEntries = async (repo, requested, entries) => {
       }
       return;
     }
-    entries.push({ path: `__extra__/${relative}`, hash: hashBytes(await readFile(absolute)) });
+    entries.push({ path: `__extra__/${relative}`, hash: await hashFile(absolute) });
   };
   await visit(root);
 };
@@ -178,8 +190,7 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
       entries.push({ path: file, hash: hashBytes(`symlink:${await readlink(absolute)}`) });
       continue;
     }
-    const bytes = await readFile(absolute);
-    entries.push({ path: file, hash: hashBytes(bytes) });
+    entries.push({ path: file, hash: await hashFile(absolute) });
   }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);
   return fingerprintEntries(entries);

@@ -143,6 +143,35 @@ test('probe accepts the collector identity and rejects an unrelated HTTP 200 ser
   }
 });
 
+test('probeServer still settles when the /health response closes without end or error', async () => {
+  // Some abort paths destroy the request mid-response and emit only 'close'
+  // (no 'end' / 'error'); the probe must settle to null so the EADDRINUSE
+  // handler cannot hang startup. Verify both an oversized-body abort and a
+  // server-side socket destroy resolve to null.
+  const oversized = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.write('x'.repeat(8192));
+    // Intentionally do not end(); the probe must abort and settle.
+  });
+  const oversizedUrl = await listen(oversized);
+
+  const dropped = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.destroy();
+  });
+  const droppedUrl = await listen(dropped);
+
+  try {
+    const oversizedResult = await probeServer(Number(new URL(oversizedUrl).port));
+    const droppedResult = await probeServer(Number(new URL(droppedUrl).port));
+    assert.equal(oversizedResult, null);
+    assert.equal(droppedResult, null);
+  } finally {
+    await close(oversized);
+    await close(dropped);
+  }
+});
+
 test('requires the launch token and returns only an opaque relative log path', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });

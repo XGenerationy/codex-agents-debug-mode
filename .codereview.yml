@@ -1,0 +1,108 @@
+# Declarative review guidance and pre-merge checks for the codex-agents-debug-mode
+# skill repository. The procedural checks in tools/validate_repository.js and
+# .github/workflows/validate.yml implement the semantics declared here; this
+# file is the single authoritative source that auditors and tooling should
+# read to understand the gate.
+version: 1
+
+# Path-specific review instructions consumed by reviewers and audit tooling.
+# Each entry declares the mode (enforced vs. advisory), the paths it applies
+# to, and clear pass/fail instructions so the gate is auditable.
+path_instructions:
+  - paths:
+      - 'scripts/**'
+    mode: enforced
+    instructions: |
+      All PRs that touch scripts/ must keep `npm test` green on every supported
+      Node LTS line (20, 22, 24) for both ubuntu-latest and windows-latest,
+      and `npm run validate` must report PASS. New behavior must come with a
+      focused regression test that fails without the change and passes with
+      it. Suppression markers (eslint-disable, nosec, noqa, @ts-ignore,
+      skipcq, etc.) and config-level rule disabling are not allowed in the
+      touched-file set.
+
+  - paths:
+      - 'tools/**'
+    mode: enforced
+    instructions: |
+      Tools run during CI (`tools/validate_repository.js`, installers) must
+      pass `node --check` syntax validation and must fail closed on missing
+      files, symlinks, and unbounded recursion. Installers must tolerate an
+      unset HOME and accept --home as a workaround.
+
+  - paths:
+      - '.github/workflows/**'
+    mode: enforced
+    instructions: |
+      Workflow changes must keep the full Node matrix green and must not
+      weaken the audit gate (no continue-on-error, no passWithNoTests, no
+      coverage/threshold reductions, no skipped required checks).
+
+  - paths:
+      - 'SKILL.md'
+      - 'README.md'
+      - 'references/**'
+    mode: advisory
+    instructions: |
+      Documentation changes should describe the public install/usage
+      contract accurately and must not introduce suppression markers as
+      literal directives outside the scanner's documented vocabulary.
+
+# Pre-merge checks: the authoritative gate every PR must pass before merge.
+# `mode: required` means a missing or non-passing check blocks merge.
+pre_merge_checks:
+  - name: node-matrix-test
+    mode: required
+    run: npm test
+    instructions: |
+      Run the complete Node test runner on Node 20, 22, and 24 for both
+      ubuntu-latest and windows-latest. PASS requires zero failing tests.
+      A skipped test is acceptable only when the test explicitly returns for
+      an unsupported platform (e.g. Windows symlink creation without
+      developer mode); a skipped test must not hide a real regression.
+
+  - name: repository-validator
+    mode: required
+    run: npm run validate
+    instructions: |
+      tools/validate_repository.js must report status:PASS. The validator
+      walks the payload tree without following symlinks, fails closed on
+      missing entries, scans touched files for public-safety patterns, and
+      runs node --check on every JavaScript file.
+
+  - name: dependency-audit
+    mode: required
+    run: npm audit --audit-level=high
+    instructions: |
+      npm audit at --audit-level=high must exit 0. Vulnerabilities must be
+      remediated, not suppressed or downgraded.
+
+  - name: javascript-syntax
+    mode: required
+    run: node --check (every .js file under scripts/ and tools/)
+    instructions: |
+      Every JavaScript file in scripts/ and tools/ must parse cleanly under
+      the supported Node engines. Enforced by the repository validator.
+
+  - name: touched-file-suppression-scan
+    mode: required
+    instructions: |
+      The complete touched-file set (tracked + untracked + changed package
+      manifests at any depth) must contain no suppression markers and no
+      config-level rule disabling. Enforced by scanSuppressionText and
+      readGateChanges in scripts/pr_closeout_repo.js and
+      scripts/pr_closeout_git.js.
+
+  - name: bash-installer-smoke
+    mode: required
+    instructions: |
+      On Linux runners, `bash ./tools/install.sh --target both --home
+      $RUNNER_TEMP/...` must install both the .codex and .agents skill
+      copies. Enforced by .github/workflows/validate.yml.
+
+  - name: powershell-installer-smoke
+    mode: required
+    instructions: |
+      On Windows runners, `.\tools\install.ps1 -Target Both -HomePath ...`
+      must install both the .codex and .agents skill copies. Enforced by
+      .github/workflows/validate.yml.

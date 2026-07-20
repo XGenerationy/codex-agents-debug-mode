@@ -1,6 +1,6 @@
 'use strict';
 
-const { readFileSync, readdirSync, statSync } = require('node:fs');
+const { readFileSync, readdirSync, lstatSync } = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
@@ -16,16 +16,41 @@ const requiredFiles = [
   'scripts/pr_closeout.js',
 ];
 
+const failures = [];
+
+// Payload walker that fails closed on missing entries and never follows
+// symlinks. statSync() follows symlinks and would let a symlinked directory
+// or cycle trigger unbounded recursion; lstatSync() lets us detect symlinks
+// and treat them as validation failures so a reviewed branch cannot hang or
+// escape the payload tree during `npm run validate`.
 const walk = (entry) => {
   const absolute = path.join(root, entry);
-  if (!statSync(absolute).isDirectory()) return [entry];
+  let info;
+  try {
+    info = lstatSync(absolute);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      failures.push(`Required payload entry is missing: ${entry}`);
+      return [];
+    }
+    throw error;
+  }
+  if (info.isSymbolicLink()) {
+    failures.push(`Payload entry must not be a symlink: ${entry}`);
+    return [];
+  }
+  if (!info.isDirectory()) return [entry];
   return readdirSync(absolute).flatMap((name) => walk(path.join(entry, name)));
 };
 
-const failures = [];
 for (const file of requiredFiles) {
   try {
-    if (!statSync(path.join(root, file)).isFile()) failures.push(`Required file is not regular: ${file}`);
+    const info = lstatSync(path.join(root, file));
+    if (info.isSymbolicLink()) {
+      failures.push(`Required file must not be a symlink: ${file}`);
+    } else if (!info.isFile()) {
+      failures.push(`Required file is not regular: ${file}`);
+    }
   } catch {
     failures.push(`Required file is missing: ${file}`);
   }

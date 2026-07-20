@@ -38,7 +38,12 @@ const readJson = async (request, maxBodyBytes) => {
     size += chunk.length;
     if (size > maxBodyBytes) {
       tooLarge = true;
-      continue;
+      // Abort the request immediately instead of continuing to drain the
+      // upload. Without this, a local client could keep the collector busy
+      // (bandwidth/CPU/socket time) with an arbitrarily large body even
+      // though the configured limit has already been exceeded.
+      request.destroy();
+      break;
     }
     chunks.push(chunk);
   }
@@ -289,7 +294,12 @@ const probeServer = (port) =>
         response.setEncoding('utf8');
         response.on('data', (chunk) => {
           body += chunk;
-          if (body.length > 4_096) request.destroy();
+          if (body.length > 4_096) {
+            // Destroy alone may only emit 'close' on some Node versions; settle
+            // synchronously so the probe cannot stall the EADDRINUSE handler.
+            request.destroy();
+            finish(null);
+          }
         });
         response.on('end', () => {
           if (response.statusCode !== 200) {
@@ -312,10 +322,19 @@ const probeServer = (port) =>
             finish(null);
           }
         });
+        // Some abort paths emit only 'close' (no 'end'/'error'), so without
+        // this listener the promise would stay pending and debug_server could
+        // hang during EADDRINUSE handling instead of reporting already_running.
+        response.on('close', () => finish(null));
+        response.on('error', () => finish(null));
       },
     );
-    request.on('timeout', () => request.destroy());
+    request.on('timeout', () => {
+      request.destroy();
+      finish(null);
+    });
     request.on('error', () => finish(null));
+    request.on('close', () => finish(null));
   });
 
 const parseAllowedOrigins = (value) =>
