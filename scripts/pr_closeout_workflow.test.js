@@ -1,0 +1,626 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const { MANDATORY_CHECKS } = require('./pr_closeout_core');
+const { digestValidationConfig } = require('./pr_closeout_git');
+const {
+  evaluateOverallStatus,
+  normalizePersistedPaths,
+  prepareOutputDirectory,
+  runCloseoutWorkflow,
+} = require('./pr_closeout_workflow');
+
+const configuredCommands = Object.fromEntries(
+  MANDATORY_CHECKS.filter(({ fixed }) => !fixed).map(({ id }) => [id, `run ${id}`]),
+);
+const reviewedConfig = (extra = {}) => ({
+  commands: configuredCommands,
+  services: {
+    redis: { host: '127.0.0.1', port: 6379 },
+    grafana: { url: 'http://127.0.0.1:3000/api/health' },
+  },
+  proofs: {
+    'grafana-render': { type: 'artifact', path: 'artifacts/grafana.json' },
+    'make-sbom': { type: 'artifact', path: 'artifacts/sbom.json' },
+    'grafana-live-render': {
+      type: 'artifact',
+      path: 'artifacts/grafana-live.json',
+      semantic: 'grafana-live-result',
+      grafanaOrigin: 'http://127.0.0.1:3000',
+    },
+    'hunter-build': {
+      type: 'command',
+      command: 'docker compose ps --format json hunter',
+      expectedPattern: 'semantic:docker-compose-running-healthy',
+    },
+  },
+  ...extra,
+});
+
+const gateAttestation = (status = 'PASS', extra = {}) => ({
+  provider: 'github-pull-request-review',
+  status,
+  baseSha: 'base123',
+  headSha: 'head123',
+  configDigest: '__TEST_DIGEST__',
+  decision: 'not-weakened',
+  reviewer: 'independent-reviewer',
+  evidence: 'https://github.example/reviews/7',
+  ...extra,
+});
+
+const passingExecution = (check, phase) => ({
+  ...check,
+  phase,
+  status: 'PASS',
+  exitCode: 0,
+  stdout: 'clean',
+  stderr: '',
+  startedAt: '2026-07-14T00:00:00.000Z',
+  finishedAt: '2026-07-14T00:00:00.001Z',
+  durationMs: 1,
+  evidence: 'clean',
+});
+
+const makeDependencies = ({
+  finalFindings = [],
+  finalHead = 'head123',
+  finalBase = 'base123',
+  sealHead = finalHead,
+  sealBase = finalBase,
+  lateSealHead,
+  livePrStatus = 'PASS',
+  admissionAttestationStatus = 'PASS',
+  finalAttestationStatus = 'PASS',
+} = {}) => {
+  let stateReads = 0;
+  let scanReads = 0;
+  let currentSealHead = sealHead;
+  const executions = [];
+  const written = [];
+  const events = [];
+  return {
+    executions,
+    written,
+    events,
+    dependencies: {
+      resolveRepositoryState: async () => {
+        stateReads += 1;
+        events.push(`repository-state:${stateReads}`);
+        return {
+          repo: 'C:/repo',
+          baseRef: 'origin/main',
+          baseSha: stateReads === 1 ? 'base123' : (stateReads === 2 ? finalBase : sealBase),
+          headSha: stateReads === 1 ? 'head123' : (stateReads === 2 ? finalHead : currentSealHead),
+          touchedFiles: ['src/a.ts'],
+        };
+      },
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [] }),
+      prepareOutputDirectory: async ({ outputDir }) => outputDir,
+      readGateChanges: async () => {
+        events.push('gate-changes');
+        return { changedFiles: [], addedLines: [] };
+      },
+      scanTouchedSuppressions: async () => {
+        scanReads += 1;
+        events.push(`suppression-scan:${scanReads}`);
+        if (scanReads > 1 && lateSealHead) currentSealHead = lateSealHead;
+        return scanReads === 1 ? [] : finalFindings;
+      },
+      runPreflight: async () => {
+        events.push('preflight');
+        return { status: 'PASS', checks: [], toolVersions: { node: 'v24' } };
+      },
+      digestValidationConfig: () => '__TEST_DIGEST__',
+      workingTreeFingerprint: async () => {
+        events.push('fingerprint');
+        return 'stable-tree';
+      },
+      cleanTreeStatus: async () => {
+        events.push('clean-tree');
+        return { status: 'PASS', evidence: 'clean' };
+      },
+      readLiveGateAttestation: async () => {
+        events.push('gate-attestation');
+        return gateAttestation(admissionAttestationStatus);
+      },
+      readLivePrState: async () => ({
+        status: livePrStatus,
+        evidence: livePrStatus === 'PASS' ? 'Live PR surfaces are clean.' : 'Live PR surface is not clean.',
+        number: 42,
+        checks: [],
+        unresolvedThreads: [],
+        externalServices: [],
+        gateAttestation: gateAttestation(finalAttestationStatus),
+      }),
+      execute: async (check, phase) => {
+        executions.push(`${phase}:${check.id}`);
+        return passingExecution(check, phase);
+      },
+      verifyBaseline: async ({ headResult }) => headResult,
+      writeEvidenceReport: async ({ report }) => {
+        events.push(`report-write:${written.length + 1}`);
+        written.push(structuredClone(report));
+        return { json: 'report.json', markdown: 'report.md' };
+      },
+    },
+  };
+};
+
+test('normalizes differently cased path aliases before persisting evidence', () => {
+  const normalized = normalizePersistedPaths(
+    {
+      repository: 'c:\\REPO',
+      evidence: 'C:/REPO/logs and c:\\EVIDENCE\\report.json',
+    },
+    'C:\\Repo',
+    'C:\\Evidence',
+  );
+
+  assert.deepEqual(normalized, {
+    repository: '<repo>',
+    evidence: '<repo>/logs and <output>\\report.json',
+  });
+});
+
+test('runs two generator passes, rescans last, and reports the final head', async () => {
+  const fixture = makeDependencies();
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig({ parallelism: 3 }),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'PASS');
+  assert.equal(result.report.headSha, 'head123');
+  assert.equal(result.report.reproducibility.status, 'PASS');
+  assert.equal(fixture.executions.filter((event) => event.includes('generator-') && event.endsWith(':prisma-generate')).length, 2);
+  assert.equal(fixture.written.length, 2);
+  assert.equal(fixture.written[0].overallStatus, 'BLOCKED');
+  assert.equal(fixture.written[1].overallStatus, 'PASS');
+  assert.equal(fixture.written[1].repositorySeal.evidenceWrite.status, 'PASS');
+  assert.deepEqual(result.paths, { json: 'report.json', markdown: 'report.md' });
+});
+
+test('admits the exact GitHub attestation before preflight or repository validation inspection', async () => {
+  const fixture = makeDependencies();
+  await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  const admission = fixture.events.indexOf('gate-attestation');
+  assert.ok(admission >= 0);
+  for (const event of ['preflight', 'gate-changes', 'suppression-scan:1', 'clean-tree']) {
+    assert.ok(fixture.events.indexOf(event) > admission, `${event} ran before attestation admission`);
+  }
+});
+
+test('runs no executable preflight or repository validation command when attestation admission is blocked', async () => {
+  const fixture = makeDependencies({ admissionAttestationStatus: 'BLOCKED' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(fixture.executions.length, 0);
+  assert.equal(fixture.events.includes('preflight'), false);
+  assert.equal(fixture.events.includes('gate-changes'), false);
+  assert.equal(fixture.events.some((event) => event.startsWith('suppression-scan:')), false);
+  assert.equal(fixture.events.includes('clean-tree'), false);
+});
+
+test('passes only essential and explicitly configured environment variables to child commands', async () => {
+  const requiredName = 'PR_CLOSEOUT_REQUIRED_TEST';
+  const safeName = 'PR_CLOSEOUT_SAFE_TEST';
+  const ambientName = 'PR_CLOSEOUT_AMBIENT_SECRET_TEST';
+  const previous = Object.fromEntries(
+    [requiredName, safeName, ambientName].map((name) => [name, process.env[name]]),
+  );
+  process.env[requiredName] = 'required-value';
+  process.env[safeName] = 'safe-value';
+  process.env[ambientName] = 'must-not-pass';
+  try {
+    const fixture = makeDependencies();
+    let executorEnvironment;
+    let preflightEnvironment;
+    delete fixture.dependencies.execute;
+    fixture.dependencies.createCommandExecutor = ({ env }) => {
+      executorEnvironment = env;
+      return async (check, phase) => passingExecution(check, phase);
+    };
+    fixture.dependencies.runPreflight = async ({ env }) => {
+      preflightEnvironment = env;
+      return { status: 'BLOCKED', checks: [], toolVersions: {} };
+    };
+
+    await runCloseoutWorkflow({
+      repo: 'C:/repo',
+      baseRef: 'origin/main',
+      config: reviewedConfig({
+        requiredEnv: [requiredName],
+        safeEnv: [safeName],
+      }),
+      outputDir: 'C:/evidence',
+      dependencies: fixture.dependencies,
+    });
+
+    for (const environment of [executorEnvironment, preflightEnvironment]) {
+      assert.equal(environment[requiredName], 'required-value');
+      assert.equal(environment[safeName], 'safe-value');
+      assert.equal(environment[ambientName], undefined);
+      assert.ok(environment.PATH || environment.Path);
+    }
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('rejects a lexically external output whose physical target is inside the repository', async () => {
+  const physical = new Map([
+    ['C:/repo', 'C:/physical/repo'],
+    ['C:/outside-link', 'C:/physical/repo/evidence'],
+  ]);
+  await assert.rejects(
+    prepareOutputDirectory({
+      repo: 'C:/repo',
+      outputDir: 'C:/outside-link',
+      mkdirPath: async () => {},
+      realpathPath: async (target) => physical.get(target),
+    }),
+    /outside the repository/i,
+  );
+});
+
+test('requires a clean initial tree before executing validation commands', async () => {
+  const fixture = makeDependencies();
+  let cleanReads = 0;
+  fixture.dependencies.cleanTreeStatus = async () => {
+    cleanReads += 1;
+    return cleanReads === 1
+      ? { status: 'FAIL', evidence: 'dirty before validation' }
+      : { status: 'PASS', evidence: 'restored after validation' };
+  };
+
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(result.report.overallStatus, 'FAIL');
+  assert.equal(result.report.initialTree.status, 'FAIL');
+  assert.equal(fixture.executions.length, 0);
+});
+
+test('gives baseline setup and comparison executions unique parent and attempt identities', async () => {
+  const fixture = makeDependencies();
+  const baselineCalls = [];
+  fixture.dependencies.execute = async (check, phase) => {
+    fixture.executions.push(`${phase}:${check.id}`);
+    const result = passingExecution(check, phase);
+    if (phase === 'qualification' && check.id === 'git-diff-check') {
+      return { ...result, status: 'FAIL', exitCode: 1, evidence: 'head failure' };
+    }
+    return result;
+  };
+  fixture.dependencies.verifyBaseline = async ({
+    check,
+    headResult,
+    execute,
+    setup,
+  }) => {
+    baselineCalls.push(await setup('C:/baseline'));
+    baselineCalls.push(await execute(check, 'C:/baseline'));
+    return headResult;
+  };
+
+  await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(baselineCalls.length, 2);
+  assert.equal(baselineCalls[0].associatedCheckId, 'git-diff-check');
+  assert.equal(baselineCalls[1].associatedCheckId, 'git-diff-check');
+  assert.notEqual(baselineCalls[0].attemptId, baselineCalls[1].attemptId);
+  assert.match(baselineCalls[0].id, /git-diff-check/);
+  assert.match(baselineCalls[1].id, /git-diff-check/);
+});
+
+test('writes a blocked provisional report, seals after that write, then writes normalized final evidence', async () => {
+  const fixture = makeDependencies();
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(fixture.written.length, 2);
+  assert.equal(fixture.written[0].overallStatus, 'BLOCKED');
+  assert.match(fixture.written[0].repositorySeal.evidence, /pending|provisional/i);
+  assert.equal(fixture.written[1].repositorySeal.evidenceWrite.status, 'PASS');
+  assert.equal(fixture.written[1].repository, '<repo>');
+  assert.doesNotMatch(JSON.stringify(fixture.written[1]), /C:[/\\](?:repo|evidence)/i);
+  assert.equal(result.report.repositorySeal.evidenceWrite.status, 'PASS');
+
+  const firstWrite = fixture.events.indexOf('report-write:1');
+  const secondWrite = fixture.events.indexOf('report-write:2');
+  assert.ok(firstWrite >= 0 && secondWrite > firstWrite);
+  assert.ok(
+    fixture.events.slice(firstWrite + 1, secondWrite).some((event) => event.startsWith('repository-state:')),
+    'repository identity was not re-read between provisional and final report writes',
+  );
+});
+
+test('fails closeout when the final suppression rescan finds a marker', async () => {
+  const fixture = makeDependencies({
+    finalFindings: [{ file: 'src/a.ts', line: 4, category: 'marker', match: 'forbidden' }],
+  });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'FAIL');
+  assert.equal(result.report.suppressionFindings.length, 1);
+});
+
+test('blocks evidence when HEAD changes during validation', async () => {
+  const fixture = makeDependencies({ finalHead: 'different-head' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.match(result.report.headConsistency.evidence, /changed during validation/i);
+});
+
+test('blocks evidence when the live base moves during validation', async () => {
+  const fixture = makeDependencies({ finalBase: 'different-base' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.match(result.report.headConsistency.evidence, /base changed during validation/i);
+});
+
+test('seals repository identity again after live PR verification', async () => {
+  const fixture = makeDependencies({ sealHead: 'post-github-drift' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(result.report.repositorySeal.status, 'BLOCKED');
+  assert.match(result.report.repositorySeal.evidence, /post-github-drift/);
+});
+
+test('blocks evidence when the base moves after live PR verification', async () => {
+  const fixture = makeDependencies({ sealBase: 'post-github-base-drift' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.match(result.report.repositorySeal.evidence, /post-github-base-drift/);
+});
+
+test('re-reads repository identity after final scans to catch late commits', async () => {
+  const fixture = makeDependencies({ lateSealHead: 'late-head-during-scan' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.match(result.report.repositorySeal.evidence, /late-head-during-scan/);
+});
+
+test('rejects evidence output inside the repository before validation starts', async () => {
+  const fixture = makeDependencies();
+  await assert.rejects(
+    runCloseoutWorkflow({
+      repo: 'C:/repo',
+      baseRef: 'origin/main',
+      config: reviewedConfig(),
+      outputDir: 'C:/repo/evidence',
+      dependencies: fixture.dependencies,
+    }),
+    /outside the repository/i,
+  );
+  assert.equal(fixture.executions.length, 0);
+});
+
+test('binds every validation-affecting config field into the review digest', async () => {
+  const baseConfig = reviewedConfig({
+    requiredEnv: ['TOKEN'],
+    timeoutMs: 1000,
+    timeoutsMs: { typecheck: 2000 },
+    minFreeDiskGb: 3,
+    ports: [3000],
+    reproducibilityPaths: ['generated/client'],
+    parallelism: 2,
+  });
+  const planDigest = async (config) => {
+    const fixture = makeDependencies();
+    fixture.dependencies.digestValidationConfig = digestValidationConfig;
+    const result = await runCloseoutWorkflow({
+      repo: 'C:/repo',
+      baseRef: 'origin/main',
+      config,
+      planOnly: true,
+      dependencies: fixture.dependencies,
+    });
+    return result.configDigest;
+  };
+  const original = await planDigest(baseConfig);
+  const variants = [
+    { ...baseConfig, requiredEnv: ['TOKEN', 'SECOND_TOKEN'] },
+    { ...baseConfig, timeoutMs: 1001 },
+    { ...baseConfig, timeoutsMs: { typecheck: 2001 } },
+    { ...baseConfig, minFreeDiskGb: 4 },
+    { ...baseConfig, ports: [3001] },
+    { ...baseConfig, reproducibilityPaths: ['generated/other'] },
+    { ...baseConfig, parallelism: 3 },
+    { ...baseConfig, services: { ...baseConfig.services, redis: { host: '127.0.0.2', port: 6379 } } },
+  ];
+  for (const variant of variants) assert.notEqual(await planDigest(variant), original);
+});
+
+test('plan emits a live GitHub attestation marker and rejects legacy self-attestation', async () => {
+  const fixture = makeDependencies();
+  const plan = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    planOnly: true,
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(plan.gateIntegrityAttestationRequired.provider, 'github-pull-request-review');
+  assert.match(plan.gateIntegrityAttestationRequired.marker, /PR-CLOSEOUT-ATTESTATION v1/);
+
+  const legacy = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig({ gateIntegrityReview: { decision: 'not-weakened' } }),
+    planOnly: true,
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(legacy.planStatus, 'FAIL');
+  assert.match(legacy.errors.join(' '), /self-attestation|gateIntegrityReview/i);
+});
+
+test('does not execute validation without independent live gate attestation', async () => {
+  const fixture = makeDependencies({ admissionAttestationStatus: 'BLOCKED' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(fixture.executions.length, 0);
+});
+
+test('blocks final evidence when the GitHub attestation is no longer valid', async () => {
+  const fixture = makeDependencies({ finalAttestationStatus: 'BLOCKED' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(fixture.executions.length > 0, true);
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(result.report.gateIntegrity.status, 'BLOCKED');
+});
+
+test('preserves exact plan blocker evidence in final mandatory rows', async () => {
+  const fixture = makeDependencies();
+  const commands = { ...configuredCommands };
+  delete commands['producer-tests'];
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig({ commands }),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.match(
+    result.report.checks.find(({ id }) => id === 'producer-tests').evidence,
+    /No authoritative command resolved for Focused producer tests/i,
+  );
+});
+
+test('blocks completion when final live GitHub PR state is not clean', async () => {
+  const fixture = makeDependencies({ livePrStatus: 'BLOCKED' });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(result.report.livePrState.status, 'BLOCKED');
+});
+
+test('overall status never treats baseline, residual findings, or dirty output as clean', () => {
+  const base = {
+    planStatus: 'PASS',
+    preflight: { status: 'PASS' },
+    gateIntegrity: { status: 'PASS' },
+    phases: { status: 'PASS' },
+    reproducibility: { status: 'PASS' },
+    cleanTree: { status: 'PASS' },
+    headConsistency: { status: 'PASS' },
+    repositorySeal: { status: 'PASS' },
+    livePrState: { status: 'PASS' },
+    suppressionFindings: [],
+  };
+  assert.equal(evaluateOverallStatus(base), 'PASS');
+  assert.equal(evaluateOverallStatus({ ...base, phases: { status: 'BASELINE' } }), 'BLOCKED');
+  assert.equal(evaluateOverallStatus({ ...base, suppressionFindings: [{}] }), 'FAIL');
+  assert.equal(evaluateOverallStatus({ ...base, cleanTree: { status: 'FAIL' } }), 'FAIL');
+});
+
+test('writes exactly 19 final mandatory rows when admission is blocked', async () => {
+  const fixture = makeDependencies();
+  fixture.dependencies.runPreflight = async () => ({
+    status: 'BLOCKED',
+    checks: [{ name: 'redis', status: 'BLOCKED', evidence: 'unavailable' }],
+    toolVersions: {},
+  });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.equal(result.report.checks.length, MANDATORY_CHECKS.length);
+  assert.deepEqual(result.report.checks.map(({ id }) => id), MANDATORY_CHECKS.map(({ id }) => id));
+  assert.ok(result.report.checks.every(({ phase, status }) => phase === 'confirmation' && status === 'BLOCKED'));
+  assert.deepEqual(result.report.qualificationChecks, []);
+});

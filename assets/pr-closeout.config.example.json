@@ -1,0 +1,66 @@
+{
+  "baseRef": "origin/main",
+  "parallelism": 4,
+  "timeoutMs": 1200000,
+  "baselineSetupCommand": "pnpm install --frozen-lockfile --ignore-scripts",
+  "minFreeDiskGb": 5,
+  "requiredEnv": [],
+  "safeEnv": [],
+  "qualificationSafe": [],
+  "resourceGroups": {
+    "redis-integration": "redis",
+    "playwright-smoke": "browser",
+    "grafana-live-render": "grafana"
+  },
+  "reproducibilityPaths": [
+    "node_modules/.prisma",
+    "node_modules/@prisma/client"
+  ],
+  "services": {
+    "redis": {
+      "host": "127.0.0.1",
+      "port": 6379
+    },
+    "grafana": {
+      "url": "http://127.0.0.1:3000/api/health"
+    }
+  },
+  "ports": [],
+  "commands": {
+    "queue-registry-tests": "<authoritative focused queue registry command>",
+    "producer-tests": "<authoritative focused producer command>",
+    "worker-tests": "<authoritative focused worker command>",
+    "api-route-tests": "<authoritative focused API route command>",
+    "redis-integration": "<authoritative real Redis integration command>",
+    "biome-touched": "<authoritative Biome command using {touchedFiles}>",
+    "typecheck": "<authoritative full typecheck command>",
+    "playwright-smoke": "<authoritative Playwright smoke command>",
+    "grafana-render": "<authoritative deterministic Grafana render command>",
+    "grafana-live-render": "<authoritative live Grafana render command>"
+  },
+  "timeoutsMs": {
+    "hunter-build": 1800000,
+    "make-pr-check": 1800000
+  },
+  "proofs": {
+    "grafana-render": {
+      "type": "artifact",
+      "path": "artifacts/grafana-render.json"
+    },
+    "make-sbom": {
+      "type": "artifact",
+      "path": "artifacts/sbom.json"
+    },
+    "grafana-live-render": {
+      "type": "artifact",
+      "path": "artifacts/grafana-live-render.json",
+      "semantic": "grafana-live-result",
+      "grafanaOrigin": "http://127.0.0.1:3000"
+    },
+    "hunter-build": {
+      "type": "command",
+      "command": "docker compose ps --format json hunter",
+      "expectedPattern": "semantic:docker-compose-running-healthy"
+    }
+  }
+}

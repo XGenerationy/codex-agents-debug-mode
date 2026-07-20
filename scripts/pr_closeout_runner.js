@@ -1,0 +1,85 @@
+const statusFrom = (results) => {
+  if (results.every(({ status }) => status === 'PASS')) return 'PASS';
+  if (results.some(({ status }) => status === 'FAIL')) return 'FAIL';
+  if (results.some(({ status }) => ['BLOCKED', 'BASELINE'].includes(status))) return 'BLOCKED';
+  return 'FAIL';
+};
+
+const runPool = async (items, limit, execute) => {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await execute(items[index]);
+    }
+  };
+  const count = Math.max(1, Math.min(Number(limit) || 1, items.length || 1));
+  await Promise.all(Array.from({ length: count }, worker));
+  return results;
+};
+
+const blockedConfirmationRows = (checks, evidence, priorResults = []) => {
+  const priorById = new Map(priorResults.map((result) => [result.id, result]));
+  return checks.map((check) => ({
+    ...check,
+    phase: 'confirmation',
+    status: 'BLOCKED',
+    exitCode: null,
+    evidence: check.evidence || priorById.get(check.id)?.evidence || evidence,
+  }));
+};
+
+const resourceAwareExecutor = (execute) => {
+  const locks = new Map();
+  return async (check, phase) => {
+    if (!check.resourceGroup) return execute(check, phase);
+    const previous = locks.get(check.resourceGroup) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    locks.set(check.resourceGroup, current);
+    await previous;
+    try {
+      return await execute(check, phase);
+    } finally {
+      release();
+      if (locks.get(check.resourceGroup) === current) locks.delete(check.resourceGroup);
+    }
+  };
+};
+
+const runValidationPhases = async ({ checks, execute, parallelism = 4 } = {}) => {
+  const unresolved = checks.filter(({ status, command }) => status === 'BLOCKED' || !command);
+  if (unresolved.length) {
+    return {
+      status: 'BLOCKED',
+      qualification: unresolved,
+      confirmation: blockedConfirmationRows(checks, 'Confirmation did not run because the validation plan is unresolved.'),
+    };
+  }
+  const qualificationChecks = checks.filter(({ qualificationSafe }) => qualificationSafe);
+  const executeQualification = resourceAwareExecutor(execute);
+  const qualification = await runPool(
+    qualificationChecks,
+    parallelism,
+    (check) => executeQualification(check, 'qualification'),
+  );
+  const qualificationStatus = statusFrom(qualification);
+  if (qualificationStatus !== 'PASS') {
+    return {
+      status: qualificationStatus,
+      qualification,
+      confirmation: blockedConfirmationRows(
+        checks,
+        'Confirmation did not run because qualification was not clean.',
+        qualification,
+      ),
+    };
+  }
+  const confirmation = [];
+  for (const check of checks) confirmation.push(await execute(check, 'confirmation'));
+  return { status: statusFrom(confirmation), qualification, confirmation };
+};
+
+module.exports = { blockedConfirmationRows, runValidationPhases, statusFrom };

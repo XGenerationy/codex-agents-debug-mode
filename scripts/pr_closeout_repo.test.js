@@ -1,0 +1,121 @@
+const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const { mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const {
+  cleanTreeStatus,
+  readGateChanges,
+  readProjectMetadata,
+  resolveRepositoryState,
+  scanTouchedSuppressions,
+  workingTreeFingerprint,
+} = require('./pr_closeout_repo');
+
+const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+
+const fixtureRepo = async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-repo-'));
+  git(repo, 'init', '--quiet');
+  git(repo, 'config', 'user.name', 'Closeout Test');
+  git(repo, 'config', 'user.email', 'closeout@example.invalid');
+  git(repo, 'config', 'commit.gpgsign', 'false');
+  await writeFile(path.join(repo, 'package.json'), JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }));
+  await writeFile(path.join(repo, 'Makefile'), 'smoke:\n\t@echo ok\n\ngrafana-render:\n\t@echo render\n');
+  await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '--quiet', '-m', 'base');
+  return repo;
+};
+
+test('collects committed, staged, unstaged, and untracked touched files', async () => {
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, 'tracked.txt'), 'changed\n');
+    await writeFile(path.join(repo, 'staged.txt'), 'staged\n');
+    git(repo, 'add', 'staged.txt');
+    await writeFile(path.join(repo, 'untracked.txt'), 'untracked\n');
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    assert.match(state.headSha, /^[a-f0-9]{40}$/);
+    assert.equal(state.baseSha, state.headSha);
+    assert.deepEqual(state.touchedFiles, ['staged.txt', 'tracked.txt', 'untracked.txt']);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('reads project metadata, fingerprints changes, and reports clean-tree truth', async () => {
+  const repo = await fixtureRepo();
+  try {
+    const metadata = await readProjectMetadata(repo);
+    assert.equal(metadata.packageScripts.typecheck, 'tsc --noEmit');
+    assert.ok(metadata.makeTargets.includes('grafana-render'));
+    const clean = await cleanTreeStatus(repo);
+    assert.equal(clean.status, 'PASS');
+    await writeFile(path.join(repo, 'new.txt'), 'first');
+    const first = await workingTreeFingerprint(repo);
+    await writeFile(path.join(repo, 'new.txt'), 'second');
+    const second = await workingTreeFingerprint(repo);
+    assert.notEqual(first, second);
+    assert.equal((await cleanTreeStatus(repo)).status, 'FAIL');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('extracts gate changes and scans the complete touched-file set', async () => {
+  const repo = await fixtureRepo();
+  try {
+    const marker = ['eslint', '-disable'].join('');
+    await writeFile(path.join(repo, 'source.js'), `// ${marker}\n`);
+    await writeFile(path.join(repo, 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }, null, 2));
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const findings = await scanTouchedSuppressions(repo, state.touchedFiles);
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].file, 'source.js');
+    assert.deepEqual(gate.changedFiles, ['package.json']);
+    assert.ok(gate.addedLines.some((line) => line.includes('vitest')));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('scans UTF-16 touched files and blocks unrecognized NUL-containing files', async () => {
+  const repo = await fixtureRepo();
+  try {
+    const marker = ['eslint', '-disable'].join('');
+    const utf16 = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from(`// ${marker}\n`, 'utf16le'),
+    ]);
+    await writeFile(path.join(repo, 'utf16-source.js'), utf16);
+    await writeFile(path.join(repo, 'binary.dat'), Buffer.from([0x41, 0x00, 0x42, 0xff]));
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const findings = await scanTouchedSuppressions(repo, state.touchedFiles);
+    assert.ok(findings.some(({ file, category }) => file === 'utf16-source.js' && category === 'marker'));
+    assert.ok(findings.some(({ file, category }) => file === 'binary.dat' && category === 'scan-error'));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('fingerprints explicitly declared ignored generator output', async () => {
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'generated/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore generated output');
+    const generated = path.join(repo, 'generated');
+    await mkdir(generated);
+    await writeFile(path.join(generated, 'client.js'), 'first');
+    const first = await workingTreeFingerprint(repo, ['generated']);
+    await writeFile(path.join(generated, 'client.js'), 'second');
+    const second = await workingTreeFingerprint(repo, ['generated']);
+    assert.notEqual(first, second);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
