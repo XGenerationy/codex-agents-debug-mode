@@ -411,7 +411,7 @@ const main = () => {
     );
     process.exitCode = 1;
   });
-  server.listen(port, '127.0.0.1', () => {
+  server.listen(port, '127.0.0.1', async () => {
     // Persist the runtime collector_token to a 0600 file under .debug/ and
     // print only the file path in stdout. stdout is captured by wrappers as
     // a structured startup line and is routinely logged, piped, or
@@ -421,33 +421,60 @@ const main = () => {
     // programmatically via the server object's collectorToken property.
     const debugDir = path.join(projectRoot, '.debug');
     const tokenFile = path.join(debugDir, 'collector_token');
-    mkdir(debugDir, { recursive: true })
-      .then(() => writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }))
-      .then(() => chmod(tokenFile, 0o600))
-      .then(() => {
-        process.stdout.write(
-          `${JSON.stringify({
-            status: 'started',
-            port,
-            service: COLLECTOR_SERVICE,
-            version: COLLECTOR_VERSION,
-            instance_id: server.collectorInstanceId,
-            log_dir: '.debug',
-            token_file: '.debug/collector_token',
-          })}\n`,
-        );
-      })
-      .catch((error) => {
-        process.stderr.write(
-          `${JSON.stringify({
-            level: 'error',
-            event: 'startup.token_write_failed',
-            reason: error?.code || (error?.message || String(error)),
-          })}\n`,
-        );
-        process.exitCode = 1;
-        server.close();
-      });
+    try {
+      // Reject a symlinked or escaped .debug directory before writing the
+      // startup collector_token, mirroring the /session handler's guard: a
+      // repo-controlled .debug symlink (or a symlinked collector_token) could
+      // otherwise redirect the write outside projectRoot and clobber an
+      // arbitrary file writable by this process.
+      try {
+        const dirInfo = await lstat(debugDir);
+        if (dirInfo.isSymbolicLink()) throw new Error('debug_dir_is_symlink');
+      } catch (error) {
+        if (error.message === 'debug_dir_is_symlink') throw error;
+        if (error.code !== 'ENOENT') throw error;
+      }
+      await mkdir(debugDir, { recursive: true });
+      const resolvedLogDir = await realpath(debugDir);
+      const resolvedRoot = await realpath(path.resolve(projectRoot));
+      const rel = path.relative(resolvedRoot, resolvedLogDir);
+      if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        throw new Error('debug_dir_escapes_root');
+      }
+      // Reject a symlinked collector_token: writeFile follows a symlink and
+      // would clobber its target. A regular file left by a previous run is
+      // safe to overwrite because the token is regenerated on every startup.
+      try {
+        const fileInfo = await lstat(tokenFile);
+        if (fileInfo.isSymbolicLink()) throw new Error('collector_token_is_symlink');
+      } catch (error) {
+        if (error.message === 'collector_token_is_symlink') throw error;
+        if (error.code !== 'ENOENT') throw error;
+      }
+      await writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 });
+      await chmod(tokenFile, 0o600);
+      process.stdout.write(
+        `${JSON.stringify({
+          status: 'started',
+          port,
+          service: COLLECTOR_SERVICE,
+          version: COLLECTOR_VERSION,
+          instance_id: server.collectorInstanceId,
+          log_dir: '.debug',
+          token_file: '.debug/collector_token',
+        })}\n`,
+      );
+    } catch (error) {
+      process.stderr.write(
+        `${JSON.stringify({
+          level: 'error',
+          event: 'startup.token_write_failed',
+          reason: error?.code || (error?.message || String(error)),
+        })}\n`,
+      );
+      process.exitCode = 1;
+      server.close();
+    }
   });
 };
 
