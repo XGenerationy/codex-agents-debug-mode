@@ -55,7 +55,7 @@ jobs:
       - name: Smoke Bash installer
         if: runner.os == 'Linux'
         run: |
-          ./tools/install.sh --target both --home "$RUNNER_TEMP/debug-skill-home"
+          bash ./tools/install.sh --target both --home "$RUNNER_TEMP/debug-skill-home"
           test -f "$RUNNER_TEMP/debug-skill-home/.codex/skills/debug/SKILL.md"
           test -f "$RUNNER_TEMP/debug-skill-home/.agents/skills/debug/SKILL.md"
 
