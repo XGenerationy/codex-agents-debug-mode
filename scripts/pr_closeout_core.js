@@ -22,14 +22,24 @@ const CONFIG_SILENCING = [
   /continue-on-error["']?\s*[:=]\s*true/i,
   /passWithNoTests["']?\s*[:=]\s*true/i,
   /allowNoTests["']?\s*[:=]\s*true/i,
+  // Accept both `maxWarnings: N` / `max-warnings=N` (JSON/YAML) and the
+  // common CLI form `--max-warnings N` (space-separated) so a PR cannot
+  // silently raise the lint warning budget via a package-scripts entry.
   /max[-_]?warnings["']?\s*[:=]\s*(?:-1|[1-9]\d*)/i,
-  /["']?rules?["']?\s*[:=][\s\S]{0,1000}?["']off["']/i,
-  /["']?rules?["']?\s*[:=][\s\S]{0,1000}?["'][^"'\r\n]+["']\s*:\s*0\b/i,
+  /--max-warnings\s+(?:-1|[1-9]\d*)\b/i,
+  // Increase the rules-object scan window so disabled rules are still caught
+  // when they sit more than 1000 chars after the `rules:` key in real-world
+  // ESLint/Biome configs. The bound stays finite to keep the regex linear.
+  /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["']off["']/i,
+  /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["'][^"'\r\n]+["']\s*:\s*0\b/i,
   /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled\s*[:=]\s*false|disabled\s*[:=]\s*true)/i,
-  /["']?linter["']?\s*:\s*\{[\s\S]{0,1000}?["']?enabled["']?\s*:\s*false/i,
+  /["']?linter["']?\s*:\s*\{[\s\S]{0,4000}?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
-  /(?:ignore|exclude)(?:s|d|Files|Patterns)?\s*[:=]/i,
+  // Consume the optional closing quote on the JSON key (e.g. "enabled":false,
+  // "ignorePatterns":[...], "exclude":[...]) so config-level disabling in
+  // tsconfig/eslint/biome JSON no longer slips past the scan.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]/i,
   /\|\|\s*true\b/i,
 ];
 
@@ -194,7 +204,7 @@ const classifyOutput = ({
     ...findStatusSignals(`${stdout}\n${stderr}`),
     ...detectedSignals.filter((line) => typeof line === 'string' && line.trim()),
   ])];
-  const failures = signals.filter((line) => /(?:\b(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?)?|skips?|skipped|todos?|xfails?|xfailed|xpassed|pending)\b|\bnot ok\b)/i.test(line));
+  const failures = signals.filter((line) => /(?:\b(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|xfails?|xfailed|xpassed|pending)\b|\bnot ok\b)/i.test(line));
   if (failures.length) return { status: 'FAIL', evidence: failures.slice(0, 5).join(' | ') };
   const blocked = signals.filter((line) => /\bblocks?|blocked\b/i.test(line));
   if (blocked.length) return { status: 'BLOCKED', evidence: blocked.slice(0, 5).join(' | ') };
@@ -212,6 +222,12 @@ const scanSuppressionText = (file, text) => {
     || /^\.(?:eslintrc|biomerc)(?:\.[a-z0-9]+)?$/.test(base)
     || ['package.json', 'makefile', '.eslintrc', '.biomerc'].includes(base)
     || normalized.startsWith('.github/workflows/');
+  // Treat touched test files as candidates for test-only weakening markers
+  // (.skip/.only/.todo) so a PR cannot focus or skip tests in an ordinary
+  // touched test file and still pass the closeout scan if the reduced test
+  // command exits 0.
+  const testLike = /(?:^|[._-])(?:test|spec)s?\.[a-z0-9]+$/i.test(base)
+    || /\.(?:test|spec)\.[a-z0-9]+$/i.test(base);
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const markerPattern = new RegExp(MARKERS
     .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
@@ -236,6 +252,13 @@ const scanSuppressionText = (file, text) => {
       const line = text.slice(0, match.index).split(/\r?\n/).length;
       findings.push({ file, line, category: 'config-silencing', match: match[0].trim() });
     }
+  }
+  if (testLike) {
+    const testWeakening = /\b(?:describe|it|test|context)\.(?:skip|only|todo)\b/i;
+    lines.forEach((line, index) => {
+      const match = line.match(testWeakening);
+      if (match) findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
+    });
   }
   return findings;
 };

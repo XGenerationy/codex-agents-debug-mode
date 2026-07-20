@@ -195,6 +195,25 @@ const hashFile = async (absolute) => {
   return hash.digest('hex');
 };
 
+// Shared filesystem-entry hasher used by both workingTreeFingerprint and
+// collectExtraEntries.visit so the symlink/lstat/ENOENT/hashFile guard has
+// one owner. Two independently-maintained copies of this safety-critical
+// guard is the pattern that produced the earlier decodeTouchedText-bypass
+// bug in this file.
+const hashFsEntry = async (absolute) => {
+  let info;
+  try {
+    info = await lstat(absolute);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return hashBytes('missing');
+  }
+  if (info.isSymbolicLink()) {
+    return hashBytes(`symlink:${await readlink(absolute)}`);
+  }
+  return hashFile(absolute);
+};
+
 const resolveExtraPath = (repo, requested) => {
   if (!requested || path.isAbsolute(requested)) throw new Error(`Reproducibility path must be repository-relative: ${requested}`);
   const absolute = path.resolve(repo, requested);
@@ -230,7 +249,7 @@ const collectExtraEntries = async (repo, requested, entries) => {
       }
       return;
     }
-    entries.push({ path: `__extra__/${relative}`, hash: await hashFile(absolute) });
+    entries.push({ path: `__extra__/${relative}`, hash: await hashFsEntry(absolute) });
   };
   await visit(root);
 };
@@ -262,25 +281,13 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   ]);
   const entries = [{ path: '__tracked_diff__', hash: diffHash }];
   for (const file of untracked) {
+    // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
+    // hashFile guard has one owner. A validation command may leave a link to
+    // /dev/zero or an outside file; the helper hashes the link target string
+    // instead of dereferencing the link, and surfaces a stable `missing`
+    // marker when the file is gone.
     const absolute = path.join(repo, file);
-    // Guard untracked symlinks before hashing: a validation command may leave
-    // a link to /dev/zero or an outside file, and following it could hang or
-    // read outside the repository before the final dirty-tree check can stop
-    // the run. Treat untracked symlinks like collectExtraEntries does and
-    // hash the link target string instead of dereferencing the link.
-    let info;
-    try {
-      info = await lstat(absolute);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      entries.push({ path: file, hash: hashBytes('missing') });
-      continue;
-    }
-    if (info.isSymbolicLink()) {
-      entries.push({ path: file, hash: hashBytes(`symlink:${await readlink(absolute)}`) });
-      continue;
-    }
-    entries.push({ path: file, hash: await hashFile(absolute) });
+    entries.push({ path: file, hash: await hashFsEntry(absolute) });
   }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);
   return fingerprintEntries(entries);

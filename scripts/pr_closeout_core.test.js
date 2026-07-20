@@ -129,6 +129,29 @@ test('treats mocha-style passing summary with failing tests as a failure signal'
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'failing: 3' }).status, 'FAIL');
   // Zero-failing summaries remain PASS.
   assert.equal(classifyOutput({ exitCode: 0, stdout: '  0 failing' }).status, 'PASS');
+  // Failure precedence must hold even when a blocked-style line coexists.
+  const mixed = classifyOutput({ exitCode: 0, stdout: '3 blocked\n1 failing' });
+  assert.equal(mixed.status, 'FAIL');
+  assert.match(mixed.evidence, /failing/i);
+});
+
+test('flags focused or skipped tests in touched test files', () => {
+  // A PR can focus or skip tests in an ordinary touched test file and still
+  // exit 0 from the reduced command; the closeout scanner must catch that
+  // weakening without relying on the test file being a gate file.
+  const findings = scanSuppressionText('src/foo.test.js', [
+    'describe.only("focused suite", () => {});',
+    'it.skip("skipped test");',
+    'test.todo("unfinished test");',
+    'context.only("another focused suite");',
+    'function runTest() {} // not a weakening',
+  ].join('\n'));
+  const matches = findings.filter(({ category }) => category === 'test-weakening');
+  assert.equal(matches.length, 4, `expected 4 test-weakening findings, got: ${JSON.stringify(matches)}`);
+  // A non-test source file with the same body must not produce test-weakening
+  // findings (the detection is scoped to test-like filenames).
+  const nonTest = scanSuppressionText('src/foo.js', 'it.skip("not in a test file");');
+  assert.deepEqual(nonTest, []);
 });
 
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {

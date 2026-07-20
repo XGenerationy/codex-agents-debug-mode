@@ -65,9 +65,33 @@ const terminateProcessTree = async ({
       };
     }
 
+    // `kill(-pgid, 0)` succeeds for zombie (<defunct>) descendants too, so on
+    // Linux containers where PID 1 does not promptly reap killed descendants
+    // we would report BLOCKED even though no live process can mutate evidence.
+    // Read /proc/<pid>/stat for the root child and treat a zombie state as
+    // "group is gone" since a defunct root cannot do anything either.
+    const isDefunct = (pid) => {
+      try {
+        const stat = require('node:fs').readFileSync(`/proc/${pid}/stat`, 'utf8');
+        // /proc/$pid/stat is `pid (comm) state ...`; comm may contain spaces
+        // and parens, so parse from the LAST ')' in the line.
+        const afterComm = stat.lastIndexOf(')');
+        if (afterComm < 0) return false;
+        const state = stat.slice(afterComm + 1).trimStart().split(/\s+/)[0];
+        return state === 'Z';
+      } catch {
+        return false;
+      }
+    };
     const groupExists = () => {
       try {
         kill(-child.pid, 0);
+        // kill(0) succeeded, but if the root child is a defunct zombie and
+        // there are no other live processes in the group, treat the group as
+        // gone (it cannot mutate evidence).
+        if (isDefunct(child.pid)) {
+          return false;
+        }
         return true;
       } catch (error) {
         if (error?.code === 'ESRCH') return false;
