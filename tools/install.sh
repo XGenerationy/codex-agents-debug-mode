@@ -8,7 +8,8 @@ home_path="${HOME}"
 while (($#)); do
   case "$1" in
     --target)
-      target="${2:-}"
+      if [[ $# -lt 2 ]]; then echo "--target requires a value" >&2; exit 2; fi
+      target="$2"
       shift 2
       ;;
     --force)
@@ -16,7 +17,8 @@ while (($#)); do
       shift
       ;;
     --home)
-      home_path="${2:-}"
+      if [[ $# -lt 2 ]]; then echo "--home requires a value" >&2; exit 2; fi
+      home_path="$2"
       shift 2
       ;;
     *)
@@ -63,5 +65,9 @@ for destination in "${destinations[@]}"; do
   for entry in "${payload[@]}"; do
     cp -R -- "$source_dir/$entry" "$destination/"
   done
-  printf '{"status":"installed","target":"%s","backup":"%s"}\n' "$destination" "$backup"
+  dest_json="${destination//\\/\\\\}"
+  dest_json="${dest_json//\"/\\\"}"
+  backup_json="${backup//\\/\\\\}"
+  backup_json="${backup_json//\"/\\\"}"
+  printf '{"status":"installed","target":"%s","backup":"%s"}\n' "$dest_json" "$backup_json"
 done

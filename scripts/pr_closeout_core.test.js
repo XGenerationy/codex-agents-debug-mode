@@ -255,3 +255,17 @@ test('keeps example placeholders blocked instead of treating them as commands', 
   assert.equal(producer.status, 'BLOCKED');
   assert.equal(producer.resolution, 'placeholder');
 });
+
+test('preserves the first BLOCKED reason when a check hits multiple BLOCKED conditions', () => {
+  // grafana-live-render can be BLOCKED three ways when nothing is configured:
+  // unresolved command (first map), missing artifact proof (second map), and
+  // missing live Grafana service URL (second map). The second pass must
+  // preserve and append to the unresolved-command evidence instead of
+  // overwriting it, so reviewers see the real root cause.
+  const plan = buildCheckPlan({ config: {} });
+  const grafana = plan.checks.find(({ id }) => id === 'grafana-live-render');
+  assert.equal(grafana.status, 'BLOCKED');
+  assert.match(grafana.evidence, /No authoritative command resolved/i);
+  assert.match(grafana.evidence, /postcondition proof/i);
+  assert.match(grafana.evidence, /Grafana health probe/i);
+});

@@ -159,9 +159,17 @@ const createDebugServer = ({
         const sessionToken = randomBytes(32).toString('base64url');
         const fileName = `debug-${sessionId}.log`;
         const logFile = path.join(logDir, fileName);
-        await mkdir(logDir, { recursive: true });
-        await writeFile(logFile, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-        sessions.set(sessionId, { eventCount: 0, logFile, sessionToken });
+        // Reserve the session slot before any awaited I/O so concurrent
+        // /session requests cannot all pass the maxSessions check at once.
+        sessions.set(sessionId, { eventCount: 0, logFile, sessionToken, provisional: true });
+        try {
+          await mkdir(logDir, { recursive: true });
+          await writeFile(logFile, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+          delete sessions.get(sessionId).provisional;
+        } catch (error) {
+          sessions.delete(sessionId);
+          throw error;
+        }
         sendJson(response, 201, {
           session_id: sessionId,
           session_token: sessionToken,
@@ -201,9 +209,18 @@ const createDebugServer = ({
           throw new RequestError('storage_limit_reached', 429);
         }
 
-        await appendFile(session.logFile, serializedEvent, 'utf8');
+        // Reserve capacity before yielding so concurrent /log requests see
+        // both the per-session event cap and the aggregate byte cap, then
+        // roll the reservation back if the append fails.
         session.eventCount += 1;
         totalBytes += eventBytes;
+        try {
+          await appendFile(session.logFile, serializedEvent, 'utf8');
+        } catch (error) {
+          session.eventCount -= 1;
+          totalBytes -= eventBytes;
+          throw error;
+        }
         sendJson(response, 202, { status: 'recorded' });
         return;
       }

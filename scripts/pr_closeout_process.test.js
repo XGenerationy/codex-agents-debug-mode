@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { access, link, mkdtemp, readFile, stat, writeFile } = require('node:fs/promises');
+const { access, link, mkdtemp, readFile, rm, stat, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -518,6 +518,33 @@ test('uses unique logs for repeated baseline setup attempts', async () => {
   );
 });
 
+test('redacts a baseline worktree cwd the same way as the head repo', async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-head-repo-'));
+  const baselineCwd = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-cwd-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-cwd-logs-'));
+  try {
+    const execute = createCommandExecutor({
+      repo,
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+    });
+    const result = await execute({
+      id: 'typecheck',
+      command: 'process.stdout.write(process.cwd())',
+    }, 'baseline', baselineCwd);
+    // Without the baseline-cwd redaction fix, the captured stdout would
+    // contain the raw baselineCwd path; with the fix it is normalized to
+    // <repo> exactly like the head execution.
+    assert.equal(result.stdout, '<repo>');
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(baselineCwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(baselineCwd, { recursive: true, force: true });
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('rejects canonicalized Git metadata artifact paths regardless of case', async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-git-proof-'));
   for (const proofPath of [
@@ -628,6 +655,26 @@ test('binds live Grafana artifact proof to a query result contract', async () =>
   }, 'confirmation');
   assert.equal(valid.status, 'PASS');
   assert.match(valid.evidence, /Grafana live query result/i);
+
+  // A 200 response can still carry per-refId errors (e.g. datasource
+  // unavailable). The proof must FAIL instead of treating the non-empty
+  // results object as clean.
+  const errorPayload = {
+    ...invalidPayload,
+    response: { results: { A: { error: 'datasource unavailable' } } },
+  };
+  const errored = await execute({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify(errorPayload))})`,
+    proof: {
+      type: 'artifact',
+      path: 'live.json',
+      semantic: 'grafana-live-result',
+      grafanaOrigin: 'http://127.0.0.1:3000',
+    },
+  }, 'confirmation');
+  assert.equal(errored.status, 'FAIL');
+  assert.match(errored.evidence, /error/i);
 });
 
 test('timeout terminates descendants before they can mutate evidence', async () => {

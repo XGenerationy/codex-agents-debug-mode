@@ -28,7 +28,7 @@ const approvedReview = (extra = {}) => ({
   commit_id: 'head123',
   body: gateAttestationMarker({ baseSha: 'base123', headSha: 'head123', configDigest: 'cfg123' }),
   submitted_at: '2026-07-14T00:00:00Z',
-  author_association: 'MEMBER',
+  author_association: 'COLLABORATOR',
   user: { login: 'reviewer' },
   ...extra,
 });
@@ -130,6 +130,32 @@ test('accepts a marker reviewer only when the repository permission lookup prove
     },
   });
   assert.equal(writeResult.status, 'PASS');
+});
+
+test('requires repository write permission for MEMBER attestors instead of trusting org membership', () => {
+  const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
+  // A MEMBER with no permission record must NOT be treated as authoritative.
+  const memberWithoutPermission = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'MEMBER' })],
+    ...expected,
+  });
+  assert.equal(memberWithoutPermission.status, 'BLOCKED');
+
+  // A MEMBER whose permission lookup returns write access is accepted.
+  const memberWithWrite = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'MEMBER' })],
+    reviewerPermissions: new Map([['reviewer', { permission: 'write' }]]),
+    ...expected,
+  });
+  assert.equal(memberWithWrite.status, 'PASS');
+
+  // A MEMBER whose permission lookup returns only read access is rejected.
+  const memberWithRead = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'MEMBER' })],
+    reviewerPermissions: new Map([['reviewer', { permission: 'read' }]]),
+    ...expected,
+  });
+  assert.equal(memberWithRead.status, 'BLOCKED');
 });
 
 test('accepts only a clean live PR bound to the expected base and head', () => {

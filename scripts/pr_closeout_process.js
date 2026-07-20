@@ -564,6 +564,23 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
       || !results || typeof results !== 'object' || Object.keys(results).length === 0) {
       return { status: 'FAIL', evidence: 'Grafana live query proof lacked a bound query request and non-empty result.' };
     }
+    // A 200 response can still carry per-refId errors (e.g. datasource
+    // unavailable). Require every result entry to be error-free and to expose
+    // a usable frame, otherwise the proof does not establish a clean result.
+    const resultEntries = Object.values(results);
+    const errorEntries = resultEntries.filter((entry) => entry && typeof entry === 'object' && (
+      String(entry.error || '').trim()
+      || String(entry.errorSource || '').trim()
+      || String(entry.status || '').toLowerCase() === 'error'
+    ));
+    if (errorEntries.length) {
+      return { status: 'FAIL', evidence: 'Grafana live query proof contained a result entry with an error.' };
+    }
+    const usableFrames = resultEntries.filter((entry) => entry && typeof entry === 'object'
+      && (Array.isArray(entry.frames) ? entry.frames.length > 0 : Array.isArray(entry?.data?.values)));
+    if (!usableFrames.length) {
+      return { status: 'FAIL', evidence: 'Grafana live query proof contained no result entry with usable frames.' };
+    }
     return { status: 'PASS', evidence: 'Verified refreshed artifact and bound Grafana live query result.' };
   }
   if (payload.operation === 'render') {
@@ -696,7 +713,13 @@ const createCommandExecutor = ({
   const logsDir = path.join(outputDir, 'logs');
   await mkdir(logsDir, { recursive: true });
   const logPath = nextLogPath(phase, check.id);
-  const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), pathReplacements, platform);
+  // When the caller supplies a baseline/worktree cwd that differs from the
+  // primary repo, extend the redaction set so baseline paths are normalized
+  // (and hashed) the same way as the head run, instead of leaking as /tmp/...
+  const effectivePathReplacements = cwd && path.resolve(cwd) !== path.resolve(repo)
+    ? [...pathReplacements, ...pathVariants(cwd).map((value) => [value, '<repo>'])]
+    : pathReplacements;
+  const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
   await writeFile(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, 'utf8');
   const execution = await spawnCaptured({
     command: check.command,
@@ -708,7 +731,7 @@ const createCommandExecutor = ({
     redactionEnv: env,
     secretNames,
     logPath,
-    pathReplacements,
+    pathReplacements: effectivePathReplacements,
     platform,
     spawnProcess,
     terminateTree,
@@ -736,7 +759,7 @@ const createCommandExecutor = ({
     const proofLogPath = nextLogPath(phase, check.id, 'proof');
     const safeProofCommand = normalizePaths(
       redactSecrets(check.proof.command, env, secretNames),
-      pathReplacements,
+      effectivePathReplacements,
       platform,
     );
     await writeFile(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, 'utf8');
@@ -750,7 +773,7 @@ const createCommandExecutor = ({
       redactionEnv: env,
       secretNames,
       logPath: proofLogPath,
-      pathReplacements,
+      pathReplacements: effectivePathReplacements,
       platform,
       spawnProcess,
       terminateTree,

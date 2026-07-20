@@ -83,6 +83,32 @@ test('extracts gate changes and scans the complete touched-file set', async () =
   }
 });
 
+test('decodes untracked gate files through the safe multi-encoding decoder', async () => {
+  const repo = await fixtureRepo();
+  try {
+    // Untracked UTF-16LE biome.json with weakening content that the older
+    // plain UTF-8 readFile path would silently mis-decode. Use an untracked
+    // gate file (biome.json) instead of overwriting the tracked package.json,
+    // because tracked modifications flow through `git diff` (UTF-8) and never
+    // reach the decodeTouchedText branch in readGateChanges.
+    const utf16 = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from(JSON.stringify({ linter: { enabled: false } }), 'utf16le'),
+    ]);
+    await writeFile(path.join(repo, 'biome.json'), utf16);
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.deepEqual(gate.changedFiles, ['biome.json']);
+    // The safe decoder must surface the weakening token instead of garbling it.
+    assert.ok(
+      gate.addedLines.some((line) => line.includes('"enabled":false') || line.includes('"enabled": false')),
+      `expected weakening token in added lines, got: ${JSON.stringify(gate.addedLines)}`,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('scans UTF-16 touched files and blocks unrecognized NUL-containing files', async () => {
   const repo = await fixtureRepo();
   try {

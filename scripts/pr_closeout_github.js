@@ -14,7 +14,11 @@ const FAILURE_CONCLUSIONS = new Set([
   'TIMED_OUT',
 ]);
 const PENDING_STATES = new Set(['EXPECTED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'REQUESTED', 'WAITING']);
-const AUTHORITATIVE_ASSOCIATIONS = new Set(['COLLABORATOR', 'MEMBER', 'OWNER']);
+// OWNER (repo owner) and COLLABORATOR (direct collaborator with write) are
+// authoritative by association. MEMBER only proves organization membership
+// (not repo write access), so it must be verified through the permission
+// endpoint in reviewerAuthorization below.
+const AUTHORITATIVE_ASSOCIATIONS = new Set(['COLLABORATOR', 'OWNER']);
 const WRITE_PERMISSIONS = new Set(['ADMIN', 'MAINTAIN', 'PUSH', 'WRITE']);
 const MAX_REVIEW_THREAD_PAGES = 100;
 

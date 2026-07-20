@@ -128,17 +128,22 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
       proof: proof || null,
     };
     if (proofType && !validArtifact && !validCommand) {
-      resolved = {
-        ...resolved,
-        status: 'BLOCKED',
-        evidence: `A ${proofType} postcondition proof is required for ${check.label}.`,
-      };
+      const proofEvidence = `A ${proofType} postcondition proof is required for ${check.label}.`;
+      resolved = resolved.status === 'BLOCKED'
+        ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+        : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
     }
     if (check.id === 'redis-integration' && !config.services?.redis) {
-      resolved = { ...resolved, status: 'BLOCKED', evidence: 'A real Redis service probe is required.' };
+      const serviceEvidence = 'A real Redis service probe is required.';
+      resolved = resolved.status === 'BLOCKED'
+        ? { ...resolved, evidence: `${resolved.evidence} ${serviceEvidence}` }
+        : { ...resolved, status: 'BLOCKED', evidence: serviceEvidence };
     }
     if (check.id === 'grafana-live-render' && !config.services?.grafana?.url) {
-      resolved = { ...resolved, status: 'BLOCKED', evidence: 'A live Grafana health probe is required.' };
+      const serviceEvidence = 'A live Grafana health probe is required.';
+      resolved = resolved.status === 'BLOCKED'
+        ? { ...resolved, evidence: `${resolved.evidence} ${serviceEvidence}` }
+        : { ...resolved, status: 'BLOCKED', evidence: serviceEvidence };
     }
     return resolved;
   });
@@ -151,18 +156,18 @@ const cleanZeroSummaries = (text) => text
   .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|skips?|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
 const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
+const COUNTED_SIGNAL = new RegExp(`(?:\\b[1-9]\\d*\\s+${STATUS_TERM}\\b|\\b${STATUS_TERM}\\s*(?::|=|\\s)\\s*[1-9]\\d*\\b)`, 'i');
+const BRACKETED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?\\[${STATUS_TERM}\\]`, 'i');
+const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, 'i');
 const statusSignal = (line) => {
-  const counted = new RegExp(`(?:\\b[1-9]\\d*\\s+${STATUS_TERM}\\b|\\b${STATUS_TERM}\\s*(?::|=|\\s)\\s*[1-9]\\d*\\b)`, 'i');
-  const bracketed = new RegExp(`^\\s*(?:[-*]\\s*)?\\[${STATUS_TERM}\\]`, 'i');
-  const labelled = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, 'i');
   const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
   const runtime = /\b(?:[A-Za-z]+Warning|[A-Za-z]+Error):/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;
   const npmWarning = /\bnpm\s+WARN\b/i;
   const framework = /(?:^\s*(?:not ok\b|#\s*(?:skip|skipped)\b|(?:skipped|failed|blocked|pending|xfailed|xpassed)\b)|\bok\s+\d+\b.*#\s*skip\b)/i;
-  return /^\s*✖/u.test(line) || counted.test(line) || bracketed.test(line)
-    || labelled.test(line) || uppercase.test(line) || compiler.test(line)
+  return /^\s*✖/u.test(line) || COUNTED_SIGNAL.test(line) || BRACKETED_SIGNAL.test(line)
+    || LABELLED_SIGNAL.test(line) || uppercase.test(line) || compiler.test(line)
     || runtime.test(line) || warning.test(line) || npmWarning.test(line) || framework.test(line);
 };
 

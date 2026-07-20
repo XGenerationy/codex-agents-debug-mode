@@ -159,7 +159,7 @@ test('normalizes differently cased path aliases before persisting evidence', () 
 
   assert.deepEqual(normalized, {
     repository: '<repo>',
-    evidence: '<repo>/logs and <output>\\report.json',
+    evidence: '<repo>/logs and <evidence>\\report.json',
   });
 });
 

@@ -123,6 +123,7 @@ const ESSENTIAL_ENV = new Set([
   'CI',
   'NO_COLOR',
   'TERM',
+  'OMO_CODEX_GIT_BASH_PATH',
 ]);
 
 const buildWorkflowEnvironment = (env, config) => {
@@ -140,15 +141,19 @@ const normalizePersistedPaths = (value, repo, outputDir, seen = new WeakSet()) =
     [repo, '<repo>'],
     [repo?.replaceAll('\\', '/'), '<repo>'],
     [repo?.replaceAll('/', '\\'), '<repo>'],
-    [outputDir, '<output>'],
-    [outputDir?.replaceAll('\\', '/'), '<output>'],
-    [outputDir?.replaceAll('/', '\\'), '<output>'],
+    [outputDir, '<evidence>'],
+    [outputDir?.replaceAll('\\', '/'), '<evidence>'],
+    [outputDir?.replaceAll('/', '\\'), '<evidence>'],
   ].filter(([candidate]) => candidate);
   const normalize = (text) => {
     let result = String(text);
     for (const [candidate, replacement] of replacements) {
       const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      result = result.replace(new RegExp(escaped, 'gi'), replacement);
+      const flags = /^[A-Za-z]:[\\/]/.test(candidate) ? 'gi' : 'g';
+      result = result.replace(
+        new RegExp(`${escaped}(?=$|[\\\\/]|[^A-Za-z0-9._-])`, flags),
+        replacement,
+      );
     }
     return result;
   };

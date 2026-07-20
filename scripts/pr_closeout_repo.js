@@ -174,8 +174,12 @@ const readGateChanges = async (repo, baseSha) => {
     : '';
   const addedLines = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
-    const text = await readFile(path.join(repo, file), 'utf8');
-    addedLines.push(...text.split(/\r?\n/).map((line) => `+${line}`));
+    try {
+      const text = decodeTouchedText(await readFile(path.join(repo, file)));
+      addedLines.push(...text.split(/\r?\n/).map((line) => `+${line}`));
+    } catch (error) {
+      addedLines.push(`+__decode_error__:${file}:${error.message}`);
+    }
   }
   return { changedFiles, addedLines };
 };

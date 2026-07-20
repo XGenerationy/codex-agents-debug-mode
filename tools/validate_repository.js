@@ -36,15 +36,23 @@ if (payloadFiles.length !== 26) {
   failures.push(`Expected 26 skill payload files, found ${payloadFiles.length}`);
 }
 
-const skill = readFileSync(path.join(root, 'SKILL.md'), 'utf8');
-if (!/^---\r?\nname:\s*debug\r?\n/m.test(skill)) failures.push('SKILL.md must declare name: debug');
-for (const trigger of ['cleanup GitHub', 'bug', 'debug']) {
-  if (!skill.includes(`"${trigger}"`)) failures.push(`SKILL.md is missing automatic trigger: ${trigger}`);
+try {
+  const skill = readFileSync(path.join(root, 'SKILL.md'), 'utf8');
+  if (!/^---\r?\nname:\s*debug\r?\n/m.test(skill)) failures.push('SKILL.md must declare name: debug');
+  for (const trigger of ['cleanup GitHub', 'bug', 'debug']) {
+    if (!skill.includes(`"${trigger}"`)) failures.push(`SKILL.md is missing automatic trigger: ${trigger}`);
+  }
+} catch {
+  // Missing file is already reported by the required-file checks above.
 }
 
-const metadata = readFileSync(path.join(root, 'agents', 'openai.yaml'), 'utf8');
-if (!/allow_implicit_invocation:\s*true/.test(metadata)) {
-  failures.push('agents/openai.yaml must allow implicit invocation');
+try {
+  const metadata = readFileSync(path.join(root, 'agents', 'openai.yaml'), 'utf8');
+  if (!/allow_implicit_invocation:\s*true/.test(metadata)) {
+    failures.push('agents/openai.yaml must allow implicit invocation');
+  }
+} catch {
+  // Missing file is already reported by the required-file checks above.
 }
 
 for (const file of payloadFiles.filter((name) => name.endsWith('.json'))) {

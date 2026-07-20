@@ -12,7 +12,21 @@ const runPool = async (items, limit, execute) => {
     while (next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await execute(items[index]);
+      try {
+        results[index] = await execute(items[index]);
+      } catch (error) {
+        // Contain executor failures to this single item so one thrown error
+        // cannot abort the whole pool and prevent the workflow from writing a
+        // structured evidence report. Mirror the executor's own BLOCKED shape
+        // so downstream classification still treats the row as non-passing.
+        const item = items[index] || {};
+        results[index] = {
+          ...item,
+          status: 'BLOCKED',
+          exitCode: null,
+          evidence: `Executor threw while running ${item.id || item.label || 'check'}: ${error?.message || error}.`,
+        };
+      }
     }
   };
   const count = Math.max(1, Math.min(Number(limit) || 1, items.length || 1));

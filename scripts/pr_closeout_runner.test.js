@@ -89,6 +89,29 @@ test('serializes qualification checks that share a resource group', async () => 
   assert.equal(maxDatabaseActive, 1);
 });
 
+test('contains a thrown executor error to a single BLOCKED qualification row', async () => {
+  const checks = ['survivor', 'thrower', 'survivor2'].map((id) => ({
+    id,
+    command: `run ${id}`,
+    qualificationSafe: true,
+  }));
+  const result = await runValidationPhases({
+    checks,
+    parallelism: 2,
+    execute: async (check) => {
+      if (check.id === 'thrower') throw new Error('boom');
+      return { ...check, phase: 'qualification', status: 'PASS', exitCode: 0 };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  const failed = result.qualification.find(({ id }) => id === 'thrower');
+  assert.equal(failed.status, 'BLOCKED');
+  assert.match(failed.evidence, /boom/);
+  // The thrown error must not abort the pool: every other row still ran.
+  assert.equal(result.qualification.length, checks.length);
+  assert.ok(result.qualification.every(({ id }) => id));
+});
+
 test('materializes all mandatory confirmation rows when the plan is unresolved', async () => {
   const checks = MANDATORY_CHECKS.map((check) => ({
     ...check,
