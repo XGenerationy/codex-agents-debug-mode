@@ -186,6 +186,10 @@ const createDebugServer = ({
           sendJson(response, 404, { error: 'unknown_session' });
           return;
         }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
         const suppliedToken =
           request.headers['x-debug-session-token'] || payload.sessionToken;
         if (!safeTokenEqual(suppliedToken, session.sessionToken)) {
