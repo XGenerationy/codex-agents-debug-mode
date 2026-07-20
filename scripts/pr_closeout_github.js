@@ -327,10 +327,34 @@ const readLiveGateAttestation = async ({
     const repositoryResult = await runGh(['repo', 'view', '--json', 'nameWithOwner'], { repo });
     const repository = repositoryResult.nameWithOwner;
     if (!repository || !repository.includes('/')) throw new Error('GitHub repository identity was not returned.');
-    const pr = await runGh(['pr', 'view', '--json', 'author,number'], { repo });
+    // Include headRefOid/baseRefOid in the admission query so the attestation
+    // cannot admit a stale local snapshot against an old approved review that
+    // still carries the local expectedHeadSha marker. Validation must never
+    // run against a PR head that has already moved on the remote.
+    const pr = await runGh(['pr', 'view', '--json', 'author,number,baseRefOid,headRefOid'], { repo });
     if (!Number.isInteger(pr.number)) throw new Error('GitHub did not return an open pull request number.');
     if (typeof pr.author?.login !== 'string' || !pr.author.login.trim()) {
       throw new Error('GitHub did not return the pull request author identity.');
+    }
+    if (typeof pr.headRefOid === 'string' && pr.headRefOid && pr.headRefOid !== expectedHeadSha) {
+      return {
+        provider: 'github-pull-request-review',
+        status: 'BLOCKED',
+        baseSha: expectedBaseSha,
+        headSha: expectedHeadSha,
+        configDigest: expectedConfigDigest,
+        evidence: `Live PR head ${pr.headRefOid.substring(0, 7)} does not match expected head ${expectedHeadSha.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
+      };
+    }
+    if (typeof pr.baseRefOid === 'string' && pr.baseRefOid && pr.baseRefOid !== expectedBaseSha) {
+      return {
+        provider: 'github-pull-request-review',
+        status: 'BLOCKED',
+        baseSha: expectedBaseSha,
+        headSha: expectedHeadSha,
+        configDigest: expectedConfigDigest,
+        evidence: `Live PR base ${pr.baseRefOid.substring(0, 7)} does not match expected base ${expectedBaseSha.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
+      };
     }
     return await readGateAttestationForPr({
       repo,

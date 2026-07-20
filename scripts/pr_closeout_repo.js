@@ -66,9 +66,30 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
 const readProjectMetadata = async (repo) => {
   let packageScripts = {};
   let makeTargets = [];
+  // Reject symlinked metadata before reading: a reviewed branch can make
+  // root package.json or a default Makefile a symlink to /dev/zero or an
+  // outside file, hanging or escaping the repository before any later check
+  // can stop the read.
+  const safeReadFile = async (relative) => {
+    const absolute = path.join(repo, relative);
+    let info;
+    try {
+      info = await lstat(absolute);
+    } catch (error) {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      throw new Error(`Refusing to read symlinked metadata: ${relative}`);
+    }
+    return readFile(absolute, 'utf8');
+  };
   try {
-    const manifest = JSON.parse(await readFile(path.join(repo, 'package.json'), 'utf8'));
-    packageScripts = manifest.scripts || {};
+    const manifestText = await safeReadFile('package.json');
+    if (manifestText !== undefined) {
+      const manifest = JSON.parse(manifestText);
+      packageScripts = manifest.scripts || {};
+    }
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
@@ -79,7 +100,8 @@ const readProjectMetadata = async (repo) => {
   const makeCandidates = ['GNUmakefile', 'makefile', 'Makefile'];
   for (const candidate of makeCandidates) {
     try {
-      const makefile = await readFile(path.join(repo, candidate), 'utf8');
+      const makefile = await safeReadFile(candidate);
+      if (makefile === undefined) continue;
       makeTargets = [...new Set(makefile.split(/\r?\n/)
         .map((line) => line.match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/))
         .filter(Boolean)
@@ -217,7 +239,24 @@ const readGateChanges = async (repo, baseSha) => {
   const addedLines = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
     try {
-      const text = decodeTouchedText(await readFile(path.join(repo, file)));
+      const absolute = path.join(repo, file);
+      // Reject untracked gate symlinks before decoding: a PR can add
+      // packages/web/package.json pointing at /dev/zero or an outside file,
+      // and following the link would hang or read outside the repository
+      // while readGateChanges runs in the admission/final scan.
+      let info;
+      try {
+        info = await lstat(absolute);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        addedLines.push(`+__decode_error__:${file}:missing`);
+        continue;
+      }
+      if (info.isSymbolicLink()) {
+        addedLines.push(`+__decode_error__:${file}:symlink_not_allowed`);
+        continue;
+      }
+      const text = decodeTouchedText(await readFile(absolute));
       for (const line of text.split(/\r?\n/)) {
         addedLines.push(`+${line}`);
       }

@@ -92,7 +92,24 @@ const runValidationPhases = async ({ checks, execute, parallelism = 4 } = {}) =>
     };
   }
   const confirmation = [];
-  for (const check of checks) confirmation.push(await execute(check, 'confirmation'));
+  for (const check of checks) {
+    // Contain confirmation executor errors the same way runPool contains
+    // qualification errors: a single thrown error (verifyBaseline worktree
+    // failure, log/proof filesystem error, etc.) must not bubble out of
+    // runValidationPhases and prevent the workflow from writing a structured
+    // evidence report. Record a BLOCKED row and continue with the next check.
+    try {
+      confirmation.push(await execute(check, 'confirmation'));
+    } catch (error) {
+      confirmation.push({
+        ...check,
+        phase: 'confirmation',
+        status: 'BLOCKED',
+        exitCode: null,
+        evidence: `Executor threw while running ${check.id || check.label || 'check'}: ${error?.message || error}.`,
+      });
+    }
+  }
   return { status: statusFrom(confirmation), qualification, confirmation };
 };
 

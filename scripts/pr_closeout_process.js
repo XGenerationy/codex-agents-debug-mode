@@ -624,10 +624,30 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
     if (errorEntries.length) {
       return { status: 'FAIL', evidence: 'Grafana live query proof contained a result entry with an error.' };
     }
-    const usableFrames = resultEntries.filter((entry) => entry && typeof entry === 'object'
-      && (Array.isArray(entry.frames) ? entry.frames.length > 0 : Array.isArray(entry?.data?.values)));
+    const usableFrames = resultEntries.filter((entry) => {
+      if (!entry || typeof entry !== 'object') return false;
+      if (Array.isArray(entry.frames)) {
+        // Require at least one frame to actually contain data values, not
+        // just an empty object/array shape. frames: [{}] or frames: [{ data:
+        // { values: [] } }] does not establish a non-empty Grafana result.
+        return entry.frames.some((frame) => {
+          if (!frame || typeof frame !== 'object') return false;
+          const values = frame?.data?.values;
+          if (Array.isArray(values)) {
+            return values.length > 0 && values.some((series) => Array.isArray(series) ? series.length > 0 : true);
+          }
+          // Some Grafana responses carry a schema/len pair without inline
+          // values; accept only when at least one numeric field is non-empty.
+          const numeric = frame?.data?.numeric ?? frame?.schema?.length;
+          return Number.isFinite(numeric) && numeric > 0;
+        });
+      }
+      // Legacy single-result shape: require a non-empty values array.
+      return Array.isArray(entry?.data?.values) && entry.data.values.length > 0
+        && entry.data.values.some((series) => Array.isArray(series) ? series.length > 0 : true);
+    });
     if (!usableFrames.length) {
-      return { status: 'FAIL', evidence: 'Grafana live query proof contained no result entry with usable frames.' };
+      return { status: 'FAIL', evidence: 'Grafana live query proof contained no result entry with non-empty frame data.' };
     }
     return { status: 'PASS', evidence: 'Verified refreshed artifact and bound Grafana live query result.' };
   }
@@ -733,9 +753,23 @@ const createCommandExecutor = ({
     pathReplacements,
     platform,
   ).replaceAll('\\', '/');
-  const classifyExecution = (execution) => execution.terminationStatus === 'BLOCKED'
-    ? { status: 'BLOCKED', evidence: execution.terminationEvidence }
-    : classifyOutput(execution);
+  const classifyExecution = (execution) => {
+    if (execution.terminationStatus === 'BLOCKED') {
+      return { status: 'BLOCKED', evidence: execution.terminationEvidence };
+    }
+    // If the raw evidence log became unwritable mid-run (disk full, perms
+    // changed, logs dir removed), the persisted evidence is incomplete.
+    // Treat that as a blocking evidence failure even if the command itself
+    // exited cleanly with no status signals — otherwise closeout could PASS
+    // while pointing at a log file that does not contain the full record.
+    if (execution.logWriteError) {
+      return {
+        status: 'BLOCKED',
+        evidence: `Raw evidence log was not writable for the full run: ${execution.logWriteError.message || execution.logWriteError}`,
+      };
+    }
+    return classifyOutput(execution);
+  };
   return async (check, phase, cwd = repo) => {
   // When the caller supplies a baseline/worktree cwd that differs from the
   // primary repo, extend the redaction set so baseline paths are normalized
@@ -1021,9 +1055,26 @@ const runPreflight = async ({
       evidence: reliable ? 'present' : (present ? 'value is too short for reliable evidence redaction' : 'missing'),
     });
   }
-  const freeGb = await diskFreeGb(repo);
   const minimum = Number(config.minFreeDiskGb ?? 2);
-  checks.push({ name: 'disk', status: freeGb >= minimum ? 'PASS' : 'BLOCKED', evidence: `${freeGb.toFixed(2)} GiB free; ${minimum} GiB required` });
+  // Wrap the disk-space probe the same way the service probes below are
+  // wrapped: statfs can reject on an unsupported or transiently unavailable
+  // filesystem, and a bare await would bubble out of runPreflight into
+  // runCloseoutWorkflow's admission Promise.all and skip the structured
+  // evidence report.
+  let freeGb;
+  try {
+    freeGb = await diskFreeGb(repo);
+  } catch (error) {
+    checks.push({
+      name: 'disk',
+      status: 'BLOCKED',
+      evidence: `Disk-space probe rejected: ${error?.message || error}`,
+    });
+    freeGb = -Infinity;
+  }
+  if (Number.isFinite(freeGb)) {
+    checks.push({ name: 'disk', status: freeGb >= minimum ? 'PASS' : 'BLOCKED', evidence: `${freeGb.toFixed(2)} GiB free; ${minimum} GiB required` });
+  }
   if (config.services?.redis) {
     let healthy = false;
     let evidence = 'Redis RESP PING did not return +PONG.';

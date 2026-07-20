@@ -29,7 +29,11 @@ const isGateFile = (file) => {
   return normalized.startsWith('.github/workflows/')
     || base === 'package.json'
     || /^\.(?:eslintrc|biomerc)(?:\..+)?$/.test(base)
-    || /^(?:pnpm-lock\.yaml|makefile(?:\..+)?|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
+    // Match all of GNU make's default filenames (GNUmakefile, makefile,
+    // Makefile) so a weakening change to whichever one readProjectMetadata
+    // actually discovers is treated as a gate change.
+    || /^(?:gnu)?makefile(?:\..+)?$/.test(base)
+    || /^(?:pnpm-lock\.yaml|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
     || /(?:^|\/)\.?pr-closeout(?:\.[^/]+)?\.json$/.test(normalized);
 };

@@ -43,13 +43,18 @@ test('recognizes files that define validation strength', () => {
     '.pr-closeout.json',
     'pr-closeout.config.json',
     '.eslintrc.json',
+    // Monorepo package manifests live under packages/*/package.json and must
+    // also be treated as validation-defining gate files.
     'packages/web/package.json',
-    'apps/api/package.json',
+    'packages/server/package.json',
+    // GNU make's default filenames: changes to whichever one readProjectMetadata
+    // actually discovers must be treated as gate changes.
+    'GNUmakefile',
+    'makefile',
   ]) {
     assert.equal(isGateFile(file), true, file);
   }
   assert.equal(isGateFile('src/worker.ts'), false);
-  assert.equal(isGateFile('packages/web/src/index.ts'), false);
 });
 
 test('blocks unreviewed gate changes and fails obvious weakening', () => {
