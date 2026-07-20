@@ -44,8 +44,10 @@ const CONFIG_SILENCING = [
   // excludes "dist"/"node_modules"; CI matrices use strategy.matrix.exclude),
   // producing false config-silencing findings on clean PRs. Require the value
   // to reference src/test/spec globs so only genuine source/test suppression
-  // is flagged.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'][^"'\r\n]*(?:src|test|spec)[^"'\r\n]*["']/i,
+  // is flagged. The alternation is anchored with \b so common values that only
+  // contain the token as a substring (windows-latest, attestation, contest)
+  // do not false-positive.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i,
   /\|\|\s*true\b/i,
 ];
 

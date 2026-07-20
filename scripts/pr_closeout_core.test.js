@@ -312,6 +312,21 @@ test('does not flag benign ignore/exclude keys targeting build output, only sour
     [],
     'benign build-output exclude must not be flagged',
   );
+  // CI matrix exclusions routinely use os values like windows-latest/ubuntu-latest,
+  // which contain "test" as a substring of "latest". The src/test/spec match must
+  // be word-boundary anchored so these ordinary excludes are NOT flagged.
+  const matrix = scanSuppressionText('.github/workflows/ci.yml', [
+    'strategy:',
+    '  matrix:',
+    '    exclude:',
+    '      - os: windows-latest',
+    '      - os: ubuntu-latest',
+  ].join('\n'));
+  assert.deepEqual(
+    matrix.filter((finding) => finding.category === 'config-silencing'),
+    [],
+    'CI matrix exclude with windows-latest/ubuntu-latest must not be flagged',
+  );
   const suppressing = scanSuppressionText('tsconfig.json', '{"exclude": ["src/**/*.test.ts"]}');
   assert.ok(
     suppressing.some((finding) => finding.category === 'config-silencing'),
