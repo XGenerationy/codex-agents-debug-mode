@@ -238,7 +238,17 @@ const hashFsEntry = async (absolute) => {
   if (info.isSymbolicLink()) {
     return hashBytes(`symlink:${await readlink(absolute)}`);
   }
-  return hashFile(absolute);
+  try {
+    return await hashFile(absolute);
+  } catch (error) {
+    // The file can disappear between lstat() and createReadStream(); treat
+    // that the same as the lstat ENOENT case (a stable `missing` hash) so a
+    // transiently-gone untracked entry cannot reject out of
+    // workingTreeFingerprint and abort runCloseoutWorkflow before the
+    // structured evidence report is written.
+    if (error.code === 'ENOENT') return hashBytes('missing');
+    throw error;
+  }
 };
 
 const resolveExtraPath = (repo, requested) => {
