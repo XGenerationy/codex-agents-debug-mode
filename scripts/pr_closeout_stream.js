@@ -56,19 +56,28 @@ const secretComponents = (value) => {
       components.push(match[1]);
     }
   }
-  // If the value is a JSON auth blob (e.g. AUTH_CONFIG={"token":"..."}), extract
-  // the leaf string values under credential-bearing keys so a tool that prints
-  // just that leaf still gets redacted. The whole-string + encoded variants
-  // cover the full blob but not an isolated leaf printed by an SDK/CLI.
+  // If the value is a JSON auth blob (e.g. AUTH_CONFIG={"token":"..."} or
+  // {"auth":{"token":"..."}}), extract the leaf string values under
+  // credential-bearing keys anywhere in the (possibly nested) structure so a
+  // tool that prints just that leaf still gets redacted. The whole-string +
+  // encoded variants cover the full blob but not an isolated leaf printed by
+  // an SDK/CLI.
   try {
-    const parsed = JSON.parse(String(value));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const [key, val] of Object.entries(parsed)) {
-        if (typeof val === 'string' && /(?:token|password|passwd|pwd|secret|key|credential|secretkey)$/i.test(key)) {
-          components.push(val);
+    const isCredentialKey = /(?:token|password|passwd|pwd|secret|key|credential)$/i;
+    const collectLeaves = (node) => {
+      if (typeof node === 'string') return;
+      if (Array.isArray(node)) {
+        for (const item of node) collectLeaves(item);
+        return;
+      }
+      if (node && typeof node === 'object') {
+        for (const [key, val] of Object.entries(node)) {
+          if (typeof val === 'string' && isCredentialKey.test(key)) components.push(val);
+          collectLeaves(val);
         }
       }
-    }
+    };
+    collectLeaves(JSON.parse(String(value)));
   } catch {}
   return [...new Set(components.filter(Boolean))];
 };

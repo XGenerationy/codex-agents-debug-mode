@@ -144,11 +144,15 @@ test('redacts credential leaves parsed from JSON auth-blob environment values', 
   // A required/safe env var can hold a JSON auth blob such as
   // AUTH_CONFIG={"token":"..."}. The redactor must redact the token leaf so a
   // tool that prints just that value cannot leak it, not only the full blob.
+  // Nested objects (e.g. {"auth":{"token":"..."}}) must also be covered.
   const leaf = 'supersecretvalue123';
-  const blob = JSON.stringify({ token: leaf, kind: 'service-account' });
-  const output = redactSecrets(`config=${blob} isolated=${leaf}`, { AUTH_CONFIG: blob }, ['AUTH_CONFIG']);
-  assert.equal(output.includes(leaf), false, 'the JSON token leaf must be redacted');
+  const nestedLeaf = 'nestedsecretvalue456';
+  const blob = JSON.stringify({ token: leaf, auth: { token: nestedLeaf }, kind: 'service-account' });
+  const output = redactSecrets(`config=${blob} isolated=${leaf} nested=${nestedLeaf}`, { AUTH_CONFIG: blob }, ['AUTH_CONFIG']);
+  assert.equal(output.includes(leaf), false, 'the top-level JSON token leaf must be redacted');
+  assert.equal(output.includes(nestedLeaf), false, 'a nested JSON token leaf must also be redacted');
   assert.match(output, /isolated=\[REDACTED\]/);
+  assert.match(output, /nested=\[REDACTED\]/);
 });
 
 test('matches explicit secret names case-insensitively against env keys', () => {

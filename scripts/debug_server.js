@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 const { randomBytes, timingSafeEqual } = require('node:crypto');
-const { appendFile, chmod, lstat, mkdir, realpath, writeFile } = require('node:fs/promises');
+const { constants } = require('node:fs');
+const { appendFile, chmod, lstat, mkdir, open, realpath, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 
@@ -88,10 +89,34 @@ const bearerToken = (request) => {
   return authorization.slice('Bearer '.length);
 };
 
+const isLoopbackAddress = (address) => {
+  if (typeof address !== 'string') return false;
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+};
+
 const isAllowedHost = (request) => {
+  // The Host header is client-controlled and alone cannot prove the TCP peer
+  // is loopback. Require the socket's remote address to be a loopback address
+  // first, so a remote client cannot bypass the guard by sending a localhost
+  // Host header when a caller binds the exported server to a non-loopback
+  // interface.
+  if (!isLoopbackAddress(request.socket.remoteAddress)) return false;
   const port = request.socket.localPort;
   const host = request.headers.host;
   return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
+};
+
+// Reject a path that is a symlink (fail-closed), tolerating ENOENT (the path
+// is about to be created). Used for both the .debug directory and the
+// collector_token file so the guard has one owner.
+const assertNotSymlink = async (target, label) => {
+  try {
+    const info = await lstat(target);
+    if (info.isSymbolicLink()) throw new Error(label);
+  } catch (error) {
+    if (error.message === label) throw error;
+    if (error.code !== 'ENOENT') throw error;
+  }
 };
 
 const configureOrigin = (request, response, allowedOrigins) => {
@@ -424,16 +449,9 @@ const main = () => {
     try {
       // Reject a symlinked or escaped .debug directory before writing the
       // startup collector_token, mirroring the /session handler's guard: a
-      // repo-controlled .debug symlink (or a symlinked collector_token) could
-      // otherwise redirect the write outside projectRoot and clobber an
-      // arbitrary file writable by this process.
-      try {
-        const dirInfo = await lstat(debugDir);
-        if (dirInfo.isSymbolicLink()) throw new Error('debug_dir_is_symlink');
-      } catch (error) {
-        if (error.message === 'debug_dir_is_symlink') throw error;
-        if (error.code !== 'ENOENT') throw error;
-      }
+      // repo-controlled .debug symlink could otherwise redirect the write
+      // outside projectRoot and clobber an arbitrary writable file.
+      await assertNotSymlink(debugDir, 'debug_dir_is_symlink');
       await mkdir(debugDir, { recursive: true });
       const resolvedLogDir = await realpath(debugDir);
       const resolvedRoot = await realpath(path.resolve(projectRoot));
@@ -441,17 +459,32 @@ const main = () => {
       if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
         throw new Error('debug_dir_escapes_root');
       }
-      // Reject a symlinked collector_token: writeFile follows a symlink and
-      // would clobber its target. A regular file left by a previous run is
-      // safe to overwrite because the token is regenerated on every startup.
+      // Open collector_token with O_NOFOLLOW and write through the descriptor
+      // so a symlink placed at the path during the window between the directory
+      // check above and the write cannot redirect it (writeFile follows
+      // symlinks; O_NOFOLLOW rejects a symlinked final component with ELOOP at
+      // open time). O_CREAT|O_TRUNC overwrites a regular file left by a
+      // previous run because the token is regenerated on every startup. On
+      // platforms without O_NOFOLLOW, fall back to a plain open after the
+      // lstat-based assertNotSymlink check on the parent directory above.
+      await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
+      const noFollow = constants.O_NOFOLLOW || 0;
+      let handle;
       try {
-        const fileInfo = await lstat(tokenFile);
-        if (fileInfo.isSymbolicLink()) throw new Error('collector_token_is_symlink');
+        handle = await open(
+          tokenFile,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow,
+          0o600,
+        );
       } catch (error) {
-        if (error.message === 'collector_token_is_symlink') throw error;
-        if (error.code !== 'ENOENT') throw error;
+        if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+        handle = await open(tokenFile, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600);
       }
-      await writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 });
+      try {
+        await handle.writeFile(token, 'utf8');
+      } finally {
+        await handle.close();
+      }
       await chmod(tokenFile, 0o600);
       process.stdout.write(
         `${JSON.stringify({
