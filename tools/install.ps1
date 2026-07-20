@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $HomePath -or -not ([string]::IsNullOrWhiteSpace($HomePath) -eq $false)) {
     throw 'HomePath is empty; pass -HomePath <path> or set $HOME.'
 }
-$HomePath = [string]::Trim($HomePath)
+$HomePath = "$HomePath".Trim()
 if (-not ([System.IO.Path]::IsPathRooted($HomePath))) {
     throw "HomePath must be an absolute path: $HomePath"
 }
