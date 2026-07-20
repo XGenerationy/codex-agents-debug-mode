@@ -7,6 +7,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Fail closed on missing/empty HomePath instead of computing relative
+# destination paths via Join-Path. Mirrors the explicit HOME validation in
+# tools/install.sh so the Windows installer does not silently install into
+# the current directory or an unexpected rooted target.
+if (-not $HomePath -or -not ([string]::IsNullOrWhiteSpace($HomePath) -eq $false)) {
+    throw 'HomePath is empty; pass -HomePath <path> or set $HOME.'
+}
+$HomePath = [string]::Trim($HomePath)
+if (-not ([System.IO.Path]::IsPathRooted($HomePath))) {
+    throw "HomePath must be an absolute path: $HomePath"
+}
 $source = Split-Path -Parent $PSScriptRoot
 $payload = @('SKILL.md', 'agents', 'assets', 'references', 'scripts')
 $targets = switch ($Target) {

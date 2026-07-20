@@ -114,16 +114,64 @@ const readProjectMetadata = async (repo) => {
   return { packageScripts, makeTargets };
 };
 
+// Cap the suppression scanner so a single huge or binary touched file cannot
+// spike memory or stall admission. Files larger than this are recorded as a
+// scan-error; suppression markers are far smaller than this in practice.
+const MAX_SUPPRESSION_SCAN_BYTES = 5 * 1024 * 1024;
+// Sample the first N bytes for a NUL byte to detect binary files quickly
+// without loading the whole file.
+const BINARY_SAMPLE_BYTES = 4096;
+const openForScan = (absolute) => new Promise((resolve, reject) => {
+  require('node:fs').open(absolute, 'r', (err, fd) => {
+    if (err) reject(err); else resolve(fd);
+  });
+});
+const readScanHead = async (absolute, size) => {
+  const fd = await openForScan(absolute);
+  try {
+    const buffer = Buffer.allocUnsafe(size);
+    const { bytesRead } = await new Promise((resolve, reject) => {
+      require('node:fs').read(fd, buffer, 0, size, 0, (error, n) => error ? reject(error) : resolve({ bytesRead: n }));
+    });
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    require('node:fs').closeSync(fd);
+  }
+};
+
 const scanTouchedSuppressions = async (repo, files) => {
   const findings = [];
   for (const file of files) {
     try {
-      const stats = await lstat(path.join(repo, file));
+      const absolute = path.join(repo, file);
+      const stats = await lstat(absolute);
       if (stats.isSymbolicLink()) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
         continue;
       }
-      const bytes = await readFile(path.join(repo, file));
+      // Reject oversized files before reading them: a large untracked artifact
+      // should not block admission with multi-MiB reads when the suppression
+      // vocabulary is small.
+      if (stats.size > MAX_SUPPRESSION_SCAN_BYTES) {
+        findings.push({ file, line: 0, category: 'scan-error', match: `Touched file exceeds suppression scan limit (${stats.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes).` });
+        continue;
+      }
+      // Sample the first bytes for a NUL to detect binary files; scanning
+      // them as text via decodeTouchedText already throws on NUL but we want
+      // a clean scan-error finding instead of letting the throw bubble.
+      // UTF-16 files start with a BOM (FF FE or FE FF) and contain NUL bytes
+      // legitimately, so do not flag those as binary.
+      if (stats.size > 0) {
+        const head = await readScanHead(absolute, Math.min(BINARY_SAMPLE_BYTES, stats.size));
+        const isUtf16Bom = head.length >= 2 && (
+          (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff)
+        );
+        if (!isUtf16Bom && head.includes(0)) {
+          findings.push({ file, line: 0, category: 'scan-error', match: 'Touched file appears to be binary (NUL byte detected).' });
+          continue;
+        }
+      }
+      const bytes = await readFile(absolute);
       findings.push(...scanSuppressionText(file, decodeTouchedText(bytes)));
     } catch (error) {
       if (error.code !== 'ENOENT') {

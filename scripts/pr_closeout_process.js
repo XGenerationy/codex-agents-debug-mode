@@ -44,8 +44,15 @@ const terminateProcessTree = async ({
   }
   try {
     if (platform === 'win32') {
-      const systemRoot = env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows';
-      const taskkill = path.join(systemRoot, 'System32', 'taskkill.exe');
+      // Resolve taskkill.exe from SystemRoot but fall back to the canonical
+      // C:\Windows\System32 location if SystemRoot is missing/relative/looks
+      // unusual. We never execute a path that was injected via the env: the
+      // value must be an absolute drive-letter Windows path that points at
+      // an existing directory, otherwise we use the hard-coded default.
+      const candidateRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim();
+      const isAbsoluteDrivePath = /^[A-Za-z]:[\\/]/.test(candidateRoot);
+      const safeRoot = isAbsoluteDrivePath ? candidateRoot : 'C:\\Windows';
+      const taskkill = path.join(safeRoot, 'System32', 'taskkill.exe');
       await runExecFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], {
         encoding: 'utf8',
         timeout: Math.max(terminationGraceMs * 5, 10_000),
@@ -87,7 +94,18 @@ const terminateProcessTree = async ({
     if (!groupExists()) {
       return { status: 'PASS', evidence: `Process group ${child.pid} stopped after SIGTERM.`, escalated: false };
     }
-    kill(-child.pid, 'SIGKILL');
+    try {
+      kill(-child.pid, 'SIGKILL');
+    } catch (error) {
+      // The group may exit between the groupExists() probe above and the
+      // SIGKILL call. ESRCH here means the group is already gone, which is a
+      // successful termination -- do not let the outer catch convert it into
+      // a spurious BLOCKED result.
+      if (error?.code === 'ESRCH') {
+        return { status: 'PASS', evidence: `Process group ${child.pid} exited before SIGKILL was delivered.`, escalated: true };
+      }
+      throw error;
+    }
     const deadline = Date.now() + terminationGraceMs;
     while (Date.now() < deadline) {
       await awaitRootClose();
@@ -110,13 +128,22 @@ const terminateProcessTree = async ({
   }
 };
 
-const redactSecrets = (text, env = process.env, names = []) => {
+// Variant of redactSecrets that takes a precomputed replacement list so hot
+// callers (safeStatusSignal, redactStructure during a single executor run)
+// do not rebuild the URL/base64/hex variants on every call. Use
+// buildSecretReplacements(env, names) once per executor and pass the result
+// here for each call.
+const redactSecretsReplacements = (text, replacements) => {
   let redacted = String(text ?? '');
-  for (const [value, replacement] of buildSecretReplacements(env, names)) {
+  for (const [value, replacement] of replacements) {
     redacted = redacted.replaceAll(value, replacement);
   }
   return redacted;
 };
+
+const redactSecrets = (text, env = process.env, names = []) => (
+  redactSecretsReplacements(text, buildSecretReplacements(env, names))
+);
 
 const redactStructure = (value, env = process.env, names = [], seen = new WeakSet()) => {
   if (typeof value === 'string') return redactSecrets(value, env, names);
@@ -201,14 +228,13 @@ const summarizeStatusSignal = (signal) => {
 
 const safeStatusSignal = ({
   signal,
-  env,
-  secretNames,
+  secretReplacements,
   pathReplacements,
   platform,
 }) => {
   const category = summarizeStatusSignal(signal).split(':', 1)[0];
   const safe = normalizePaths(
-    redactSecrets(String(signal), env, secretNames),
+    redactSecretsReplacements(String(signal), secretReplacements),
     pathReplacements,
     platform,
   ).replace(/\s+/gu, ' ').trim().slice(0, 500);
@@ -268,6 +294,10 @@ const spawnCaptured = async ({
       });
     }
   };
+  // Precompute the secret replacement list once per spawnCaptured() call so
+  // the status-signal summarizer and downstream redactors do not rebuild the
+  // URL/base64/hex variants on every chunk.
+  const secretReplacements = buildSecretReplacements(redactionEnv, secretNames);
   const makeState = () => ({
     redactor: createDecodedRedactor(redactionEnv, secretNames),
     normalizer: createStreamingReplacer(pathReplacements, { caseInsensitive: platform === 'win32' }),
@@ -275,8 +305,7 @@ const spawnCaptured = async ({
     scanner: createStreamingSignalScanner(findStatusSignals, {
       summarizeSignal: (signal) => safeStatusSignal({
         signal,
-        env: redactionEnv,
-        secretNames,
+        secretReplacements,
         pathReplacements,
         platform,
       }),

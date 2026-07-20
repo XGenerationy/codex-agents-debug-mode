@@ -392,6 +392,11 @@ const main = () => {
     process.exitCode = 1;
   });
   server.listen(port, '127.0.0.1', () => {
+    // Keep the runtime collector_token OUT of stdout: stdout is captured by
+    // wrappers as a structured startup line and is routinely logged, piped,
+    // or persisted. The collector_token is intentionally exposed only via
+    // Object.defineProperty on the server object so the parent process can
+    // read it programmatically; never print it as a log line.
     process.stdout.write(
       `${JSON.stringify({
         status: 'started',
@@ -399,7 +404,6 @@ const main = () => {
         service: COLLECTOR_SERVICE,
         version: COLLECTOR_VERSION,
         instance_id: server.collectorInstanceId,
-        collector_token: server.collectorToken,
         log_dir: '.debug',
       })}\n`,
     );

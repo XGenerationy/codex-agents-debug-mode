@@ -80,23 +80,31 @@ test('redacts overlapping configured secrets longest-first', () => {
   assert.equal(output, 'token=[REDACTED]');
 });
 
-test('automatically redacts short sensitive environment values and encoded variants', () => {
-  const secret = 'x/';
-  const env = { GITHUB_TOKEN: secret, ORDINARY_VALUE: 'visible' };
+test('does not auto-redact short sensitive values to avoid over-broad replacement', () => {
+  // Short values (below MIN_AUTO_SECRET_LENGTH) would corrupt ordinary text
+  // if they were auto-redacted everywhere as substrings, so the redactor
+  // skips them. Long values from auto-discovered sensitive names are still
+  // redacted along with their URL/base64/hex variants.
+  const secret = 'x/secret-value-long-enough';
+  const env = { GITHUB_TOKEN: secret, ORDINARY_VALUE: 'visible', SHORT_TOKEN: 'tiny' };
   const encoded = [
     encodeURIComponent(secret),
     JSON.stringify(secret).slice(1, -1),
     Buffer.from(secret).toString('base64'),
     Buffer.from(secret).toString('base64url'),
   ];
-  const output = redactSecrets(`raw=${secret} url=${encoded[0]} json=${encoded[1]} b64=${encoded[2]} b64url=${encoded[3]} ordinary=${env.ORDINARY_VALUE}`, env);
-  assert.doesNotMatch(output, /x\//);
-  for (const value of encoded) assert.equal(output.includes(value), false, value);
+  const output = redactSecrets(`raw=${secret} url=${encoded[0]} json=${encoded[1]} b64=${encoded[2]} b64url=${encoded[3]} ordinary=${env.ORDINARY_VALUE} short=${env.SHORT_TOKEN}`, env);
+  for (const value of [secret, ...encoded]) assert.equal(output.includes(value), false, value);
   assert.match(output, /ordinary=visible/);
+  // The short auto-discovered value must remain visible to avoid corrupting
+  // ordinary text where it appears as a substring.
+  assert.match(output, /short=tiny/);
 });
 
 test('streaming redaction covers automatically discovered encoded secrets across chunks', () => {
-  const secret = 'tiny';
+  // Long auto-discovered secret must still be redacted across chunk
+  // boundaries; the encoded base64 form is also covered.
+  const secret = 'long-enough-secret';
   const encoded = Buffer.from(secret).toString('base64');
   const redactor = createStreamingRedactor({ API_TOKEN: secret }, []);
   const output = redactor.push(`encoded=${encoded.slice(0, 3)}`)
@@ -116,6 +124,13 @@ test('redacts credentials and encoded components from sensitive URL environment 
     Buffer.from(password).toString('hex'),
   ].join(' '), { DATABASE_URL: databaseUrl });
   assert.doesNotMatch(output, /postgresql|alice|p@ss|p%40ss|cEBzcyB3b3Jk|70407373/i);
+});
+
+test('explicitly-allowed short secret values are still redacted end-to-end', () => {
+  // Explicitly-listed names opt in to redaction regardless of length so
+  // users can still redact short tokens when they choose to.
+  const output = redactSecrets('value=tiny', { SHORT_TOKEN: 'tiny' }, ['SHORT_TOKEN']);
+  assert.equal(output, 'value=[REDACTED]');
 });
 
 test('preflight blocks required secrets that are too short for reliable evidence capture', async () => {

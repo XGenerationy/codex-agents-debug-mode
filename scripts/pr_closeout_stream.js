@@ -59,18 +59,37 @@ const secretComponents = (value) => {
   return [...new Set(components.filter(Boolean))];
 };
 
+// Minimum length below which an AUTO-DISCOVERED sensitive env value is NOT
+// added to the literal replaceAll redaction list. Short values (e.g. "ok",
+// "1", "true", "x/", "tiny") would otherwise corrupt ordinary text throughout
+// captured stdout/stderr and logs by being redacted everywhere they appear as
+// a substring. Values from names EXPLICITLY listed in the `names` array are
+// always redacted regardless of length, because the user opted in.
+const MIN_AUTO_SECRET_LENGTH = 8;
+
 const buildSecretReplacements = (env = process.env, names = []) => {
-  const selected = new Set([
-    ...names,
-    ...Object.keys(env).filter(isSensitiveEnvName),
-  ]);
-  const values = [...selected]
-    .map((name) => env[name])
-    .filter((value) => typeof value === 'string' && value.length > 0)
+  const explicit = new Set(names.map((name) => String(name)));
+  const isExplicit = (name) => explicit.has(String(name));
+  // Auto-discovered sensitive names (matched by SENSITIVE_ENV_NAME) are only
+  // included if their value is long enough not to cause over-broad
+  // replacement of ordinary text. Explicit names are always included.
+  const selected = [
+    ...explicit,
+    ...Object.keys(env).filter((name) => isSensitiveEnvName(name) && !isExplicit(name)),
+  ];
+  const values = selected
+    .map((name) => {
+      const value = env[name];
+      if (typeof value !== 'string') return undefined;
+      if (value.length === 0) return undefined;
+      if (!isExplicit(name) && value.length < MIN_AUTO_SECRET_LENGTH) return undefined;
+      return value;
+    })
+    .filter(Boolean)
     .flatMap(secretComponents)
     .flatMap(secretVariants);
   return [...new Set(values)]
-    .filter(Boolean)
+    .filter((value) => typeof value === 'string' && value.length > 0)
     .sort((left, right) => right.length - left.length)
     .map((value) => [value, '[REDACTED]']);
 };
