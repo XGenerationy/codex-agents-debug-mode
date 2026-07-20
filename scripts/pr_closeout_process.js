@@ -232,6 +232,15 @@ const spawnCaptured = async ({
   let stderr = '';
   let timedOut = false;
   const log = createWriteStream(logPath, { flags: 'a', encoding: 'utf8' });
+  let logError = null;
+  log.on('error', (error) => { logError = error; });
+  const writeLog = (chunk, source) => {
+    if (logError) return;
+    if (!log.write(chunk) && source && typeof source.pause === 'function') {
+      source.pause();
+      log.once('drain', () => source.resume());
+    }
+  };
   const makeState = () => ({
     redactor: createDecodedRedactor(redactionEnv, secretNames),
     normalizer: createStreamingReplacer(pathReplacements, { caseInsensitive: platform === 'win32' }),
@@ -259,7 +268,7 @@ const spawnCaptured = async ({
     if (!normalized) return;
     if (stream === 'stdout') stdout = cappedAppend(stdout, normalized);
     else stderr = cappedAppend(stderr, normalized);
-    log.write(`[${stream}] ${normalized}`);
+    writeLog(`[${stream}] ${normalized}`, child[stream]);
     states[stream].hash.update(normalized);
   };
   const emitSafe = (stream, safe) => {
@@ -371,8 +380,13 @@ const spawnCaptured = async ({
       ...states.stdout.scanner.values(),
       ...states.stderr.scanner.values(),
     ],
+    logWriteError: logError ? logError.message : null,
   };
-  await new Promise((resolve) => log.end(resolve));
+  await new Promise((resolve) => {
+    if (logError) return resolve();
+    log.end(resolve);
+    log.once('error', resolve);
+  });
   return result;
 };
 

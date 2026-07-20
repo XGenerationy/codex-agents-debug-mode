@@ -16,6 +16,7 @@ const {
   resolveCommandShell,
   runPreflight,
   snapshotArtifactProof,
+  spawnCaptured,
 } = require('./pr_closeout_process');
 
 const listen = (server) => new Promise((resolve, reject) => {
@@ -777,4 +778,21 @@ test('preflight treats warning output from a successful probe as failure', async
   });
   assert.equal(result.status, 'FAIL');
   assert.ok(result.checks.some(({ name, status }) => name === 'node' && status === 'FAIL'));
+});
+
+test('captures write-stream errors in logWriteError instead of crashing', async () => {
+  const badLogPath = path.join(tmpdir(), `closeout-missing-${Date.now()}-dir`, 'nested', 'log.txt');
+  const result = await spawnCaptured({
+    command: "process.stdout.write('hello')",
+    cwd: process.cwd(),
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+    timeoutMs: 5000,
+    env: process.env,
+    logPath: badLogPath,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, 'hello');
+  assert.ok(result.logWriteError, 'logWriteError must be populated when the write stream fails');
+  assert.equal(typeof result.logWriteError, 'string');
 });
