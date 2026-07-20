@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { mkdir, mkdtemp, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -141,6 +141,51 @@ test('fingerprints explicitly declared ignored generator output', async () => {
     await writeFile(path.join(generated, 'client.js'), 'second');
     const second = await workingTreeFingerprint(repo, ['generated']);
     assert.notEqual(first, second);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('rejects touched symlinks instead of following them', async (t) => {
+  const repo = await fixtureRepo();
+  try {
+    const marker = ['eslint', '-disable'].join('');
+    await writeFile(path.join(repo, 'target.js'), `// ${marker}\n`);
+    try {
+      await symlink('target.js', path.join(repo, 'link.js'));
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'ENOSYS') {
+        t.skip(`symlink creation not permitted on this platform (${error.code})`);
+        return;
+      }
+      throw error;
+    }
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const findings = await scanTouchedSuppressions(repo, state.touchedFiles);
+    const linkFinding = findings.find(({ file }) => file === 'link.js');
+    assert.ok(linkFinding, 'expected a finding for the touched symlink');
+    assert.equal(linkFinding.category, 'scan-error');
+    assert.match(linkFinding.match, /symlink/i);
+    assert.ok(
+      !findings.some(({ file }) => file === 'link.js' && file !== 'link.js'),
+      'symlink must not be followed into suppression findings',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('handles untracked gate files with more than 100k lines without RangeError', async () => {
+  const repo = await fixtureRepo();
+  try {
+    const lineCount = 120_000;
+    const body = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join('\n');
+    await writeFile(path.join(repo, 'pnpm-lock.yaml'), `${body}\n`);
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.deepEqual(gate.changedFiles, ['pnpm-lock.yaml']);
+    assert.equal(gate.addedLines.length, lineCount + 1);
+    assert.ok(gate.addedLines.every((line) => line.startsWith('+')));
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

@@ -185,6 +185,42 @@ test('detects extended suppression markers and flexible type-ignore whitespace',
   assert.ok(findings.every(({ category }) => category === 'marker'));
 });
 
+test('does not match suppression markers as substrings of larger words', () => {
+  const falsePositives = [
+    'const delay = nanoseconds(timeout);',
+    'export function fetchNoqaTokens() {',
+    'return options.nocheck;',
+    'function disableNolintHooks() {}',
+    'pipelineRubocop:disabledByConfig',
+  ];
+  for (const line of falsePositives) {
+    assert.deepEqual(
+      scanSuppressionText('src/code.ts', line),
+      [],
+      `${line} must not match a suppression marker`,
+    );
+  }
+});
+
+test('still matches suppression markers when preceded by comment syntax or whitespace', () => {
+  const truePositives = [
+    '# nosec',
+    '// noqa: E501',
+    '/* istanbul ignore next */',
+    '// @ts-ignore',
+    '# shellcheck disable=SC2086',
+    '// NOSONAR',
+    '  # nosec',
+    '\t# type: ignore',
+  ];
+  for (const line of truePositives) {
+    assert.ok(
+      scanSuppressionText('src/code.ts', line).some(({ category }) => category === 'marker'),
+      `${line} must match a suppression marker`,
+    );
+  }
+});
+
 test('detects common config-level compiler, framework, linter, and ignore-file silencing', () => {
   const cases = [
     ['tsconfig.json', '{"compilerOptions":{"skipLibCheck":true},"exclude":["generated"]}'],

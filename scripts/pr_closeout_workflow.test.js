@@ -283,6 +283,37 @@ test('rejects a lexically external output whose physical target is inside the re
   );
 });
 
+test('rejects an output-dir traversing a symlink into the repo before creating anything', async () => {
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'codex-pr-closeout-symlink-'));
+  try {
+    const repoRoot = nodePath.join(tmp, 'repo');
+    const linkDir = nodePath.join(tmp, 'link-to-repo');
+    const outputDir = nodePath.join(linkDir, 'evidence');
+    await fs.mkdir(repoRoot, { recursive: true });
+    try {
+      await fs.symlink(repoRoot, linkDir, 'dir');
+    } catch (error) {
+      if (error && (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'ENOSYS')) {
+        return;
+      }
+      throw error;
+    }
+    await assert.rejects(
+      prepareOutputDirectory({ repo: repoRoot, outputDir }),
+      /outside the repository/i,
+    );
+    await assert.rejects(
+      fs.access(nodePath.join(repoRoot, 'evidence')),
+      (error) => error && error.code === 'ENOENT',
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('requires a clean initial tree before executing validation commands', async () => {
   const fixture = makeDependencies();
   let cleanReads = 0;

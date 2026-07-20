@@ -28,7 +28,7 @@ const approvedReview = (extra = {}) => ({
   commit_id: 'head123',
   body: gateAttestationMarker({ baseSha: 'base123', headSha: 'head123', configDigest: 'cfg123' }),
   submitted_at: '2026-07-14T00:00:00Z',
-  author_association: 'COLLABORATOR',
+  author_association: 'OWNER',
   user: { login: 'reviewer' },
   ...extra,
 });
@@ -158,6 +158,29 @@ test('requires repository write permission for MEMBER attestors instead of trust
   assert.equal(memberWithRead.status, 'BLOCKED');
 });
 
+test('requires repository write permission for COLLABORATOR attestors instead of trusting the association', () => {
+  const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
+  const collaboratorWithoutPermission = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'COLLABORATOR' })],
+    ...expected,
+  });
+  assert.equal(collaboratorWithoutPermission.status, 'BLOCKED');
+
+  const collaboratorWithWrite = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'COLLABORATOR' })],
+    reviewerPermissions: new Map([['reviewer', { permission: 'write' }]]),
+    ...expected,
+  });
+  assert.equal(collaboratorWithWrite.status, 'PASS');
+
+  const collaboratorWithRead = classifyGateAttestation({
+    reviews: [approvedReview({ author_association: 'COLLABORATOR' })],
+    reviewerPermissions: new Map([['reviewer', { permission: 'read' }]]),
+    ...expected,
+  });
+  assert.equal(collaboratorWithRead.status, 'BLOCKED');
+});
+
 test('accepts only a clean live PR bound to the expected base and head', () => {
   const result = classifyLivePrState({
     repository: 'owner/repo',
@@ -233,6 +256,14 @@ test('passes a CheckRun only when it is completed successfully', () => {
     });
     assert.equal(result.status, expected, `CheckRun ${check.status}/${check.conclusion}`);
   }
+});
+
+test('classifies a STARTUP_FAILURE check conclusion as failure', () => {
+  const result = classifyPr({
+    ...cleanPr(),
+    statusCheckRollup: [{ name: 'startup-failed', status: 'COMPLETED', conclusion: 'STARTUP_FAILURE' }],
+  });
+  assert.equal(result.status, 'FAIL');
 });
 
 test('blocks malformed check rollup entries without throwing', () => {
@@ -338,7 +369,44 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
-  assert.equal(calls.filter(([command]) => command === 'api').length, 4);
+  assert.equal(calls.filter(([command]) => command === 'api').length, 6);
+});
+
+test('re-reads unresolved review threads before final classification to avoid stale evidence', async () => {
+  let threadReads = 0;
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        threadReads += 1;
+        const unresolved = threadReads === 1;
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes: [unresolved
+              ? { isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }
+              : { isResolved: true, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          } } } },
+        };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.unresolvedThreads.length, 0);
+  assert.equal(threadReads, 2);
 });
 
 test('blocks when the PR head changes during live verification', async () => {

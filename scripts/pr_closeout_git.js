@@ -27,7 +27,7 @@ const isGateFile = (file) => {
   const normalized = normalizePath(file);
   const base = path.posix.basename(normalized).toLowerCase();
   return normalized.startsWith('.github/workflows/')
-    || normalized === 'package.json'
+    || base === 'package.json'
     || /^\.(?:eslintrc|biomerc)(?:\..+)?$/.test(base)
     || /^(?:pnpm-lock\.yaml|makefile(?:\..+)?|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
@@ -37,7 +37,7 @@ const isGateFile = (file) => {
 const WEAKENING_PATTERNS = [
   /\b(?:describe|it|test)\.(?:skip|only|todo)\b/i,
   /--(?:no-verify|force|passWithNoTests)\b/i,
-  /(?:coverage|threshold)[^\n]*(?:0|false|null)/i,
+  /(?:coverage|threshold)["']?\s*[:=]\s*(?:["']?0(?:\.0+)?["']?|false|null)(?![\w.])/i,
   /(?:fail-fast|failFast)\s*[:=]\s*false/i,
 ];
 
@@ -132,7 +132,7 @@ const verifyGeneratorReproducibility = async ({ executeGenerator, fingerprint })
 
 const normalizeFailure = (result) => {
   if (result.outputDigest) {
-    return `${result.status}\n${result.exitCode}\n${result.timedOut || false}\n${JSON.stringify(result.outputDigest)}`;
+    return `${result.status}\n${result.exitCode}\n${result.timedOut || false}\n${JSON.stringify(result.outputDigest)}\n${JSON.stringify(result.proofResult || null)}`;
   }
   let output = `${result.status}\n${result.exitCode}\n${result.stdout || ''}\n${result.stderr || ''}`
     .replace(/\x1b\[[0-9;]*m/g, '')

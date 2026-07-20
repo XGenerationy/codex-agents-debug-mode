@@ -37,6 +37,7 @@ const terminateProcessTree = async ({
   terminationGraceMs = 2000,
   runExecFile = execFileAsync,
   kill = process.kill.bind(process),
+  closePromise,
 } = {}) => {
   if (!Number.isInteger(child?.pid) || child.pid <= 0) {
     return { status: 'BLOCKED', evidence: 'Process-tree termination has no valid process identifier.', escalated: false };
@@ -66,6 +67,9 @@ const terminateProcessTree = async ({
         throw error;
       }
     };
+    const awaitRootClose = async () => {
+      if (closePromise) await Promise.race([closePromise, delay(terminationGraceMs)]);
+    };
     try {
       kill(-child.pid, 'SIGTERM');
     } catch (error) {
@@ -75,12 +79,14 @@ const terminateProcessTree = async ({
       throw error;
     }
     await delay(terminationGraceMs);
+    await awaitRootClose();
     if (!groupExists()) {
       return { status: 'PASS', evidence: `Process group ${child.pid} stopped after SIGTERM.`, escalated: false };
     }
     kill(-child.pid, 'SIGKILL');
     const deadline = Date.now() + terminationGraceMs;
     while (Date.now() < deadline) {
+      await awaitRootClose();
       if (!groupExists()) {
         return { status: 'PASS', evidence: `Process group ${child.pid} required SIGKILL and is gone.`, escalated: true };
       }
@@ -312,6 +318,7 @@ const spawnCaptured = async ({
       platform,
       env,
       terminationGraceMs,
+      closePromise,
     });
     outcome = await Promise.race([
       closePromise,
@@ -672,10 +679,6 @@ const createCommandExecutor = ({
   const attempts = new Map();
   const pathReplacements = buildPathReplacements({ cwd: repo, outputDir, env });
   const childEnv = buildChildEnvironment(env, secretNames);
-  const scrub = (value) => mapStructureStrings(
-    redactStructure(value, env, secretNames),
-    (text) => normalizePaths(text, pathReplacements, platform),
-  );
   const nextLogPath = (phase, id, kind = '') => {
     const safePhase = String(phase).replace(/[^a-z0-9_-]/gi, '-');
     const safeId = String(id).replace(/[^a-z0-9_-]/gi, '-');
@@ -693,8 +696,17 @@ const createCommandExecutor = ({
     ? { status: 'BLOCKED', evidence: execution.terminationEvidence }
     : classifyOutput(execution);
   return async (check, phase, cwd = repo) => {
-  const finalize = scrub;
-  const safeCheck = scrub(check);
+  // When the caller supplies a baseline/worktree cwd that differs from the
+  // primary repo, extend the redaction set so baseline paths are normalized
+  // (and hashed) the same way as the head run, instead of leaking as /tmp/...
+  const effectivePathReplacements = cwd && path.resolve(cwd) !== path.resolve(repo)
+    ? [...pathReplacements, ...pathVariants(cwd).map((value) => [value, '<repo>'])]
+    : pathReplacements;
+  const finalize = (value) => mapStructureStrings(
+    redactStructure(value, env, secretNames),
+    (text) => normalizePaths(text, effectivePathReplacements, platform),
+  );
+  const safeCheck = finalize(check);
   if (unsafeTermination) {
     return finalize({
       ...safeCheck,
@@ -713,12 +725,6 @@ const createCommandExecutor = ({
   const logsDir = path.join(outputDir, 'logs');
   await mkdir(logsDir, { recursive: true });
   const logPath = nextLogPath(phase, check.id);
-  // When the caller supplies a baseline/worktree cwd that differs from the
-  // primary repo, extend the redaction set so baseline paths are normalized
-  // (and hashed) the same way as the head run, instead of leaking as /tmp/...
-  const effectivePathReplacements = cwd && path.resolve(cwd) !== path.resolve(repo)
-    ? [...pathReplacements, ...pathVariants(cwd).map((value) => [value, '<repo>'])]
-    : pathReplacements;
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
   await writeFile(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, 'utf8');
   const execution = await spawnCaptured({

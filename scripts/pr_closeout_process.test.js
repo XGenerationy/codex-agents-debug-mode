@@ -545,6 +545,41 @@ test('redacts a baseline worktree cwd the same way as the head repo', async () =
   }
 });
 
+test('redacts baseline cwd paths from artifact proof evidence', async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-head-repo-'));
+  const baselineCwd = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-cwd-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-artifact-proof-logs-'));
+  try {
+    const execute = createCommandExecutor({
+      repo,
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+    });
+    // The artifact does not exist before the run, so snapshotArtifactProof
+    // records exists:false; the command then creates a non-empty file, so
+    // verifyArtifactProof returns PASS with proofResult fields (path, realPath,
+    // realRoot) resolved against baselineCwd. Without cwd-aware redaction on
+    // the finalized result, those absolute baseline paths would leak.
+    const result = await execute({
+      id: 'make-sbom',
+      command: "require('node:fs').writeFileSync('artifact.json','{\"name\":\"sbom\"}\\n');process.stdout.write(process.cwd())",
+      proof: { type: 'artifact', path: 'artifact.json' },
+    }, 'baseline', baselineCwd);
+    assert.equal(result.status, 'PASS', result.evidence);
+    assert.equal(result.stdout, '<repo>');
+    assert.ok(result.proofResult, 'artifact proof result should be attached');
+    const escaped = new RegExp(baselineCwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    assert.doesNotMatch(result.stderr || '', escaped);
+    assert.doesNotMatch(JSON.stringify(result), escaped);
+    assert.doesNotMatch(JSON.stringify(result.proofResult), escaped);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(baselineCwd, { recursive: true, force: true });
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('rejects canonicalized Git metadata artifact paths regardless of case', async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-git-proof-'));
   for (const proofPath of [

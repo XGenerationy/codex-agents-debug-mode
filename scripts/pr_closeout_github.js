@@ -10,15 +10,16 @@ const FAILURE_CONCLUSIONS = new Set([
   'FAILURE',
   'NEUTRAL',
   'SKIPPED',
+  'STARTUP_FAILURE',
   'STALE',
   'TIMED_OUT',
 ]);
 const PENDING_STATES = new Set(['EXPECTED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'REQUESTED', 'WAITING']);
-// OWNER (repo owner) and COLLABORATOR (direct collaborator with write) are
-// authoritative by association. MEMBER only proves organization membership
-// (not repo write access), so it must be verified through the permission
-// endpoint in reviewerAuthorization below.
-const AUTHORITATIVE_ASSOCIATIONS = new Set(['COLLABORATOR', 'OWNER']);
+// OWNER (repo owner) is authoritative by association. MEMBER only proves
+// organization membership and COLLABORATOR only proves an invitation to
+// collaborate; neither guarantees repository write access, so both must be
+// verified through the permission endpoint in reviewerAuthorization below.
+const AUTHORITATIVE_ASSOCIATIONS = new Set(['OWNER']);
 const WRITE_PERMISSIONS = new Set(['ADMIN', 'MAINTAIN', 'PUSH', 'WRITE']);
 const MAX_REVIEW_THREAD_PAGES = 100;
 
@@ -372,6 +373,47 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   }
 }`;
 
+const readUnresolvedReviewThreads = async ({ repo, owner, name, number, runGh }) => {
+  const unresolvedThreads = [];
+  const seenCursors = new Set();
+  let cursor;
+  for (let page = 0; page < MAX_REVIEW_THREAD_PAGES; page += 1) {
+    const args = [
+      'api',
+      'graphql',
+      '-f', `query=${REVIEW_THREADS_QUERY}`,
+      '-F', `owner=${owner}`,
+      '-F', `name=${name}`,
+      '-F', `number=${number}`,
+    ];
+    if (cursor) args.push('-F', `cursor=${cursor}`);
+    const response = await runGh(args, { repo });
+    const threads = response?.data?.repository?.pullRequest?.reviewThreads;
+    if (!threads || !Array.isArray(threads.nodes) || !threads.pageInfo) {
+      throw new Error('GitHub returned malformed review-thread data.');
+    }
+    for (const thread of threads.nodes) {
+      if (!thread.isResolved) {
+        unresolvedThreads.push({
+          path: thread.path || null,
+          line: thread.line || null,
+          isOutdated: Boolean(thread.isOutdated),
+          url: thread.comments?.nodes?.at(-1)?.url || null,
+        });
+      }
+    }
+    if (!threads.pageInfo.hasNextPage) break;
+    const next = threads.pageInfo.endCursor;
+    if (!next || seenCursors.has(next)) throw new Error('GitHub review-thread pagination did not advance.');
+    seenCursors.add(next);
+    cursor = next;
+    if (page === MAX_REVIEW_THREAD_PAGES - 1) {
+      throw new Error(`GitHub review-thread pagination exceeded ${MAX_REVIEW_THREAD_PAGES} pages.`);
+    }
+  }
+  return unresolvedThreads;
+};
+
 const PR_VIEW_FIELDS = 'author,baseRefOid,headRefOid,isDraft,latestReviews,mergeable,mergeStateStatus,number,reviewDecision,state,statusCheckRollup,url';
 
 const capturePrStabilityTuple = (pr) => {
@@ -419,43 +461,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       throw new Error('GitHub did not return the pull request author identity.');
     }
     const [owner, name] = repository.split('/');
-    const unresolvedThreads = [];
-    const seenCursors = new Set();
-    let cursor;
-    for (let page = 0; page < MAX_REVIEW_THREAD_PAGES; page += 1) {
-      const args = [
-        'api',
-        'graphql',
-        '-f', `query=${REVIEW_THREADS_QUERY}`,
-        '-F', `owner=${owner}`,
-        '-F', `name=${name}`,
-        '-F', `number=${pr.number}`,
-      ];
-      if (cursor) args.push('-F', `cursor=${cursor}`);
-      const response = await runGh(args, { repo });
-      const threads = response?.data?.repository?.pullRequest?.reviewThreads;
-      if (!threads || !Array.isArray(threads.nodes) || !threads.pageInfo) {
-        throw new Error('GitHub returned malformed review-thread data.');
-      }
-      for (const thread of threads.nodes) {
-        if (!thread.isResolved) {
-          unresolvedThreads.push({
-            path: thread.path || null,
-            line: thread.line || null,
-            isOutdated: Boolean(thread.isOutdated),
-            url: thread.comments?.nodes?.at(-1)?.url || null,
-          });
-        }
-      }
-      if (!threads.pageInfo.hasNextPage) break;
-      const next = threads.pageInfo.endCursor;
-      if (!next || seenCursors.has(next)) throw new Error('GitHub review-thread pagination did not advance.');
-      seenCursors.add(next);
-      cursor = next;
-      if (page === MAX_REVIEW_THREAD_PAGES - 1) {
-        throw new Error(`GitHub review-thread pagination exceeded ${MAX_REVIEW_THREAD_PAGES} pages.`);
-      }
-    }
+    const unresolvedThreads = await readUnresolvedReviewThreads({ repo, owner, name, number: pr.number, runGh });
     const firstGateSnapshot = await readGateAttestationSnapshotForPr({
       repo,
       repository,
@@ -498,10 +504,11 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: finalGateSnapshot.attestation,
       };
     }
+    const finalUnresolvedThreads = await readUnresolvedReviewThreads({ repo, owner, name, number: pr.number, runGh });
     return classifyLivePrState({
       repository,
       pr: finalPr,
-      unresolvedThreads,
+      unresolvedThreads: finalUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: finalGateSnapshot.attestation,

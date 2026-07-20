@@ -43,10 +43,13 @@ test('recognizes files that define validation strength', () => {
     '.pr-closeout.json',
     'pr-closeout.config.json',
     '.eslintrc.json',
+    'packages/web/package.json',
+    'apps/api/package.json',
   ]) {
     assert.equal(isGateFile(file), true, file);
   }
   assert.equal(isGateFile('src/worker.ts'), false);
+  assert.equal(isGateFile('packages/web/src/index.ts'), false);
 });
 
 test('blocks unreviewed gate changes and fails obvious weakening', () => {
@@ -134,11 +137,52 @@ test('detects multiline gate weakening and produces stable config digests', () =
   assert.notEqual(digestValidationConfig({ a: 1 }), digestValidationConfig({ a: 2 }));
 });
 
+test('does not flag positive coverage thresholds as weakening', () => {
+  const base = { changedFiles: ['package.json'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
+  for (const line of [
+    '+  "coverage": 80',
+    '+  "threshold": 100',
+    '+  "coverage": 0.5',
+    '+  "coverage": 0.50',
+    '+  "coverage":"0.5"',
+  ]) {
+    assert.notEqual(
+      classifyGateIntegrity({ ...base, addedLines: [line] }).status,
+      'FAIL',
+      line,
+    );
+  }
+  for (const line of [
+    '+  "coverage": 0',
+    '+  "coverage": false',
+    '+  "threshold": null',
+    '+  "coverage": 0.0',
+    '+coverage=0',
+  ]) {
+    assert.equal(
+      classifyGateIntegrity({ ...base, addedLines: [line] }).status,
+      'FAIL',
+      line,
+    );
+  }
+});
+
 test('failure signatures use the full captured-output digest', () => {
   const base = { status: 'FAIL', exitCode: 1, stdout: 'same capped output', stderr: '', cwd: 'C:/repo' };
   const first = failureSignature({ ...base, outputDigest: { stdout: 'aaa', stderr: 'empty' } });
   const second = failureSignature({ ...base, outputDigest: { stdout: 'bbb', stderr: 'empty' } });
   assert.notEqual(first, second);
+});
+
+test('failure signatures differ when postcondition proof results differ', () => {
+  const base = { status: 'FAIL', exitCode: 1, stdout: 'same', stderr: '', cwd: 'C:/repo' };
+  const outputDigest = { stdout: 'aaa', stderr: 'empty' };
+  const passed = failureSignature({ ...base, outputDigest, proofResult: { status: 'PASS', matched: true } });
+  const failed = failureSignature({ ...base, outputDigest, proofResult: { status: 'FAIL', matched: false } });
+  const missing = failureSignature({ ...base, outputDigest });
+  assert.notEqual(passed, failed);
+  assert.notEqual(passed, missing);
+  assert.notEqual(failed, missing);
 });
 
 test('fingerprints are stable across order and change with content', () => {

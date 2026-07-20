@@ -87,6 +87,11 @@ const scanTouchedSuppressions = async (repo, files) => {
   const findings = [];
   for (const file of files) {
     try {
+      const stats = await lstat(path.join(repo, file));
+      if (stats.isSymbolicLink()) {
+        findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
+        continue;
+      }
       const bytes = await readFile(path.join(repo, file));
       findings.push(...scanSuppressionText(file, decodeTouchedText(bytes)));
     } catch (error) {
@@ -176,7 +181,9 @@ const readGateChanges = async (repo, baseSha) => {
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
     try {
       const text = decodeTouchedText(await readFile(path.join(repo, file)));
-      addedLines.push(...text.split(/\r?\n/).map((line) => `+${line}`));
+      for (const line of text.split(/\r?\n/)) {
+        addedLines.push(`+${line}`);
+      }
     } catch (error) {
       addedLines.push(`+__decode_error__:${file}:${error.message}`);
     }

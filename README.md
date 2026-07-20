@@ -53,7 +53,7 @@ timestamped backup before installing the new copy.
 ```bash
 git clone https://github.com/XGenerationy/codex-agents-debug-mode.git
 cd codex-agents-debug-mode
-./tools/install.sh --target both
+bash ./tools/install.sh --target both
 ```
 
 Use `--force` to preserve an existing target as a timestamped backup and replace it.

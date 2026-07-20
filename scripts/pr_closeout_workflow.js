@@ -84,6 +84,23 @@ const assertOutputOutsideRepository = (repo, outputDir) => {
   if (inside) throw new Error(`Evidence output must be outside the repository: ${outputDir}`);
 };
 
+const resolvePhysicalTarget = async (target, realpathPath) => {
+  const missing = [];
+  let current = target;
+  while (true) {
+    try {
+      const resolved = await realpathPath(current);
+      return missing.length ? path.join(resolved, ...missing.reverse()) : resolved;
+    } catch (error) {
+      if (error && error.code !== 'ENOENT') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) return target;
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+};
+
 const prepareOutputDirectory = async ({
   repo,
   outputDir,
@@ -93,11 +110,13 @@ const prepareOutputDirectory = async ({
   const resolvedRepo = path.resolve(repo);
   const resolvedOutput = path.resolve(outputDir);
   assertOutputOutsideRepository(resolvedRepo, resolvedOutput);
-  await mkdirPath(resolvedOutput, { recursive: true });
-  const [physicalRepo, physicalOutput] = await Promise.all([
+  const [physicalRepo, physicalAncestor] = await Promise.all([
     realpathPath(repo),
-    realpathPath(outputDir),
+    resolvePhysicalTarget(outputDir, realpathPath),
   ]);
+  assertOutputOutsideRepository(physicalRepo, physicalAncestor);
+  await mkdirPath(resolvedOutput, { recursive: true });
+  const physicalOutput = await realpathPath(outputDir);
   assertOutputOutsideRepository(physicalRepo, physicalOutput);
   return resolvedOutput;
 };

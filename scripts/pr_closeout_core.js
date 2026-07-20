@@ -214,7 +214,7 @@ const scanSuppressionText = (file, text) => {
     || normalized.startsWith('.github/workflows/');
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const markerPattern = new RegExp(MARKERS
-    .map((marker) => marker.split(/\s+/).map(escape).join('\\s+'))
+    .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
     .join('|'), 'i');
   const lines = text.split(/\r?\n/);
   lines.forEach((line, index) => {
