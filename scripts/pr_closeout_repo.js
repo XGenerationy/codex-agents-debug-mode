@@ -82,6 +82,9 @@ const readProjectMetadata = async (repo) => {
     if (info.isSymbolicLink()) {
       throw new Error(`Refusing to read symlinked metadata: ${relative}`);
     }
+    if (info.size > MAX_SUPPRESSION_SCAN_BYTES) {
+      throw new Error(`Refusing to read oversized metadata (${info.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes): ${relative}`);
+    }
     return readFile(absolute, 'utf8');
   };
   try {

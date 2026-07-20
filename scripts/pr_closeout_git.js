@@ -63,6 +63,20 @@ const classifyGateIntegrity = ({
       evidence: `Potential gate weakening detected: ${weakening.slice(0, 5).join(' | ')}`,
     };
   }
+  // A gate file that could not be fully decoded (tracked-diff maxBuffer
+  // overflow, an oversized/missing/symlinked untracked gate file) leaves the
+  // gate change set unscannable. Refuse to PASS on attestation alone in that
+  // case — the closeout gate cannot prove no weakening was introduced when it
+  // could not read the complete diff.
+  const decodeErrors = addedLines.filter((line) => String(line).includes('__decode_error__'));
+  if (decodeErrors.length) {
+    return {
+      status: 'FAIL',
+      changedFiles: gateFiles,
+      configuredCommands: configured,
+      evidence: `Gate change could not be fully decoded; refusing to PASS without a complete scan: ${decodeErrors.slice(0, 3).join(' | ')}`,
+    };
+  }
   const reviewed = attestation
     && attestation.provider === 'github-pull-request-review'
     && attestation.status === 'PASS'

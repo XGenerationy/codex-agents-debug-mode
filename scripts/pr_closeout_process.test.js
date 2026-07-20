@@ -140,6 +140,25 @@ test('redacts credentials and encoded components from sensitive URL environment 
   assert.doesNotMatch(output, /postgresql|alice|p@ss|p%40ss|cEBzcyB3b3Jk|70407373/i);
 });
 
+test('redacts credential leaves parsed from JSON auth-blob environment values', () => {
+  // A required/safe env var can hold a JSON auth blob such as
+  // AUTH_CONFIG={"token":"..."}. The redactor must redact the token leaf so a
+  // tool that prints just that value cannot leak it, not only the full blob.
+  const leaf = 'supersecretvalue123';
+  const blob = JSON.stringify({ token: leaf, kind: 'service-account' });
+  const output = redactSecrets(`config=${blob} isolated=${leaf}`, { AUTH_CONFIG: blob }, ['AUTH_CONFIG']);
+  assert.equal(output.includes(leaf), false, 'the JSON token leaf must be redacted');
+  assert.match(output, /isolated=\[REDACTED\]/);
+});
+
+test('matches explicit secret names case-insensitively against env keys', () => {
+  // A config listing "npm_token" must redact NPM_TOKEN (buildChildEnvironment
+  // uppercases the allowlist); the redaction allowlist must do the same so a
+  // short explicit value is still redacted regardless of casing.
+  const output = redactSecrets('leak: shrt', { NPM_TOKEN: 'shrt' }, ['npm_token']);
+  assert.equal(output.includes('shrt'), false, 'short explicit (case-mismatched) value must be redacted');
+});
+
 test('explicitly-allowed short secret values are still redacted end-to-end', () => {
   // Explicitly-listed names opt in to redaction regardless of length so
   // users can still redact short tokens when they choose to.

@@ -72,6 +72,19 @@ test('blocks unreviewed gate changes and fails obvious weakening', () => {
     }).status,
     'PASS',
   );
+  // A gate file that could not be fully decoded (tracked-diff maxBuffer
+  // overflow, oversized/missing/symlinked untracked gate file) leaves the gate
+  // change set unscannable. Even with a valid attestation the closeout gate
+  // must refuse to PASS, because it cannot prove no weakening was introduced.
+  assert.equal(
+    classifyGateIntegrity({
+      ...base,
+      addedLines: ['+__decode_error__:package.json:diff_buffer_exceeded:Error: maxBuffer exceeded'],
+      attestation: liveAttestation(),
+    }).status,
+    'FAIL',
+    'an unscannable gate diff must fail closed even with a valid attestation',
+  );
   assert.equal(
     classifyGateIntegrity({
       ...base,

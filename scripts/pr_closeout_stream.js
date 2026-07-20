@@ -56,6 +56,20 @@ const secretComponents = (value) => {
       components.push(match[1]);
     }
   }
+  // If the value is a JSON auth blob (e.g. AUTH_CONFIG={"token":"..."}), extract
+  // the leaf string values under credential-bearing keys so a tool that prints
+  // just that leaf still gets redacted. The whole-string + encoded variants
+  // cover the full blob but not an isolated leaf printed by an SDK/CLI.
+  try {
+    const parsed = JSON.parse(String(value));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [key, val] of Object.entries(parsed)) {
+        if (typeof val === 'string' && /(?:token|password|passwd|pwd|secret|key|credential|secretkey)$/i.test(key)) {
+          components.push(val);
+        }
+      }
+    }
+  } catch {}
   return [...new Set(components.filter(Boolean))];
 };
 
@@ -68,13 +82,18 @@ const secretComponents = (value) => {
 const MIN_AUTO_SECRET_LENGTH = 8;
 
 const buildSecretReplacements = (env = process.env, names = []) => {
-  const explicit = new Set(names.map((name) => String(name)));
-  const isExplicit = (name) => explicit.has(String(name));
+  // Match explicit names case-insensitively against actual env keys, mirroring
+  // buildChildEnvironment (which uppercases the allowlist): a config listing
+  // "npm_token" must redact NPM_TOKEN. Resolve each configured name to the
+  // actual env key so the value lookup below succeeds.
+  const explicitUpper = new Set(names.map((name) => String(name).toUpperCase()));
+  const isExplicit = (name) => explicitUpper.has(String(name).toUpperCase());
+  const explicitNames = Object.keys(env).filter((name) => isExplicit(name));
   // Auto-discovered sensitive names (matched by SENSITIVE_ENV_NAME) are only
   // included if their value is long enough not to cause over-broad
   // replacement of ordinary text. Explicit names are always included.
   const selected = [
-    ...explicit,
+    ...explicitNames,
     ...Object.keys(env).filter((name) => isSensitiveEnvName(name) && !isExplicit(name)),
   ];
   const values = selected

@@ -32,10 +32,14 @@ const CONFIG_SILENCING = [
   // ESLint/Biome configs. The bound stays finite to keep the regex linear.
   /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["']off["']/i,
   /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["'][^"'\r\n]+["']\s*:\s*0\b/i,
-  /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled\s*[:=]\s*false|disabled\s*[:=]\s*true)/i,
+  /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled["']?\s*[:=]\s*false|disabled["']?\s*[:=]\s*true)/i,
   /["']?linter["']?\s*:\s*\{[\s\S]{0,4000}?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
+  // eslint/biome --quiet suppresses warning output; since the closeout gate
+  // treats warnings as a failing signal, adding --quiet to a touched lint
+  // script hides exactly the warnings that would otherwise block closeout.
+  /--quiet\b/i,
   // Consume the optional closing quote on the JSON key (e.g. "enabled":false,
   // "ignorePatterns":[...], "exclude":[...]) so config-level disabling in
   // tsconfig/eslint/biome JSON no longer slips past the scan.
@@ -217,6 +221,15 @@ const classifyOutput = ({
   const blocked = signals.filter((line) => /\bblocks?|blocked\b/i.test(line));
   if (blocked.length) return { status: 'BLOCKED', evidence: blocked.slice(0, 5).join(' | ') };
   if (signals.length) return { status: 'FAIL', evidence: signals.slice(0, 5).join(' | ') };
+  // A test runner that exits 0 after doing no work (e.g. Jest/Vitest "No tests
+  // found, exiting with code 0") provides no authoritative test evidence. The
+  // closeout gate explicitly rejects passWithNoTests-style weakening, so a
+  // no-test run must not fall through to PASS. Targeted at the no-work
+  // summaries; ordinary "no tests were skipped" is not matched.
+  const combined = `${stdout}\n${stderr}`;
+  if (/\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined) || /\bno\s+test\s+files?\s+found\b/i.test(combined)) {
+    return { status: 'FAIL', evidence: 'Test runner reported no tests found/executed; closeout requires authoritative test evidence.' };
+  }
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
 };
 

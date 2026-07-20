@@ -852,9 +852,9 @@ const evaluateCommandProof = ({ check, execution }) => {
 const createCommandExecutor = ({
   repo,
   outputDir,
-  shell = resolveCommandShell(),
-  shellArgs = (command) => ['-lc', command],
   env = process.env,
+  shell = resolveCommandShell({ env }),
+  shellArgs = (command) => ['-lc', command],
   secretNames = [],
   timeoutMs = DEFAULT_TIMEOUT_MS,
   timeoutsMs = {},

@@ -135,6 +135,18 @@ test('treats mocha-style passing summary with failing tests as a failure signal'
   assert.match(mixed.evidence, /failing/i);
 });
 
+test('treats a no-test run as a failure even when the runner exits 0', () => {
+  // Jest/Vitest print "No tests found, exiting with code 0" when a misconfigured
+  // glob matches nothing. The closeout gate requires authoritative test
+  // evidence (it rejects passWithNoTests-style weakening), so a no-work run
+  // must not fall through to PASS.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'No tests found, exiting with code 0' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'No test files found ["src/**/*.spec.ts"]' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stderr: 'no tests to run' }).status, 'FAIL');
+  // A normal "no tests were skipped" passing summary must NOT be flagged.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'no tests were skipped' }).status, 'PASS');
+});
+
 test('flags focused or skipped tests in touched test files', () => {
   // A PR can focus or skip tests in an ordinary touched test file and still
   // exit 0 from the reduced command; the closeout scanner must catch that
@@ -331,6 +343,25 @@ test('does not flag benign ignore/exclude keys targeting build output, only sour
   assert.ok(
     suppressing.some((finding) => finding.category === 'config-silencing'),
     'src/test-targeting exclude must be flagged',
+  );
+});
+
+test('detects quoted enabled/disabled JSON gate switches and --quiet lint scripts', () => {
+  // JSON config disables a gate via a QUOTED key: "enabled":false. The pattern
+  // must tolerate the closing quote before the colon so package.json-style
+  // {"typecheck":{"enabled":false}} is flagged.
+  assert.ok(
+    scanSuppressionText('package.json', '{"typecheck":{"enabled":false}}').some((f) => f.category === 'config-silencing'),
+    'quoted "enabled":false must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('package.json', '{"lint":{"disabled":true}}').some((f) => f.category === 'config-silencing'),
+    'quoted "disabled":true must be flagged',
+  );
+  // eslint/biome --quiet hides warnings the closeout gate treats as failing.
+  assert.ok(
+    scanSuppressionText('package.json', '{"scripts":{"lint:touched":"eslint . --quiet"}}').some((f) => f.category === 'config-silencing'),
+    '--quiet lint script must be flagged',
   );
 });
 
