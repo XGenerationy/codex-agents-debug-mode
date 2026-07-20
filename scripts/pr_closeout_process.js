@@ -78,7 +78,11 @@ const terminateProcessTree = async ({
       }
       throw error;
     }
-    await delay(terminationGraceMs);
+    // awaitRootClose already bounds the wait to terminationGraceMs via its
+    // internal race against closePromise. An additional unconditional delay
+    // here would stack a second full grace period before SIGKILL escalation
+    // is even considered, doubling worst-case time-to-SIGKILL when the
+    // process ignores SIGTERM.
     await awaitRootClose();
     if (!groupExists()) {
       return { status: 'PASS', evidence: `Process group ${child.pid} stopped after SIGTERM.`, escalated: false };
@@ -233,12 +237,35 @@ const spawnCaptured = async ({
   let timedOut = false;
   const log = createWriteStream(logPath, { flags: 'a', encoding: 'utf8' });
   let logError = null;
-  log.on('error', (error) => { logError = error; });
+  // Track sources paused on backpressure so they can be resumed if the log
+  // stream errors mid-write. Without this, an append-mode open failure, disk
+  // full, or locked-file error would leave 'drain' waiting forever and the
+  // paused source would stall the child process on its stdout/stderr pipe
+  // until timeoutMs fires.
+  const pausedSources = new Set();
+  const resumePausedSources = () => {
+    for (const source of pausedSources) {
+      try {
+        if (typeof source.resume === 'function') source.resume();
+      } catch {}
+    }
+    pausedSources.clear();
+  };
+  log.on('error', (error) => {
+    logError = error;
+    resumePausedSources();
+  });
   const writeLog = (chunk, source) => {
     if (logError) return;
     if (!log.write(chunk) && source && typeof source.pause === 'function') {
       source.pause();
-      log.once('drain', () => source.resume());
+      pausedSources.add(source);
+      log.once('drain', () => {
+        pausedSources.delete(source);
+        try {
+          source.resume();
+        } catch {}
+      });
     }
   };
   const makeState = () => ({
@@ -998,15 +1025,27 @@ const runPreflight = async ({
   const minimum = Number(config.minFreeDiskGb ?? 2);
   checks.push({ name: 'disk', status: freeGb >= minimum ? 'PASS' : 'BLOCKED', evidence: `${freeGb.toFixed(2)} GiB free; ${minimum} GiB required` });
   if (config.services?.redis) {
-    const healthy = await probeRedis(config.services.redis);
+    let healthy = false;
+    let evidence = 'Redis RESP PING did not return +PONG.';
+    try {
+      healthy = await probeRedis(config.services.redis);
+    } catch (error) {
+      healthy = false;
+      evidence = `Redis probe rejected: ${error?.message || error}`;
+    }
     checks.push({
       name: 'redis',
       status: healthy ? 'PASS' : 'BLOCKED',
-      evidence: healthy ? 'Redis RESP PING returned +PONG.' : 'Redis RESP PING did not return +PONG.',
+      evidence: healthy ? 'Redis RESP PING returned +PONG.' : evidence,
     });
   }
   if (config.services?.grafana?.url) {
-    const health = await probeHttp(config.services.grafana.url);
+    let health = null;
+    try {
+      health = await probeHttp(config.services.grafana.url);
+    } catch (error) {
+      health = { healthy: false, evidence: `Grafana probe rejected: ${error?.message || error}` };
+    }
     checks.push({
       name: 'grafana',
       status: health?.healthy === true ? 'PASS' : 'BLOCKED',
@@ -1014,8 +1053,16 @@ const runPreflight = async ({
     });
   }
   for (const service of config.ports || []) {
-    const healthy = await probeTcp(service);
-    checks.push({ name: `port:${service.name || `${service.host}:${service.port}`}`, status: healthy ? 'PASS' : 'BLOCKED', evidence: healthy ? 'TCP reachable' : 'TCP unavailable' });
+    let healthy = false;
+    let evidence = 'TCP unavailable';
+    try {
+      healthy = await probeTcp(service);
+      evidence = healthy ? 'TCP reachable' : 'TCP unavailable';
+    } catch (error) {
+      healthy = false;
+      evidence = `TCP probe rejected: ${error?.message || error}`;
+    }
+    checks.push({ name: `port:${service.name || `${service.host}:${service.port}`}`, status: healthy ? 'PASS' : 'BLOCKED', evidence });
   }
   const status = checks.some((check) => check.status === 'FAIL')
     ? 'FAIL'

@@ -461,7 +461,6 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       throw new Error('GitHub did not return the pull request author identity.');
     }
     const [owner, name] = repository.split('/');
-    const unresolvedThreads = await readUnresolvedReviewThreads({ repo, owner, name, number: pr.number, runGh });
     const firstGateSnapshot = await readGateAttestationSnapshotForPr({
       repo,
       repository,
@@ -493,13 +492,17 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     const prStable = stabilityTuplesMatch(capturePrStabilityTuple(pr), capturePrStabilityTuple(finalPr));
     const reviewsStable = stabilityTuplesMatch(firstGateSnapshot.stabilityTuple, finalGateSnapshot.stabilityTuple);
     if (!prStable || !reviewsStable) {
+      // Defer the unstable-state review-thread read into this branch so the
+      // common stable path only pays for one thread read (the final one
+      // below) instead of two full paginated round-trips.
+      const unstableThreads = await readUnresolvedReviewThreads({ repo, owner, name, number: pr.number, runGh });
       return {
         status: 'BLOCKED',
         evidence: 'Live GitHub PR, check, or review state changed during verification; rerun against a stable remote snapshot.',
         repository,
         number: finalPr.number,
         checks: [],
-        unresolvedThreads,
+        unresolvedThreads: unstableThreads,
         externalServices: [],
         gateAttestation: finalGateSnapshot.attestation,
       };

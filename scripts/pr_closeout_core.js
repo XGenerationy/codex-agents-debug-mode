@@ -151,16 +151,16 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
 };
 
 const cleanZeroSummaries = (text) => text
-  .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
-  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
-  .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|skips?|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
+  .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
+  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
+  .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
-const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
+const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
 const COUNTED_SIGNAL = new RegExp(`(?:\\b[1-9]\\d*\\s+${STATUS_TERM}\\b|\\b${STATUS_TERM}\\s*(?::|=|\\s)\\s*[1-9]\\d*\\b)`, 'i');
 const BRACKETED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?\\[${STATUS_TERM}\\]`, 'i');
 const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, 'i');
 const statusSignal = (line) => {
-  const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
+  const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?|ING)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
   const runtime = /\b(?:[A-Za-z]+Warning|[A-Za-z]+Error):/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;

@@ -434,6 +434,12 @@ const runCloseoutWorkflow = async ({
         captureVersions: async (cwd) => (await d.runPreflight({
           repo: cwd,
           config: { minFreeDiskGb: 0 },
+          // Pass the sanitized childEnv so the disposable base worktree's
+          // version probes use the same isolated environment as admission
+          // preflight and command execution, instead of falling back to
+          // process.env and leaking ambient CI credentials into the baseline
+          // comparison.
+          env: childEnv,
         })).toolVersions,
       }));
     };

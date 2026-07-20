@@ -121,6 +121,16 @@ test('distinguishes status signals from passing failure-path test names', () => 
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'todo: 2' }).status, 'FAIL');
 });
 
+test('treats mocha-style passing summary with failing tests as a failure signal', () => {
+  // Mocha prints `passing: N`/`failing: N` summary lines. When a wrapper or
+  // npm script masks the underlying test runner's exit code, the closeout
+  // classifier must still catch `1 failing` (or `failing: 1`) on stdout.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '  1 failing' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'failing: 3' }).status, 'FAIL');
+  // Zero-failing summaries remain PASS.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '  0 failing' }).status, 'PASS');
+});
+
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
   const failures = [
     'ok 1 - feature # SKIP unavailable',

@@ -65,6 +65,66 @@ test('reads project metadata, fingerprints changes, and reports clean-tree truth
   }
 });
 
+test('readProjectMetadata discovers make targets from GNUmakefile and makefile defaults', async () => {
+  // GNU make searches GNUmakefile, makefile, then Makefile. Repositories that
+  // use the lowercase form must still surface their named targets so named
+  // checks do not stay unresolved.
+  for (const filename of ['GNUmakefile', 'makefile']) {
+    const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-defaults-'));
+    try {
+      git(repo, 'init', '--quiet');
+      await writeFile(path.join(repo, filename), 'grafana-render:\n\t@echo render\n');
+      git(repo, 'add', '.');
+      git(repo, 'commit', '--quiet', '-m', 'baseline');
+      const metadata = await readProjectMetadata(repo);
+      assert.ok(
+        metadata.makeTargets.includes('grafana-render'),
+        `${filename} targets must be discovered, got: ${JSON.stringify(metadata.makeTargets)}`,
+      );
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }
+});
+
+test('workingTreeFingerprint hashes untracked symlinks instead of following them', async () => {
+  // A validation command can leave an untracked symlink that points at an
+  // outside file or device. Following it could hang (e.g. /dev/zero) or read
+  // outside the repository before the dirty-tree check stops the run. The
+  // fingerprint must hash the link target string, not dereference the link.
+  const repo = await fixtureRepo();
+  try {
+    const outside = await mkdtemp(path.join(tmpdir(), 'closeout-fingerprint-outside-'));
+    try {
+      const outsideFile = path.join(outside, 'payload.txt');
+      await writeFile(outsideFile, 'fingerprint-content');
+      const linkPath = path.join(repo, 'link-to-outside.txt');
+      try {
+        await symlink(outsideFile, linkPath);
+      } catch (error) {
+        if (error.code === 'EPERM' || error.code === 'ENOSYS') {
+          // Windows without developer mode / privileged symlink creation.
+          return;
+        }
+        throw error;
+      }
+      const fingerprint = await workingTreeFingerprint(repo);
+      // The fingerprint must be stable across re-reads (link target unchanged).
+      const repeat = await workingTreeFingerprint(repo);
+      assert.equal(fingerprint, repeat);
+      // And it must NOT incorporate the outside file's contents: changing the
+      // outside payload must not change the fingerprint of the untracked link.
+      await writeFile(outsideFile, 'different-content');
+      const afterChange = await workingTreeFingerprint(repo);
+      assert.equal(fingerprint, afterChange, 'untracked symlink must be hashed as a link, not followed');
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('extracts gate changes and scans the complete touched-file set', async () => {
   const repo = await fixtureRepo();
   try {
@@ -167,7 +227,7 @@ test('rejects touched symlinks instead of following them', async (t) => {
     assert.equal(linkFinding.category, 'scan-error');
     assert.match(linkFinding.match, /symlink/i);
     assert.ok(
-      !findings.some(({ file }) => file === 'link.js' && file !== 'link.js'),
+      !findings.some((finding) => finding.file === 'link.js' && finding.category !== 'scan-error'),
       'symlink must not be followed into suppression findings',
     );
   } finally {

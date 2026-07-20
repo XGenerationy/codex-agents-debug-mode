@@ -780,6 +780,40 @@ test('preflight treats warning output from a successful probe as failure', async
   assert.ok(result.checks.some(({ name, status }) => name === 'node' && status === 'FAIL'));
 });
 
+test('preflight converts rejecting service probes into BLOCKED checks instead of aborting the workflow', async () => {
+  // An invalid host/port (or transient socket rejection) used to bubble up
+  // through runPreflight and abort runCloseoutWorkflow's Promise.all, which
+  // prevented writing any structured evidence report. Probes that reject must
+  // now become BLOCKED entries so the workflow can still produce a report.
+  const explodingRedis = async () => { throw new Error('invalid port'); };
+  const explodingTcp = async () => { throw new Error('ECONNREFUSED'); };
+  const explodingHttp = async () => { throw new Error('grafana unreachable'); };
+  const result = await runPreflight({
+    repo: process.cwd(),
+    config: {
+      minFreeDiskGb: 0,
+      services: { redis: { host: '127.0.0.1', port: NaN }, grafana: { url: 'http://127.0.0.1:1' } },
+      ports: [{ name: 'broken', host: '127.0.0.1', port: 'not-a-number' }],
+    },
+    probeCommand: async () => ({ exitCode: 0, stdout: 'v1', stderr: '' }),
+    diskFreeGb: async () => 10,
+    probeRedis: explodingRedis,
+    probeTcp: explodingTcp,
+    probeHttp: explodingHttp,
+  });
+  assert.notEqual(result.status, 'FAIL');
+  assert.equal(result.status, 'BLOCKED');
+  const redis = result.checks.find((c) => c.name === 'redis');
+  const grafana = result.checks.find((c) => c.name === 'grafana');
+  const port = result.checks.find((c) => c.name.startsWith('port:'));
+  assert.equal(redis.status, 'BLOCKED');
+  assert.match(redis.evidence, /invalid port/i);
+  assert.equal(grafana.status, 'BLOCKED');
+  assert.match(grafana.evidence, /grafana unreachable/i);
+  assert.equal(port.status, 'BLOCKED');
+  assert.match(port.evidence, /ECONNREFUSED/i);
+});
+
 test('captures write-stream errors in logWriteError instead of crashing', async () => {
   const badLogPath = path.join(tmpdir(), `closeout-missing-${Date.now()}-dir`, 'nested', 'log.txt');
   const result = await spawnCaptured({

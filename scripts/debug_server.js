@@ -133,7 +133,18 @@ const createDebugServer = ({
       return;
     }
 
-    const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
+    // Parse the request target inside the caught section so a malformed
+    // absolute target (e.g. `GET http://[ HTTP/1.1`) returns a fail-closed
+    // 400/404 response instead of rejecting the async request handler
+    // outside the JSON error path and terminating the collector under Node's
+    // default unhandled-rejection behavior.
+    let pathname;
+    try {
+      pathname = new URL(request.url, 'http://127.0.0.1').pathname;
+    } catch (error) {
+      sendJson(response, 400, { error: 'invalid_request_target' });
+      return;
+    }
 
     try {
       if (request.method === 'GET' && pathname === '/health') {
@@ -154,13 +165,29 @@ const createDebugServer = ({
           throw new RequestError('session_limit_reached', 429);
         }
 
-        const payload = await readJson(request, effectiveLimits.maxBodyBytes);
+        // Reserve a provisional session slot BEFORE the awaited readJson so
+        // two chunked /session requests that flush headers before sending
+        // their bodies cannot both pass the maxSessions check while readJson
+        // is pending. The slot is removed if any later step fails.
+        const reservationId = `pending-${randomBytes(12).toString('hex')}`;
+        sessions.set(reservationId, { eventCount: 0, logFile: null, sessionToken: null, provisional: true });
+        let payload;
+        try {
+          payload = await readJson(request, effectiveLimits.maxBodyBytes);
+        } catch (error) {
+          sessions.delete(reservationId);
+          throw error;
+        }
         const sessionId = `${normalizeSessionName(payload.name)}-${randomBytes(12).toString('hex')}`;
         const sessionToken = randomBytes(32).toString('base64url');
         const fileName = `debug-${sessionId}.log`;
         const logFile = path.join(logDir, fileName);
-        // Reserve the session slot before any awaited I/O so concurrent
-        // /session requests cannot all pass the maxSessions check at once.
+        sessions.delete(reservationId);
+        // Re-check the session limit after the reservation is released because
+        // a concurrent request may have finalized its own session in the window.
+        if (sessions.size >= effectiveLimits.maxSessions) {
+          throw new RequestError('session_limit_reached', 429);
+        }
         sessions.set(sessionId, { eventCount: 0, logFile, sessionToken, provisional: true });
         try {
           await mkdir(logDir, { recursive: true });

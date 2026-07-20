@@ -71,14 +71,22 @@ const readProjectMetadata = async (repo) => {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  try {
-    const makefile = await readFile(path.join(repo, 'Makefile'), 'utf8');
-    makeTargets = [...new Set(makefile.split(/\r?\n/)
-      .map((line) => line.match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/))
-      .filter(Boolean)
-      .map((match) => match[1]))];
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+  // GNU make's documented default search order is GNUmakefile, makefile,
+  // then Makefile (https://www.gnu.org/software/make/manual/html_node/Makefile-Names.html).
+  // Read the first one that exists so repositories that use the lowercase
+  // form still surface their named targets.
+  const makeCandidates = ['GNUmakefile', 'makefile', 'Makefile'];
+  for (const candidate of makeCandidates) {
+    try {
+      const makefile = await readFile(path.join(repo, candidate), 'utf8');
+      makeTargets = [...new Set(makefile.split(/\r?\n/)
+        .map((line) => line.match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/))
+        .filter(Boolean)
+        .map((match) => match[1]))];
+      break;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
   }
   return { packageScripts, makeTargets };
 };
@@ -152,7 +160,25 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   ]);
   const entries = [{ path: '__tracked_diff__', hash: hashBytes(diff) }];
   for (const file of untracked) {
-    const bytes = await readFile(path.join(repo, file));
+    const absolute = path.join(repo, file);
+    // Guard untracked symlinks before hashing: a validation command may leave
+    // a link to /dev/zero or an outside file, and following it could hang or
+    // read outside the repository before the final dirty-tree check can stop
+    // the run. Treat untracked symlinks like collectExtraEntries does and
+    // hash the link target string instead of dereferencing the link.
+    let info;
+    try {
+      info = await lstat(absolute);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      entries.push({ path: file, hash: hashBytes('missing') });
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      entries.push({ path: file, hash: hashBytes(`symlink:${await readlink(absolute)}`) });
+      continue;
+    }
+    const bytes = await readFile(absolute);
     entries.push({ path: file, hash: hashBytes(bytes) });
   }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);

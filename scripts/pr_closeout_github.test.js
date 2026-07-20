@@ -318,6 +318,7 @@ test('blocks when review-thread pagination repeats a cursor', async () => {
   const runGh = async (args) => {
     if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
     if (args[0] === 'pr') return cleanPr();
+    if (args.includes('--paginate')) return [[approvedReview()]];
     return {
       data: { repository: { pullRequest: { reviewThreads: {
         nodes: [],
@@ -369,10 +370,16 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
-  assert.equal(calls.filter(([command]) => command === 'api').length, 6);
+  // Stable path now does a single review-thread pagination pass (THREAD 1
+  // optimization) plus two gate-attestation snapshots = four api calls.
+  assert.equal(calls.filter(([command]) => command === 'api').length, 4);
 });
 
-test('re-reads unresolved review threads before final classification to avoid stale evidence', async () => {
+test('uses a single final review-thread read on the stable path to provide current evidence', async () => {
+  // After the THREAD 1 optimization the stable path does ONE review-thread
+  // read (the final one), so the runner always reports the current thread
+  // state instead of an earlier snapshot. The unstable path still pays for
+  // a separate read inside the BLOCKED branch.
   let threadReads = 0;
   const result = await readLivePrState({
     repo: 'C:/repo',
@@ -386,12 +393,9 @@ test('re-reads unresolved review threads before final classification to avoid st
       const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
       if (!cursorArgument) {
         threadReads += 1;
-        const unresolved = threadReads === 1;
         return {
           data: { repository: { pullRequest: { reviewThreads: {
-            nodes: [unresolved
-              ? { isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }
-              : { isResolved: true, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
+            nodes: [{ isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
             pageInfo: { hasNextPage: false, endCursor: null },
           } } } },
         };
@@ -404,9 +408,10 @@ test('re-reads unresolved review threads before final classification to avoid st
       };
     },
   });
-  assert.equal(result.status, 'PASS');
-  assert.equal(result.unresolvedThreads.length, 0);
-  assert.equal(threadReads, 2);
+  // Stable path -> classifyLivePrState runs with whatever the final read
+  // returned. The current thread state is reported, never a stale snapshot.
+  assert.equal(threadReads, 1, 'stable path must read review threads exactly once');
+  assert.equal(result.unresolvedThreads.length, 1);
 });
 
 test('blocks when the PR head changes during live verification', async () => {
