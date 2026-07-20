@@ -73,6 +73,8 @@ test('readProjectMetadata discovers make targets from GNUmakefile and makefile d
     const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-defaults-'));
     try {
       git(repo, 'init', '--quiet');
+      git(repo, 'config', 'user.name', 'Closeout Test');
+      git(repo, 'config', 'user.email', 'closeout@example.invalid');
       await writeFile(path.join(repo, filename), 'grafana-render:\n\t@echo render\n');
       git(repo, 'add', '.');
       git(repo, 'commit', '--quiet', '-m', 'baseline');
