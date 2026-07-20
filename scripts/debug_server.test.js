@@ -282,6 +282,47 @@ test('requires the per-session token before accepting a log event', async () => 
   }
 });
 
+test('/log accepts both snake_case and camelCase session keys', async () => {
+  // /session returns session_id / session_token (snake_case) but older docs
+  // and several SDKs use sessionId / sessionToken (camelCase). A client that
+  // reuses the /session response payload directly must still be able to
+  // post log events without transforming the keys.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+
+    // snake_case (the exact /session response payload).
+    const snake = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        session_id: session.session_id,
+        session_token: session.session_token,
+        msg: 'snake-case-event',
+      },
+    });
+    assert.equal(snake.status, 202);
+
+    // camelCase (the older documented form).
+    const camel = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'camel-case-event',
+      },
+    });
+    assert.equal(camel.status, 202);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('enforces bounded sessions and events', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({

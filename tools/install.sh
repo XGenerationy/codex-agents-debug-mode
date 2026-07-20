@@ -36,6 +36,14 @@ if [[ -z "$home_path" ]]; then
   exit 2
 fi
 
+# Reject relative home paths so the installer cannot silently write into the
+# current working directory. Mirrors the absolute-path check in
+# tools/install.ps1 (System.IO.Path.IsPathRooted).
+if [[ "$home_path" != /* ]]; then
+  echo "--home / HOME must be an absolute path: $home_path" >&2
+  exit 2
+fi
+
 case "$target" in
   codex) destinations=("$home_path/.codex/skills/debug") ;;
   agents) destinations=("$home_path/.agents/skills/debug") ;;

@@ -24,7 +24,15 @@ const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const execFileAsync = promisify(execFile);
 
 const resolveCommandShell = ({ platform = process.platform, env = process.env } = {}) => {
-  if (platform !== 'win32') return '/bin/bash';
+  if (platform !== 'win32') {
+    // Allow an explicit override for *nix too, mirroring the Windows override
+    // below. Fall back to `bash` resolved through PATH (POSIX `execvp`
+    // semantics via child_process.spawn) instead of hard-coding /bin/bash,
+    // so minimal/container images without /bin/bash but with bash on PATH
+    // still work. If bash is unavailable the spawn will surface a clear
+    // ENOENT rather than failing every check silently.
+    return env.OMO_CODEX_SHELL_PATH || 'bash';
+  }
   return env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe';
 };
 

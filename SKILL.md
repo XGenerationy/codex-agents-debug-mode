@@ -159,9 +159,11 @@ Response:
 ```
 
 Save the `collector_token` from startup plus the `session_id` and `session_token` from the
-session response. Never print either token into application logs, reports, commits, or PR
-messages. For browser instrumentation, set `DEBUG_ALLOWED_ORIGIN` to the exact application
-origin before launch; unspecified browser origins are rejected.
+session response. The server writes the collector_token to `.debug/collector_token` (mode 0600)
+and announces that path in the startup JSON's `token_file` field; capture it via
+`COLLECTOR_TOKEN=$(cat .debug/collector_token)`. Never print either token into application logs,
+reports, commits, or PR messages. For browser instrumentation, set `DEBUG_ALLOWED_ORIGIN` to the
+exact application origin before launch; unspecified browser origins are rejected.
 
 **Server endpoints:**
 - GET `/health` → returns collector-specific service, version, and instance identity

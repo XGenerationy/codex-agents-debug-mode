@@ -212,7 +212,11 @@ const createDebugServer = ({
 
       if (request.method === 'POST' && pathname === '/log') {
         const payload = await readJson(request, effectiveLimits.maxBodyBytes);
-        const sessionId = payload.sessionId;
+        // /session returns snake_case keys (session_id, session_token) but
+        // older docs and several SDKs use camelCase (sessionId, sessionToken).
+        // Accept both shapes so a client that reuses the /session response
+        // payload directly does not fail with unknown_session/unauthorized.
+        const sessionId = payload.sessionId || payload.session_id;
         const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
         if (!session) {
           sendJson(response, 404, { error: 'unknown_session' });
@@ -223,7 +227,7 @@ const createDebugServer = ({
           return;
         }
         const suppliedToken =
-          request.headers['x-debug-session-token'] || payload.sessionToken;
+          request.headers['x-debug-session-token'] || payload.sessionToken || payload.session_token;
         if (!safeTokenEqual(suppliedToken, session.sessionToken)) {
           sendJson(response, 401, { error: 'unauthorized' });
           return;
@@ -392,21 +396,38 @@ const main = () => {
     process.exitCode = 1;
   });
   server.listen(port, '127.0.0.1', () => {
-    // Keep the runtime collector_token OUT of stdout: stdout is captured by
-    // wrappers as a structured startup line and is routinely logged, piped,
-    // or persisted. The collector_token is intentionally exposed only via
-    // Object.defineProperty on the server object so the parent process can
-    // read it programmatically; never print it as a log line.
-    process.stdout.write(
-      `${JSON.stringify({
-        status: 'started',
-        port,
-        service: COLLECTOR_SERVICE,
-        version: COLLECTOR_VERSION,
-        instance_id: server.collectorInstanceId,
-        log_dir: '.debug',
-      })}\n`,
-    );
+    // Persist the runtime collector_token to a 0600 file under .debug/ and
+    // print only the file path in stdout. stdout is captured by wrappers as
+    // a structured startup line and is routinely logged, piped, or
+    // persisted, so we never print the token itself there; instead the
+    // documented workflow reads it via `export COLLECTOR_TOKEN=$(cat
+    // .debug/collector_token)`. The token also stays available
+    // programmatically via the server object's collectorToken property.
+    const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
+    writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 })
+      .then(() => {
+        process.stdout.write(
+          `${JSON.stringify({
+            status: 'started',
+            port,
+            service: COLLECTOR_SERVICE,
+            version: COLLECTOR_VERSION,
+            instance_id: server.collectorInstanceId,
+            log_dir: '.debug',
+            token_file: '.debug/collector_token',
+          })}\n`,
+        );
+      })
+      .catch((error) => {
+        process.stderr.write(
+          `${JSON.stringify({
+            level: 'error',
+            event: 'startup.token_write_failed',
+            reason: error?.code || (error?.message || String(error)),
+          })}\n`,
+        );
+        process.exitCode = 1;
+      });
   });
 };
 
