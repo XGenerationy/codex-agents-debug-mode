@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { randomBytes, timingSafeEqual } = require('node:crypto');
-const { appendFile, mkdir, writeFile } = require('node:fs/promises');
+const { appendFile, chmod, lstat, mkdir, realpath, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 
@@ -195,7 +195,23 @@ const createDebugServer = ({
         }
         sessions.set(sessionId, { eventCount: 0, logFile, sessionToken, provisional: true });
         try {
+          // Reject a symlinked or escaped .debug directory before writing session
+          // evidence: a PR-controlled worktree can point .debug at an external
+          // directory, which would let the collector write outside projectRoot.
+          try {
+            const dirInfo = await lstat(logDir);
+            if (dirInfo.isSymbolicLink()) throw new RequestError('debug_dir_is_symlink');
+          } catch (error) {
+            if (error instanceof RequestError) throw error;
+            if (error.code !== 'ENOENT') throw error;
+          }
           await mkdir(logDir, { recursive: true });
+          const resolvedLogDir = await realpath(logDir);
+          const resolvedRoot = await realpath(path.resolve(projectRoot));
+          const rel = path.relative(resolvedRoot, resolvedLogDir);
+          if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+            throw new RequestError('debug_dir_escapes_root');
+          }
           await writeFile(logFile, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
           delete sessions.get(sessionId).provisional;
         } catch (error) {
@@ -403,8 +419,11 @@ const main = () => {
     // documented workflow reads it via `export COLLECTOR_TOKEN=$(cat
     // .debug/collector_token)`. The token also stays available
     // programmatically via the server object's collectorToken property.
-    const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
-    writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 })
+    const debugDir = path.join(projectRoot, '.debug');
+    const tokenFile = path.join(debugDir, 'collector_token');
+    mkdir(debugDir, { recursive: true })
+      .then(() => writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }))
+      .then(() => chmod(tokenFile, 0o600))
       .then(() => {
         process.stdout.write(
           `${JSON.stringify({
@@ -427,6 +446,7 @@ const main = () => {
           })}\n`,
         );
         process.exitCode = 1;
+        server.close();
       });
   });
 };

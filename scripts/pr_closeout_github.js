@@ -336,24 +336,30 @@ const readLiveGateAttestation = async ({
     if (typeof pr.author?.login !== 'string' || !pr.author.login.trim()) {
       throw new Error('GitHub did not return the pull request author identity.');
     }
-    if (typeof pr.headRefOid === 'string' && pr.headRefOid && pr.headRefOid !== expectedHeadSha) {
+    if (typeof pr.headRefOid !== 'string' || !pr.headRefOid) {
+      throw new Error('GitHub did not return the pull request head OID.');
+    }
+    if (pr.headRefOid !== expectedHeadSha) {
       return {
         provider: 'github-pull-request-review',
         status: 'BLOCKED',
         baseSha: expectedBaseSha,
         headSha: expectedHeadSha,
         configDigest: expectedConfigDigest,
-        evidence: `Live PR head ${pr.headRefOid.substring(0, 7)} does not match expected head ${expectedHeadSha.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
+        evidence: `Live PR head ${pr.headRefOid.substring(0, 7)} does not match expected head ${expectedHeadSha?.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
       };
     }
-    if (typeof pr.baseRefOid === 'string' && pr.baseRefOid && pr.baseRefOid !== expectedBaseSha) {
+    if (typeof pr.baseRefOid !== 'string' || !pr.baseRefOid) {
+      throw new Error('GitHub did not return the pull request base OID.');
+    }
+    if (pr.baseRefOid !== expectedBaseSha) {
       return {
         provider: 'github-pull-request-review',
         status: 'BLOCKED',
         baseSha: expectedBaseSha,
         headSha: expectedHeadSha,
         configDigest: expectedConfigDigest,
-        evidence: `Live PR base ${pr.baseRefOid.substring(0, 7)} does not match expected base ${expectedBaseSha.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
+        evidence: `Live PR base ${pr.baseRefOid.substring(0, 7)} does not match expected base ${expectedBaseSha?.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
       };
     }
     return await readGateAttestationForPr({

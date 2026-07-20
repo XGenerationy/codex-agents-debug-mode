@@ -154,6 +154,18 @@ test('flags focused or skipped tests in touched test files', () => {
   assert.deepEqual(nonTest, []);
 });
 
+test('flags focused or skipped tests in __tests__/ files without a test/spec filename', () => {
+  // Standard Jest layout: src/__tests__/foo.js has no test/spec token in the
+  // filename, so without path-aware detection weakening markers in it would
+  // bypass the scan. The closeout scanner must still catch them.
+  const findings = scanSuppressionText('src/__tests__/foo.js', 'it.skip("skipped test");');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].category, 'test-weakening');
+  assert.match(findings[0].match, /it\.skip/i);
+  // A non-test path that merely contains the substring still must not match.
+  assert.deepEqual(scanSuppressionText('src/__tests_data__/foo.js', 'it.skip("no match");'), []);
+});
+
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
   const failures = [
     'ok 1 - feature # SKIP unavailable',
@@ -254,6 +266,22 @@ test('still matches suppression markers when preceded by comment syntax or white
   }
 });
 
+test('does not flag suppression vocabulary that is sole quoted-string data', () => {
+  // The scanner's own MARKERS vocabulary and quoted test fixtures are data,
+  // not active directives. A line whose content is a single quoted string
+  // (e.g. `'skipcq',` or `'// noqa',`) must not self-flag, while the same
+  // marker used as a real directive is still detected.
+  assert.deepEqual(scanSuppressionText('scripts/pr_closeout_core.js', "  'skipcq',"), []);
+  assert.deepEqual(scanSuppressionText('scripts/pr_closeout_core.js', "  '// noqa',"), []);
+  assert.deepEqual(scanSuppressionText('scripts/pr_closeout_core.js', '  `eslint-disable`,'), []);
+  const directive = scanSuppressionText('src/code.ts', '// skipcq');
+  assert.ok(
+    directive.some(({ category }) => category === 'marker'),
+    'real // skipcq directive must still be detected',
+  );
+  assert.match(directive.find(({ category }) => category === 'marker').match, /skipcq/i);
+});
+
 test('detects common config-level compiler, framework, linter, and ignore-file silencing', () => {
   const cases = [
     ['tsconfig.json', '{"compilerOptions":{"skipLibCheck":true},"exclude":["generated"]}'],
@@ -271,6 +299,24 @@ test('detects common config-level compiler, framework, linter, and ignore-file s
 
 test('does not treat ordinary source-code fields as config silencing', () => {
   assert.deepEqual(scanSuppressionText('src/options.ts', 'const ignore = request.ignore;'), []);
+});
+
+test('does not flag benign ignore/exclude keys targeting build output, only source/test globs', () => {
+  // Routine tsconfig/CI exclude keys (dist, node_modules, build) must not
+  // produce config-silencing findings; only values that suppress source/test
+  // paths (src/**, **/*.test.ts) are flagged, so clean PRs touching a
+  // tsconfig.json or a CI matrix are not blocked.
+  const benign = scanSuppressionText('tsconfig.json', '{"exclude": ["dist", "node_modules"]}');
+  assert.deepEqual(
+    benign.filter((finding) => finding.category === 'config-silencing'),
+    [],
+    'benign build-output exclude must not be flagged',
+  );
+  const suppressing = scanSuppressionText('tsconfig.json', '{"exclude": ["src/**/*.test.ts"]}');
+  assert.ok(
+    suppressing.some((finding) => finding.category === 'config-silencing'),
+    'src/test-targeting exclude must be flagged',
+  );
 });
 
 test('detects multiline config rule disabling', () => {

@@ -308,7 +308,7 @@ const runCloseoutWorkflow = async ({
     repo: initial.repo,
     outputDir: resolvedOutput,
     env: childEnv,
-    secretNames: config.requiredEnv || [],
+    secretNames: [...(config.requiredEnv || []), ...(config.safeEnv || [])],
     timeoutMs: config.timeoutMs,
     timeoutsMs: config.timeoutsMs,
   });

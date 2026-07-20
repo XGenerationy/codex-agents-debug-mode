@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 # destination paths via Join-Path. Mirrors the explicit HOME validation in
 # tools/install.sh so the Windows installer does not silently install into
 # the current directory or an unexpected rooted target.
-if (-not $HomePath -or -not ([string]::IsNullOrWhiteSpace($HomePath) -eq $false)) {
+if ([string]::IsNullOrWhiteSpace($HomePath)) {
     throw 'HomePath is empty; pass -HomePath <path> or set $HOME.'
 }
 $HomePath = "$HomePath".Trim()

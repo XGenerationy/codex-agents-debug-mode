@@ -36,6 +36,33 @@ const resolveCommandShell = ({ platform = process.platform, env = process.env } 
   return env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe';
 };
 
+const probeCommandShell = async (shell, env = process.env) => {
+  // A bare command name (no path separator) is resolved through PATH by
+  // child_process.spawn, but fs.access checks only the process cwd. On normal
+  // Linux runners the default `bash` lives at /usr/bin/bash (on PATH, not in
+  // cwd), so probing access('bash') would report BLOCKED before any other
+  // preflight probe can pass even though spawn would succeed. Search PATH
+  // (and PATHEXT on Windows) for bare names; for an explicit path, access is
+  // authoritative.
+  if (/[\\/]/.test(shell)) {
+    await access(shell);
+    return shell;
+  }
+  const pathEntries = String(env.PATH || env.Path || '').split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === 'win32'
+    ? String(env.PATHEXT || '.EXE;.CMD;.BAT').split(';').filter(Boolean)
+    : [''];
+  for (const dir of pathEntries) {
+    for (const ext of extensions) {
+      try {
+        await access(path.join(dir, shell + ext));
+        return shell;
+      } catch {}
+    }
+  }
+  throw new Error(`not found on PATH: ${shell}`);
+};
+
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const terminateProcessTree = async ({
@@ -91,7 +118,46 @@ const terminateProcessTree = async ({
         return false;
       }
     };
+    // Enumerate the process group via /proc and return the PIDs of members
+    // that are NOT zombies. Returns null when /proc is unavailable (non-Linux);
+    // the caller falls back to the kill(-pgid, 0) + isDefunct(root) probe.
+    // kill(-pgid, 0) succeeds for a reaped descendant zombie too, so on Linux
+    // containers where PID 1 does not promptly reap killed descendants this
+    // probe can stay green even though no live process can mutate evidence.
+    // Enumerating the group lets us prove the group is gone when every member
+    // is a zombie (including the root-reaped case isDefunct(root) misses).
+    const liveMembersInGroup = (pgid) => {
+      let entries;
+      try {
+        entries = require('node:fs').readdirSync('/proc');
+      } catch {
+        return null;
+      }
+      const live = [];
+      for (const entry of entries) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const stat = require('node:fs').readFileSync(`/proc/${entry}/stat`, 'utf8');
+          const afterComm = stat.lastIndexOf(')');
+          if (afterComm < 0) continue;
+          const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
+          const state = fields[0];
+          // /proc/$pid/stat layout after (comm): state ppid pgrp session ...
+          const memberPgrp = Number(fields[2]);
+          if (Number.isInteger(memberPgrp) && memberPgrp === pgid && state !== 'Z') {
+            live.push(Number(entry));
+          }
+        } catch {
+          // The process exited between readdir and read; ignore it.
+        }
+      }
+      return live;
+    };
     const groupExists = () => {
+      const liveMembers = liveMembersInGroup(child.pid);
+      if (liveMembers !== null) {
+        return liveMembers.length > 0;
+      }
       try {
         kill(-child.pid, 0);
         // kill(0) succeeded, but if the root child is a defunct zombie and
@@ -1025,6 +1091,14 @@ const probeGrafanaHealthDefault = (url, timeoutMs = 2500) => new Promise((resolv
         done({ healthy: false, evidence: 'Grafana health response was not valid JSON.' });
       }
     });
+    // If the endpoint sends headers (and possibly partial data) then aborts or
+    // closes the socket before 'end', the promise would otherwise hang: the
+    // request timeout does not re-fire once a response has begun. 'close' runs
+    // after a normal 'end' too, but done() is idempotent so the late call is a
+    // no-op; in the abort case it is the only path that settles the probe, so
+    // runPreflight records a BLOCKED Grafana row instead of hanging forever.
+    response.once('close', () => done({ healthy: false, evidence: 'Grafana health response closed before completion.' }));
+    response.once('error', () => done({ healthy: false, evidence: 'Grafana health response stream errored before completion.' }));
   });
   request.once('timeout', () => {
     request.destroy();
@@ -1083,7 +1157,7 @@ const runPreflight = async ({
   const toolVersions = {};
   const shell = resolveCommandShell({ env });
   try {
-    await access(shell);
+    await probeCommandShell(shell, env);
     checks.push({ name: 'command-shell', status: 'PASS', evidence: shell });
   } catch {
     checks.push({ name: 'command-shell', status: 'BLOCKED', evidence: `Required shell not found: ${shell}` });

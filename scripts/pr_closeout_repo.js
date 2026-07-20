@@ -1,7 +1,7 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { createReadStream } = require('node:fs');
-const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
+const { constants, createReadStream } = require('node:fs');
+const { lstat, open, readFile, readdir, readlink } = require('node:fs/promises');
 const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
 
@@ -121,30 +121,43 @@ const MAX_SUPPRESSION_SCAN_BYTES = 5 * 1024 * 1024;
 // Sample the first N bytes for a NUL byte to detect binary files quickly
 // without loading the whole file.
 const BINARY_SAMPLE_BYTES = 4096;
-const openForScan = (absolute) => new Promise((resolve, reject) => {
-  require('node:fs').open(absolute, 'r', (err, fd) => {
-    if (err) reject(err); else resolve(fd);
-  });
-});
-const readScanHead = async (absolute, size) => {
-  const fd = await openForScan(absolute);
+
+// Open with O_NOFOLLOW (where the platform supports it) so a final-component
+// symlink is rejected at open time, closing the lstat-then-readFile TOCTOU
+// race: between a plain lstat and a subsequent path-based read, a concurrent
+// replacement can redirect the read through a symlink. Reading through the
+// returned file descriptor cannot be redirected. On platforms without
+// O_NOFOLLOW (e.g. Windows), the caller's lstat symlink check still rejects
+// static symlinks. Mirrors the existing openArtifact behavior.
+const openNoFollow = async (absolute) => {
+  const noFollow = constants.O_NOFOLLOW || 0;
   try {
-    const buffer = Buffer.allocUnsafe(size);
-    const { bytesRead } = await new Promise((resolve, reject) => {
-      require('node:fs').read(fd, buffer, 0, size, 0, (error, n) => error ? reject(error) : resolve({ bytesRead: n }));
-    });
-    return buffer.subarray(0, bytesRead);
-  } finally {
-    require('node:fs').closeSync(fd);
+    return await open(absolute, constants.O_RDONLY | noFollow);
+  } catch (error) {
+    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    return open(absolute, constants.O_RDONLY);
   }
+};
+
+const readHeadFromHandle = async (handle, size) => {
+  const buffer = Buffer.allocUnsafe(size);
+  const { bytesRead } = await handle.read(buffer, 0, size, 0);
+  return buffer.subarray(0, bytesRead);
 };
 
 const scanTouchedSuppressions = async (repo, files) => {
   const findings = [];
   for (const file of files) {
+    let handle;
     try {
       const absolute = path.join(repo, file);
-      const stats = await lstat(absolute);
+      let stats;
+      try {
+        stats = await lstat(absolute);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        continue;
+      }
       if (stats.isSymbolicLink()) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
         continue;
@@ -156,13 +169,25 @@ const scanTouchedSuppressions = async (repo, files) => {
         findings.push({ file, line: 0, category: 'scan-error', match: `Touched file exceeds suppression scan limit (${stats.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes).` });
         continue;
       }
+      // Open with O_NOFOLLOW (where supported) and read through the resulting
+      // file descriptor so a concurrent replacement cannot redirect the read
+      // through a symlink between the lstat above and the bytes we scan.
+      try {
+        handle = await openNoFollow(absolute);
+      } catch (error) {
+        if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+          findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
+          continue;
+        }
+        throw error;
+      }
       // Sample the first bytes for a NUL to detect binary files; scanning
       // them as text via decodeTouchedText already throws on NUL but we want
       // a clean scan-error finding instead of letting the throw bubble.
       // UTF-16 files start with a BOM (FF FE or FE FF) and contain NUL bytes
       // legitimately, so do not flag those as binary.
       if (stats.size > 0) {
-        const head = await readScanHead(absolute, Math.min(BINARY_SAMPLE_BYTES, stats.size));
+        const head = await readHeadFromHandle(handle, Math.min(BINARY_SAMPLE_BYTES, stats.size));
         const isUtf16Bom = head.length >= 2 && (
           (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff)
         );
@@ -171,12 +196,14 @@ const scanTouchedSuppressions = async (repo, files) => {
           continue;
         }
       }
-      const bytes = await readFile(absolute);
+      const bytes = await handle.readFile();
       findings.push(...scanSuppressionText(file, decodeTouchedText(bytes)));
     } catch (error) {
       if (error.code !== 'ENOENT') {
         findings.push({ file, line: 0, category: 'scan-error', match: error.message });
       }
+    } finally {
+      if (handle) await handle.close().catch(() => {});
     }
   }
   return findings;
@@ -308,11 +335,26 @@ const readGateChanges = async (repo, baseSha) => {
   const changedFiles = [...new Set([...changed, ...untracked].filter(isGateFile))].sort();
   if (!changedFiles.length) return { changedFiles, addedLines: [] };
   const tracked = changedFiles.filter((file) => !untracked.includes(file));
-  const diff = tracked.length
-    ? await gitText(repo, ['diff', '--unified=0', '--no-ext-diff', baseSha, '--', ...tracked])
-    : '';
-  const addedLines = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+  // Contain a very large tracked gate-file diff (e.g. a regenerated
+  // pnpm-lock.yaml or workspace manifest churn) that would exceed execFile's
+  // maxBuffer and reject out of readGateChanges before the workflow can write a
+  // structured evidence report. On overflow (or any git failure), record a
+  // bounded decode-error marker for the tracked gate files and continue to the
+  // untracked-file scan so the caller still receives a structured result.
+  let diff = '';
+  let trackedDiffError = null;
+  if (tracked.length) {
+    try {
+      diff = await gitText(repo, ['diff', '--unified=0', '--no-ext-diff', baseSha, '--', ...tracked]);
+    } catch (error) {
+      trackedDiffError = error;
+    }
+  }
+  const addedLines = trackedDiffError
+    ? [`+__decode_error__:${tracked.join(',')}:diff_buffer_exceeded:${trackedDiffError?.code || trackedDiffError?.message || trackedDiffError}`]
+    : diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
+    let handle;
     try {
       const absolute = path.join(repo, file);
       // Reject untracked gate symlinks before decoding: a PR can add
@@ -331,12 +373,34 @@ const readGateChanges = async (repo, baseSha) => {
         addedLines.push(`+__decode_error__:${file}:symlink_not_allowed`);
         continue;
       }
-      const text = decodeTouchedText(await readFile(absolute));
+      // Bound reads of untracked gate files the same way scanTouchedSuppressions
+      // bounds touched-file reads: a large untracked lockfile or generated
+      // config must not exhaust memory before the dirty-tree result can stop
+      // the run.
+      if (info.size > MAX_SUPPRESSION_SCAN_BYTES) {
+        addedLines.push(`+__decode_error__:${file}:exceeds_scan_limit`);
+        continue;
+      }
+      // Open with O_NOFOLLOW (where supported) and read through the descriptor
+      // so a concurrent replacement cannot redirect the read through a symlink
+      // between the lstat above and the bytes we decode.
+      try {
+        handle = await openNoFollow(absolute);
+      } catch (error) {
+        if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+          addedLines.push(`+__decode_error__:${file}:symlink_not_allowed`);
+          continue;
+        }
+        throw error;
+      }
+      const text = decodeTouchedText(await handle.readFile());
       for (const line of text.split(/\r?\n/)) {
         addedLines.push(`+${line}`);
       }
     } catch (error) {
       addedLines.push(`+__decode_error__:${file}:${error.message}`);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
     }
   }
   return { changedFiles, addedLines };

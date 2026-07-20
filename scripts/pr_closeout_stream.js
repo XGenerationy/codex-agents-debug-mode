@@ -82,12 +82,18 @@ const buildSecretReplacements = (env = process.env, names = []) => {
       const value = env[name];
       if (typeof value !== 'string') return undefined;
       if (value.length === 0) return undefined;
-      if (!isExplicit(name) && value.length < MIN_AUTO_SECRET_LENGTH) return undefined;
-      return value;
+      const explicit = isExplicit(name);
+      if (!explicit && value.length < MIN_AUTO_SECRET_LENGTH) return undefined;
+      return { value, explicit };
     })
     .filter(Boolean)
-    .flatMap(secretComponents)
-    .flatMap(secretVariants);
+    .flatMap(({ value, explicit }) => {
+      const variants = secretComponents(value).flatMap(secretVariants);
+      // For auto-discovered (non-explicit) names, also drop short extracted
+      // components/variants (e.g. a URL's "pw" fragment) so they cannot
+      // over-redact ordinary text. Explicitly-listed names keep every variant.
+      return explicit ? variants : variants.filter((variant) => typeof variant === 'string' && variant.length >= MIN_AUTO_SECRET_LENGTH);
+    });
   return [...new Set(values)]
     .filter((value) => typeof value === 'string' && value.length > 0)
     .sort((left, right) => right.length - left.length)
@@ -217,6 +223,7 @@ const createStreamingSignalScanner = (
 };
 
 module.exports = {
+  MIN_AUTO_SECRET_LENGTH,
   buildChildEnvironment,
   buildSecretReplacements,
   createDecodedRedactor,

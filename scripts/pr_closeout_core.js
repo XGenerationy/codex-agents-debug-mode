@@ -39,7 +39,13 @@ const CONFIG_SILENCING = [
   // Consume the optional closing quote on the JSON key (e.g. "enabled":false,
   // "ignorePatterns":[...], "exclude":[...]) so config-level disabling in
   // tsconfig/eslint/biome JSON no longer slips past the scan.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]/i,
+  // Only flag ignore/exclude keys whose value targets source/test/spec paths.
+  // A bare `"exclude":` key fires on routine config (nearly every tsconfig.json
+  // excludes "dist"/"node_modules"; CI matrices use strategy.matrix.exclude),
+  // producing false config-silencing findings on clean PRs. Require the value
+  // to reference src/test/spec globs so only genuine source/test suppression
+  // is flagged.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'][^"'\r\n]*(?:src|test|spec)[^"'\r\n]*["']/i,
   /\|\|\s*true\b/i,
 ];
 
@@ -227,13 +233,26 @@ const scanSuppressionText = (file, text) => {
   // touched test file and still pass the closeout scan if the reduced test
   // command exits 0.
   const testLike = /(?:^|[._-])(?:test|spec)s?\.[a-z0-9]+$/i.test(base)
-    || /\.(?:test|spec)\.[a-z0-9]+$/i.test(base);
+    || /\.(?:test|spec)\.[a-z0-9]+$/i.test(base)
+    // Also classify files inside a __tests__/ directory (a standard Jest
+    // layout with no test/spec token in the filename) as test files so
+    // weakening markers (describe.only/it.skip/test.todo) in them are scanned.
+    || /(?:^|\/)__tests__\//i.test(normalized);
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const markerPattern = new RegExp(MARKERS
     .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
     .join('|'), 'i');
+  // A line whose non-whitespace content is a single quoted string literal
+  // (with an optional trailing comma) is data, not an active directive: the
+  // scanner's own MARKERS vocabulary (`'skipcq',`) and quoted test fixtures
+  // (`'// noqa',`) would otherwise self-flag and block implementation changes
+  // to this tool. Real suppression directives (`// skipcq`, `# noqa`) are
+  // never sole quoted strings, so skipping these lines preserves directive
+  // detection while avoiding self-referential false positives.
+  const isStringLiteralData = (line) => /^\s*['"`][^'"`\r\n]*['"`],?\s*$/.test(line);
   const lines = text.split(/\r?\n/);
   lines.forEach((line, index) => {
+    if (isStringLiteralData(line)) return;
     const marker = line.match(markerPattern);
     if (marker) findings.push({ file, line: index + 1, category: 'marker', match: marker[0] });
   });

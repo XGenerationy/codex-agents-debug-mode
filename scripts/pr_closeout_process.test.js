@@ -19,6 +19,8 @@ const {
   spawnCaptured,
 } = require('./pr_closeout_process');
 
+const { MIN_AUTO_SECRET_LENGTH } = require('./pr_closeout_stream');
+
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
   server.listen(0, '127.0.0.1', () => resolve(server.address().port));
@@ -99,6 +101,18 @@ test('does not auto-redact short sensitive values to avoid over-broad replacemen
   // The short auto-discovered value must remain visible to avoid corrupting
   // ordinary text where it appears as a substring.
   assert.match(output, /short=tiny/);
+});
+
+test('redacts auto-discovered secrets at exactly MIN_AUTO_SECRET_LENGTH and treats shorter as visible', () => {
+  // The redactor uses value.length < MIN_AUTO_SECRET_LENGTH to skip short
+  // auto-discovered values, so a value of exactly the threshold must be
+  // redacted while anything shorter stays visible.
+  const boundary = '12345678'; // length === MIN_AUTO_SECRET_LENGTH (8)
+  assert.equal(boundary.length, MIN_AUTO_SECRET_LENGTH);
+  const env = { API_TOKEN: boundary };
+  assert.equal(redactSecrets(`tok=${boundary}`, env).includes(boundary), false);
+  const shorter = '1234567'; // length === MIN_AUTO_SECRET_LENGTH - 1
+  assert.equal(redactSecrets(`short=${shorter}`, { API_TOKEN: shorter }).includes(shorter), true);
 });
 
 test('streaming redaction covers automatically discovered encoded secrets across chunks', () => {
