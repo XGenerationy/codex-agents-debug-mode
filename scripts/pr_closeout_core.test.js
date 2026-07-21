@@ -143,6 +143,10 @@ test('treats a no-test run as a failure even when the runner exits 0', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'No tests found, exiting with code 0' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'No test files found ["src/**/*.spec.ts"]' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stderr: 'no tests to run' }).status, 'FAIL');
+  // Numeric no-work summaries (Node TAP "# tests 0" / "# pass 0", Vitest
+  // "Tests 0 passed (0)" / "Test Files 0") must also be treated as no-work.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '# tests 0\n# pass 0' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files  0 (0)     Tests  0 passed (0)' }).status, 'FAIL');
   // A normal "no tests were skipped" passing summary must NOT be flagged.
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'no tests were skipped' }).status, 'PASS');
 });
@@ -292,6 +296,20 @@ test('does not flag suppression vocabulary that is sole quoted-string data', () 
     'real // skipcq directive must still be detected',
   );
   assert.match(directive.find(({ category }) => category === 'marker').match, /skipcq/i);
+});
+
+test('does not flag marker vocabulary in markdown inline-code spans', () => {
+  // Documentation that lists the marker vocabulary in markdown inline-code
+  // (e.g. references/pr-closeout-validation.md) must not self-flag: a marker
+  // wrapped in backticks is an example, not a directive. Real directives in
+  // prose (// skipcq, # noqa) are not wrapped and are still detected.
+  assert.deepEqual(scanSuppressionText('references/pr-closeout-validation.md', '- `skipcq`'), []);
+  assert.deepEqual(scanSuppressionText('README.md', 'Use `eslint-disable` only as a last resort.'), []);
+  assert.deepEqual(scanSuppressionText('docs.md', 'Token wrapping (`biome-ignore`) is discouraged.'), []);
+  assert.ok(
+    scanSuppressionText('notes.md', 'Remember: // skipcq is forbidden.').some(({ category }) => category === 'marker'),
+    'a real // skipcq directive in prose must still be detected',
+  );
 });
 
 test('detects common config-level compiler, framework, linter, and ignore-file silencing', () => {

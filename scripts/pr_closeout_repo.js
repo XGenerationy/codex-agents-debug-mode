@@ -165,6 +165,13 @@ const scanTouchedSuppressions = async (repo, files) => {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
         continue;
       }
+      // Reject non-regular files (FIFO, socket, device): a read-only FIFO on
+      // POSIX blocks forever waiting for a writer, stalling the scan before
+      // any dirty-tree result can stop the run.
+      if (!stats.isFile()) {
+        findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is not a regular file; refusing to read.' });
+        continue;
+      }
       // Reject oversized files before reading them: a large untracked artifact
       // should not block admission with multi-MiB reads when the suppression
       // vocabulary is small.
@@ -240,6 +247,10 @@ const hashFsEntry = async (absolute) => {
   }
   if (info.isSymbolicLink()) {
     return hashBytes(`symlink:${await readlink(absolute)}`);
+  }
+  if (!info.isFile()) {
+    // FIFO/socket/device: streaming would block or read non-file content.
+    return hashBytes('non-regular');
   }
   try {
     return await hashFile(absolute);
@@ -384,6 +395,10 @@ const readGateChanges = async (repo, baseSha) => {
       }
       if (info.isSymbolicLink()) {
         addedLines.push(`+__decode_error__:${file}:symlink_not_allowed`);
+        continue;
+      }
+      if (!info.isFile()) {
+        addedLines.push(`+__decode_error__:${file}:non_regular_file`);
         continue;
       }
       // Bound reads of untracked gate files the same way scanTouchedSuppressions

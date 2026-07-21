@@ -230,6 +230,14 @@ const classifyOutput = ({
   if (/\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined) || /\bno\s+test\s+files?\s+found\b/i.test(combined)) {
     return { status: 'FAIL', evidence: 'Test runner reported no tests found/executed; closeout requires authoritative test evidence.' };
   }
+  // Numeric no-work summaries from common runners: Node's TAP `# tests 0` /
+  // `# pass 0` and Vitest's `Tests 0 passed (0)` / `Test Files 0`. These exit 0
+  // while doing no work; the closeout gate requires authoritative test evidence.
+  if (/^[ \t]*#\s*tests?\s+0\b/im.test(combined)
+    || /\btests?\s+0\s+passed\b/i.test(combined)
+    || /\btest\s+files?\s+0\b/i.test(combined)) {
+    return { status: 'FAIL', evidence: 'Test runner reported zero tests as the total; closeout requires authoritative test evidence.' };
+  }
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
 };
 
@@ -268,8 +276,21 @@ const scanSuppressionText = (file, text) => {
   const lines = text.split(/\r?\n/);
   lines.forEach((line, index) => {
     if (isStringLiteralData(line)) return;
-    const marker = line.match(markerPattern);
-    if (marker) findings.push({ file, line: index + 1, category: 'marker', match: marker[0] });
+    // Iterate every marker occurrence so each can be assessed independently.
+    const globalPattern = new RegExp(markerPattern.source, 'gi');
+    for (const match of line.matchAll(globalPattern)) {
+      // A marker wrapped in matching quote/backtick characters is data, not a
+      // directive: a markdown inline-code span (`skipcq`) in documentation, a
+      // quoted token, or a template literal. Real directives (// skipcq,
+      // # noqa, <!-- biome-ignore -->) are never wrapped this way, so skipping
+      // wrapped matches preserves directive detection while exempting the
+      // scanner's own documented vocabulary from self-flagging.
+      const before = line[match.index - 1];
+      const after = line[match.index + match[0].length];
+      if (before && after && before === after && '\'`""'.includes(before)) continue;
+      findings.push({ file, line: index + 1, category: 'marker', match: match[0] });
+      break;
+    }
   });
   if (ignoreFile) {
     lines.forEach((line, index) => {

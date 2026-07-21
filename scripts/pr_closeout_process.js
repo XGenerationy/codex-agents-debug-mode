@@ -512,6 +512,16 @@ const spawnCaptured = async ({
   if (outcome?.spawnError) record('stderr', outcome.spawnError.message);
   flush('stdout');
   flush('stderr');
+  // Drain the evidence log BEFORE building the result so a write error during
+  // the final flush (ENOSPC on buffered data, perms change, removed logs dir)
+  // is reflected in result.logWriteError instead of being lost: the result
+  // previously captured logError before this flush ran, so a late flush error
+  // could let a command PASS while the durable raw evidence was incomplete.
+  await new Promise((resolve) => {
+    if (logError) return resolve();
+    log.end(resolve);
+    log.once('error', resolve);
+  });
   const finishedAt = new Date().toISOString();
   const result = {
     exitCode: outcome?.exitCode ?? null,
@@ -536,11 +546,6 @@ const spawnCaptured = async ({
     ],
     logWriteError: logError ? logError.message : null,
   };
-  await new Promise((resolve) => {
-    if (logError) return resolve();
-    log.end(resolve);
-    log.once('error', resolve);
-  });
   return result;
 };
 
@@ -816,10 +821,14 @@ const evaluateCommandProof = ({ check, execution }) => {
       };
     }
     const rows = parseDockerComposeRows(execution.stdout);
-    const explicitlyNamed = rows.filter((row) => row && typeof row === 'object' && Object.hasOwn(row, 'Service'));
-    const hunterRows = (explicitlyNamed.length
-      ? explicitlyNamed.filter((row) => String(row.Service).toLowerCase() === 'hunter')
-      : rows).filter((row) => row && typeof row === 'object');
+    // Require an explicit Service=hunter row. docker compose ps --format json
+    // always includes Service; JSON without any Service field cannot prove the
+    // running/healthy row is the hunter service (another container could
+    // satisfy State/Health), so fail closed instead of treating every row as
+    // hunter.
+    const hunterRows = rows
+      .filter((row) => row && typeof row === 'object' && Object.hasOwn(row, 'Service'))
+      .filter((row) => String(row.Service).toLowerCase() === 'hunter');
     const matched = hunterRows.length > 0 && hunterRows.every((row) => (
       String(row.State).toLowerCase() === 'running' && String(row.Health).toLowerCase() === 'healthy'
     ));
