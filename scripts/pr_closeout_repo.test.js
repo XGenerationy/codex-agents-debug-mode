@@ -175,10 +175,33 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
     } catch {
       // unset
     }
+    // Global exclude seal must match workingTreeFingerprint (XDG + global core).
+    const os = require('node:os');
+    const globalExcludeParts = [];
+    try {
+      const globalExcludes = git(repo, 'config', '--global', '--get', 'core.excludesFile');
+      if (globalExcludes) {
+        const resolved = path.isAbsolute(globalExcludes)
+          ? globalExcludes
+          : path.resolve(os.homedir(), globalExcludes);
+        globalExcludeParts.push(`globalCore:${resolved}\0${hashFileOrMissing(resolved)}`);
+      } else {
+        globalExcludeParts.push('globalCore:unset');
+      }
+    } catch {
+      globalExcludeParts.push('globalCore:unset');
+    }
+    const xdgConfig = process.env.XDG_CONFIG_HOME
+      ? process.env.XDG_CONFIG_HOME
+      : path.join(os.homedir(), '.config');
+    const xdgIgnore = path.join(xdgConfig, 'git', 'ignore');
+    globalExcludeParts.push(`xdg:${xdgIgnore}\0${hashFileOrMissing(xdgIgnore)}`);
+    const globalExcludesHash = hashBytes(globalExcludeParts.sort().join('\n'));
     const expectedFingerprint = fingerprintEntries([
       { path: '__tracked_diff__', hash: require('node:crypto').createHash('sha256').update(trackedDiff).digest('hex') },
       { path: '__git_info_exclude__', hash: hashFileOrMissing(excludePath) },
       { path: '__git_core_excludesFile__', hash: excludesFileHash },
+      { path: '__git_global_excludes__', hash: globalExcludesHash },
       { path: 'large-untracked.bin', hash: expected },
     ]);
     const fingerprint = await workingTreeFingerprint(repo);

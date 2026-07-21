@@ -375,14 +375,16 @@ const scanSuppressionText = (file, text) => {
           if (ch === quote) quote = null;
           continue;
         }
-        // An unquoted `//` starts a line comment. Real string literals cannot
-        // span past it, so any earlier raw apostrophe (e.g. "don't" in a
-        // comment) was never a quote-open — stop and treat the match as code.
-        if (ch === '/' && line[i + 1] === '/') return false;
-        // Same for block comments: /* don't */ must not open a string.
+        // An unquoted `//` starts a line comment. Matches after it are inert
+        // (the test runner never executes them), so treat the match as skipped.
+        if (ch === '/' && line[i + 1] === '/') return true;
+        // Same for block comments: /* don't */ must not open a string, and a
+        // match still inside an unclosed or surrounding block comment is inert.
         if (ch === '/' && line[i + 1] === '*') {
           const end = line.indexOf('*/', i + 2);
-          if (end === -1) return false;
+          if (end === -1) return true;
+          // Match falls inside this block comment.
+          if (at > i && at < end) return true;
           i = end + 1;
           continue;
         }

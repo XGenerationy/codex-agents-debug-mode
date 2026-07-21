@@ -2,6 +2,7 @@ const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { constants, createReadStream } = require('node:fs');
 const { lstat, open, readFile, readdir, readlink } = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
 
@@ -51,8 +52,20 @@ const withNoTextconv = (args) => {
   return out;
 };
 
+// Internal git must not run local fsmonitor/hooks configured in the repo or
+// user config — those would execute outside spawnCaptured containment.
+const withInternalGitSafety = (args) => ([
+  '-c', 'core.fsmonitor=',
+  '-c', 'core.useBuiltinFSMonitor=false',
+  ...withNoTextconv(args),
+]);
+
 const gitBuffer = async (repo, args) => {
-  const result = await execFileAsync('git', withNoTextconv(args), { cwd: repo, encoding: 'buffer', maxBuffer: 50_000_000 });
+  const result = await execFileAsync('git', withInternalGitSafety(args), {
+    cwd: repo,
+    encoding: 'buffer',
+    maxBuffer: 50_000_000,
+  });
   return result.stdout;
 };
 
@@ -385,6 +398,31 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   } catch {
     entries.push({ path: '__git_core_excludesFile__', hash: hashBytes('unset') });
   }
+  // Seal Git's default global excludes too (`--exclude-standard` also reads
+  // $XDG_CONFIG_HOME/git/ignore and the global core.excludesFile).
+  const globalExcludeParts = [];
+  try {
+    const globalExcludes = await gitText(repo, ['config', '--global', '--get', 'core.excludesFile']);
+    if (globalExcludes) {
+      const resolved = path.isAbsolute(globalExcludes)
+        ? globalExcludes
+        : path.resolve(os.homedir(), globalExcludes);
+      globalExcludeParts.push(`globalCore:${resolved}\0${await hashFsEntry(resolved)}`);
+    } else {
+      globalExcludeParts.push('globalCore:unset');
+    }
+  } catch {
+    globalExcludeParts.push('globalCore:unset');
+  }
+  const xdgConfig = process.env.XDG_CONFIG_HOME
+    ? process.env.XDG_CONFIG_HOME
+    : path.join(os.homedir(), '.config');
+  const xdgIgnore = path.join(xdgConfig, 'git', 'ignore');
+  globalExcludeParts.push(`xdg:${xdgIgnore}\0${await hashFsEntry(xdgIgnore)}`);
+  entries.push({
+    path: '__git_global_excludes__',
+    hash: hashBytes(globalExcludeParts.sort().join('\n')),
+  });
   for (const file of untracked) {
     // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
     // hashFile guard has one owner. A validation command may leave a link to
@@ -399,7 +437,10 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
 };
 
 const cleanTreeStatus = async (repo) => {
-  const raw = await gitText(repo, ['status', '--porcelain=v1']);
+  // Force untracked reporting even when status.showUntrackedFiles=no is set
+  // locally/globally; otherwise porcelain omits untracked files and a dirty
+  // tree can PASS while fingerprints still see the same stable untracked set.
+  const raw = await gitText(repo, ['status', '--porcelain=v1', '--untracked-files=all']);
   if (raw) {
     return { status: 'FAIL', evidence: `Working tree is not clean: ${raw.split(/\r?\n/).slice(0, 20).join(' | ')}` };
   }

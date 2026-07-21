@@ -233,6 +233,21 @@ const appendSessionEvent = (session, serializedEvent) => {
       ) {
         throw new RequestError('session_log_replaced', 409);
       }
+      // Re-verify the opened log still resolves inside the project even if the
+      // original .debug directory was renamed out and replaced with a symlink
+      // to an outside path (inode can still match the moved tree).
+      if (identity.projectRootReal) {
+        let realLog;
+        try {
+          realLog = await realpath(session.logFile);
+        } catch {
+          throw new RequestError('session_log_replaced', 409);
+        }
+        const rel = path.relative(identity.projectRootReal, realLog);
+        if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+          throw new RequestError('session_log_replaced', 409);
+        }
+      }
       await handle.writeFile(serializedEvent, 'utf8');
       identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
     } finally {
@@ -374,6 +389,8 @@ const createDebugServer = ({
               ino: info.ino,
               birthtimeMs: info.birthtimeMs,
               bytesWritten: 0,
+              projectRootReal: resolvedRoot,
+              logDirReal: resolvedLogDir,
             };
           } finally {
             await handle.close();

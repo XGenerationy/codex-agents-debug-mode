@@ -121,29 +121,91 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   return live;
 };
 
-const sweepSpawnMarkOrphans = async ({
+// Secondary containment: find live non-zombie processes whose cwd is under the
+// sealed worktree and whose starttime is at/after the spawn. A child that
+// unsets OMO_CLOSEOUT_SPAWN_MARK (env -u) still typically keeps the worktree
+// cwd, so this reaps mark-stripped setsid orphans.
+const listLivePidsWithCwdUnder = (rootCwd, {
+  selfPid = process.pid,
+  minStarttime = 0,
+} = {}) => {
+  if (!rootCwd) return [];
+  let entries;
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return null;
+  }
+  const { readlinkSync } = require('node:fs');
+  let rootReal;
+  try {
+    rootReal = require('node:fs').realpathSync(rootCwd);
+  } catch {
+    rootReal = path.resolve(rootCwd);
+  }
+  const live = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid === selfPid || pid === 1) continue;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm < 0) continue;
+      const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
+      const state = fields[0];
+      if (state === 'Z') continue;
+      // /proc/pid/stat: after (comm) → state ppid pgrp session ... starttime is
+      // field index 19 in the post-comm fields (man proc_pid_stat).
+      const starttime = Number(fields[19]);
+      if (Number.isFinite(minStarttime) && Number.isFinite(starttime) && starttime < minStarttime) {
+        continue;
+      }
+      let cwdLink;
+      try {
+        cwdLink = readlinkSync(`/proc/${pid}/cwd`);
+      } catch {
+        continue;
+      }
+      const cwdReal = path.resolve(cwdLink);
+      const rel = path.relative(rootReal, cwdReal);
+      if (rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))) {
+        live.push(pid);
+      }
+    } catch {
+      // Process exited or unreadable.
+    }
+  }
+  return live;
+};
+
+const sweepDetachedOrphans = async ({
   mark,
+  cwd,
+  minStarttime = 0,
   kill = process.kill.bind(process),
   terminationGraceMs = 2000,
   selfPid = process.pid,
 } = {}) => {
-  if (!mark) {
-    return { status: 'PASS', evidence: 'No spawn mark to sweep.', escalated: false };
-  }
-  const list = () => listLivePidsWithSpawnMark(mark, { selfPid });
+  const list = () => {
+    const byMark = listLivePidsWithSpawnMark(mark, { selfPid });
+    const byCwd = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
+    if (byMark === null && byCwd === null) return null;
+    return [...new Set([...(byMark || []), ...(byCwd || [])])];
+  };
   let remaining = list();
   if (remaining === null) {
     // Non-Linux: process-group termination is the only containment available.
     return {
       status: 'PASS',
-      evidence: 'Spawn-mark orphan sweep skipped (/proc unavailable).',
+      evidence: 'Detached orphan sweep skipped (/proc unavailable).',
       escalated: false,
     };
   }
   if (remaining.length === 0) {
     return {
       status: 'PASS',
-      evidence: 'No detached spawn-mark descendants remained.',
+      evidence: 'No detached spawn-mark or worktree-cwd descendants remained.',
       escalated: false,
     };
   }
@@ -156,7 +218,7 @@ const sweepSpawnMarkOrphans = async ({
     if (remaining.length === 0) {
       return {
         status: 'PASS',
-        evidence: 'Detached spawn-mark descendants stopped after SIGTERM.',
+        evidence: 'Detached descendants stopped after SIGTERM (mark/cwd sweep).',
         escalated: false,
       };
     }
@@ -172,7 +234,7 @@ const sweepSpawnMarkOrphans = async ({
     if (remaining.length === 0) {
       return {
         status: 'PASS',
-        evidence: 'Detached spawn-mark descendants required SIGKILL and are gone.',
+        evidence: 'Detached descendants required SIGKILL and are gone (mark/cwd sweep).',
         escalated: true,
       };
     }
@@ -182,13 +244,13 @@ const sweepSpawnMarkOrphans = async ({
   if (remaining.length === 0) {
     return {
       status: 'PASS',
-      evidence: 'Detached spawn-mark descendants required SIGKILL and are gone.',
+      evidence: 'Detached descendants required SIGKILL and are gone (mark/cwd sweep).',
       escalated: true,
     };
   }
   return {
     status: 'BLOCKED',
-    evidence: `Detached spawn-mark descendants still live after SIGTERM/SIGKILL: pids ${remaining.slice(0, 8).join(',')}.`,
+    evidence: `Detached descendants still live after SIGTERM/SIGKILL: pids ${remaining.slice(0, 8).join(',')}.`,
     escalated: true,
   };
 };
@@ -202,6 +264,8 @@ const terminateProcessTree = async ({
   kill = process.kill.bind(process),
   closePromise,
   spawnMark,
+  cwd,
+  minStarttime = 0,
 } = {}) => {
   if (!Number.isInteger(child?.pid) || child.pid <= 0) {
     return { status: 'BLOCKED', evidence: 'Process-tree termination has no valid process identifier.', escalated: false };
@@ -334,11 +398,14 @@ const terminateProcessTree = async ({
       if (closePromise) await Promise.race([closePromise, delay(terminationGraceMs)]);
     };
     // After the process group looks gone, still sweep descendants that left
-    // the group (setsid / detached:true) via the per-spawn environ mark.
+    // the group (setsid / detached:true) via the per-spawn environ mark and
+    // worktree-cwd + starttime containment (covers env -u mark stripping).
     const withOrphanSweep = async (groupResult) => {
       if (groupResult.status === 'BLOCKED') return groupResult;
-      const sweep = await sweepSpawnMarkOrphans({
+      const sweep = await sweepDetachedOrphans({
         mark: spawnMark,
+        cwd,
+        minStarttime,
         kill,
         terminationGraceMs,
       });
@@ -648,6 +715,10 @@ const spawnCaptured = async ({
   const spawnEnv = spawnMark
     ? { ...env, [SPAWN_MARK_ENV]: spawnMark }
     : env;
+  // Capture approximate starttime for /proc-based cwd sweeps. On Linux this
+  // is jiffies since boot; we re-read the child's starttime after spawn when
+  // /proc is available so the orphan filter is exact.
+  let minStarttime = 0;
   const child = spawnProcess(shell, shellArgs(command), {
     cwd,
     env: spawnEnv,
@@ -655,6 +726,19 @@ const spawnCaptured = async ({
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  if (platform !== 'win32' && Number.isInteger(child?.pid)) {
+    try {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm >= 0) {
+        const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
+        const starttime = Number(fields[19]);
+        if (Number.isFinite(starttime)) minStarttime = starttime;
+      }
+    } catch {
+      minStarttime = 0;
+    }
+  }
   const emitNormalized = (stream, normalized) => {
     if (!normalized) return;
     if (stream === 'stdout') stdout = cappedAppend(stdout, normalized);
@@ -721,6 +805,8 @@ const spawnCaptured = async ({
         terminationGraceMs,
         closePromise,
         spawnMark,
+        cwd,
+        minStarttime,
       });
   } else {
     timedOut = true;
@@ -731,6 +817,8 @@ const spawnCaptured = async ({
       terminationGraceMs,
       closePromise,
       spawnMark,
+      cwd,
+      minStarttime,
     });
     outcome = await Promise.race([
       closePromise,
@@ -1033,7 +1121,12 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
           if (!frame || typeof frame !== 'object') return false;
           const values = frame?.data?.values;
           if (Array.isArray(values)) {
-            return values.length > 0 && values.some((series) => Array.isArray(series) && series.length > 0);
+            // Require at least one non-null/non-empty datapoint, not just a
+            // series of nulls (e.g. values: [[null, null]]).
+            return values.length > 0 && values.some((series) => (
+              Array.isArray(series)
+              && series.some((point) => point !== null && point !== undefined && point !== '')
+            ));
           }
           // Some Grafana responses carry a schema/len pair without inline
           // values; accept only when at least one numeric field is non-empty.
@@ -1041,10 +1134,12 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
           return Number.isFinite(numeric) && numeric > 0;
         });
       }
-      // Legacy single-result shape: require a non-empty values array holding
-      // at least one non-empty series (values: [null] is not usable data).
+      // Legacy single-result shape: require at least one real datapoint.
       return Array.isArray(entry?.data?.values) && entry.data.values.length > 0
-        && entry.data.values.some((series) => Array.isArray(series) && series.length > 0);
+        && entry.data.values.some((series) => (
+          Array.isArray(series)
+          && series.some((point) => point !== null && point !== undefined && point !== '')
+        ));
     });
     if (!usableFrames.length) {
       return { status: 'FAIL', evidence: 'Grafana live query proof contained no result entry with non-empty frame data.' };
@@ -1571,6 +1666,7 @@ module.exports = {
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeGrafanaHealthDefault,
   probeRedisDefault,
@@ -1581,7 +1677,7 @@ module.exports = {
   runPreflight,
   spawnCaptured,
   snapshotArtifactProof,
-  sweepSpawnMarkOrphans,
+  sweepDetachedOrphans,
   terminateProcessTree,
   verifyArtifactProof,
 };

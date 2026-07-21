@@ -186,16 +186,22 @@ test('flags focused or skipped tests in touched test files', () => {
     require('node:fs').readFileSync(__filename, 'utf8'),
   ).filter(({ category }) => category === 'test-weakening');
   assert.equal(selfScan.length, 0, `scanner test fixtures must not self-flag: ${JSON.stringify(selfScan)}`);
-  // A contraction inside a preceding // comment must not open a bogus quote
+  // A contraction inside a preceding block comment must not open a bogus quote
   // that hides a real, executable .skip/.only call on the same line.
   const commentApostrophe = scanSuppressionText(
     'src/foo.test.js',
-    "// don't remove this: it.skip(\"temporarily disabled\");",
+    "/* don't remove this */ it.skip(\"temporarily disabled\");",
   ).filter(({ category }) => category === 'test-weakening');
   assert.equal(
     commentApostrophe.length,
     1,
-    `real it.skip after a contraction comment must be flagged: ${JSON.stringify(commentApostrophe)}`,
+    `real it.skip after a contraction block-comment must be flagged: ${JSON.stringify(commentApostrophe)}`,
+  );
+  // Pure line-comment examples are inert and must not fail closeout.
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "// it.only('example', () => {})")
+      .filter(({ category }) => category === 'test-weakening').length,
+    0,
   );
 });
 

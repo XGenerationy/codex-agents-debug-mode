@@ -1169,6 +1169,18 @@ test('rejects Grafana live frames that carry no real series values', async () =>
   assert.equal(nullSeries.status, 'FAIL');
   assert.match(nullSeries.evidence, /non-empty frame data/i);
 
+  // Series of only null datapoints (values: [[null, null]]) also fail.
+  const nullPoints = await execute({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify({
+      ...basePayload,
+      response: { results: { A: { frames: [{ data: { values: [[null, null]] } }] } } },
+    }))})`,
+    proof,
+  }, 'confirmation');
+  assert.equal(nullPoints.status, 'FAIL');
+  assert.match(nullPoints.evidence, /non-empty frame data/i);
+
   // The legacy single-result shape has the same requirement.
   const legacyNullSeries = await execute({
     id: 'grafana-live-render',

@@ -1,6 +1,6 @@
 const { execFile } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdtemp, rm } = require('node:fs/promises');
+const { mkdir, mkdtemp, rm } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -226,8 +226,14 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
   }
   let added = false;
   let primaryError;
+  // Disable hooks for internal worktree create/remove so a local
+  // post-checkout/post-rewrite hook cannot mutate evidence outside the
+  // command executor's timeout/redaction/process-tree controls.
+  const noHooksDir = path.join(parent, 'no-hooks');
+  await mkdir(noHooksDir, { recursive: true });
+  const withNoHooks = (args) => ['-c', `core.hooksPath=${noHooksDir}`, ...args];
   try {
-    await runGit(repo, ['worktree', 'add', '--detach', worktree, baseSha]);
+    await runGit(repo, withNoHooks(['worktree', 'add', '--detach', worktree, baseSha]));
     added = true;
     return await callback(worktree);
   } catch (error) {
@@ -236,8 +242,8 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
   } finally {
     try {
       if (added) {
-        await runGit(repo, ['worktree', 'remove', '--force', worktree]);
-        await runGit(repo, ['worktree', 'prune']);
+        await runGit(repo, withNoHooks(['worktree', 'remove', '--force', worktree]));
+        await runGit(repo, withNoHooks(['worktree', 'prune']));
       }
     } finally {
       try {

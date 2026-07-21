@@ -114,15 +114,21 @@ declare -a committed_flags=()
 
 cleanup_stages() {
   local path
+  # Use if/then (not `[[ ... ]] && rm`) so set -e never treats a non-matching
+  # path as a failing command when this runs from the EXIT trap.
   for path in "${stage_paths[@]+"${stage_paths[@]}"}"; do
-    [[ -n "$path" && -e "$path" ]] && rm -rf -- "$path"
+    if [[ -n "$path" && -e "$path" ]]; then
+      rm -rf -- "$path" || true
+    fi
   done
 }
 
 rollback_commits() {
   local i dest backup
   for ((i = ${#commit_dests[@]} - 1; i >= 0; i--)); do
-    [[ "${committed_flags[$i]:-}" == "1" ]] || continue
+    if [[ "${committed_flags[$i]:-}" != "1" ]]; then
+      continue
+    fi
     dest="${commit_dests[$i]}"
     backup="${commit_backups[$i]}"
     rm -rf -- "$dest" 2>/dev/null || true
