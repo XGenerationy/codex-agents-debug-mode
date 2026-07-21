@@ -61,6 +61,11 @@ const readJson = async (request, maxBodyBytes) => {
     if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ABORT_ERR' || error?.name === 'AbortError') {
       throw new RequestError('request_aborted', 400);
     }
+    // Unmatched stream errors may indicate a server-side bug; keep a structured
+    // 400 response for the client but retain stderr visibility (previously 500).
+    process.stderr.write(
+      `${JSON.stringify({ level: 'error', event: 'request.body_read_failed', reason: code || error?.message || String(error) })}\n`,
+    );
     throw new RequestError('request_failed', 400);
   }
 

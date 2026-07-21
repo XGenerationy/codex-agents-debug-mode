@@ -36,6 +36,8 @@ const CONFIG_SILENCING = [
   /["']?linter["']?\s*:\s*\{[\s\S]{0,4000}?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
+  // Next.js: eslint.ignoreDuringBuilds lets production builds pass with ESLint errors.
+  /["']?ignoreDuringBuilds["']?\s*:\s*true/i,
   // eslint/biome (and peer linters) --quiet suppresses warning output; since
   // the closeout gate treats warnings as a failing signal, adding --quiet to a
   // touched lint script hides exactly the warnings that would otherwise block
@@ -65,6 +67,8 @@ const CONFIG_SILENCING = [
   // the same way `|| true` does: `|| :` (POSIX no-op) and `|| exit 0`.
   /\|\|\s*:(?=\s|$|[;"'`&;\n])/i,
   /\|\|\s*exit\s+0\b/i,
+  // Unconditional zero-exit tails that do not need ||, e.g. `jest; exit 0`.
+  /(?:^|[;&\n])\s*exit\s+0\b/i,
 ];
 
 const define = (id, label, options = {}) => ({ id, label, ...options });
@@ -250,7 +254,9 @@ const classifyOutput = ({
   // files alongside real passes, which IS authoritative test evidence.
   if (/^[ \t]*#\s*tests?\s+0\b/im.test(combined)
     || /\btests?\s+0\s+passed\b/i.test(combined)
-    || new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STATUS_TERM}\\b)`, 'i').test(combined)) {
+    || new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STATUS_TERM}\\b)`, 'i').test(combined)
+    // Mocha-style no-work: "0 passing" with exit 0 (not "N passing" with failures).
+    || /(?:^|\n)\s*0\s+passing\b/i.test(combined)) {
     return { status: 'FAIL', evidence: 'Test runner reported zero tests as the total; closeout requires authoritative test evidence.' };
   }
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
@@ -365,6 +371,13 @@ const scanSuppressionText = (file, text) => {
         // span past it, so any earlier raw apostrophe (e.g. "don't" in a
         // comment) was never a quote-open — stop and treat the match as code.
         if (ch === '/' && line[i + 1] === '/') return false;
+        // Same for block comments: /* don't */ must not open a string.
+        if (ch === '/' && line[i + 1] === '*') {
+          const end = line.indexOf('*/', i + 2);
+          if (end === -1) return false;
+          i = end + 1;
+          continue;
+        }
         if (ch === "'" || ch === '"' || ch === '`') quote = ch;
       }
       return quote !== null;

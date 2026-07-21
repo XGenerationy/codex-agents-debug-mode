@@ -346,7 +346,7 @@ test('maps request stream errors to RequestError instead of bubbling as 500', as
     () => readJson(failing, 64 * 1024),
     (error) => error instanceof RequestError
       && error.status === 400
-      && (error.code === 'request_aborted' || error.code === 'request_failed'),
+      && error.code === 'request_aborted',
   );
 });
 

@@ -503,6 +503,33 @@ test('flags active test-weakening after a quoted fixture on the same line', () =
   assert.match(findings[0].match, /it\.only/i);
 });
 
+test('flags active test-weakening after a block-comment apostrophe on the same line', () => {
+  const findings = scanSuppressionText(
+    'src/foo.test.js',
+    "/* don't */ it.only('real', () => {});",
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(findings.length, 1, JSON.stringify(findings));
+  assert.match(findings[0].match, /it\.only/i);
+});
+
+test('rejects Mocha zero-passing summaries as no-work', () => {
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '0 passing' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '  0 passing (12ms)' }).status, 'FAIL');
+});
+
+test('flags unconditional exit 0 and Next.js ignoreDuringBuilds', () => {
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest >/dev/null 2>&1; exit 0' } }))
+      .some((f) => f.category === 'config-silencing'),
+    'unconditional exit 0 must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('next.config.js', 'module.exports = { eslint: { ignoreDuringBuilds: true } }')
+      .some((f) => f.category === 'config-silencing'),
+    'ignoreDuringBuilds must be flagged',
+  );
+});
+
 test('detects multiline config rule disabling', () => {
   const findings = scanSuppressionText('.eslintrc.json', [
     '{',

@@ -60,8 +60,10 @@ for (const file of requiredFiles) {
 }
 
 const payloadFiles = payloadEntries.flatMap(walk).sort();
-if (payloadFiles.length !== 26) {
-  failures.push(`Expected 26 skill payload files, found ${payloadFiles.length}`);
+// Keep this count in lockstep with the skill payload tree under scripts/,
+// agents/, assets/, references/, and SKILL.md (including new test modules).
+if (payloadFiles.length !== 28) {
+  failures.push(`Expected 28 skill payload files, found ${payloadFiles.length}`);
 }
 
 try {
@@ -131,8 +133,9 @@ for (const file of javascriptFiles) {
   });
   // Never crash while reporting a syntax failure: spawn can fail with
   // result.error and null status, and stderr may be non-string.
-  const stderr = typeof result.stderr === 'string' ? result.stderr.trim() : '';
-  const stdout = typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  // Support string or Buffer stderr/stdout regardless of spawnSync encoding.
+  const stderr = result.stderr ? String(result.stderr).trim() : '';
+  const stdout = result.stdout ? String(result.stdout).trim() : '';
   if (result.error) {
     failures.push(`JavaScript syntax check spawn failed for ${file}: ${result.error.message}`);
     continue;

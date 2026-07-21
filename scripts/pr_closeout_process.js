@@ -1268,11 +1268,32 @@ const runPreflight = async ({
   const checks = [];
   const toolVersions = {};
   const shell = resolveCommandShell({ env });
+  // Redact personal home prefixes from shell evidence so absolute shell paths
+  // under the caller's home (e.g. OMO_CODEX_SHELL_PATH) do not leak into reports.
+  const redactShellEvidence = (value) => {
+    let text = String(value ?? '');
+    const homes = [
+      env.HOME,
+      env.USERPROFILE,
+      env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : null,
+    ].filter(Boolean);
+    for (const home of homes) {
+      for (const candidate of [home, String(home).replaceAll('\\', '/'), String(home).replaceAll('/', '\\')]) {
+        if (!candidate) continue;
+        text = text.split(candidate).join('<home>');
+      }
+    }
+    return text;
+  };
   try {
     await probeCommandShell(shell, env);
-    checks.push({ name: 'command-shell', status: 'PASS', evidence: shell });
+    checks.push({ name: 'command-shell', status: 'PASS', evidence: redactShellEvidence(shell) });
   } catch {
-    checks.push({ name: 'command-shell', status: 'BLOCKED', evidence: `Required shell not found: ${shell}` });
+    checks.push({
+      name: 'command-shell',
+      status: 'BLOCKED',
+      evidence: redactShellEvidence(`Required shell not found: ${shell}`),
+    });
   }
   // Tool probes run with, and have their evidence redacted against, BOTH
   // configured env lists: safeEnv entries are deliberately preserved for the

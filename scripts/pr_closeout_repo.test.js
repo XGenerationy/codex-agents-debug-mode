@@ -11,6 +11,7 @@ const {
   readProjectMetadata,
   resolveRepositoryState,
   scanTouchedSuppressions,
+  withNoTextconv,
   workingTreeFingerprint,
 } = require('./pr_closeout_repo');
 
@@ -165,7 +166,9 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
             hashFsEntry: async () => crypto.createHash('sha256').update(fs.readFileSync(excludePath)).digest('hex'),
           };
         }
-      } catch {}
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
       return { hashFsEntry: async () => crypto.createHash('sha256').update('missing').digest('hex') };
     })();
     const expectedFingerprint = fingerprintEntries([

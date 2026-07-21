@@ -1,8 +1,14 @@
 const { StringDecoder } = require('node:string_decoder');
 
 const SENSITIVE_ENV_NAME = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+// npm basic-auth config uses bare `_AUTH` / `_auth` (e.g. NPM_CONFIG__AUTH,
+// npm_config__auth) which does not match the TOKEN/AUTH_TOKEN suffix patterns.
+const SENSITIVE_NPM_AUTH = /(?:^|_)_?AUTH$/i;
 
-const isSensitiveEnvName = (name) => SENSITIVE_ENV_NAME.test(String(name));
+const isSensitiveEnvName = (name) => {
+  const key = String(name);
+  return SENSITIVE_ENV_NAME.test(key) || SENSITIVE_NPM_AUTH.test(key);
+};
 
 const buildChildEnvironment = (env = process.env, allowedSensitiveNames = []) => {
   const allowed = new Set(allowedSensitiveNames.map((name) => String(name).toUpperCase()));

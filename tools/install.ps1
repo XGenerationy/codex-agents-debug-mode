@@ -18,7 +18,9 @@ $HomePath = "$HomePath".Trim()
 # IsPathRooted accepts rooted-relative paths like \tmp that still depend on the
 # current drive. Require a fully qualified path (drive letter or UNC).
 $isFullyQualified = $false
-if ([System.IO.Path]::IsPathFullyQualified) {
+# Branch on PS version: IsPathFullyQualified exists on PS 6+ /.NET Core.
+# Do not probe the static member under StrictMode on Windows PowerShell 5.1.
+if ($PSVersionTable.PSVersion.Major -ge 6) {
     $isFullyQualified = [System.IO.Path]::IsPathFullyQualified($HomePath)
 } else {
     $isFullyQualified = $HomePath -match '^[A-Za-z]:[\\/]' -or $HomePath -match '^\\\\[^\\]+\\'

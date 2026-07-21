@@ -9,7 +9,20 @@ const { scanSuppressionText } = require('./pr_closeout_core');
 const { fingerprintEntries, isGateFile } = require('./pr_closeout_git');
 
 const execFileAsync = promisify(execFile);
-const normalize = (file) => String(file).replaceAll('\\', '/').replace(/^\.\//, '');
+// Preserve literal backslashes on POSIX: Git can report a filename that
+// contains `\`, and converting every `\` to `/` would probe the wrong path and
+// skip suppression scans (ENOENT). Only normalize Windows path separators when
+// the path looks like a Windows absolute path or contains drive-style roots.
+const normalize = (file) => {
+  const raw = String(file);
+  const stripped = raw.replace(/^\.\//, '');
+  if (process.platform === 'win32' || /^[A-Za-z]:[\\/]/.test(stripped) || stripped.includes('\\')) {
+    // On Windows, path separators are `\`; on POSIX a backslash is a literal
+    // character in the filename — only map `\` → `/` on win32.
+    if (process.platform === 'win32') return stripped.replaceAll('\\', '/');
+  }
+  return stripped;
+};
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const utf16leDecoder = new TextDecoder('utf-16le', { fatal: true });
 const utf16beDecoder = new TextDecoder('utf-16be', { fatal: true });
@@ -346,9 +359,15 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   const entries = [{ path: '__tracked_diff__', hash: diffHash }];
-  // Seal Git exclude metadata: a command that appends to .git/info/exclude
-  // could hide new untracked files from both status and fingerprint otherwise.
-  const excludePath = path.join(repo, '.git', 'info', 'exclude');
+  // Seal Git exclude metadata via Git-resolved path so linked worktrees
+  // (where `.git` is a file) still fingerprint the real gitdir exclude file.
+  let excludePath;
+  try {
+    const gitPath = await gitText(repo, ['rev-parse', '--git-path', 'info/exclude']);
+    excludePath = path.isAbsolute(gitPath) ? gitPath : path.join(repo, gitPath);
+  } catch {
+    excludePath = path.join(repo, '.git', 'info', 'exclude');
+  }
   entries.push({ path: '__git_info_exclude__', hash: await hashFsEntry(excludePath) });
   for (const file of untracked) {
     // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
@@ -465,9 +484,12 @@ const readGateChanges = async (repo, baseSha) => {
 
 module.exports = {
   cleanTreeStatus,
+  decodeTouchedText,
+  normalize,
   readGateChanges,
   readProjectMetadata,
   resolveRepositoryState,
   scanTouchedSuppressions,
+  withNoTextconv,
   workingTreeFingerprint,
 };
