@@ -194,14 +194,15 @@ test('accepts only a clean live PR bound to the expected base and head', () => {
   assert.equal(result.checks[0].name, 'ci');
 });
 
-test('classifies failed or skipped checks as failure and pending state as blocked', () => {
+test('classifies failed checks as FAIL and skipped checks as BLOCKED', () => {
+  // FAILURE is a functional fail; SKIPPED is missing evidence (run it or mark
+  // blocked), not a functional regression — see pr-closeout-validation.md.
   const failed = classifyLivePrState({
     repository: 'owner/repo',
     pr: {
       ...cleanPr(),
       statusCheckRollup: [
         { name: 'failed', status: 'COMPLETED', conclusion: 'FAILURE' },
-        { name: 'skipped', status: 'COMPLETED', conclusion: 'SKIPPED' },
       ],
     },
     unresolvedThreads: [],
@@ -210,6 +211,29 @@ test('classifies failed or skipped checks as failure and pending state as blocke
     gateAttestation: cleanAttestation(),
   });
   assert.equal(failed.status, 'FAIL');
+  assert.equal(failed.checks[0].classification, 'FAIL');
+
+  const skipped = classifyLivePrState({
+    repository: 'owner/repo',
+    pr: {
+      ...cleanPr(),
+      statusCheckRollup: [
+        { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'path-filtered', status: 'COMPLETED', conclusion: 'SKIPPED' },
+      ],
+    },
+    unresolvedThreads: [],
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    gateAttestation: cleanAttestation(),
+  });
+  assert.equal(skipped.status, 'BLOCKED');
+  assert.equal(
+    skipped.checks.find((check) => check.name === 'path-filtered').classification,
+    'BLOCKED',
+  );
+  assert.match(skipped.evidence, /path-filtered/i);
+  assert.doesNotMatch(skipped.evidence, /concluded SKIPPED/i);
 
   const pending = classifyLivePrState({
     repository: 'owner/repo',

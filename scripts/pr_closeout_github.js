@@ -3,16 +3,22 @@ const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
 
+// True functional/infra failures. SKIPPED is intentionally absent: docs say a
+// skipped applicable check is not PASS and must be run or marked BLOCKED, not
+// reported as a functional FAIL (see references/pr-closeout-validation.md).
 const FAILURE_CONCLUSIONS = new Set([
   'ACTION_REQUIRED',
   'CANCELLED',
   'ERROR',
   'FAILURE',
   'NEUTRAL',
-  'SKIPPED',
   'STARTUP_FAILURE',
   'STALE',
   'TIMED_OUT',
+]);
+// Check conclusions that block closeout without claiming a functional failure.
+const BLOCKED_CONCLUSIONS = new Set([
+  'SKIPPED',
 ]);
 const PENDING_STATES = new Set(['EXPECTED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'REQUESTED', 'WAITING']);
 // OWNER (repo owner) is authoritative by association. MEMBER only proves
@@ -132,6 +138,7 @@ const normalizeCheck = (value) => {
   const conclusion = String(legacy ? check.state : check.conclusion || '').toUpperCase();
   let classification = 'BLOCKED';
   if (FAILURE_CONCLUSIONS.has(conclusion)) classification = 'FAIL';
+  else if (BLOCKED_CONCLUSIONS.has(conclusion)) classification = 'BLOCKED';
   else if (legacy && status === 'SUCCESS') classification = 'PASS';
   else if (!legacy && status === 'COMPLETED' && conclusion === 'SUCCESS') classification = 'PASS';
   else if (PENDING_STATES.has(status) || PENDING_STATES.has(conclusion) || !status || !conclusion) classification = 'BLOCKED';
