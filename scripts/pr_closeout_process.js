@@ -45,7 +45,7 @@ const probeCommandShell = async (shell, env = process.env) => {
   // (and PATHEXT on Windows) for bare names; for an explicit path, access is
   // authoritative.
   if (/[\\/]/.test(shell)) {
-    await access(shell);
+    await access(shell, constants.X_OK);
     return shell;
   }
   const pathEntries = String(env.PATH || env.Path || '').split(path.delimiter).filter(Boolean);
@@ -55,7 +55,9 @@ const probeCommandShell = async (shell, env = process.env) => {
   for (const dir of pathEntries) {
     for (const ext of extensions) {
       try {
-        await access(path.join(dir, shell + ext));
+        // Probe with X_OK so a non-executable file on PATH does not PASS the
+        // command-shell row and then fail at spawn. On Windows X_OK is a no-op.
+        await access(path.join(dir, shell + ext), constants.X_OK);
         return shell;
       } catch {}
     }
@@ -1171,7 +1173,7 @@ const runPreflight = async ({
   } catch {
     checks.push({ name: 'command-shell', status: 'BLOCKED', evidence: `Required shell not found: ${shell}` });
   }
-  const commandEnv = buildChildEnvironment(env, config.requiredEnv || []);
+  const commandEnv = buildChildEnvironment(env, [...(config.requiredEnv || []), ...(config.safeEnv || [])]);
   const runProbe = probeCommand || ((command) => probeCommandDefault({
     command,
     repo,

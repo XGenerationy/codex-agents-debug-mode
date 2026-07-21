@@ -75,6 +75,15 @@ const main = async () => {
     if (result.report.overallStatus !== 'PASS') process.exitCode = 2;
   } catch (error) {
     process.stderr.write(`pr-closeout: ${error.message}\n`);
+    // Emit a machine-readable BLOCKED record so callers still get structured
+    // evidence when init throws before an output directory/report is created
+    // (bad repo path, missing base ref, unreadable metadata, etc.). Without
+    // this, callers had only a stderr line and no JSON to act on.
+    process.stdout.write(`${JSON.stringify({
+      status: 'BLOCKED',
+      overallStatus: 'BLOCKED',
+      error: error?.message || String(error),
+    })}\n`);
     process.exitCode = 3;
   }
 };

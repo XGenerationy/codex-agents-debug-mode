@@ -41,7 +41,15 @@ foreach ($destination in $targets) {
         if (-not $Force) {
             throw "Target exists: $destination. Rerun with -Force to preserve it as a backup and replace it."
         }
-        $backup = "$destination.backup.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
+        # Collision-proof backup name: high-resolution UTC Ticks + PID, with a
+        # retrying counter so repeated forced installs cannot collide.
+        $stamp = [DateTime]::UtcNow.Ticks
+        $backup = "$destination.backup.$stamp`_$PID"
+        $retry = 0
+        while (Test-Path -LiteralPath $backup) {
+            $retry++
+            $backup = "$destination.backup.$stamp`_$PID`_$retry"
+        }
     }
 
     if ($PSCmdlet.ShouldProcess($destination, 'Install evidence debug skill')) {

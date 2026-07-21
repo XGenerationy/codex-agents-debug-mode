@@ -89,6 +89,12 @@ pre_merge_checks:
       runs node --check on every JavaScript file.
     mode: error
     run: npm run validate
+    instructions: |
+      PASS requires the validator to exit 0 and print status:PASS with the
+      expected payload/javascript file counts. FAIL when any required file is
+      missing, a payload entry is a symlink, a JSON file does not parse, a
+      payload file exceeds the size bound, a public-safety pattern matches, or
+      any JavaScript file fails node --check.
     issue_assessment:
       severity: error
 
@@ -99,6 +105,11 @@ pre_merge_checks:
       remediated, not suppressed or downgraded.
     mode: error
     run: npm audit --audit-level=high
+    instructions: |
+      PASS requires `npm audit --audit-level=high` to exit 0 (no high or
+      critical advisories). Any advisory at the configured level must be
+      remediated by upgrading, patching, or replacing the dependency; it must
+      not be suppressed, downgraded via an .npmrc ignore, or excluded.
     issue_assessment:
       severity: error
 
@@ -111,6 +122,13 @@ pre_merge_checks:
       readGateChanges in scripts/pr_closeout_repo.js and
       scripts/pr_closeout_git.js.
     mode: error
+    instructions: |
+      PASS requires scanSuppressionText and readGateChanges to return zero
+      findings for the complete touched-file set. FAIL on any marker
+      (skipcq, eslint-disable, biome-ignore, @ts-ignore, noqa, nosec, etc.),
+      any config-level rule disabling, any test-weakening token in a touched
+      test file, or any __decode_error__ in the gate diff. Findings must be
+      fixed at the source, never suppressed.
     issue_assessment:
       severity: error
 
@@ -121,6 +139,13 @@ pre_merge_checks:
       $RUNNER_TEMP/...` must install both the .codex and .agents skill
       copies. Enforced by .github/workflows/validate.yml.
     mode: error
+    instructions: |
+      PASS requires the bash installer to exit 0, install both target
+      directories, and emit a machine-readable JSON result line that parses
+      cleanly. FAIL on a missing payload entry, a relative home path, a
+      non-absolute home path, an existing target without --force, or invalid
+      JSON output. Backup preservation must be collision-proof under repeated
+      forced installs.
     issue_assessment:
       severity: error
 
@@ -131,6 +156,13 @@ pre_merge_checks:
       must install both the .codex and .agents skill copies. Enforced by
       .github/workflows/validate.yml.
     mode: error
+    instructions: |
+      PASS requires the PowerShell installer to exit 0, install both target
+      directories, and emit a machine-readable JSON result line that parses
+      cleanly. FAIL on an empty or non-absolute HomePath, a missing payload
+      entry, an existing target without -Force, or invalid JSON output.
+      Backup preservation must be collision-proof under repeated forced
+      installs.
     issue_assessment:
       severity: error
 

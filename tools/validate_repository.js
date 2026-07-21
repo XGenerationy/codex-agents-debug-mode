@@ -6,6 +6,9 @@ const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const payloadEntries = ['SKILL.md', 'agents', 'assets', 'references', 'scripts'];
+// Bound validator memory: a pathological payload file should produce a
+// deterministic FAIL instead of spiking memory or crashing CI.
+const MAX_PAYLOAD_FILE_BYTES = 2 * 1024 * 1024;
 const requiredFiles = [
   'SKILL.md',
   'agents/openai.yaml',
@@ -82,7 +85,12 @@ try {
 
 for (const file of payloadFiles.filter((name) => name.endsWith('.json'))) {
   try {
-    JSON.parse(readFileSync(path.join(root, file), 'utf8'));
+    const abs = path.join(root, file);
+    if (lstatSync(abs).size > MAX_PAYLOAD_FILE_BYTES) {
+      failures.push(`Payload JSON exceeds validator size bound: ${file}`);
+      continue;
+    }
+    JSON.parse(readFileSync(abs, 'utf8'));
   } catch (error) {
     failures.push(`Invalid JSON in ${file}: ${error.message}`);
   }
@@ -97,7 +105,17 @@ const publicSafetyPatterns = [
 ];
 
 for (const file of payloadFiles) {
-  const content = readFileSync(path.join(root, file), 'utf8');
+  const abs = path.join(root, file);
+  try {
+    if (lstatSync(abs).size > MAX_PAYLOAD_FILE_BYTES) {
+      failures.push(`Payload file exceeds validator size bound: ${file}`);
+      continue;
+    }
+  } catch {
+    // Missing files are reported by the required-file checks; skip here.
+    continue;
+  }
+  const content = readFileSync(abs, 'utf8');
   for (const [label, pattern] of publicSafetyPatterns) {
     if (pattern.test(content)) failures.push(`${file} contains ${label}`);
   }

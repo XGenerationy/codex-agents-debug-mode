@@ -59,6 +59,22 @@ script_dir="${BASH_SOURCE[0]%/*}"
 source_dir="$(cd "$script_dir/.." && pwd)"
 payload=(SKILL.md agents assets references scripts)
 
+# Emit a machine-readable install result as valid JSON. Prefer node's
+# JSON.stringify (the skill requires Node anyway) so every control character
+# is escaped correctly; fall back to a manual escaper that covers backslash,
+# quote, and the common JSON control characters for minimal environments.
+emit_result() {
+  local target="$1" backup="$2"
+  if command -v node >/dev/null 2>&1; then
+    node -e 'console.log(JSON.stringify({status:"installed",target:process.argv[1],backup:process.argv[2]}))' "$target" "$backup"
+    return
+  fi
+  local t b
+  t="${target//\\/\\\\}"; t="${t//\"/\\\"}"; t="${t//$'\n'/\\n}"; t="${t//$'\r'/\\r}"; t="${t//$'\t'/\\t}"
+  b="${backup//\\/\\\\}"; b="${b//\"/\\\"}"; b="${b//$'\n'/\\n}"; b="${b//$'\r'/\\r}"; b="${b//$'\t'/\\t}"
+  printf '{"status":"installed","target":"%s","backup":"%s"}\n' "$t" "$b"
+}
+
 for entry in "${payload[@]}"; do
   [[ -e "$source_dir/$entry" ]] || {
     echo "Missing skill payload entry: $entry" >&2
@@ -73,7 +89,13 @@ for destination in "${destinations[@]}"; do
       echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
       exit 1
     fi
-    backup="$destination.backup.$(date -u +%Y%m%d%H%M%S)"
+    # Collision-proof backup name: second-level timestamp + PID + a retrying
+    # counter so repeated forced installs in the same second cannot collide.
+    base_ts="$(date -u +%Y%m%d%H%M%S)"
+    backup="$destination.backup.$base_ts.$$"
+    while [[ -e "$backup" ]]; do
+      backup="$destination.backup.$base_ts.$$.$RANDOM"
+    done
     mv -- "$destination" "$backup"
   fi
 
@@ -81,9 +103,5 @@ for destination in "${destinations[@]}"; do
   for entry in "${payload[@]}"; do
     cp -R -- "$source_dir/$entry" "$destination/"
   done
-  dest_json="${destination//\\/\\\\}"
-  dest_json="${dest_json//\"/\\\"}"
-  backup_json="${backup//\\/\\\\}"
-  backup_json="${backup_json//\"/\\\"}"
-  printf '{"status":"installed","target":"%s","backup":"%s"}\n' "$dest_json" "$backup_json"
+  emit_result "$destination" "$backup"
 done

@@ -148,9 +148,22 @@ const verifyGeneratorReproducibility = async ({ executeGenerator, fingerprint })
   };
 };
 
+// Reduce a proof result to its stable fields for baseline failure signatures.
+// proofResult carries volatile artifact-identity fields (realPath/realRoot are
+// absolute paths that differ between the head repo and the disposable baseline
+// worktree; dev/ino/mtimeMs/ctimeMs/size change every run because the proof
+// artifact is regenerated). Without normalization, failureSignature() cannot
+// match the same logical failure across head and baseline, so the baseline
+// comparison always reports "did not reproduce" even for identical failures.
+const STABLE_PROOF_KEYS = ['status', 'exists', 'digest', 'path', 'evidence', 'matched', 'matchPolicyValid', 'policyValid'];
+const stableProofResult = (proofResult) => {
+  if (!proofResult || typeof proofResult !== 'object') return null;
+  return Object.fromEntries(STABLE_PROOF_KEYS.filter((key) => key in proofResult).map((key) => [key, proofResult[key]]));
+};
+
 const normalizeFailure = (result) => {
   if (result.outputDigest) {
-    return `${result.status}\n${result.exitCode}\n${result.timedOut || false}\n${JSON.stringify(result.outputDigest)}\n${JSON.stringify(result.proofResult || null)}`;
+    return `${result.status}\n${result.exitCode}\n${result.timedOut || false}\n${JSON.stringify(result.outputDigest)}\n${JSON.stringify(stableProofResult(result.proofResult))}`;
   }
   let output = `${result.status}\n${result.exitCode}\n${result.stdout || ''}\n${result.stderr || ''}`
     .replace(/\x1b\[[0-9;]*m/g, '')

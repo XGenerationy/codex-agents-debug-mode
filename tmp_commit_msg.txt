@@ -1,0 +1,55 @@
+fix(debug): address round-5 review findings (qodo summary + Codex P2)
+
+Round-5 findings from qodo's 35-item review comment and the Codex re-review.
+Items already resolved by earlier rounds are not re-touched. No suppressions.
+
+scripts/pr_closeout_process.js:
+- safeEnv honored in preflight: runPreflight's probe child env now includes
+  config.safeEnv in the buildChildEnvironment allowlist (was requiredEnv only),
+  so credentials listed only in safeEnv are forwarded to tool probes
+- shell probe uses X_OK: probeCommandShell checks the execute bit (constants
+  .X_OK) so a non-executable file on PATH no longer PASSes the command-shell
+  row and fails later at spawn (no-op on Windows)
+
+scripts/pr_closeout_git.js:
+- normalize proof results before baseline signatures: failureSignature now
+  reduces proofResult to its stable fields (status/exists/digest/path/
+  evidence/matched/policyValid) before stringifying, dropping volatile
+  artifact-identity fields (absolute realPath/realRoot, dev/ino/mtimeMs/
+  ctimeMs/size) that differ between the head repo and the disposable baseline
+  worktree, so the same logical failure reproduces cleanly
+
+scripts/pr_closeout.js:
+- init-failure evidence: on an early throw (bad repo/base, unreadable
+  metadata) the CLI now emits a machine-readable BLOCKED JSON record to
+  stdout in addition to the stderr line, so callers always have structured
+  evidence even when no output directory/report was created
+
+tools/install.sh:
+- collision-proof backup name: timestamp + PID + retrying counter so repeated
+  forced installs in the same second cannot collide
+- valid JSON output: prefer node JSON.stringify (full control-char escaping);
+  fall back to a manual escaper covering backslash/quote/\n/\r/\t
+
+tools/install.ps1:
+- collision-proof backup name via high-resolution Ticks + PID + retry counter
+
+tools/validate_repository.js:
+- bound payload-file reads at 2 MiB so a pathological payload file produces a
+  deterministic FAIL instead of spiking memory or crashing CI
+
+.codereview.yml:
+- add explicit instructions: blocks to the five pre_merge_checks that lacked
+  them (repository-validator, dependency-audit, touched-file-suppression-scan,
+  bash-installer-smoke, powershell-installer-smoke) for auditable pass/fail
+  criteria
+
+#16 (unpinned gh/git) is answered with reasoning rather than a code change:
+the closeout runner operates on the developer's own repository in trusted
+CI/dev environments and requires an independent live GitHub review attestation
+by an authorized reviewer; running it against untrusted repos is not a
+supported use case, and PATH resolution is the standard for git/gh tooling.
+
+Validation: npm test 173 (172 pass / 0 fail / 1 platform-symlink skip),
+npm run validate PASS, bash -n install.sh clean, install.ps1 parse clean,
+git diff --check clean, no suppression markers.
