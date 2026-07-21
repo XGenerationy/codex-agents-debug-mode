@@ -257,10 +257,7 @@ def debug_log(msg, data=None, hypothesis_id=None):
     except requests.RequestException as error:
         if not _debug_transport_failure_reported:
             _debug_transport_failure_reported = True
-            print(
-                f'Debug collector transport failed: {type(error).__name__}',
-                file=sys.stderr,
-            )
+            print(f'Debug collector transport failed: {type(error).__name__}', file=sys.stderr)
 # #endregion
 
 # Usage

@@ -179,6 +179,13 @@ test('flags focused or skipped tests in touched test files', () => {
   // findings (the detection is scoped to test-like filenames).
   const nonTest = scanSuppressionText('src/foo.js', 'it.skip("not in a test file");');
   assert.deepEqual(nonTest, []);
+  // This regression file itself embeds fixture literals; scanning it must not
+  // report those string-literal fixtures as active test-weakening.
+  const selfScan = scanSuppressionText(
+    'scripts/pr_closeout_core.test.js',
+    require('node:fs').readFileSync(__filename, 'utf8'),
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(selfScan.length, 0, `scanner test fixtures must not self-flag: ${JSON.stringify(selfScan)}`);
 });
 
 test('flags focused or skipped tests in __tests__/ files without a test/spec filename', () => {
@@ -455,6 +462,13 @@ test('detects quoted enabled/disabled JSON gate switches and --quiet lint script
   assert.ok(
     scanSuppressionText('package.json', '{"scripts":{"lint:touched":"eslint . --quiet"}}').some((f) => f.category === 'config-silencing'),
     '--quiet lint script must be flagged',
+  );
+  // Non-lint --quiet probes (git diff --quiet) must not be config-silencing.
+  assert.equal(
+    scanSuppressionText('.github/workflows/validate.yml', 'run: git diff --quiet')
+      .filter((f) => f.category === 'config-silencing').length,
+    0,
+    'git diff --quiet must not be flagged as config silencing',
   );
 });
 

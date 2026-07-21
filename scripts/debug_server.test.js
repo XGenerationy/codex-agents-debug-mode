@@ -638,6 +638,33 @@ test('rejects appends after the session log path is swapped for a directory', as
   }
 });
 
+test('serializes concurrent /log appends for the same session', async () => {
+  // Two concurrent /log requests must not race the size check against
+  // identity.bytesWritten: without a per-session queue one append can grow
+  // the file while the other still holds a stale byte count and returns
+  // session_log_replaced for a valid event.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, (_, index) => recordEvent(baseUrl, session, `concurrent-event-${index}`)),
+    );
+    for (const response of responses) {
+      assert.equal(response.status, 202, JSON.stringify(response.body));
+      assert.deepEqual(response.body, { status: 'recorded' });
+    }
+    const logPath = path.join(projectRoot, session.log_file);
+    const lines = (await readFile(logPath, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 20);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test(
   'install.sh emits the real target and backup paths in its JSON result',
   { skip: !bashAvailable && 'bash is required to run tools/install.sh', timeout: 60000 },

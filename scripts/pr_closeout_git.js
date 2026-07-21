@@ -42,7 +42,11 @@ const WEAKENING_PATTERNS = [
   /\b(?:describe|it|test)\.(?:skip|only|todo)\b/i,
   /--(?:no-verify|force|passWithNoTests)\b/i,
   /(?:coverage|threshold)["']?\s*[:=]\s*(?:["']?0(?:\.0+)?["']?|false|null)(?![\w.])/i,
-  /(?:fail-fast|failFast)\s*[:=]\s*false/i,
+  // Intentionally NOT matching strategy.fail-fast: false / failFast: false.
+  // In GitHub Actions that setting keeps the rest of the matrix running after
+  // one leg fails (required for full Node/OS visibility). Flagging it as gate
+  // weakening made any workflow adding the standard matrix line FAIL even with
+  // an exact authorized review.
 ];
 
 // A coverage threshold can also be zeroed in nested config form, with the

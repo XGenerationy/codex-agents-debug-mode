@@ -42,7 +42,10 @@ const secretVariants = (value) => {
 
 const secretComponents = (value) => {
   const components = [String(value)];
-  const isCredentialKey = /(?:token|password|passwd|pwd|secret|key|credential)$/i;
+  // Include bare Docker registry key `auth` (DOCKER_AUTH_CONFIG leaf) as well as
+  // keys that end with token/password/secret/key/credential. Encoded variants of
+  // each leaf still flow through secretVariants below.
+  const isCredentialKey = /(?:^auth$|(?:token|password|passwd|pwd|secret|key|credential)$)/i;
   try {
     const parsed = new URL(String(value));
     for (const component of [parsed.username, parsed.password]) {

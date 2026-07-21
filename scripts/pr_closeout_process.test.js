@@ -157,6 +157,18 @@ test('redacts credential leaves parsed from JSON auth-blob environment values', 
   assert.match(output, /nested=\[REDACTED\]/);
 });
 
+test('redacts bare Docker auth leaf from DOCKER_AUTH_CONFIG JSON', () => {
+  // DOCKER_AUTH_CONFIG={"auths":{"registry":{"auth":"..."}}} stores the
+  // base64 credential under the bare key `auth`, which does not end in
+  // token/password/secret/key/credential. The leaf must still be redacted when
+  // a package manager prints only that value.
+  const leaf = 'supersecretvalue123';
+  const blob = JSON.stringify({ auths: { registry: { auth: leaf } } });
+  const output = redactSecrets(`isolated=${leaf}`, { DOCKER_AUTH_CONFIG: blob }, ['DOCKER_AUTH_CONFIG']);
+  assert.equal(output.includes(leaf), false, 'bare auth JSON leaf must be redacted');
+  assert.match(output, /isolated=\[REDACTED\]/);
+});
+
 test('matches explicit secret names case-insensitively against env keys', () => {
   // A config listing "npm_token" must redact NPM_TOKEN (buildChildEnvironment
   // uppercases the allowlist); the redaction allowlist must do the same so a

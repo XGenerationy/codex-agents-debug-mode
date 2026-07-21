@@ -28,8 +28,8 @@ path_instructions:
       Node LTS line (20, 22, 24) for both ubuntu-latest and windows-latest,
       and `npm run validate` must report PASS. New behavior must come with a
       focused regression test that fails without the change and passes with
-      it. Suppression markers (eslint-disable, nosec, noqa, @ts-ignore,
-      skipcq, etc.) and config-level rule disabling are not allowed in the
+      it. Suppression markers (`eslint-disable`, `nosec`, `noqa`, `@ts-ignore`,
+      `skipcq`, etc.) and config-level rule disabling are not allowed in the
       touched-file set.
 
   - paths:
@@ -125,10 +125,10 @@ pre_merge_checks:
     instructions: |
       PASS requires scanSuppressionText and readGateChanges to return zero
       findings for the complete touched-file set. FAIL on any marker
-      (skipcq, eslint-disable, biome-ignore, @ts-ignore, noqa, nosec, etc.),
-      any config-level rule disabling, any test-weakening token in a touched
-      test file, or any __decode_error__ in the gate diff. Findings must be
-      fixed at the source, never suppressed.
+      (`skipcq`, `eslint-disable`, `biome-ignore`, `@ts-ignore`, `noqa`,
+      `nosec`, etc.), any config-level rule disabling, any test-weakening
+      token in a touched test file, or any __decode_error__ in the gate
+      diff. Findings must be fixed at the source, never suppressed.
     issue_assessment:
       severity: error
 

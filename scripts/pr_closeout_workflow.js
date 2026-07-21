@@ -301,7 +301,7 @@ const runCloseoutWorkflow = async ({
       checks: plan.checks.map(({ id, label, command, resolution, status, evidence }) => ({
         id, label, command, resolution, status, evidence,
       })),
-    }, process.env, config.requiredEnv || []);
+    }, process.env, [...(config.requiredEnv || []), ...(config.safeEnv || [])]);
   }
 
   const requestedOutput = path.resolve(outputDir || defaultOutputDir(initial.repo, initial.headSha));
@@ -525,6 +525,10 @@ const runCloseoutWorkflow = async ({
       attestation: livePrState.gateAttestation,
     });
   }
+  // Include safeEnv alongside requiredEnv so custom secrets named only in
+  // safeEnv (and embedded in configuredCommands / gateIntegrity) are redacted
+  // from workflow-level reports — executors already redact both lists.
+  const reportSecretNames = [...(config.requiredEnv || []), ...(config.safeEnv || [])];
   let report = normalizePersistedPaths(redactStructure({
     schemaVersion: 2,
     repository: sealedState.repo,
@@ -550,7 +554,7 @@ const runCloseoutWorkflow = async ({
     suppressionFindings: finalSuppressions,
     qualificationChecks: phases.qualification,
     checks: phases.confirmation,
-  }, process.env, config.requiredEnv || []), sealedState.repo, resolvedOutput);
+  }, process.env, reportSecretNames), sealedState.repo, resolvedOutput);
   report.overallStatus = evaluateOverallStatus({
     planStatus,
     preflight,

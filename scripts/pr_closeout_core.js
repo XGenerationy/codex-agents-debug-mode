@@ -36,10 +36,12 @@ const CONFIG_SILENCING = [
   /["']?linter["']?\s*:\s*\{[\s\S]{0,4000}?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
-  // eslint/biome --quiet suppresses warning output; since the closeout gate
-  // treats warnings as a failing signal, adding --quiet to a touched lint
-  // script hides exactly the warnings that would otherwise block closeout.
-  /--quiet\b/i,
+  // eslint/biome (and peer linters) --quiet suppresses warning output; since
+  // the closeout gate treats warnings as a failing signal, adding --quiet to a
+  // touched lint script hides exactly the warnings that would otherwise block
+  // closeout. Scope to lint-tool context so legitimate probes such as
+  // `git diff --quiet` are not classified as config silencing.
+  /\b(?:eslint|biome|stylelint|prettier|ruff|pylint|flake8|rubocop)\b[^\n]*--quiet\b/i,
   // Consume the optional closing quote on the JSON key (e.g. "enabled":false,
   // "ignorePatterns":[...], "exclude":[...]) so config-level disabling in
   // tsconfig/eslint/biome JSON no longer slips past the scan.
@@ -278,13 +280,20 @@ const scanSuppressionText = (file, text) => {
     .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
     .join('|'), 'i');
   // A line whose non-whitespace content is a single quoted string literal
-  // (with an optional trailing comma) is data, not an active directive: the
-  // scanner's own MARKERS vocabulary (`'skipcq',`) and quoted test fixtures
-  // (`'// noqa',`) would otherwise self-flag and block implementation changes
-  // to this tool. Real suppression directives (`// skipcq`, `# noqa`) are
-  // never sole quoted strings, so skipping these lines preserves directive
-  // detection while avoiding self-referential false positives.
-  const isStringLiteralData = (line) => /^\s*['"`][^'"`\r\n]*['"`],?\s*$/.test(line);
+  // (with an optional trailing comma/semicolon) is data, not an active
+  // directive: the scanner's own MARKERS vocabulary (`'skipcq',`), quoted
+  // test fixtures (`'// noqa',`, `'describe.only("x")',`), would otherwise
+  // self-flag and block implementation changes to this tool. Real
+  // suppression directives (`// skipcq`, `# noqa`) and real focused/skipped
+  // calls (`it.skip("x")`) are never sole quoted strings, so skipping these
+  // lines preserves directive detection while avoiding self-referential
+  // false positives. Allow the other quote style inside the outer quotes so
+  // fixtures like 'describe.only("focused suite")', match.
+  const isStringLiteralData = (line) => (
+    /^\s*'([^'\\]|\\.)*'[,;]?\s*$/.test(line)
+    || /^\s*"([^"\\]|\\.)*"[,;]?\s*$/.test(line)
+    || /^\s*`([^`\\]|\\.)*`[,;]?\s*$/.test(line)
+  );
   const lines = text.split(/\r?\n/);
   // Compile the global scan pattern once per file, not once per line;
   // matchAll clones the regex internally, so sharing it across lines is safe.
@@ -326,11 +335,38 @@ const scanSuppressionText = (file, text) => {
     // Jasmine/Jest aliases fit/fdescribe (focus) and xit/xdescribe (skip) are
     // runner-native weakening equivalents of .only/.skip. The lookbehind
     // requires a standalone call so member calls such as curve.fit(data) do
-    // not false-positive.
+    // not false-positive. Skip sole string-literal fixture lines and matches
+    // that sit inside string/template literals so this scanner's own
+    // regression tests (e.g. scanSuppressionText(..., 'it.skip("x")')) do
+    // not self-flag as active test-weakening.
     const testWeakening = /\b(?:describe|it|test|context)\.(?:skip|only|todo)\b|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    const isInsideQuotes = (line, at) => {
+      let quote = null;
+      let escaped = false;
+      for (let i = 0; i < at; i += 1) {
+        const ch = line[i];
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (quote) {
+          if (ch === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (ch === quote) quote = null;
+          continue;
+        }
+        if (ch === "'" || ch === '"' || ch === '`') quote = ch;
+      }
+      return quote !== null;
+    };
     lines.forEach((line, index) => {
+      if (isStringLiteralData(line)) return;
       const match = line.match(testWeakening);
-      if (match) findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
+      if (match && !isInsideQuotes(line, match.index ?? 0)) {
+        findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
+      }
     });
   }
   return findings;

@@ -155,6 +155,20 @@ test('detects multiline gate weakening and produces stable config digests', () =
   assert.notEqual(digestValidationConfig({ a: 1 }), digestValidationConfig({ a: 2 }));
 });
 
+test('does not treat GitHub Actions fail-fast false as gate weakening', () => {
+  // strategy.fail-fast: false keeps the full Node/OS matrix visible after one
+  // leg fails; that is required visibility, not a weakened gate.
+  const result = classifyGateIntegrity({
+    changedFiles: ['.github/workflows/validate.yml'],
+    addedLines: ['+    fail-fast: false', '+    failFast: false'],
+    baseSha: 'base123',
+    headSha: 'abc123',
+    configDigest: 'cfg123',
+    attestation: liveAttestation(),
+  });
+  assert.equal(result.status, 'PASS', result.evidence);
+});
+
 test('does not flag positive coverage thresholds as weakening', () => {
   const base = { changedFiles: ['package.json'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
   for (const line of [

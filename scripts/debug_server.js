@@ -171,42 +171,53 @@ const configureOrigin = (request, response, allowedOrigins) => {
 // and the exact byte count this server has written, because POSIX filesystems
 // can recycle a just-freed inode for a deleted-and-recreated log. Every
 // replacement shape fails closed with the same structured conflict.
-const appendSessionEvent = async (session, serializedEvent) => {
-  let handle;
-  try {
-    handle = await openNoFollow(session.logFile, constants.O_WRONLY | constants.O_APPEND);
-  } catch (error) {
-    // EISDIR: POSIX reports a directory swap as EISDIR, Windows as EPERM
-    // (or EACCES on some setups) when a path is opened for writing. Any of
-    // these means the path no longer names our regular session file, so
-    // fail closed with the same structured conflict instead of a 500.
-    if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
-      throw new RequestError('session_log_replaced', 409);
+//
+// Concurrent /log requests for the same session are serialized on
+// session.appendChain so the size check, write, and bytesWritten update cannot
+// race each other (a parallel append would otherwise grow the file while a
+// second request still holds a stale identity.bytesWritten and false-positive
+// session_log_replaced).
+const appendSessionEvent = (session, serializedEvent) => {
+  const previous = session.appendChain || Promise.resolve();
+  const run = previous.catch(() => {}).then(async () => {
+    let handle;
+    try {
+      handle = await openNoFollow(session.logFile, constants.O_WRONLY | constants.O_APPEND);
+    } catch (error) {
+      // EISDIR: POSIX reports a directory swap as EISDIR, Windows as EPERM
+      // (or EACCES on some setups) when a path is opened for writing. Any of
+      // these means the path no longer names our regular session file, so
+      // fail closed with the same structured conflict instead of a 500.
+      if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
+        throw new RequestError('session_log_replaced', 409);
+      }
+      throw error;
     }
-    throw error;
-  }
-  try {
-    const info = await handle.stat();
-    const identity = session.logFileIdentity;
-    // dev/ino can survive a delete+recreate through inode reuse, so also
-    // require the recorded birth time (when the filesystem reports one on
-    // both sides) and exactly the byte count this server has appended — a
-    // replacement file starts with different content or an empty size.
-    const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
-      || info.birthtimeMs === identity.birthtimeMs;
-    if (
-      !info.isFile() || !identity
-      || info.dev !== identity.dev || info.ino !== identity.ino
-      || !sameBirth
-      || info.size !== identity.bytesWritten
-    ) {
-      throw new RequestError('session_log_replaced', 409);
+    try {
+      const info = await handle.stat();
+      const identity = session.logFileIdentity;
+      // dev/ino can survive a delete+recreate through inode reuse, so also
+      // require the recorded birth time (when the filesystem reports one on
+      // both sides) and exactly the byte count this server has appended — a
+      // replacement file starts with different content or an empty size.
+      const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
+        || info.birthtimeMs === identity.birthtimeMs;
+      if (
+        !info.isFile() || !identity
+        || info.dev !== identity.dev || info.ino !== identity.ino
+        || !sameBirth
+        || info.size !== identity.bytesWritten
+      ) {
+        throw new RequestError('session_log_replaced', 409);
+      }
+      await handle.writeFile(serializedEvent, 'utf8');
+      identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+    } finally {
+      await handle.close();
     }
-    await handle.writeFile(serializedEvent, 'utf8');
-    identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
-  } finally {
-    await handle.close();
-  }
+  });
+  session.appendChain = run;
+  return run;
 };
 
 const createDebugServer = ({
