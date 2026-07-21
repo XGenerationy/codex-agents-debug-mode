@@ -357,6 +357,10 @@ const scanSuppressionText = (file, text) => {
           if (ch === quote) quote = null;
           continue;
         }
+        // An unquoted `//` starts a line comment. Real string literals cannot
+        // span past it, so any earlier raw apostrophe (e.g. "don't" in a
+        // comment) was never a quote-open — stop and treat the match as code.
+        if (ch === '/' && line[i + 1] === '/') return false;
         if (ch === "'" || ch === '"' || ch === '`') quote = ch;
       }
       return quote !== null;
