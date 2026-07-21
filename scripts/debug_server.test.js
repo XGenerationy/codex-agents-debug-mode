@@ -273,6 +273,24 @@ test('requires the launch token and returns only an opaque relative log path', a
   }
 });
 
+test('rejects POST /session when .debug is a regular file instead of a directory', async () => {
+  // A worktree can place a regular file at .debug; mkdir would throw ENOTDIR
+  // and previously surfaced as an unstructured 500. Map that to a structured
+  // 409 so clients get a stable error code.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-file-'));
+  await writeFile(path.join(projectRoot, '.debug'), 'not-a-directory');
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+  try {
+    const response = await createSession(baseUrl);
+    assert.equal(response.status, 409, JSON.stringify(response.body));
+    assert.equal(response.body.error, 'debug_dir_not_directory');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('creates a session and records one credential-free NDJSON event', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });

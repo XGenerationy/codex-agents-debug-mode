@@ -19,13 +19,28 @@ const requiredFiles = [
   'scripts/pr_closeout.js',
 ];
 
+// Non-payload paths that still ship in the public repo and must pass the
+// public-distribution safety scan (docs, workflows, tooling).
+const safetyScanRoots = [
+  'README.md',
+  'SECURITY.md',
+  'CONTRIBUTING.md',
+  'NOTICE.md',
+  'LICENSE',
+  'package.json',
+  '.codereview.yml',
+  '.github/workflows',
+  'tools',
+];
+
 const failures = [];
 
 // Payload walker that fails closed on missing entries and never follows
 // symlinks. statSync() follows symlinks and would let a symlinked directory
 // or cycle trigger unbounded recursion; lstatSync() lets us detect symlinks
 // and treat them as validation failures so a reviewed branch cannot hang or
-// escape the payload tree during `npm run validate`.
+// escape the payload tree during `npm run validate`. Non-regular files
+// (FIFO/socket/device) must not enter readFileSync / node --check either.
 const walk = (entry) => {
   const absolute = path.join(root, entry);
   let info;
@@ -42,8 +57,35 @@ const walk = (entry) => {
     failures.push(`Payload entry must not be a symlink: ${entry}`);
     return [];
   }
-  if (!info.isDirectory()) return [entry];
-  return readdirSync(absolute).flatMap((name) => walk(path.join(entry, name)));
+  if (info.isDirectory()) {
+    return readdirSync(absolute).flatMap((name) => walk(path.join(entry, name)));
+  }
+  if (info.isFile()) return [entry];
+  failures.push(`Payload entry must be a regular file: ${entry}`);
+  return [];
+};
+
+// Soft walk for optional safety-scan roots: missing optional docs are skipped
+// rather than failing the whole validator.
+const walkOptional = (entry) => {
+  const absolute = path.join(root, entry);
+  let info;
+  try {
+    info = lstatSync(absolute);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  if (info.isSymbolicLink()) {
+    failures.push(`Safety-scan path must not be a symlink: ${entry}`);
+    return [];
+  }
+  if (info.isDirectory()) {
+    return readdirSync(absolute).flatMap((name) => walkOptional(path.join(entry, name)));
+  }
+  if (info.isFile()) return [entry];
+  failures.push(`Safety-scan path must be a regular file: ${entry}`);
+  return [];
 };
 
 for (const file of requiredFiles) {
@@ -106,29 +148,51 @@ const publicSafetyPatterns = [
   ['generated attribution line', /^\s*Generated with \[Claude Code\]/m],
 ];
 
-for (const file of payloadFiles) {
+const safetyScanFiles = [...new Set([
+  ...payloadFiles,
+  ...safetyScanRoots.flatMap(walkOptional),
+])].sort();
+
+const scanFileForPublicSafety = (file) => {
   const abs = path.join(root, file);
+  let info;
   try {
-    if (lstatSync(abs).size > MAX_PAYLOAD_FILE_BYTES) {
-      failures.push(`Payload file exceeds validator size bound: ${file}`);
-      continue;
-    }
+    info = lstatSync(abs);
   } catch {
-    // Missing files are reported by the required-file checks; skip here.
-    continue;
+    return;
+  }
+  if (!info.isFile()) {
+    failures.push(`Safety scan target is not a regular file: ${file}`);
+    return;
+  }
+  if (info.size > MAX_PAYLOAD_FILE_BYTES) {
+    failures.push(`Safety scan file exceeds validator size bound: ${file}`);
+    return;
   }
   const content = readFileSync(abs, 'utf8');
   for (const [label, pattern] of publicSafetyPatterns) {
     if (pattern.test(content)) failures.push(`${file} contains ${label}`);
   }
-}
+};
+
+for (const file of safetyScanFiles) scanFileForPublicSafety(file);
 
 const javascriptFiles = [
   ...walk('scripts').filter((name) => name.endsWith('.js')),
-  ...walk('tools').filter((name) => name.endsWith('.js')),
+  ...walkOptional('tools').filter((name) => name.endsWith('.js')),
 ];
 for (const file of javascriptFiles) {
-  const result = spawnSync(process.execPath, ['--check', path.join(root, file)], {
+  const abs = path.join(root, file);
+  try {
+    if (!lstatSync(abs).isFile()) {
+      failures.push(`JavaScript syntax check skipped non-regular file: ${file}`);
+      continue;
+    }
+  } catch {
+    failures.push(`JavaScript syntax check target missing: ${file}`);
+    continue;
+  }
+  const result = spawnSync(process.execPath, ['--check', abs], {
     encoding: 'utf8',
   });
   // Never crash while reporting a syntax failure: spawn can fail with
@@ -154,6 +218,7 @@ if (failures.length > 0) {
     status: 'PASS',
     payloadFiles: payloadFiles.length,
     javascriptFiles: javascriptFiles.length,
+    safetyScanFiles: safetyScanFiles.length,
     dependencies: 0,
   }) + '\n');
 }

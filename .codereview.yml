@@ -20,10 +20,9 @@ issue_assessment:
 # Each entry declares the mode (`error` blocks merge, `warning` is advisory)
 # and clear pass/fail instructions so the gate is auditable.
 path_instructions:
-  # mode: error entries only list criteria CI/tooling can evaluate
-  # deterministically (npm test, npm run validate, suppression scan, node --check).
-  # Subjective reviewer judgment stays mode: warning so error semantics remain
-  # automatically enforceable and auditable.
+  # One entry per path glob (no overlapping path_instructions for the same
+  # pattern). mode: error holds CI-enforceable criteria; advisory reviewer
+  # guidance is included in the same entry so modes do not conflict.
   - paths:
       - 'scripts/**'
     mode: error
@@ -33,14 +32,9 @@ path_instructions:
       and `npm run validate` must report PASS. Suppression markers
       (`eslint-disable`, `nosec`, `noqa`, `@ts-ignore`, `skipcq`, etc.) and
       config-level rule disabling are not allowed in the touched-file set
-      (enforced by scanSuppressionText / closeout gate).
-
-  - paths:
-      - 'scripts/**'
-    mode: warning
-    instructions: |
-      Prefer a focused regression test that fails without the change and
-      passes with it when behavior changes; reviewers confirm adequacy.
+      (enforced by scanSuppressionText / closeout gate). Prefer a focused
+      regression test that fails without the change and passes with it when
+      behavior changes.
 
   - paths:
       - 'tools/**'
@@ -48,15 +42,9 @@ path_instructions:
     instructions: |
       Tools run during CI (`tools/validate_repository.js`, installers) must
       pass `node --check` syntax validation and must fail closed on missing
-      files, symlinks, and unbounded recursion (enforced by npm run validate
-      and installer smoke checks).
-
-  - paths:
-      - 'tools/**'
-    mode: warning
-    instructions: |
-      Installers should tolerate an unset HOME and accept --home / -HomePath
-      as a workaround; reviewers confirm platform edge cases not covered by CI.
+      files, symlinks, non-regular files, and unbounded recursion (enforced by
+      npm run validate and installer smoke checks). Installers should tolerate
+      an unset HOME and accept --home / -HomePath as a workaround.
 
   - paths:
       - '.github/workflows/**'
@@ -70,12 +58,17 @@ path_instructions:
   - paths:
       - 'SKILL.md'
       - 'README.md'
+      - 'SECURITY.md'
+      - 'CONTRIBUTING.md'
+      - 'NOTICE.md'
+      - 'LICENSE'
       - 'references/**'
     mode: warning
     instructions: |
       Documentation changes should describe the public install/usage
       contract accurately and must not introduce suppression markers as
       literal directives outside the scanner's documented vocabulary.
+      Public-distribution safety patterns also cover these root docs.
 
 # Pre-merge checks: the authoritative gate every PR must pass before merge.
 # Each entry uses mode: error (blocks merge on failure) or mode: warning.

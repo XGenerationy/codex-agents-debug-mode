@@ -350,22 +350,32 @@ const createDebugServer = ({
         }
         sessions.set(sessionId, { eventCount: 0, logFile, sessionToken, provisional: true });
         try {
-          // Reject a symlinked or escaped .debug directory before writing session
-          // evidence: a PR-controlled worktree can point .debug at an external
-          // directory, which would let the collector write outside projectRoot.
+          // Reject a symlinked, non-directory, or escaped .debug path before
+          // writing session evidence. A regular *file* named .debug would make
+          // mkdir throw ENOTDIR and surface as an unstructured 500; a
+          // PR-controlled symlink could point outside projectRoot.
           try {
             const dirInfo = await lstat(logDir);
-            if (dirInfo.isSymbolicLink()) throw new RequestError('debug_dir_is_symlink');
+            if (dirInfo.isSymbolicLink()) throw new RequestError('debug_dir_is_symlink', 409);
+            if (!dirInfo.isDirectory()) throw new RequestError('debug_dir_not_directory', 409);
           } catch (error) {
             if (error instanceof RequestError) throw error;
             if (error.code !== 'ENOENT') throw error;
           }
-          await mkdir(logDir, { recursive: true });
+          try {
+            await mkdir(logDir, { recursive: true });
+          } catch (error) {
+            // Race: path became a file/symlink between lstat and mkdir.
+            if (['EEXIST', 'ENOTDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
+              throw new RequestError('debug_dir_not_directory', 409);
+            }
+            throw error;
+          }
           const resolvedLogDir = await realpath(logDir);
           const resolvedRoot = await realpath(path.resolve(projectRoot));
           const rel = path.relative(resolvedRoot, resolvedLogDir);
           if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-            throw new RequestError('debug_dir_escapes_root');
+            throw new RequestError('debug_dir_escapes_root', 409);
           }
           // Create the empty session log through a no-follow descriptor and
           // record its identity. /log re-opens this path for every event and
