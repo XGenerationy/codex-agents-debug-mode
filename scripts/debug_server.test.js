@@ -451,6 +451,8 @@ test('refuses to write the launch token through a hard-linked collector_token', 
   // A repo-controlled .debug/collector_token hard link shares its inode with
   // an outside file; a truncating startup write would clobber that file
   // through the link. Startup must fail closed and leave the target intact.
+  // Open must not use O_TRUNC before fstat: even if pre-checks race, the
+  // outside inode must not be truncated at open time.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   let child;
   try {
@@ -470,6 +472,36 @@ test('refuses to write the launch token through a hard-linked collector_token', 
     assert.match(result.stderr, /startup\.token_write_failed/);
     assert.match(result.stderr, /collector_token_not_private/);
     assert.equal(await readFile(outsideFile, 'utf8'), 'precious');
+  } finally {
+    if (child) stopCli(child);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('rewrites an existing private collector_token without open-time truncation', { timeout: 20000 }, async () => {
+  // Second startup reuses an existing regular private token file. Open must
+  // not pass O_TRUNC; validation then truncate-via-descriptor + write must
+  // leave a fresh token. Exercises the EEXIST branch of the token writer.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  let child;
+  try {
+    const debugDir = path.join(projectRoot, '.debug');
+    const tokenFile = path.join(debugDir, 'collector_token');
+    await mkdir(debugDir, { recursive: true });
+    await writeFile(tokenFile, 'stale-token-content-from-prior-run', { mode: 0o600 });
+
+    const port = await findFreePort();
+    const launched = launchCli(projectRoot, port);
+    child = launched.child;
+    const result = await launched.outcome;
+
+    assert.equal(result.status, 'started');
+    const contents = await readFile(tokenFile, 'utf8');
+    assert.notEqual(contents, 'stale-token-content-from-prior-run');
+    assert.match(contents, /^[A-Za-z0-9_-]{43}$/);
+    const info = await stat(tokenFile);
+    assert.equal(info.isFile(), true);
+    assert.equal(info.nlink, 1);
   } finally {
     if (child) stopCli(child);
     await rm(projectRoot, { recursive: true, force: true });

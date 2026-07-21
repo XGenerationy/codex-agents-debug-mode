@@ -579,26 +579,35 @@ const main = () => {
         throw new Error('debug_dir_escapes_root');
       }
       // Refuse to reuse a pre-existing collector_token that is not a private
-      // regular file BEFORE the truncating open below: a hard-linked token
-      // file shares its inode with another file, so O_TRUNC would clobber
-      // that outside file through the link (the symlink case is rejected
-      // above). O_CREAT|O_TRUNC still overwrites a regular file left by a
-      // previous run because the token is regenerated on every startup.
+      // regular file before opening it: a hard-linked token shares its inode
+      // with another file (symlink case is rejected above). The open path
+      // deliberately avoids O_TRUNC so a TOCTOU swap to a hard-linked inode
+      // between these checks and open cannot truncate an outside file at open
+      // time; we only truncate after fstat proves the opened inode is still a
+      // private regular file.
       await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
       await assertPrivateRegularFile(tokenFile, 'collector_token_not_private');
-      // Open with O_NOFOLLOW so a symlink swapped in after the lstat checks
-      // cannot redirect the write, then re-verify through the descriptor that
-      // the opened file is still a private regular file. Permissions are
-      // applied through the descriptor before close: a path-based chmod after
-      // close could race a symlink swap and retarget an outside file.
-      const handle = await openNoFollow(
-        tokenFile,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
-        0o600,
-      );
+      // Prefer create-exclusive for a fresh path; if the file already exists
+      // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
+      // blocks a symlink swap after the lstat checks. Then re-verify through
+      // the descriptor and only then truncate + write. Permissions are applied
+      // through the descriptor before close: a path-based chmod after close
+      // could race a symlink swap and retarget an outside file.
+      let handle;
+      try {
+        handle = await openNoFollow(
+          tokenFile,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+          0o600,
+        );
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+        handle = await openNoFollow(tokenFile, constants.O_WRONLY, 0o600);
+      }
       try {
         const info = await handle.stat();
         if (!info.isFile() || info.nlink > 1) throw new Error('collector_token_not_private');
+        await handle.truncate(0);
         await handle.writeFile(token, 'utf8');
         await handle.chmod(0o600);
       } finally {
