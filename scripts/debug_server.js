@@ -166,8 +166,10 @@ const configureOrigin = (request, response, allowedOrigins) => {
 // path. The debugged project can mutate .debug after the session is created,
 // so a path-based append would follow a swapped symlink or parent directory
 // outside projectRoot, or block on a FIFO. The descriptor is opened with
-// no-follow semantics and must still be the original regular file (the
-// dev/ino recorded at session creation) before any bytes are written; every
+// no-follow semantics and must still be the original regular file before any
+// bytes are written; identity is checked by dev/ino plus creation birth time
+// and the exact byte count this server has written, because POSIX filesystems
+// can recycle a just-freed inode for a deleted-and-recreated log. Every
 // replacement shape fails closed with the same structured conflict.
 const appendSessionEvent = async (session, serializedEvent) => {
   let handle;
@@ -182,10 +184,22 @@ const appendSessionEvent = async (session, serializedEvent) => {
   try {
     const info = await handle.stat();
     const identity = session.logFileIdentity;
-    if (!info.isFile() || !identity || info.dev !== identity.dev || info.ino !== identity.ino) {
+    // dev/ino can survive a delete+recreate through inode reuse, so also
+    // require the recorded birth time (when the filesystem reports one on
+    // both sides) and exactly the byte count this server has appended — a
+    // replacement file starts with different content or an empty size.
+    const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
+      || info.birthtimeMs === identity.birthtimeMs;
+    if (
+      !info.isFile() || !identity
+      || info.dev !== identity.dev || info.ino !== identity.ino
+      || !sameBirth
+      || info.size !== identity.bytesWritten
+    ) {
       throw new RequestError('session_log_replaced', 409);
     }
     await handle.writeFile(serializedEvent, 'utf8');
+    identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
   } finally {
     await handle.close();
   }
@@ -301,10 +315,15 @@ const createDebugServer = ({
             throw new RequestError('debug_dir_escapes_root');
           }
           // Create the empty session log through a no-follow descriptor and
-          // record its dev/ino identity. /log re-opens this path for every
-          // event and requires the opened file to still be the same regular
-          // file, so a swapped symlink, parent directory, or FIFO under
-          // .debug cannot redirect or block appends (see appendSessionEvent).
+          // record its identity. /log re-opens this path for every event and
+          // requires the opened file to still be the same regular file, so a
+          // swapped symlink, parent directory, or FIFO under .debug cannot
+          // redirect or block appends (see appendSessionEvent). dev/ino alone
+          // is not enough: POSIX filesystems eagerly reuse a just-freed inode,
+          // so a deleted-and-recreated log can present the SAME dev/ino. Bind
+          // the creation-time birth time (where the filesystem reports one)
+          // and the byte count this server has written — a replacement starts
+          // life with a different birth time and unexpected content/size.
           const handle = await openNoFollow(
             logFile,
             constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
@@ -312,7 +331,12 @@ const createDebugServer = ({
           );
           try {
             const info = await handle.stat();
-            sessions.get(sessionId).logFileIdentity = { dev: info.dev, ino: info.ino };
+            sessions.get(sessionId).logFileIdentity = {
+              dev: info.dev,
+              ino: info.ino,
+              birthtimeMs: info.birthtimeMs,
+              bytesWritten: 0,
+            };
           } finally {
             await handle.close();
           }

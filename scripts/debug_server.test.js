@@ -531,8 +531,10 @@ test('rejects appends after the session log is swapped for a hard link', async (
 });
 
 test('rejects appends after the session log is recreated at the same path', async () => {
-  // A deleted-and-recreated session log is a different file (new inode) even
-  // though the path string is unchanged; appends must fail closed.
+  // A deleted-and-recreated session log must be treated as a different file
+  // even though the path string is unchanged. POSIX filesystems can recycle
+  // the just-freed inode, so dev/ino alone cannot prove replacement — the
+  // server also binds the recorded byte count and creation birth time.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
   const baseUrl = await listen(server);
@@ -548,6 +550,32 @@ test('rejects appends after the session log is recreated at the same path', asyn
     assert.equal(response.status, 409);
     assert.deepEqual(response.body, { error: 'session_log_replaced' });
     assert.equal(await readFile(logPath, 'utf8'), 'sentinel\n');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('rejects appends after out-of-band bytes appear in the session log', async () => {
+  // The server tracks exactly how many bytes it has appended; a writer that
+  // adds content out of band (forged events, truncation games) breaks that
+  // binding even when dev/ino still match, so the next append must fail
+  // closed instead of building on a tampered log.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    const first = await recordEvent(baseUrl, session);
+    assert.equal(first.status, 202);
+    await writeFile(logPath, 'forged\n', { flag: 'a' });
+
+    const response = await recordEvent(baseUrl, session);
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { error: 'session_log_replaced' });
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
