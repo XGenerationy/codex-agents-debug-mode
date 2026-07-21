@@ -12,6 +12,7 @@ const {
   createDecodedRedactor,
   createStreamingRedactor,
   redactSecrets,
+  redactStructure,
   probeGrafanaHealthDefault,
   probeRedisDefault,
   resolveCommandShell,
@@ -140,6 +141,25 @@ test('redacts credentials and encoded components from sensitive URL environment 
     Buffer.from(password).toString('hex'),
   ].join(' '), { DATABASE_URL: databaseUrl });
   assert.doesNotMatch(output, /postgresql|alice|p@ss|p%40ss|cEBzcyB3b3Jk|70407373/i);
+});
+
+test('preserves shared object references while still terminating true cycles', () => {
+  // report.toolVersions and report.preflight.toolVersions often alias the same
+  // object; a traversal-wide WeakSet that marks every re-visit as Circular
+  // corrupts one of those fields. Shared refs must stay equal after redaction.
+  const toolVersions = { node: 'v22.0.0', pnpm: '9.0.0' };
+  const preflight = { status: 'PASS', toolVersions };
+  const report = { toolVersions, preflight, secret: 'supersecretvalue123' };
+  const redacted = redactStructure(report, { API_TOKEN: 'supersecretvalue123' }, ['API_TOKEN']);
+  assert.equal(redacted.toolVersions, redacted.preflight.toolVersions);
+  assert.deepEqual(redacted.toolVersions, { node: 'v22.0.0', pnpm: '9.0.0' });
+  assert.match(redacted.secret, /\[REDACTED\]/);
+  // True cycles still terminate with [Circular].
+  const cycle = { name: 'root' };
+  cycle.self = cycle;
+  const cycled = redactStructure(cycle, {}, []);
+  assert.equal(cycled.self, '[Circular]');
+  assert.equal(cycled.name, 'root');
 });
 
 test('redacts credential leaves parsed from JSON auth-blob environment values', () => {

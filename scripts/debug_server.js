@@ -26,6 +26,9 @@ class RequestError extends Error {
 }
 
 const sendJson = (response, status, payload) => {
+  // Guard against secondary throws when the client already closed the socket
+  // (e.g. after request_aborted); writableEnded/destroyed means we cannot respond.
+  if (response.writableEnded || response.destroyed) return;
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   response.end(`${JSON.stringify(payload)}\n`);
 };
@@ -35,18 +38,30 @@ const readJson = async (request, maxBodyBytes) => {
   let size = 0;
   let tooLarge = false;
 
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > maxBodyBytes) {
-      tooLarge = true;
-      // Abort the request immediately instead of continuing to drain the
-      // upload. Without this, a local client could keep the collector busy
-      // (bandwidth/CPU/socket time) with an arbitrarily large body even
-      // though the configured limit has already been exceeded.
-      request.destroy();
-      break;
+  try {
+    for await (const chunk of request) {
+      size += chunk.length;
+      if (size > maxBodyBytes) {
+        tooLarge = true;
+        // Abort the request immediately instead of continuing to drain the
+        // upload. Without this, a local client could keep the collector busy
+        // (bandwidth/CPU/socket time) with an arbitrarily large body even
+        // though the configured limit has already been exceeded.
+        request.destroy();
+        break;
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch (error) {
+    // Client disconnect / stream reset is not a server fault; map to a
+    // structured RequestError so the handler does not log request.failed and
+    // respond with 500 internal_error when a response can still be written.
+    if (error instanceof RequestError) throw error;
+    const code = error?.code;
+    if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ABORT_ERR' || error?.name === 'AbortError') {
+      throw new RequestError('request_aborted', 400);
+    }
+    throw new RequestError('request_failed', 400);
   }
 
   if (tooLarge) throw new RequestError('body_too_large', 413);
@@ -643,6 +658,8 @@ if (require.main === module) main();
 module.exports = {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  RequestError,
   createDebugServer,
   probeServer,
+  readJson,
 };

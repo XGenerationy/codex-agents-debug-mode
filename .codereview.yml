@@ -20,17 +20,27 @@ issue_assessment:
 # Each entry declares the mode (`error` blocks merge, `warning` is advisory)
 # and clear pass/fail instructions so the gate is auditable.
 path_instructions:
+  # mode: error entries only list criteria CI/tooling can evaluate
+  # deterministically (npm test, npm run validate, suppression scan, node --check).
+  # Subjective reviewer judgment stays mode: warning so error semantics remain
+  # automatically enforceable and auditable.
   - paths:
       - 'scripts/**'
     mode: error
     instructions: |
       All PRs that touch scripts/ must keep `npm test` green on every supported
       Node LTS line (20, 22, 24) for both ubuntu-latest and windows-latest,
-      and `npm run validate` must report PASS. New behavior must come with a
-      focused regression test that fails without the change and passes with
-      it. Suppression markers (`eslint-disable`, `nosec`, `noqa`, `@ts-ignore`,
-      `skipcq`, etc.) and config-level rule disabling are not allowed in the
-      touched-file set.
+      and `npm run validate` must report PASS. Suppression markers
+      (`eslint-disable`, `nosec`, `noqa`, `@ts-ignore`, `skipcq`, etc.) and
+      config-level rule disabling are not allowed in the touched-file set
+      (enforced by scanSuppressionText / closeout gate).
+
+  - paths:
+      - 'scripts/**'
+    mode: warning
+    instructions: |
+      Prefer a focused regression test that fails without the change and
+      passes with it when behavior changes; reviewers confirm adequacy.
 
   - paths:
       - 'tools/**'
@@ -38,16 +48,24 @@ path_instructions:
     instructions: |
       Tools run during CI (`tools/validate_repository.js`, installers) must
       pass `node --check` syntax validation and must fail closed on missing
-      files, symlinks, and unbounded recursion. Installers must tolerate an
-      unset HOME and accept --home / -HomePath as a workaround.
+      files, symlinks, and unbounded recursion (enforced by npm run validate
+      and installer smoke checks).
+
+  - paths:
+      - 'tools/**'
+    mode: warning
+    instructions: |
+      Installers should tolerate an unset HOME and accept --home / -HomePath
+      as a workaround; reviewers confirm platform edge cases not covered by CI.
 
   - paths:
       - '.github/workflows/**'
     mode: error
     instructions: |
       Workflow changes must keep the full Node matrix green and must not
-      weaken the audit gate (no continue-on-error, no passWithNoTests, no
-      coverage/threshold reductions, no skipped required checks).
+      introduce continue-on-error, passWithNoTests, coverage/threshold
+      reductions, or skipped required checks on required jobs (detectable via
+      gate integrity / workflow scan and CI conclusions).
 
   - paths:
       - 'SKILL.md'

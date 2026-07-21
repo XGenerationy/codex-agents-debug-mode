@@ -10,8 +10,10 @@ const test = require('node:test');
 const {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  RequestError,
   createDebugServer,
   probeServer,
+  readJson,
 } = require('./debug_server');
 
 const TEST_LAUNCH_TOKEN = 'test-launch-token-with-enough-entropy-for-fixtures';
@@ -328,6 +330,24 @@ test('rejects an invalid Host and an untrusted browser origin', async () => {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('maps request stream errors to RequestError instead of bubbling as 500', async () => {
+  // readJson wraps stream iteration so client disconnect / ECONNRESET becomes
+  // RequestError(request_aborted|request_failed) rather than an uncaught error
+  // that the HTTP handler would classify as internal_error 500.
+  const { Readable } = require('node:stream');
+  const failing = new Readable({
+    read() {
+      this.destroy(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    },
+  });
+  await assert.rejects(
+    () => readJson(failing, 64 * 1024),
+    (error) => error instanceof RequestError
+      && error.status === 400
+      && (error.code === 'request_aborted' || error.code === 'request_failed'),
+  );
 });
 
 test('requires the per-session token before accepting a log event', async () => {

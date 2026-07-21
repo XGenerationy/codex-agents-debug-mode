@@ -268,29 +268,63 @@ const redactSecrets = (text, env = process.env, names = []) => (
   redactSecretsReplacements(text, buildSecretReplacements(env, names))
 );
 
-const redactStructure = (value, env = process.env, names = [], seen = new WeakSet()) => {
+// Walk with a clone cache so legitimate shared references (e.g. report.toolVersions
+// and report.preflight.toolVersions pointing at the same object) are redacted once
+// and reused, while true cycles still terminate. A traversal-wide WeakSet that
+// returned "[Circular]" for every repeated ref corrupted shared evidence fields.
+const redactStructure = (value, env = process.env, names = [], clones = new WeakMap(), stack = new WeakSet()) => {
   if (typeof value === 'string') return redactSecrets(value, env, names);
   if (Buffer.isBuffer(value)) return redactSecrets(value.toString('utf8'), env, names);
   if (!value || typeof value !== 'object') return value;
-  if (seen.has(value)) return '[Circular]';
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((entry) => redactStructure(entry, env, names, seen));
-  if (value instanceof Error) {
-    return redactStructure({ name: value.name, message: value.message, stack: value.stack }, env, names, seen);
+  // Stack first: a re-visit while still building this object is a true cycle.
+  // Clones second: a re-visit after the object left the stack is a shared ref.
+  if (stack.has(value)) return '[Circular]';
+  if (clones.has(value)) return clones.get(value);
+  stack.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const out = [];
+      clones.set(value, out);
+      for (const entry of value) out.push(redactStructure(entry, env, names, clones, stack));
+      return out;
+    }
+    if (value instanceof Error) {
+      const out = redactStructure(
+        { name: value.name, message: value.message, stack: value.stack },
+        env,
+        names,
+        clones,
+        stack,
+      );
+      clones.set(value, out);
+      return out;
+    }
+    if (value instanceof Map) {
+      const out = {};
+      clones.set(value, out);
+      for (const [key, entry] of value.entries()) {
+        out[redactSecrets(String(key), env, names)] = redactStructure(entry, env, names, clones, stack);
+      }
+      return out;
+    }
+    if (value instanceof Set) {
+      const out = [];
+      clones.set(value, out);
+      for (const entry of value) out.push(redactStructure(entry, env, names, clones, stack));
+      return out;
+    }
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
+      return value;
+    }
+    const out = {};
+    clones.set(value, out);
+    for (const [key, entry] of Object.entries(value)) {
+      out[redactSecrets(key, env, names)] = redactStructure(entry, env, names, clones, stack);
+    }
+    return out;
+  } finally {
+    stack.delete(value);
   }
-  if (value instanceof Map) {
-    return Object.fromEntries([...value.entries()].map(([key, entry]) => [
-      redactSecrets(String(key), env, names),
-      redactStructure(entry, env, names, seen),
-    ]));
-  }
-  if (value instanceof Set) return [...value].map((entry) => redactStructure(entry, env, names, seen));
-  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
-  return Object.fromEntries(Object.entries(value)
-    .map(([key, entry]) => [
-      redactSecrets(key, env, names),
-      redactStructure(entry, env, names, seen),
-    ]));
 };
 
 const cappedAppend = (current, chunk) => {

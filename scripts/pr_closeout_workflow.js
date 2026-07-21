@@ -159,7 +159,9 @@ const buildWorkflowEnvironment = (env, config) => {
   )));
 };
 
-const normalizePersistedPaths = (value, repo, outputDir, seen = new WeakSet()) => {
+// Clone-cache walk: shared references stay shared after path normalization;
+// only true cycles become "[Circular]" (same contract as redactStructure).
+const normalizePersistedPaths = (value, repo, outputDir, clones = new WeakMap(), stack = new WeakSet()) => {
   const replacements = [
     [repo, '<repo>'],
     [repo?.replaceAll('\\', '/'), '<repo>'],
@@ -182,13 +184,26 @@ const normalizePersistedPaths = (value, repo, outputDir, seen = new WeakSet()) =
   };
   if (typeof value === 'string') return normalize(value);
   if (!value || typeof value !== 'object') return value;
-  if (seen.has(value)) return '[Circular]';
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((entry) => normalizePersistedPaths(entry, repo, outputDir, seen));
-  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
-    normalize(key),
-    normalizePersistedPaths(entry, repo, outputDir, seen),
-  ]));
+  // Stack first (true cycle while building); clones second (shared refs done).
+  if (stack.has(value)) return '[Circular]';
+  if (clones.has(value)) return clones.get(value);
+  stack.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const out = [];
+      clones.set(value, out);
+      for (const entry of value) out.push(normalizePersistedPaths(entry, repo, outputDir, clones, stack));
+      return out;
+    }
+    const out = {};
+    clones.set(value, out);
+    for (const [key, entry] of Object.entries(value)) {
+      out[normalize(key)] = normalizePersistedPaths(entry, repo, outputDir, clones, stack);
+    }
+    return out;
+  } finally {
+    stack.delete(value);
+  }
 };
 
 const sameList = (left = [], right = []) => (

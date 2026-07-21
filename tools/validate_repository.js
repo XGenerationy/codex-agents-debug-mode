@@ -129,7 +129,18 @@ for (const file of javascriptFiles) {
   const result = spawnSync(process.execPath, ['--check', path.join(root, file)], {
     encoding: 'utf8',
   });
-  if (result.status !== 0) failures.push(`JavaScript syntax failed for ${file}: ${result.stderr.trim()}`);
+  // Never crash while reporting a syntax failure: spawn can fail with
+  // result.error and null status, and stderr may be non-string.
+  const stderr = typeof result.stderr === 'string' ? result.stderr.trim() : '';
+  const stdout = typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  if (result.error) {
+    failures.push(`JavaScript syntax check spawn failed for ${file}: ${result.error.message}`);
+    continue;
+  }
+  if (result.status !== 0) {
+    const detail = stderr || stdout || `exit ${result.status ?? 'null'}`;
+    failures.push(`JavaScript syntax failed for ${file}: ${detail}`);
+  }
 }
 
 if (failures.length > 0) {
