@@ -176,7 +176,11 @@ const appendSessionEvent = async (session, serializedEvent) => {
   try {
     handle = await openNoFollow(session.logFile, constants.O_WRONLY | constants.O_APPEND);
   } catch (error) {
-    if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR'].includes(error?.code)) {
+    // EISDIR: POSIX reports a directory swap as EISDIR, Windows as EPERM
+    // (or EACCES on some setups) when a path is opened for writing. Any of
+    // these means the path no longer names our regular session file, so
+    // fail closed with the same structured conflict instead of a 500.
+    if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
       throw new RequestError('session_log_replaced', 409);
     }
     throw error;

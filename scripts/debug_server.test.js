@@ -591,11 +591,13 @@ test(
     const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
     const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
     const baseUrl = await listen(server);
+    let outsideDir;
 
     try {
       const session = (await createSession(baseUrl)).body;
       const logPath = path.join(projectRoot, session.log_file);
-      const outsideFile = path.join(await mkdtemp(path.join(tmpdir(), 'debug-skill-outside-')), 'outside.log');
+      outsideDir = await mkdtemp(path.join(tmpdir(), 'debug-skill-outside-'));
+      const outsideFile = path.join(outsideDir, 'outside.log');
       await rm(logPath);
       await symlink(outsideFile, logPath);
 
@@ -607,9 +609,34 @@ test(
     } finally {
       await close(server);
       await rm(projectRoot, { recursive: true, force: true });
+      if (outsideDir) await rm(outsideDir, { recursive: true, force: true });
     }
   },
 );
+
+test('rejects appends after the session log path is swapped for a directory', async () => {
+  // open(O_WRONLY | O_APPEND) on a directory raises EISDIR on POSIX and
+  // EPERM/EACCES on Windows; every shape must map to the same structured
+  // conflict instead of a generic 500.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    await rm(logPath);
+    await mkdir(logPath);
+
+    const response = await recordEvent(baseUrl, session);
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { error: 'session_log_replaced' });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
 
 test(
   'install.sh emits the real target and backup paths in its JSON result',
