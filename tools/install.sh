@@ -127,13 +127,19 @@ done
 declare -a committed_dests=()
 declare -a committed_backups=()
 
+# Restore a destination from its backup if present (committed or in-flight).
+restore_from_backup() {
+  local dest="$1" backup="$2"
+  rm -rf -- "$dest" 2>/dev/null || true
+  if [[ -n "$backup" && -e "$backup" ]]; then
+    mv -- "$backup" "$dest" 2>/dev/null || true
+  fi
+}
+
 rollback() {
   local i
   for ((i = ${#committed_dests[@]} - 1; i >= 0; i--)); do
-    rm -rf -- "${committed_dests[$i]}" 2>/dev/null || true
-    if [[ -n "${committed_backups[$i]:-}" && -e "${committed_backups[$i]}" ]]; then
-      mv -- "${committed_backups[$i]}" "${committed_dests[$i]}" 2>/dev/null || true
-    fi
+    restore_from_backup "${committed_dests[$i]}" "${committed_backups[$i]:-}"
   done
 }
 
@@ -146,7 +152,11 @@ for destination in "${destinations[@]}"; do
     mv -- "$destination" "$backup"
   fi
   # Commit: move staged tree into place (atomic rename when same filesystem).
+  # If this fails after we already renamed an existing destination to backup,
+  # restore that in-flight backup before rolling back prior commits — otherwise
+  # the target is left missing while a backup still exists on disk.
   if ! mv -- "$stage" "$destination"; then
+    restore_from_backup "$destination" "$backup"
     rollback
     echo "Failed to install to $destination" >&2
     exit 1

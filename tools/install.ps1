@@ -98,9 +98,25 @@ try {
         if (Test-Path -LiteralPath $item.Destination) {
             $backup = New-UniqueBackupPath -Destination $item.Destination
             Move-Item -LiteralPath $item.Destination -Destination $backup
+            # Record backup before the stage commit so a failed stage→destination
+            # move still restores this in-flight backup (not only fully committed
+            # prior targets).
+            $item.Backup = $backup
         }
-        Move-Item -LiteralPath $item.Stage -Destination $item.Destination
-        $item.Backup = $backup
+        try {
+            Move-Item -LiteralPath $item.Stage -Destination $item.Destination
+        }
+        catch {
+            # Stage move failed: put the original destination back if we backed it up.
+            if ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
+                if (Test-Path -LiteralPath $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction SilentlyContinue
+                $item.Backup = $null
+            }
+            throw
+        }
         $item.Committed = $true
         $item.Stage = $null
         Write-Output ([pscustomobject]@{
@@ -111,11 +127,12 @@ try {
     }
 }
 catch {
-    # Roll back any destinations already committed in this run.
+    # Roll back committed destinations and any in-flight backup (destination
+    # renamed to backup, stage move never succeeded / already restored).
     for ($i = $staged.Count - 1; $i -ge 0; $i--) {
         $item = $staged[$i]
-        if ($item.Committed) {
-            try {
+        try {
+            if ($item.Committed) {
                 if (Test-Path -LiteralPath $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force
                 }
@@ -123,9 +140,16 @@ catch {
                     Move-Item -LiteralPath $item.Backup -Destination $item.Destination
                 }
             }
-            catch {
-                # Best-effort rollback; surface the original install error below.
+            elseif ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
+                # In-flight: destination was renamed to backup but never committed.
+                if (Test-Path -LiteralPath $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force
+                }
+                Move-Item -LiteralPath $item.Backup -Destination $item.Destination
             }
+        }
+        catch {
+            # Best-effort rollback; surface the original install error below.
         }
     }
     throw
