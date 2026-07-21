@@ -536,6 +536,17 @@ test('flags test-weakening after a regex literal with an apostrophe', () => {
   assert.match(findings[0].match, /it\.only/i);
 });
 
+test('flags test-weakening after a return-preceded regex with an apostrophe', () => {
+  // Keyword context (return/typeof/...) must be recognized as a full word, not a
+  // single character, or a return-preceded regex with an apostrophe hides focus.
+  const findings = scanSuppressionText(
+    'src/foo.test.js',
+    "return /it's ok/; it.only('real', () => {});",
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(findings.length, 1, JSON.stringify(findings));
+  assert.match(findings[0].match, /it\.only/i);
+});
+
 test('rejects Mocha zero-passing summaries as no-work', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: '0 passing' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: '  0 passing (12ms)' }).status, 'FAIL');

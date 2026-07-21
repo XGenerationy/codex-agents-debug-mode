@@ -387,10 +387,16 @@ const scanSuppressionText = (file, text) => {
           continue;
         }
         // Regex literals (e.g. /don't/) must not open a quote on the apostrophe.
-        // Heuristic: `/` after a token that typically precedes a regex, not division.
+        // Heuristic: `/` after punctuation or a keyword that typically precedes a
+        // regex, not after an identifier (which is usually division).
         if (ch === '/' && line[i + 1] && line[i + 1] !== '/' && line[i + 1] !== '*') {
           const prev = prevSignificant(i);
-          if (!prev || /[=(:,;[!&|?{~+\-*%^<>]/.test(prev) || prev === 'return' || /[({[]/.test(prev)) {
+          // prevSignificant is a single character; keyword context needs a word.
+          const prevWord = line.slice(0, i).match(/([A-Za-z_$][\w$]*)\s*$/)?.[1];
+          const regexContextKeyword = prevWord
+            ? /^(?:return|typeof|instanceof|in|of|new|do|else|yield|await|case|void|delete|throw)$/.test(prevWord)
+            : false;
+          if (!prev || /[=(:,;[!&|?{~+\-*%^<>]/.test(prev) || regexContextKeyword) {
             let k = i + 1;
             let reEsc = false;
             for (; k < line.length; k += 1) {

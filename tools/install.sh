@@ -85,26 +85,85 @@ for entry in "${payload[@]}"; do
   }
 done
 
+# Preflight all destinations before mutating any of them so multi-target
+# installs cannot leave one path updated and another absent/partial.
 for destination in "${destinations[@]}"; do
+  if [[ -e "$destination" && "$force" != "true" ]]; then
+    echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
+    exit 1
+  fi
+done
+
+unique_backup() {
+  local destination="$1"
+  local base_ts backup
+  base_ts="$(date -u +%Y%m%d%H%M%S)"
+  backup="$destination.backup.$base_ts.$$"
+  while [[ -e "$backup" ]]; do
+    backup="$destination.backup.$base_ts.$$.$RANDOM"
+  done
+  printf '%s\n' "$backup"
+}
+
+# Stage each destination's payload under a sibling temp dir, then commit only
+# after every staged tree is complete. On commit failure, restore backups.
+declare -a stage_paths=()
+declare -a commit_dests=()
+declare -a commit_backups=()
+declare -a committed_flags=()
+
+cleanup_stages() {
+  local path
+  for path in "${stage_paths[@]+"${stage_paths[@]}"}"; do
+    [[ -n "$path" && -e "$path" ]] && rm -rf -- "$path"
+  done
+}
+
+rollback_commits() {
+  local i dest backup
+  for ((i = ${#commit_dests[@]} - 1; i >= 0; i--)); do
+    [[ "${committed_flags[$i]:-}" == "1" ]] || continue
+    dest="${commit_dests[$i]}"
+    backup="${commit_backups[$i]}"
+    rm -rf -- "$dest" 2>/dev/null || true
+    if [[ -n "$backup" && -e "$backup" ]]; then
+      mv -- "$backup" "$dest" 2>/dev/null || true
+    fi
+  done
+}
+
+trap 'rollback_commits; cleanup_stages' ERR
+trap 'cleanup_stages' EXIT
+
+for destination in "${destinations[@]}"; do
+  parent="$(dirname -- "$destination")"
+  mkdir -p -- "$parent"
+  stage="$parent/.debug-install-stage.$(date -u +%Y%m%d%H%M%S).$$.${#stage_paths[@]}"
+  rm -rf -- "$stage"
+  mkdir -p -- "$stage"
+  for entry in "${payload[@]}"; do
+    cp -R -- "$source_dir/$entry" "$stage/"
+  done
+  stage_paths+=("$stage")
+  commit_dests+=("$destination")
+  commit_backups+=("")
+  committed_flags+=("0")
+done
+
+for i in "${!commit_dests[@]}"; do
+  destination="${commit_dests[$i]}"
+  stage="${stage_paths[$i]}"
   backup=""
   if [[ -e "$destination" ]]; then
-    if [[ "$force" != "true" ]]; then
-      echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
-      exit 1
-    fi
-    # Collision-proof backup name: second-level timestamp + PID + a retrying
-    # counter so repeated forced installs in the same second cannot collide.
-    base_ts="$(date -u +%Y%m%d%H%M%S)"
-    backup="$destination.backup.$base_ts.$$"
-    while [[ -e "$backup" ]]; do
-      backup="$destination.backup.$base_ts.$$.$RANDOM"
-    done
+    backup="$(unique_backup "$destination")"
     mv -- "$destination" "$backup"
   fi
-
-  mkdir -p -- "$destination"
-  for entry in "${payload[@]}"; do
-    cp -R -- "$source_dir/$entry" "$destination/"
-  done
+  mv -- "$stage" "$destination"
+  stage_paths[$i]=""
+  commit_backups[$i]="$backup"
+  committed_flags[$i]="1"
   emit_result "$destination" "$backup"
 done
+
+# Successful path: clear ERR rollback; EXIT still cleans any leftover stages.
+trap - ERR

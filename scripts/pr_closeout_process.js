@@ -72,6 +72,21 @@ const probeCommandShell = async (shell, env = process.env) => {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+// Resolve per-check timeout budgets for primary and proof spawns. Baseline
+// comparison ids (`${checkId}-baseline-comparison`) inherit the parent check's
+// configured timeout so base reruns get the same budget as the head run.
+const resolveCheckTimeout = (check, timeoutsMs = {}, timeoutMs) => {
+  if (timeoutsMs[check?.id] != null) return timeoutsMs[check.id];
+  if (check?.associatedCheckId && timeoutsMs[check.associatedCheckId] != null) {
+    return timeoutsMs[check.associatedCheckId];
+  }
+  if (typeof check?.id === 'string' && check.id.endsWith('-baseline-comparison')) {
+    const parentId = check.id.slice(0, -'-baseline-comparison'.length);
+    if (timeoutsMs[parentId] != null) return timeoutsMs[parentId];
+  }
+  return timeoutMs;
+};
+
 // Live non-zombie PIDs whose environ contains SPAWN_MARK_ENV=mark. Returns
 // null when /proc is unavailable (non-Linux). Used to re-find descendants that
 // left the original process group via setsid/detached:true after the group
@@ -1196,14 +1211,8 @@ const createCommandExecutor = ({
     cwd,
     shell,
     shellArgs,
-    // Baseline comparison ids are `${checkId}-baseline-comparison`; look up
-    // the parent check's configured timeout so base reruns get the same budget.
-    timeoutMs: timeoutsMs[check.id]
-      || timeoutsMs[check.associatedCheckId]
-      || (typeof check.id === 'string' && check.id.endsWith('-baseline-comparison')
-        ? timeoutsMs[check.id.slice(0, -'-baseline-comparison'.length)]
-        : undefined)
-      || timeoutMs,
+    // Baseline comparison ids inherit the parent check's configured timeout.
+    timeoutMs: resolveCheckTimeout(check, timeoutsMs, timeoutMs),
     env: childEnv,
     redactionEnv: env,
     secretNames,
@@ -1245,9 +1254,7 @@ const createCommandExecutor = ({
       cwd,
       shell,
       shellArgs,
-      timeoutMs: timeoutsMs[check.id]
-        || timeoutsMs[check.associatedCheckId]
-        || timeoutMs,
+      timeoutMs: resolveCheckTimeout(check, timeoutsMs, timeoutMs),
       env: childEnv,
       redactionEnv: env,
       secretNames,
@@ -1569,6 +1576,7 @@ module.exports = {
   probeRedisDefault,
   redactSecrets,
   redactStructure,
+  resolveCheckTimeout,
   resolveCommandShell,
   runPreflight,
   spawnCaptured,
