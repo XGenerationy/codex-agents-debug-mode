@@ -121,13 +121,14 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   return live;
 };
 
-// Secondary containment: find live non-zombie processes whose cwd is under the
-// sealed worktree and whose starttime is at/after the spawn. A child that
-// unsets OMO_CLOSEOUT_SPAWN_MARK (env -u) still typically keeps the worktree
-// cwd, so this reaps mark-stripped setsid orphans.
+// Secondary containment for mark-stripped setsid orphans: live non-zombie
+// processes whose cwd is under the sealed worktree, started at/after the
+// spawn, AND that left our session (setsid/detached). Filtering on session
+// avoids killing parallel test workers that share process.cwd() as the repo.
 const listLivePidsWithCwdUnder = (rootCwd, {
   selfPid = process.pid,
   minStarttime = 0,
+  selfSession = null,
 } = {}) => {
   if (!rootCwd) return [];
   let entries;
@@ -143,6 +144,20 @@ const listLivePidsWithCwdUnder = (rootCwd, {
   } catch {
     rootReal = path.resolve(rootCwd);
   }
+  let runnerSession = selfSession;
+  if (runnerSession == null) {
+    try {
+      const selfStat = readFileSync(`/proc/${selfPid}/stat`, 'utf8');
+      const after = selfStat.lastIndexOf(')');
+      if (after >= 0) {
+        const fields = selfStat.slice(after + 1).trimStart().split(/\s+/);
+        // post-comm: state(0) ppid(1) pgrp(2) session(3)
+        runnerSession = Number(fields[3]);
+      }
+    } catch {
+      runnerSession = null;
+    }
+  }
   const live = [];
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
@@ -157,8 +172,14 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       if (state === 'Z') continue;
       // /proc/pid/stat: after (comm) → state ppid pgrp session ... starttime is
       // field index 19 in the post-comm fields (man proc_pid_stat).
+      const session = Number(fields[3]);
       const starttime = Number(fields[19]);
       if (Number.isFinite(minStarttime) && Number.isFinite(starttime) && starttime < minStarttime) {
+        continue;
+      }
+      // Only target processes that left the runner session (setsid/detached).
+      // Same-session peers (parallel node:test workers) must not be reaped.
+      if (Number.isFinite(runnerSession) && Number.isFinite(session) && session === runnerSession) {
         continue;
       }
       let cwdLink;

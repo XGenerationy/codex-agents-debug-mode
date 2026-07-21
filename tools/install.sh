@@ -105,71 +105,54 @@ unique_backup() {
   printf '%s\n' "$backup"
 }
 
-# Stage each destination's payload under a sibling temp dir, then commit only
-# after every staged tree is complete. On commit failure, restore backups.
+# Stage each destination under a sibling temp dir first. Only after every
+# staged tree is complete do we commit (backup + replace). On any commit
+# failure, restore previously committed destinations from their backups.
+stage_root="$(mktemp -d "${TMPDIR:-/tmp}/debug-install-stages.XXXXXX")"
+# shellcheck disable=SC2064
+trap 'rm -rf -- "$stage_root"' EXIT
+
 declare -a stage_paths=()
-declare -a commit_dests=()
-declare -a commit_backups=()
-declare -a committed_flags=()
-
-cleanup_stages() {
-  local path
-  # Use if/then (not `[[ ... ]] && rm`) so set -e never treats a non-matching
-  # path as a failing command when this runs from the EXIT trap.
-  for path in "${stage_paths[@]+"${stage_paths[@]}"}"; do
-    if [[ -n "$path" && -e "$path" ]]; then
-      rm -rf -- "$path" || true
-    fi
-  done
-}
-
-rollback_commits() {
-  local i dest backup
-  for ((i = ${#commit_dests[@]} - 1; i >= 0; i--)); do
-    if [[ "${committed_flags[$i]:-}" != "1" ]]; then
-      continue
-    fi
-    dest="${commit_dests[$i]}"
-    backup="${commit_backups[$i]}"
-    rm -rf -- "$dest" 2>/dev/null || true
-    if [[ -n "$backup" && -e "$backup" ]]; then
-      mv -- "$backup" "$dest" 2>/dev/null || true
-    fi
-  done
-}
-
-trap 'rollback_commits; cleanup_stages' ERR
-trap 'cleanup_stages' EXIT
-
 for destination in "${destinations[@]}"; do
   parent="$(dirname -- "$destination")"
   mkdir -p -- "$parent"
-  stage="$parent/.debug-install-stage.$(date -u +%Y%m%d%H%M%S).$$.${#stage_paths[@]}"
-  rm -rf -- "$stage"
+  stage="$stage_root/$(printf '%s' "$destination" | sed 's/[^A-Za-z0-9._-]/_/g')"
   mkdir -p -- "$stage"
   for entry in "${payload[@]}"; do
     cp -R -- "$source_dir/$entry" "$stage/"
   done
   stage_paths+=("$stage")
-  commit_dests+=("$destination")
-  commit_backups+=("")
-  committed_flags+=("0")
 done
 
-for i in "${!commit_dests[@]}"; do
-  destination="${commit_dests[$i]}"
-  stage="${stage_paths[$i]}"
+declare -a committed_dests=()
+declare -a committed_backups=()
+
+rollback() {
+  local i
+  for ((i = ${#committed_dests[@]} - 1; i >= 0; i--)); do
+    rm -rf -- "${committed_dests[$i]}" 2>/dev/null || true
+    if [[ -n "${committed_backups[$i]:-}" && -e "${committed_backups[$i]}" ]]; then
+      mv -- "${committed_backups[$i]}" "${committed_dests[$i]}" 2>/dev/null || true
+    fi
+  done
+}
+
+idx=0
+for destination in "${destinations[@]}"; do
+  stage="${stage_paths[$idx]}"
   backup=""
   if [[ -e "$destination" ]]; then
     backup="$(unique_backup "$destination")"
     mv -- "$destination" "$backup"
   fi
-  mv -- "$stage" "$destination"
-  stage_paths[$i]=""
-  commit_backups[$i]="$backup"
-  committed_flags[$i]="1"
+  # Commit: move staged tree into place (atomic rename when same filesystem).
+  if ! mv -- "$stage" "$destination"; then
+    rollback
+    echo "Failed to install to $destination" >&2
+    exit 1
+  fi
+  committed_dests+=("$destination")
+  committed_backups+=("$backup")
   emit_result "$destination" "$backup"
+  idx=$((idx + 1))
 done
-
-# Successful path: clear ERR rollback; EXIT still cleans any leftover stages.
-trap - ERR
