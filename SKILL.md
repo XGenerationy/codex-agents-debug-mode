@@ -274,10 +274,13 @@ debug_log('Function entry', {'user_id': user_id, 'type': type(user_id)}, 'H1')
 
 ### Phase 4: Clear and Reproduce
 
-1. Clear logs:
-   ```bash
-   : > /path/to/project/.debug/debug-$SESSION_ID.log
-   ```
+1. **Do not truncate an active session log.** The collector tracks
+   `bytesWritten` for the open session; truncating
+   `.debug/debug-$SESSION_ID.log` on disk leaves that counter stale and the
+   next `/log` append returns `409 session_log_replaced`. For a clean
+   reproduction, create a **fresh session** (new `POST /session`) and use its
+   new `session_id` / `session_token` / log path instead of truncating the
+   previous file.
 
 2. Provide reproduction steps:
    ```xml
@@ -331,7 +334,7 @@ debugLog('Function entry', { userId, runId: 'post-fix' }, 'H1');
 
 ### Phase 7: Verify
 
-1. Clear logs
+1. Create a **fresh session** (do not truncate the previous session log)
 2. Reproduce again through the matching surface (bug should be gone)
 3. Compare before/after:
    ```

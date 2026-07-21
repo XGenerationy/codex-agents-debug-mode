@@ -369,6 +369,22 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     excludePath = path.join(repo, '.git', 'info', 'exclude');
   }
   entries.push({ path: '__git_info_exclude__', hash: await hashFsEntry(excludePath) });
+  // Seal core.excludesFile: --exclude-standard honors that path for untracked
+  // discovery, so mutating it can hide files without changing info/exclude.
+  try {
+    const excludesFile = await gitText(repo, ['config', '--get', 'core.excludesFile']);
+    const resolved = excludesFile
+      ? (path.isAbsolute(excludesFile) ? excludesFile : path.resolve(repo, excludesFile))
+      : '';
+    entries.push({
+      path: '__git_core_excludesFile__',
+      hash: resolved
+        ? hashBytes(`path:${resolved}\0${await hashFsEntry(resolved)}`)
+        : hashBytes('unset'),
+    });
+  } catch {
+    entries.push({ path: '__git_core_excludesFile__', hash: hashBytes('unset') });
+  }
   for (const file of untracked) {
     // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
     // hashFile guard has one owner. A validation command may leave a link to

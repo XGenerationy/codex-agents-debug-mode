@@ -512,6 +512,30 @@ test('flags active test-weakening after a block-comment apostrophe on the same l
   assert.match(findings[0].match, /it\.only/i);
 });
 
+test('flags chained Jest/Vitest focus and skip modifiers', () => {
+  // Runner modifier chains (concurrent + only/skip/each) must still flag.
+  for (const line of [
+    'test.concurrent.only("focused concurrent", () => {});',
+    'test.concurrent.skip("skipped concurrent", () => {});',
+    'it.only.each([[1]])("table", () => {});',
+    'describe.only.each([["a"]])("suite", () => {});',
+  ]) {
+    const findings = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(findings.length, 1, `expected flag for: ${line} got ${JSON.stringify(findings)}`);
+  }
+});
+
+test('flags test-weakening after a regex literal with an apostrophe', () => {
+  // Apostrophes inside a regex literal must not open a quote that hides focus.
+  const findings = scanSuppressionText(
+    'src/foo.test.js',
+    "const r = /don't/; it.only('real', () => {});",
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(findings.length, 1, JSON.stringify(findings));
+  assert.match(findings[0].match, /it\.only/i);
+});
+
 test('rejects Mocha zero-passing summaries as no-work', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: '0 passing' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: '  0 passing (12ms)' }).status, 'FAIL');

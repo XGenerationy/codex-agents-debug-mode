@@ -1,6 +1,6 @@
 const { execFile, spawn } = require('node:child_process');
-const { createHash } = require('node:crypto');
-const { constants, createWriteStream } = require('node:fs');
+const { createHash, randomBytes } = require('node:crypto');
+const { constants, createWriteStream, readdirSync, readFileSync } = require('node:fs');
 const { access, lstat, mkdir, open, realpath, statfs, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const https = require('node:https');
@@ -8,6 +8,11 @@ const net = require('node:net');
 const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
 const { promisify } = require('node:util');
+
+// Injected into every validation spawn so descendants that leave the process
+// group (setsid / detached:true) can still be found via /proc/*/environ and
+// reaped. Name avoids isSensitiveEnvName TOKEN/SECRET patterns.
+const SPAWN_MARK_ENV = 'OMO_CLOSEOUT_SPAWN_MARK';
 
 const { classifyOutput, findStatusSignals } = require('./pr_closeout_core');
 const {
@@ -67,6 +72,112 @@ const probeCommandShell = async (shell, env = process.env) => {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+// Live non-zombie PIDs whose environ contains SPAWN_MARK_ENV=mark. Returns
+// null when /proc is unavailable (non-Linux). Used to re-find descendants that
+// left the original process group via setsid/detached:true after the group
+// itself looks empty.
+const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
+  if (!mark) return [];
+  const target = `${SPAWN_MARK_ENV}=${mark}`;
+  let entries;
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return null;
+  }
+  const live = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid === selfPid) continue;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm < 0) continue;
+      const state = stat.slice(afterComm + 1).trimStart().split(/\s+/)[0];
+      if (state === 'Z') continue;
+      const environ = readFileSync(`/proc/${pid}/environ`);
+      const vars = environ.toString('utf8').split('\0');
+      if (vars.includes(target)) live.push(pid);
+    } catch {
+      // Process exited between readdir and read, or environ is unreadable.
+    }
+  }
+  return live;
+};
+
+const sweepSpawnMarkOrphans = async ({
+  mark,
+  kill = process.kill.bind(process),
+  terminationGraceMs = 2000,
+  selfPid = process.pid,
+} = {}) => {
+  if (!mark) {
+    return { status: 'PASS', evidence: 'No spawn mark to sweep.', escalated: false };
+  }
+  const list = () => listLivePidsWithSpawnMark(mark, { selfPid });
+  let remaining = list();
+  if (remaining === null) {
+    // Non-Linux: process-group termination is the only containment available.
+    return {
+      status: 'PASS',
+      evidence: 'Spawn-mark orphan sweep skipped (/proc unavailable).',
+      escalated: false,
+    };
+  }
+  if (remaining.length === 0) {
+    return {
+      status: 'PASS',
+      evidence: 'No detached spawn-mark descendants remained.',
+      escalated: false,
+    };
+  }
+  for (const pid of remaining) {
+    try { kill(pid, 'SIGTERM'); } catch {}
+  }
+  const softDeadline = Date.now() + Math.min(terminationGraceMs, 500);
+  while (Date.now() < softDeadline) {
+    remaining = list() || [];
+    if (remaining.length === 0) {
+      return {
+        status: 'PASS',
+        evidence: 'Detached spawn-mark descendants stopped after SIGTERM.',
+        escalated: false,
+      };
+    }
+    await delay(25);
+  }
+  remaining = list() || [];
+  for (const pid of remaining) {
+    try { kill(pid, 'SIGKILL'); } catch {}
+  }
+  const hardDeadline = Date.now() + terminationGraceMs;
+  while (Date.now() < hardDeadline) {
+    remaining = list() || [];
+    if (remaining.length === 0) {
+      return {
+        status: 'PASS',
+        evidence: 'Detached spawn-mark descendants required SIGKILL and are gone.',
+        escalated: true,
+      };
+    }
+    await delay(25);
+  }
+  remaining = list() || [];
+  if (remaining.length === 0) {
+    return {
+      status: 'PASS',
+      evidence: 'Detached spawn-mark descendants required SIGKILL and are gone.',
+      escalated: true,
+    };
+  }
+  return {
+    status: 'BLOCKED',
+    evidence: `Detached spawn-mark descendants still live after SIGTERM/SIGKILL: pids ${remaining.slice(0, 8).join(',')}.`,
+    escalated: true,
+  };
+};
+
 const terminateProcessTree = async ({
   child,
   platform = process.platform,
@@ -75,6 +186,7 @@ const terminateProcessTree = async ({
   runExecFile = execFileAsync,
   kill = process.kill.bind(process),
   closePromise,
+  spawnMark,
 } = {}) => {
   if (!Number.isInteger(child?.pid) || child.pid <= 0) {
     return { status: 'BLOCKED', evidence: 'Process-tree termination has no valid process identifier.', escalated: false };
@@ -138,7 +250,7 @@ const terminateProcessTree = async ({
     // "group is gone" since a defunct root cannot do anything either.
     const isDefunct = (pid) => {
       try {
-        const stat = require('node:fs').readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
         // /proc/$pid/stat is `pid (comm) state ...`; comm may contain spaces
         // and parens, so parse from the LAST ')' in the line.
         const afterComm = stat.lastIndexOf(')');
@@ -160,7 +272,7 @@ const terminateProcessTree = async ({
     const liveMembersInGroup = (pgid) => {
       let entries;
       try {
-        entries = require('node:fs').readdirSync('/proc');
+        entries = readdirSync('/proc');
       } catch {
         return null;
       }
@@ -168,7 +280,7 @@ const terminateProcessTree = async ({
       for (const entry of entries) {
         if (!/^\d+$/.test(entry)) continue;
         try {
-          const stat = require('node:fs').readFileSync(`/proc/${entry}/stat`, 'utf8');
+          const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
           const afterComm = stat.lastIndexOf(')');
           if (afterComm < 0) continue;
           const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
@@ -206,11 +318,37 @@ const terminateProcessTree = async ({
     const awaitRootClose = async () => {
       if (closePromise) await Promise.race([closePromise, delay(terminationGraceMs)]);
     };
+    // After the process group looks gone, still sweep descendants that left
+    // the group (setsid / detached:true) via the per-spawn environ mark.
+    const withOrphanSweep = async (groupResult) => {
+      if (groupResult.status === 'BLOCKED') return groupResult;
+      const sweep = await sweepSpawnMarkOrphans({
+        mark: spawnMark,
+        kill,
+        terminationGraceMs,
+      });
+      if (sweep.status === 'BLOCKED') {
+        return {
+          status: 'BLOCKED',
+          evidence: `${groupResult.evidence} ${sweep.evidence}`,
+          escalated: true,
+        };
+      }
+      return {
+        status: 'PASS',
+        evidence: `${groupResult.evidence} ${sweep.evidence}`,
+        escalated: Boolean(groupResult.escalated || sweep.escalated),
+      };
+    };
     try {
       kill(-child.pid, 'SIGTERM');
     } catch (error) {
       if (error?.code === 'ESRCH') {
-        return { status: 'PASS', evidence: `Process group ${child.pid} had already exited.`, escalated: false };
+        return withOrphanSweep({
+          status: 'PASS',
+          evidence: `Process group ${child.pid} had already exited.`,
+          escalated: false,
+        });
       }
       throw error;
     }
@@ -221,7 +359,11 @@ const terminateProcessTree = async ({
     // process ignores SIGTERM.
     await awaitRootClose();
     if (!groupExists()) {
-      return { status: 'PASS', evidence: `Process group ${child.pid} stopped after SIGTERM.`, escalated: false };
+      return withOrphanSweep({
+        status: 'PASS',
+        evidence: `Process group ${child.pid} stopped after SIGTERM.`,
+        escalated: false,
+      });
     }
     try {
       kill(-child.pid, 'SIGKILL');
@@ -231,7 +373,11 @@ const terminateProcessTree = async ({
       // successful termination -- do not let the outer catch convert it into
       // a spurious BLOCKED result.
       if (error?.code === 'ESRCH') {
-        return { status: 'PASS', evidence: `Process group ${child.pid} exited before SIGKILL was delivered.`, escalated: true };
+        return withOrphanSweep({
+          status: 'PASS',
+          evidence: `Process group ${child.pid} exited before SIGKILL was delivered.`,
+          escalated: true,
+        });
       }
       throw error;
     }
@@ -239,7 +385,11 @@ const terminateProcessTree = async ({
     while (Date.now() < deadline) {
       await awaitRootClose();
       if (!groupExists()) {
-        return { status: 'PASS', evidence: `Process group ${child.pid} required SIGKILL and is gone.`, escalated: true };
+        return withOrphanSweep({
+          status: 'PASS',
+          evidence: `Process group ${child.pid} required SIGKILL and is gone.`,
+          escalated: true,
+        });
       }
       await delay(25);
     }
@@ -476,9 +626,16 @@ const spawnCaptured = async ({
     hash: createHash('sha256'),
   });
   const states = { stdout: makeState(), stderr: makeState() };
+  // Unique mark inherited by every descendant of this spawn. terminateProcessTree
+  // uses it to re-find processes that leave the process group (setsid /
+  // detached:true) after the original group appears empty.
+  const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
+  const spawnEnv = spawnMark
+    ? { ...env, [SPAWN_MARK_ENV]: spawnMark }
+    : env;
   const child = spawnProcess(shell, shellArgs(command), {
     cwd,
-    env,
+    env: spawnEnv,
     detached: platform !== 'win32',
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -548,6 +705,7 @@ const spawnCaptured = async ({
         env,
         terminationGraceMs,
         closePromise,
+        spawnMark,
       });
   } else {
     timedOut = true;
@@ -557,6 +715,7 @@ const spawnCaptured = async ({
       env,
       terminationGraceMs,
       closePromise,
+      spawnMark,
     });
     outcome = await Promise.race([
       closePromise,
@@ -1401,9 +1560,11 @@ const runPreflight = async ({
 };
 
 module.exports = {
+  SPAWN_MARK_ENV,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  listLivePidsWithSpawnMark,
   probeGrafanaHealthDefault,
   probeRedisDefault,
   redactSecrets,
@@ -1412,6 +1573,7 @@ module.exports = {
   runPreflight,
   spawnCaptured,
   snapshotArtifactProof,
+  sweepSpawnMarkOrphans,
   terminateProcessTree,
   verifyArtifactProof,
 };

@@ -349,10 +349,18 @@ const scanSuppressionText = (file, text) => {
     // that sit inside string/template literals so this scanner's own
     // regression tests (e.g. scanSuppressionText(..., 'it.skip("x")')) do
     // not self-flag as active test-weakening.
-    const testWeakening = /\b(?:describe|it|test|context)\.(?:skip|only|todo)\b|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Allow runner modifier chains (Jest/Vitest): test.concurrent.only / it.only.each, etc.
+    const testWeakening = /\b(?:describe|it|test|context)(?:\.[A-Za-z_]\w*)*\.(?:skip|only|todo)\b|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     const isInsideQuotes = (line, at) => {
       let quote = null;
       let escaped = false;
+      const prevSignificant = (from) => {
+        for (let j = from - 1; j >= 0; j -= 1) {
+          const c = line[j];
+          if (!/\s/.test(c)) return c;
+        }
+        return '';
+      };
       for (let i = 0; i < at; i += 1) {
         const ch = line[i];
         if (escaped) {
@@ -377,6 +385,34 @@ const scanSuppressionText = (file, text) => {
           if (end === -1) return false;
           i = end + 1;
           continue;
+        }
+        // Regex literals (e.g. /don't/) must not open a quote on the apostrophe.
+        // Heuristic: `/` after a token that typically precedes a regex, not division.
+        if (ch === '/' && line[i + 1] && line[i + 1] !== '/' && line[i + 1] !== '*') {
+          const prev = prevSignificant(i);
+          if (!prev || /[=(:,;[!&|?{~+\-*%^<>]/.test(prev) || prev === 'return' || /[({[]/.test(prev)) {
+            let k = i + 1;
+            let reEsc = false;
+            for (; k < line.length; k += 1) {
+              if (reEsc) {
+                reEsc = false;
+                continue;
+              }
+              if (line[k] === '\\') {
+                reEsc = true;
+                continue;
+              }
+              if (line[k] === '/') {
+                // Skip flags
+                k += 1;
+                while (k < line.length && /[a-z]/i.test(line[k])) k += 1;
+                i = k - 1;
+                break;
+              }
+              if (line[k] === '\n') break;
+            }
+            continue;
+          }
         }
         if (ch === "'" || ch === '"' || ch === '`') quote = ch;
       }

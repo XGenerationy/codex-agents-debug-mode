@@ -446,12 +446,44 @@ const runCloseoutWorkflow = async ({
         baseSha: initial.baseSha,
         check,
         headResult: result,
-        execute: (baselineCheck, cwd) => execute({
-          ...baselineCheck,
-          id: `${check.id}-baseline-comparison`,
-          associatedCheckId: check.id,
-          attemptId: `${check.id}:baseline:${++baselineAttempt}`,
-        }, 'baseline', cwd),
+        // Generator head failures use two-pass fingerprinting; baseline must
+        // reproduce with the same two-run protocol, not a single generator exec.
+        execute: async (baselineCheck, cwd) => {
+          if (check.generator) {
+            const repro = await verifyGeneratorReproducibility({
+              executeGenerator: (run) => execute({
+                ...baselineCheck,
+                id: `${check.id}-baseline-comparison-gen-${run}`,
+                associatedCheckId: check.id,
+                attemptId: `${check.id}:baseline-gen-${run}:${++baselineAttempt}`,
+                generator: true,
+              }, 'baseline', cwd),
+              fingerprint: () => d.workingTreeFingerprint(cwd, reproducibilityPaths),
+            });
+            const firstRun = repro.first || repro;
+            const terminal = repro.second || firstRun;
+            return {
+              ...baselineCheck,
+              phase: 'baseline',
+              status: repro.status,
+              exitCode: terminal.exitCode ?? null,
+              startedAt: firstRun.startedAt,
+              finishedAt: terminal.finishedAt,
+              durationMs: (firstRun.durationMs || 0) + (repro.second?.durationMs || 0),
+              stdout: terminal.stdout || '',
+              stderr: terminal.stderr || '',
+              evidence: repro.evidence,
+              first: repro.first,
+              second: repro.second,
+            };
+          }
+          return execute({
+            ...baselineCheck,
+            id: `${check.id}-baseline-comparison`,
+            associatedCheckId: check.id,
+            attemptId: `${check.id}:baseline:${++baselineAttempt}`,
+          }, 'baseline', cwd);
+        },
         setup: (cwd) => execute({
           id: `${check.id}-baseline-dependency-setup`,
           associatedCheckId: check.id,

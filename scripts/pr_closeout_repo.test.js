@@ -151,29 +151,34 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
     const trackedDiff = require('node:child_process').execFileSync(
       'git', ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD'], { cwd: repo },
     );
-    // workingTreeFingerprint also seals .git/info/exclude into the digest.
+    // workingTreeFingerprint also seals .git/info/exclude and core.excludesFile.
     const excludePath = path.join(repo, '.git', 'info', 'exclude');
-    const { hashFsEntry } = (() => {
-      // Recompute exclude entry the same way as the implementation via public API:
-      // include it by re-running fingerprint with only known entries isn't exported,
-      // so hash the file content if present the same way hashFsEntry would for a file.
-      const crypto = require('node:crypto');
-      const fs = require('node:fs');
+    const crypto = require('node:crypto');
+    const fs = require('node:fs');
+    const hashBytes = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const hashFileOrMissing = (filePath) => {
       try {
-        const st = fs.lstatSync(excludePath);
-        if (st.isFile()) {
-          return {
-            hashFsEntry: async () => crypto.createHash('sha256').update(fs.readFileSync(excludePath)).digest('hex'),
-          };
-        }
+        const st = fs.lstatSync(filePath);
+        if (st.isFile()) return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
-      return { hashFsEntry: async () => crypto.createHash('sha256').update('missing').digest('hex') };
-    })();
+      return hashBytes('missing');
+    };
+    let excludesFileHash = hashBytes('unset');
+    try {
+      const configured = git(repo, 'config', '--get', 'core.excludesFile');
+      if (configured) {
+        const resolved = path.isAbsolute(configured) ? configured : path.resolve(repo, configured);
+        excludesFileHash = hashBytes(`path:${resolved}\0${hashFileOrMissing(resolved)}`);
+      }
+    } catch {
+      // unset
+    }
     const expectedFingerprint = fingerprintEntries([
       { path: '__tracked_diff__', hash: require('node:crypto').createHash('sha256').update(trackedDiff).digest('hex') },
-      { path: '__git_info_exclude__', hash: await hashFsEntry() },
+      { path: '__git_info_exclude__', hash: hashFileOrMissing(excludePath) },
+      { path: '__git_core_excludesFile__', hash: excludesFileHash },
       { path: 'large-untracked.bin', hash: expected },
     ]);
     const fingerprint = await workingTreeFingerprint(repo);
@@ -364,5 +369,33 @@ test('workingTreeFingerprint records a bounded marker for non-regular reproducib
     assert.equal(fingerprint, repeat, 'non-regular entry fingerprint must be stable across re-reads');
   } finally {
     await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals core.excludesFile path and contents', async () => {
+  // --exclude-standard honors core.excludesFile; mutating it can hide untracked
+  // files without changing info/exclude. The seal must change when the config
+  // path or the file contents change.
+  const repo = await fixtureRepo();
+  const outside = await mkdtemp(path.join(tmpdir(), 'closeout-excludes-file-'));
+  try {
+    const before = await workingTreeFingerprint(repo);
+    const excludesPath = path.join(outside, 'extra-excludes');
+    await writeFile(excludesPath, 'hidden/\n');
+    git(repo, 'config', 'core.excludesFile', excludesPath);
+    const afterConfig = await workingTreeFingerprint(repo);
+    assert.notEqual(before, afterConfig, 'setting core.excludesFile must change the fingerprint');
+    await mkdir(path.join(repo, 'hidden'));
+    await writeFile(path.join(repo, 'hidden', 'x'), 'secret');
+    // hidden/x is ignored via core.excludesFile, so it must not appear as an
+    // untracked entry — but the seal already recorded the excludes file.
+    const withHidden = await workingTreeFingerprint(repo);
+    assert.equal(withHidden, afterConfig, 'ignored untracked files must not change fingerprint beyond excludes seal');
+    await writeFile(excludesPath, 'hidden/\nother/\n');
+    const afterContents = await workingTreeFingerprint(repo);
+    assert.notEqual(afterConfig, afterContents, 'mutating core.excludesFile contents must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });

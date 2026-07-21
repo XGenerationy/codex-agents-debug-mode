@@ -8,9 +8,11 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  SPAWN_MARK_ENV,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  listLivePidsWithSpawnMark,
   redactSecrets,
   redactStructure,
   probeGrafanaHealthDefault,
@@ -1005,6 +1007,42 @@ test('terminates background descendants left behind by a cleanly exiting command
   assert.equal(result.terminationStatus, 'PASS', result.terminationEvidence);
   await new Promise((resolve) => setTimeout(resolve, 1200));
   await assert.rejects(access(marker));
+});
+
+test('terminates detached/setsid descendants that leave the process group', { timeout: 20000 }, async () => {
+  // POSIX + /proc only: a validation script can `detached:true` / setsid a
+  // child, exit 0, and leave a descendant outside the original process group.
+  // Group kill alone would PASS; the spawn-mark environ sweep must still reap
+  // it before the command is considered clean.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-logs-'));
+  const marker = path.join(repo, 'setsid-survived.txt');
+  const ready = path.join(repo, 'setsid-ready.txt');
+  const descendant = "const fs=require('node:fs');fs.writeFileSync(process.env.SETSID_READY,String(process.pid));setInterval(()=>{},1000);setTimeout(()=>fs.writeFileSync(process.env.SETSID_MARKER,'survived'),800)";
+  const execute = createCommandExecutor({
+    repo,
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+    env: { ...process.env, SETSID_MARKER: marker, SETSID_READY: ready },
+  });
+  // detached:true puts the grandchild in a new session/process group so the
+  // original group can exit empty while the orphan still holds the spawn mark.
+  const command = [
+    'const {spawn}=require("node:child_process");',
+    `const child=spawn(process.execPath,["-e",${JSON.stringify(descendant)}],{stdio:"ignore",env:process.env,detached:true});`,
+    'child.unref();',
+    // Give the detached child time to start and inherit the spawn mark before
+    // the process-group leader exits 0.
+    'setTimeout(()=>process.exit(0),250);',
+  ].join('');
+  const result = await execute({ id: 'setsid-exit-tree', command }, 'qualification');
+  assert.equal(result.terminationStatus, 'PASS', result.terminationEvidence);
+  assert.match(result.terminationEvidence || '', /spawn-mark|Process group/i);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await assert.rejects(access(marker), 'detached descendant must not mutate the worktree after termination');
 });
 
 test('still runs taskkill /T when the Windows root PID has already exited', async () => {
