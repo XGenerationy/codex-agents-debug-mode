@@ -1,21 +1,22 @@
 # Security Policy
 
-## Supported version
+## Supported versions
 
-Security fixes target the current `main` branch.
+Security fixes are accepted on the default branch of this repository.
 
 ## Reporting a vulnerability
 
-Do not disclose credentials, private repository data, or a working exploit in a public issue.
-Use GitHub's private vulnerability reporting feature for this repository.
+Please **do not** open a public GitHub issue for security reports.
+
+Report vulnerabilities privately via GitHub Security Advisories for this
+repository:
+
+https://github.com/XGenerationy/codex-agents-debug-mode/security/advisories/new
 
 Include:
 
-- the affected file and behavior;
-- reproducible steps using non-sensitive fixtures;
-- expected and observed results;
-- the security impact;
-- a proposed mitigation, if known.
+- a description of the issue and impact;
+- steps to reproduce or a proof of concept when possible;
+- affected versions or commit SHAs if known.
 
-Reports are evaluated using the same evidence-first workflow as the skill itself. A security claim
-is not closed until the fix has regression coverage and matching-surface verification.
+We will acknowledge receipt and work with you on coordinated disclosure.

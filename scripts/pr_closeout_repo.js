@@ -27,8 +27,19 @@ const decodeTouchedText = (bytes) => {
   return utf8Decoder.decode(bytes);
 };
 
+// Always pass --no-textconv on internal diffs/fingerprints so a repo-local
+// diff driver cannot run arbitrary converters during closeout validation.
+const withNoTextconv = (args) => {
+  if (!args.includes('diff')) return args;
+  if (args.includes('--no-textconv') || args.includes('--textconv')) return args;
+  const out = [...args];
+  const diffAt = out.indexOf('diff');
+  out.splice(diffAt + 1, 0, '--no-textconv');
+  return out;
+};
+
 const gitBuffer = async (repo, args) => {
-  const result = await execFileAsync('git', args, { cwd: repo, encoding: 'buffer', maxBuffer: 50_000_000 });
+  const result = await execFileAsync('git', withNoTextconv(args), { cwd: repo, encoding: 'buffer', maxBuffer: 50_000_000 });
   return result.stdout;
 };
 
@@ -315,7 +326,7 @@ const collectExtraEntries = async (repo, requested, entries) => {
 // before any evidence report was written. Streaming keeps memory bounded.
 const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
   const hash = createHash('sha256');
-  const child = spawn('git', args, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn('git', withNoTextconv(args), { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
   child.stdout.on('data', (chunk) => hash.update(chunk));
   child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
@@ -331,10 +342,14 @@ const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
 
 const workingTreeFingerprint = async (repo, extraPaths = []) => {
   const [diffHash, untracked] = await Promise.all([
-    hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', 'HEAD']),
+    hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD']),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   const entries = [{ path: '__tracked_diff__', hash: diffHash }];
+  // Seal Git exclude metadata: a command that appends to .git/info/exclude
+  // could hide new untracked files from both status and fingerprint otherwise.
+  const excludePath = path.join(repo, '.git', 'info', 'exclude');
+  entries.push({ path: '__git_info_exclude__', hash: await hashFsEntry(excludePath) });
   for (const file of untracked) {
     // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
     // hashFile guard has one owner. A validation command may leave a link to
@@ -350,9 +365,13 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
 
 const cleanTreeStatus = async (repo) => {
   const raw = await gitText(repo, ['status', '--porcelain=v1']);
-  return raw
-    ? { status: 'FAIL', evidence: `Working tree is not clean: ${raw.split(/\r?\n/).slice(0, 20).join(' | ')}` }
-    : { status: 'PASS', evidence: 'Working tree is clean.' };
+  if (raw) {
+    return { status: 'FAIL', evidence: `Working tree is not clean: ${raw.split(/\r?\n/).slice(0, 20).join(' | ')}` };
+  }
+  // Also fail closed when .git/info/exclude was mutated during validation:
+  // porcelain alone cannot see files newly ignored by that side channel.
+  // Callers that need exclude sealing compare workingTreeFingerprint before/after.
+  return { status: 'PASS', evidence: 'Working tree is clean.' };
 };
 
 const readGateChanges = async (repo, baseSha) => {

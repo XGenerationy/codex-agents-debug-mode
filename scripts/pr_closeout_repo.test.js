@@ -148,10 +148,29 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
     ).digest('hex');
     const { fingerprintEntries } = require('../scripts/pr_closeout_git');
     const trackedDiff = require('node:child_process').execFileSync(
-      'git', ['diff', '--binary', '--no-ext-diff', 'HEAD'], { cwd: repo },
+      'git', ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD'], { cwd: repo },
     );
+    // workingTreeFingerprint also seals .git/info/exclude into the digest.
+    const excludePath = path.join(repo, '.git', 'info', 'exclude');
+    const { hashFsEntry } = (() => {
+      // Recompute exclude entry the same way as the implementation via public API:
+      // include it by re-running fingerprint with only known entries isn't exported,
+      // so hash the file content if present the same way hashFsEntry would for a file.
+      const crypto = require('node:crypto');
+      const fs = require('node:fs');
+      try {
+        const st = fs.lstatSync(excludePath);
+        if (st.isFile()) {
+          return {
+            hashFsEntry: async () => crypto.createHash('sha256').update(fs.readFileSync(excludePath)).digest('hex'),
+          };
+        }
+      } catch {}
+      return { hashFsEntry: async () => crypto.createHash('sha256').update('missing').digest('hex') };
+    })();
     const expectedFingerprint = fingerprintEntries([
       { path: '__tracked_diff__', hash: require('node:crypto').createHash('sha256').update(trackedDiff).digest('hex') },
+      { path: '__git_info_exclude__', hash: await hashFsEntry() },
       { path: 'large-untracked.bin', hash: expected },
     ]);
     const fingerprint = await workingTreeFingerprint(repo);

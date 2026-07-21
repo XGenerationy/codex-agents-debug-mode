@@ -61,6 +61,10 @@ const CONFIG_SILENCING = [
   // as **/*.d.ts, dist, or node_modules stay unflagged.
   /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
   /\|\|\s*true\b/i,
+  // Shell zero-exit neutralizers that hide command failure from classifyOutput
+  // the same way `|| true` does: `|| :` (POSIX no-op) and `|| exit 0`.
+  /\|\|\s*:(?=\s|$|[;"'`&;\n])/i,
+  /\|\|\s*exit\s+0\b/i,
 ];
 
 const define = (id, label, options = {}) => ({ id, label, ...options });
@@ -281,14 +285,15 @@ const scanSuppressionText = (file, text) => {
     .join('|'), 'i');
   // A line whose non-whitespace content is a single quoted string literal
   // (with an optional trailing comma/semicolon) is data, not an active
-  // directive: the scanner's own MARKERS vocabulary (`'skipcq',`), quoted
-  // test fixtures (`'// noqa',`, `'describe.only("x")',`), would otherwise
-  // self-flag and block implementation changes to this tool. Real
-  // suppression directives (`// skipcq`, `# noqa`) and real focused/skipped
-  // calls (`it.skip("x")`) are never sole quoted strings, so skipping these
-  // lines preserves directive detection while avoiding self-referential
+  // directive: the scanner's own MARKERS vocabulary (quoted marker names),
+  // quoted test fixtures, and sole-string data would otherwise self-flag and
+  // block implementation changes to this tool. Real suppression directives
+  // and real focused/skipped calls are never sole quoted strings, so skipping
+  // these lines preserves directive detection while avoiding self-referential
   // false positives. Allow the other quote style inside the outer quotes so
   // fixtures like 'describe.only("focused suite")', match.
+  // (Do not spell bare marker tokens in these comments: this file is itself
+  // scanned when touched.)
   const isStringLiteralData = (line) => (
     /^\s*'([^'\\]|\\.)*'[,;]?\s*$/.test(line)
     || /^\s*"([^"\\]|\\.)*"[,;]?\s*$/.test(line)
@@ -303,11 +308,10 @@ const scanSuppressionText = (file, text) => {
     // Iterate every marker occurrence so each can be assessed independently.
     for (const match of line.matchAll(globalPattern)) {
       // A marker wrapped in matching quote/backtick characters is data, not a
-      // directive: a markdown inline-code span (`skipcq`) in documentation, a
-      // quoted token, or a template literal. Real directives (// skipcq,
-      // # noqa, <!-- biome-ignore -->) are never wrapped this way, so skipping
-      // wrapped matches preserves directive detection while exempting the
-      // scanner's own documented vocabulary from self-flagging.
+      // directive (markdown inline-code, quoted tokens, template literals).
+      // Real directives are never wrapped that way, so skipping wrapped
+      // matches preserves directive detection while exempting documented
+      // vocabulary from self-flagging.
       const before = line[match.index - 1];
       const after = line[match.index + match[0].length];
       if (before && after && before === after && '\'`""'.includes(before)) continue;
@@ -365,11 +369,15 @@ const scanSuppressionText = (file, text) => {
       }
       return quote !== null;
     };
+    const globalWeakening = new RegExp(testWeakening.source, 'gi');
     lines.forEach((line, index) => {
       if (isStringLiteralData(line)) return;
-      const match = line.match(testWeakening);
-      if (match && !isInsideQuotes(line, match.index ?? 0)) {
+      // Inspect every occurrence: a quoted fixture before a real call on the
+      // same line must not hide the later active .skip/.only.
+      for (const match of line.matchAll(globalWeakening)) {
+        if (isInsideQuotes(line, match.index ?? 0)) continue;
         findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
+        break;
       }
     });
   }

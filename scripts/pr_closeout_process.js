@@ -103,9 +103,10 @@ const terminateProcessTree = async ({
           return probeError?.code === 'ESRCH';
         }
       };
-      if (rootGone()) {
-        return { status: 'PASS', evidence: `Process tree ${child.pid} had already exited.`, escalated: false };
-      }
+      // Always run taskkill /T even when the root PID is already gone: child
+      // processes may still be alive after the root exits, and Microsoft's
+      // /T flag terminates the process and its children. Proving only that the
+      // root is ESRCH is not proof the tree is gone.
       try {
         await runExecFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], {
           encoding: 'utf8',
@@ -113,10 +114,15 @@ const terminateProcessTree = async ({
           windowsHide: true,
         });
       } catch (error) {
-        if (rootGone()) {
-          return { status: 'PASS', evidence: `Process tree ${child.pid} had already exited.`, escalated: false };
-        }
-        throw error;
+        // taskkill exits non-zero when the PID is already gone; that is OK only
+        // after we attempted /T (descendants were still targeted). If the root
+        // is still present, surface the failure.
+        if (!rootGone()) throw error;
+        return {
+          status: 'PASS',
+          evidence: `Windows process tree ${child.pid} was targeted with taskkill /T /F; root already exited.`,
+          escalated: true,
+        };
       }
       return {
         status: 'PASS',
@@ -1031,7 +1037,14 @@ const createCommandExecutor = ({
     cwd,
     shell,
     shellArgs,
-    timeoutMs: timeoutsMs[check.id] || timeoutMs,
+    // Baseline comparison ids are `${checkId}-baseline-comparison`; look up
+    // the parent check's configured timeout so base reruns get the same budget.
+    timeoutMs: timeoutsMs[check.id]
+      || timeoutsMs[check.associatedCheckId]
+      || (typeof check.id === 'string' && check.id.endsWith('-baseline-comparison')
+        ? timeoutsMs[check.id.slice(0, -'-baseline-comparison'.length)]
+        : undefined)
+      || timeoutMs,
     env: childEnv,
     redactionEnv: env,
     secretNames,
@@ -1073,7 +1086,9 @@ const createCommandExecutor = ({
       cwd,
       shell,
       shellArgs,
-      timeoutMs: timeoutsMs[check.id] || timeoutMs,
+      timeoutMs: timeoutsMs[check.id]
+        || timeoutsMs[check.associatedCheckId]
+        || timeoutMs,
       env: childEnv,
       redactionEnv: env,
       secretNames,

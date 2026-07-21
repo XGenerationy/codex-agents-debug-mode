@@ -217,8 +217,11 @@ const appendSessionEvent = (session, serializedEvent) => {
       // replacement file starts with different content or an empty size.
       const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
         || info.birthtimeMs === identity.birthtimeMs;
+      // nlink > 1 means the session log was hard-linked to another path after
+      // /session; the token/artifact writers already fail closed on that shape.
       if (
         !info.isFile() || !identity
+        || info.nlink > 1
         || info.dev !== identity.dev || info.ino !== identity.ino
         || !sameBirth
         || info.size !== identity.bytesWritten

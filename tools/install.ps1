@@ -15,8 +15,16 @@ if ([string]::IsNullOrWhiteSpace($HomePath)) {
     throw 'HomePath is empty; pass -HomePath <path> or set $HOME.'
 }
 $HomePath = "$HomePath".Trim()
-if (-not ([System.IO.Path]::IsPathRooted($HomePath))) {
-    throw "HomePath must be an absolute path: $HomePath"
+# IsPathRooted accepts rooted-relative paths like \tmp that still depend on the
+# current drive. Require a fully qualified path (drive letter or UNC).
+$isFullyQualified = $false
+if ([System.IO.Path]::IsPathFullyQualified) {
+    $isFullyQualified = [System.IO.Path]::IsPathFullyQualified($HomePath)
+} else {
+    $isFullyQualified = $HomePath -match '^[A-Za-z]:[\\/]' -or $HomePath -match '^\\\\[^\\]+\\'
+}
+if (-not $isFullyQualified) {
+    throw "HomePath must be a fully qualified absolute path (drive letter or UNC): $HomePath"
 }
 $source = Split-Path -Parent $PSScriptRoot
 $payload = @('SKILL.md', 'agents', 'assets', 'references', 'scripts')

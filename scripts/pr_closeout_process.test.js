@@ -1007,10 +1007,10 @@ test('terminates background descendants left behind by a cleanly exiting command
   await assert.rejects(access(marker));
 });
 
-test('treats an already-exited Windows process tree as proven gone', async () => {
-  // taskkill exits non-zero when the root PID no longer exists; a command
-  // that exited cleanly before termination was considered must not be
-  // misreported as a termination failure, and taskkill must not even run.
+test('still runs taskkill /T when the Windows root PID has already exited', async () => {
+  // A clean root exit does not prove descendants are gone; always run
+  // taskkill /T so children are targeted. Non-zero taskkill after the root is
+  // ESRCH is still PASS (the /T attempt was made).
   let taskkillRan = false;
   const result = await terminateProcessTree({
     child: { pid: 424242 },
@@ -1021,15 +1021,17 @@ test('treats an already-exited Windows process tree as proven gone', async () =>
       error.code = 'ESRCH';
       throw error;
     },
-    runExecFile: async () => {
+    runExecFile: async (file, args) => {
       taskkillRan = true;
+      assert.match(file, /taskkill\.exe$/i);
+      assert.deepEqual(args, ['/PID', '424242', '/T', '/F']);
       return { stdout: '', stderr: '' };
     },
   });
   assert.equal(result.status, 'PASS');
-  assert.equal(result.escalated, false);
-  assert.equal(taskkillRan, false);
-  assert.match(result.evidence, /already exited/i);
+  assert.equal(result.escalated, true);
+  assert.equal(taskkillRan, true);
+  assert.match(result.evidence, /taskkill/i);
 });
 
 test('runs taskkill for a live Windows process tree', async () => {
@@ -1052,13 +1054,12 @@ test('runs taskkill for a live Windows process tree', async () => {
 });
 
 test('accepts a Windows tree that exits before taskkill lands', async () => {
-  let probes = 0;
+  // taskkill fails because the root already died mid-call; post-check ESRCH
+  // means the /T attempt still counts as proven termination.
   const result = await terminateProcessTree({
     child: { pid: 1234 },
     platform: 'win32',
     kill: () => {
-      probes += 1;
-      if (probes === 1) return true;
       const error = new Error('no such process');
       error.code = 'ESRCH';
       throw error;
@@ -1066,8 +1067,8 @@ test('accepts a Windows tree that exits before taskkill lands', async () => {
     runExecFile: async () => { throw new Error('taskkill failed'); },
   });
   assert.equal(result.status, 'PASS');
-  assert.equal(result.escalated, false);
-  assert.match(result.evidence, /already exited/i);
+  assert.equal(result.escalated, true);
+  assert.match(result.evidence, /taskkill/i);
 });
 
 test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async () => {

@@ -481,6 +481,26 @@ test('detects quoted enabled/disabled JSON gate switches and --quiet lint script
     0,
     'git diff --quiet must not be flagged as config silencing',
   );
+  // Shell zero-exit neutralizers beyond || true.
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest || exit 0' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '|| exit 0 must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest || :' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '|| : must be flagged',
+  );
+});
+
+test('flags active test-weakening after a quoted fixture on the same line', () => {
+  const findings = scanSuppressionText(
+    'tests/foo.js',
+    'const s = "it.skip"; it.only("real", () => {});',
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].match, /it\.only/i);
 });
 
 test('detects multiline config rule disabling', () => {
