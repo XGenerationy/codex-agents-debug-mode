@@ -151,6 +151,17 @@ test('treats a no-test run as a failure even when the runner exits 0', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'no tests were skipped' }).status, 'PASS');
 });
 
+test('accepts zero-count failure buckets when real tests passed', () => {
+  // `Test Files 0 failed | 2 passed (2)` reports zero failed files alongside
+  // real passes — the `Test Files 0` prefix is a bucket count, not a zero
+  // total, so it must not be treated as a no-work summary.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files 0 failed | 2 passed (2)' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files 0 skipped | 2 passed (2)' }).status, 'PASS');
+  // A zero TOTAL remains a no-work failure.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files 0 passed (0)' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files  0 (0)     Tests  0 passed (0)' }).status, 'FAIL');
+});
+
 test('flags focused or skipped tests in touched test files', () => {
   // A PR can focus or skip tests in an ordinary touched test file and still
   // exit 0 from the reduced command; the closeout scanner must catch that
@@ -180,6 +191,46 @@ test('flags focused or skipped tests in __tests__/ files without a test/spec fil
   assert.match(findings[0].match, /it\.skip/i);
   // A non-test path that merely contains the substring still must not match.
   assert.deepEqual(scanSuppressionText('src/__tests_data__/foo.js', 'it.skip("no match");'), []);
+});
+
+test('flags Jasmine fit/fdescribe/xit/xdescribe aliases in touched test files', () => {
+  // Jasmine-native aliases focus (fit/fdescribe) or skip (xit/xdescribe) tests
+  // without any .only/.skip modifier, so the modifier-only scan misses them.
+  const findings = scanSuppressionText('src/foo.test.js', [
+    'fit("focused test", () => {});',
+    'fdescribe("focused suite", () => {});',
+    'xit("skipped test", () => {});',
+    'xdescribe("skipped suite", () => {});',
+  ].join('\n'));
+  const matches = findings.filter(({ category }) => category === 'test-weakening');
+  assert.equal(matches.length, 4, `expected 4 test-weakening findings, got: ${JSON.stringify(matches)}`);
+  // Aliases must be standalone calls: member calls and larger words that
+  // merely contain the token are not weakening.
+  for (const line of ['const p = profit(seed);', 'curve.fit(data);']) {
+    assert.deepEqual(
+      scanSuppressionText('src/foo.test.js', line).filter(({ category }) => category === 'test-weakening'),
+      [],
+      `${line} must not be flagged`,
+    );
+  }
+  // Outside a test file the aliases are not flagged.
+  assert.deepEqual(scanSuppressionText('src/foo.js', 'fit("not a test file");'), []);
+});
+
+test('flags weakening markers in test directory files without a test/spec filename', () => {
+  // tests/foo.js has no test/spec token in the filename, so a filename-only
+  // predicate misses it; standard test directories must count as test-like.
+  for (const path of ['tests/foo.js', 'test/foo.js', 'spec/foo.js', 'src/specs/foo.js']) {
+    const findings = scanSuppressionText(path, 'it.skip("skipped test");');
+    assert.ok(
+      findings.some(({ category }) => category === 'test-weakening'),
+      `${path} must be treated as a test file`,
+    );
+  }
+  // Lookalike directory segments must not be treated as test directories.
+  for (const path of ['src/contest/foo.js', 'src/test-utils/foo.js', 'src/latest/foo.js']) {
+    assert.deepEqual(scanSuppressionText(path, 'it.skip("no match");'), [], `${path} must not match`);
+  }
 });
 
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
@@ -361,6 +412,30 @@ test('does not flag benign ignore/exclude keys targeting build output, only sour
   assert.ok(
     suppressing.some((finding) => finding.category === 'config-silencing'),
     'src/test-targeting exclude must be flagged',
+  );
+});
+
+test('flags extension-only ignore globs as config silencing', () => {
+  // ignorePatterns: ["**/*.ts"] names no src/test/spec token, yet it
+  // suppresses every TypeScript file from the lint gate; bare
+  // source-extension globs in ignore/exclude values must be flagged.
+  const cases = [
+    ['package.json', '{"eslintConfig":{"ignorePatterns":["**/*.ts"]}}'],
+    ['.eslintrc.json', '{"ignorePatterns": ["**/*.js"]}'],
+    ['biome.json', '{"linter":{"ignore":["**/*.tsx"]}}'],
+  ];
+  for (const [file, text] of cases) {
+    assert.ok(
+      scanSuppressionText(file, text).some((finding) => finding.category === 'config-silencing'),
+      `${file} with an extension-only ignore glob must be flagged`,
+    );
+  }
+  // Build-artifact and declaration globs stay benign.
+  const benign = scanSuppressionText('tsconfig.json', '{"exclude": ["**/*.d.ts", "dist", "node_modules"]}');
+  assert.deepEqual(
+    benign.filter((finding) => finding.category === 'config-silencing'),
+    [],
+    'build-artifact globs must not be flagged',
   );
 });
 

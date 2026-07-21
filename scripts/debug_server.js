@@ -2,7 +2,7 @@
 
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { constants } = require('node:fs');
-const { appendFile, chmod, lstat, mkdir, open, realpath, writeFile } = require('node:fs/promises');
+const { lstat, mkdir, open, realpath } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 
@@ -119,6 +119,40 @@ const assertNotSymlink = async (target, label) => {
   }
 };
 
+// Reject a pre-existing path that is not a private regular file: a hard link
+// (nlink > 1) shares its inode with another file, so truncating the path would
+// clobber that outside file through the link, and a non-regular entry (FIFO,
+// device, directory) cannot safely receive token material. ENOENT is
+// tolerated because the path is about to be created.
+const assertPrivateRegularFile = async (target, label) => {
+  try {
+    const info = await lstat(target);
+    if (!info.isFile() || info.nlink > 1) throw new Error(label);
+  } catch (error) {
+    if (error.message === label) throw error;
+    if (error.code !== 'ENOENT') throw error;
+  }
+};
+
+// Open a path without following a symlinked final component: writeFile and
+// appendFile follow symlinks, while O_NOFOLLOW rejects one with ELOOP at open
+// time. O_NONBLOCK keeps a FIFO at the path from parking a libuv worker (the
+// open then fails with ENXIO when no reader is attached); it has no effect on
+// regular files. On platforms without O_NOFOLLOW the flag is undefined and the
+// call reduces to a plain open; filesystems that reject O_NOFOLLOW get a
+// fallback open that still keeps O_NONBLOCK, paired with the lstat-based
+// guards callers run first.
+const openNoFollow = async (target, flags, mode) => {
+  const noFollow = constants.O_NOFOLLOW || 0;
+  const nonBlock = constants.O_NONBLOCK || 0;
+  try {
+    return await open(target, flags | noFollow | nonBlock, mode);
+  } catch (error) {
+    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    return await open(target, flags | nonBlock, mode);
+  }
+};
+
 const configureOrigin = (request, response, allowedOrigins) => {
   const origin = request.headers.origin;
   if (origin === undefined) return true;
@@ -126,6 +160,35 @@ const configureOrigin = (request, response, allowedOrigins) => {
   response.setHeader('Access-Control-Allow-Origin', origin);
   response.setHeader('Vary', 'Origin');
   return true;
+};
+
+// Append a serialized event to a session log without trusting the recorded
+// path. The debugged project can mutate .debug after the session is created,
+// so a path-based append would follow a swapped symlink or parent directory
+// outside projectRoot, or block on a FIFO. The descriptor is opened with
+// no-follow semantics and must still be the original regular file (the
+// dev/ino recorded at session creation) before any bytes are written; every
+// replacement shape fails closed with the same structured conflict.
+const appendSessionEvent = async (session, serializedEvent) => {
+  let handle;
+  try {
+    handle = await openNoFollow(session.logFile, constants.O_WRONLY | constants.O_APPEND);
+  } catch (error) {
+    if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR'].includes(error?.code)) {
+      throw new RequestError('session_log_replaced', 409);
+    }
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    const identity = session.logFileIdentity;
+    if (!info.isFile() || !identity || info.dev !== identity.dev || info.ino !== identity.ino) {
+      throw new RequestError('session_log_replaced', 409);
+    }
+    await handle.writeFile(serializedEvent, 'utf8');
+  } finally {
+    await handle.close();
+  }
 };
 
 const createDebugServer = ({
@@ -237,7 +300,22 @@ const createDebugServer = ({
           if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
             throw new RequestError('debug_dir_escapes_root');
           }
-          await writeFile(logFile, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+          // Create the empty session log through a no-follow descriptor and
+          // record its dev/ino identity. /log re-opens this path for every
+          // event and requires the opened file to still be the same regular
+          // file, so a swapped symlink, parent directory, or FIFO under
+          // .debug cannot redirect or block appends (see appendSessionEvent).
+          const handle = await openNoFollow(
+            logFile,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+            0o600,
+          );
+          try {
+            const info = await handle.stat();
+            sessions.get(sessionId).logFileIdentity = { dev: info.dev, ino: info.ino };
+          } finally {
+            await handle.close();
+          }
           delete sessions.get(sessionId).provisional;
         } catch (error) {
           sessions.delete(sessionId);
@@ -292,11 +370,13 @@ const createDebugServer = ({
 
         // Reserve capacity before yielding so concurrent /log requests see
         // both the per-session event cap and the aggregate byte cap, then
-        // roll the reservation back if the append fails.
+        // roll the reservation back if the append fails. The append itself
+        // re-validates the session log (see appendSessionEvent) because the
+        // debugged project can mutate .debug between /session and /log.
         session.eventCount += 1;
         totalBytes += eventBytes;
         try {
-          await appendFile(session.logFile, serializedEvent, 'utf8');
+          await appendSessionEvent(session, serializedEvent);
         } catch (error) {
           session.eventCount -= 1;
           totalBytes -= eventBytes;
@@ -459,33 +539,32 @@ const main = () => {
       if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
         throw new Error('debug_dir_escapes_root');
       }
-      // Open collector_token with O_NOFOLLOW and write through the descriptor
-      // so a symlink placed at the path during the window between the directory
-      // check above and the write cannot redirect it (writeFile follows
-      // symlinks; O_NOFOLLOW rejects a symlinked final component with ELOOP at
-      // open time). O_CREAT|O_TRUNC overwrites a regular file left by a
-      // previous run because the token is regenerated on every startup. On
-      // platforms without O_NOFOLLOW, fall back to a plain open after the
-      // lstat-based assertNotSymlink check on the parent directory above.
+      // Refuse to reuse a pre-existing collector_token that is not a private
+      // regular file BEFORE the truncating open below: a hard-linked token
+      // file shares its inode with another file, so O_TRUNC would clobber
+      // that outside file through the link (the symlink case is rejected
+      // above). O_CREAT|O_TRUNC still overwrites a regular file left by a
+      // previous run because the token is regenerated on every startup.
       await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
-      const noFollow = constants.O_NOFOLLOW || 0;
-      let handle;
+      await assertPrivateRegularFile(tokenFile, 'collector_token_not_private');
+      // Open with O_NOFOLLOW so a symlink swapped in after the lstat checks
+      // cannot redirect the write, then re-verify through the descriptor that
+      // the opened file is still a private regular file. Permissions are
+      // applied through the descriptor before close: a path-based chmod after
+      // close could race a symlink swap and retarget an outside file.
+      const handle = await openNoFollow(
+        tokenFile,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+        0o600,
+      );
       try {
-        handle = await open(
-          tokenFile,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow,
-          0o600,
-        );
-      } catch (error) {
-        if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-        handle = await open(tokenFile, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600);
-      }
-      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink > 1) throw new Error('collector_token_not_private');
         await handle.writeFile(token, 'utf8');
+        await handle.chmod(0o600);
       } finally {
         await handle.close();
       }
-      await chmod(tokenFile, 0o600);
       process.stdout.write(
         `${JSON.stringify({
           status: 'started',

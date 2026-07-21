@@ -66,7 +66,10 @@ payload=(SKILL.md agents assets references scripts)
 emit_result() {
   local target="$1" backup="$2"
   if command -v node >/dev/null 2>&1; then
-    node -e 'console.log(JSON.stringify({status:"installed",target:process.argv[1],backup:process.argv[2]}))' "$target" "$backup"
+    # With `node -e`, user arguments land at process.argv[1]/[2] on every
+    # supported Node version (verified on Node 20/22/24). The `--` separator
+    # keeps values beginning with `-` from being parsed as Node CLI options.
+    node -e 'console.log(JSON.stringify({status:"installed",target:process.argv[1],backup:process.argv[2]}))' -- "$target" "$backup"
     return
   fi
   local t b

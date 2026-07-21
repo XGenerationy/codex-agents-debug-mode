@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
-const { access, link, mkdtemp, readFile, rm, stat, writeFile } = require('node:fs/promises');
+const { execFileSync } = require('node:child_process');
+const { access, link, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -17,9 +18,10 @@ const {
   runPreflight,
   snapshotArtifactProof,
   spawnCaptured,
+  terminateProcessTree,
 } = require('./pr_closeout_process');
 
-const { MIN_AUTO_SECRET_LENGTH } = require('./pr_closeout_stream');
+const { MIN_AUTO_SECRET_LENGTH, buildChildEnvironment } = require('./pr_closeout_stream');
 
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
@@ -881,4 +883,230 @@ test('captures write-stream errors in logWriteError instead of crashing', async 
   assert.equal(result.stdout, 'hello');
   assert.ok(result.logWriteError, 'logWriteError must be populated when the write stream fails');
   assert.equal(typeof result.logWriteError, 'string');
+});
+
+test('treats common database password env vars as sensitive', () => {
+  // PGPASSWORD and MYSQL_PWD are standard database credential names that do
+  // not contain any of the generic sensitive tokens (PASSWORD/PWD match no
+  // segment boundary), so they must be named explicitly. Otherwise ambient
+  // database credentials are forwarded to child commands and left visible in
+  // captured evidence.
+  const child = buildChildEnvironment({
+    PGPASSWORD: 'pg-secret-123',
+    MYSQL_PWD: 'mysql-secret-456',
+    PGUSER: 'hunter',
+    PATH: '/usr/bin',
+  }, []);
+  assert.equal(child.PGPASSWORD, undefined);
+  assert.equal(child.MYSQL_PWD, undefined);
+  assert.equal(child.PGUSER, 'hunter');
+  assert.equal(child.PATH, '/usr/bin');
+  assert.equal(redactSecrets('pw=pg-secret-123', { PGPASSWORD: 'pg-secret-123' }), 'pw=[REDACTED]');
+  assert.equal(redactSecrets('pwd=mysql-secret-456', { MYSQL_PWD: 'mysql-secret-456' }), 'pwd=[REDACTED]');
+});
+
+test('redacts credential leaves from URL query parameters', () => {
+  // A sensitive env value can be a URL carrying a query credential, e.g.
+  // AUTH_CONFIG=https://host/callback?token=supersecretvalue123. A tool that
+  // prints just the query token leaf must still be redacted, not only the
+  // whole URL or its userinfo components.
+  const leaf = 'supersecretvalue123';
+  const value = `https://host/callback?token=${leaf}&next=/home`;
+  const output = redactSecrets(`config=${value} isolated=${leaf}`, { AUTH_CONFIG: value }, ['AUTH_CONFIG']);
+  assert.equal(output.includes(leaf), false, 'the URL query token leaf must be redacted');
+  assert.match(output, /isolated=\[REDACTED\]/);
+});
+
+test('preflight preserves and redacts safeEnv credentials', async () => {
+  // safeEnv entries are deliberately kept in the probe child environment and
+  // must also be treated as explicitly-redacted inputs for probe evidence,
+  // exactly like requiredEnv (mirroring the executor's secretNames). A probe
+  // echoing a custom registry/auth value must not persist it in the report.
+  const secret = 's3cr3t-registry-value';
+  const result = await runPreflight({
+    repo: process.cwd(),
+    config: { requiredEnv: [], safeEnv: ['REGISTRY_LOGIN'], minFreeDiskGb: 0 },
+    env: { REGISTRY_LOGIN: secret },
+    probeCommand: async () => ({ exitCode: 0, stdout: `login ${secret}`, stderr: '' }),
+    diskFreeGb: async () => 10,
+  });
+  assert.doesNotMatch(JSON.stringify(result.checks), /s3cr3t-registry-value/);
+  assert.ok(Object.values(result.toolVersions).every((version) => !version.includes(secret)));
+});
+
+test('preflight resolves required env names case-insensitively', async () => {
+  // buildChildEnvironment and buildSecretReplacements match configured names
+  // case-insensitively; the preflight presence check must do the same so a
+  // config listing "npm_token" sees NPM_TOKEN instead of blocking as missing.
+  const result = await runPreflight({
+    repo: process.cwd(),
+    config: { requiredEnv: ['npm_token'], minFreeDiskGb: 0 },
+    env: { NPM_TOKEN: 'abcd1234' },
+    probeCommand: async () => ({ exitCode: 0, stdout: 'v1', stderr: '' }),
+    diskFreeGb: async () => 10,
+  });
+  const credential = result.checks.find(({ name }) => name === 'env:npm_token');
+  assert.equal(credential.status, 'PASS');
+  assert.equal(credential.evidence, 'present');
+});
+
+test('terminates background descendants left behind by a cleanly exiting command', { timeout: 20000 }, async () => {
+  // POSIX-only: this sweeps the command's process group. Windows has no
+  // process groups to probe once the root has exited, so the win32 path can
+  // only report the root as already gone (covered by the terminateProcessTree
+  // unit tests below).
+  if (process.platform === 'win32') return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-logs-'));
+  const marker = path.join(repo, 'descendant-survived.txt');
+  const descendant = "setInterval(()=>{},1000);setTimeout(()=>require('node:fs').writeFileSync(process.env.CLEAN_MARKER,'survived'),600)";
+  const execute = createCommandExecutor({
+    repo,
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+    env: { ...process.env, CLEAN_MARKER: marker },
+  });
+  const command = `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore',env:process.env});child.unref();process.exit(0)`;
+  const result = await execute({ id: 'clean-exit-tree', command }, 'qualification');
+  assert.equal(result.status, 'PASS', result.evidence);
+  assert.equal(result.terminationStatus, 'PASS', result.terminationEvidence);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await assert.rejects(access(marker));
+});
+
+test('treats an already-exited Windows process tree as proven gone', async () => {
+  // taskkill exits non-zero when the root PID no longer exists; a command
+  // that exited cleanly before termination was considered must not be
+  // misreported as a termination failure, and taskkill must not even run.
+  let taskkillRan = false;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    kill: (pid, signal) => {
+      assert.equal(signal, 0);
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async () => {
+      taskkillRan = true;
+      return { stdout: '', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.escalated, false);
+  assert.equal(taskkillRan, false);
+  assert.match(result.evidence, /already exited/i);
+});
+
+test('runs taskkill for a live Windows process tree', async () => {
+  const calls = [];
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    env: { SystemRoot: 'C:\\Windows' },
+    kill: () => true,
+    runExecFile: async (file, args) => {
+      calls.push([file, args]);
+      return { stdout: 'SUCCESS', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.escalated, true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0][0], /taskkill\.exe$/i);
+  assert.deepEqual(calls[0][1], ['/PID', '1234', '/T', '/F']);
+});
+
+test('accepts a Windows tree that exits before taskkill lands', async () => {
+  let probes = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    kill: () => {
+      probes += 1;
+      if (probes === 1) return true;
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async () => { throw new Error('taskkill failed'); },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.escalated, false);
+  assert.match(result.evidence, /already exited/i);
+});
+
+test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async () => {
+  // POSIX-only: Windows Node cannot see POSIX FIFOs. A proof command's
+  // background process can swap the verified artifact for a FIFO between the
+  // lstat and the hash open; opening a FIFO read-only without O_NONBLOCK
+  // would block waiting for a writer, so the proof must fail closed instead.
+  if (process.platform === 'win32') return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fifo-artifact-'));
+  const fifoPath = path.join(repo, 'render.json');
+  execFileSync('mkfifo', [fifoPath]);
+  const regularPath = path.join(repo, 'regular.json');
+  await writeFile(regularPath, '{}');
+  const regularStats = await lstat(regularPath);
+  // Simulate the swap: lstat reports the pre-swap regular file while the path
+  // now resolves to a FIFO.
+  const result = await snapshotArtifactProof({
+    proof: { type: 'artifact', path: 'render.json' },
+    cwd: repo,
+    filesystem: {
+      lstat: async (target) => (path.resolve(target) === path.resolve(fifoPath) ? regularStats : lstat(target)),
+      realpath,
+    },
+  });
+  assert.equal(result.status, 'FAIL');
+  assert.match(result.evidence, /not a regular file/i);
+});
+
+test('rejects Grafana live frames that carry no real series values', async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-grafana-empty-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-grafana-empty-logs-'));
+  const execute = createCommandExecutor({
+    repo,
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+  });
+  const basePayload = {
+    provider: 'grafana',
+    operation: 'query',
+    endpoint: 'http://127.0.0.1:3000/api/ds/query',
+    httpStatus: 200,
+    request: { queries: [{ refId: 'A' }] },
+  };
+  const proof = {
+    type: 'artifact',
+    path: 'live.json',
+    semantic: 'grafana-live-result',
+    grafanaOrigin: 'http://127.0.0.1:3000',
+  };
+  // A frame whose values are placeholders (null) must not pass as usable data.
+  const nullSeries = await execute({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify({
+      ...basePayload,
+      response: { results: { A: { frames: [{ data: { values: [null] } }] } } },
+    }))})`,
+    proof,
+  }, 'confirmation');
+  assert.equal(nullSeries.status, 'FAIL');
+  assert.match(nullSeries.evidence, /non-empty frame data/i);
+
+  // The legacy single-result shape has the same requirement.
+  const legacyNullSeries = await execute({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify({
+      ...basePayload,
+      response: { results: { A: { data: { values: [null] } } } },
+    }))})`,
+    proof,
+  }, 'confirmation');
+  assert.equal(legacyNullSeries.status, 'FAIL');
+  assert.match(legacyNullSeries.evidence, /non-empty frame data/i);
 });

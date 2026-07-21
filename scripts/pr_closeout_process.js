@@ -90,11 +90,34 @@ const terminateProcessTree = async ({
       const isAbsoluteDrivePath = /^[A-Za-z]:[\\/]/.test(candidateRoot);
       const safeRoot = isAbsoluteDrivePath ? candidateRoot : 'C:\\Windows';
       const taskkill = path.join(safeRoot, 'System32', 'taskkill.exe');
-      await runExecFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], {
-        encoding: 'utf8',
-        timeout: Math.max(terminationGraceMs * 5, 10_000),
-        windowsHide: true,
-      });
+      // taskkill exits non-zero when the root PID is already gone (for
+      // example a command that exited cleanly before termination was even
+      // considered), which the outer catch would misreport as a termination
+      // failure. Probe the root first and again after a failed taskkill: an
+      // already-gone root means there is no tree left to terminate.
+      const rootGone = () => {
+        try {
+          kill(child.pid, 0);
+          return false;
+        } catch (probeError) {
+          return probeError?.code === 'ESRCH';
+        }
+      };
+      if (rootGone()) {
+        return { status: 'PASS', evidence: `Process tree ${child.pid} had already exited.`, escalated: false };
+      }
+      try {
+        await runExecFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], {
+          encoding: 'utf8',
+          timeout: Math.max(terminationGraceMs * 5, 10_000),
+          windowsHide: true,
+        });
+      } catch (error) {
+        if (rootGone()) {
+          return { status: 'PASS', evidence: `Process tree ${child.pid} had already exited.`, escalated: false };
+        }
+        throw error;
+      }
       return {
         status: 'PASS',
         evidence: `Windows process tree ${child.pid} was terminated with taskkill /T /F.`,
@@ -469,13 +492,23 @@ const spawnCaptured = async ({
   ]);
 
   let outcome = first.outcome;
-  let termination = {
-    status: 'PASS',
-    evidence: 'Command exited before timeout; no process-tree termination was required.',
-    escalated: false,
-  };
+  let termination;
   if (first.kind === 'close') {
     clearTimeout(timer);
+    // A command can exit 0 while detached background descendants keep running
+    // in its process group, still able to mutate the worktree after the final
+    // seal. Prove the group is gone (terminating any stragglers) before
+    // treating the clean exit as clean. A spawn error means the command never
+    // started, so there is no group to sweep.
+    termination = outcome?.spawnError
+      ? { status: 'PASS', evidence: 'Command did not start; no process group was created.', escalated: false }
+      : await terminateTree({
+        child,
+        platform,
+        env,
+        terminationGraceMs,
+        closePromise,
+      });
   } else {
     timedOut = true;
     termination = await terminateTree({
@@ -521,8 +554,8 @@ const spawnCaptured = async ({
   // could let a command PASS while the durable raw evidence was incomplete.
   await new Promise((resolve) => {
     if (logError) return resolve();
-    log.end(resolve);
     log.once('error', resolve);
+    log.end(resolve);
   });
   const finishedAt = new Date().toISOString();
   const result = {
@@ -559,12 +592,28 @@ const isContainedPath = (root, target) => {
 
 const openArtifact = async (artifact) => {
   const noFollow = constants.O_NOFOLLOW || 0;
+  // A proof command can leave a background process that swaps the verified
+  // artifact for a FIFO (or another non-regular file) between the lstat in
+  // snapshotArtifactProof and this open. On POSIX, opening a FIFO read-only
+  // without O_NONBLOCK waits for a writer, so the proof would hang instead of
+  // returning a structured FAIL. Open with O_NONBLOCK where the platform
+  // supports it (regular-file reads are unaffected; the constant is absent on
+  // Windows) and fail closed below if the opened handle is not a regular
+  // file, before any read can block or stream unbounded device data.
+  const nonBlock = constants.O_NONBLOCK || 0;
+  let handle;
   try {
-    return await open(artifact, constants.O_RDONLY | noFollow);
+    handle = await open(artifact, constants.O_RDONLY | noFollow | nonBlock);
   } catch (error) {
     if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    return open(artifact, constants.O_RDONLY);
+    handle = await open(artifact, constants.O_RDONLY | nonBlock);
   }
+  const info = await handle.stat();
+  if (!info.isFile()) {
+    await handle.close();
+    throw new Error(`Artifact is not a regular file: ${artifact}`);
+  }
+  return handle;
 };
 
 const hashArtifactDefault = async (artifact) => {
@@ -762,13 +811,15 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
       if (!entry || typeof entry !== 'object') return false;
       if (Array.isArray(entry.frames)) {
         // Require at least one frame to actually contain data values, not
-        // just an empty object/array shape. frames: [{}] or frames: [{ data:
-        // { values: [] } }] does not establish a non-empty Grafana result.
+        // just an empty object/array shape. frames: [{}], frames: [{ data:
+        // { values: [] } }], or frames: [{ data: { values: [null] } }] does
+        // not establish a non-empty Grafana result; at least one series must
+        // be a non-empty array of real values.
         return entry.frames.some((frame) => {
           if (!frame || typeof frame !== 'object') return false;
           const values = frame?.data?.values;
           if (Array.isArray(values)) {
-            return values.length > 0 && values.some((series) => Array.isArray(series) ? series.length > 0 : true);
+            return values.length > 0 && values.some((series) => Array.isArray(series) && series.length > 0);
           }
           // Some Grafana responses carry a schema/len pair without inline
           // values; accept only when at least one numeric field is non-empty.
@@ -776,9 +827,10 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
           return Number.isFinite(numeric) && numeric > 0;
         });
       }
-      // Legacy single-result shape: require a non-empty values array.
+      // Legacy single-result shape: require a non-empty values array holding
+      // at least one non-empty series (values: [null] is not usable data).
       return Array.isArray(entry?.data?.values) && entry.data.values.length > 0
-        && entry.data.values.some((series) => Array.isArray(series) ? series.length > 0 : true);
+        && entry.data.values.some((series) => Array.isArray(series) && series.length > 0);
     });
     if (!usableFrames.length) {
       return { status: 'FAIL', evidence: 'Grafana live query proof contained no result entry with non-empty frame data.' };
@@ -1173,7 +1225,13 @@ const runPreflight = async ({
   } catch {
     checks.push({ name: 'command-shell', status: 'BLOCKED', evidence: `Required shell not found: ${shell}` });
   }
-  const commandEnv = buildChildEnvironment(env, [...(config.requiredEnv || []), ...(config.safeEnv || [])]);
+  // Tool probes run with, and have their evidence redacted against, BOTH
+  // configured env lists: safeEnv entries are deliberately preserved for the
+  // child environment and must also be treated as explicitly-redacted inputs,
+  // exactly like the executor path (which passes requiredEnv + safeEnv as
+  // secretNames).
+  const sensitiveEnvNames = [...(config.requiredEnv || []), ...(config.safeEnv || [])];
+  const commandEnv = buildChildEnvironment(env, sensitiveEnvNames);
   const runProbe = probeCommand || ((command) => probeCommandDefault({
     command,
     repo,
@@ -1187,12 +1245,17 @@ const runPreflight = async ({
     const rawEvidence = status === 'PASS'
       ? (result.stdout || result.stderr || `exit ${result.exitCode}`).trim().split(/\r?\n/)[0]
       : classification.evidence;
-    const evidence = redactSecrets(rawEvidence, env, config.requiredEnv);
+    const evidence = redactSecrets(rawEvidence, env, sensitiveEnvNames);
     checks.push({ name, status, evidence });
     if (status === 'PASS') toolVersions[name] = evidence;
   }
+  const envNames = Object.keys(env);
   for (const name of config.requiredEnv || []) {
-    const value = env[name];
+    // Resolve the configured name to the actual env key case-insensitively,
+    // mirroring buildChildEnvironment/buildSecretReplacements: a config
+    // listing "npm_token" must see NPM_TOKEN instead of reporting it missing.
+    const actualName = envNames.find((key) => key.toUpperCase() === String(name).toUpperCase());
+    const value = actualName === undefined ? undefined : env[actualName];
     const present = typeof value === 'string' && value.length > 0;
     const reliable = present && value.length >= 4;
     checks.push({

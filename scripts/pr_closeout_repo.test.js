@@ -180,6 +180,22 @@ test('extracts gate changes and scans the complete touched-file set', async () =
   }
 });
 
+test('surfaces deleted gate files on a dedicated channel', async () => {
+  const repo = await fixtureRepo();
+  try {
+    // Deleting a validation-defining file contributes no added lines, so it
+    // must reach classifyGateIntegrity through deletedFiles to fail closed.
+    await rm(path.join(repo, 'Makefile'));
+    await rm(path.join(repo, 'tracked.txt'));
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.deepEqual(gate.deletedFiles, ['Makefile']);
+    assert.ok(gate.changedFiles.includes('Makefile'));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('decodes untracked gate files through the safe multi-encoding decoder', async () => {
   const repo = await fixtureRepo();
   try {
@@ -283,6 +299,47 @@ test('handles untracked gate files with more than 100k lines without RangeError'
     assert.deepEqual(gate.changedFiles, ['pnpm-lock.yaml']);
     assert.equal(gate.addedLines.length, lineCount + 1);
     assert.ok(gate.addedLines.every((line) => line.startsWith('+')));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata rejects non-regular metadata before reading it', async () => {
+  // A reviewed branch can replace package.json or the first default makefile
+  // with a directory (or FIFO): a plain read then throws EISDIR or blocks
+  // before runCloseoutWorkflow has created any structured evidence report.
+  // Fail closed with a clear error instead.
+  for (const entry of ['package.json', 'GNUmakefile']) {
+    const repo = await fixtureRepo();
+    try {
+      await rm(path.join(repo, entry), { force: true });
+      await mkdir(path.join(repo, entry));
+      await assert.rejects(readProjectMetadata(repo), /non-regular metadata/);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }
+});
+
+test('workingTreeFingerprint records a bounded marker for non-regular reproducibility entries', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('FIFO creation is not available on Windows');
+    return;
+  }
+  // A generator can leave a FIFO under a configured reproducibility path such
+  // as node_modules/.prisma. Streaming it blocks forever waiting for a writer
+  // before any structured evidence report is written; the fingerprint must
+  // record a bounded non-regular marker instead.
+  const repo = await fixtureRepo();
+  try {
+    await mkdir(path.join(repo, 'out'));
+    execFileSync('mkfifo', [path.join(repo, 'out', 'fifo')]);
+    const hang = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('workingTreeFingerprint hung on a FIFO')), 5000).unref();
+    });
+    const fingerprint = await Promise.race([workingTreeFingerprint(repo, ['out']), hang]);
+    const repeat = await workingTreeFingerprint(repo, ['out']);
+    assert.equal(fingerprint, repeat, 'non-regular entry fingerprint must be stable across re-reads');
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

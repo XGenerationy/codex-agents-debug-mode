@@ -344,3 +344,87 @@ test('blocks baseline classification when deterministic dependency setup fails',
   assert.equal(result.status, 'BLOCKED');
   assert.match(result.evidence, /dependency setup was not clean/i);
 });
+
+test('treats npm lockfiles as validation-defining gate files', () => {
+  // This repository validates with `npm ci`/`npm audit`, so the npm lockfiles
+  // define validation strength the same way pnpm-lock.yaml does.
+  for (const file of ['package-lock.json', 'npm-shrinkwrap.json', 'packages/web/package-lock.json']) {
+    assert.equal(isGateFile(file), true, file);
+  }
+});
+
+test('detects coverage threshold reductions split across added lines', () => {
+  const base = { changedFiles: ['vitest.config.ts'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
+  const addedLines = ['+  coverageThreshold: {', '+    statements: 0,', '+  },'];
+  assert.equal(classifyGateIntegrity({ ...base, addedLines }).status, 'FAIL');
+  assert.equal(
+    classifyGateIntegrity({ ...base, addedLines, attestation: liveAttestation() }).status,
+    'FAIL',
+    'a multiline coverage reduction must fail closed even with a valid attestation',
+  );
+  // Positive thresholds in the same nested form are not weakening.
+  assert.equal(
+    classifyGateIntegrity({
+      ...base,
+      addedLines: ['+  coverageThreshold: {', '+    statements: 80,', '+  },'],
+      attestation: liveAttestation(),
+    }).status,
+    'PASS',
+  );
+});
+
+test('fails closed when a gate file is deleted', () => {
+  const base = {
+    changedFiles: ['.github/workflows/validate.yml'],
+    addedLines: [],
+    baseSha: 'base123',
+    headSha: 'abc123',
+    configDigest: 'cfg123',
+  };
+  // A deleted gate file yields no added lines to scan; the removal of an
+  // entire validation surface must not PASS on attestation alone.
+  const deleted = classifyGateIntegrity({
+    ...base,
+    deletedFiles: ['.github/workflows/validate.yml'],
+    attestation: liveAttestation(),
+  });
+  assert.equal(deleted.status, 'FAIL');
+  assert.match(deleted.evidence, /deleted/i);
+  // Deleting a non-gate file does not affect gate integrity.
+  assert.equal(
+    classifyGateIntegrity({
+      ...base,
+      changedFiles: [],
+      deletedFiles: ['src/worker.ts'],
+      attestation: liveAttestation(),
+    }).status,
+    'PASS',
+  );
+});
+
+test('failure signatures ignore volatile proof result fields', () => {
+  // The same logical artifact proof recorded in the head repo and in the
+  // disposable baseline worktree differs only in volatile fields (absolute
+  // paths, log paths, timestamps, durations); the signatures must match.
+  const base = { status: 'FAIL', exitCode: 1, stdout: 'same', stderr: '', cwd: 'C:/repo' };
+  const outputDigest = { stdout: 'aaa', stderr: 'empty' };
+  const head = failureSignature({
+    ...base,
+    outputDigest,
+    proofResult: {
+      status: 'PASS', exists: true, digest: 'abc', path: 'C:/repo/out/artifact.json',
+      realPath: 'C:/repo/out/artifact.json', realRoot: 'C:/repo', size: 10, mtimeMs: 1, ctimeMs: 2,
+      logPath: 'C:/repo/logs/proof.log', durationMs: 42,
+    },
+  });
+  const baseline = failureSignature({
+    ...base,
+    outputDigest,
+    proofResult: {
+      status: 'PASS', exists: true, digest: 'abc', path: 'C:/temp/baseline/out/artifact.json',
+      realPath: 'C:/temp/baseline/out/artifact.json', realRoot: 'C:/temp/baseline', size: 10, mtimeMs: 99, ctimeMs: 100,
+      logPath: 'C:/temp/baseline/logs/proof.log', durationMs: 7,
+    },
+  });
+  assert.equal(head, baseline);
+});

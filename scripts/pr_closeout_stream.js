@@ -1,6 +1,6 @@
 const { StringDecoder } = require('node:string_decoder');
 
-const SENSITIVE_ENV_NAME = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|PASSWORD|PASSWD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+const SENSITIVE_ENV_NAME = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
 const isSensitiveEnvName = (name) => SENSITIVE_ENV_NAME.test(String(name));
 
@@ -42,6 +42,7 @@ const secretVariants = (value) => {
 
 const secretComponents = (value) => {
   const components = [String(value)];
+  const isCredentialKey = /(?:token|password|passwd|pwd|secret|key|credential)$/i;
   try {
     const parsed = new URL(String(value));
     for (const component of [parsed.username, parsed.password]) {
@@ -50,6 +51,12 @@ const secretComponents = (value) => {
       try {
         components.push(decodeURIComponent(component));
       } catch {}
+    }
+    // Query parameters can carry credentials too (?token=...&api_key=...): a
+    // tool that prints just that leaf value would otherwise leak it even
+    // though the whole URL is redacted.
+    for (const [key, param] of parsed.searchParams) {
+      if (param && isCredentialKey.test(key)) components.push(param);
     }
   } catch {
     for (const match of String(value).matchAll(/(?:^|[;\s])(?:password|passwd|pwd|secret|token|user(?:name| id)?)=([^;\s]+)/gi)) {
@@ -63,7 +70,6 @@ const secretComponents = (value) => {
   // encoded variants cover the full blob but not an isolated leaf printed by
   // an SDK/CLI.
   try {
-    const isCredentialKey = /(?:token|password|passwd|pwd|secret|key|credential)$/i;
     const collectLeaves = (node) => {
       if (typeof node === 'string') return;
       if (Array.isArray(node)) {

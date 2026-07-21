@@ -655,3 +655,111 @@ test('writes exactly 19 final mandatory rows when admission is blocked', async (
   assert.ok(result.report.checks.every(({ phase, status }) => phase === 'confirmation' && status === 'BLOCKED'));
   assert.deepEqual(result.report.qualificationChecks, []);
 });
+
+test('preserves the Unix shell override in the workflow environment', async () => {
+  const previous = process.env.OMO_CODEX_SHELL_PATH;
+  process.env.OMO_CODEX_SHELL_PATH = '/opt/custom/bin/bash';
+  try {
+    const fixture = makeDependencies();
+    let executorEnvironment;
+    let preflightEnvironment;
+    delete fixture.dependencies.execute;
+    fixture.dependencies.createCommandExecutor = ({ env }) => {
+      executorEnvironment = env;
+      return async (check, phase) => passingExecution(check, phase);
+    };
+    fixture.dependencies.runPreflight = async ({ env }) => {
+      preflightEnvironment = env;
+      return { status: 'BLOCKED', checks: [], toolVersions: {} };
+    };
+
+    await runCloseoutWorkflow({
+      repo: 'C:/repo',
+      baseRef: 'origin/main',
+      config: reviewedConfig(),
+      outputDir: 'C:/evidence',
+      dependencies: fixture.dependencies,
+    });
+
+    assert.equal(executorEnvironment.OMO_CODEX_SHELL_PATH, '/opt/custom/bin/bash');
+    assert.equal(preflightEnvironment.OMO_CODEX_SHELL_PATH, '/opt/custom/bin/bash');
+  } finally {
+    if (previous === undefined) delete process.env.OMO_CODEX_SHELL_PATH;
+    else process.env.OMO_CODEX_SHELL_PATH = previous;
+  }
+});
+
+test('preserves failed generator execution details in the row and baseline signature', async () => {
+  // A generator run that fails is returned by verifyGeneratorReproducibility
+  // as the top-level result rather than under first/second; the final row and
+  // the head-side baseline comparison must keep the real exit code, output,
+  // and timing so an identical failure at base can match.
+  const fixture = makeDependencies();
+  let baselineHeadResult;
+  fixture.dependencies.execute = async (check, phase) => {
+    fixture.executions.push(`${phase}:${check.id}`);
+    const result = passingExecution(check, phase);
+    if (check.id === 'prisma-generate' && phase === 'confirmation-generator-1') {
+      return {
+        ...result,
+        status: 'FAIL',
+        exitCode: 17,
+        stdout: 'generator exploded',
+        stderr: 'boom',
+        evidence: 'generator failed',
+      };
+    }
+    return result;
+  };
+  fixture.dependencies.verifyBaseline = async ({ headResult }) => {
+    baselineHeadResult = headResult;
+    return headResult;
+  };
+
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  const row = result.report.checks.find(({ id }) => id === 'prisma-generate');
+  assert.equal(row.status, 'FAIL');
+  assert.equal(row.exitCode, 17);
+  assert.equal(row.stdout, 'generator exploded');
+  assert.equal(row.stderr, 'boom');
+  assert.equal(row.startedAt, '2026-07-14T00:00:00.000Z');
+  assert.equal(row.durationMs, 1);
+  assert.equal(baselineHeadResult.exitCode, 17);
+  assert.equal(baselineHeadResult.stdout, 'generator exploded');
+});
+
+test('seals ignored generated output paths after all checks', async () => {
+  // Generated outputs under ignored paths are invisible to cleanTreeStatus
+  // and the tracked-diff hash. A mutation landing after live GitHub
+  // verification must trip the repository seal, so every post-validation and
+  // evidence-write fingerprint is bound to the reproducibility paths.
+  const fixture = makeDependencies();
+  const fingerprintCalls = [];
+  fixture.dependencies.workingTreeFingerprint = async (repo, extraPaths = []) => {
+    fingerprintCalls.push(extraPaths);
+    return extraPaths.length && fingerprintCalls.length > 4 ? 'generated-mutated' : 'stable-tree';
+  };
+
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig({ reproducibilityPaths: ['generated/client'] }),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  assert.equal(result.report.repositorySeal.status, 'BLOCKED');
+  assert.match(result.report.repositorySeal.evidence, /fingerprint changed after live GitHub verification/i);
+  assert.equal(result.report.overallStatus, 'BLOCKED');
+  assert.ok(fingerprintCalls.length >= 4);
+  for (const extraPaths of fingerprintCalls) {
+    assert.deepEqual(extraPaths, ['node_modules/.prisma', 'node_modules/@prisma/client', 'generated/client']);
+  }
+});

@@ -142,7 +142,11 @@ const ESSENTIAL_ENV = new Set([
   'CI',
   'NO_COLOR',
   'TERM',
+  // Shell overrides honored by resolveCommandShell: Windows Git Bash and the
+  // Unix OMO_CODEX_SHELL_PATH override must survive environment filtering or
+  // preflight probes and executors fall back to a shell that is not on PATH.
   'OMO_CODEX_GIT_BASH_PATH',
+  'OMO_CODEX_SHELL_PATH',
 ]);
 
 const buildWorkflowEnvironment = (env, config) => {
@@ -334,6 +338,16 @@ const runCloseoutWorkflow = async ({
     status: initialAttestation.status === 'FAIL' ? 'FAIL' : 'BLOCKED',
     evidence: initialAttestation.evidence || 'Independent live GitHub attestation was not clean.',
   };
+  // Ignored generator outputs are invisible to cleanTreeStatus and the
+  // tracked-diff hash, so fingerprint them at every seal point (admission,
+  // post-validation, post-GitHub, post-evidence-write); a validation or
+  // confirmation step mutating them after the generator reproducibility
+  // check must break a seal instead of passing unnoticed.
+  const reproducibilityPaths = [...new Set([
+    'node_modules/.prisma',
+    'node_modules/@prisma/client',
+    ...(config.reproducibilityPaths || []),
+  ])];
   const attestationAdmitted = initialAttestation.status === 'PASS';
   if (attestationAdmitted) {
     const [observedPreflight, initialGateChanges, observedSuppressions, observedTree] = await Promise.all([
@@ -345,7 +359,7 @@ const runCloseoutWorkflow = async ({
     preflight = observedPreflight;
     initialSuppressions = observedSuppressions;
     initialTree = observedTree;
-    if (initialTree.status === 'PASS') initialFingerprint = await d.workingTreeFingerprint(initial.repo, []);
+    if (initialTree.status === 'PASS') initialFingerprint = await d.workingTreeFingerprint(initial.repo, reproducibilityPaths);
     gateIntegrity = classifyGateIntegrity({
       ...initialGateChanges,
       configuredCommands,
@@ -375,11 +389,6 @@ const runCloseoutWorkflow = async ({
   };
 
   if (admitted === 'PASS') {
-    const reproducibilityPaths = [...new Set([
-      'node_modules/.prisma',
-      'node_modules/@prisma/client',
-      ...(config.reproducibilityPaths || []),
-    ])];
     let baselineChain = Promise.resolve();
     let baselineAttempt = 0;
     const serializeBaseline = (operation) => {
@@ -395,15 +404,20 @@ const runCloseoutWorkflow = async ({
           fingerprint: () => d.workingTreeFingerprint(initial.repo, reproducibilityPaths),
         });
         reproducibility.paths = reproducibilityPaths;
-        const terminal = reproducibility.second || reproducibility.first || {};
+        // A generator run that fails is returned as the top-level result
+        // rather than under first/second; fall back to it so the row and the
+        // head-side baseline signature keep the real exit code, output, and
+        // timing instead of an empty terminal.
+        const firstRun = reproducibility.first || reproducibility;
+        const terminal = reproducibility.second || firstRun;
         result = {
           ...check,
           phase,
           status: reproducibility.status,
           exitCode: terminal.exitCode ?? null,
-          startedAt: reproducibility.first?.startedAt,
+          startedAt: firstRun.startedAt,
           finishedAt: terminal.finishedAt,
-          durationMs: (reproducibility.first?.durationMs || 0) + (reproducibility.second?.durationMs || 0),
+          durationMs: (firstRun.durationMs || 0) + (reproducibility.second?.durationMs || 0),
           stdout: terminal.stdout || '',
           stderr: terminal.stderr || '',
           evidence: reproducibility.evidence,
@@ -462,7 +476,7 @@ const runCloseoutWorkflow = async ({
     ? { status: 'BLOCKED', evidence: consistencyProblems.join(' ') }
     : { status: 'PASS', evidence: `Evidence belongs to final base ${finalState.baseSha} and head ${finalState.headSha}.` };
   const beforeGithubFingerprint = attestationAdmitted
-    ? await d.workingTreeFingerprint(finalState.repo, [])
+    ? await d.workingTreeFingerprint(finalState.repo, reproducibilityPaths)
     : null;
   const livePrState = await d.readLivePrState({
     repo: finalState.repo,
@@ -482,7 +496,7 @@ const runCloseoutWorkflow = async ({
     ]);
   }
   const afterGithubFingerprint = attestationAdmitted
-    ? await d.workingTreeFingerprint(observedState.repo, [])
+    ? await d.workingTreeFingerprint(observedState.repo, reproducibilityPaths)
     : null;
   const sealedState = await d.resolveRepositoryState({ repo: observedState.repo, baseRef });
   let repositorySeal = attestationAdmitted
@@ -567,7 +581,7 @@ const runCloseoutWorkflow = async ({
   await d.writeEvidenceReport({ outputDir: resolvedOutput, report: provisional });
   const evidenceState = await d.resolveRepositoryState({ repo: sealedState.repo, baseRef });
   const evidenceFingerprint = attestationAdmitted
-    ? await d.workingTreeFingerprint(evidenceState.repo, [])
+    ? await d.workingTreeFingerprint(evidenceState.repo, reproducibilityPaths)
     : null;
   const evidenceSeal = attestationAdmitted
     ? sealRepository({

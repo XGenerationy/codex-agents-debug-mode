@@ -52,6 +52,12 @@ const CONFIG_SILENCING = [
   // contain the token as a substring (windows-latest, attestation, contest)
   // do not false-positive.
   /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i,
+  // Extension-only ignore globs (e.g. ignorePatterns: ["**/*.ts"]) suppress an
+  // entire source language from the lint gate without naming a src/test/spec
+  // directory, so the token-based pattern above never fires. Flag ignore /
+  // exclude values that are bare source-extension globs; build artifacts such
+  // as **/*.d.ts, dist, or node_modules stay unflagged.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
   /\|\|\s*true\b/i,
 ];
 
@@ -233,9 +239,12 @@ const classifyOutput = ({
   // Numeric no-work summaries from common runners: Node's TAP `# tests 0` /
   // `# pass 0` and Vitest's `Tests 0 passed (0)` / `Test Files 0`. These exit 0
   // while doing no work; the closeout gate requires authoritative test evidence.
+  // `Test Files 0` only counts as a zero total when it is not a bucket count in
+  // a richer summary: `Test Files 0 failed | 2 passed (2)` reports zero failed
+  // files alongside real passes, which IS authoritative test evidence.
   if (/^[ \t]*#\s*tests?\s+0\b/im.test(combined)
     || /\btests?\s+0\s+passed\b/i.test(combined)
-    || /\btest\s+files?\s+0\b/i.test(combined)) {
+    || new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STATUS_TERM}\\b)`, 'i').test(combined)) {
     return { status: 'FAIL', evidence: 'Test runner reported zero tests as the total; closeout requires authoritative test evidence.' };
   }
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
@@ -257,10 +266,13 @@ const scanSuppressionText = (file, text) => {
   // command exits 0.
   const testLike = /(?:^|[._-])(?:test|spec)s?\.[a-z0-9]+$/i.test(base)
     || /\.(?:test|spec)\.[a-z0-9]+$/i.test(base)
-    // Also classify files inside a __tests__/ directory (a standard Jest
-    // layout with no test/spec token in the filename) as test files so
-    // weakening markers (describe.only/it.skip/test.todo) in them are scanned.
-    || /(?:^|\/)__tests__\//i.test(normalized);
+    // Also classify files inside standard test directories (__tests__/ — a
+    // standard Jest layout — plus test/, tests/, spec/, and specs/) as test
+    // files even when the filename has no test/spec token, so weakening
+    // markers (describe.only/it.skip/test.todo) in tests/foo.js are scanned.
+    // The segment must match in full so lookalikes such as contest/, latest/,
+    // test-utils/, or __tests_data__/ do not false-positive.
+    || /(?:^|\/)(?:tests?|specs?|__tests__)\//i.test(normalized);
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const markerPattern = new RegExp(MARKERS
     .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
@@ -274,10 +286,12 @@ const scanSuppressionText = (file, text) => {
   // detection while avoiding self-referential false positives.
   const isStringLiteralData = (line) => /^\s*['"`][^'"`\r\n]*['"`],?\s*$/.test(line);
   const lines = text.split(/\r?\n/);
+  // Compile the global scan pattern once per file, not once per line;
+  // matchAll clones the regex internally, so sharing it across lines is safe.
+  const globalPattern = new RegExp(markerPattern.source, 'gi');
   lines.forEach((line, index) => {
     if (isStringLiteralData(line)) return;
     // Iterate every marker occurrence so each can be assessed independently.
-    const globalPattern = new RegExp(markerPattern.source, 'gi');
     for (const match of line.matchAll(globalPattern)) {
       // A marker wrapped in matching quote/backtick characters is data, not a
       // directive: a markdown inline-code span (`skipcq`) in documentation, a
@@ -309,7 +323,11 @@ const scanSuppressionText = (file, text) => {
     }
   }
   if (testLike) {
-    const testWeakening = /\b(?:describe|it|test|context)\.(?:skip|only|todo)\b/i;
+    // Jasmine/Jest aliases fit/fdescribe (focus) and xit/xdescribe (skip) are
+    // runner-native weakening equivalents of .only/.skip. The lookbehind
+    // requires a standalone call so member calls such as curve.fit(data) do
+    // not false-positive.
+    const testWeakening = /\b(?:describe|it|test|context)\.(?:skip|only|todo)\b|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     lines.forEach((line, index) => {
       const match = line.match(testWeakening);
       if (match) findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });

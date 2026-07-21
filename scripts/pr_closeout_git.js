@@ -33,7 +33,7 @@ const isGateFile = (file) => {
     // Makefile) so a weakening change to whichever one readProjectMetadata
     // actually discovers is treated as a gate change.
     || /^(?:gnu)?makefile(?:\..+)?$/.test(base)
-    || /^(?:pnpm-lock\.yaml|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
+    || /^(?:pnpm-lock\.yaml|package-lock\.json|npm-shrinkwrap\.json|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
     || /(?:^|\/)\.?pr-closeout(?:\.[^/]+)?\.json$/.test(normalized);
 };
@@ -45,14 +45,41 @@ const WEAKENING_PATTERNS = [
   /(?:fail-fast|failFast)\s*[:=]\s*false/i,
 ];
 
+// A coverage threshold can also be zeroed in nested config form, with the
+// coverage/threshold key and the zeroed metric on separate added lines
+// (`coverageThreshold:` on one line, `statements: 0` on the next). The
+// per-line patterns above never see both halves of that combination, so the
+// joined added diff is scanned with these patterns as well.
+const MULTILINE_WEAKENING_PATTERNS = [
+  /(?:coverage|threshold)["']?\s*[:=][\s\S]{0,160}?\b(?:statements|branches|functions|lines)["']?\s*[:=]\s*["']?0(?:\.0+)?["']?(?![\w.])/i,
+];
+
 const classifyGateIntegrity = ({
-  changedFiles = [], addedLines = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
+  changedFiles = [], addedLines = [], deletedFiles = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
 } = {}) => {
   const gateFiles = changedFiles.filter(isGateFile);
   const configured = [...new Set(configuredCommands)].sort();
+  // A deleted gate file contributes no added lines to scan, so the weakening
+  // checks below have nothing to evaluate for it. Removing an entire
+  // validation surface must fail closed rather than PASS on attestation alone.
+  const deletedGateFiles = deletedFiles.filter(isGateFile);
+  if (deletedGateFiles.length) {
+    return {
+      status: 'FAIL',
+      changedFiles: gateFiles,
+      deletedFiles: deletedGateFiles,
+      configuredCommands: configured,
+      evidence: `Validation-defining gate files were deleted: ${deletedGateFiles.slice(0, 5).join(' | ')}`,
+    };
+  }
   const suppressionFindings = scanSuppressionText('__gate__.json', addedLines.join('\n'));
+  const joinedAddedLines = addedLines.join('\n');
   const weakening = [
     ...addedLines.filter((line) => WEAKENING_PATTERNS.some((pattern) => pattern.test(line))),
+    ...MULTILINE_WEAKENING_PATTERNS
+      .map((pattern) => joinedAddedLines.match(pattern))
+      .filter(Boolean)
+      .map((match) => match[0].replace(/\s*\n\s*/g, ' ')),
     ...suppressionFindings.map((finding) => finding.match),
   ];
   if (weakening.length) {
@@ -149,13 +176,15 @@ const verifyGeneratorReproducibility = async ({ executeGenerator, fingerprint })
 };
 
 // Reduce a proof result to its stable fields for baseline failure signatures.
-// proofResult carries volatile artifact-identity fields (realPath/realRoot are
-// absolute paths that differ between the head repo and the disposable baseline
-// worktree; dev/ino/mtimeMs/ctimeMs/size change every run because the proof
-// artifact is regenerated). Without normalization, failureSignature() cannot
-// match the same logical failure across head and baseline, so the baseline
-// comparison always reports "did not reproduce" even for identical failures.
-const STABLE_PROOF_KEYS = ['status', 'exists', 'digest', 'path', 'evidence', 'matched', 'matchPolicyValid', 'policyValid'];
+// proofResult carries volatile artifact-identity fields (path/realPath/realRoot
+// are absolute paths resolved against the per-run command worktree, so they
+// differ between the head repo and the disposable baseline worktree;
+// dev/ino/mtimeMs/ctimeMs/size change every run because the proof artifact is
+// regenerated, and logPath/durationMs vary per attempt). Without normalization,
+// failureSignature() cannot match the same logical failure across head and
+// baseline, so the baseline comparison always reports "did not reproduce" even
+// for identical failures.
+const STABLE_PROOF_KEYS = ['status', 'exists', 'digest', 'evidence', 'matched', 'matchPolicyValid', 'policyValid'];
 const stableProofResult = (proofResult) => {
   if (!proofResult || typeof proofResult !== 'object') return null;
   return Object.fromEntries(STABLE_PROOF_KEYS.filter((key) => key in proofResult).map((key) => [key, proofResult[key]]));

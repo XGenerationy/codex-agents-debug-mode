@@ -66,10 +66,11 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
 const readProjectMetadata = async (repo) => {
   let packageScripts = {};
   let makeTargets = [];
-  // Reject symlinked metadata before reading: a reviewed branch can make
-  // root package.json or a default Makefile a symlink to /dev/zero or an
-  // outside file, hanging or escaping the repository before any later check
-  // can stop the read.
+  // Reject symlinked and non-regular metadata before reading: a reviewed
+  // branch can make root package.json or a default Makefile a symlink to
+  // /dev/zero or an outside file, or replace it with a directory or FIFO
+  // whose read throws EISDIR or blocks before any later check can stop the
+  // read and before any structured evidence report exists.
   const safeReadFile = async (relative) => {
     const absolute = path.join(repo, relative);
     let info;
@@ -81,6 +82,9 @@ const readProjectMetadata = async (repo) => {
     }
     if (info.isSymbolicLink()) {
       throw new Error(`Refusing to read symlinked metadata: ${relative}`);
+    }
+    if (!info.isFile()) {
+      throw new Error(`Refusing to read non-regular metadata: ${relative}`);
     }
     if (info.size > MAX_SUPPRESSION_SCAN_BYTES) {
       throw new Error(`Refusing to read oversized metadata (${info.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes): ${relative}`);
@@ -352,12 +356,18 @@ const cleanTreeStatus = async (repo) => {
 };
 
 const readGateChanges = async (repo, baseSha) => {
-  const [changed, untracked] = await Promise.all([
+  // A deleted gate file contributes no added lines, so surface it on a
+  // dedicated channel: classifyGateIntegrity must fail closed when a
+  // validation-defining file (workflow, package.json, lockfile) is removed
+  // rather than PASS on attestation alone.
+  const [changed, deleted, untracked] = await Promise.all([
     gitPaths(repo, ['diff', '--name-only', '-z', baseSha]),
+    gitPaths(repo, ['diff', '--name-only', '--diff-filter=D', '-z', baseSha]),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   const changedFiles = [...new Set([...changed, ...untracked].filter(isGateFile))].sort();
-  if (!changedFiles.length) return { changedFiles, addedLines: [] };
+  const deletedFiles = [...new Set(deleted.filter(isGateFile))].sort();
+  if (!changedFiles.length) return { changedFiles, addedLines: [], deletedFiles };
   const tracked = changedFiles.filter((file) => !untracked.includes(file));
   // Contain a very large tracked gate-file diff (e.g. a regenerated
   // pnpm-lock.yaml or workspace manifest churn) that would exceed execFile's
@@ -431,7 +441,7 @@ const readGateChanges = async (repo, baseSha) => {
       if (handle) await handle.close().catch(() => {});
     }
   }
-  return { changedFiles, addedLines };
+  return { changedFiles, addedLines, deletedFiles };
 };
 
 module.exports = {

@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
-const { mkdtemp, readFile, rm } = require('node:fs/promises');
+const { spawn, spawnSync } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -90,6 +91,78 @@ const recordEvent = (baseUrl, session, msg = 'Function entry') =>
       hypothesisId: 'H1',
     },
   });
+
+// Pick a currently-free loopback port for CLI startup tests. The server under
+// test binds it a moment later, so a parallel process could theoretically win
+// the gap; in practice the window is milliseconds.
+const findFreePort = () =>
+  new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+
+// Spawn the real CLI against a temp project root. Resolves with the parsed
+// startup outcome as soon as the single structured startup line appears on
+// stdout, or with the exit code when the process exits before printing one.
+const launchCli = (projectRoot, port) => {
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, 'debug_server.js'), projectRoot],
+    { env: { ...process.env, DEBUG_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const outcome = new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      const line = stdout.split('\n').find((entry) => entry.trim().startsWith('{'));
+      if (!line) return;
+      try {
+        finish({ status: JSON.parse(line).status, stdout, stderr, exitCode: null });
+      } catch {
+        // Partial line; keep collecting until it completes or the child exits.
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('exit', (code) => finish({ status: null, stdout, stderr, exitCode: code }));
+    child.on('error', reject);
+  });
+  return { child, outcome };
+};
+
+const stopCli = (child) => {
+  if (child.exitCode === null && !child.killed) child.kill();
+};
+
+const bashProbe = spawnSync('bash', ['-c', 'true']);
+const bashAvailable = !bashProbe.error && bashProbe.status === 0;
+
+// Git Bash passes MSYS-style paths (/c/...) to the installer, which forwards
+// them to the native node.exe; the emitted JSON then carries the Windows form
+// (C:/...). Compare through path.normalize so the assertion holds on both
+// POSIX shells and Git Bash.
+const toBashPath = (nativePath) => {
+  if (process.platform !== 'win32') return nativePath;
+  const converted = spawnSync('cygpath', ['-u', nativePath], { encoding: 'utf8' });
+  if (converted.error || converted.status !== 0) {
+    throw converted.error || new Error(`cygpath failed: ${converted.stderr}`);
+  }
+  return converted.stdout.trim();
+};
 
 test('prints CLI help without starting the server', () => {
   const scriptPath = path.join(__dirname, 'debug_server.js');
@@ -373,3 +446,181 @@ test('enforces the aggregate log byte cap', async () => {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
+
+test('refuses to write the launch token through a hard-linked collector_token', { timeout: 20000 }, async () => {
+  // A repo-controlled .debug/collector_token hard link shares its inode with
+  // an outside file; a truncating startup write would clobber that file
+  // through the link. Startup must fail closed and leave the target intact.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  let child;
+  try {
+    const debugDir = path.join(projectRoot, '.debug');
+    const outsideFile = path.join(projectRoot, 'outside.txt');
+    await mkdir(debugDir, { recursive: true });
+    await writeFile(outsideFile, 'precious', 'utf8');
+    await link(outsideFile, path.join(debugDir, 'collector_token'));
+
+    const port = await findFreePort();
+    const launched = launchCli(projectRoot, port);
+    child = launched.child;
+    const result = await launched.outcome;
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.stdout.includes('"started"'), false);
+    assert.match(result.stderr, /startup\.token_write_failed/);
+    assert.match(result.stderr, /collector_token_not_private/);
+    assert.equal(await readFile(outsideFile, 'utf8'), 'precious');
+  } finally {
+    if (child) stopCli(child);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('writes the launch token through the descriptor with owner-only permissions', { timeout: 20000 }, async () => {
+  // The startup token write must succeed end to end through the opened file
+  // descriptor (write + chmod before close), leaving a private regular file
+  // that holds exactly the launch token.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  let child;
+  try {
+    const port = await findFreePort();
+    const launched = launchCli(projectRoot, port);
+    child = launched.child;
+    const result = await launched.outcome;
+
+    assert.equal(result.status, 'started');
+    const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
+    const info = await stat(tokenFile);
+    assert.equal(info.isFile(), true);
+    assert.equal(info.nlink, 1);
+    if (process.platform !== 'win32') {
+      assert.equal(info.mode & 0o777, 0o600);
+    }
+    assert.match(await readFile(tokenFile, 'utf8'), /^[A-Za-z0-9_-]{43}$/);
+  } finally {
+    if (child) stopCli(child);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('rejects appends after the session log is swapped for a hard link', async () => {
+  // The debugged project can mutate .debug after session creation. Swapping
+  // the session log for a hard link to an outside file must fail closed
+  // instead of appending the event through the shared inode.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    const outsideFile = path.join(projectRoot, 'outside.log');
+    await writeFile(outsideFile, '', 'utf8');
+    await rm(logPath);
+    await link(outsideFile, logPath);
+
+    const response = await recordEvent(baseUrl, session);
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { error: 'session_log_replaced' });
+    assert.equal(await readFile(outsideFile, 'utf8'), '');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('rejects appends after the session log is recreated at the same path', async () => {
+  // A deleted-and-recreated session log is a different file (new inode) even
+  // though the path string is unchanged; appends must fail closed.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    await rm(logPath);
+    await writeFile(logPath, 'sentinel\n', 'utf8');
+
+    const response = await recordEvent(baseUrl, session);
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { error: 'session_log_replaced' });
+    assert.equal(await readFile(logPath, 'utf8'), 'sentinel\n');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test(
+  'rejects appends after the session log is swapped for a symlink',
+  { skip: process.platform === 'win32' && 'Windows cannot create file symlinks without elevation' },
+  async () => {
+    // A symlinked session log must be rejected by the no-follow open instead
+    // of appending the event outside projectRoot.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+    const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const baseUrl = await listen(server);
+
+    try {
+      const session = (await createSession(baseUrl)).body;
+      const logPath = path.join(projectRoot, session.log_file);
+      const outsideFile = path.join(await mkdtemp(path.join(tmpdir(), 'debug-skill-outside-')), 'outside.log');
+      await rm(logPath);
+      await symlink(outsideFile, logPath);
+
+      const response = await recordEvent(baseUrl, session);
+
+      assert.equal(response.status, 409);
+      assert.deepEqual(response.body, { error: 'session_log_replaced' });
+      assert.equal(existsSync(outsideFile), false);
+    } finally {
+      await close(server);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.sh emits the real target and backup paths in its JSON result',
+  { skip: !bashAvailable && 'bash is required to run tools/install.sh', timeout: 60000 },
+  async () => {
+    // Regression guard for the embedded `node -e` emit snippet: the install
+    // result must carry the real target and backup values in the right
+    // fields, never the eval context string or shifted arguments.
+    const homeNative = await mkdtemp(path.join(tmpdir(), 'debug-skill-home-'));
+    try {
+      const home = toBashPath(homeNative);
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const expectedTarget = path.join(homeNative, '.codex', 'skills', 'debug');
+
+      const fresh = spawnSync('bash', [installer, '--home', home, '--target', 'codex'], {
+        encoding: 'utf8',
+      });
+      assert.equal(fresh.status, 0, fresh.stderr);
+      const freshResult = JSON.parse(fresh.stdout.trim());
+      assert.deepEqual(Object.keys(freshResult).sort(), ['backup', 'status', 'target']);
+      assert.equal(freshResult.status, 'installed');
+      assert.equal(path.normalize(freshResult.target), expectedTarget);
+      assert.equal(freshResult.backup, '');
+      assert.equal(existsSync(path.join(expectedTarget, 'SKILL.md')), true);
+
+      const forced = spawnSync('bash', [installer, '--home', home, '--target', 'codex', '--force'], {
+        encoding: 'utf8',
+      });
+      assert.equal(forced.status, 0, forced.stderr);
+      const forcedResult = JSON.parse(forced.stdout.trim());
+      assert.equal(forcedResult.status, 'installed');
+      assert.equal(path.normalize(forcedResult.target), expectedTarget);
+      assert.equal(
+        path.normalize(forcedResult.backup).startsWith(`${expectedTarget}.backup.`),
+        true,
+      );
+      assert.equal(existsSync(path.normalize(forcedResult.backup)), true);
+    } finally {
+      await rm(homeNative, { recursive: true, force: true });
+    }
+  },
+);
