@@ -1085,6 +1085,33 @@ test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd'
       found.includes(childPid),
       `fd-holding orphan ${childPid} must be found by the sweep, got: ${JSON.stringify(found)}`,
     );
+
+    // A sibling orphan that holds ONLY a pipe/socket (no repo file) must NOT be
+    // reaped: pseudo fd targets like `pipe:[…]` are not absolute paths, so the
+    // sweep must ignore them to avoid killing an unrelated process.
+    let pipePid = 0;
+    const pipeOnly = [
+      'const os=require("node:os");',
+      'process.chdir(os.tmpdir());',
+      'process.stdout.write(String(process.pid));',
+      'setInterval(()=>{},10000);',
+    ].join('');
+    const pipeChild = spawn(process.execPath, ['-e', pipeOnly], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      detached: true,
+    });
+    pipeChild.unref();
+    pipeChild.stdout.on('data', (chunk) => { pipePid = Number(String(chunk).trim()); });
+    for (let i = 0; i < 40 && !pipePid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(pipePid > 0, 'pipe-only orphan must report its pid');
+    const found2 = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(
+      !(found2 || []).includes(pipePid),
+      `pipe-only orphan ${pipePid} must NOT be reaped, got: ${JSON.stringify(found2)}`,
+    );
+    try { process.kill(pipePid, 'SIGKILL'); } catch {}
   } finally {
     if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch {} }
     await rm(repo, { recursive: true, force: true });

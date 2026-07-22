@@ -188,6 +188,12 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       } catch {
         continue;
       }
+      // Only a real (absolute) file path can point under the repo. Pseudo
+      // descriptors readlink to non-path targets like `pipe:[123]`, `socket:[…]`,
+      // or `anon_inode:[eventfd]`; feeding those through path.resolve would make
+      // them relative to the runner cwd (commonly the repo) and falsely mark an
+      // unrelated pipe/socket-holding process for reaping.
+      if (!path.isAbsolute(target)) continue;
       if (underRoot(path.resolve(target))) return true;
     }
     return false;
@@ -1553,12 +1559,17 @@ const TOOL_PROBES = [
 
 const probeCommandDefault = async ({ command, repo, shell, env }) => {
   try {
-    // Disable shell startup files (--noprofile --norc) so a validation command
+    // Disable Bash startup files (--noprofile --norc) so a validation command
     // that writes $HOME/.bash_profile cannot run profile code during these
     // preflight version probes (which run outside spawnCaptured containment).
     // The passed env already carries PATH, so tool discovery does not depend on
-    // the profile.
-    const result = await execFileAsync(shell, ['--noprofile', '--norc', '-lc', command], {
+    // the profile. These flags are Bash-specific, so only add them when the
+    // resolved shell is Bash; other POSIX shells (sh/dash) would reject them.
+    const isBash = !shell || /(^|[/\\])bash(\.exe)?$/i.test(shell);
+    const shellArgs = isBash
+      ? ['--noprofile', '--norc', '-lc', command]
+      : ['-lc', command];
+    const result = await execFileAsync(shell, shellArgs, {
       cwd: repo,
       env,
       encoding: 'utf8',

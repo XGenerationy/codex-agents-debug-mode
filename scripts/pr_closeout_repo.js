@@ -398,7 +398,7 @@ const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
 
 const workingTreeFingerprint = async (repo, extraPaths = []) => {
   const [diffHash, untracked] = await Promise.all([
-    hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD']),
+    hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD']),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   const entries = [{ path: '__tracked_diff__', hash: diffHash }];
@@ -478,7 +478,9 @@ const cleanTreeStatus = async (repo) => {
   // Force untracked reporting even when status.showUntrackedFiles=no is set
   // locally/globally; otherwise porcelain omits untracked files and a dirty
   // tree can PASS while fingerprints still see the same stable untracked set.
-  const raw = await gitText(repo, ['status', '--porcelain=v1', '--untracked-files=all']);
+  // --ignore-submodules=none overrides a local `submodule.<name>.ignore=all` so
+  // a validation command cannot dirty a submodule and leave the seal clean.
+  const raw = await gitText(repo, ['status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none']);
   if (raw) {
     return { status: 'FAIL', evidence: `Working tree is not clean: ${raw.split(/\r?\n/).slice(0, 20).join(' | ')}` };
   }
