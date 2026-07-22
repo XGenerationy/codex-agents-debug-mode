@@ -150,6 +150,9 @@ catch {
         }
         catch {
             # Best-effort rollback; surface the original install error below.
+            # Record the rollback-step failure so a partially broken state is
+            # not silently hidden behind the primary install error.
+            Write-Warning "Rollback step failed for $($item.Destination): $($_.Exception.Message)"
         }
     }
     throw

@@ -177,8 +177,12 @@ const scanFileForPublicSafety = (file) => {
 
 for (const file of safetyScanFiles) scanFileForPublicSafety(file);
 
+// Derive the JavaScript list from payloadFiles (scripts/ is already a payload
+// entry) plus the optional tools/ walk, instead of re-walking scripts/ — that
+// duplicate traversal repeated filesystem work and could surface walk() failures
+// twice for missing/symlinked/non-regular entries.
 const javascriptFiles = [
-  ...walk('scripts').filter((name) => name.endsWith('.js')),
+  ...payloadFiles.filter((name) => name.endsWith('.js')),
   ...walkOptional('tools').filter((name) => name.endsWith('.js')),
 ];
 for (const file of javascriptFiles) {

@@ -128,11 +128,19 @@ declare -a committed_dests=()
 declare -a committed_backups=()
 
 # Restore a destination from its backup if present (committed or in-flight).
+# Best-effort: a rollback step failure is surfaced on stderr but does not abort
+# the remaining rollback steps, since the original install error must remain the
+# primary failure. rm/mv return non-zero are caught explicitly so set -e does
+# not exit the script mid-rollback.
 restore_from_backup() {
   local dest="$1" backup="$2"
-  rm -rf -- "$dest" 2>/dev/null || true
+  if ! rm -rf -- "$dest" 2>/dev/null; then
+    echo "Rollback warning: could not remove $dest" >&2
+  fi
   if [[ -n "$backup" && -e "$backup" ]]; then
-    mv -- "$backup" "$dest" 2>/dev/null || true
+    if ! mv -- "$backup" "$dest" 2>/dev/null; then
+      echo "Rollback warning: could not restore $dest from backup" >&2
+    fi
   fi
 }
 
@@ -149,7 +157,15 @@ for destination in "${destinations[@]}"; do
   backup=""
   if [[ -e "$destination" ]]; then
     backup="$(unique_backup "$destination")"
-    mv -- "$destination" "$backup"
+    # Guard the backup move: under set -e a bare mv failure in the then-body
+    # would exit the script before rollback() runs, leaving previously
+    # committed destinations without their backups restored. Handle it
+    # explicitly like the staged-tree move below.
+    if ! mv -- "$destination" "$backup"; then
+      rollback
+      echo "Failed to back up $destination" >&2
+      exit 1
+    fi
   fi
   # Commit: move staged tree into place (atomic rename when same filesystem).
   # If this fails after we already renamed an existing destination to backup,
