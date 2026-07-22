@@ -331,7 +331,9 @@ test('disables fsmonitor and global attributes for the internal baseline worktre
     const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
       worktree = created;
       // The checked-out file must be the plain blob, uncorrupted by any filter.
-      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8');
+      // Normalize CRLF so the assertion holds on Windows (autocrlf checkout)
+      // while still detecting any smudge-driven content change.
+      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n');
       assert.equal(content, 'base\n');
       return 'verified';
     });
