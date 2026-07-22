@@ -278,6 +278,10 @@ const scanSuppressionText = (file, text) => {
   // command exits 0.
   const testLike = /(?:^|[._-])(?:test|spec)s?\.[a-z0-9]+$/i.test(base)
     || /\.(?:test|spec)\.[a-z0-9]+$/i.test(base)
+    // Cypress E2E spec naming (*.cy.ts / *.cy.js) is honored by the runner for
+    // it.only/describe.skip, so focused/skipped E2E coverage in a touched
+    // cypress/e2e/login.cy.ts file must be scanned even outside a test/ dir.
+    || /\.cy\.[a-z0-9]+$/i.test(base)
     // Also classify files inside standard test directories (__tests__/ — a
     // standard Jest layout — plus test/, tests/, spec/, and specs/) as test
     // files even when the filename has no test/spec token, so weakening
@@ -356,7 +360,13 @@ const scanSuppressionText = (file, text) => {
     // focuses/skips at runtime, so a reduced test command can exit 0 and bypass
     // the closeout weakening scan. Allow runner modifier chains
     // (test.concurrent.only / it.only.each) on the dot form.
-    const testWeakening = /\b(?:describe|it|test|context)(?:\.[A-Za-z_]\w*)*\.(?:skip|only|todo)\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Dot-member chains (describe.only / it.skip / test.todo) — including the
+    // optional-chaining form it?.only which still focuses at runtime when `it`
+    // is defined — plus the computed-property equivalents (it['only'] /
+    // describe["skip"] / test[`only`]) are runner-native focus/skip forms. Allow
+    // runner modifier chains (test.concurrent.only / it.only.each) on the dot
+    // form. `\??\.` accepts both `.` and `?.` so it?.only / describe?.skip match.
+    const testWeakening = /\b(?:describe|it|test|context)(?:\??\.[A-Za-z_]\w*)*\??\.(?:skip|only|todo)\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     // Scan a whole source line and mark every position that is inert (inside a
     // string, line/block comment, or regex literal) so test-weakening matches
     // the runner can never execute are not flagged. Block-comment state is

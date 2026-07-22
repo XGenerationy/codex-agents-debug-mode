@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { mkdir, mkdtemp, rm, symlink, writeFile } = require('node:fs/promises');
+const { chmod, mkdir, mkdtemp, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -484,6 +484,49 @@ test('workingTreeFingerprint seals an untracked self-ignoring .gitignore that hi
     await writeFile(path.join(repo, 'hidden', '.gitignore'), '.gitignore\nhidden/\nother/\n');
     const afterMutate = await workingTreeFingerprint(repo);
     assert.notEqual(after, afterMutate, 'mutating a self-ignoring .gitignore must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('cleanTreeStatus rejects assume-unchanged and skip-worktree index bits', async () => {
+  // git update-index --assume-unchanged / --skip-worktree hide working-tree
+  // modifications from `git status` and `git diff`, so a validation command can
+  // edit a tracked file after marking it and leave porcelain clean. The seal
+  // must fail closed when either bit is set on a tracked file.
+  const repo = await fixtureRepo();
+  try {
+    // sanity: clean tree is PASS before any bit is set
+    assert.equal((await cleanTreeStatus(repo)).status, 'PASS');
+    await writeFile(path.join(repo, 'tracked.txt'), 'changed-but-assumed\n');
+    git(repo, 'update-index', '--assume-unchanged', 'tracked.txt');
+    const assumed = await cleanTreeStatus(repo);
+    assert.equal(assumed.status, 'FAIL', `assume-unchanged must fail closed: ${JSON.stringify(assumed)}`);
+    assert.match(assumed.evidence, /assume-unchanged|skip-worktree/i);
+    // Clear the bit and set skip-worktree instead.
+    git(repo, 'update-index', '--no-assume-unchanged', 'tracked.txt');
+    git(repo, 'update-index', '--skip-worktree', 'tracked.txt');
+    const skipped = await cleanTreeStatus(repo);
+    assert.equal(skipped.status, 'FAIL', `skip-worktree must fail closed: ${JSON.stringify(skipped)}`);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('cleanTreeStatus detects a chmod change even when core.fileMode is disabled', async () => {
+  // When core.fileMode=false, git status/diff ignore executable-bit changes.
+  // The internal safety override forces core.fileMode=true so a chmod change to
+  // a tracked file cannot hide from the clean-tree seal. POSIX-only: Windows
+  // has no Unix executable bit for git to compare.
+  if (process.platform === 'win32') return;
+  const repo = await fixtureRepo();
+  try {
+    assert.equal((await cleanTreeStatus(repo)).status, 'PASS');
+    git(repo, 'config', 'core.fileMode', 'false');
+    const target = path.join(repo, 'tracked.txt');
+    await chmod(target, 0o755);
+    const result = await cleanTreeStatus(repo);
+    assert.equal(result.status, 'FAIL', `chmod change must be detected despite core.fileMode=false: ${JSON.stringify(result)}`);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

@@ -212,11 +212,19 @@ const normalizeFailure = (result) => {
 const failureSignature = (result) => createHash('sha256').update(normalizeFailure(result)).digest('hex');
 
 const runGit = async (repo, args, options = {}) => {
-  const result = await execFileAsync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: 20_000_000, ...options });
+  const result = await execFileAsync('git', args, {
+    cwd: repo,
+    encoding: 'utf8',
+    maxBuffer: 20_000_000,
+    // Bound internal git calls so a wedged worktree/fsmonitor/filter cannot hang
+    // the closeout gate indefinitely (overridable per call via options.timeout).
+    timeout: 120_000,
+    ...options,
+  });
   return result.stdout;
 };
 
-const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
+const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, callback) => {
   const parent = await mkdtemp(path.join(tmpdir(), 'codex-pr-baseline-'));
   const worktree = path.join(parent, 'worktree');
   const resolvedParent = path.resolve(parent);
@@ -247,8 +255,14 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
     '-c', 'core.attributesFile=',
     ...args,
   ];
+  // Run internal baseline git with the workflow's sanitized environment (when
+  // provided) and a bounded timeout so the baseline checkout does not inherit
+  // ambient CI secrets via process.env and cannot hang the closeout gate.
+  const gitOptions = {};
+  if (env) gitOptions.env = env;
+  if (timeoutMs) gitOptions.timeout = timeoutMs;
   try {
-    await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]));
+    await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]), gitOptions);
     added = true;
     return await callback(worktree);
   } catch (error) {
@@ -257,8 +271,8 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
   } finally {
     try {
       if (added) {
-        await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]));
-        await runGit(repo, withInternalSafety(['worktree', 'prune']));
+        await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]), gitOptions);
+        await runGit(repo, withInternalSafety(['worktree', 'prune']), gitOptions);
       }
     } finally {
       try {
@@ -280,11 +294,13 @@ const verifyBaseline = async ({
   toolVersions,
   captureVersions,
   setup,
+  env,
+  baselineGitTimeoutMs,
 } = {}) => {
   if (!check.baselineSafe) {
     return { ...headResult, evidence: `${headResult.evidence || ''} Check is not baseline-safe; no baseline claim was made.`.trim() };
   }
-  const comparison = await withWorktree({ repo, baseSha }, async (worktree) => {
+  const comparison = await withWorktree({ repo, baseSha, env, timeoutMs: baselineGitTimeoutMs }, async (worktree) => {
     const setupResult = setup ? await setup(worktree) : { status: 'PASS', evidence: 'No baseline setup configured.' };
     if (setupResult.status !== 'PASS') return { setupResult };
     return {

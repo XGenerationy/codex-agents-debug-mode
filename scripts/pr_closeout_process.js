@@ -1553,7 +1553,12 @@ const TOOL_PROBES = [
 
 const probeCommandDefault = async ({ command, repo, shell, env }) => {
   try {
-    const result = await execFileAsync(shell, ['-lc', command], {
+    // Disable shell startup files (--noprofile --norc) so a validation command
+    // that writes $HOME/.bash_profile cannot run profile code during these
+    // preflight version probes (which run outside spawnCaptured containment).
+    // The passed env already carries PATH, so tool discovery does not depend on
+    // the profile.
+    const result = await execFileAsync(shell, ['--noprofile', '--norc', '-lc', command], {
       cwd: repo,
       env,
       encoding: 'utf8',

@@ -54,9 +54,13 @@ const withNoTextconv = (args) => {
 
 // Internal git must not run local fsmonitor/hooks configured in the repo or
 // user config — those would execute outside spawnCaptured containment.
+// core.fileMode=true forces executable-bit detection so a validation command
+// that sets core.fileMode=false cannot hide a chmod change to a tracked file
+// from the status/diff seal.
 const withInternalGitSafety = (args) => ([
   '-c', 'core.fsmonitor=',
   '-c', 'core.useBuiltinFSMonitor=false',
+  '-c', 'core.fileMode=true',
   ...withNoTextconv(args),
 ]);
 
@@ -477,6 +481,23 @@ const cleanTreeStatus = async (repo) => {
   const raw = await gitText(repo, ['status', '--porcelain=v1', '--untracked-files=all']);
   if (raw) {
     return { status: 'FAIL', evidence: `Working tree is not clean: ${raw.split(/\r?\n/).slice(0, 20).join(' | ')}` };
+  }
+  // assume-unchanged / skip-worktree index bits hide working-tree modifications
+  // from `git status` and `git diff`, so a validation command can edit a tracked
+  // file after marking it and leave both the porcelain check and the diff
+  // fingerprint unchanged. `git ls-files -v` tags assume-unchanged files with a
+  // lowercase letter and skip-worktree files with 'S'; reject either before the
+  // tree is declared clean.
+  const tagged = await gitText(repo, ['ls-files', '-v']);
+  const masked = tagged.split(/\r?\n/).filter((line) => {
+    const tag = line[0];
+    return tag && (tag === 'S' || (tag >= 'a' && tag <= 'z'));
+  });
+  if (masked.length) {
+    return {
+      status: 'FAIL',
+      evidence: `Tracked file marked assume-unchanged/skip-worktree (hides modifications): ${masked.slice(0, 10).map((line) => line.slice(2)).join(', ')}`,
+    };
   }
   // Also fail closed when .git/info/exclude was mutated during validation:
   // porcelain alone cannot see files newly ignored by that side channel.

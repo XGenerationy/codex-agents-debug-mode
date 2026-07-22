@@ -338,6 +338,27 @@ test('treats regex literals in keyword context (return /.../) so they cannot hid
   }
 });
 
+test('flags optional-chaining focus/skip forms and Cypress spec files', () => {
+  // it?.only(...) still focuses at runtime when `it` is defined (it?.only ===
+  // it.only), and Cypress honors it.only/describe.skip in *.cy.ts/*.cy.js spec
+  // files even outside a test/ directory. Both must be scanned.
+  for (const line of ["it?.only(\"focused\");", "describe?.skip(\"suite\");", "test?.todo(\"unfinished\");"]) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(matches.length, 1, `${line} must be flagged, got: ${JSON.stringify(matches)}`);
+  }
+  // Cypress spec naming is detected as test-like.
+  const cy = scanSuppressionText('cypress/e2e/login.cy.ts', 'it.only("focused e2e");')
+    .filter(({ category }) => category === 'test-weakening');
+  assert.equal(cy.length, 1, `cypress *.cy.ts focus must be flagged: ${JSON.stringify(cy)}`);
+  // A lookalike non-spec extension must not be treated as a Cypress spec.
+  assert.deepEqual(
+    scanSuppressionText('src/login.cy.map.js', 'it.only("nope");')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
   const failures = [
     'ok 1 - feature # SKIP unavailable',

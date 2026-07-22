@@ -446,6 +446,10 @@ const runCloseoutWorkflow = async ({
         baseSha: initial.baseSha,
         check,
         headResult: result,
+        // Thread the sanitized childEnv into the disposable baseline worktree so
+        // the internal git worktree add/remove runs with the filtered environment
+        // (not ambient process.env/CI secrets), matching the command executor.
+        env: childEnv,
         // Generator head failures use two-pass fingerprinting; baseline must
         // reproduce with the same two-run protocol, not a single generator exec.
         execute: async (baselineCheck, cwd) => {
