@@ -14,6 +14,7 @@ const {
   createStreamingRedactor,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
+  probeCommandDefault,
   redactSecrets,
   redactStructure,
   probeGrafanaHealthDefault,
@@ -967,6 +968,22 @@ test('preflight preserves and redacts safeEnv credentials', async () => {
   });
   assert.doesNotMatch(JSON.stringify(result.checks), /s3cr3t-registry-value/);
   assert.ok(Object.values(result.toolVersions).every((version) => !version.includes(secret)));
+});
+
+test('probeCommandDefault runs commands through the login shell (bash -lc) and resolves PATH', async () => {
+  // Exercise the DEFAULT preflight probe path (not a stubbed probeCommand) to
+  // guard the shell invocation: probeCommandDefault must run `bash -lc <cmd>`
+  // so profile/PATH-managed tools stay discoverable, matching the command
+  // executor. A malformed shell-args change would make this exit non-zero.
+  const shell = resolveCommandShell({ env: process.env });
+  const result = await probeCommandDefault({
+    command: 'printf %s probe-default-ok',
+    repo: process.cwd(),
+    shell,
+    env: process.env,
+  });
+  assert.equal(result.exitCode, 0, `default probe must succeed via the login shell: ${JSON.stringify(result)}`);
+  assert.equal(result.stdout, 'probe-default-ok');
 });
 
 test('preflight resolves required env names case-insensitively', async () => {

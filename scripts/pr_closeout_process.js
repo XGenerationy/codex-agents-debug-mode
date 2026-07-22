@@ -1739,6 +1739,7 @@ module.exports = {
   createStreamingRedactor,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
+  probeCommandDefault,
   probeGrafanaHealthDefault,
   probeRedisDefault,
   redactSecrets,
