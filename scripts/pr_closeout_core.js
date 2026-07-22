@@ -350,89 +350,133 @@ const scanSuppressionText = (file, text) => {
     // regression tests (e.g. scanSuppressionText(..., 'it.skip("x")')) do
     // not self-flag as active test-weakening.
     // Allow runner modifier chains (Jest/Vitest): test.concurrent.only / it.only.each, etc.
-    const testWeakening = /\b(?:describe|it|test|context)(?:\.[A-Za-z_]\w*)*\.(?:skip|only|todo)\b|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
-    const isInsideQuotes = (line, at) => {
+    // Dot-member chains (describe.only / it.skip / test.todo) and the
+    // computed-property equivalents (it['only'] / describe["skip"] /
+    // test[`only`]) are runner-native focus/skip forms; the bracket form still
+    // focuses/skips at runtime, so a reduced test command can exit 0 and bypass
+    // the closeout weakening scan. Allow runner modifier chains
+    // (test.concurrent.only / it.only.each) on the dot form.
+    const testWeakening = /\b(?:describe|it|test|context)(?:\.[A-Za-z_]\w*)*\.(?:skip|only|todo)\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Scan a whole source line and mark every position that is inert (inside a
+    // string, line/block comment, or regex literal) so test-weakening matches
+    // the runner can never execute are not flagged. Block-comment state is
+    // carried across lines: a `/*` opened on a previous line makes the whole
+    // following line inert until its `*/`, so a focused test sketched inside a
+    // multi-line block comment is not flagged. Regex character classes are
+    // tracked too, so `/[/']/` does not terminate early and let the `'` open a
+    // bogus string around a later real .only call.
+    const scanLineInertness = (line, carryBlockComment) => {
+      const inert = new Array(line.length).fill(false);
+      let blockComment = Boolean(carryBlockComment);
       let quote = null;
       let escaped = false;
+      let lineComment = false;
+      let i = 0;
       const prevSignificant = (from) => {
         for (let j = from - 1; j >= 0; j -= 1) {
-          const c = line[j];
-          if (!/\s/.test(c)) return c;
+          if (!/\s/.test(line[j])) return line[j];
         }
         return '';
       };
-      for (let i = 0; i < at; i += 1) {
+      while (i < line.length) {
         const ch = line[i];
-        if (escaped) {
-          escaped = false;
+        if (blockComment) {
+          const close = line.indexOf('*/', i);
+          if (close === -1) {
+            inert.fill(true, i);
+            return { inert, blockComment: true };
+          }
+          inert.fill(true, i, close + 2);
+          i = close + 2;
+          blockComment = false;
+          continue;
+        }
+        if (lineComment) {
+          inert[i] = true;
+          i += 1;
           continue;
         }
         if (quote) {
-          if (ch === '\\') {
+          inert[i] = true;
+          if (escaped) {
+            escaped = false;
+          } else if (ch === '\\') {
             escaped = true;
-            continue;
+          } else if (ch === quote) {
+            quote = null;
           }
-          if (ch === quote) quote = null;
+          i += 1;
           continue;
         }
-        // An unquoted `//` starts a line comment. Matches after it are inert
-        // (the test runner never executes them), so treat the match as skipped.
-        if (ch === '/' && line[i + 1] === '/') return true;
-        // Same for block comments: /* don't */ must not open a string, and a
-        // match still inside an unclosed or surrounding block comment is inert.
+        if (ch === '/' && line[i + 1] === '/') {
+          lineComment = true;
+          inert[i] = true;
+          inert[i + 1] = true;
+          i += 2;
+          continue;
+        }
         if (ch === '/' && line[i + 1] === '*') {
-          const end = line.indexOf('*/', i + 2);
-          if (end === -1) return true;
-          // Match falls inside this block comment.
-          if (at > i && at < end) return true;
-          i = end + 1;
+          blockComment = true;
+          inert[i] = true;
+          inert[i + 1] = true;
+          i += 2;
           continue;
         }
-        // Regex literals (e.g. /don't/) must not open a quote on the apostrophe.
-        // Heuristic: `/` after punctuation or a keyword that typically precedes a
-        // regex, not after an identifier (which is usually division).
+        // Regex literals (e.g. /don't/) must not open a quote on the
+        // apostrophe. Heuristic: `/` after punctuation or a keyword that
+        // typically precedes a regex, not after an identifier (division).
         if (ch === '/' && line[i + 1] && line[i + 1] !== '/' && line[i + 1] !== '*') {
           const prev = prevSignificant(i);
-          // prevSignificant is a single character; keyword context needs a word.
           const prevWord = line.slice(0, i).match(/([A-Za-z_$][\w$]*)\s*$/)?.[1];
           const regexContextKeyword = prevWord
             ? /^(?:return|typeof|instanceof|in|of|new|do|else|yield|await|case|void|delete|throw)$/.test(prevWord)
             : false;
           if (!prev || /[=(:,;[!&|?{~+\-*%^<>]/.test(prev) || regexContextKeyword) {
+            inert[i] = true;
             let k = i + 1;
             let reEsc = false;
-            for (; k < line.length; k += 1) {
-              if (reEsc) {
-                reEsc = false;
-                continue;
-              }
-              if (line[k] === '\\') {
-                reEsc = true;
-                continue;
-              }
-              if (line[k] === '/') {
-                // Skip flags
+            let inClass = false;
+            while (k < line.length) {
+              const rc = line[k];
+              inert[k] = true;
+              if (reEsc) { reEsc = false; k += 1; continue; }
+              if (rc === '\\') { reEsc = true; k += 1; continue; }
+              // A `[...]` class can contain `/` and quotes without ending the
+              // regex or opening a string; only an unescaped `/` outside a
+              // class closes the literal.
+              if (rc === '[' && !inClass) { inClass = true; k += 1; continue; }
+              if (rc === ']' && inClass) { inClass = false; k += 1; continue; }
+              if (rc === '/' && !inClass) {
                 k += 1;
-                while (k < line.length && /[a-z]/i.test(line[k])) k += 1;
-                i = k - 1;
+                while (k < line.length && /[a-z]/i.test(line[k])) { inert[k] = true; k += 1; }
                 break;
               }
-              if (line[k] === '\n') break;
+              if (rc === '\n') break;
+              k += 1;
             }
+            i = k;
             continue;
           }
         }
-        if (ch === "'" || ch === '"' || ch === '`') quote = ch;
+        if (ch === "'" || ch === '"' || ch === '`') {
+          quote = ch;
+          inert[i] = true;
+          i += 1;
+          continue;
+        }
+        i += 1;
       }
-      return quote !== null;
+      return { inert, blockComment };
     };
     const globalWeakening = new RegExp(testWeakening.source, 'gi');
+    let blockComment = false;
     lines.forEach((line, index) => {
-      if (isStringLiteralData(line)) return;
+      const { inert, blockComment: outgoing } = scanLineInertness(line, blockComment);
+      blockComment = outgoing;
       // Inspect every occurrence: a quoted fixture before a real call on the
       // same line must not hide the later active .skip/.only.
       for (const match of line.matchAll(globalWeakening)) {
-        if (isInsideQuotes(line, match.index ?? 0)) continue;
+        if (inert[match.index ?? 0]) continue;
         findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
         break;
       }

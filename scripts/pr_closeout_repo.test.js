@@ -202,6 +202,8 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
       { path: '__git_info_exclude__', hash: hashFileOrMissing(excludePath) },
       { path: '__git_core_excludesFile__', hash: excludesFileHash },
       { path: '__git_global_excludes__', hash: globalExcludesHash },
+      // No per-directory .gitignore in this fixture, so the seal is the empty hash.
+      { path: '__gitignore_files__', hash: hashBytes('') },
       { path: 'large-untracked.bin', hash: expected },
     ]);
     const fingerprint = await workingTreeFingerprint(repo);
@@ -420,5 +422,69 @@ test('workingTreeFingerprint seals core.excludesFile path and contents', async (
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint expands a tilde core.excludesFile the way Git does', async () => {
+  // Git expands a leading ~/ in pathname config values against $HOME. Without
+  // that expansion a value like ~/gitignore would be hashed as a repo-relative
+  // path and a command could set excludesFile to hide untracked files without
+  // changing the seal. The resolved path must be $HOME-relative.
+  const repo = await fixtureRepo();
+  const home = await mkdtemp(path.join(tmpdir(), 'closeout-tilde-home-'));
+  try {
+    const before = await workingTreeFingerprint(repo);
+    // Place the real excludes file in the fake HOME and reference it via ~/.
+    const relExcludes = path.join(home, 'gitignore');
+    await writeFile(relExcludes, 'hidden/\n');
+    // Point core.excludesFile at a ~/ pathname so expansion is exercised.
+    git(repo, 'config', 'core.excludesFile', '~/gitignore');
+    // os.homedir() reads HOME on POSIX and USERPROFILE on Windows; set both so
+    // the resolved home is the fake home on every platform.
+    const oldHome = process.env.HOME;
+    const oldUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      const after = await workingTreeFingerprint(repo);
+      assert.notEqual(before, after, 'a tilde excludesFile must resolve to $HOME and change the fingerprint');
+      // A repo-relative interpretation (<repo>/~/gitignore) would not match the
+      // real file; confirm the seal reflects the HOME-resolved file contents by
+      // mutating it and observing a further change.
+      await writeFile(relExcludes, 'hidden/\nother/\n');
+      const afterMutate = await workingTreeFingerprint(repo);
+      assert.notEqual(after, afterMutate, 'mutating the HOME-resolved tilde excludesFile must change the fingerprint');
+    } finally {
+      process.env.HOME = oldHome;
+      process.env.USERPROFILE = oldUserProfile;
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals an untracked self-ignoring .gitignore that hides files', async () => {
+  // A validation command can write an untracked .gitignore that ignores itself
+  // and an artifact directory. --exclude-standard then omits both the ignore
+  // file and the hidden files, so without sealing per-directory ignore files
+  // the fingerprint would be unchanged. The seal must change when a new
+  // self-ignoring .gitignore appears.
+  const repo = await fixtureRepo();
+  try {
+    const before = await workingTreeFingerprint(repo);
+    // Create an untracked .gitignore that ignores itself and a hidden dir.
+    await mkdir(path.join(repo, 'hidden'));
+    await writeFile(path.join(repo, 'hidden', '.gitignore'), '.gitignore\nhidden/\n');
+    await writeFile(path.join(repo, 'hidden', 'x'), 'secret');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(before, after, 'a newly-appeared self-ignoring .gitignore must change the fingerprint');
+    // The hidden file is genuinely ignored by Git, but the ignore-file seal now
+    // records it; mutating the ignore contents must change the seal again.
+    await writeFile(path.join(repo, 'hidden', '.gitignore'), '.gitignore\nhidden/\nother/\n');
+    const afterMutate = await workingTreeFingerprint(repo);
+    assert.notEqual(after, afterMutate, 'mutating a self-ignoring .gitignore must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
   }
 });

@@ -308,6 +308,39 @@ test('creates and removes a real detached baseline worktree', async () => {
   }
 });
 
+test('disables fsmonitor and global attributes for the internal baseline worktree', async () => {
+  // A validation command can set core.fsmonitor or a global attribute smudge
+  // filter that would execute during `git worktree add`. The internal worktree
+  // wrapper overrides core.fsmonitor / core.useBuiltinFSMonitor /
+  // core.attributesFile so no attacker-configured git mechanism runs during the
+  // baseline checkout. Regression guard: with hostile config present the
+  // worktree must still be created and the checked-out blob must be uncorrupted.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-safety-'));
+  let worktree;
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    // Hostile config that would otherwise be inherited by `git worktree add`.
+    git(repo, 'config', 'core.fsmonitor', '/nonexistent/fsmonitor-helper');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+    const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
+      worktree = created;
+      // The checked-out file must be the plain blob, uncorrupted by any filter.
+      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8');
+      assert.equal(content, 'base\n');
+      return 'verified';
+    });
+    assert.equal(value, 'verified');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('does not claim a baseline for an unsafe or non-matching failure', async () => {
   const unsafe = await verifyBaseline({
     repo: 'C:/repo',

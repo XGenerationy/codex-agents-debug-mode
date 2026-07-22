@@ -257,6 +257,68 @@ test('flags weakening markers in test directory files without a test/spec filena
   }
 });
 
+test('flags computed-property focus/skip forms in touched test files', () => {
+  // Bracket member access (it['only'] / describe["skip"] / test[`only`]) still
+  // focuses or skips tests at runtime, so a reduced command can exit 0 and
+  // bypass the weakening scan. These must be flagged like the dot form.
+  const fixtures = [
+    "it['only'](\"focused\");",
+    'describe["skip"]("suite");',
+    'test[`only`]("focused");',
+    "context['todo'](\"unfinished\");",
+  ];
+  for (const line of fixtures) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(matches.length, 1, `${line} must be flagged, got: ${JSON.stringify(matches)}`);
+  }
+  // Bracket access on an unrelated callee is not test-weakening.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', "result['only'] = 1;")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  // Outside a test file the bracket forms are not flagged.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.js', "it['only']('nope');")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
+test('does not flag focused tests inside a multi-line block comment', () => {
+  // A focused test sketched inside a /* ... */ block that spans lines is never
+  // executed by the runner, so it must not be flagged as test-weakening. Block
+  // comment state must be carried across lines.
+  const blocked = scanSuppressionText('src/foo.test.js', [
+    '/*',
+    'it.only("sketched, not active");',
+    'describe.skip("also sketched");',
+    '*/',
+  ].join('\n')).filter(({ category }) => category === 'test-weakening');
+  assert.deepEqual(blocked, [], `block-commented focus must not flag: ${JSON.stringify(blocked)}`);
+  // A real call after the block comment closes (on a later line) still flags.
+  const afterClose = scanSuppressionText('src/foo.test.js', [
+    '/* comment */',
+    'it.only("active");',
+  ].join('\n')).filter(({ category }) => category === 'test-weakening');
+  assert.equal(afterClose.length, 1, `real it.only after a closed block comment must flag: ${JSON.stringify(afterClose)}`);
+});
+
+test('parses regex character classes before quote checks', () => {
+  // A regex literal like /[/']/ contains both `/` and a quote inside its
+  // character class; the scanner must track the class so it does not end the
+  // regex at the class `/` and let the apostrophe open a bogus string that
+  // hides a later real .only call.
+  const flagged = scanSuppressionText('src/foo.test.js', "const r = /[/']/; it.only(\"after regex\");")
+    .filter(({ category }) => category === 'test-weakening');
+  assert.equal(flagged.length, 1, `real it.only after a char-class regex must be flagged: ${JSON.stringify(flagged)}`);
+  // A regex with a class containing only `/` must not leave a dangling state.
+  const flags2 = scanSuppressionText('src/foo.test.js', "const re = /[/]/; test.skip(\"after\");")
+    .filter(({ category }) => category === 'test-weakening');
+  assert.equal(flags2.length, 1);
+});
+
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
   const failures = [
     'ok 1 - feature # SKIP unavailable',

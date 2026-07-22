@@ -177,6 +177,41 @@ pre_merge_checks:
     issue_assessment:
       severity: error
 
+  - name: pr-title
+    title: PR title is a concise imperative summary of the change
+    description: |
+      The PR title becomes the first line of the squash-merge commit, so it
+      must summarize the change on its own. This repository uses Conventional
+      Commits style (e.g. feat(debug):, fix(closeout):).
+    mode: error
+    instructions: |
+      PASS requires a non-empty title that summarizes the change in the
+      repository's Conventional Commits style. FAIL when the title is empty, a
+      placeholder (e.g. "update"), or does not state what the change does.
+    issue_assessment:
+      severity: error
+      docstrings: |
+        The title must stand alone without the description because it is the
+        only line preserved verbatim in the squash-merge subject.
+
+  - name: pr-description
+    title: PR description explains why and how with re-runnable validation
+    description: |
+      The PR body is the audit record for the change. It must include a
+      Summary and the validation evidence (commands a reviewer can re-run)
+      needed to accept the change.
+    mode: error
+    instructions: |
+      PASS requires a Summary section and the validation commands a reviewer
+      can re-run (e.g. npm test, npm run validate). FAIL when the body is
+      empty, a placeholder, or omits the validation evidence the closeout
+      gate requires.
+    issue_assessment:
+      severity: error
+      docstrings: |
+        The description is the audit record; it must list the commands that
+        prove the gate passes so a reviewer can reproduce the result.
+
 # Structured custom_checks block: explicit, machine-readable check
 # definitions consumed by audit tooling. Mirrors the pre_merge_checks above
 # in a flattened schema for consumers that prefer the structured form.

@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const { access, link, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
@@ -12,6 +12,7 @@ const {
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   redactSecrets,
   redactStructure,
@@ -1043,6 +1044,51 @@ test('terminates detached/setsid descendants that leave the process group', { ti
   assert.match(result.terminationEvidence || '', /spawn-mark|Process group/i);
   await new Promise((resolve) => setTimeout(resolve, 1200));
   await assert.rejects(access(marker), 'detached descendant must not mutate the worktree after termination');
+});
+
+test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd', { timeout: 15000 }, async () => {
+  // A descendant that strips the spawn mark AND chdir's out of the repo escapes
+  // both the mark sweep and the cwd check. When it still holds an open
+  // descriptor into the repo (a common precursor to a late absolute-path
+  // write), the fd probe must find it. POSIX + /proc only.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-sweep-'));
+  let childPid = 0;
+  try {
+    const held = path.join(repo, 'held.txt');
+    await writeFile(held, 'open-handle');
+    // Detached grandchild: carries no spawn mark, chdir's to tmpdir, but holds
+    // an open read handle to a file inside the repo.
+    const grandchild = [
+      'const fs=require("node:fs");const os=require("node:os");const path=require("node:path");',
+      'fs.openSync(path.join(process.argv[1],"held.txt"),"r");',
+      'process.chdir(os.tmpdir());',
+      'process.stdout.write(String(process.pid));',
+      'setInterval(()=>{},10000);',
+    ].join('');
+    const child = spawn(process.execPath, ['-e', grandchild, repo], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      detached: true,
+    });
+    child.unref();
+    child.stdout.on('data', (chunk) => { childPid = Number(String(chunk).trim()); });
+    // Wait for the grandchild to start, chdir, and open the handle.
+    for (let i = 0; i < 40 && !childPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(childPid > 0, 'grandchild must report its pid');
+
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(found !== null, '/proc must be available');
+    assert.ok(
+      found.includes(childPid),
+      `fd-holding orphan ${childPid} must be found by the sweep, got: ${JSON.stringify(found)}`,
+    );
+  } finally {
+    if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('still runs taskkill /T when the Windows root PID has already exited', async () => {

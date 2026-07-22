@@ -53,6 +53,11 @@ const readJson = async (request, maxBodyBytes) => {
       chunks.push(chunk);
     }
   } catch (error) {
+    // The oversize path destroys the request to stop the upload; if that
+    // destroy surfaces as an async-iterator error, it must still map to the
+    // deterministic 413 limit violation rather than a 400-class abort, so an
+    // oversized upload is always reported as body_too_large.
+    if (tooLarge) throw new RequestError('body_too_large', 413);
     // Client disconnect / stream reset is not a server fault; map to a
     // structured RequestError so the handler does not log request.failed and
     // respond with 500 internal_error when a response can still be written.

@@ -60,6 +60,32 @@ const withInternalGitSafety = (args) => ([
   ...withNoTextconv(args),
 ]);
 
+// Git expands a leading `~/` (and `~\`) in pathname config values such as
+// core.excludesFile against the user's home directory before resolving them
+// (see git-config: pathname). Without that expansion a value like `~/gitignore`
+// would be hashed as a repo-relative path (<repo>/~/gitignore) and a command
+// could set excludesFile to hide untracked files without changing the seal.
+const expandGitPathname = (value, repo) => {
+  if (!value) return '';
+  if (path.isAbsolute(value)) return value;
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  if (value.startsWith('~\\')) return path.join(os.homedir(), value.slice(2));
+  return path.resolve(repo, value);
+};
+
+// Enumerate every per-directory ignore file (tracked, untracked, and even a
+// self-ignoring untracked .gitignore that lists itself). --exclude-standard
+// omits ignored files, so a validation command can write an untracked
+// .gitignore that hides an artifact directory and leave both cleanTreeStatus
+// and the untracked fingerprint unchanged. The ignored query pathspec-bound to
+// .gitignore surfaces the self-ignoring file without walking node_modules.
+const listIgnoreFiles = async (repo) => {
+  const pathspec = [':(glob)**/.gitignore', '.gitignore'];
+  const visible = await gitPaths(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...pathspec]);
+  const ignored = await gitPaths(repo, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', ...pathspec]);
+  return [...new Set([...visible, ...ignored])].sort();
+};
+
 const gitBuffer = async (repo, args) => {
   const result = await execFileAsync('git', withInternalGitSafety(args), {
     cwd: repo,
@@ -352,7 +378,7 @@ const collectExtraEntries = async (repo, requested, entries) => {
 // before any evidence report was written. Streaming keeps memory bounded.
 const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
   const hash = createHash('sha256');
-  const child = spawn('git', withNoTextconv(args), { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn('git', withInternalGitSafety(args), { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
   child.stdout.on('data', (chunk) => hash.update(chunk));
   child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
@@ -386,9 +412,7 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   // discovery, so mutating it can hide files without changing info/exclude.
   try {
     const excludesFile = await gitText(repo, ['config', '--get', 'core.excludesFile']);
-    const resolved = excludesFile
-      ? (path.isAbsolute(excludesFile) ? excludesFile : path.resolve(repo, excludesFile))
-      : '';
+    const resolved = excludesFile ? expandGitPathname(excludesFile, repo) : '';
     entries.push({
       path: '__git_core_excludesFile__',
       hash: resolved
@@ -404,9 +428,7 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   try {
     const globalExcludes = await gitText(repo, ['config', '--global', '--get', 'core.excludesFile']);
     if (globalExcludes) {
-      const resolved = path.isAbsolute(globalExcludes)
-        ? globalExcludes
-        : path.resolve(os.homedir(), globalExcludes);
+      const resolved = expandGitPathname(globalExcludes, os.homedir());
       globalExcludeParts.push(`globalCore:${resolved}\0${await hashFsEntry(resolved)}`);
     } else {
       globalExcludeParts.push('globalCore:unset');
@@ -423,6 +445,18 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     path: '__git_global_excludes__',
     hash: hashBytes(globalExcludeParts.sort().join('\n')),
   });
+  // Seal every per-directory .gitignore (tracked, untracked, and even a
+  // self-ignoring one) so a validation command cannot drop an untracked
+  // .gitignore that hides an artifact directory without changing the
+  // fingerprint. --exclude-standard omits ignored files, so the ignored query
+  // (pathspec-bound to .gitignore) surfaces a self-ignoring ignore file too.
+  const ignoreFiles = await listIgnoreFiles(repo);
+  const ignoreParts = [];
+  for (const rel of ignoreFiles) {
+    const absolute = path.isAbsolute(rel) ? rel : path.join(repo, rel);
+    ignoreParts.push(`${rel}\0${await hashFsEntry(absolute)}`);
+  }
+  entries.push({ path: '__gitignore_files__', hash: hashBytes(ignoreParts.join('\n')) });
   for (const file of untracked) {
     // Delegate to the shared hashFsEntry helper so the symlink/lstat/ENOENT/
     // hashFile guard has one owner. A validation command may leave a link to

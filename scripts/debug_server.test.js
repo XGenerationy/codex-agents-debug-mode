@@ -368,6 +368,29 @@ test('maps request stream errors to RequestError instead of bubbling as 500', as
   );
 });
 
+test('reports an oversized body as a deterministic 413 body_too_large', async () => {
+  // Exceeding maxBodyBytes destroys the request mid-upload. If that destroy
+  // surfaces as an async-iterator error, readJson must still classify the
+  // failure as the deterministic 413 limit violation (body_too_large), not a
+  // 400-class abort.
+  const { Readable } = require('node:stream');
+  const limit = 64 * 1024;
+  const oversized = new Readable({
+    read() {
+      // A single chunk larger than the limit forces the oversize branch and the
+      // immediate request.destroy() inside readJson.
+      this.push(Buffer.alloc(limit + 1024, 0x61));
+      this.push(null);
+    },
+  });
+  await assert.rejects(
+    () => readJson(oversized, limit),
+    (error) => error instanceof RequestError
+      && error.status === 413
+      && error.code === 'body_too_large',
+  );
+});
+
 test('requires the per-session token before accepting a log event', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });

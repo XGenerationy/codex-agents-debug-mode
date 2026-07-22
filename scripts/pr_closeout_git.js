@@ -226,14 +226,29 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
   }
   let added = false;
   let primaryError;
-  // Disable hooks for internal worktree create/remove so a local
-  // post-checkout/post-rewrite hook cannot mutate evidence outside the
-  // command executor's timeout/redaction/process-tree controls.
+  // Disable hooks AND the internal Git mechanisms that can execute attacker
+  // code during an internal worktree create/remove, outside the command
+  // executor's timeout/redaction/process-tree controls:
+  //  - core.hooksPath: post-checkout/post-rewrite hooks on worktree add/remove.
+  //  - core.fsmonitor / core.useBuiltinFSMonitor: the fsmonitor hook is invoked
+  //    by `git worktree add` when configured (it inherits the repo's fsmonitor),
+  //    so a validation command that sets core.fsmonitor gets code executed.
+  //  - core.attributesFile: a global attributes file plus a per-driver smudge
+  //    filter can run an external command during the worktree checkout; clearing
+  //    the global attributes source neutralizes that vector for this checkout.
+  //    (In-tree .gitattributes is reviewed/trusted; .git/info/attributes shares
+  //    the same per-repo trust boundary as the hooks config neutralized above.)
   const noHooksDir = path.join(parent, 'no-hooks');
   await mkdir(noHooksDir, { recursive: true });
-  const withNoHooks = (args) => ['-c', `core.hooksPath=${noHooksDir}`, ...args];
+  const withInternalSafety = (args) => [
+    '-c', `core.hooksPath=${noHooksDir}`,
+    '-c', 'core.fsmonitor=',
+    '-c', 'core.useBuiltinFSMonitor=false',
+    '-c', 'core.attributesFile=',
+    ...args,
+  ];
   try {
-    await runGit(repo, withNoHooks(['worktree', 'add', '--detach', worktree, baseSha]));
+    await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]));
     added = true;
     return await callback(worktree);
   } catch (error) {
@@ -242,8 +257,8 @@ const withDisposableWorktree = async ({ repo, baseSha }, callback) => {
   } finally {
     try {
       if (added) {
-        await runGit(repo, withNoHooks(['worktree', 'remove', '--force', worktree]));
-        await runGit(repo, withNoHooks(['worktree', 'prune']));
+        await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]));
+        await runGit(repo, withInternalSafety(['worktree', 'prune']));
       }
     } finally {
       try {

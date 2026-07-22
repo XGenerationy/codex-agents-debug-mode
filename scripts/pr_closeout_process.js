@@ -159,6 +159,39 @@ const listLivePidsWithCwdUnder = (rootCwd, {
     }
   }
   const live = [];
+  const underRoot = (real) => {
+    const rel = path.relative(rootReal, real);
+    return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
+  };
+  // Secondary containment for mark-stripped setsid orphans: a descendant that
+  // ran `env -u <mark> setsid sh -c 'cd /tmp; ...; write <repo>/file'` drops the
+  // spawn mark and leaves the repo cwd, so neither the mark sweep nor the cwd
+  // check finds it. Probe its open file descriptors for one that resolves under
+  // the repo — a common precursor to a late absolute-path write. This is scoped
+  // to the few processes that already passed the session+starttime filter, and
+  // bounded per process, so it stays cheap. A long-sleeping orphan with no open
+  // repo fd still requires OS-level containment (cgroup/pidfd or a read-only
+  // repo bind), which is a broad architectural change tracked separately.
+  const hasOpenFdUnder = (pid) => {
+    let fds;
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      return false;
+    }
+    let checked = 0;
+    for (const fd of fds) {
+      if (checked++ > 256) break;
+      let target;
+      try {
+        target = readlinkSync(`/proc/${pid}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      if (underRoot(path.resolve(target))) return true;
+    }
+    return false;
+  };
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
@@ -182,15 +215,16 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       if (Number.isFinite(runnerSession) && Number.isFinite(session) && session === runnerSession) {
         continue;
       }
-      let cwdLink;
+      let cwdLink = null;
       try {
         cwdLink = readlinkSync(`/proc/${pid}/cwd`);
       } catch {
-        continue;
+        // cwd unreadable (EACCES on another user's process, or the orphan
+        // chdir'd somewhere odd); fall through to fd probing below.
       }
-      const cwdReal = path.resolve(cwdLink);
-      const rel = path.relative(rootReal, cwdReal);
-      if (rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))) {
+      if (cwdLink && underRoot(path.resolve(cwdLink))) {
+        live.push(pid);
+      } else if (hasOpenFdUnder(pid)) {
         live.push(pid);
       }
     } catch {
