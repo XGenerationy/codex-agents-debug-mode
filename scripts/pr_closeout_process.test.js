@@ -1055,6 +1055,7 @@ test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd'
   if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-sweep-'));
   let childPid = 0;
+  let pipePid = 0;
   try {
     const held = path.join(repo, 'held.txt');
     await writeFile(held, 'open-handle');
@@ -1089,7 +1090,6 @@ test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd'
     // A sibling orphan that holds ONLY a pipe/socket (no repo file) must NOT be
     // reaped: pseudo fd targets like `pipe:[…]` are not absolute paths, so the
     // sweep must ignore them to avoid killing an unrelated process.
-    let pipePid = 0;
     const pipeOnly = [
       'const os=require("node:os");',
       'process.chdir(os.tmpdir());',
@@ -1111,9 +1111,10 @@ test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd'
       !(found2 || []).includes(pipePid),
       `pipe-only orphan ${pipePid} must NOT be reaped, got: ${JSON.stringify(found2)}`,
     );
-    try { process.kill(pipePid, 'SIGKILL'); } catch {}
   } finally {
+    // Clean up both detached orphans even if an assertion throws mid-test.
     if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch {} }
+    if (pipePid) { try { process.kill(pipePid, 'SIGKILL'); } catch {} }
     await rm(repo, { recursive: true, force: true });
   }
 });

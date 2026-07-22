@@ -79,12 +79,12 @@ emit_result() {
 }
 
 for entry in "${payload[@]}"; do
-  # Reject symlinks: -e follows a symlink to an outside path and would pass, then
-  # cp -R would stage the link (or its target) into the installed skill, letting
-  # a reviewed payload point outside the tree. Payload entries must be regular
-  # files/directories.
-  [[ -e "$source_dir/$entry" && ! -L "$source_dir/$entry" ]] || {
-    echo "Skill payload entry must be a regular file/directory, not a symlink or missing: $entry" >&2
+  # Reject symlinks and special files (FIFOs, sockets, devices): -e follows a
+  # symlink to an outside path and would pass, then cp -R would stage the link
+  # (or its target) into the installed skill, letting a reviewed payload point
+  # outside the tree. Require a regular file or directory.
+  [[ (-f "$source_dir/$entry" || -d "$source_dir/$entry") && ! -L "$source_dir/$entry" ]] || {
+    echo "Skill payload entry must be a regular file/directory, not a symlink, special file, or missing: $entry" >&2
     exit 1
   }
 done
