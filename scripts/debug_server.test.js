@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const { existsSync } = require('node:fs');
-const { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { copyFile, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -801,33 +801,33 @@ test(
 );
 
 test(
-  'install.sh payload predicate rejects symlinks and special files before staging',
-  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: mkfifo/symlink'), timeout: 30000 },
+  'install.sh rejects a symlink payload entry before staging',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
-    // Guard the payload-validation predicate used in tools/install.sh: a payload
-    // entry must be a regular file or directory and must not be a symlink, so
-    // symlinks-to-outside and special files (FIFO/socket/device) are rejected
-    // before cp -R stages them into the installed skill.
-    const dir = await mkdtemp(path.join(tmpdir(), 'install-payload-pred-'));
+    // Exercise the REAL installer rather than duplicating its predicate: build a
+    // minimal payload tree where one payload entry is a symlink to an outside
+    // path, copy tools/install.sh into it, and assert the installer exits
+    // non-zero at payload validation instead of staging the link.
+    const root = await mkdtemp(path.join(tmpdir(), 'install-reject-src-'));
+    const home = await mkdtemp(path.join(tmpdir(), 'install-reject-home-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'install-reject-out-'));
     try {
-      const regular = path.join(dir, 'regular.txt');
-      const linked = path.join(dir, 'linked.txt');
-      const outside = path.join(dir, 'outside-target');
-      const fifo = path.join(dir, 'fifo');
-      await writeFile(regular, 'x');
-      await writeFile(outside, 'y');
-      await symlink(outside, linked);
-      spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
-      const accepts = (entry) => spawnSync(
-        'bash',
-        ['-c', '[[ (-f "$1" || -d "$1") && ! -L "$1" ]]; printf %s $?', 'bash', entry],
-        { encoding: 'utf8' },
-      ).stdout;
-      assert.equal(accepts(regular), '0', 'regular file payload entry must be accepted');
-      assert.equal(accepts(linked), '1', 'symlink payload entry must be rejected');
-      assert.equal(accepts(fifo), '1', 'FIFO payload entry must be rejected');
+      await mkdir(path.join(root, 'tools'));
+      await writeFile(path.join(root, 'SKILL.md'), 'skill');
+      await mkdir(path.join(root, 'agents'));
+      await mkdir(path.join(root, 'references'));
+      await mkdir(path.join(root, 'scripts'));
+      await writeFile(path.join(outside, 'o'), 'x');
+      // 'assets' payload entry is a symlink to an outside directory.
+      await symlink(outside, path.join(root, 'assets'));
+      await copyFile(path.join(__dirname, '..', 'tools', 'install.sh'), path.join(root, 'tools', 'install.sh'));
+      const res = spawnSync('bash', [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      assert.notEqual(res.status, 0, 'installer must exit non-zero for a symlink payload entry');
+      assert.match((res.stderr || '') + (res.stdout || ''), /symlink|regular file/i, `rejection message must mention symlink/regular file: ${JSON.stringify(res)}`);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   },
 );
