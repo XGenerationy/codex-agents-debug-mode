@@ -239,17 +239,13 @@ const readReviewerPermissions = async ({
   expectedHeadSha,
   expectedConfigDigest,
   runGh,
-  // Reuse a previously-fetched permission map (e.g. across the two stability
-  // snapshots in readLivePrState) so per-reviewer collaborator API calls are
-  // not repeated for reviewers whose permission is already known.
-  permissions: cached = new Map(),
 }) => {
   const marker = gateAttestationMarker({
     baseSha: expectedBaseSha,
     headSha: expectedHeadSha,
     configDigest: expectedConfigDigest,
   });
-  const reviewerPermissions = new Map(cached);
+  const reviewerPermissions = new Map();
   for (const review of reviews) {
     if (!reviewMatchesAttestationShape({ review, prAuthor, expectedHeadSha, marker })) continue;
     const reviewer = review.user.login;
@@ -292,9 +288,6 @@ const readGateAttestationSnapshotForPr = async ({
   expectedHeadSha,
   expectedConfigDigest,
   runGh,
-  // Optional pre-fetched permission map; reused instead of re-fetching per
-  // reviewer (permissions are stable across the two stability snapshots).
-  reviewerPermissions: cachedPermissions,
 }) => {
   const reviews = flattenReviewPages(await runGh([
     'api',
@@ -311,7 +304,6 @@ const readGateAttestationSnapshotForPr = async ({
     expectedHeadSha,
     expectedConfigDigest,
     runGh,
-    permissions: cachedPermissions,
   });
   return {
     attestation: classifyGateAttestation({
@@ -323,8 +315,6 @@ const readGateAttestationSnapshotForPr = async ({
       reviewerPermissions,
     }),
     stabilityTuple: captureReviewStabilityTuple(reviews, reviewerPermissions),
-    // Expose the permission map so callers can reuse it across snapshots.
-    reviewerPermissions,
   };
 };
 
@@ -525,11 +515,10 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       expectedHeadSha,
       expectedConfigDigest,
       runGh,
-      // Reuse the first snapshot's permission map: reviewer permissions are
-      // stable across the two snapshots, so per-reviewer collaborator API calls
-      // are not repeated (only brand-new reviewers get fetched). Reviews are
-      // still fetched twice because that is the stability/race check itself.
-      reviewerPermissions: firstGateSnapshot.reviewerPermissions,
+      // The second snapshot must fetch reviewer permissions independently:
+      // reusing the first snapshot's permission map would mask permission
+      // changes (and make transient permission-API failures sticky) across the
+      // stability window, defeating the two-independent-snapshots race check.
     });
     const finalPr = await runGh([
       'pr',
