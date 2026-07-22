@@ -319,6 +319,25 @@ test('parses regex character classes before quote checks', () => {
   assert.equal(flags2.length, 1);
 });
 
+test('treats regex literals in keyword context (return /.../) so they cannot hide a later .only', () => {
+  // A `/` that follows a regex-context keyword like `return` begins a regex
+  // literal (not division). The scanner must consume the whole literal —
+  // including an apostrophe inside it — so the apostrophe does not open a bogus
+  // string that hides a later active it.only call. The keyword context is
+  // detected from the preceding word token, not a single character.
+  const cases = [
+    "return /it's ok/; it.only(\"x\");",
+    "return /it's ok/; describe.skip(\"x\");",
+    "typeof x; /don't/; it.only(\"x\");",
+    "const z = a / b; it.only(\"division then call\");",
+  ];
+  for (const line of cases) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(matches.length, 1, `${line} must flag exactly one weakening, got: ${JSON.stringify(matches)}`);
+  }
+});
+
 test('rejects framework-native skip, pending, xfail, and TAP failure output', () => {
   const failures = [
     'ok 1 - feature # SKIP unavailable',
