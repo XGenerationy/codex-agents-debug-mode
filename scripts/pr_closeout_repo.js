@@ -69,12 +69,21 @@ const withInternalGitSafety = (args) => ([
 // (see git-config: pathname). Without that expansion a value like `~/gitignore`
 // would be hashed as a repo-relative path (<repo>/~/gitignore) and a command
 // could set excludesFile to hide untracked files without changing the seal.
-const expandGitPathname = (value, repo) => {
+/**
+ * Resolve a Git pathname config value the way Git does: absolute paths are
+ * kept as-is, a leading `~/` or `~\` is expanded against the home directory,
+ * and any other value is resolved relative to `base` (the repo for local
+ * config, the home dir for global config).
+ * @param {string} value - Raw config value (e.g. `~/gitignore`, `/abs/path`).
+ * @param {string} base - Base directory for non-absolute, non-tilde values.
+ * @returns {string} The resolved absolute path, or '' for an empty value.
+ */
+const expandGitPathname = (value, base) => {
   if (!value) return '';
   if (path.isAbsolute(value)) return value;
   if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
   if (value.startsWith('~\\')) return path.join(os.homedir(), value.slice(2));
-  return path.resolve(repo, value);
+  return path.resolve(base, value);
 };
 
 // Enumerate every per-directory ignore file (tracked, untracked, and even a
@@ -83,6 +92,15 @@ const expandGitPathname = (value, repo) => {
 // .gitignore that hides an artifact directory and leave both cleanTreeStatus
 // and the untracked fingerprint unchanged. The ignored query pathspec-bound to
 // .gitignore surfaces the self-ignoring file without walking node_modules.
+/**
+ * Enumerate every per-directory ignore file under the repo: tracked, untracked,
+ * and even a self-ignoring untracked `.gitignore` that lists itself. Uses two
+ * pathspec-bound `git ls-files` queries (visible + ignored) so a validation
+ * command cannot drop an untracked `.gitignore` that hides an artifact dir
+ * without changing the fingerprint, without walking node_modules.
+ * @param {string} repo - Absolute path to the repository working tree.
+ * @returns {Promise<string[]>} Sorted list of repo-relative `.gitignore` paths.
+ */
 const listIgnoreFiles = async (repo) => {
   const pathspec = [':(glob)**/.gitignore', '.gitignore'];
   const visible = await gitPaths(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...pathspec]);

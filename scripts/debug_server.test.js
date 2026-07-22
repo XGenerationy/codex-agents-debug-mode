@@ -799,3 +799,35 @@ test(
     }
   },
 );
+
+test(
+  'install.sh payload predicate rejects symlinks and special files before staging',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: mkfifo/symlink'), timeout: 30000 },
+  async () => {
+    // Guard the payload-validation predicate used in tools/install.sh: a payload
+    // entry must be a regular file or directory and must not be a symlink, so
+    // symlinks-to-outside and special files (FIFO/socket/device) are rejected
+    // before cp -R stages them into the installed skill.
+    const dir = await mkdtemp(path.join(tmpdir(), 'install-payload-pred-'));
+    try {
+      const regular = path.join(dir, 'regular.txt');
+      const linked = path.join(dir, 'linked.txt');
+      const outside = path.join(dir, 'outside-target');
+      const fifo = path.join(dir, 'fifo');
+      await writeFile(regular, 'x');
+      await writeFile(outside, 'y');
+      await symlink(outside, linked);
+      spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
+      const accepts = (entry) => spawnSync(
+        'bash',
+        ['-c', '[[ (-f "$1" || -d "$1") && ! -L "$1" ]]; printf %s $?', 'bash', entry],
+        { encoding: 'utf8' },
+      ).stdout;
+      assert.equal(accepts(regular), '0', 'regular file payload entry must be accepted');
+      assert.equal(accepts(linked), '1', 'symlink payload entry must be rejected');
+      assert.equal(accepts(fifo), '1', 'FIFO payload entry must be rejected');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);

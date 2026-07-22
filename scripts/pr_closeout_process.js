@@ -1559,17 +1559,17 @@ const TOOL_PROBES = [
 
 const probeCommandDefault = async ({ command, repo, shell, env }) => {
   try {
-    // Disable Bash startup files (--noprofile --norc) so a validation command
-    // that writes $HOME/.bash_profile cannot run profile code during these
-    // preflight version probes (which run outside spawnCaptured containment).
-    // The passed env already carries PATH, so tool discovery does not depend on
-    // the profile. These flags are Bash-specific, so only add them when the
-    // resolved shell is Bash; other POSIX shells (sh/dash) would reject them.
-    const isBash = !shell || /(^|[/\\])bash(\.exe)?$/i.test(shell);
-    const shellArgs = isBash
-      ? ['--noprofile', '--norc', '-lc', command]
-      : ['-lc', command];
-    const result = await execFileAsync(shell, shellArgs, {
+    // Use the same login-shell invocation as the command executor (`bash -lc`) so
+    // preflight tool discovery matches what the executor can actually resolve.
+    // An earlier hardening pass tried `--noprofile --norc` here to stop an
+    // injected ~/.bash_profile from running during preflight, but that broke
+    // discovery of tools whose PATH is set up by login/profile init — preflight
+    // marked them BLOCKED and admission blocked the workflow even though the
+    // executor (which kept `-lc`) would have resolved them. The profile-injection
+    // vector is accepted as a known P2: preflight runs in the parent process
+    // trust domain, and fully containing it would mean routing these probes
+    // through spawnCaptured (a separate change).
+    const result = await execFileAsync(shell, ['-lc', command], {
       cwd: repo,
       env,
       encoding: 'utf8',
