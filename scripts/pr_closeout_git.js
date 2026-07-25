@@ -1,6 +1,6 @@
 const { execFile } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdir, mkdtemp, rename, rm } = require('node:fs/promises');
+const { lstat, mkdir, mkdtemp, rename, rm } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -396,15 +396,30 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       );
     }
   } catch (error) {
-    // git config --get-regexp exits 1 when there are no matches. Only that
-    // specific "empty result" outcome is safe to treat as zero drivers.
-    // Timeouts, maxBuffer overflows, missing git, and unreadable config must
-    // fail closed — otherwise worktree add would proceed without knowing
-    // whether filter.<driver>.process (etc.) still needs neutralizing.
+    // git config --get-regexp exits 1 when there are no matches. Some Git
+    // versions also exit 1 (not 128) when .git/config is unreadable or not a
+    // regular file (e.g. replaced by a directory). Only treat exit 1 as
+    // "no drivers" when the local config path is a readable regular file.
     const exitCode = error?.code;
     if (exitCode !== 1 && exitCode !== '1') {
       throw new Error(
         `Failed to enumerate local filter.* keys for baseline worktree safety: ${error?.message || error}`,
+      );
+    }
+    let configPath;
+    try {
+      const gitPath = String(await runGit(repo, ['rev-parse', '--git-path', 'config'], {
+        ...(env ? { env } : {}),
+        ...(timeoutMs ? { timeout: timeoutMs } : {}),
+      })).trim();
+      configPath = path.isAbsolute(gitPath) ? gitPath : path.resolve(repo, gitPath);
+      const info = await lstat(configPath);
+      if (!info.isFile()) {
+        throw new Error(`local config is not a regular file: ${configPath}`);
+      }
+    } catch (verifyError) {
+      throw new Error(
+        `Failed to enumerate local filter.* keys for baseline worktree safety: ${verifyError?.message || verifyError}`,
       );
     }
   }
@@ -423,8 +438,14 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   if (env) gitOptions.env = env;
   if (timeoutMs) gitOptions.timeout = timeoutMs;
 
-  const infoAttributes = path.join(repo, '.git', 'info', 'attributes');
-  const infoAttributesBackup = path.join(repo, '.git', 'info', `attributes.closeout-disabled.${process.pid}`);
+  // Resolve through git so linked worktrees (where .git is a file) still
+  // locate the shared info/attributes path. path.join(repo, '.git', ...) is
+  // ENOTDIR in that case and would block every baseline comparison.
+  const infoAttributesRaw = String(await runGit(repo, ['rev-parse', '--git-path', 'info/attributes'], gitOptions)).trim();
+  const infoAttributes = path.isAbsolute(infoAttributesRaw)
+    ? infoAttributesRaw
+    : path.resolve(repo, infoAttributesRaw);
+  const infoAttributesBackup = `${infoAttributes}.closeout-disabled.${process.pid}`;
   let attributesMoved = false;
   try {
     try {

@@ -488,6 +488,7 @@ const runCloseoutWorkflow = async ({
     secretNames: [...(config.requiredEnv || []), ...(config.safeEnv || [])],
     timeoutMs: config.timeoutMs,
     timeoutsMs: config.timeoutsMs,
+    grafanaServiceUrl: config.services?.grafana?.url || null,
   });
   const initialAttestation = await d.readLiveGateAttestation({
     repo: initial.repo,

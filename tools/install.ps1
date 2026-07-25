@@ -72,10 +72,26 @@ foreach ($entry in $payload) {
     Assert-PayloadEntrySafe -Path $entryPath -Label $entry
 }
 
+
+function Test-DestinationOccupied {
+    param([Parameter(Mandatory)][string]$Path)
+    # Test-Path can return $false for a dangling symlink/junction (target missing)
+    # even though the reparse point still occupies the name. Get-Item -Force sees
+    # the directory entry itself.
+    if (Test-Path -LiteralPath $Path) { return $true }
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 # Preflight all destinations before mutating any of them so multi-target
 # installs cannot leave one path updated and another absent/partial.
 foreach ($destination in $targets) {
-    if ((Test-Path -LiteralPath $destination) -and -not $Force) {
+    if ((Test-DestinationOccupied -Path $destination) -and -not $Force) {
         throw "Target exists: $destination. Rerun with -Force to preserve it as a backup and replace it."
     }
 }
@@ -126,7 +142,7 @@ try {
     $pendingResults = @()
     foreach ($item in $staged) {
         $backup = $null
-        if (Test-Path -LiteralPath $item.Destination) {
+        if (Test-DestinationOccupied -Path $item.Destination) {
             $backup = New-UniqueBackupPath -Destination $item.Destination
             Move-Item -LiteralPath $item.Destination -Destination $backup
             # Record backup before the stage commit so a failed stage→destination

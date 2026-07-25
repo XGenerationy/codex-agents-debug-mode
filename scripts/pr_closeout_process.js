@@ -315,17 +315,20 @@ const listLivePidsWithCwdUnder = (rootCwd, {
  */
 const sweepDetachedOrphans = async ({
   mark,
-  cwd,
-  minStarttime = 0,
+  cwd, // retained for call-site compatibility; no longer used for kill decisions
+  minStarttime = 0, // retained for call-site compatibility with mark-era scans
   kill = process.kill.bind(process),
   terminationGraceMs = 2000,
   selfPid = process.pid,
 } = {}) => {
+  void cwd;
+  void minStarttime;
+  // Only reap PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
+  // unrelated processes that merely work in the same repository (editor,
+  // parallel automation, a newly opened shell) and must not be signaled.
   const list = () => {
-    const byMark = listLivePidsWithSpawnMark(mark, { selfPid });
-    const byCwd = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
-    if (byMark === null && byCwd === null) return null;
-    return [...new Set([...(byMark || []), ...(byCwd || [])])];
+    if (!mark) return [];
+    return listLivePidsWithSpawnMark(mark, { selfPid });
   };
   let remaining = list();
   if (remaining === null) {
@@ -339,7 +342,9 @@ const sweepDetachedOrphans = async ({
   if (remaining.length === 0) {
     return {
       status: 'PASS',
-      evidence: 'No detached spawn-mark or worktree-cwd descendants remained.',
+      evidence: mark
+        ? 'No detached spawn-mark descendants remained.'
+        : 'Detached orphan sweep skipped (no spawn mark; refusing cwd-only reaping).',
       escalated: false,
     };
   }
@@ -352,7 +357,7 @@ const sweepDetachedOrphans = async ({
     if (remaining.length === 0) {
       return {
         status: 'PASS',
-        evidence: 'Detached descendants stopped after SIGTERM (mark/cwd sweep).',
+        evidence: 'Detached descendants stopped after SIGTERM (spawn-mark sweep).',
         escalated: false,
       };
     }
@@ -368,7 +373,7 @@ const sweepDetachedOrphans = async ({
     if (remaining.length === 0) {
       return {
         status: 'PASS',
-        evidence: 'Detached descendants required SIGKILL and are gone (mark/cwd sweep).',
+        evidence: 'Detached descendants required SIGKILL and are gone (spawn-mark sweep).',
         escalated: true,
       };
     }
@@ -378,7 +383,7 @@ const sweepDetachedOrphans = async ({
   if (remaining.length === 0) {
     return {
       status: 'PASS',
-      evidence: 'Detached descendants required SIGKILL and are gone (mark/cwd sweep).',
+      evidence: 'Detached descendants required SIGKILL and are gone (spawn-mark sweep).',
       escalated: true,
     };
   }
@@ -1629,7 +1634,7 @@ const readBoundArtifactJson = async (proofResult) => {
  * response metadata. Any other operation, or a missing/malformed field,
  * fails closed.
  */
-const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
+const verifyGrafanaLiveArtifact = async ({ proof, proofResult, expectedGrafanaOrigin = null }) => {
   if (proof.semantic !== 'grafana-live-result') {
     return { status: 'FAIL', evidence: 'Grafana live proof requires semantic=grafana-live-result.' };
   }
@@ -1643,7 +1648,13 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
   try {
     endpoint = new URL(payload.endpoint);
     if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('unsupported protocol');
-    if (proof.grafanaOrigin && endpoint.origin !== new URL(proof.grafanaOrigin).origin) {
+    // Prefer proof.grafanaOrigin; fall back to the preflight service URL origin
+    // so a proof cannot pass against a different Grafana than the one probed.
+    const expectedRaw = proof.grafanaOrigin || expectedGrafanaOrigin;
+    if (!expectedRaw) {
+      return { status: 'FAIL', evidence: 'Grafana live proof requires a configured Grafana origin (proof.grafanaOrigin or services.grafana.url).' };
+    }
+    if (endpoint.origin !== new URL(expectedRaw).origin) {
       return { status: 'FAIL', evidence: 'Grafana live proof endpoint did not match the configured Grafana origin.' };
     }
   } catch (error) {
@@ -1835,6 +1846,7 @@ const createCommandExecutor = ({
   spawnProcess = spawn,
   terminateTree = terminateProcessTree,
   terminationGraceMs = 2000,
+  grafanaServiceUrl = null,
 } = {}) => {
   let unsafeTermination;
   const attempts = new Map();
@@ -1934,7 +1946,11 @@ const createCommandExecutor = ({
     if (proofResult.status !== 'PASS' || check.id !== 'grafana-live-render') {
       return finalize({ ...result, status: proofResult.status, evidence: proofResult.evidence, proofResult });
     }
-    const semantic = await verifyGrafanaLiveArtifact({ proof: check.proof, proofResult });
+    const semantic = await verifyGrafanaLiveArtifact({
+      proof: check.proof,
+      proofResult,
+      expectedGrafanaOrigin: grafanaServiceUrl,
+    });
     return finalize({ ...result, status: semantic.status, evidence: semantic.evidence, proofResult });
   }
   if (check.proof.type === 'command') {

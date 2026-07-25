@@ -134,14 +134,31 @@ output handling.
 **Step 1: Ensure server is running** (starts if needed, no-op if already running):
 
 ```bash
-node /absolute/path/to/debug/scripts/debug_server.js /path/to/project &
+# Capture startup JSON: the trailing & returns before listen writes the token.
+# Prefer a foreground launch in a dedicated terminal, or redirect and wait:
+node /absolute/path/to/debug/scripts/debug_server.js /path/to/project > /tmp/debug-collector-start.json 2>&1 &
+# Wait for the started (or already_running) record before reading the token.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if grep -qE '"status":"(started|already_running)"' /tmp/debug-collector-start.json 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
+# Prefer the token from the startup JSON; fall back to the token file only after
+# a fresh `started` write (do not reuse a stale file from a prior run).
+COLLECTOR_TOKEN=$(python3 -c "import json,sys; print(json.load(open('/tmp/debug-collector-start.json')).get('collector_token') or '')" 2>/dev/null)
+if [ -z "$COLLECTOR_TOKEN" ] && [ -f .debug/collector_token ]; then
+  # Only safe if status was started (new write). If already_running, use the
+  # token from the original launch session — not an on-disk file you did not write.
+  COLLECTOR_TOKEN=$(cat .debug/collector_token)
+fi
 ```
 
 Resolve the script path from this skill's own directory; do not assume the current project has
 a `skills/debug` folder.
 
 Server outputs JSON:
-- `{"status":"started",...}` - new server started
+- `{"status":"started",...}` - new server started (includes `collector_token` / `token_file`)
 - `{"status":"already_running",...}` - the collector identity was verified, but reuse still
   requires the launch token captured from the original `started` response
 

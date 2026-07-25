@@ -1132,11 +1132,10 @@ test('terminates detached/setsid descendants that leave the process group', { ti
   await assert.rejects(access(marker), 'detached descendant must not mutate the worktree after termination');
 });
 
-test('cwd sweep also reaps mark-free detached orphans that hold an open repo fd', { timeout: 15000 }, async () => {
-  // A descendant that strips the spawn mark AND chdir's out of the repo escapes
-  // both the mark sweep and the cwd check. When it still holds an open
-  // descriptor into the repo (a common precursor to a late absolute-path
-  // write), the fd probe must find it. POSIX + /proc only.
+test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { timeout: 15000 }, async () => {
+  // Discovery helper listLivePidsWithCwdUnder still finds mark-free processes
+  // that hold a repo fd (useful diagnostics). Orphan kill path no longer
+  // reaps by cwd/fd alone — only spawn-mark PIDs are signaled. POSIX + /proc.
   if (process.platform === 'win32') return;
   if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-sweep-'));

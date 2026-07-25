@@ -129,19 +129,24 @@ unique_backup() {
   printf '%s\n' "$backup"
 }
 
-# Stage each destination under a sibling temp dir first. Only after every
-# staged tree is complete do we commit (backup + replace). On any commit
-# failure, restore previously committed destinations from their backups.
-stage_root="$(mktemp -d "${TMPDIR:-/tmp}/debug-install-stages.XXXXXX")"
-# shellcheck disable=SC2064
-trap 'rm -rf -- "$stage_root"' EXIT
-
+# Stage each destination under its destination parent so the final mv is an
+# atomic rename on the same filesystem. Staging under ${TMPDIR:-/tmp} can land
+# on a different device than $HOME (NFS home, container bind mounts); then
+# `mv` copies and an interruption can leave a partial install after backup.
 declare -a stage_paths=()
+cleanup_stages() {
+  local s
+  for s in "${stage_paths[@]:-}"; do
+    rm -rf -- "$s" 2>/dev/null || true
+  done
+}
+# shellcheck disable=SC2064
+trap 'cleanup_stages' EXIT
+
 for destination in "${destinations[@]}"; do
   parent="$(dirname -- "$destination")"
   mkdir -p -- "$parent"
-  stage="$stage_root/$(printf '%s' "$destination" | sed 's/[^A-Za-z0-9._-]/_/g')"
-  mkdir -p -- "$stage"
+  stage="$(mktemp -d -- "$parent/.debug-install-stage.XXXXXX" 2>/dev/null     || mktemp -d "$parent/.debug-install-stage.XXXXXX")"
   for entry in "${payload[@]}"; do
     cp -R -- "$source_dir/$entry" "$stage/"
   done
