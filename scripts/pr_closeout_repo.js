@@ -157,11 +157,35 @@ const gitBuffer = async (repo, args) => {
 };
 
 const gitText = async (repo, args) => (await gitBuffer(repo, args)).toString('utf8').trim();
-const gitPaths = async (repo, args) => (await gitBuffer(repo, args))
-  .toString('utf8')
-  .split('\0')
-  .filter(Boolean)
-  .map(normalize);
+/**
+ * Split NUL-delimited git path output with a fatal UTF-8 decode per segment.
+ * Lossy `toString('utf8')` would replace invalid bytes with U+FFFD and point
+ * suppression/gate scans at the wrong path (ENOENT skip), so non-UTF-8 path
+ * records fail closed instead of silently dropping a touched file.
+ */
+const gitPaths = async (repo, args) => {
+  const buffer = await gitBuffer(repo, args);
+  const paths = [];
+  let start = 0;
+  for (let i = 0; i <= buffer.length; i += 1) {
+    if (i === buffer.length || buffer[i] === 0) {
+      if (i > start) {
+        const slice = buffer.subarray(start, i);
+        let decoded;
+        try {
+          decoded = utf8Decoder.decode(slice);
+        } catch {
+          throw new Error(
+            `Git path is not valid UTF-8 (fail closed): ${Buffer.from(slice).toString('hex').slice(0, 48)}`,
+          );
+        }
+        if (decoded.length) paths.push(normalize(decoded));
+      }
+      start = i + 1;
+    }
+  }
+  return paths;
+};
 
 /**
  * Resolve the repository snapshot the rest of closeout operates on: HEAD,

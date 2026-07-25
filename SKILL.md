@@ -168,10 +168,15 @@ print(token)
 Resolve the script path from this skill's own directory; do not assume the current project has
 a `skills/debug` folder.
 
-Server outputs JSON:
-- `{"status":"started",...}` - new server started (includes `collector_token` / `token_file`)
-- `{"status":"already_running",...}` - the collector identity was verified, but reuse still
-  requires the launch token captured from the original `started` response
+Server outputs JSON (launch token is **not** printed in the startup line — stdout is often
+logged/piped). Read the token from the announced on-disk path:
+- `{"status":"started","token_file":".debug/collector_token",...}` - new server started;
+  `collector_token` is **omitted** from JSON by design. Load it via
+  `token_file` relative to `$PROJECT` (mode 0600 file).
+- `{"status":"already_running",...}` - the collector identity was verified; neither
+  `collector_token` nor a fresh `token_file` write is included. Reuse requires the launch
+  token from the original `started` session (the existing `.debug/collector_token` if you
+  still hold it), not a field on this JSON line.
 
 **Step 2: Create session** (server generates unique ID from your description):
 

@@ -324,16 +324,19 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
   try {
     await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
     await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
-    // Commit as a pair: if the second rename fails, remove the first final so
-    // consumers never observe contradictory report.json vs report.md.
-    await rename(jsonTmp, json);
+    // Commit Markdown first, PASS/final JSON last. If the process is
+    // SIGKILL'd between renames, consumers still see provisional/old JSON
+    // (not a machine-readable PASS with stale BLOCKED Markdown). On a
+    // recoverable second-rename failure, remove the committed Markdown so
+    // the pair stays consistent.
+    await rename(markdownTmp, markdown);
     try {
-      await rename(markdownTmp, markdown);
+      await rename(jsonTmp, json);
     } catch (error) {
       let orphaned = false;
-      await unlink(json).catch(() => { orphaned = true; });
+      await unlink(markdown).catch(() => { orphaned = true; });
       if (orphaned) {
-        error.message = `${error.message || error} (report.md commit failed and ${json} could not be removed; the report pair is inconsistent)`;
+        error.message = `${error.message || error} (report.json commit failed and ${markdown} could not be removed; the report pair is inconsistent)`;
       }
       throw error;
     }

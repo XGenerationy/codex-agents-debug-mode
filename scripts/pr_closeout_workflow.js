@@ -706,13 +706,16 @@ const runCloseoutWorkflow = async ({
   let cleanTree = { status: 'BLOCKED', evidence: 'Final tree inspection did not run because attestation admission was not clean.' };
   let finalGateChanges = { changedFiles: [], addedLines: [] };
   if (attestationAdmitted) {
+    // Cheap clean-tree probe first: a dirty tree already fails closeout, so
+    // avoid streaming multi-gigabyte untracked artifacts through
+    // workingTreeFingerprint before that rejection.
     [finalSuppressions, cleanTree, finalGateChanges] = await Promise.all([
       d.scanTouchedSuppressions(observedState.repo, observedState.touchedFiles),
       d.cleanTreeStatus(observedState.repo),
       d.readGateChanges(observedState.repo, observedState.mergeBaseSha || observedState.baseSha),
     ]);
   }
-  const afterGithubFingerprint = attestationAdmitted
+  const afterGithubFingerprint = (attestationAdmitted && cleanTree.status === 'PASS')
     ? await d.workingTreeFingerprint(observedState.repo, reproducibilityPaths)
     : null;
   const sealedState = await d.resolveRepositoryState({ repo: observedState.repo, baseRef });

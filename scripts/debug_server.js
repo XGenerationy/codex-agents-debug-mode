@@ -371,18 +371,25 @@ const createDebugServer = ({
   limits = {},
 } = {}) => {
   const resolvedProjectRoot = path.resolve(projectRoot);
+  // Canonical identity: realpath + Windows case fold so a symlink spelling
+  // and its target hash to the same project_hash (already_running, not
+  // port_in_use_by_other_process).
+  let canonicalProjectRoot = resolvedProjectRoot;
+  try {
+    canonicalProjectRoot = require('node:fs').realpathSync(resolvedProjectRoot);
+  } catch {
+    // Missing path: keep lexical resolve for first-run startup.
+  }
+  if (process.platform === 'win32') {
+    canonicalProjectRoot = canonicalProjectRoot.replace(/\\/g, '/').toLowerCase();
+  }
   const logDir = path.join(resolvedProjectRoot, '.debug');
-  // A one-way, non-reversible fingerprint of projectRoot. /health is
-  // deliberately unauthenticated (see isAllowedHost) and must never leak the
-  // raw path, but the EADDRINUSE probe in main() still needs a way for two
-  // invocations to agree they mean the SAME project without either being
-  // able to recover the other's path from what /health reports. SHA-256 is
-  // one-way, so this is safe to expose; it is an identity/UX signal (avoiding
-  // a false "already_running" report for an unrelated project's collector
-  // that happens to occupy the same port), not a security boundary --
-  // projectRoot is already visible locally via a running collector's own
-  // process argv regardless.
-  const projectHash = createHash('sha256').update(resolvedProjectRoot).digest('hex');
+  // A one-way, non-reversible fingerprint of the canonical project root.
+  // /health is deliberately unauthenticated (see isAllowedHost) and must
+  // never leak the raw path, but the EADDRINUSE probe in main() still needs
+  // a way for two invocations to agree they mean the SAME project without
+  // either being able to recover the other's path from what /health reports.
+  const projectHash = createHash('sha256').update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   const originSet = new Set(allowedOrigins);

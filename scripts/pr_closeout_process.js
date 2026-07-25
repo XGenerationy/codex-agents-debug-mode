@@ -315,17 +315,17 @@ const listLivePidsWithCwdUnder = (rootCwd, {
  */
 const sweepDetachedOrphans = async ({
   mark,
-  cwd, // retained for call-site compatibility; no longer used for kill decisions
-  minStarttime = 0, // retained for call-site compatibility with mark-era scans
+  cwd, // used for mark-free cwd/fd discovery when a child stripped the mark
+  minStarttime = 0,
   kill = process.kill.bind(process),
   terminationGraceMs = 2000,
   selfPid = process.pid,
 } = {}) => {
-  void cwd;
-  void minStarttime;
-  // Only reap PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
-  // unrelated processes that merely work in the same repository (editor,
-  // parallel automation, a newly opened shell) and must not be signaled.
+  // Only *reap* PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
+  // unrelated processes that merely work in the same repository and must not
+  // be signaled. Mark-free candidates discovered via cwd/fd still force
+  // BLOCKED so closeout cannot PASS while a setsid orphan may keep mutating
+  // the tree after `env -u` stripped the spawn mark.
   const list = () => {
     if (!mark) return [];
     return listLivePidsWithSpawnMark(mark, { selfPid });
@@ -340,6 +340,23 @@ const sweepDetachedOrphans = async ({
     };
   }
   if (remaining.length === 0) {
+    if (cwd) {
+      const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
+      if (unmarked === null) {
+        return {
+          status: 'PASS',
+          evidence: 'No detached spawn-mark descendants remained; cwd/fd orphan probe unavailable.',
+          escalated: false,
+        };
+      }
+      if (unmarked.length > 0) {
+        return {
+          status: 'BLOCKED',
+          evidence: `Detached mark-free descendant(s) still live under the worktree (pids ${unmarked.slice(0, 8).join(', ')}); cannot safely attribute/terminate without spawn mark.`,
+          escalated: false,
+        };
+      }
+    }
     return {
       status: 'PASS',
       evidence: mark

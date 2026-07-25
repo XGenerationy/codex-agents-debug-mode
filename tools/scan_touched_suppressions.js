@@ -169,12 +169,16 @@ const listTouchedFiles = (baseSha) => {
 const VALIDATION_REMOVAL_PATTERNS = [
   /^\-\s*run:\s*/i,
   /^\-\s*-\s*run:\s*/i,
+  // Action-based validation steps (CodeQL, etc.): removed `uses:` lines.
+  /^\-\s*uses:\s*\S+/i,
+  /^\-\s*-\s*uses:\s*\S+/i,
+  /^\-.*\buses:\s+(?:github\/codeql-action|aquasecurity\/trivy-action|securego\/gosec|golangci\/golangci-lint-action|github\/super-linter|oxsecurity\/megalinter|codecov\/codecov-action|sonarsource\/sonarcloud)\S*/i,
   /^\-.*\bnpm\s+(?:ci|test|run\b|audit\b)/i,
   /^\-.*\bpnpm\s+(?:test|run\b|audit\b)/i,
   /^\-.*\bscan:suppressions\b/i,
   /^\-.*\bnode\s+--test\b/i,
   /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
-  /^\-\s*-\s*name:\s*.*(?:test|validate|audit|scan|lint)/i,
+  /^\-\s*-\s*name:\s*.*(?:test|validate|audit|scan|lint|codeql|security|coverage)/i,
   // Common validation commands removed from block steps while `run: |` remains.
   /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,

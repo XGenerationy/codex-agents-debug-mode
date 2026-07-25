@@ -134,6 +134,20 @@ test('distinguishes status signals from passing failure-path test names', () => 
     classifyOutput({ exitCode: 0, stdout: 'failure-mode tests passed\nerror recovery tests passed' }).status,
     'PASS',
   );
+  // Passing TAP/Node titles that mention TypeError must not be runtime FAIL.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'ok 1 - handles TypeError: invalid value' }).status,
+    'PASS',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: '# Subtest: handles TypeError: invalid value' }).status,
+    'PASS',
+  );
+  // A real runtime diagnostic still fails.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'TypeError: invalid value\n    at Object.<anonymous>' }).status,
+    'FAIL',
+  );
   assert.equal(classifyOutput({ exitCode: 0, stdout: '1 skipped' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'todo: 2' }).status, 'FAIL');
 });
@@ -648,6 +662,27 @@ test('flags active test-weakening after a block-comment apostrophe on the same l
   ).filter(({ category }) => category === 'test-weakening');
   assert.equal(findings.length, 1, JSON.stringify(findings));
   assert.match(findings[0].match, /it\.only/i);
+});
+
+test('flags multiline focused/skipped test member access', () => {
+  const only = 'on' + 'ly';
+  const multiline = [
+    'test',
+    `  .${only}('focused', () => {});`,
+  ].join('\n');
+  const findings = scanSuppressionText('src/foo.test.js', multiline);
+  assert.ok(
+    findings.some(({ category }) => category === 'test-weakening'),
+    'test\\n  .only must be detected',
+  );
+  const withComment = [
+    'describe /* gap */',
+    `  .skip('skipped', () => {});`,
+  ].join('\n');
+  assert.ok(
+    scanSuppressionText('src/foo.test.js', withComment).some(({ category }) => category === 'test-weakening'),
+    'describe /* gap */ .skip must be detected',
+  );
 });
 
 test('flags focus/skip calls inside template-literal interpolations', () => {

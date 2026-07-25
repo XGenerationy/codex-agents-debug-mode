@@ -281,13 +281,18 @@ const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, '
 const statusSignal = (line) => {
   const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?|ING)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
-  const runtime = /\b(?:[A-Za-z]+Warning|[A-Za-z]+Error):/i;
+  // Runtime diagnostics like `TypeError: ...`. Do not match passing test
+  // titles that merely mention those words (TAP `ok 1 - handles TypeError:`
+  // or Node `# Subtest: handles TypeError: ...`).
+  const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+Warning|[A-Za-z]+Error):\s*\S/;
+  const passingTestTitle = /^\s*(?:ok\s+\d+\b|#\s*Subtest:|✓|√|✔|PASS\b|passed\b)/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;
   const npmWarning = /\bnpm\s+WARN\b/i;
   const framework = /(?:^\s*(?:not ok\b|#\s*(?:skip|skipped)\b|(?:skipped|failed|blocked|pending|xfailed|xpassed)\b)|\bok\s+\d+\b.*#\s*skip\b)/i;
+  const runtimeHit = runtime.test(line) && !passingTestTitle.test(line);
   return /^\s*✖/u.test(line) || COUNTED_SIGNAL.test(line) || BRACKETED_SIGNAL.test(line)
     || LABELLED_SIGNAL.test(line) || uppercase.test(line) || compiler.test(line)
-    || runtime.test(line) || warning.test(line) || npmWarning.test(line) || framework.test(line);
+    || runtimeHit || warning.test(line) || npmWarning.test(line) || framework.test(line);
 };
 
 /**
@@ -711,6 +716,39 @@ const scanSuppressionText = (file, text) => {
         break;
       }
     });
+    // Multiline member access: `test\n  .only(...)` or `describe /* gap */ .skip`
+    // is not visible to the per-line pass. Only start a window when the line
+    // ends with a bare test receiver (so quoted fixtures like
+    // `'describe.only(...)'` on a single line are not re-scanned without
+    // string inertness). Collapse comments/whitespace across at most 3 lines.
+    if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
+      const windowWeakening = new RegExp(testWeakening.source, 'i');
+      const bareReceiver = /\b(?:describe|it|test|context)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
+      for (let i = 0; i < lines.length; i += 1) {
+        const lead = lines[i]
+          .replace(/\/\*[\s\S]*?\*\//g, ' ')
+          .replace(/\/\/[^\n]*/g, '');
+        if (!bareReceiver.test(lead.trimEnd())) continue;
+        const windowText = lines.slice(i, i + 3).join('\n')
+          .replace(/\/\*[\s\S]*?\*\//g, ' ')
+          .replace(/\/\/[^\n]*/g, ' ')
+          // Strip quoted string literals so fixture lines in the window do not
+          // supply a false `.only` match without inertness tracking.
+          .replace(/(['"`])(?:\\.|(?!\1)[\s\S])*\1/g, ' ')
+          .replace(/\s+/g, ' ')
+          // Join `test .only` / `describe .skip` after whitespace collapse.
+          .replace(/\b(describe|it|test|context)\s+\./gi, '$1.');
+        const match = windowText.match(windowWeakening);
+        if (!match) continue;
+        findings.push({
+          file,
+          line: i + 1,
+          category: 'test-weakening',
+          match: match[0].replace(/\s+/g, ' ').slice(0, 80),
+        });
+        break;
+      }
+    }
   }
   return findings;
 };
