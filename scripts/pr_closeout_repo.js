@@ -1,13 +1,14 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { constants, createReadStream } = require('node:fs');
-const { lstat, open, readFile, readdir, readlink } = require('node:fs/promises');
+const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
 
 const { scanSuppressionText } = require('./pr_closeout_core');
 const { fingerprintEntries, isGateFile } = require('./pr_closeout_git');
+const { openNoFollow } = require('./pr_closeout_fs');
 
 const execFileAsync = promisify(execFile);
 /**
@@ -285,28 +286,9 @@ const MAX_SUPPRESSION_SCAN_BYTES = 5 * 1024 * 1024;
 // without loading the whole file.
 const BINARY_SAMPLE_BYTES = 4096;
 
-/**
- * Open a file with `O_NOFOLLOW` (where the platform supports it) so a
- * final-component symlink is rejected at open time, closing the
- * lstat-then-readFile TOCTOU race: between a caller's plain `lstat` and a
- * later path-based read, a concurrent replacement could otherwise redirect
- * the read through a symlink. Reading through the returned file descriptor
- * cannot be redirected. Falls back to a plain open when the platform has no
- * `O_NOFOLLOW` (e.g. Windows) or rejects the flag as unsupported — the
- * caller's `lstat` symlink check still rejects a static symlink there.
- * Mirrors the existing `openArtifact` behavior.
- * @param {string} absolute - Absolute filesystem path.
- * @returns {Promise<import('node:fs/promises').FileHandle>} An open file handle.
- */
-const openNoFollow = async (absolute) => {
-  const noFollow = constants.O_NOFOLLOW || 0;
-  try {
-    return await open(absolute, constants.O_RDONLY | noFollow);
-  } catch (error) {
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    return open(absolute, constants.O_RDONLY);
-  }
-};
+// openNoFollow is shared (pr_closeout_fs.js): defaults to O_RDONLY so
+// openNoFollow(absolute) remains the read-side call shape used by
+// suppression/gate scanners. Write-side callers pass explicit flags.
 
 const readHeadFromHandle = async (handle, size) => {
   const buffer = Buffer.allocUnsafe(size);

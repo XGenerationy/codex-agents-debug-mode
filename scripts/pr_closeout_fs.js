@@ -28,12 +28,17 @@ const assertNotSymlink = async (target, message) => {
  * EOPNOTSUPP), falls back to a plain open — callers must still run
  * assertNotSymlink first as the primary guard there. ELOOP is rethrown as-is
  * so callers can map it to a domain-specific message.
+ *
+ * `flags` defaults to `O_RDONLY` so one-argument callers (suppression/gate
+ * scanners that open for read) keep working. Explicit non-integer flags
+ * (e.g. string modes like `'a'`) still throw TypeError so they cannot coerce
+ * via `|` to O_RDONLY.
  * @param {string} target
- * @param {number} flags
+ * @param {number} [flags=constants.O_RDONLY]
  * @param {number} [mode=0o666]
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
-const openNoFollow = async (target, flags, mode = 0o666) => {
+const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) => {
   if (!Number.isInteger(flags)) {
     throw new TypeError('openNoFollow requires numeric fs.constants flags.');
   }
