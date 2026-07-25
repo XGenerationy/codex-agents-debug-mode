@@ -695,7 +695,7 @@ const runCloseoutWorkflow = async ({
   // Cheap clean-tree probe before any fingerprint: a dirty tree already fails
   // closeout, so skip streaming multi-gigabyte untracked artifacts through
   // workingTreeFingerprint on the dirty path (before and after GitHub).
-  let preGithubCleanTree = attestationAdmitted
+  const preGithubCleanTree = attestationAdmitted
     ? await d.cleanTreeStatus(finalState.repo)
     : { status: 'BLOCKED', evidence: 'Pre-GitHub tree inspection did not run because attestation admission was not clean.' };
   const beforeGithubFingerprint = (attestationAdmitted && preGithubCleanTree.status === 'PASS')
@@ -717,6 +717,15 @@ const runCloseoutWorkflow = async ({
       d.cleanTreeStatus(observedState.repo),
       d.readGateChanges(observedState.repo, observedState.mergeBaseSha || observedState.baseSha),
     ]);
+    // Surface pre-GitHub dirt: a dirty probe that later cleans up must still
+    // fail the clean-tree gate so the run cannot PASS after skipping the
+    // before-GitHub fingerprint for performance.
+    if (preGithubCleanTree.status !== 'PASS' && cleanTree.status === 'PASS') {
+      cleanTree = {
+        status: preGithubCleanTree.status === 'FAIL' ? 'FAIL' : 'BLOCKED',
+        evidence: `Pre-GitHub working tree was not clean before live verification: ${preGithubCleanTree.evidence}`,
+      };
+    }
   }
   const afterGithubFingerprint = (attestationAdmitted && cleanTree.status === 'PASS')
     ? await d.workingTreeFingerprint(observedState.repo, reproducibilityPaths)
@@ -771,6 +780,7 @@ const runCloseoutWorkflow = async ({
     headConsistency,
     repositorySeal,
     initialTree: { ...initialTree, fingerprint: initialFingerprint },
+    preGithubCleanTree,
     cleanTree,
     livePrState,
     touchedFiles: sealedState.touchedFiles,

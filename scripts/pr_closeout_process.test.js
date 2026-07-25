@@ -820,6 +820,11 @@ test('binds live Grafana artifact proof to a query result contract', async () =>
     },
   }, 'confirmation');
   assert.equal(evilOrigin.status, 'FAIL');
+  assert.match(
+    evilOrigin.evidence,
+    /origin|endpoint|host|service|grafana/i,
+    `evil-origin FAIL must cite origin/service mismatch, got: ${evilOrigin.evidence}`,
+  );
 
   // Missing grafanaServiceUrl must not fall back to proof.grafanaOrigin.
   const noServiceUrl = createCommandExecutor({
@@ -839,6 +844,11 @@ test('binds live Grafana artifact proof to a query result contract', async () =>
     },
   }, 'confirmation');
   assert.equal(missingService.status, 'FAIL');
+  assert.match(
+    missingService.evidence,
+    /origin|endpoint|host|service|grafana|url/i,
+    `missing-service FAIL must cite missing/invalid service URL, got: ${missingService.evidence}`,
+  );
 });
 
 test('timeout terminates descendants before they can mutate evidence', async () => {

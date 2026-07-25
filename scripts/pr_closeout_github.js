@@ -720,6 +720,12 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     if (!Number.isInteger(postThreadPr.number)) {
       throw new Error('GitHub did not return a post-thread pull request number.');
     }
+    // Mirror the author-identity guard used for pr/finalPr/terminalPr so a
+    // response without author.login cannot reach classifyLivePrState (where
+    // self-approval exclusion depends on a real author identity).
+    if (typeof postThreadPr.author?.login !== 'string' || !postThreadPr.author.login.trim()) {
+      throw new Error('GitHub did not return a post-thread pull request author identity.');
+    }
     const postThreadGateSnapshot = await readGateAttestationSnapshotForPr({
       repo,
       repository,

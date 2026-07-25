@@ -84,10 +84,17 @@ const resolveEmptyTreeSha = () => {
 };
 
 const isEmptyTreeSha = (sha) => {
-  const value = String(sha || '').trim();
-  if (!value) return false;
-  if (value === EMPTY_TREE) return true;
-  return value === resolveEmptyTreeSha();
+  // Compare case-insensitively and accept abbreviated empty-tree IDs (7+)
+  // so CLOSEOUT_BASE_SHA=4b825dc (or an uppercase form) still uses the
+  // two-dot empty-tree diff path instead of a three-dot commit range Git rejects.
+  const value = String(sha || '').trim().toLowerCase();
+  if (!value || !/^[0-9a-f]{7,64}$/.test(value)) return false;
+  const known = EMPTY_TREE.toLowerCase();
+  const resolved = String(resolveEmptyTreeSha() || '').trim().toLowerCase();
+  if (value === known || (resolved && value === resolved)) return true;
+  if (known.startsWith(value)) return true;
+  if (resolved && resolved.startsWith(value)) return true;
+  return false;
 };
 
 const resolveBaseSha = () => {
