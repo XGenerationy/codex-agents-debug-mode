@@ -461,6 +461,30 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
     : path.resolve(repo, infoAttributesRaw);
   const infoAttributesBackup = `${infoAttributes}.closeout-disabled.${process.pid}`;
   let attributesMoved = false;
+  // Sync restore for signal handlers: async finally may not run on SIGINT/
+  // SIGTERM before process exit, which would leave the validated repo without
+  // .git/info/attributes and an orphaned closeout-disabled backup.
+  const restoreAttributesSync = () => {
+    if (!attributesMoved) return;
+    try {
+      // eslint-friendly: use renameSync from fs for signal-safe restore.
+      require('node:fs').renameSync(infoAttributesBackup, infoAttributes);
+      attributesMoved = false;
+    } catch (restoreError) {
+      try {
+        process.stderr.write(
+          `Failed to restore ${infoAttributes} on signal: ${restoreError?.message || restoreError}\n`,
+        );
+      } catch {
+        // stderr may be closed
+      }
+    }
+  };
+  const onTerminateSignal = () => {
+    restoreAttributesSync();
+  };
+  process.on('SIGINT', onTerminateSignal);
+  process.on('SIGTERM', onTerminateSignal);
   try {
     try {
       await rename(infoAttributes, infoAttributesBackup);
@@ -490,9 +514,12 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       }
     }
   } finally {
+    process.off('SIGINT', onTerminateSignal);
+    process.off('SIGTERM', onTerminateSignal);
     if (attributesMoved) {
       try {
         await rename(infoAttributesBackup, infoAttributes);
+        attributesMoved = false;
       } catch (restoreError) {
         if (!primaryError) throw restoreError;
         // Primary path already failed; still surface that the repo was left

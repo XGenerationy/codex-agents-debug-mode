@@ -2,7 +2,7 @@
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
 const { constants } = require('node:fs');
-const { lstat, mkdir, open, realpath } = require('node:fs/promises');
+const { lstat, mkdir, open, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
@@ -491,6 +491,20 @@ const createDebugServer = ({
           if (!isInsideRoot(resolvedRoot, resolvedLogDir)) {
             throw new RequestError('debug_dir_escapes_root', 409);
           }
+          // Re-lstat the real parent after realpath: openNoFollow only guards
+          // the leaf name, so a TOCTOU swap of `.debug` for a symlink between
+          // realpath and open would otherwise create the log outside the root.
+          // Pin creation to the resolved absolute parent path and re-verify
+          // containment on the created file before recording identity.
+          try {
+            const pinnedDirInfo = await lstat(resolvedLogDir);
+            if (pinnedDirInfo.isSymbolicLink()) throw new RequestError('debug_dir_is_symlink', 409);
+            if (!pinnedDirInfo.isDirectory()) throw new RequestError('debug_dir_not_directory', 409);
+          } catch (error) {
+            if (error instanceof RequestError) throw error;
+            throw new RequestError('debug_dir_not_directory', 409);
+          }
+          const resolvedLogFile = path.join(resolvedLogDir, fileName);
           // Create the empty session log through a no-follow descriptor and
           // record its identity. /log re-opens this path for every event and
           // requires the opened file to still be the same regular file, so a
@@ -502,12 +516,38 @@ const createDebugServer = ({
           // and the byte count this server has written — a replacement starts
           // life with a different birth time and unexpected content/size.
           const handle = await openNoFollow(
-            logFile,
+            resolvedLogFile,
             constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
             0o600,
           );
           try {
             const info = await handle.stat();
+            if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
+            let createdReal;
+            try {
+              createdReal = await realpath(resolvedLogFile);
+            } catch {
+              throw new RequestError('session_log_escapes_root', 409);
+            }
+            if (!isInsideRoot(resolvedRoot, createdReal)) {
+              throw new RequestError('session_log_escapes_root', 409);
+            }
+            const createdParent = path.dirname(createdReal);
+            if (createdParent !== resolvedLogDir) {
+              // Case-normalization / trailing-separator platforms: compare via realpath.
+              let parentReal;
+              try {
+                parentReal = await realpath(createdParent);
+              } catch {
+                throw new RequestError('session_log_escapes_root', 409);
+              }
+              if (parentReal !== resolvedLogDir) {
+                throw new RequestError('session_log_escapes_root', 409);
+              }
+            }
+            // Prefer the post-create real path so later /log opens do not walk
+            // through a later-replaced `.debug` symlink intermediate.
+            sessions.get(sessionId).logFile = createdReal;
             sessions.get(sessionId).logFileIdentity = {
               dev: info.dev,
               ino: info.ino,
@@ -516,9 +556,21 @@ const createDebugServer = ({
               projectRootReal: resolvedRoot,
               logDirReal: resolvedLogDir,
             };
-          } finally {
-            await handle.close();
+          } catch (error) {
+            // Best-effort remove a partially created file that failed containment.
+            try {
+              await handle.close();
+            } catch {
+              // ignore
+            }
+            try {
+              await unlink(resolvedLogFile);
+            } catch {
+              // ignore
+            }
+            throw error;
           }
+          await handle.close();
           delete sessions.get(sessionId).provisional;
         } catch (error) {
           sessions.delete(sessionId);

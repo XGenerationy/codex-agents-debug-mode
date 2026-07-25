@@ -126,14 +126,16 @@ try {
             Remove-Item -LiteralPath $stage -Recurse -Force
         }
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
-        foreach ($entry in $payload) {
-            Copy-Item -LiteralPath (Join-Path $source $entry) -Destination $stage -Recurse -Force
-        }
+        # Register the stage before populating it so a failed Copy-Item still
+        # leaves the partial directory in $staged for finally cleanup.
         $staged += [pscustomobject]@{
             Destination = $destination
             Stage       = $stage
             Backup      = $null
             Committed   = $false
+        }
+        foreach ($entry in $payload) {
+            Copy-Item -LiteralPath (Join-Path $source $entry) -Destination $stage -Recurse -Force
         }
     }
 

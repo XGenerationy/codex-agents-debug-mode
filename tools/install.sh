@@ -148,10 +148,12 @@ for destination in "${destinations[@]}"; do
   parent="$(dirname -- "$destination")"
   mkdir -p -- "$parent"
   stage="$(mktemp -d -- "$parent/.debug-install-stage.XXXXXX" 2>/dev/null     || mktemp -d "$parent/.debug-install-stage.XXXXXX")"
+  # Register before populating so a failed cp still leaves the stage path for
+  # the EXIT trap / cleanup_stages to remove.
+  stage_paths+=("$stage")
   for entry in "${payload[@]}"; do
     cp -R -- "$source_dir/$entry" "$stage/"
   done
-  stage_paths+=("$stage")
 done
 
 declare -a committed_dests=()
