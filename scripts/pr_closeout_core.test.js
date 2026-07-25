@@ -785,6 +785,23 @@ test('detects quoted enabled/disabled JSON gate switches and --quiet lint script
       .some((f) => f.category === 'config-silencing'),
     '|| : must be flagged',
   );
+  // Direct pipeline tails mask left-hand failure without pipefail
+  // (CodeRabbit #4780344655).
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest | true' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '| true must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest | :' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '| : must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest | exit 0' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '| exit 0 must be flagged',
+  );
 });
 
 test('flags active test-weakening after a quoted fixture on the same line', () => {
@@ -1034,9 +1051,15 @@ test('blocks configured commands that neutralize failures', () => {
   assert.ok(findCommandFailureNeutralizer('actual-test; true'));
   assert.ok(findCommandFailureNeutralizer('actual-test; :'));
   assert.ok(findCommandFailureNeutralizer('actual-test; exit 0'));
+  // Direct pipeline tails to always-success (no pipefail) — CodeRabbit #4780344655.
+  assert.ok(findCommandFailureNeutralizer('actual-test | true'));
+  assert.ok(findCommandFailureNeutralizer('actual-test | :'));
+  assert.ok(findCommandFailureNeutralizer('actual-test | exit 0'));
   // `&& exit 0` short-circuits on failure — not a neutralizer.
   assert.equal(findCommandFailureNeutralizer('pnpm test && exit 0'), null);
   assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
+  // Ordinary pipelines are not failure neutralizers.
+  assert.equal(findCommandFailureNeutralizer('actual-test | cat'), null);
 
   const plan = buildCheckPlan({
     config: {

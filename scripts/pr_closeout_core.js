@@ -83,6 +83,11 @@ const CONFIG_SILENCING = [
   /(?:^|[;\n])\s*true\b/i,
   /(?:^|[;\n])\s*:/i,
   /(?:^|[;\n])\s*exit\s+0\b/i,
+  // Direct pipeline tails to always-success commands. Without `pipefail`,
+  // `cmd | true` / `cmd | :` / `cmd | exit 0` report the right-hand exit
+  // status and mask a failed left-hand command (CodeRabbit #4780344655).
+  // Single-pipe only: lookaround excludes `||` which is handled above.
+  /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
 ];
 
 /**
@@ -107,6 +112,11 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   /(?:^|[;\n])\s*true\b/i,
   /(?:^|[;\n])\s*:/i,
   /(?:^|[;\n])\s*exit\s+0\b/i,
+  // Direct pipeline tails to always-success commands. Without `pipefail`,
+  // `cmd | true` / `cmd | :` / `cmd | exit 0` report the right-hand exit
+  // status and mask a failed left-hand command (CodeRabbit #4780344655).
+  // Single-pipe only: lookaround excludes `||` which is handled above.
+  /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
   /\bpassWithNoTests\b/i,
   /\ballowNoTests\b/i,
   /\b--passWithNoTests\b/i,
