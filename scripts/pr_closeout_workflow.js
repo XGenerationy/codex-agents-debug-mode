@@ -424,7 +424,14 @@ const runCloseoutWorkflow = async ({
   const startedAt = new Date().toISOString();
   const initial = await d.resolveRepositoryState({ repo, baseRef });
   const metadata = await d.readProjectMetadata(initial.repo);
-  const plan = buildCheckPlan({ config, ...metadata, touchedFiles: initial.touchedFiles });
+  const plan = buildCheckPlan({
+    config,
+    ...metadata,
+    touchedFiles: initial.touchedFiles,
+    // Expand fixed range checks (git-diff-check) from the live merge-base,
+    // not a hard-coded origin/main, so non-main PR bases are correct.
+    mergeBaseSha: initial.mergeBaseSha || initial.baseSha,
+  });
   const planStatus = planStatusFor(plan);
   const baselineSetupCommand = config.baselineSetupCommand || 'pnpm install --frozen-lockfile --ignore-scripts';
   const { gateIntegrityReview: _gateIntegrityReview, ...validationConfig } = config;

@@ -136,7 +136,8 @@ output handling.
 ```bash
 # Always pass the absolute project path; resolve token relative to THAT project
 # (not the shell cwd — a relative `.debug/collector_token` would read the wrong tree).
-PROJECT=/absolute/path/to/project
+# export so the python3 subprocess can read PROJECT via os.environ.
+export PROJECT=/absolute/path/to/project
 node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT" > /tmp/debug-collector-start.json 2>&1 &
 # Wait for the started (or already_running) record before reading the token.
 for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -148,16 +149,20 @@ done
 # Prefer collector_token from startup JSON when present; otherwise resolve
 # token_file relative to $PROJECT (token_file is repo-relative).
 COLLECTOR_TOKEN=$(python3 -c "
-import json, os
+import json, os, sys
 from pathlib import Path
+project = os.environ.get('PROJECT') or ''
+if not project:
+    sys.stderr.write('PROJECT is not set; export PROJECT=/absolute/path/to/project\n')
+    sys.exit(1)
 data = json.load(open('/tmp/debug-collector-start.json'))
 token = data.get('collector_token') or ''
 if not token:
     rel = data.get('token_file') or '.debug/collector_token'
-    path = Path(rel) if os.path.isabs(rel) else Path(os.environ['PROJECT']) / rel
+    path = Path(rel) if os.path.isabs(rel) else Path(project) / rel
     token = path.read_text(encoding='utf-8').strip() if path.is_file() else ''
 print(token)
-" 2>/dev/null)
+")
 ```
 
 Resolve the script path from this skill's own directory; do not assume the current project has
@@ -269,11 +274,14 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
 debugLog('Function entry', { userId, score, typeScore: typeof score }, 'H1,H2');
 ```
 
-**Python:**
+**Python:** (stdlib only — no undeclared third-party HTTP package)
 ```python
 # #region debug
+import json
 import sys
-import requests, traceback
+import traceback
+import urllib.error
+import urllib.request
 SESSION_ID = 'REPLACE_WITH_SESSION_ID'  # e.g. 'fix-null-userid-a1b2c3'
 SESSION_TOKEN = 'REPLACE_WITH_SESSION_TOKEN'
 _debug_transport_failure_reported = False
@@ -281,17 +289,26 @@ _debug_transport_failure_reported = False
 def debug_log(msg, data=None, hypothesis_id=None):
     global _debug_transport_failure_reported
     try:
-        requests.post('http://localhost:8787/log', json={
+        payload = json.dumps({
             'sessionId': SESSION_ID, 'sessionToken': SESSION_TOKEN,
             'msg': msg, 'data': data,
-            'hypothesisId': hypothesis_id, 'loc': traceback.format_stack()[-2].strip()
-        }, timeout=0.5).raise_for_status()
-    # json.dumps (inside requests) raises TypeError/ValueError directly for
-    # non-JSON-serializable data (e.g. a bare type/class object) rather than
-    # wrapping it as a requests.RequestException, so catching only
-    # RequestException lets a bad `data` value crash the app being debugged
-    # instead of just skipping that one log line.
-    except (requests.RequestException, TypeError, ValueError) as error:
+            'hypothesisId': hypothesis_id, 'loc': traceback.format_stack()[-2].strip(),
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            'http://localhost:8787/log',
+            data=payload,
+            method='POST',
+            headers={'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as response:
+            if getattr(response, 'status', 200) >= 400:
+                raise urllib.error.HTTPError(
+                    req.full_url, response.status, 'collector_http_error', response.headers, None,
+                )
+    # json.dumps raises TypeError/ValueError for non-JSON-serializable data
+    # (e.g. a bare type/class object). Catch those plus transport errors so a
+    # bad `data` value or collector outage only skips that log line.
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, TypeError, ValueError) as error:
         if not _debug_transport_failure_reported:
             _debug_transport_failure_reported = True
             print(f'Debug collector transport failed: {type(error).__name__}', file=sys.stderr)

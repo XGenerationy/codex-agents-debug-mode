@@ -35,10 +35,11 @@ test('defines the exact mandatory 19-check closeout matrix in order', () => {
   const fixed = Object.fromEntries(
     MANDATORY_CHECKS.filter(({ fixed: isFixed }) => isFixed).map(({ id, command }) => [id, command]),
   );
-  // git-diff-check must inspect the committed PR range (merge-base...HEAD),
-  // not the empty working-tree diff admission already requires to be clean.
+  // git-diff-check must inspect the committed PR range via the live
+  // {mergeBaseSha} placeholder (expanded at plan build time), not a
+  // hard-coded origin/main or the empty working-tree diff.
   assert.match(fixed['git-diff-check'], /git diff --check/);
-  assert.match(fixed['git-diff-check'], /merge-base|rev-list/);
+  assert.match(fixed['git-diff-check'], /\{mergeBaseSha\}/);
   assert.match(fixed['git-diff-check'], /\.\.\.HEAD/);
   assert.deepEqual(
     Object.fromEntries(Object.entries(fixed).filter(([id]) => id !== 'git-diff-check')),
@@ -69,10 +70,14 @@ test('discovers authoritative named checks and refuses fixed-command overrides',
     },
     makeTargets: ['grafana-render'],
     touchedFiles: ['src/a.ts', 'src/space name.ts'],
+    mergeBaseSha: 'abc123mergebase',
   });
 
   assert.match(plan.errors.join('\n'), /cannot override fixed check git-diff-check/i);
-  assert.match(plan.checks.find(({ id }) => id === 'git-diff-check').command, /git diff --check/);
+  assert.match(
+    plan.checks.find(({ id }) => id === 'git-diff-check').command,
+    /git diff --check 'abc123mergebase'\.\.\.HEAD/,
+  );
   assert.equal(
     plan.checks.find(({ id }) => id === 'queue-registry-tests').command,
     'pnpm run test:queue-registry',

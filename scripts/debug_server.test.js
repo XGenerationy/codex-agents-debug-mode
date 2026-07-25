@@ -360,6 +360,25 @@ test('rejects an invalid Host and an untrusted browser origin', async () => {
   }
 });
 
+test('accepts bracketed IPv6 loopback Host when the peer is loopback', async () => {
+  // Node clients targeting ::1 send Host: [::1]:<port>. The peer-address
+  // check already accepts ::1; the Host allowlist must match the bracketed form.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+  try {
+    const port = new URL(baseUrl).port;
+    const health = await requestJson(baseUrl, {
+      pathname: '/health',
+      headers: { Host: `[::1]:${port}` },
+    });
+    assert.equal(health.status, 200, JSON.stringify(health.body));
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('maps request stream errors to RequestError instead of bubbling as 500', async () => {
   // readJson wraps stream iteration so client disconnect / ECONNRESET becomes
   // RequestError(request_aborted|request_failed) rather than an uncaught error

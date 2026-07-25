@@ -197,7 +197,11 @@ const isAllowedHost = (request) => {
   if (!isLoopbackAddress(request.socket.remoteAddress)) return false;
   const port = request.socket.localPort;
   const host = request.headers.host;
-  return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
+  // IPv4, localhost, and bracketed IPv6 loopback authorities are accepted.
+  // Node HTTP clients targeting ::1 send Host: [::1]:<port>.
+  return host === `127.0.0.1:${port}`
+    || host === `localhost:${port}`
+    || host === `[::1]:${port}`;
 };
 
 // Reject a path that is a symlink (fail-closed), tolerating ENOENT (the path

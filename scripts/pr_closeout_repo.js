@@ -1,6 +1,5 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { constants, createReadStream } = require('node:fs');
 const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -394,14 +393,28 @@ const hashBytes = (value) => createHash('sha256').update(value).digest('hex');
  * (initial tree, before/after GitHub verification, final seal), and a single
  * large untracked artifact is enough to spike memory if `readFile()` were
  * used instead.
+ *
+ * Opens with openNoFollow and re-checks the descriptor is still a regular
+ * file before streaming, so a TOCTOU replacement of the path with a symlink
+ * or FIFO between lstat (in hashFsEntry) and open cannot redirect the read
+ * outside the repository or hang on a non-file.
  * @param {string} absolute - Absolute filesystem path to a regular file.
  * @returns {Promise<string>} Hex-encoded SHA-256 digest of the file's contents.
  */
 const hashFile = async (absolute) => {
-  const hash = createHash('sha256');
-  const stream = createReadStream(absolute);
-  for await (const chunk of stream) hash.update(chunk);
-  return hash.digest('hex');
+  const handle = await openNoFollow(absolute);
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new Error(`hashFile target is not a regular file after open: ${absolute}`);
+    }
+    const hash = createHash('sha256');
+    const stream = handle.createReadStream();
+    for await (const chunk of stream) hash.update(chunk);
+    return hash.digest('hex');
+  } finally {
+    await handle.close().catch(() => {});
+  }
 };
 
 /**
@@ -440,12 +453,20 @@ const hashFsEntry = async (absolute) => {
     const content = await hashFile(absolute);
     return hashBytes(`regular:mode=${info.mode & 0o777}:sha=${content}`);
   } catch (error) {
-    // The file can disappear between lstat() and createReadStream(); treat
-    // that the same as the lstat ENOENT case (a stable `missing` hash) so a
+    // The file can disappear between lstat() and openNoFollow(); treat that
+    // the same as the lstat ENOENT case (a stable `missing` hash) so a
     // transiently-gone untracked entry cannot reject out of
     // workingTreeFingerprint and abort runCloseoutWorkflow before the
-    // structured evidence report is written.
+    // structured evidence report is written. ELOOP means a symlink won the
+    // race; treat it like a symlink entry rather than following.
     if (error.code === 'ENOENT') return hashBytes('missing');
+    if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+      try {
+        return hashBytes(`symlink:${await readlink(absolute)}`);
+      } catch {
+        return hashBytes('missing');
+      }
+    }
     throw error;
   }
 };

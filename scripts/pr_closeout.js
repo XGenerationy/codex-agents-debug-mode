@@ -85,8 +85,10 @@ const main = async () => {
       outputDir: options.outputDir,
       planOnly: options.plan,
     });
+    // One JSON line on stdout (JSONL-style contract): no pretty-print indent,
+    // so line-oriented wrappers can parse each record as a single line.
     if (options.plan) {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(result)}\n`);
       if (result.planStatus !== 'PASS') process.exitCode = 2;
       return;
     }
@@ -94,7 +96,7 @@ const main = async () => {
       status: result.report.overallStatus,
       headSha: result.report.headSha,
       report: result.paths,
-    }, null, 2)}\n`);
+    })}\n`);
     if (result.report.overallStatus !== 'PASS') process.exitCode = 2;
   } catch (error) {
     process.stderr.write(`pr-closeout: ${error.message}\n`);

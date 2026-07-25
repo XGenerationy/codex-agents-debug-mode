@@ -74,7 +74,9 @@ const CONFIG_SILENCING = [
 const define = (id, label, options = {}) => ({ id, label, ...options });
 
 const MANDATORY_CHECKS = [
-  define('git-diff-check', 'git diff --check', { fixed: true, command: 'base=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git rev-list --max-parents=0 HEAD | head -1); git diff --check "$base"...HEAD', qualificationSafe: true, baselineSafe: true }),
+  // {mergeBaseSha} is expanded from the live PR merge-base at plan build time
+  // (not hard-coded origin/main) so release-branch PRs and non-main bases are correct.
+  define('git-diff-check', 'git diff --check', { fixed: true, command: 'git diff --check {mergeBaseSha}...HEAD', qualificationSafe: true, baselineSafe: true }),
   define('pnpm-audit', 'pnpm high-severity audit', { fixed: true, command: 'pnpm audit --audit-level high', qualificationSafe: true, baselineSafe: true }),
   define('prisma-validate', 'Prisma schema validation', { fixed: true, command: 'pnpm prisma validate', baselineSafe: true }),
   define('prisma-generate', 'Prisma generation', { fixed: true, command: 'pnpm prisma generate', generator: true, baselineSafe: true }),
@@ -114,18 +116,26 @@ const REQUIRED_PROOFS = {
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 
 /**
- * Substitute the literal `{touchedFiles}` placeholder in a configured
- * command string with the touched files, each shellQuote-escaped and
- * space-joined, so a check command like `eslint {touchedFiles}` runs against
- * exactly the files this PR touched.
+ * Substitute plan-time placeholders in a configured command string:
+ * - `{touchedFiles}` → shell-quoted, space-joined touched paths
+ * - `{mergeBaseSha}` → the live PR merge-base SHA (shell-quoted)
+ * so fixed range checks (e.g. git-diff-check) and touched-file commands use
+ * the already-resolved closeout state rather than hard-coded branch names.
  * @param {string} command - Configured command template.
  * @param {string[]} touchedFiles - Repo-relative touched file paths.
- * @returns {string} The command with `{touchedFiles}` expanded.
+ * @param {{mergeBaseSha?: string}} [options]
+ * @returns {string} The command with placeholders expanded.
  */
-const expandCommand = (command, touchedFiles) => command.replaceAll(
-  '{touchedFiles}',
-  touchedFiles.map(shellQuote).join(' '),
-);
+const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
+  let expanded = String(command).replaceAll(
+    '{touchedFiles}',
+    touchedFiles.map(shellQuote).join(' '),
+  );
+  if (mergeBaseSha) {
+    expanded = expanded.replaceAll('{mergeBaseSha}', shellQuote(mergeBaseSha));
+  }
+  return expanded;
+};
 
 /**
  * Resolve every MANDATORY_CHECKS definition into either a runnable command
@@ -144,10 +154,10 @@ const expandCommand = (command, touchedFiles) => command.replaceAll(
  * evidence is extended rather than replaced. A config that sets
  * `gateIntegrityReview` (self-attestation) always produces a top-level
  * error, since only a live GitHub PR review attestation is accepted.
- * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], touchedFiles?: string[]}} options
+ * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], touchedFiles?: string[], mergeBaseSha?: string}} options
  * @returns {{checks: object[], errors: string[]}}
  */
-const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], touchedFiles = [] } = {}) => {
+const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], touchedFiles = [], mergeBaseSha } = {}) => {
   const commands = config.commands || {};
   const qualificationSafe = new Set(config.qualificationSafe || []);
   const resourceGroups = config.resourceGroups || {};
@@ -156,13 +166,22 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
   if (Object.hasOwn(config, 'gateIntegrityReview')) {
     errors.push('gateIntegrityReview self-attestation is forbidden; use the required live GitHub PR review attestation.');
   }
+  const expand = (command) => expandCommand(command, touchedFiles, { mergeBaseSha });
   const checks = MANDATORY_CHECKS.map((definition) => {
     const configured = commands[definition.id];
     if (definition.fixed) {
       if (configured !== undefined && configured !== definition.command) {
         errors.push(`Configuration cannot override fixed check ${definition.id}.`);
       }
-      return { ...definition, resolution: 'fixed' };
+      if (definition.command.includes('{mergeBaseSha}') && !mergeBaseSha) {
+        return {
+          ...definition,
+          status: 'BLOCKED',
+          resolution: 'fixed',
+          evidence: 'Live merge-base SHA is required to expand the fixed git-diff-check range.',
+        };
+      }
+      return { ...definition, command: expand(definition.command), resolution: 'fixed' };
     }
     if (typeof configured === 'string' && configured.trim()) {
       if (/^(?:<[^>]+>|REPLACE(?:_|\b))/i.test(configured.trim())) {
@@ -173,7 +192,7 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
           evidence: `Replace the example placeholder for ${definition.label}.`,
         };
       }
-      return { ...definition, command: expandCommand(configured.trim(), touchedFiles), resolution: 'configured' };
+      return { ...definition, command: expand(configured.trim()), resolution: 'configured' };
     }
     const packageScript = definition.packageCandidates?.find((candidate) => packageScripts[candidate]);
     if (packageScript) {
