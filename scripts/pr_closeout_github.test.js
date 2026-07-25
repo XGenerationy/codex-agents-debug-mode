@@ -394,17 +394,14 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
-  // Stable path: two gate-attestation snapshots before the thread walk, one
-  // review-thread pagination pass (2 pages here), then a terminal third
-  // gate-attestation snapshot after the thread walk = five api calls.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 5);
+  // Stable path: three gate-attestation snapshots (first, final, terminal) +
+  // two review-thread walks (2 pages each with this mock) = 3 + 4 = 7 api.
+  assert.equal(calls.filter(([command]) => command === 'api').length, 7);
 });
 
-test('uses a single final review-thread read on the stable path to provide current evidence', async () => {
-  // After the THREAD 1 optimization the stable path does ONE review-thread
-  // read (the final one), so the runner always reports the current thread
-  // state instead of an earlier snapshot. The unstable path still pays for
-  // a separate read inside the BLOCKED branch.
+test('re-reads review threads after the terminal snapshot and requires stability', async () => {
+  // Stable path does two review-thread reads: one after PR/review stability,
+  // one after the terminal PR+attestation snapshot. Both must match.
   let threadReads = 0;
   const result = await readLivePrState({
     repo: 'C:/repo',
@@ -433,9 +430,7 @@ test('uses a single final review-thread read on the stable path to provide curre
       };
     },
   });
-  // Stable path -> classifyLivePrState runs with whatever the final read
-  // returned. The current thread state is reported, never a stale snapshot.
-  assert.equal(threadReads, 1, 'stable path must read review threads exactly once');
+  assert.equal(threadReads, 2, 'stable path must re-read review threads after the terminal snapshot');
   assert.equal(result.unresolvedThreads.length, 1);
 });
 

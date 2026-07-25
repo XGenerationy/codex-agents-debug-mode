@@ -254,12 +254,13 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
  * @param {string} text - Raw text to clean.
  * @returns {string} Text with zero-count status phrases removed.
  */
+// Include runner-native skip buckets: Rust `ignored`, pytest `deselected`.
 const cleanZeroSummaries = (text) => text
-  .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
-  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
-  .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
+  .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
+  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
+  .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
-const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
+const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
 const COUNTED_SIGNAL = new RegExp(`(?:\\b[1-9]\\d*\\s+${STATUS_TERM}\\b|\\b${STATUS_TERM}\\s*(?::|=|\\s)\\s*[1-9]\\d*\\b)`, 'i');
 const BRACKETED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?\\[${STATUS_TERM}\\]`, 'i');
 const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, 'i');
@@ -340,7 +341,7 @@ const classifyOutput = ({
     ...findStatusSignals(`${stdout}\n${stderr}`),
     ...detectedSignals.filter((line) => typeof line === 'string' && line.trim()),
   ])];
-  const failures = signals.filter((line) => /(?:\b(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|xfails?|xfailed|xpassed|pending)\b|\bnot ok\b)/i.test(line));
+  const failures = signals.filter((line) => /(?:\b(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|xfails?|xfailed|xpassed|pending)\b|\bnot ok\b)/i.test(line));
   if (failures.length) return { status: 'FAIL', evidence: failures.slice(0, 5).join(' | ') };
   const blocked = signals.filter((line) => /\bblocks?|blocked\b/i.test(line));
   if (blocked.length) return { status: 'BLOCKED', evidence: blocked.slice(0, 5).join(' | ') };

@@ -245,7 +245,30 @@ const readProjectMetadata = async (repo) => {
     if (info.size > MAX_SUPPRESSION_SCAN_BYTES) {
       throw new Error(`Refusing to read oversized metadata (${info.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes): ${relative}`);
     }
-    return readFile(absolute, 'utf8');
+    // Open with O_NOFOLLOW and re-verify on the descriptor so a TOCTOU swap
+    // to a symlink/FIFO between lstat and read cannot escape the repo or hang.
+    let handle;
+    try {
+      handle = await openNoFollow(absolute);
+    } catch (error) {
+      if (error.code === 'ENOENT') return undefined;
+      if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+        throw new Error(`Refusing to read symlinked metadata: ${relative}`);
+      }
+      throw error;
+    }
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile()) {
+        throw new Error(`Refusing to read non-regular metadata: ${relative}`);
+      }
+      if (opened.size > MAX_SUPPRESSION_SCAN_BYTES) {
+        throw new Error(`Refusing to read oversized metadata (${opened.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes): ${relative}`);
+      }
+      return await handle.readFile('utf8');
+    } finally {
+      await handle.close().catch(() => {});
+    }
   };
   try {
     const manifestText = await safeReadFile('package.json');

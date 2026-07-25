@@ -221,15 +221,25 @@ const main = async () => {
     process.stdout.write('suppression-scan: no marker/config-silencing/test-weakening findings\n');
   }
 
-  // Gate integrity still uses the raw base SHA via readGateChanges (two-dot
-  // against the working tree). Validation-removal inspection uses the same
-  // three-dot/two-dot rule as the touched-file list so PR-range semantics hold.
-  const gate = await readGateChanges(root, baseSha);
+  // readGateChanges uses two-dot `git diff <base>` semantics. When baseSha is
+  // the PR base *tip* (GITHUB_BASE_SHA), that can report base-only gate files
+  // as deleted. Resolve merge-base(base, HEAD) for commit bases so the gate
+  // scan matches PR-range / three-dot semantics used by the touched-file list.
+  let gateBaseSha = baseSha;
+  if (!isEmptyTreeSha(baseSha)) {
+    try {
+      const mb = gitScalar(['merge-base', baseSha, headSha]);
+      if (isUsableSha(mb)) gateBaseSha = mb;
+    } catch {
+      // Keep baseSha if merge-base cannot be computed.
+    }
+  }
+  const gate = await readGateChanges(root, gateBaseSha);
   const integrity = classifyGateIntegrity({
     changedFiles: gate.changedFiles,
     addedLines: gate.addedLines,
     deletedFiles: gate.deletedFiles,
-    baseSha,
+    baseSha: gateBaseSha,
     headSha,
     configDigest: process.env.CLOSEOUT_CONFIG_DIGEST || 'ci-suppression-scan',
   });
@@ -243,7 +253,7 @@ const main = async () => {
     // Additive gate changes still need live review for closeout, but CI must
     // not treat deletion-only weakening as success. Inspect removed lines.
     const removals = detectValidationRemovals(
-      baseSha,
+      gateBaseSha,
       [...new Set([...gate.changedFiles, ...gate.deletedFiles])].filter(isGateFile),
     );
     if (removals.length) {

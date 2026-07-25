@@ -89,6 +89,8 @@ test('discovers authoritative named checks and refuses fixed-command overrides',
 
 test('treats warning-like output as failure but accepts canonical zero summaries', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'Tests: 42 passed, 0 failed, 0 skipped\nWarnings: 0' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '4 passed; 0 failed; 0 ignored' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '4 passed, 0 deselected' }).status, 'PASS');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'warning: deprecated dependency' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stderr: 'BLOCKED: Redis unavailable' }).status, 'BLOCKED');
   assert.equal(classifyOutput({ exitCode: 1, stderr: 'ordinary command failure' }).status, 'FAIL');
@@ -98,6 +100,9 @@ test('treats warning-like output as failure but accepts canonical zero summaries
   assert.equal(classifyOutput({ exitCode: 0, stderr: 'UserWarning: unsafe fallback' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stderr: '(node:123) ExperimentalWarning: unstable API' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'warning deprecated package' }).status, 'FAIL');
+  // Runner-native skip buckets (Rust ignored, pytest deselected) must FAIL.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '4 passed; 0 failed; 1 ignored' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '4 passed, 1 deselected' }).status, 'FAIL');
   assert.equal(
     classifyOutput({ exitCode: 1, stderr: 'BLOCKED: command reached a real failure' }).status,
     'FAIL',

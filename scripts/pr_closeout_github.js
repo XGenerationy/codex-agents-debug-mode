@@ -680,14 +680,30 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       finalGateSnapshot.stabilityTuple,
       terminalGateSnapshot.stabilityTuple,
     );
-    if (!terminalPrStable || !terminalReviewsStable) {
+    // Thread state is not in PR/review stability tuples. Re-read threads after
+    // the terminal snapshot and require an identical unresolved set so a
+    // reopen during the terminal window cannot PASS with a stale empty list.
+    const terminalUnresolvedThreads = await readUnresolvedReviewThreads({
+      repo, owner, name, number: terminalPr.number, runGh,
+    });
+    const threadTuple = (threads) => JSON.stringify(
+      [...(threads || [])]
+        .map((thread) => ({
+          path: thread?.path ?? null,
+          line: thread?.line ?? null,
+          url: thread?.url ?? null,
+        }))
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    );
+    const threadsStable = threadTuple(finalUnresolvedThreads) === threadTuple(terminalUnresolvedThreads);
+    if (!terminalPrStable || !terminalReviewsStable || !threadsStable) {
       return {
         status: 'BLOCKED',
         evidence: 'Live GitHub PR, check, or review state changed during verification; rerun against a stable remote snapshot.',
         repository,
         number: terminalPr.number,
         checks: [],
-        unresolvedThreads: finalUnresolvedThreads,
+        unresolvedThreads: terminalUnresolvedThreads,
         externalServices: [],
         gateAttestation: terminalGateSnapshot.attestation,
       };
@@ -695,7 +711,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     return classifyLivePrState({
       repository,
       pr: terminalPr,
-      unresolvedThreads: finalUnresolvedThreads,
+      unresolvedThreads: terminalUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: terminalGateSnapshot.attestation,

@@ -1042,12 +1042,28 @@ const openLogNoFollow = async (target, flags) => {
  * Write a one-shot evidence log header (truncating any prior content),
  * no-follow. Used for the "command: ...\ncwd: ..." header written before a
  * command or command-proof spawn begins.
+ *
+ * Opens without O_TRUNC first so a hard-linked log path cannot truncate a
+ * second name on the same inode before identity checks run. Requires a
+ * regular file with nlink === 1, then truncates through the verified
+ * descriptor.
  * @param {string} target
  * @param {string} contents
  */
 const writeLogHeaderNoFollow = async (target, contents) => {
-  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
+  // O_CREAT without O_TRUNC: create if missing, never truncate until fstat.
+  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT);
   try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error(`Refusing to write evidence log that is not a regular file: ${target}`);
+    }
+    if (info.nlink !== 1) {
+      throw new Error(
+        `Refusing to write evidence log with hard links (nlink=${info.nlink}): ${target}`,
+      );
+    }
+    await handle.truncate(0);
     await handle.writeFile(contents, 'utf8');
   } finally {
     await handle.close();

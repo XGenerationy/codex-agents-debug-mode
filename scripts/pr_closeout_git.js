@@ -480,11 +480,31 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       }
     }
   };
-  const onTerminateSignal = () => {
+  // After restore, re-deliver the signal so default Node termination runs.
+  // Leaving the handler installed would swallow Ctrl-C / CI SIGTERM and let
+  // closeout continue after attributes were restored.
+  const onSigInt = () => {
     restoreAttributesSync();
+    process.removeListener('SIGINT', onSigInt);
+    process.removeListener('SIGTERM', onSigTerm);
+    try {
+      process.kill(process.pid, 'SIGINT');
+    } catch {
+      process.exit(130);
+    }
   };
-  process.on('SIGINT', onTerminateSignal);
-  process.on('SIGTERM', onTerminateSignal);
+  const onSigTerm = () => {
+    restoreAttributesSync();
+    process.removeListener('SIGINT', onSigInt);
+    process.removeListener('SIGTERM', onSigTerm);
+    try {
+      process.kill(process.pid, 'SIGTERM');
+    } catch {
+      process.exit(143);
+    }
+  };
+  process.on('SIGINT', onSigInt);
+  process.on('SIGTERM', onSigTerm);
   try {
     try {
       await rename(infoAttributes, infoAttributesBackup);
@@ -514,8 +534,8 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       }
     }
   } finally {
-    process.off('SIGINT', onTerminateSignal);
-    process.off('SIGTERM', onTerminateSignal);
+    process.removeListener('SIGINT', onSigInt);
+    process.removeListener('SIGTERM', onSigTerm);
     if (attributesMoved) {
       try {
         await rename(infoAttributesBackup, infoAttributes);
