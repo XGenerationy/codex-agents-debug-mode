@@ -101,7 +101,8 @@ function New-UniqueBackupPath {
     $stamp = [DateTime]::UtcNow.Ticks
     $backup = "$Destination.backup.$stamp`_$PID"
     $retry = 0
-    while (Test-Path -LiteralPath $backup) {
+    # Test-DestinationOccupied also sees dangling reparse points that Test-Path misses.
+    while (Test-DestinationOccupied -Path $backup) {
         $retry++
         $backup = "$Destination.backup.$stamp`_$PID`_$retry"
     }
@@ -121,7 +122,7 @@ try {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
         }
         $stage = Join-Path $parent ('.debug-install-stage.' + [DateTime]::UtcNow.Ticks + '_' + $PID + '_' + $staged.Count)
-        if (Test-Path -LiteralPath $stage) {
+        if (Test-DestinationOccupied -Path $stage) {
             Remove-Item -LiteralPath $stage -Recurse -Force
         }
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
