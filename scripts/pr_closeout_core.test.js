@@ -275,6 +275,25 @@ test('accepts zero-count failure buckets when real tests passed', () => {
   // A zero TOTAL remains a no-work failure.
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files 0 passed (0)' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'Test Files  0 (0)     Tests  0 passed (0)' }).status, 'FAIL');
+  // Go/cargo workspace: empty packages print no-test markers next to real
+  // packages that ran tests — mixed output must PASS when evidence exists.
+  assert.equal(classifyOutput({
+    exitCode: 0,
+    stdout: '[no test files]\nok\tcloud.google.com/go/storage/v2\t0.219s\n',
+  }).status, 'PASS');
+  assert.equal(classifyOutput({
+    exitCode: 0,
+    stdout: 'running 0 tests\ntest result: ok. 0 passed; 0 failed\nrunning 0 tests\ntest result: ok. 2 passed; 0 failed\n',
+  }).status, 'PASS');
+  // Pure Go/Rust no-work (no accompanying authoritative pass) still FAILs.
+  assert.equal(classifyOutput({
+    exitCode: 0,
+    stdout: '[no test files]\n',
+  }).status, 'FAIL');
+  assert.equal(classifyOutput({
+    exitCode: 0,
+    stdout: 'running 0 tests\ntest result: ok. 0 passed; 0 failed\n',
+  }).status, 'FAIL');
 });
 
 test('flags focused or skipped tests in touched test files', () => {

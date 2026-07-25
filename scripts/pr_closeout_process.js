@@ -77,10 +77,24 @@ const resolveCommandShell = ({ platform = process.platform, env = process.env } 
 };
 
 /**
- * Default argv for every check/proof/preflight spawn. Uses a non-login,
- * non-interactive bash (`--noprofile --norc -c`) so `~/.bash_profile`,
- * `~/.bashrc`, and other shell startup files cannot inject PATH rewrites,
- * aliases, or arbitrary commands into the validation trust domain.
+ * Whether `shell` is bash-compatible enough to accept `--noprofile`/`--norc`.
+ * Bare `sh`, `dash`, `zsh`, `ksh`, or other POSIX shells reject those flags
+ * (or treat them as unknown options) and never reach `-c`.
+ * @param {string} [shell]
+ * @returns {boolean}
+ */
+const isBashCompatibleShell = (shell) => {
+  const base = path.basename(String(shell || 'bash')).toLowerCase().replace(/\.exe$/i, '');
+  return base === 'bash' || base.endsWith('-bash') || base.includes('bash');
+};
+
+/**
+ * Default argv for every check/proof/preflight spawn. For bash-compatible
+ * shells uses a non-login, non-interactive argv (`--noprofile --norc -c`) so
+ * `~/.bash_profile`, `~/.bashrc`, and other shell startup files cannot inject
+ * PATH rewrites, aliases, or arbitrary commands into the validation trust
+ * domain. For non-bash shells (zsh, dash, ksh, …) emits only `-c` so the
+ * command still runs instead of dying on unknown flags.
  *
  * Profile-dependent tool discovery is intentionally NOT performed here:
  * callers must put required tools on the parent process `PATH` (CI runners
@@ -88,9 +102,14 @@ const resolveCommandShell = ({ platform = process.platform, env = process.env } 
  * per-command shell is the safe alternative to `bash -lc`.
  *
  * @param {string} command shell command string to execute
+ * @param {string} [shell='bash'] shell binary path or name (from resolveCommandShell)
  * @returns {string[]} argv for spawn/execFile after the shell binary
  */
-const defaultShellArgs = (command) => ['--noprofile', '--norc', '-c', command];
+const defaultShellArgs = (command, shell = 'bash') => (
+  isBashCompatibleShell(shell)
+    ? ['--noprofile', '--norc', '-c', command]
+    : ['-c', command]
+);
 
 /**
  * Confirms the shell resolved by resolveCommandShell is actually runnable
@@ -1268,7 +1287,7 @@ const spawnCaptured = async ({
   // is jiffies since boot; we re-read the child's starttime after spawn when
   // /proc is available so the orphan filter is exact.
   let minStarttime = 0;
-  const child = spawnProcess(shell, shellArgs(command), {
+  const child = spawnProcess(shell, shellArgs(command, shell), {
     cwd,
     env: spawnEnv,
     // Detached so the child is a process-group leader and kill(-pid) works.
@@ -2271,7 +2290,7 @@ const probeCommandDefault = async ({
   let minStarttime = 0;
   let stdout = '';
   let stderr = '';
-  const child = spawnProcess(shell, defaultShellArgs(command), {
+  const child = spawnProcess(shell, defaultShellArgs(command, shell), {
     cwd: repo,
     env: spawnEnv,
     detached: platform !== 'win32',

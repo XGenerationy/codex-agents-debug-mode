@@ -377,16 +377,27 @@ const classifyOutput = ({
   // no-test run must not fall through to PASS. Targeted at the no-work
   // summaries; ordinary "no tests were skipped" is not matched.
   const combined = `${stdout}\n${stderr}`;
-  if (/\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined)
+  // Go `go test ./...` and cargo workspace runs print per-package "no tests"
+  // lines alongside real `ok` / `N passed` evidence. Those mixed runs still
+  // have authoritative tests and must not be failed for the empty packages.
+  const hasAuthoritativeTestEvidence = (
+    /\bok\t\S+/m.test(combined)
+    || /test result:\s*ok\.\s*[1-9]\d*\s+passed/i.test(combined)
+    || /\btests?\s+[1-9]\d*\s+passed\b/i.test(combined)
+    || /^[ \t]*#\s*tests?\s+[1-9]/im.test(combined)
+    || /(?:^|\n)\s*[1-9]\d*\s+passing\b/i.test(combined)
+  );
+  const pureNoWork = /\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined)
     || /\bno\s+test\s+files?\s+found\b/i.test(combined)
-    // Go: `[no test files]` / `testing: warning: no tests to run`
-    || /\[no test files\]/i.test(combined)
-    || /\bno tests to run\b/i.test(combined)
-    // Rust/cargo test: `running 0 tests`
-    || /\brunning\s+0\s+tests?\b/i.test(combined)
     // Python unittest: `Ran 0 tests`
     || /\bran\s+0\s+tests?\b/i.test(combined)
-    || /\b0\s+tests?\s+(?:run|ran|executed)\b/i.test(combined)) {
+    || /\b0\s+tests?\s+(?:run|ran|executed)\b/i.test(combined);
+  // Go/Rust package-level empty markers: only pure-no-work when no real tests
+  // ran elsewhere in the same output stream.
+  const goRustEmptyPackage = /\[no test files\]/i.test(combined)
+    || /\bno tests to run\b/i.test(combined)
+    || /\brunning\s+0\s+tests?\b/i.test(combined);
+  if (pureNoWork || (goRustEmptyPackage && !hasAuthoritativeTestEvidence)) {
     return { status: 'FAIL', evidence: 'Test runner reported no tests found/executed; closeout requires authoritative test evidence.' };
   }
   // Numeric no-work summaries from common runners: Node's TAP `# tests 0` /

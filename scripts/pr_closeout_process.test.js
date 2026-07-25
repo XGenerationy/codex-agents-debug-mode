@@ -1102,6 +1102,12 @@ test('probeCommandDefault runs commands through a non-login shell (--noprofile -
   // inject side effects, while still resolving tools already on PATH.
   const { defaultShellArgs } = require('./pr_closeout_process');
   assert.deepEqual(defaultShellArgs('true'), ['--noprofile', '--norc', '-c', 'true']);
+  assert.deepEqual(defaultShellArgs('true', 'bash'), ['--noprofile', '--norc', '-c', 'true']);
+  assert.deepEqual(defaultShellArgs('true', '/bin/bash'), ['--noprofile', '--norc', '-c', 'true']);
+  // Non-bash shells must not receive bash-only flags (zsh/dash/ksh reject them).
+  assert.deepEqual(defaultShellArgs('true', 'zsh'), ['-c', 'true']);
+  assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'true']);
+  assert.deepEqual(defaultShellArgs('true', 'C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe'), ['--noprofile', '--norc', '-c', 'true']);
   const shell = resolveCommandShell({ env: process.env });
   const result = await probeCommandDefault({
     command: 'printf %s probe-default-ok',
