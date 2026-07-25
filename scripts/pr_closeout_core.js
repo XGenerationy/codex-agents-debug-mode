@@ -549,6 +549,83 @@ const scanSuppressionText = (file, text) => {
           continue;
         }
         if (quote) {
+          // Template literals: static text is inert, but `${...}` interpolations
+          // execute as JavaScript and can register focus/skip calls. Scan the
+          // expression body as live code (non-inert) while keeping the
+          // surrounding backticks and static segments inert.
+          if (quote === '`') {
+            if (escaped) {
+              inert[i] = true;
+              escaped = false;
+              i += 1;
+              continue;
+            }
+            if (ch === '\\') {
+              inert[i] = true;
+              escaped = true;
+              i += 1;
+              continue;
+            }
+            if (ch === '`') {
+              inert[i] = true;
+              quote = null;
+              i += 1;
+              continue;
+            }
+            if (ch === '$' && line[i + 1] === '{') {
+              inert[i] = true;
+              inert[i + 1] = true;
+              i += 2;
+              let depth = 1;
+              let interpQuote = null;
+              let interpEscaped = false;
+              while (i < line.length && depth > 0) {
+                const ic = line[i];
+                if (interpQuote) {
+                  // Nested string inside the interpolation is inert; the
+                  // surrounding expression is still executable, but we only
+                  // need inertness for quotes so .only inside them is ignored.
+                  inert[i] = true;
+                  if (interpEscaped) {
+                    interpEscaped = false;
+                  } else if (ic === '\\') {
+                    interpEscaped = true;
+                  } else if (ic === interpQuote) {
+                    interpQuote = null;
+                  }
+                  i += 1;
+                  continue;
+                }
+                if (ic === "'" || ic === '"' || ic === '`') {
+                  inert[i] = true;
+                  interpQuote = ic;
+                  i += 1;
+                  continue;
+                }
+                if (ic === '{') {
+                  depth += 1;
+                  i += 1;
+                  continue;
+                }
+                if (ic === '}') {
+                  depth -= 1;
+                  if (depth === 0) {
+                    inert[i] = true; // closing brace of ${...}
+                    i += 1;
+                    break;
+                  }
+                  i += 1;
+                  continue;
+                }
+                // Expression body: leave inert[i] false so test.only is live.
+                i += 1;
+              }
+              continue;
+            }
+            inert[i] = true;
+            i += 1;
+            continue;
+          }
           inert[i] = true;
           if (escaped) {
             escaped = false;

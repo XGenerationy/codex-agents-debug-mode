@@ -745,6 +745,8 @@ test('binds live Grafana artifact proof to a query result contract', async () =>
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
+    // Origin must come from the independently probed service URL, not proof.grafanaOrigin.
+    grafanaServiceUrl: 'http://127.0.0.1:3000',
   });
   const invalidPayload = {
     provider: 'grafana',
@@ -1469,6 +1471,7 @@ test('rejects Grafana live frames that carry no real series values', async () =>
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
+    grafanaServiceUrl: 'http://127.0.0.1:3000',
   });
   const basePayload = {
     provider: 'grafana',

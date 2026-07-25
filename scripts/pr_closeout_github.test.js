@@ -394,9 +394,10 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
-  // Stable path now does a single review-thread pagination pass (THREAD 1
-  // optimization) plus two gate-attestation snapshots = four api calls.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 4);
+  // Stable path: two gate-attestation snapshots before the thread walk, one
+  // review-thread pagination pass (2 pages here), then a terminal third
+  // gate-attestation snapshot after the thread walk = five api calls.
+  assert.equal(calls.filter(([command]) => command === 'api').length, 5);
 });
 
 test('uses a single final review-thread read on the stable path to provide current evidence', async () => {

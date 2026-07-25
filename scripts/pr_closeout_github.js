@@ -648,13 +648,57 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       };
     }
     const finalUnresolvedThreads = await readUnresolvedReviewThreads({ repo, owner, name, number: pr.number, runGh });
+    // Revalidate after the (often long) paginated thread walk: a push, check
+    // flip, review edit, or permission change during that window would leave
+    // finalPr / finalGateSnapshot stale while threads look current. Take a
+    // terminal PR + attestation snapshot and require the full stability
+    // tuple to still match before classifying PASS.
+    const terminalPr = await runGh([
+      'pr',
+      'view',
+      '--json',
+      PR_VIEW_FIELDS,
+    ], { repo });
+    if (!Number.isInteger(terminalPr.number)) throw new Error('GitHub did not return a terminal pull request number.');
+    if (typeof terminalPr.author?.login !== 'string' || !terminalPr.author.login.trim()) {
+      throw new Error('GitHub did not return a terminal pull request author identity.');
+    }
+    const terminalGateSnapshot = await readGateAttestationSnapshotForPr({
+      repo,
+      repository,
+      pr: terminalPr,
+      expectedBaseSha,
+      expectedHeadSha,
+      expectedConfigDigest,
+      runGh,
+    });
+    const terminalPrStable = stabilityTuplesMatch(
+      capturePrStabilityTuple(finalPr),
+      capturePrStabilityTuple(terminalPr),
+    );
+    const terminalReviewsStable = stabilityTuplesMatch(
+      finalGateSnapshot.stabilityTuple,
+      terminalGateSnapshot.stabilityTuple,
+    );
+    if (!terminalPrStable || !terminalReviewsStable) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub PR, check, or review state changed during verification; rerun against a stable remote snapshot.',
+        repository,
+        number: terminalPr.number,
+        checks: [],
+        unresolvedThreads: finalUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: terminalGateSnapshot.attestation,
+      };
+    }
     return classifyLivePrState({
       repository,
-      pr: finalPr,
+      pr: terminalPr,
       unresolvedThreads: finalUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
-      gateAttestation: finalGateSnapshot.attestation,
+      gateAttestation: terminalGateSnapshot.attestation,
     });
   } catch (error) {
     return {

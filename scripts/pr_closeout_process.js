@@ -1623,7 +1623,8 @@ const readBoundArtifactJson = async (proofResult) => {
  * Validates that a `grafana-live-render` artifact JSON payload actually
  * proves a live Grafana call was made, not just that some JSON file exists.
  * Requires `proof.semantic === 'grafana-live-result'`, an http(s) `endpoint`
- * matching `proof.grafanaOrigin` when configured, and a 2xx `httpStatus`.
+ * matching the independently probed `expectedGrafanaOrigin` (from
+ * `services.grafana.url`), and a 2xx `httpStatus`.
  * For a `query` operation, additionally requires the request to have
  * targeted `/api/ds/query` with at least one query, every result entry to
  * be error-free, and at least one result to carry a genuinely non-empty
@@ -1648,14 +1649,15 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult, expectedGrafanaOr
   try {
     endpoint = new URL(payload.endpoint);
     if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('unsupported protocol');
-    // Prefer proof.grafanaOrigin; fall back to the preflight service URL origin
-    // so a proof cannot pass against a different Grafana than the one probed.
-    const expectedRaw = proof.grafanaOrigin || expectedGrafanaOrigin;
-    if (!expectedRaw) {
-      return { status: 'FAIL', evidence: 'Grafana live proof requires a configured Grafana origin (proof.grafanaOrigin or services.grafana.url).' };
+    // Require the independently probed services.grafana.url origin. Do not
+    // let proof.grafanaOrigin from closeout config override it: a config
+    // proof path can otherwise point the artifact check at a different host
+    // than the one preflight actually probed.
+    if (!expectedGrafanaOrigin) {
+      return { status: 'FAIL', evidence: 'Grafana live proof requires a configured Grafana origin (services.grafana.url).' };
     }
-    if (endpoint.origin !== new URL(expectedRaw).origin) {
-      return { status: 'FAIL', evidence: 'Grafana live proof endpoint did not match the configured Grafana origin.' };
+    if (endpoint.origin !== new URL(expectedGrafanaOrigin).origin) {
+      return { status: 'FAIL', evidence: 'Grafana live proof endpoint did not match the probed Grafana origin.' };
     }
   } catch (error) {
     return { status: 'FAIL', evidence: `Grafana live proof endpoint was invalid: ${error.message}` };

@@ -645,6 +645,30 @@ test('flags active test-weakening after a block-comment apostrophe on the same l
   assert.match(findings[0].match, /it\.only/i);
 });
 
+test('flags focus/skip calls inside template-literal interpolations', () => {
+  // Static template text is inert, but `${test.only(...)}` executes and must
+  // be scanned as live JavaScript. Split the focus token so this test file
+  // itself stays clean under a full-file suppression scan.
+  const only = 'on' + 'ly';
+  const line = [
+    'const marker = `${test.' + only + '("focused", fn)}`;',
+  ].join('\n');
+  const findings = scanSuppressionText('src/foo.test.js', line);
+  assert.ok(
+    findings.some(({ category }) => category === 'test-weakening'),
+    'template interpolation must still detect active focus/skip calls',
+  );
+  // Pure static template text with a lookalike must not flag.
+  const staticOnly = scanSuppressionText(
+    'src/foo.test.js',
+    'const msg = `call test.' + only + ' in docs`;',
+  );
+  assert.deepEqual(
+    staticOnly.filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
 test('flags chained Jest/Vitest focus and skip modifiers', () => {
   // Runner modifier chains (concurrent + only/skip/each) must still flag.
   for (const line of [

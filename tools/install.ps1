@@ -143,7 +143,13 @@ try {
     $pendingResults = @()
     foreach ($item in $staged) {
         $backup = $null
+        # Recheck -Force at commit time: two concurrent non-Force installers can
+        # both pass preflight while the target is absent; after the first
+        # commits, the second must refuse rather than back up and replace.
         if (Test-DestinationOccupied -Path $item.Destination) {
+            if (-not $Force) {
+                throw "Target exists: $($item.Destination). Rerun with -Force to preserve it as a backup and replace it."
+            }
             $backup = New-UniqueBackupPath -Destination $item.Destination
             Move-Item -LiteralPath $item.Destination -Destination $backup
             # Record backup before the stage commit so a failed stage→destination

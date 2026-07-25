@@ -10,10 +10,15 @@
  *
  * Resolves the comparison base from (in order):
  *   CLOSEOUT_BASE_SHA, GITHUB_BASE_SHA, GITHUB_EVENT_BEFORE (push preimage),
- *   merge-base with GITHUB_BASE_REF / origin/main / main, else the root commit.
+ *   merge-base with GITHUB_BASE_REF / origin/main / main, else the empty tree.
  *
  * Touched-file Git queries fail closed: any enumeration error aborts the
  * gate with a non-zero exit instead of treating the failure as an empty set.
+ *
+ * Diff form:
+ * - commit bases use three-dot `base...HEAD` (PR-range / merge-base semantics)
+ * - the empty-tree fallback uses two-dot `emptyTree HEAD` (symmetric range
+ *   requires two commits and rejects a tree object)
  */
 
 const { execFileSync } = require('node:child_process');
@@ -28,8 +33,12 @@ const {
 const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 const git = (args, options = {}) => {
+  // Do not trim the full stdout: path lists are NUL-delimited and individual
+  // entries may begin/end with whitespace (legal Git paths). Callers that need
+  // a trimmed scalar SHA still trim themselves.
   const stdout = execFileSync('git', args, {
     cwd: root,
     encoding: 'utf8',
@@ -37,13 +46,18 @@ const git = (args, options = {}) => {
     maxBuffer: GIT_MAX_BUFFER,
     ...options,
   });
-  return String(stdout || '').trim();
+  return String(stdout || '');
 };
 
-const splitZ = (text) => String(text || '')
-  .split('\0')
-  .map((entry) => entry.trim())
-  .filter(Boolean);
+const gitScalar = (args, options = {}) => git(args, options).trim();
+
+const splitZ = (text) => {
+  // Preserve each nonempty NUL-delimited segment byte-for-byte. Do not trim:
+  // a leading/trailing space is part of a legal Git path.
+  const raw = String(text || '');
+  if (!raw) return [];
+  return raw.split('\0').filter((entry) => entry.length > 0);
+};
 
 const isUsableSha = (value) => {
   const sha = String(value || '').trim();
@@ -51,6 +65,8 @@ const isUsableSha = (value) => {
   if (!sha || /^0+$/.test(sha)) return false;
   return /^[0-9a-f]{7,40}$/i.test(sha);
 };
+
+const isEmptyTreeSha = (sha) => String(sha || '').trim() === EMPTY_TREE;
 
 const resolveBaseSha = () => {
   const explicit = [
@@ -72,8 +88,7 @@ const resolveBaseSha = () => {
     ];
     for (const ref of candidates) {
       try {
-        const mb = git(['merge-base', 'HEAD', ref]);
-        if (isUsableSha(mb) && mb !== git(['rev-parse', 'HEAD'])) return mb;
+        const mb = gitScalar(['merge-base', 'HEAD', ref]);
         if (isUsableSha(mb)) return mb;
       } catch {
         // try next candidate
@@ -83,27 +98,26 @@ const resolveBaseSha = () => {
 
   for (const ref of ['origin/main', 'main', 'origin/master', 'master']) {
     try {
-      const head = git(['rev-parse', 'HEAD']);
-      const mb = git(['merge-base', 'HEAD', ref]);
+      const head = gitScalar(['rev-parse', 'HEAD']);
+      const mb = gitScalar(['merge-base', 'HEAD', ref]);
       // On a push checkout, origin/main often equals HEAD; that yields an
-      // empty range. Prefer the first-parent predecessor when available.
+      // empty range. Prefer a merge-base that is not HEAD.
       if (isUsableSha(mb) && mb !== head) return mb;
     } catch {
       // try next
     }
   }
 
-  // Last resort for a first commit on a new repo: scan the whole tree by
-  // using the empty tree object so the range is well-defined.
+  // Last resort for a first commit on a new repo: the empty tree object.
   try {
-    return git(['hash-object', '-t', 'tree', '/dev/null']);
+    const hashed = gitScalar(['hash-object', '-t', 'tree', '/dev/null']);
+    if (isUsableSha(hashed) || hashed === EMPTY_TREE) return hashed || EMPTY_TREE;
   } catch {
     // Windows may not have /dev/null as a usable path for hash-object.
   }
-  const emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
   try {
-    git(['cat-file', '-t', emptyTree]);
-    return emptyTree;
+    gitScalar(['cat-file', '-t', EMPTY_TREE]);
+    return EMPTY_TREE;
   } catch {
     // fall through
   }
@@ -111,9 +125,33 @@ const resolveBaseSha = () => {
   throw new Error('Unable to resolve a comparison base SHA for the suppression scan');
 };
 
+/**
+ * Name-only diff from base to HEAD. Commit bases use three-dot (PR range);
+ * the empty tree uses two-dot because `tree...commit` is rejected by Git.
+ */
+const diffNameOnly = (baseSha) => {
+  if (isEmptyTreeSha(baseSha)) {
+    return splitZ(git(['diff', '--name-only', '-z', baseSha, 'HEAD']));
+  }
+  return splitZ(git(['diff', '--name-only', '-z', `${baseSha}...HEAD`]));
+};
+
+/**
+ * Unified diff for gate files. Same three-dot vs two-dot rule as name-only.
+ */
+const diffUnified = (baseSha, files) => {
+  if (!files.length) return '';
+  if (isEmptyTreeSha(baseSha)) {
+    return git(['diff', '--unified=0', '--no-ext-diff', baseSha, 'HEAD', '--', ...files]);
+  }
+  // Three-dot: only PR-range changes (merge-base...HEAD), not base-branch-only
+  // edits that would appear in a two-endpoint diff against a moved base tip.
+  return git(['diff', '--unified=0', '--no-ext-diff', `${baseSha}...HEAD`, '--', ...files]);
+};
+
 const listTouchedFiles = (baseSha) => {
   // Fail closed: do not swallow git errors into an empty touched set.
-  const tracked = splitZ(git(['diff', '--name-only', '-z', `${baseSha}...HEAD`]));
+  const tracked = diffNameOnly(baseSha);
   // Unstaged working-tree changes.
   const unstaged = splitZ(git(['diff', '--name-only', '-z']));
   // Index-only (staged) changes that are not yet in HEAD.
@@ -126,7 +164,8 @@ const listTouchedFiles = (baseSha) => {
 // Deletion of validation-bearing lines inside a still-present gate file does
 // not produce a deletedFiles entry and may not match WEAKENING_PATTERNS on
 // added lines, so classifyGateIntegrity alone can return BLOCKED. Treat these
-// removals as FAIL in CI.
+// removals as FAIL in CI. Include multi-language test runners that commonly
+// appear inside `run: |` block steps (not only npm/pnpm/make).
 const VALIDATION_REMOVAL_PATTERNS = [
   /^\-\s*run:\s*/i,
   /^\-\s*-\s*run:\s*/i,
@@ -136,13 +175,16 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-.*\bnode\s+--test\b/i,
   /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
   /^\-\s*-\s*name:\s*.*(?:test|validate|audit|scan|lint)/i,
+  // Common validation commands removed from block steps while `run: |` remains.
+  /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
+  /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
 ];
 
 const detectValidationRemovals = (baseSha, gateFiles) => {
   if (!gateFiles.length) return [];
   let diff = '';
   try {
-    diff = git(['diff', '--unified=0', '--no-ext-diff', baseSha, 'HEAD', '--', ...gateFiles]);
+    diff = diffUnified(baseSha, gateFiles);
   } catch (error) {
     throw new Error(`Failed to read gate diff for validation-removal scan: ${error.message}`);
   }
@@ -158,7 +200,7 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
 
 const main = async () => {
   const baseSha = resolveBaseSha();
-  const headSha = git(['rev-parse', 'HEAD']);
+  const headSha = gitScalar(['rev-parse', 'HEAD']);
   const files = listTouchedFiles(baseSha);
 
   process.stdout.write(`suppression-scan base=${baseSha} head=${headSha} files=${files.length}\n`);
@@ -179,6 +221,9 @@ const main = async () => {
     process.stdout.write('suppression-scan: no marker/config-silencing/test-weakening findings\n');
   }
 
+  // Gate integrity still uses the raw base SHA via readGateChanges (two-dot
+  // against the working tree). Validation-removal inspection uses the same
+  // three-dot/two-dot rule as the touched-file list so PR-range semantics hold.
   const gate = await readGateChanges(root, baseSha);
   const integrity = classifyGateIntegrity({
     changedFiles: gate.changedFiles,

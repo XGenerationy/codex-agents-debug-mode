@@ -194,7 +194,16 @@ for destination in "${destinations[@]}"; do
   # the later mv over it and any subsequent rollback via restore_from_backup
   # (which unconditionally removes $destination) would destroy it with
   # nothing to put back, even though a real backup was never made.
+  #
+  # Recheck --force at commit time: two concurrent non-force installers can
+  # both pass the earlier preflight while the target is absent; after the
+  # first commits, the second must refuse rather than back up and replace.
   if [[ -e "$destination" || -L "$destination" ]]; then
+    if [[ "$force" != "true" ]]; then
+      rollback
+      echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
+      exit 1
+    fi
     backup="$(unique_backup "$destination")"
     # Guard the backup move: under set -e a bare mv failure in the then-body
     # would exit the script before rollback() runs, leaving previously
