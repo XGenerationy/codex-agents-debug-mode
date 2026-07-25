@@ -600,6 +600,20 @@ test('treats npm lockfiles as validation-defining gate files', () => {
   }
 });
 
+test('treats workspace manifests as validation-defining gate files', () => {
+  // Removing a package from pnpm-workspace.yaml (or lerna/nx/turbo workspace
+  // roots) can drop validation surfaces without touching package.json scripts.
+  for (const file of [
+    'pnpm-workspace.yaml',
+    'packages/pnpm-workspace.yaml',
+    'lerna.json',
+    'nx.json',
+    'turbo.json',
+  ]) {
+    assert.equal(isGateFile(file), true, file);
+  }
+});
+
 test('detects coverage threshold reductions split across added lines', () => {
   const base = { changedFiles: ['vitest.config.ts'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
   const addedLines = ['+  coverageThreshold: {', '+    statements: 0,', '+  },'];

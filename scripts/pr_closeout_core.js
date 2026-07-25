@@ -98,7 +98,10 @@ const MANDATORY_CHECKS = [
   define('redis-integration', 'Real Redis integration test', { packageCandidates: ['test:redis:integration', 'test:integration:redis'], baselineSafe: false }),
   define('biome-touched', 'Biome on touched files', { packageCandidates: ['biome:touched', 'lint:touched'], baselineSafe: true }),
   define('typecheck', 'Authoritative typecheck', { packageCandidates: ['typecheck', 'type-check', 'check:types'], baselineSafe: true }),
-  define('playwright-smoke', 'Playwright smoke', { packageCandidates: ['playwright-smoke', 'test:e2e:smoke', 'test:smoke'], baselineSafe: false }),
+  // Generic `test:smoke` is intentionally excluded: many repos use that name
+  // for unit/API smoke that never launches a browser. Map browser smoke via
+  // playwright-/e2e-named scripts or an explicit check override.
+  define('playwright-smoke', 'Playwright smoke', { packageCandidates: ['playwright-smoke', 'test:e2e:smoke', 'test:playwright:smoke', 'playwright:smoke'], baselineSafe: false }),
   define('grafana-render', 'Deterministic Grafana render', { packageCandidates: ['grafana-render', 'render:grafana'], makeCandidates: ['grafana-render'], baselineSafe: true }),
   define('make-smoke', 'make smoke', { fixed: true, command: 'make smoke', baselineSafe: true }),
   define('make-sbom', 'make sbom', { fixed: true, command: 'make sbom', baselineSafe: true }),
@@ -540,7 +543,9 @@ const scanSuppressionText = (file, text) => {
     // Allow optional whitespace/comments between the receiver, dots, and the
     // focus/skip/todo member so `test . only(...)` / `test /* x */.only(...)`
     // cannot evade the scan. Multiline receiver splits are handled below.
-    const testWeakening = /\b(?:describe|it|test|context)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Include Mocha TDD / Vitest `suite` alias alongside describe/it/test/context
+    // so suite.only / suite.skip cannot focus a suite while the scan reports clean.
+    const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     /**
      * Scan a whole source line and mark every character position that is
      * inert (inside a string, a line/block comment, or a regex literal), so
@@ -856,7 +861,7 @@ const scanSuppressionText = (file, text) => {
     };
     if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
       const windowWeakening = new RegExp(testWeakening.source, 'i');
-      const bareReceiver = /\b(?:describe|it|test|context)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
+      const bareReceiver = /\b(?:describe|it|test|context|suite)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
       for (let i = 0; i < lines.length; i += 1) {
         // Strip quotes across the full window first so a live receiver that
         // only becomes visible after `${...}` extraction (e.g. `${test` on
@@ -871,8 +876,8 @@ const scanSuppressionText = (file, text) => {
         if (!bareReceiver.test(lead.trimEnd())) continue;
         const windowText = strippedWindow
           .replace(/\s+/g, ' ')
-          // Join `test .only` / `describe .skip` after whitespace collapse.
-          .replace(/\b(describe|it|test|context)\s+\./gi, '$1.');
+          // Join `test .only` / `describe .skip` / `suite .only` after collapse.
+          .replace(/\b(describe|it|test|context|suite)\s+\./gi, '$1.');
         const match = windowText.match(windowWeakening);
         if (!match) continue;
         findings.push({

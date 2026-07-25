@@ -596,6 +596,11 @@ const runCloseoutWorkflow = async ({
         // timing instead of an empty terminal.
         const firstRun = reproducibility.first || reproducibility;
         const terminal = reproducibility.second || firstRun;
+        // Preserve both generator attempts so renderMarkdown can count two
+        // confirmation executions (Reruns observed / attempt IDs) instead of
+        // treating the dual run as a single terminal-only row.
+        const generatorAttempts = [reproducibility.first, reproducibility.second]
+          .filter(Boolean);
         result = {
           ...check,
           phase,
@@ -607,77 +612,95 @@ const runCloseoutWorkflow = async ({
           stdout: terminal.stdout || '',
           stderr: terminal.stderr || '',
           evidence: reproducibility.evidence,
+          first: reproducibility.first,
+          second: reproducibility.second,
+          attempts: generatorAttempts.length > 0 ? generatorAttempts : undefined,
         };
       } else {
         result = await execute(check, phase);
       }
       if (result.status === 'PASS') return result;
-      return serializeBaseline(() => d.verifyBaseline({
-        repo: initial.repo,
-        baseSha: initial.baseSha,
-        check,
-        headResult: result,
-        // Thread the sanitized childEnv into the disposable baseline worktree so
-        // the internal git worktree add/remove runs with the filtered environment
-        // (not ambient process.env/CI secrets), matching the command executor.
-        env: childEnv,
-        // Generator head failures use two-pass fingerprinting; baseline must
-        // reproduce with the same two-run protocol, not a single generator exec.
-        execute: async (baselineCheck, cwd) => {
-          if (check.generator) {
-            const repro = await verifyGeneratorReproducibility({
-              executeGenerator: (run) => execute({
-                ...baselineCheck,
-                id: `${check.id}-baseline-comparison-gen-${run}`,
-                associatedCheckId: check.id,
-                attemptId: `${check.id}:baseline-gen-${run}:${++baselineAttempt}`,
-                generator: true,
-              }, 'baseline', cwd),
-              fingerprint: () => d.workingTreeFingerprint(cwd, reproducibilityPaths),
-            });
-            const firstRun = repro.first || repro;
-            const terminal = repro.second || firstRun;
-            return {
-              ...baselineCheck,
-              phase: 'baseline',
-              status: repro.status,
-              exitCode: terminal.exitCode ?? null,
-              startedAt: firstRun.startedAt,
-              finishedAt: terminal.finishedAt,
-              durationMs: (firstRun.durationMs || 0) + (repro.second?.durationMs || 0),
-              stdout: terminal.stdout || '',
-              stderr: terminal.stderr || '',
-              evidence: repro.evidence,
-              first: repro.first,
-              second: repro.second,
-            };
-          }
-          return execute({
-            ...baselineCheck,
-            id: `${check.id}-baseline-comparison`,
-            associatedCheckId: check.id,
-            attemptId: `${check.id}:baseline:${++baselineAttempt}`,
-          }, 'baseline', cwd);
-        },
-        setup: (cwd) => execute({
-          id: `${check.id}-baseline-dependency-setup`,
-          associatedCheckId: check.id,
-          attemptId: `${check.id}:baseline-setup:${++baselineAttempt}`,
-          command: baselineSetupCommand,
-          baselineSafe: false,
-        }, 'baseline-setup', cwd),
-        toolVersions: preflight.toolVersions,
-        captureVersions: async (cwd) => (await d.runPreflight({
-          repo: cwd,
-          config: { minFreeDiskGb: 0 },
-          // Pass the sanitized childEnv so the disposable base worktree's
-          // version probes use the same isolated environment as admission
-          // preflight and command execution, instead of falling back to
-          // process.env and leaking ambient CI credentials into the baseline
-          // comparison.
+      // Baseline attribution is optional once head already failed. An
+      // infrastructure throw from verifyBaseline (worktree create, filter
+      // enumeration, etc.) must not replace a proven FAIL with BLOCKED.
+      try {
+        return await serializeBaseline(() => d.verifyBaseline({
+          repo: initial.repo,
+          baseSha: initial.baseSha,
+          check,
+          headResult: result,
+          // Thread the sanitized childEnv into the disposable baseline worktree so
+          // the internal git worktree add/remove runs with the filtered environment
+          // (not ambient process.env/CI secrets), matching the command executor.
           env: childEnv,
-        })).toolVersions,
-      }));
+          // Generator head failures use two-pass fingerprinting; baseline must
+          // reproduce with the same two-run protocol, not a single generator exec.
+          execute: async (baselineCheck, cwd) => {
+            if (check.generator) {
+              const repro = await verifyGeneratorReproducibility({
+                executeGenerator: (run) => execute({
+                  ...baselineCheck,
+                  id: `${check.id}-baseline-comparison-gen-${run}`,
+                  associatedCheckId: check.id,
+                  attemptId: `${check.id}:baseline-gen-${run}:${++baselineAttempt}`,
+                  generator: true,
+                }, 'baseline', cwd),
+                fingerprint: () => d.workingTreeFingerprint(cwd, reproducibilityPaths),
+              });
+              const firstRun = repro.first || repro;
+              const terminal = repro.second || firstRun;
+              return {
+                ...baselineCheck,
+                phase: 'baseline',
+                status: repro.status,
+                exitCode: terminal.exitCode ?? null,
+                startedAt: firstRun.startedAt,
+                finishedAt: terminal.finishedAt,
+                durationMs: (firstRun.durationMs || 0) + (repro.second?.durationMs || 0),
+                stdout: terminal.stdout || '',
+                stderr: terminal.stderr || '',
+                evidence: repro.evidence,
+                first: repro.first,
+                second: repro.second,
+              };
+            }
+            return execute({
+              ...baselineCheck,
+              id: `${check.id}-baseline-comparison`,
+              associatedCheckId: check.id,
+              attemptId: `${check.id}:baseline:${++baselineAttempt}`,
+            }, 'baseline', cwd);
+          },
+          setup: (cwd) => execute({
+            id: `${check.id}-baseline-dependency-setup`,
+            associatedCheckId: check.id,
+            attemptId: `${check.id}:baseline-setup:${++baselineAttempt}`,
+            command: baselineSetupCommand,
+            baselineSafe: false,
+          }, 'baseline-setup', cwd),
+          toolVersions: preflight.toolVersions,
+          captureVersions: async (cwd) => (await d.runPreflight({
+            repo: cwd,
+            config: { minFreeDiskGb: 0 },
+            // Pass the sanitized childEnv so the disposable base worktree's
+            // version probes use the same isolated environment as admission
+            // preflight and command execution, instead of falling back to
+            // process.env and leaking ambient CI credentials into the baseline
+            // comparison.
+            env: childEnv,
+          })).toolVersions,
+        }));
+      } catch (error) {
+        const note = error?.message || String(error);
+        return {
+          ...result,
+          status: result.status === 'FAIL' ? 'FAIL' : 'BLOCKED',
+          evidence: [
+            result.evidence,
+            `Baseline comparison unavailable (infrastructure error; head result preserved): ${note}`,
+          ].filter(Boolean).join('\n'),
+        };
+      }
     };
     phases = await runValidationPhases({
       checks: plan.checks,

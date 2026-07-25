@@ -60,13 +60,13 @@ const isGateFile = (file) => {
     // Makefile) so a weakening change to whichever one readProjectMetadata
     // actually discovers is treated as a gate change.
     || /^(?:gnu)?makefile(?:\..+)?$/.test(base)
-    || /^(?:pnpm-lock\.yaml|package-lock\.json|npm-shrinkwrap\.json|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
+    || /^(?:pnpm-lock\.yaml|pnpm-workspace\.yaml|package-lock\.json|npm-shrinkwrap\.json|lerna\.json|nx\.json|turbo\.json|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
     || /(?:^|\/)\.?pr-closeout(?:\.[^/]+)?\.json$/.test(normalized);
 };
 
 const WEAKENING_PATTERNS = [
-  /\b(?:describe|it|test)\.(?:skip|only|todo)\b/i,
+  /\b(?:describe|it|test|context|suite)\.(?:skip|only|todo)\b/i,
   /--(?:no-verify|force|passWithNoTests)\b/i,
   /(?:coverage|threshold)["']?\s*[:=]\s*(?:["']?0(?:\.0+)?["']?|false|null)(?![\w.])/i,
   // Intentionally NOT matching strategy.fail-fast: false / failFast: false.

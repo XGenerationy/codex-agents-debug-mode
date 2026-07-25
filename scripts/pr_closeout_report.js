@@ -1,5 +1,5 @@
 const { constants } = require('node:fs');
-const { mkdir, rename, unlink } = require('node:fs/promises');
+const { chmod, mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow } = require('./pr_closeout_fs');
 
@@ -347,7 +347,7 @@ const writeNoFollow = async (target, contents) => {
     handle = await openNoFollow(
       target,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-      0o666,
+      0o600,
     );
   } catch (error) {
     if (error?.code === 'ELOOP') {
@@ -359,6 +359,14 @@ const writeNoFollow = async (target, contents) => {
     throw error;
   }
   try {
+    try {
+      await handle.chmod(0o600);
+    } catch (error) {
+      if (error?.code && !['ENOTSUP', 'EPERM', 'EINVAL', 'EACCES'].includes(error.code)
+        && process.platform !== 'win32') {
+        throw error;
+      }
+    }
     const info = await handle.stat();
     if (!info.isFile() || info.nlink !== 1) {
       throw new Error(
@@ -382,7 +390,14 @@ const writeNoFollow = async (target, contents) => {
  * @returns {Promise<{json: string, markdown: string}>} the absolute paths written.
  */
 const writeEvidenceReport = async ({ outputDir, report }) => {
-  await mkdir(outputDir, { recursive: true });
+  // Owner-only evidence directory so captured private-repo command output is
+  // not world-readable under a shared temp path (umask-independent intent).
+  await mkdir(outputDir, { recursive: true, mode: 0o700 });
+  try {
+    await chmod(outputDir, 0o700);
+  } catch {
+    // Platform may ignore directory modes (Windows); continue.
+  }
   const json = path.join(outputDir, 'report.json');
   const markdown = path.join(outputDir, 'report.md');
   // Validate both final targets before writing either temp or final path.

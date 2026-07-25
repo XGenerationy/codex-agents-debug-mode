@@ -475,7 +475,13 @@ test('workingTreeFingerprint seals contents behind a core.excludesFile symlink',
     const target = path.join(outside, 'real-excludes');
     const link = path.join(outside, 'excludes-link');
     await writeFile(target, 'hidden/\n');
-    await symlink(target, link);
+    try {
+      await symlink(target, link);
+    } catch (error) {
+      // Restricted sandboxes may disallow symlink creation; match sibling tests.
+      if (error.code === 'EPERM' || error.code === 'ENOSYS' || error.code === 'EACCES') return;
+      throw error;
+    }
     git(repo, 'config', 'core.excludesFile', link);
     const before = await workingTreeFingerprint(repo);
     await writeFile(target, 'hidden/\nother/\n');

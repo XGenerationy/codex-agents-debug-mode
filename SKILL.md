@@ -613,6 +613,19 @@ instrumentation:
 }
 ```
 
+**Collector origin allowlist required for the relay POST:** `createDebugServer` rejects every
+`Origin` not listed in `DEBUG_ALLOWED_ORIGIN`. A Manifest V3 service-worker `fetch` to
+`http://localhost:8787/log` sends the extension origin (`chrome-extension://<id>`) and triggers a
+CORS preflight; without that exact origin allowed, the collector responds `403 origin_not_allowed`
+even when `host_permissions` is correct. Launch the collector with the extension origin before
+using the relay (replace `<id>` with the value from `chrome://extensions`):
+
+```bash
+DEBUG_ALLOWED_ORIGIN=chrome-extension://<id> node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT"
+```
+
+Comma-separate multiple origins when both a page origin and the extension origin must be allowed.
+
 **Injected scripts (MAIN world):**
 If debugging code injected via `<script>` into the page context, use `window.postMessage` to relay to content script, which then relays to background:
 

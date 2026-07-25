@@ -286,10 +286,11 @@ test('flags focused or skipped tests in touched test files', () => {
     'it.skip("skipped test");',
     'test.todo("unfinished test");',
     'context.only("another focused suite");',
+    'suite.only("mocha tdd focused suite", () => {});',
     'function runTest() {} // not a weakening',
   ].join('\n'));
   const matches = findings.filter(({ category }) => category === 'test-weakening');
-  assert.equal(matches.length, 4, `expected 4 test-weakening findings, got: ${JSON.stringify(matches)}`);
+  assert.equal(matches.length, 5, `expected 5 test-weakening findings, got: ${JSON.stringify(matches)}`);
   // A non-test source file with the same body must not produce test-weakening
   // findings (the detection is scoped to test-like filenames).
   const nonTest = scanSuppressionText('src/foo.js', 'it.skip("not in a test file");');

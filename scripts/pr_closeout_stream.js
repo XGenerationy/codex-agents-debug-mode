@@ -72,7 +72,11 @@ const secretVariants = (value) => {
     base64.replace(/=+$/u, ''),
     base64url,
     base64url.replace(/=+$/u, ''),
+    // Lowercase hex (Buffer default) and uppercase hex (tools that print
+    // conventional UPPER hex). Replacement is case-sensitive, so both forms
+    // must be registered or an uppercase encoding would persist in evidence.
     Buffer.from(raw, 'utf8').toString('hex'),
+    Buffer.from(raw, 'utf8').toString('hex').toUpperCase(),
   ];
 };
 

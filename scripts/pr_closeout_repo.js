@@ -561,7 +561,16 @@ const hashGitExcludePath = async (absolute) => {
     throw error;
   }
   if (info.isSymbolicLink()) {
-    const target = await readlink(absolute);
+    // TOCTOU: the symlink can vanish between lstat and readlink. Fail closed
+    // with the same stable "missing" marker as a vanished path, not an
+    // uncaught throw that aborts the whole fingerprint step.
+    let target;
+    try {
+      target = await readlink(absolute);
+    } catch (error) {
+      if (error.code === 'ENOENT') return hashBytes('missing');
+      throw error;
+    }
     let followed = 'missing';
     try {
       // realpath follows the symlink chain to the final path Git would read.

@@ -1,7 +1,7 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash, randomBytes } = require('node:crypto');
 const { constants, createWriteStream, readdirSync, readFileSync } = require('node:fs');
-const { access, lstat, mkdir, open, realpath, statfs } = require('node:fs/promises');
+const { access, chmod, lstat, mkdir, open, realpath, statfs } = require('node:fs/promises');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
@@ -1078,10 +1078,24 @@ const assertLogNotSymlink = async (target) => {
 };
 
 // Open a raw evidence log path without following a symlinked final component.
+// Mode 0600 at create time; fchmod after open so a permissive umask cannot
+// leave evidence world-readable under a shared temp directory.
 const openLogNoFollow = async (target, flags) => {
   await assertLogNotSymlink(target);
   try {
-    return await openNoFollowShared(target, flags, 0o666);
+    const handle = await openNoFollowShared(target, flags, 0o600);
+    try {
+      await handle.chmod(0o600);
+    } catch (error) {
+      // Windows and some network FS ignore or reject chmod; keep the handle
+      // when the platform cannot enforce Unix modes.
+      if (error?.code && !['ENOTSUP', 'EPERM', 'EINVAL', 'EACCES'].includes(error.code)
+        && process.platform !== 'win32') {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
+    }
+    return handle;
   } catch (error) {
     if (error?.code === 'ELOOP') {
       throw new Error(`Refusing to write evidence log through an existing symlink: ${target}`);
@@ -1981,7 +1995,12 @@ const createCommandExecutor = ({
     return finalize({ ...safeCheck, phase, status: 'FAIL', evidence: artifactBefore.evidence, proofResult: artifactBefore });
   }
   const logsDir = path.join(outputDir, 'logs');
-  await mkdir(logsDir, { recursive: true });
+  await mkdir(logsDir, { recursive: true, mode: 0o700 });
+  try {
+    await chmod(logsDir, 0o700);
+  } catch {
+    // Platform may ignore directory modes.
+  }
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
   await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`);
@@ -2225,30 +2244,131 @@ const TOOL_PROBES = [
  * checks can actually resolve at run time and shell profiles cannot inject
  * side effects. Tools must already be on the parent process PATH.
  *
- * Never throws: a rejected execFile is normalized into the same
- * `{exitCode, stdout, stderr}` shape as a successful run, using the
- * rejection's `code`/`stdout`/`stderr` (falling back to `error.message`),
- * so every probe result can be handled uniformly by the caller.
+ * Spawns detached (POSIX) under a unique SPAWN_MARK so a probe such as
+ * `pnpm prisma --version` that starts a detached helper and exits cannot
+ * leave an unmarked orphan that later mutates the worktree after the final
+ * seal. terminateProcessTree runs after close/timeout the same way as the
+ * validation executor.
+ *
+ * Never throws: spawn errors and non-zero exits are normalized into the same
+ * `{exitCode, stdout, stderr}` shape so every probe result can be handled
+ * uniformly by the caller.
  * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string}>}
  */
-const probeCommandDefault = async ({ command, repo, shell, env }) => {
-  try {
-    const result = await execFileAsync(shell, defaultShellArgs(command), {
-      cwd: repo,
+const probeCommandDefault = async ({
+  command,
+  repo,
+  shell,
+  env,
+  platform = process.platform,
+  spawnProcess = spawn,
+  terminateTree = terminateProcessTree,
+  timeoutMs = 120_000,
+  terminationGraceMs = 2000,
+}) => {
+  const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
+  const spawnEnv = spawnMark ? { ...env, [SPAWN_MARK_ENV]: spawnMark } : env;
+  let minStarttime = 0;
+  let stdout = '';
+  let stderr = '';
+  const child = spawnProcess(shell, defaultShellArgs(command), {
+    cwd: repo,
+    env: spawnEnv,
+    detached: platform !== 'win32',
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (platform !== 'win32' && Number.isInteger(child?.pid)) {
+    try {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm >= 0) {
+        const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
+        const starttime = Number(fields[19]);
+        if (Number.isFinite(starttime)) minStarttime = starttime;
+      }
+    } catch {
+      minStarttime = 0;
+    }
+  }
+  const cap = (acc, chunk) => {
+    const next = acc + String(chunk ?? '');
+    return next.length > CAPTURE_LIMIT ? next.slice(0, CAPTURE_LIMIT) : next;
+  };
+  child.stdout?.on('data', (chunk) => { stdout = cap(stdout, chunk); });
+  child.stderr?.on('data', (chunk) => { stderr = cap(stderr, chunk); });
+
+  let closeResolved = false;
+  let resolveClose;
+  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+  const close = (outcome) => {
+    if (closeResolved) return;
+    closeResolved = true;
+    resolveClose(outcome);
+  };
+  child.once('error', (error) => close({ exitCode: null, signal: null, spawnError: error }));
+  child.once('close', (exitCode, signal) => close({ exitCode, signal }));
+
+  const first = await Promise.race([
+    closePromise.then((outcome) => ({ kind: 'close', outcome })),
+    new Promise((resolve) => {
+      setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+    }),
+  ]);
+
+  let outcome = first.outcome;
+  if (first.kind === 'close') {
+    if (!outcome?.spawnError) {
+      await terminateTree({
+        child,
+        platform,
+        env,
+        terminationGraceMs,
+        closePromise,
+        spawnMark,
+        cwd: repo,
+        minStarttime,
+      });
+    }
+  } else {
+    await terminateTree({
+      child,
+      platform,
       env,
-      encoding: 'utf8',
-      maxBuffer: 2_000_000,
-      timeout: 120_000,
-      windowsHide: true,
+      terminationGraceMs,
+      closePromise,
+      spawnMark,
+      cwd: repo,
+      minStarttime,
     });
-    return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
-  } catch (error) {
+    outcome = await Promise.race([
+      closePromise,
+      new Promise((resolve) => { setTimeout(() => resolve(null), terminationGraceMs); }),
+    ]);
+    if (!outcome) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      outcome = await Promise.race([
+        closePromise,
+        new Promise((resolve) => { setTimeout(() => resolve(null), terminationGraceMs); }),
+      ]);
+    }
+  }
+
+  if (outcome?.spawnError) {
     return {
-      exitCode: Number.isInteger(error.code) ? error.code : null,
-      stdout: error.stdout || '',
-      stderr: error.stderr || error.message,
+      exitCode: null,
+      stdout,
+      stderr: outcome.spawnError.message || String(outcome.spawnError),
     };
   }
+  if (!outcome) {
+    return { exitCode: null, stdout, stderr: stderr || 'probe timed out' };
+  }
+  return {
+    exitCode: Number.isInteger(outcome.exitCode) ? outcome.exitCode : null,
+    stdout,
+    stderr,
+  };
 };
 
 /**
