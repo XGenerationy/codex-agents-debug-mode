@@ -804,6 +804,41 @@ test('binds live Grafana artifact proof to a query result contract', async () =>
   }, 'confirmation');
   assert.equal(errored.status, 'FAIL');
   assert.match(errored.evidence, /error/i);
+
+  // proof.grafanaOrigin must not override the independently probed origin.
+  const evilOrigin = await execute({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify({
+      ...validPayload,
+      endpoint: 'http://evil.example:3000/api/ds/query',
+    }))})`,
+    proof: {
+      type: 'artifact',
+      path: 'live.json',
+      semantic: 'grafana-live-result',
+      grafanaOrigin: 'http://evil.example:3000',
+    },
+  }, 'confirmation');
+  assert.equal(evilOrigin.status, 'FAIL');
+
+  // Missing grafanaServiceUrl must not fall back to proof.grafanaOrigin.
+  const noServiceUrl = createCommandExecutor({
+    repo,
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+  });
+  const missingService = await noServiceUrl({
+    id: 'grafana-live-render',
+    command: `require('node:fs').writeFileSync('live.json',${JSON.stringify(JSON.stringify(validPayload))})`,
+    proof: {
+      type: 'artifact',
+      path: 'live.json',
+      semantic: 'grafana-live-result',
+      grafanaOrigin: 'http://127.0.0.1:3000',
+    },
+  }, 'confirmation');
+  assert.equal(missingService.status, 'FAIL');
 });
 
 test('timeout terminates descendants before they can mutate evidence', async () => {
@@ -1010,6 +1045,15 @@ test('treats common database password env vars as sensitive', () => {
   assert.equal(child.PATH, '/usr/bin');
   assert.equal(redactSecrets('pw=pg-secret-123', { PGPASSWORD: 'pg-secret-123' }), 'pw=[REDACTED]');
   assert.equal(redactSecrets('pwd=mysql-secret-456', { MYSQL_PWD: 'mysql-secret-456' }), 'pwd=[REDACTED]');
+  // Azure-style AccountKey leaves extracted from connection strings must
+  // redact even when only the key value is printed by a CLI.
+  const azureKey = 'SuperSecretAccountKeyValue99';
+  const azureConn = `DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=${azureKey};EndpointSuffix=core.windows.net`;
+  assert.equal(
+    redactSecrets(`isolated=${azureKey}`, { AZURE_STORAGE_CONNECTION_STRING: azureConn }, ['AZURE_STORAGE_CONNECTION_STRING']).includes(azureKey),
+    false,
+    'AccountKey leaf must be redacted when printed alone',
+  );
 });
 
 test('redacts credential leaves from URL query parameters', () => {

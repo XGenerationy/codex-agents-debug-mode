@@ -394,9 +394,10 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
-  // Stable path: three gate-attestation snapshots (first, final, terminal) +
-  // two review-thread walks (2 pages each with this mock) = 3 + 4 = 7 api.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 7);
+  // Stable path: four gate-attestation snapshots (first, final, terminal,
+  // post-thread) + two review-thread walks (2 pages each with this mock) =
+  // 4 snapshots (mix of paginate + graphql) + thread pages → 8 api calls.
+  assert.equal(calls.filter(([command]) => command === 'api').length, 8);
 });
 
 test('re-reads review threads after the terminal snapshot and requires stability', async () => {

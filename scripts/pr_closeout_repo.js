@@ -404,13 +404,29 @@ const scanTouchedSuppressions = async (repo, files) => {
         }
         throw error;
       }
+      // Re-stat the opened descriptor so a TOCTOU grow/replace after lstat
+      // cannot push the read past MAX_SUPPRESSION_SCAN_BYTES.
+      const opened = await handle.stat();
+      if (!opened.isFile()) {
+        findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is not a regular file; refusing to read.' });
+        continue;
+      }
+      if (opened.size > MAX_SUPPRESSION_SCAN_BYTES) {
+        findings.push({
+          file,
+          line: 0,
+          category: 'scan-error',
+          match: `Touched file exceeds suppression scan limit (${opened.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes).`,
+        });
+        continue;
+      }
       // Sample the first bytes for a NUL to detect binary files; scanning
       // them as text via decodeTouchedText already throws on NUL but we want
       // a clean scan-error finding instead of letting the throw bubble.
       // UTF-16 files start with a BOM (FF FE or FE FF) and contain NUL bytes
       // legitimately, so do not flag those as binary.
-      if (stats.size > 0) {
-        const head = await readHeadFromHandle(handle, Math.min(BINARY_SAMPLE_BYTES, stats.size));
+      if (opened.size > 0) {
+        const head = await readHeadFromHandle(handle, Math.min(BINARY_SAMPLE_BYTES, opened.size));
         const isUtf16Bom = head.length >= 2 && (
           (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff)
         );
@@ -419,8 +435,16 @@ const scanTouchedSuppressions = async (repo, files) => {
           continue;
         }
       }
-      const bytes = await handle.readFile();
-      findings.push(...scanSuppressionText(file, decodeTouchedText(bytes)));
+      // Bound the read to the re-stated size so a concurrent grow during
+      // readFile cannot force an unbounded buffer allocation.
+      const bytes = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < opened.size) {
+        const { bytesRead } = await handle.read(bytes, offset, opened.size - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      findings.push(...scanSuppressionText(file, decodeTouchedText(bytes.subarray(0, offset))));
     } catch (error) {
       if (error.code !== 'ENOENT') {
         findings.push({ file, line: 0, category: 'scan-error', match: error.message });

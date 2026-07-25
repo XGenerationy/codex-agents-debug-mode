@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
-const { constants } = require('node:fs');
+const { constants, realpathSync } = require('node:fs');
 const { lstat, mkdir, open, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
@@ -376,7 +376,7 @@ const createDebugServer = ({
   // port_in_use_by_other_process).
   let canonicalProjectRoot = resolvedProjectRoot;
   try {
-    canonicalProjectRoot = require('node:fs').realpathSync(resolvedProjectRoot);
+    canonicalProjectRoot = realpathSync(resolvedProjectRoot);
   } catch {
     // Missing path: keep lexical resolve for first-run startup.
   }

@@ -172,6 +172,53 @@ test('distinguishes status signals from passing failure-path test names', () => 
     }).status,
     'PASS',
   );
+  // Bare Error / Warning diagnostics (with and without bracketed codes).
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: 'Error: something went wrong\n    at Object.<anonymous>',
+    }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: 'Error [ERR_MODULE_NOT_FOUND]: Cannot find module',
+    }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stderr: 'Warning: experimental feature enabled',
+    }).status,
+    'FAIL',
+  );
+  // Passing TAP titles that mention bare Error still must not fail.
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: 'ok 1 - handles Error [ERR_MODULE_NOT_FOUND]: missing',
+    }).status,
+    'PASS',
+  );
+  // Failing TAP counterpart of the passing-title exemption must still FAIL.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'not ok 1 - handles TypeError: invalid value' }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: '  TypeError [ERR_INVALID_ARG_TYPE]: indented diagnostic',
+    }).status,
+    'FAIL',
+  );
+  // Go test SKIP records exit 0 while omitting coverage.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: '--- SKIP: TestNeedsDocker (0.00s)' }).status,
+    'FAIL',
+  );
   assert.equal(classifyOutput({ exitCode: 0, stdout: '1 skipped' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'todo: 2' }).status, 'FAIL');
 });
@@ -707,6 +754,46 @@ test('flags multiline focused/skipped test member access', () => {
     scanSuppressionText('src/foo.test.js', withComment).some(({ category }) => category === 'test-weakening'),
     'describe /* gap */ .skip must be detected',
   );
+  // Same-line whitespace / comment between receiver and focus member.
+  assert.ok(
+    scanSuppressionText('src/foo.test.js', `test . ${only}("focused");`)
+      .some(({ category }) => category === 'test-weakening'),
+    'test . only must be detected',
+  );
+  assert.ok(
+    scanSuppressionText('src/foo.test.js', `test /* note */.${only}("focused");`)
+      .some(({ category }) => category === 'test-weakening'),
+    'test /* note */.only must be detected',
+  );
+  // Negative: an unrelated identifier ending a line followed by an
+  // unrelated .only-named method must not false-positive.
+  const benign = [
+    'const value = compute(test',
+    '  .onlyIfEnabled);',
+  ].join('\n');
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', benign)
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+    'benign multiline .onlyIfEnabled must not flag',
+  );
+});
+
+test('classifies e2e and integration suite filenames as test-like', () => {
+  const only = 'on' + 'ly';
+  for (const file of [
+    'src/login.e2e.ts',
+    'src/redis.integration.js',
+    'src/foo.unit.ts',
+    'e2e/checkout.js',
+    'integration/api.js',
+  ]) {
+    assert.ok(
+      scanSuppressionText(file, `it.${only}("focused");`)
+        .some(({ category }) => category === 'test-weakening'),
+      `${file} must be scanned for test-weakening`,
+    );
+  }
 });
 
 test('flags focus/skip calls inside template-literal interpolations', () => {

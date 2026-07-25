@@ -282,19 +282,23 @@ const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, '
 const statusSignal = (line) => {
   const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?|ING)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
-  // Runtime diagnostics like `TypeError: ...` and Node's bracketed-code form
-  // `TypeError [ERR_INVALID_ARG_TYPE]: ...`. Do not match passing test titles
-  // that merely mention those words (TAP `ok 1 - handles TypeError:` or
-  // Node `# Subtest: handles TypeError: ...`).
-  const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+Warning|[A-Za-z]+Error)(?:\s+\[[^\]]+\])?:\s*\S/;
+  // Runtime diagnostics like `TypeError: ...`, bare `Error: ...`, and Node's
+  // bracketed-code form `Error [ERR_INVALID_ARG_TYPE]: ...` / `TypeError
+  // [ERR_*]: ...`. Do not match passing test titles that merely mention those
+  // words (TAP `ok 1 - handles TypeError:` or Node `# Subtest: handles
+  // TypeError: ...`).
+  const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+(?:Warning|Error)|Warning|Error)(?:\s+\[[^\]]+\])?:\s*\S/;
   const passingTestTitle = /^\s*(?:ok\s+\d+\b|#\s*Subtest:|✓|√|✔|PASS\b|passed\b)/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;
   const npmWarning = /\bnpm\s+WARN\b/i;
+  // Go test SKIP records (`--- SKIP: TestFoo`) exit 0 while omitting coverage.
+  const goSkip = /^\s*---\s*SKIP:\s+\S/;
   const framework = /(?:^\s*(?:not ok\b|#\s*(?:skip|skipped)\b|(?:skipped|failed|blocked|pending|xfailed|xpassed)\b)|\bok\s+\d+\b.*#\s*skip\b)/i;
   const runtimeHit = runtime.test(line) && !passingTestTitle.test(line);
   return /^\s*✖/u.test(line) || COUNTED_SIGNAL.test(line) || BRACKETED_SIGNAL.test(line)
     || LABELLED_SIGNAL.test(line) || uppercase.test(line) || compiler.test(line)
-    || runtimeHit || warning.test(line) || npmWarning.test(line) || framework.test(line);
+    || runtimeHit || warning.test(line) || npmWarning.test(line) || goSkip.test(line)
+    || framework.test(line);
 };
 
 /**
@@ -426,13 +430,16 @@ const scanSuppressionText = (file, text) => {
     // it.only/describe.skip, so focused/skipped E2E coverage in a touched
     // cypress/e2e/login.cy.ts file must be scanned even outside a test/ dir.
     || /\.cy\.[a-z0-9]+$/i.test(base)
+    // Playwright/Jest-style suite suffixes that are not named *.test.* but
+    // still execute under the project test runner when touched.
+    || /\.(?:e2e|integration|unit|accept(?:ance)?|functional|system)\.[a-z0-9]+$/i.test(base)
     // Also classify files inside standard test directories (__tests__/ — a
     // standard Jest layout — plus test/, tests/, spec/, and specs/) as test
     // files even when the filename has no test/spec token, so weakening
     // markers (describe.only/it.skip/test.todo) in tests/foo.js are scanned.
     // The segment must match in full so lookalikes such as contest/, latest/,
     // test-utils/, or __tests_data__/ do not false-positive.
-    || /(?:^|\/)(?:tests?|specs?|__tests__)\//i.test(normalized);
+    || /(?:^|\/)(?:tests?|specs?|__tests__|e2e|integration)\//i.test(normalized);
   const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const markerPattern = new RegExp(MARKERS
     .map((marker) => `(?<![\\w$])${marker.split(/\s+/).map(escape).join('\\s+')}(?![\\w$])`)
@@ -510,7 +517,10 @@ const scanSuppressionText = (file, text) => {
     // describe["skip"] / test[`only`]) are runner-native focus/skip forms. Allow
     // runner modifier chains (test.concurrent.only / it.only.each) on the dot
     // form. `\??\.` accepts both `.` and `?.` so it?.only / describe?.skip match.
-    const testWeakening = /\b(?:describe|it|test|context)(?:\??\.[A-Za-z_]\w*)*\??\.(?:skip|only|todo)\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Allow optional whitespace/comments between the receiver, dots, and the
+    // focus/skip/todo member so `test . only(...)` / `test /* x */.only(...)`
+    // cannot evade the scan. Multiline receiver splits are handled below.
+    const testWeakening = /\b(?:describe|it|test|context)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     /**
      * Scan a whole source line and mark every character position that is
      * inert (inside a string, a line/block comment, or a regex literal), so

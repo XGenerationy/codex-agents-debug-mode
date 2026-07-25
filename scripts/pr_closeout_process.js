@@ -320,6 +320,7 @@ const sweepDetachedOrphans = async ({
   kill = process.kill.bind(process),
   terminationGraceMs = 2000,
   selfPid = process.pid,
+  platform = process.platform,
 } = {}) => {
   // Only *reap* PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
   // unrelated processes that merely work in the same repository and must not
@@ -332,10 +333,20 @@ const sweepDetachedOrphans = async ({
   };
   let remaining = list();
   if (remaining === null) {
-    // Non-Linux: process-group termination is the only containment available.
+    // /proc is required to re-find setsid escapees after process-group kill.
+    // On Linux its absence is an incomplete containment proof → BLOCKED.
+    // On non-Linux hosts /proc is never present; process-group kill is the
+    // only available containment and the authoritative gate runs on Linux CI.
+    if (platform === 'linux') {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Detached orphan sweep unavailable (/proc missing on Linux); cannot prove setsid descendants exited.',
+        escalated: false,
+      };
+    }
     return {
       status: 'PASS',
-      evidence: 'Detached orphan sweep skipped (/proc unavailable).',
+      evidence: 'Detached orphan sweep skipped (/proc unavailable; process-group containment only).',
       escalated: false,
     };
   }
@@ -343,9 +354,16 @@ const sweepDetachedOrphans = async ({
     if (cwd) {
       const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
       if (unmarked === null) {
+        if (platform === 'linux') {
+          return {
+            status: 'BLOCKED',
+            evidence: 'No detached spawn-mark descendants remained, but cwd/fd orphan probe is unavailable on Linux; cannot prove mark-free descendants exited.',
+            escalated: false,
+          };
+        }
         return {
           status: 'PASS',
-          evidence: 'No detached spawn-mark descendants remained; cwd/fd orphan probe unavailable.',
+          evidence: 'No detached spawn-mark descendants remained; cwd/fd orphan probe unavailable (process-group containment only).',
           escalated: false,
         };
       }
@@ -724,6 +742,7 @@ const terminateProcessTree = async ({
         minStarttime,
         kill,
         terminationGraceMs,
+        platform,
       });
       if (sweep.status === 'BLOCKED') {
         return {
@@ -1222,6 +1241,7 @@ const spawnCaptured = async ({
   const child = spawnProcess(shell, shellArgs(command), {
     cwd,
     env: spawnEnv,
+    // Detached so the child is a process-group leader and kill(-pid) works.
     detached: platform !== 'win32',
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],

@@ -708,13 +708,54 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: terminalGateSnapshot.attestation,
       };
     }
+    // The thread walk above is the longest remaining read. Re-capture PR +
+    // gate attestation once more so a check flip / push during that walk
+    // cannot be classified against the pre-walk snapshot.
+    const postThreadPr = await runGh([
+      'pr',
+      'view',
+      '--json',
+      PR_VIEW_FIELDS,
+    ], { repo });
+    if (!Number.isInteger(postThreadPr.number)) {
+      throw new Error('GitHub did not return a post-thread pull request number.');
+    }
+    const postThreadGateSnapshot = await readGateAttestationSnapshotForPr({
+      repo,
+      repository,
+      pr: postThreadPr,
+      expectedBaseSha,
+      expectedHeadSha,
+      expectedConfigDigest,
+      runGh,
+    });
+    const postThreadPrStable = stabilityTuplesMatch(
+      capturePrStabilityTuple(terminalPr),
+      capturePrStabilityTuple(postThreadPr),
+    );
+    const postThreadReviewsStable = stabilityTuplesMatch(
+      terminalGateSnapshot.stabilityTuple,
+      postThreadGateSnapshot.stabilityTuple,
+    );
+    if (!postThreadPrStable || !postThreadReviewsStable) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub PR, check, or review state changed during the terminal thread walk; rerun against a stable remote snapshot.',
+        repository,
+        number: postThreadPr.number,
+        checks: [],
+        unresolvedThreads: terminalUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: postThreadGateSnapshot.attestation,
+      };
+    }
     return classifyLivePrState({
       repository,
-      pr: terminalPr,
+      pr: postThreadPr,
       unresolvedThreads: terminalUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
-      gateAttestation: terminalGateSnapshot.attestation,
+      gateAttestation: postThreadGateSnapshot.attestation,
     });
   } catch (error) {
     return {

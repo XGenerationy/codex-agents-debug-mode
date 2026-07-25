@@ -39,12 +39,14 @@ const git = (args, options = {}) => {
   // Do not trim the full stdout: path lists are NUL-delimited and individual
   // entries may begin/end with whitespace (legal Git paths). Callers that need
   // a trimmed scalar SHA still trim themselves.
+  const { input, ...rest } = options;
   const stdout = execFileSync('git', args, {
     cwd: root,
     encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     maxBuffer: GIT_MAX_BUFFER,
-    ...options,
+    input: input === undefined ? undefined : input,
+    ...rest,
   });
   return String(stdout || '');
 };
@@ -62,11 +64,31 @@ const splitZ = (text) => {
 const isUsableSha = (value) => {
   const sha = String(value || '').trim();
   // GitHub push "before" is 40 zeros when the ref is newly created.
+  // Accept both SHA-1 (≤40) and SHA-256 (64) object IDs.
   if (!sha || /^0+$/.test(sha)) return false;
-  return /^[0-9a-f]{7,40}$/i.test(sha);
+  return /^[0-9a-f]{7,64}$/i.test(sha);
 };
 
-const isEmptyTreeSha = (sha) => String(sha || '').trim() === EMPTY_TREE;
+// Repository-specific empty tree (SHA-1 constant or SHA-256 hash-object result).
+let cachedEmptyTreeSha = null;
+const resolveEmptyTreeSha = () => {
+  if (cachedEmptyTreeSha) return cachedEmptyTreeSha;
+  try {
+    cachedEmptyTreeSha = gitScalar(['hash-object', '-t', 'tree', '--stdin'], { input: '' });
+    if (cachedEmptyTreeSha) return cachedEmptyTreeSha;
+  } catch {
+    // fall through to the well-known SHA-1 empty tree
+  }
+  cachedEmptyTreeSha = EMPTY_TREE;
+  return cachedEmptyTreeSha;
+};
+
+const isEmptyTreeSha = (sha) => {
+  const value = String(sha || '').trim();
+  if (!value) return false;
+  if (value === EMPTY_TREE) return true;
+  return value === resolveEmptyTreeSha();
+};
 
 const resolveBaseSha = () => {
   const explicit = [
@@ -108,12 +130,13 @@ const resolveBaseSha = () => {
     }
   }
 
-  // Last resort for a first commit on a new repo: the empty tree object.
+  // Last resort for a first commit on a new repo: the empty tree object
+  // (SHA-1 well-known ID or the repository's SHA-256 empty tree).
   try {
-    const hashed = gitScalar(['hash-object', '-t', 'tree', '/dev/null']);
-    if (isUsableSha(hashed) || hashed === EMPTY_TREE) return hashed || EMPTY_TREE;
+    const empty = resolveEmptyTreeSha();
+    if (isUsableSha(empty) || isEmptyTreeSha(empty)) return empty;
   } catch {
-    // Windows may not have /dev/null as a usable path for hash-object.
+    // fall through
   }
   try {
     gitScalar(['cat-file', '-t', EMPTY_TREE]);
@@ -141,12 +164,14 @@ const diffNameOnly = (baseSha) => {
  */
 const diffUnified = (baseSha, files) => {
   if (!files.length) return '';
+  // --no-textconv: a configured textconv filter must not rewrite deleted
+  // validation lines before detectValidationRemovals scans the diff.
   if (isEmptyTreeSha(baseSha)) {
-    return git(['diff', '--unified=0', '--no-ext-diff', baseSha, 'HEAD', '--', ...files]);
+    return git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', baseSha, 'HEAD', '--', ...files]);
   }
   // Three-dot: only PR-range changes (merge-base...HEAD), not base-branch-only
   // edits that would appear in a two-endpoint diff against a moved base tip.
-  return git(['diff', '--unified=0', '--no-ext-diff', `${baseSha}...HEAD`, '--', ...files]);
+  return git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', `${baseSha}...HEAD`, '--', ...files]);
 };
 
 const listTouchedFiles = (baseSha) => {
@@ -178,7 +203,9 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-.*\bscan:suppressions\b/i,
   /^\-.*\bnode\s+--test\b/i,
   /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
-  /^\-\s*-\s*name:\s*.*(?:test|validate|audit|scan|lint|codeql|security|coverage)/i,
+  // Word-boundary the keywords so values like `windows-latest` or
+  // `attestation` do not match the bare `test` / `scan` substrings.
+  /^\-\s*-\s*name:\s*.*\b(?:test|validate|audit|scan|lint|codeql|security|coverage)\b/i,
   // Common validation commands removed from block steps while `run: |` remains.
   /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,

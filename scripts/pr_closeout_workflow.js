@@ -692,7 +692,13 @@ const runCloseoutWorkflow = async ({
   const headConsistency = consistencyProblems.length
     ? { status: 'BLOCKED', evidence: consistencyProblems.join(' ') }
     : { status: 'PASS', evidence: `Evidence belongs to final base ${finalState.baseSha} and head ${finalState.headSha}.` };
-  const beforeGithubFingerprint = attestationAdmitted
+  // Cheap clean-tree probe before any fingerprint: a dirty tree already fails
+  // closeout, so skip streaming multi-gigabyte untracked artifacts through
+  // workingTreeFingerprint on the dirty path (before and after GitHub).
+  let preGithubCleanTree = attestationAdmitted
+    ? await d.cleanTreeStatus(finalState.repo)
+    : { status: 'BLOCKED', evidence: 'Pre-GitHub tree inspection did not run because attestation admission was not clean.' };
+  const beforeGithubFingerprint = (attestationAdmitted && preGithubCleanTree.status === 'PASS')
     ? await d.workingTreeFingerprint(finalState.repo, reproducibilityPaths)
     : null;
   const livePrState = await d.readLivePrState({
@@ -706,9 +712,6 @@ const runCloseoutWorkflow = async ({
   let cleanTree = { status: 'BLOCKED', evidence: 'Final tree inspection did not run because attestation admission was not clean.' };
   let finalGateChanges = { changedFiles: [], addedLines: [] };
   if (attestationAdmitted) {
-    // Cheap clean-tree probe first: a dirty tree already fails closeout, so
-    // avoid streaming multi-gigabyte untracked artifacts through
-    // workingTreeFingerprint before that rejection.
     [finalSuppressions, cleanTree, finalGateChanges] = await Promise.all([
       d.scanTouchedSuppressions(observedState.repo, observedState.touchedFiles),
       d.cleanTreeStatus(observedState.repo),
@@ -847,7 +850,51 @@ const runCloseoutWorkflow = async ({
     suppressionFindings: finalSuppressions,
   });
   await d.prepareOutputDirectory({ repo: initial.repo, outputDir: resolvedOutput });
-  const paths = await d.writeEvidenceReport({ outputDir: resolvedOutput, report });
+  let paths = await d.writeEvidenceReport({ outputDir: resolvedOutput, report });
+  // Post-write seal: a same-user swap of the output directory (or an ancestor)
+  // after prepareOutputDirectory could redirect report.json/report.md into the
+  // repository. Re-fingerprint and rewrite the report as non-PASS if the tree
+  // moved after the evidence write.
+  if (attestationAdmitted) {
+    const postWriteState = await d.resolveRepositoryState({ repo: sealedState.repo, baseRef });
+    const postWriteFingerprint = await d.workingTreeFingerprint(postWriteState.repo, reproducibilityPaths);
+    const postWriteSeal = sealRepository({
+      validatedState: evidenceState,
+      observedState: postWriteState,
+      sealedState: postWriteState,
+      beforeFingerprint: evidenceFingerprint,
+      afterFingerprint: postWriteFingerprint,
+    });
+    if (postWriteSeal.status !== 'PASS') {
+      repositorySeal = {
+        ...repositorySeal,
+        status: repositorySeal.status === 'FAIL' || postWriteSeal.status === 'FAIL' ? 'FAIL' : 'BLOCKED',
+        evidenceWrite: {
+          status: postWriteSeal.status,
+          evidence: `Post-write seal failed: ${postWriteSeal.evidence}`,
+          fingerprint: postWriteFingerprint,
+        },
+      };
+      report = {
+        ...report,
+        repositorySeal: normalizePersistedPaths(repositorySeal, sealedState.repo, resolvedOutput),
+      };
+      report.overallStatus = evaluateOverallStatus({
+        planStatus,
+        preflight,
+        gateIntegrity,
+        phases,
+        reproducibility,
+        cleanTree,
+        headConsistency,
+        repositorySeal,
+        livePrState,
+        suppressionFindings: finalSuppressions,
+      });
+      await d.prepareOutputDirectory({ repo: initial.repo, outputDir: resolvedOutput });
+      paths = await d.writeEvidenceReport({ outputDir: resolvedOutput, report });
+    }
+  }
   return { report, paths };
 };
 

@@ -462,8 +462,9 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   const infoAttributesBackup = `${infoAttributes}.closeout-disabled.${process.pid}`;
   let attributesMoved = false;
   // Sync restore for signal handlers: async finally may not run on SIGINT/
-  // SIGTERM before process exit, which would leave the validated repo without
-  // .git/info/attributes and an orphaned closeout-disabled backup.
+  // SIGTERM/SIGHUP/SIGBREAK before process exit, which would leave the
+  // validated repo without .git/info/attributes and an orphaned
+  // closeout-disabled backup.
   const restoreAttributesSync = () => {
     if (!attributesMoved) return;
     try {
@@ -483,28 +484,34 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   // After restore, re-deliver the signal so default Node termination runs.
   // Leaving the handler installed would swallow Ctrl-C / CI SIGTERM and let
   // closeout continue after attributes were restored.
-  const onSigInt = () => {
-    restoreAttributesSync();
-    process.removeListener('SIGINT', onSigInt);
-    process.removeListener('SIGTERM', onSigTerm);
-    try {
-      process.kill(process.pid, 'SIGINT');
-    } catch {
-      process.exit(130);
-    }
+  const signalExitCodes = {
+    SIGINT: 130,
+    SIGTERM: 143,
+    SIGHUP: 129,
+    SIGBREAK: 1,
   };
-  const onSigTerm = () => {
-    restoreAttributesSync();
-    process.removeListener('SIGINT', onSigInt);
-    process.removeListener('SIGTERM', onSigTerm);
-    try {
-      process.kill(process.pid, 'SIGTERM');
-    } catch {
-      process.exit(143);
+  const restoreSignals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  if (process.platform === 'win32') restoreSignals.push('SIGBREAK');
+  const signalHandlers = new Map();
+  const detachAllSignalHandlers = () => {
+    for (const [signal, handler] of signalHandlers) {
+      process.removeListener(signal, handler);
     }
+    signalHandlers.clear();
   };
-  process.on('SIGINT', onSigInt);
-  process.on('SIGTERM', onSigTerm);
+  for (const signal of restoreSignals) {
+    const handler = () => {
+      restoreAttributesSync();
+      detachAllSignalHandlers();
+      try {
+        process.kill(process.pid, signal);
+      } catch {
+        process.exit(signalExitCodes[signal] ?? 1);
+      }
+    };
+    signalHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
   try {
     try {
       await rename(infoAttributes, infoAttributesBackup);
@@ -534,14 +541,17 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       }
     }
   } finally {
-    process.removeListener('SIGINT', onSigInt);
-    process.removeListener('SIGTERM', onSigTerm);
+    // Restore attributes while signal handlers still cover the async rename
+    // window, then detach. A signal mid-restore still runs restoreAttributesSync.
     if (attributesMoved) {
       try {
         await rename(infoAttributesBackup, infoAttributes);
         attributesMoved = false;
       } catch (restoreError) {
-        if (!primaryError) throw restoreError;
+        if (!primaryError) {
+          detachAllSignalHandlers();
+          throw restoreError;
+        }
         // Primary path already failed; still surface that the repo was left
         // without its .git/info/attributes (orphaned closeout-disabled file).
         const detail = `Failed to restore ${infoAttributes}: ${restoreError?.message || restoreError}`;
@@ -553,6 +563,7 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
         }
       }
     }
+    detachAllSignalHandlers();
   }
 };
 

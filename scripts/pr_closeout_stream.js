@@ -112,7 +112,10 @@ const secretComponents = (value) => {
       if (param && isCredentialKey.test(key)) components.push(param);
     }
   } catch {
-    for (const match of String(value).matchAll(/(?:^|[;\s])(?:password|passwd|pwd|secret|token|user(?:name| id)?)=([^;\s]+)/gi)) {
+    // Include Azure-style AccountKey / SharedAccessKey / access-key leaves so
+    // a CLI that prints only the key value (not the whole connection string)
+    // is still redacted.
+    for (const match of String(value).matchAll(/(?:^|[;\s])(?:password|passwd|pwd|secret|token|user(?:name| id)?|account[_-]?key|shared[_-]?access[_-]?key|access[_-]?key|api[_-]?key|private[_-]?key)=([^;\s]+)/gi)) {
       components.push(match[1]);
     }
   }
