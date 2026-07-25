@@ -355,11 +355,15 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //    so a validation command that sets core.fsmonitor gets code executed.
   //  - core.attributesFile: a global attributes file plus a per-driver smudge
   //    filter can run an external command during the worktree checkout.
-  //  - filter.<driver>.smudge / .clean: repository-local filter drivers are a
-  //    separate config surface from core.attributesFile; clearing only the
-  //    global attributes path still lets `.git/info/attributes` assign a
-  //    driver whose smudge command runs during checkout. Neutralize every
-  //    configured local filter.*.smudge/clean via -c overrides.
+  //  - filter.<driver>.{smudge,clean,process,required}: repository-local
+  //    filter drivers are a separate config surface from core.attributesFile.
+  //    Clearing only the global attributes path still lets `.git/info/
+  //    attributes` or in-tree `.gitattributes` assign a driver. Git prefers
+  //    `filter.<driver>.process` (long-running filter protocol) over smudge/
+  //    clean when present, so neutralizing only smudge/clean leaves an
+  //    executable path open. Enumerate every local filter.* key, then for
+  //    each driver name force smudge=/clean=/process= empty and
+  //    required=false via -c overrides.
   //  - `.git/info/attributes`: temporarily rename away during the internal
   //    checkout so per-repo attributes cannot re-enable a filter driver even
   //    if config discovery misses a name.
@@ -367,15 +371,27 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   await mkdir(noHooksDir, { recursive: true });
   const filterOverrides = [];
   try {
-    const listed = await runGit(repo, ['config', '--local', '--get-regexp', '^filter\\..*\\.(smudge|clean)$'], {
+    // Match any filter.<driver>.<setting> key so process/required cannot hide
+    // behind a non-smudge/clean suffix.
+    const listed = await runGit(repo, ['config', '--local', '--get-regexp', '^filter\\.'], {
       ...(env ? { env } : {}),
       ...(timeoutMs ? { timeout: timeoutMs } : {}),
     });
+    const drivers = new Set();
     for (const line of String(listed || '').split(/\r?\n/)) {
       const key = line.trim().split(/\s+/, 1)[0];
-      if (key && key.startsWith('filter.')) {
-        filterOverrides.push('-c', `${key}=`);
-      }
+      if (!key || !key.startsWith('filter.')) continue;
+      const parts = key.split('.');
+      // filter.<driver>.<setting> — require at least three segments.
+      if (parts.length >= 3 && parts[1]) drivers.add(parts[1]);
+    }
+    for (const driver of drivers) {
+      filterOverrides.push(
+        '-c', `filter.${driver}.smudge=`,
+        '-c', `filter.${driver}.clean=`,
+        '-c', `filter.${driver}.process=`,
+        '-c', `filter.${driver}.required=false`,
+      );
     }
   } catch {
     // No local filter keys (exit 1 from --get-regexp) is fine.

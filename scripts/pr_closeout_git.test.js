@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { access, mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
+const { access, chmod, mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -381,6 +381,57 @@ test('neutralizes repository filter drivers and .git/info/attributes during base
     // Restored for the main repo after the helper finishes.
     const restoredAfter = require('node:fs').readFileSync(path.join(infoDir, 'attributes'), 'utf8');
     assert.match(restoredAfter, /filter=evil/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+
+test('neutralizes filter.<driver>.process and required during baseline worktree checkout', async () => {
+  // Git prefers filter.<driver>.process over smudge/clean when present. A
+  // hostile validation command can set only process+required (no smudge) and
+  // assign the driver via in-tree .gitattributes; parking .git/info/attributes
+  // alone does not cover that path, and clearing only smudge/clean leaves
+  // process executable during `git worktree add`.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-filter-process-'));
+  const marker = path.join(repo, 'evil-process-ran');
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    // In-tree attributes (not .git/info/attributes) so info-park alone is
+    // insufficient defense.
+    await writeFile(path.join(repo, '.gitattributes'), 'tracked.txt filter=evil\n');
+    git(repo, 'add', 'tracked.txt', '.gitattributes');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+
+    const evilScript = path.join(repo, 'evil-process.sh');
+    // Side-effect marker + hard fail: if process is invoked, the checkout is
+    // not a clean unfiltered blob (required=true makes the failure fatal).
+    await writeFile(
+      evilScript,
+      `#!/bin/sh\nprintf 'ran\\n' >> '${marker.replace(/'/g, "'\\''")}'\nexit 1\n`,
+    );
+    await chmod(evilScript, 0o755);
+    git(repo, 'config', 'filter.evil.process', evilScript);
+    git(repo, 'config', 'filter.evil.required', 'true');
+    // Deliberately do NOT set smudge/clean — the incomplete fix only cleared
+    // those keys and would leave process live.
+
+    const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
+      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n');
+      assert.equal(content, 'base\n', 'process filter must not rewrite or block the baseline checkout');
+      return 'verified';
+    });
+    assert.equal(value, 'verified');
+    assert.equal(
+      require('node:fs').existsSync(marker),
+      false,
+      'filter.evil.process must never have been invoked during the baseline checkout',
+    );
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
