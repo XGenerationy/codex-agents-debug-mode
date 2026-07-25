@@ -395,14 +395,15 @@ test('queries live PR metadata and paginates unresolved review threads', async (
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.unresolvedThreads.length, 1);
   // Stable path: four gate-attestation snapshots (first, final, terminal,
-  // post-thread) + two review-thread walks (2 pages each with this mock) =
-  // 4 snapshots (mix of paginate + graphql) + thread pages → 8 api calls.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 8);
+  // post-thread) + three review-thread walks (2 pages each with this mock) =
+  // 4 snapshots (mix of paginate + graphql) + 6 thread pages → 10 api calls.
+  assert.equal(calls.filter(([command]) => command === 'api').length, 10);
 });
 
 test('re-reads review threads after the terminal snapshot and requires stability', async () => {
-  // Stable path does two review-thread reads: one after PR/review stability,
-  // one after the terminal PR+attestation snapshot. Both must match.
+  // Stable path does three review-thread reads: after PR/review stability,
+  // after the terminal PR+attestation snapshot, and after the post-thread
+  // PR/gate re-fetch. All three must match.
   let threadReads = 0;
   const result = await readLivePrState({
     repo: 'C:/repo',
@@ -431,8 +432,53 @@ test('re-reads review threads after the terminal snapshot and requires stability
       };
     },
   });
-  assert.equal(threadReads, 2, 'stable path must re-read review threads after the terminal snapshot');
+  assert.equal(threadReads, 3, 'stable path must re-read review threads after terminal and post-thread snapshots');
   assert.equal(result.unresolvedThreads.length, 1);
+});
+
+test('blocks when review threads change during the post-thread verification window', async () => {
+  let threadReads = 0;
+  const openThread = {
+    isResolved: false,
+    isOutdated: false,
+    path: 'src/a.ts',
+    line: 4,
+    comments: { nodes: [{ url: 'https://github.example/comment/1' }] },
+  };
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        threadReads += 1;
+        // First two walks agree (empty). Third (post-thread) surfaces a new
+        // unresolved thread opened during the PR/gate re-fetch window.
+        const nodes = threadReads >= 3 ? [openThread] : [];
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes,
+            pageInfo: { hasNextPage: false, endCursor: null },
+          } } } },
+        };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /threads changed during post-thread/i);
+  assert.equal(result.unresolvedThreads.length, 1);
+  assert.equal(threadReads, 3);
 });
 
 test('blocks when the PR head changes during live verification', async () => {

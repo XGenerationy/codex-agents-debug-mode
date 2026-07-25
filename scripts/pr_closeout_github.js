@@ -749,10 +749,29 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: postThreadGateSnapshot.attestation,
       };
     }
+    // The post-thread PR/gate re-fetch itself is another network window. A
+    // new unresolved review thread opened in that window would leave
+    // terminalUnresolvedThreads stale (often empty) while PR/checks still
+    // look stable — re-read threads and require an identical set before PASS.
+    const postThreadUnresolvedThreads = await readUnresolvedReviewThreads({
+      repo, owner, name, number: postThreadPr.number, runGh,
+    });
+    if (threadTuple(terminalUnresolvedThreads) !== threadTuple(postThreadUnresolvedThreads)) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub review threads changed during post-thread verification; rerun against a stable remote snapshot.',
+        repository,
+        number: postThreadPr.number,
+        checks: [],
+        unresolvedThreads: postThreadUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: postThreadGateSnapshot.attestation,
+      };
+    }
     return classifyLivePrState({
       repository,
       pr: postThreadPr,
-      unresolvedThreads: terminalUnresolvedThreads,
+      unresolvedThreads: postThreadUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: postThreadGateSnapshot.attestation,
