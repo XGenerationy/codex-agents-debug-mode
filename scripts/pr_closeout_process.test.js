@@ -1400,8 +1400,8 @@ test('rejects an untrusted SystemRoot absolute path for Windows cleanup tools', 
     platform: 'win32',
     env: {
       SystemRoot: 'C:\\Users\\attacker\\planted',
-      __closeoutPathExists: (candidate) => /planted/i.test(candidate),
     },
+    pathExists: (candidate) => /planted/i.test(candidate),
     kill: () => true,
     runExecFile: async (file, args) => {
       calls.push(file);
@@ -1420,10 +1420,9 @@ test('fails artifact proof when the file exceeds the hash size ceiling', async (
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-huge-artifact-'));
   try {
     const artifact = path.join(repo, 'huge.bin');
-    // Sparse-ish large buffer without writing multi-GB to disk: create a small
-    // file then inject size via a custom hash? snapshotArtifactProof uses real
-    // lstat size before hashing. Write a file just over the limit is too big
-    // for CI (5MB is fine though).
+    // One byte over the ceiling: snapshotArtifactProof reads the real lstat
+    // size before hashing, so 5 MiB + 1 is enough to trip the bound and is
+    // cheap enough for CI.
     const oversized = Buffer.alloc(MAX_ARTIFACT_HASH_BYTES + 1, 0x61);
     await writeFile(artifact, oversized);
     const result = await snapshotArtifactProof({

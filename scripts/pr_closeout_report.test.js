@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { mkdtemp, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
+const { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -367,6 +367,30 @@ test('writeEvidenceReport commits report.json and report.md as a pair (no leftov
     const md = await readFile(path.join(outputDir, 'report.md'), 'utf8');
     assert.equal(json.overallStatus, 'PASS');
     assert.match(md, /\*\*PASS\*\*/);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport removes report.json when the report.md rename fails', async () => {
+  // Force the second rename to fail by pre-creating report.md as a directory
+  // (rename onto an existing non-empty directory fails). The already-committed
+  // report.json must be removed so consumers never see a contradictory pair.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-mdfail-'));
+  try {
+    await mkdir(path.join(outputDir, 'report.md'));
+    await writeFile(path.join(outputDir, 'report.md', 'blocker'), 'x', 'utf8');
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+      /./,
+    );
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.json must be removed when report.md commit fails',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
   } finally {
     await rm(outputDir, { recursive: true, force: true });
   }

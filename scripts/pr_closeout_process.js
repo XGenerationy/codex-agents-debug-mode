@@ -468,6 +468,7 @@ const terminateProcessTree = async ({
   terminationGraceMs = 2000,
   runExecFile = execFileAsync,
   kill = process.kill.bind(process),
+  pathExists,
   closePromise,
   spawnMark,
   cwd,
@@ -485,8 +486,10 @@ const terminateProcessTree = async ({
       // and that the real taskkill + powershell binaries exist there; otherwise
       // fall back to the hard-coded C:\\Windows default (which tests also use
       // as a pure path-construction base when pathExists is not injected).
-      const pathExists = typeof env.__closeoutPathExists === 'function'
-        ? env.__closeoutPathExists
+      // Existence probe is an explicit DI option (never read from env — env is
+      // untrusted process.env in production). Default to fs.existsSync.
+      const existsCheck = typeof pathExists === 'function'
+        ? pathExists
         : (candidate) => {
           try {
             const { existsSync } = require('node:fs');
@@ -504,23 +507,26 @@ const terminateProcessTree = async ({
         if (!looksLikeWindowsRoot(root)) return false;
         const taskkillPath = path.join(root, 'System32', 'taskkill.exe');
         const powershellPath = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-        return pathExists(taskkillPath) && pathExists(powershellPath);
+        return existsCheck(taskkillPath) && existsCheck(powershellPath);
       };
       const envRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim();
       const hardcodedRoot = 'C:\\Windows';
-      // Prefer the hard-coded system location whenever it is present and
-      // trusted. An attacker-controlled SystemRoot that merely looks like a
-      // Windows tree (and contains planted taskkill/powershell binaries) must
-      // never override a real system install.
+      // Prefer hard-coded C:\\Windows whenever it exists and is trusted.
+      // On real win32 hosts, never accept a merely Windows-shaped envRoot when
+      // the hard-coded install is missing — fall back to C:\\Windows for path
+      // construction rather than attacker-controlled SystemRoot.
+      // On non-win32 (unit tests with mocked runExecFile), a Windows-shaped
+      // envRoot is allowed for path construction only.
       let safeRoot = hardcodedRoot;
       if (isTrustedSystemRoot(hardcodedRoot)) {
         safeRoot = hardcodedRoot;
-      } else if (isTrustedSystemRoot(envRoot)) {
-        safeRoot = envRoot;
+      } else if (platform === 'win32') {
+        if (isTrustedSystemRoot(envRoot)) {
+          safeRoot = envRoot;
+        } else {
+          safeRoot = hardcodedRoot;
+        }
       } else if (looksLikeWindowsRoot(envRoot)) {
-        // Unit tests / non-Windows hosts: no real install on disk. Still reject
-        // absolute non-Windows paths; accept only a Windows-shaped root for
-        // path construction used by mocked runExecFile.
         safeRoot = envRoot;
       } else {
         safeRoot = hardcodedRoot;

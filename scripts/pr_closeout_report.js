@@ -330,7 +330,11 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
     try {
       await rename(markdownTmp, markdown);
     } catch (error) {
-      await unlink(json).catch(() => {});
+      let orphaned = false;
+      await unlink(json).catch(() => { orphaned = true; });
+      if (orphaned) {
+        error.message = `${error.message || error} (report.md commit failed and ${json} could not be removed; the report pair is inconsistent)`;
+      }
       throw error;
     }
   } catch (error) {

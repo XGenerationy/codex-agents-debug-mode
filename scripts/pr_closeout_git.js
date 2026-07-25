@@ -381,9 +381,11 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
     for (const line of String(listed || '').split(/\r?\n/)) {
       const key = line.trim().split(/\s+/, 1)[0];
       if (!key || !key.startsWith('filter.')) continue;
-      const parts = key.split('.');
-      // filter.<driver>.<setting> — require at least three segments.
-      if (parts.length >= 3 && parts[1]) drivers.add(parts[1]);
+      // filter.<driver>.<setting>: driver may contain dots (filter.a.b.process).
+      const lastDot = key.lastIndexOf('.');
+      if (lastDot <= 'filter.'.length) continue;
+      const driver = key.slice('filter.'.length, lastDot);
+      if (driver) drivers.add(driver);
     }
     for (const driver of drivers) {
       filterOverrides.push(
@@ -458,6 +460,15 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
         await rename(infoAttributesBackup, infoAttributes);
       } catch (restoreError) {
         if (!primaryError) throw restoreError;
+        // Primary path already failed; still surface that the repo was left
+        // without its .git/info/attributes (orphaned closeout-disabled file).
+        const detail = `Failed to restore ${infoAttributes}: ${restoreError?.message || restoreError}`;
+        primaryError.restoreFailure = detail;
+        try {
+          process.stderr.write(`${detail}\n`);
+        } catch {
+          // stderr may be closed; property attachment above is enough.
+        }
       }
     }
   }

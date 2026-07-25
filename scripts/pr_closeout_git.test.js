@@ -438,6 +438,39 @@ test('neutralizes filter.<driver>.process and required during baseline worktree 
 });
 
 
+
+test('neutralizes dotted filter driver names (filter.a.b.process)', async () => {
+  // Git allows dotted filter subsection names. Parsing only parts[1] would
+  // neutralize filter.a.* while leaving filter.a.b.process intact.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-dotted-filter-'));
+  const marker = path.join(repo, 'dotted-process-ran');
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    await writeFile(path.join(repo, '.gitattributes'), 'tracked.txt filter=a.b\n');
+    git(repo, 'add', 'tracked.txt', '.gitattributes');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+    const evilScript = path.join(repo, 'evil-dotted.sh');
+    await writeFile(evilScript, `#!/bin/sh\nprintf 'ran\\n' >> '${marker.replace(/'/g, "'\\''")}'\nexit 1\n`);
+    await chmod(evilScript, 0o755);
+    git(repo, 'config', 'filter.a.b.process', evilScript);
+    git(repo, 'config', 'filter.a.b.required', 'true');
+    const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
+      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n');
+      assert.equal(content, 'base\n');
+      return 'ok';
+    });
+    assert.equal(value, 'ok');
+    assert.equal(require('node:fs').existsSync(marker), false);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('fails closed when local filter.* enumeration is not a clean empty match', async () => {
   // Swallowing every get-regexp error would skip filterOverrides and leave
   // process/required active during worktree add. Only exit code 1 (no matches)

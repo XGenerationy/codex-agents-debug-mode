@@ -34,6 +34,9 @@ const assertNotSymlink = async (target, message) => {
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
 const openNoFollow = async (target, flags, mode = 0o666) => {
+  if (!Number.isInteger(flags)) {
+    throw new TypeError('openNoFollow requires numeric fs.constants flags.');
+  }
   const noFollow = constants.O_NOFOLLOW || 0;
   try {
     return await open(target, flags | noFollow, mode);
