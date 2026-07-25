@@ -1,5 +1,5 @@
 const { constants } = require('node:fs');
-const { mkdir, open } = require('node:fs/promises');
+const { lstat, mkdir, open } = require('node:fs/promises');
 const path = require('node:path');
 
 const safeText = (value) => String(value ?? '')
@@ -255,16 +255,38 @@ const renderMarkdown = (report) => {
   return lines.join('\n');
 };
 
+// Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
+// (the path is about to be created). This is the primary guard on platforms
+// without O_NOFOLLOW (Node's fs.constants.O_NOFOLLOW is undefined on
+// Windows, so the open-time defense in writeNoFollow below is a silent
+// no-op there) and defense-in-depth everywhere else. Mirrors
+// debug_server.js's assertNotSymlink.
+const assertNotSymlink = async (target) => {
+  let info;
+  try {
+    info = await lstat(target);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error(`Refusing to write evidence report through an existing symlink: ${target}`);
+  }
+};
+
 // Write without following a symlinked final component. writeFile follows a
 // symlink; if outputDir already contains report.json/report.md as a symlink
 // (a reused temp directory or otherwise-populated output path), a
 // path-based write would silently overwrite whatever the link points to
 // instead of writing evidence there — and by this point the repository seal
 // has already run, so it cannot catch the divergence. Fail closed instead.
-// On platforms without O_NOFOLLOW the open falls back to following
-// semantics, matching the read-side openNoFollow helpers elsewhere in this
-// codebase (e.g. pr_closeout_repo.js).
+// The lstat check above is what actually enforces this on platforms without
+// O_NOFOLLOW (e.g. Windows); the O_NOFOLLOW open flag below is
+// defense-in-depth against the TOCTOU gap between that lstat and this open
+// on platforms that do support it, matching the read-side openNoFollow
+// helpers elsewhere in this codebase (e.g. pr_closeout_repo.js).
 const writeNoFollow = async (target, contents) => {
+  await assertNotSymlink(target);
   const noFollow = constants.O_NOFOLLOW || 0;
   let handle;
   try {
