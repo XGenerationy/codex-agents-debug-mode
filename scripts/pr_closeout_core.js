@@ -270,9 +270,10 @@ const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, '
  * counted term (`3 errors`, `errors: 3`, via COUNTED_SIGNAL); a bracketed tag
  * (`[FAIL]`) or labelled line (`Warnings:`) at line start; an all-caps
  * leading status word; compiler-style diagnostics (`file.js:12:3: warning
- * ...`); a runtime `SomeWarning:`/`SomeError:` class name; a leading
- * `warning` word (including Node's `(node:1234) Warning:` form); `npm WARN`;
- * and TAP/test-framework markers (`not ok`, `# skip`, bare
+ * ...`); a runtime `SomeWarning:`/`SomeError:` class name (including Node's
+ * `TypeError [ERR_...]: ...` bracketed-code form); a leading `warning` word
+ * (including Node's `(node:1234) Warning:` form); `npm WARN`; and
+ * TAP/test-framework markers (`not ok`, `# skip`, bare
  * `skipped`/`failed`/`blocked`/`pending`/`xfailed`/`xpassed`, or `ok N ... #
  * skip`).
  * @param {string} line - A single line of command output (already ANSI-stripped).
@@ -281,10 +282,11 @@ const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, '
 const statusSignal = (line) => {
   const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?|ING)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
-  // Runtime diagnostics like `TypeError: ...`. Do not match passing test
-  // titles that merely mention those words (TAP `ok 1 - handles TypeError:`
-  // or Node `# Subtest: handles TypeError: ...`).
-  const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+Warning|[A-Za-z]+Error):\s*\S/;
+  // Runtime diagnostics like `TypeError: ...` and Node's bracketed-code form
+  // `TypeError [ERR_INVALID_ARG_TYPE]: ...`. Do not match passing test titles
+  // that merely mention those words (TAP `ok 1 - handles TypeError:` or
+  // Node `# Subtest: handles TypeError: ...`).
+  const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+Warning|[A-Za-z]+Error)(?:\s+\[[^\]]+\])?:\s*\S/;
   const passingTestTitle = /^\s*(?:ok\s+\d+\b|#\s*Subtest:|✓|√|✔|PASS\b|passed\b)/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;
   const npmWarning = /\bnpm\s+WARN\b/i;
@@ -721,20 +723,123 @@ const scanSuppressionText = (file, text) => {
     // ends with a bare test receiver (so quoted fixtures like
     // `'describe.only(...)'` on a single line are not re-scanned without
     // string inertness). Collapse comments/whitespace across at most 3 lines.
+    //
+    // Quote stripping must not erase executable template interpolations: a
+    // naive backtick strip would drop `${test\n  .only(...)}` entirely and
+    // re-open a multiline bypass. Single/double-quoted strings are removed
+    // wholesale; template literals keep only their `${...}` expression bodies
+    // (static template text is inert and discarded).
+    const stripQuotesPreserveTemplateExpr = (text) => {
+      let out = '';
+      let i = 0;
+      while (i < text.length) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"') {
+          const quote = ch;
+          i += 1;
+          while (i < text.length) {
+            if (text[i] === '\\') {
+              i += 2;
+              continue;
+            }
+            if (text[i] === quote) {
+              i += 1;
+              break;
+            }
+            i += 1;
+          }
+          out += ' ';
+          continue;
+        }
+        if (ch === '`') {
+          i += 1;
+          while (i < text.length) {
+            if (text[i] === '\\') {
+              i += 2;
+              continue;
+            }
+            if (text[i] === '`') {
+              i += 1;
+              break;
+            }
+            if (text[i] === '$' && text[i + 1] === '{') {
+              i += 2;
+              let depth = 1;
+              let start = i;
+              let nestedQuote = null;
+              let nestedEscaped = false;
+              while (i < text.length && depth > 0) {
+                const c = text[i];
+                if (nestedQuote) {
+                  if (nestedEscaped) {
+                    nestedEscaped = false;
+                  } else if (c === '\\') {
+                    nestedEscaped = true;
+                  } else if (c === nestedQuote) {
+                    nestedQuote = null;
+                  }
+                  i += 1;
+                  continue;
+                }
+                if (c === "'" || c === '"' || c === '`') {
+                  nestedQuote = c;
+                  i += 1;
+                  continue;
+                }
+                if (c === '{') {
+                  depth += 1;
+                  i += 1;
+                  continue;
+                }
+                if (c === '}') {
+                  depth -= 1;
+                  if (depth === 0) {
+                    // Recurse so nested templates inside the expression also
+                    // preserve only their live ${...} bodies.
+                    out += stripQuotesPreserveTemplateExpr(text.slice(start, i));
+                    i += 1;
+                    break;
+                  }
+                  i += 1;
+                  continue;
+                }
+                i += 1;
+              }
+              // Unclosed `${` at end of the scan window (receiver split across
+              // the window boundary): still emit the partial expression so a
+              // bare `test` inside `${test` can open the multiline fallback.
+              if (depth > 0) {
+                out += stripQuotesPreserveTemplateExpr(text.slice(start, i));
+              }
+              continue;
+            }
+            // Static template text is inert — drop it.
+            i += 1;
+          }
+          out += ' ';
+          continue;
+        }
+        out += ch;
+        i += 1;
+      }
+      return out;
+    };
     if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
       const windowWeakening = new RegExp(testWeakening.source, 'i');
       const bareReceiver = /\b(?:describe|it|test|context)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
       for (let i = 0; i < lines.length; i += 1) {
-        const lead = lines[i]
-          .replace(/\/\*[\s\S]*?\*\//g, ' ')
-          .replace(/\/\/[^\n]*/g, '');
+        // Strip quotes across the full window first so a live receiver that
+        // only becomes visible after `${...}` extraction (e.g. `${test` on
+        // one line and `.only(...)}` on the next) can open the fallback.
+        // Static template text is discarded and cannot open a window.
+        const strippedWindow = stripQuotesPreserveTemplateExpr(
+          lines.slice(i, i + 3).join('\n')
+            .replace(/\/\*[\s\S]*?\*\//g, ' ')
+            .replace(/\/\/[^\n]*/g, ' '),
+        );
+        const lead = (strippedWindow.split('\n')[0] ?? '');
         if (!bareReceiver.test(lead.trimEnd())) continue;
-        const windowText = lines.slice(i, i + 3).join('\n')
-          .replace(/\/\*[\s\S]*?\*\//g, ' ')
-          .replace(/\/\/[^\n]*/g, ' ')
-          // Strip quoted string literals so fixture lines in the window do not
-          // supply a false `.only` match without inertness tracking.
-          .replace(/(['"`])(?:\\.|(?!\1)[\s\S])*\1/g, ' ')
+        const windowText = strippedWindow
           .replace(/\s+/g, ' ')
           // Join `test .only` / `describe .skip` after whitespace collapse.
           .replace(/\b(describe|it|test|context)\s+\./gi, '$1.');

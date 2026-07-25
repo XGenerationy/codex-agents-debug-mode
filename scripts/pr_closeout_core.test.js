@@ -148,6 +148,30 @@ test('distinguishes status signals from passing failure-path test names', () => 
     classifyOutput({ exitCode: 0, stdout: 'TypeError: invalid value\n    at Object.<anonymous>' }).status,
     'FAIL',
   );
+  // Node-style diagnostics with a bracketed error code before the colon must
+  // also fail (e.g. TypeError [ERR_INVALID_ARG_TYPE]: ...).
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: 'TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string',
+    }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stderr: 'RangeError [ERR_OUT_OF_RANGE]: The value of "offset" is out of range',
+    }).status,
+    'FAIL',
+  );
+  // Passing TAP titles that mention the bracketed form still must not fail.
+  assert.equal(
+    classifyOutput({
+      exitCode: 0,
+      stdout: 'ok 1 - handles TypeError [ERR_INVALID_ARG_TYPE]: invalid value',
+    }).status,
+    'PASS',
+  );
   assert.equal(classifyOutput({ exitCode: 0, stdout: '1 skipped' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'todo: 2' }).status, 'FAIL');
 });
@@ -706,6 +730,32 @@ test('flags focus/skip calls inside template-literal interpolations', () => {
   assert.deepEqual(
     staticOnly.filter(({ category }) => category === 'test-weakening'),
     [],
+  );
+  // Multiline receiver split inside a template interpolation must still flag.
+  // A naive backtick-strip on the multiline window would erase `${test\n  .only}`
+  // and miss this active focus call. Build the fixture via concat so this test
+  // file itself does not embed an active test.only call for full-file scans.
+  const multilineInterp = [
+    'const s = `${test',
+    '  .' + only + "('focused')}`;",
+  ].join('\n');
+  assert.ok(
+    scanSuppressionText('src/foo.test.js', multilineInterp).some(
+      ({ category }) => category === 'test-weakening',
+    ),
+    'multiline template interpolation ${test\\n  .only} must be detected',
+  );
+  // Static multiline template text that only *looks* like a receiver split
+  // must not flag (no live ${...} expression).
+  const staticMultiline = [
+    'const msg = `call test',
+    '  .' + only + ' in docs`;',
+  ].join('\n');
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', staticMultiline)
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+    'static multiline template text must not flag',
   );
 });
 
