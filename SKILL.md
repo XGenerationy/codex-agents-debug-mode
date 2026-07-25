@@ -134,9 +134,10 @@ output handling.
 **Step 1: Ensure server is running** (starts if needed, no-op if already running):
 
 ```bash
-# Capture startup JSON: the trailing & returns before listen writes the token.
-# Prefer a foreground launch in a dedicated terminal, or redirect and wait:
-node /absolute/path/to/debug/scripts/debug_server.js /path/to/project > /tmp/debug-collector-start.json 2>&1 &
+# Always pass the absolute project path; resolve token relative to THAT project
+# (not the shell cwd — a relative `.debug/collector_token` would read the wrong tree).
+PROJECT=/absolute/path/to/project
+node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT" > /tmp/debug-collector-start.json 2>&1 &
 # Wait for the started (or already_running) record before reading the token.
 for i in 1 2 3 4 5 6 7 8 9 10; do
   if grep -qE '"status":"(started|already_running)"' /tmp/debug-collector-start.json 2>/dev/null; then
@@ -144,14 +145,19 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   fi
   sleep 0.2
 done
-# Prefer the token from the startup JSON; fall back to the token file only after
-# a fresh `started` write (do not reuse a stale file from a prior run).
-COLLECTOR_TOKEN=$(python3 -c "import json,sys; print(json.load(open('/tmp/debug-collector-start.json')).get('collector_token') or '')" 2>/dev/null)
-if [ -z "$COLLECTOR_TOKEN" ] && [ -f .debug/collector_token ]; then
-  # Only safe if status was started (new write). If already_running, use the
-  # token from the original launch session — not an on-disk file you did not write.
-  COLLECTOR_TOKEN=$(cat .debug/collector_token)
-fi
+# Prefer collector_token from startup JSON when present; otherwise resolve
+# token_file relative to $PROJECT (token_file is repo-relative).
+COLLECTOR_TOKEN=$(python3 -c "
+import json, os
+from pathlib import Path
+data = json.load(open('/tmp/debug-collector-start.json'))
+token = data.get('collector_token') or ''
+if not token:
+    rel = data.get('token_file') or '.debug/collector_token'
+    path = Path(rel) if os.path.isabs(rel) else Path(os.environ['PROJECT']) / rel
+    token = path.read_text(encoding='utf-8').strip() if path.is_file() else ''
+print(token)
+" 2>/dev/null)
 ```
 
 Resolve the script path from this skill's own directory; do not assume the current project has

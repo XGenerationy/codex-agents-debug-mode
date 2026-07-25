@@ -10,7 +10,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "validate": "node tools/validate_repository.js"
+    "validate": "node tools/validate_repository.js",
+    "scan:suppressions": "node tools/scan_touched_suppressions.js"
   },
   "repository": {
     "type": "git",

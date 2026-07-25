@@ -74,7 +74,7 @@ const CONFIG_SILENCING = [
 const define = (id, label, options = {}) => ({ id, label, ...options });
 
 const MANDATORY_CHECKS = [
-  define('git-diff-check', 'git diff --check', { fixed: true, command: 'git diff --check', qualificationSafe: true, baselineSafe: true }),
+  define('git-diff-check', 'git diff --check', { fixed: true, command: 'base=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git rev-list --max-parents=0 HEAD | head -1); git diff --check "$base"...HEAD', qualificationSafe: true, baselineSafe: true }),
   define('pnpm-audit', 'pnpm high-severity audit', { fixed: true, command: 'pnpm audit --audit-level high', qualificationSafe: true, baselineSafe: true }),
   define('prisma-validate', 'Prisma schema validation', { fixed: true, command: 'pnpm prisma validate', baselineSafe: true }),
   define('prisma-generate', 'Prisma generation', { fixed: true, command: 'pnpm prisma generate', generator: true, baselineSafe: true }),
@@ -353,8 +353,9 @@ const classifyOutput = ({
 
 /**
  * Scan one file's text for three independent categories of gate-weakening.
- * Suppression markers (MARKERS — skipcq, eslint-disable, ts-ignore, noqa,
- * etc.) are checked in every file. Config-level silencing (CONFIG_SILENCING
+ * Suppression markers (the MARKERS vocabulary: DeepSource, ESLint, Biome,
+ * TypeScript, Ruff, and peer-tool directives) are checked in every file.
+ * Config-level silencing (CONFIG_SILENCING
  * — continue-on-error, a raised --max-warnings budget, a rule turned "off",
  * ignoreBuildErrors, || true, and similar) is only checked in files
  * classified as config/workflow/ignore-file-shaped, plus every non-comment

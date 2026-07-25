@@ -156,10 +156,16 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
     const crypto = require('node:crypto');
     const fs = require('node:fs');
     const hashBytes = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    // Mirror hashFsEntry: regular files seal content AND permission bits so a
+    // mode-only flip on an ignored reproducibility artifact cannot keep the
+    // same digest. Missing paths hash to a fixed marker.
     const hashFileOrMissing = (filePath) => {
       try {
         const st = fs.lstatSync(filePath);
-        if (st.isFile()) return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+        if (st.isFile()) {
+          const content = crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+          return hashBytes(`regular:mode=${st.mode & 0o777}:sha=${content}`);
+        }
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
@@ -204,11 +210,16 @@ test('workingTreeFingerprint streams large untracked files instead of buffering 
       { path: '__git_global_excludes__', hash: globalExcludesHash },
       // No per-directory .gitignore in this fixture, so the seal is the empty hash.
       { path: '__gitignore_files__', hash: hashBytes('') },
-      { path: 'large-untracked.bin', hash: expected },
+      { path: 'large-untracked.bin', hash: hashFileOrMissing(large) },
     ]);
     const fingerprint = await workingTreeFingerprint(repo);
-    // The streamed hash must match a one-shot SHA-256 of the large file.
+    // The streamed hash (with mode bits) must match the expected seal entry.
     assert.equal(fingerprint, expectedFingerprint, 'streamed hash must match a one-shot SHA-256 of the large file');
+    // Sanity: content-only digest is still produced for the file itself.
+    assert.equal(
+      crypto.createHash('sha256').update(fs.readFileSync(large)).digest('hex'),
+      expected,
+    );
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -306,6 +317,34 @@ test('fingerprints explicitly declared ignored generator output', async () => {
     await writeFile(path.join(generated, 'client.js'), 'second');
     const second = await workingTreeFingerprint(repo, ['generated']);
     assert.notEqual(first, second);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('repository seal includes permission bits for reproducibility entries', async () => {
+  // Ignored generated artifacts are sealed via reproducibilityPaths; content
+  // alone is not enough — flipping only the executable bit must change the
+  // fingerprint so a later validation step cannot quietly re-mark the file.
+  if (process.platform === 'win32') {
+    // Windows does not preserve POSIX mode bits the same way; skip rather
+    // than claim a false positive pass on an unsupported surface.
+    return;
+  }
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'generated/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore generated output');
+    const generated = path.join(repo, 'generated');
+    await mkdir(generated);
+    const artifact = path.join(generated, 'tool.sh');
+    await writeFile(artifact, '#!/bin/sh\necho ok\n');
+    await chmod(artifact, 0o644);
+    const before = await workingTreeFingerprint(repo, ['generated']);
+    await chmod(artifact, 0o755);
+    const after = await workingTreeFingerprint(repo, ['generated']);
+    assert.notEqual(before, after, 'mode-only change must break the repository seal');
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

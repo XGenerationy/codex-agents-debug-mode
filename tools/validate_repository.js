@@ -28,6 +28,8 @@ const safetyScanRoots = [
   'NOTICE.md',
   'LICENSE',
   'package.json',
+  'package-lock.json',
+  '.gitattributes',
   '.codereview.yml',
   '.github/workflows',
   'tools',

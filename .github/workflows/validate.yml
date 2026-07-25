@@ -32,6 +32,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history so the suppression scan can resolve merge-base and
+          # diff the complete PR range (base...HEAD), not only the tip commit.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -48,6 +52,15 @@ jobs:
 
       - name: Validate repository
         run: npm run validate
+
+      - name: Scan touched files for suppressions
+        env:
+          # Prefer the PR base SHA when present so the scan covers the full
+          # PR range, not only the latest push commit. Push-to-main falls
+          # back to merge-base with origin/main inside the scanner.
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: npm run scan:suppressions
 
       - name: Run tests
         run: npm test

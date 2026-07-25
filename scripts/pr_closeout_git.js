@@ -361,19 +361,51 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //    attributes` or in-tree `.gitattributes` assign a driver. Git prefers
   //    `filter.<driver>.process` (long-running filter protocol) over smudge/
   //    clean when present, so neutralizing only smudge/clean leaves an
-  //    executable path open. Enumerate every local filter.* key, then for
-  //    each driver name force smudge=/clean=/process= empty and
-  //    required=false via -c overrides.
+  //    executable path open. Enumerate every effective filter.* key from all
+  //    config scopes (local/global/system/worktree), then for each driver name
+  //    force smudge=/clean=/process= empty and required=false via -c overrides.
+  //    Global drivers must be included: a base `.gitattributes` can select a
+  //    driver defined only in the operator's global Git config.
   //  - `.git/info/attributes`: temporarily rename away during the internal
   //    checkout so per-repo attributes cannot re-enable a filter driver even
   //    if config discovery misses a name.
   const noHooksDir = path.join(parent, 'no-hooks');
   await mkdir(noHooksDir, { recursive: true });
   const filterOverrides = [];
+  // Fail closed if the local config path is missing or not a regular file
+  // BEFORE trusting enumeration. Without --local, a broken .git/config can
+  // still let get-regexp succeed from global/system scopes and skip this
+  // health check, leaving later git worktree operations to fail opaquely.
+  // Prefer git-path resolution, but fall back to repo/.git/config when
+  // rev-parse itself cannot read the broken config directory.
+  const assertLocalConfigReadable = async () => {
+    let configPath = path.join(repo, '.git', 'config');
+    try {
+      const gitPath = String(await runGit(repo, ['rev-parse', '--git-path', 'config'], {
+        ...(env ? { env } : {}),
+        ...(timeoutMs ? { timeout: timeoutMs } : {}),
+      })).trim();
+      configPath = path.isAbsolute(gitPath) ? gitPath : path.resolve(repo, gitPath);
+    } catch {
+      // Keep the default path; lstat below decides fail-closed.
+    }
+    try {
+      const info = await lstat(configPath);
+      if (!info.isFile()) {
+        throw new Error(`local config is not a regular file: ${configPath}`);
+      }
+    } catch (verifyError) {
+      throw new Error(
+        `Failed to enumerate filter.* keys for baseline worktree safety: ${verifyError?.message || verifyError}`,
+      );
+    }
+  };
+  await assertLocalConfigReadable();
   try {
     // Match any filter.<driver>.<setting> key so process/required cannot hide
-    // behind a non-smudge/clean suffix.
-    const listed = await runGit(repo, ['config', '--local', '--get-regexp', '^filter\\.'], {
+    // behind a non-smudge/clean suffix. Omit --local so global/system drivers
+    // selected by in-tree .gitattributes are also neutralized via -c.
+    const listed = await runGit(repo, ['config', '--get-regexp', '^filter\\.'], {
       ...(env ? { env } : {}),
       ...(timeoutMs ? { timeout: timeoutMs } : {}),
     });
@@ -396,30 +428,12 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
       );
     }
   } catch (error) {
-    // git config --get-regexp exits 1 when there are no matches. Some Git
-    // versions also exit 1 (not 128) when .git/config is unreadable or not a
-    // regular file (e.g. replaced by a directory). Only treat exit 1 as
-    // "no drivers" when the local config path is a readable regular file.
+    // git config --get-regexp exits 1 when there are no matches. Local config
+    // was already verified readable above, so exit 1 is a clean empty set.
     const exitCode = error?.code;
     if (exitCode !== 1 && exitCode !== '1') {
       throw new Error(
-        `Failed to enumerate local filter.* keys for baseline worktree safety: ${error?.message || error}`,
-      );
-    }
-    let configPath;
-    try {
-      const gitPath = String(await runGit(repo, ['rev-parse', '--git-path', 'config'], {
-        ...(env ? { env } : {}),
-        ...(timeoutMs ? { timeout: timeoutMs } : {}),
-      })).trim();
-      configPath = path.isAbsolute(gitPath) ? gitPath : path.resolve(repo, gitPath);
-      const info = await lstat(configPath);
-      if (!info.isFile()) {
-        throw new Error(`local config is not a regular file: ${configPath}`);
-      }
-    } catch (verifyError) {
-      throw new Error(
-        `Failed to enumerate local filter.* keys for baseline worktree safety: ${verifyError?.message || verifyError}`,
+        `Failed to enumerate filter.* keys for baseline worktree safety: ${error?.message || error}`,
       );
     }
   }

@@ -496,7 +496,7 @@ test('fails closed when local filter.* enumeration is not a clean empty match', 
     try {
       await assert.rejects(
         () => withDisposableWorktree({ repo, baseSha }, async () => 'should-not-run'),
-        /enumerate local filter/i,
+        /enumerate filter/i,
       );
     } finally {
       await rm(configPath, { recursive: true, force: true });

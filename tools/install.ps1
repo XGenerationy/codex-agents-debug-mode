@@ -159,8 +159,8 @@ try {
             # Only clear $item.Backup after a confirmed successful restore; if the
             # restore itself fails (e.g. destination locked), keep the reference so
             # the outer catch can retry and report rather than stranding the backup.
-            if ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
-                if (Test-Path -LiteralPath $item.Destination) {
+            if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
                 }
                 try {
@@ -192,16 +192,16 @@ catch {
         $item = $staged[$i]
         try {
             if ($item.Committed) {
-                if (Test-Path -LiteralPath $item.Destination) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force
                 }
-                if ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
+                if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
                     Move-Item -LiteralPath $item.Backup -Destination $item.Destination
                 }
             }
-            elseif ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
+            elseif ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
                 # In-flight: destination was renamed to backup but never committed.
-                if (Test-Path -LiteralPath $item.Destination) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force
                 }
                 Move-Item -LiteralPath $item.Backup -Destination $item.Destination
@@ -218,7 +218,7 @@ catch {
 }
 finally {
     foreach ($item in $staged) {
-        if ($item.Stage -and (Test-Path -LiteralPath $item.Stage)) {
+        if ($item.Stage -and (Test-DestinationOccupied -Path $item.Stage)) {
             Remove-Item -LiteralPath $item.Stage -Recurse -Force -ErrorAction SilentlyContinue
         }
     }

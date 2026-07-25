@@ -140,7 +140,8 @@ cleanup_stages() {
     rm -rf -- "$s" 2>/dev/null || true
   done
 }
-# shellcheck disable=SC2064
+# Single-quoted trap body so the handler is not expanded at registration time
+# (shellcheck SC2064). Do not add a disable directive; the quote form is the fix.
 trap 'cleanup_stages' EXIT
 
 for destination in "${destinations[@]}"; do

@@ -435,7 +435,10 @@ const hashFsEntry = async (absolute) => {
     return hashBytes('non-regular');
   }
   try {
-    return await hashFile(absolute);
+    // Include permission bits so ignored generated artifacts cannot flip
+    // executable/mode without breaking the repository seal fingerprint.
+    const content = await hashFile(absolute);
+    return hashBytes(`regular:mode=${info.mode & 0o777}:sha=${content}`);
   } catch (error) {
     // The file can disappear between lstat() and createReadStream(); treat
     // that the same as the lstat ENOENT case (a stable `missing` hash) so a
