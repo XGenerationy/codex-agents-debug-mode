@@ -394,6 +394,9 @@ const createDebugServer = ({
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   const originSet = new Set(allowedOrigins);
   let totalBytes = 0;
+  // Token-file persistence finishes after listen(); until then the collector
+  // is not ready for already_running relaunch claims.
+  let collectorReady = false;
 
   const server = http.createServer(async (request, response) => {
     if (!isAllowedHost(request)) {
@@ -437,6 +440,7 @@ const createDebugServer = ({
           version: COLLECTOR_VERSION,
           instance_id: instanceId,
           project_hash: projectHash,
+          ready: collectorReady,
         });
         return;
       }
@@ -660,6 +664,11 @@ const createDebugServer = ({
     collectorToken: { value: token },
     collectorInstanceId: { value: instanceId },
     collectorProjectHash: { value: projectHash },
+    markCollectorReady: {
+      value: () => {
+        collectorReady = true;
+      },
+    },
   });
   return server;
 };
@@ -682,7 +691,7 @@ const createDebugServer = ({
  * a valid match, or `null` for any failure, timeout, malformed body, or
  * non-200/non-matching response — this never rejects.
  * @param {number} port
- * @returns {Promise<{service: string, version: number, instance_id: string, project_hash: string}|null>}
+ * @returns {Promise<{service: string, version: number, instance_id: string, project_hash: string, ready: boolean}|null>}
  */
 const probeServer = (port) =>
   new Promise((resolve) => {
@@ -720,7 +729,13 @@ const probeServer = (port) =>
               /^[a-f0-9]{32}$/.test(identity.instance_id) &&
               typeof identity.project_hash === 'string' &&
               /^[a-f0-9]{64}$/.test(identity.project_hash);
-            finish(valid ? identity : null);
+            // ready may be absent on older collectors; treat as not ready so
+            // already_running cannot claim success before token persistence.
+            if (valid) {
+              finish({ ...identity, ready: identity.ready === true });
+              return;
+            }
+            finish(null);
           } catch (error) {
             if (error instanceof SyntaxError) {
               finish(null);
@@ -743,6 +758,28 @@ const probeServer = (port) =>
     request.on('error', () => finish(null));
     request.on('close', () => finish(null));
   });
+
+/**
+ * Probe until the same-project collector reports ready (token persisted), or
+ * until the retry budget is exhausted. Avoids already_running while the first
+ * process is still mid token-file write after listen().
+ * @param {number} port
+ * @param {string} expectedProjectHash
+ * @param {{attempts?: number, delayMs?: number}} [options]
+ */
+const probeReadyCollector = async (port, expectedProjectHash, { attempts = 20, delayMs = 50 } = {}) => {
+  for (let i = 0; i < attempts; i += 1) {
+    const identity = await probeServer(port);
+    if (identity && identity.project_hash === expectedProjectHash && identity.ready) {
+      return identity;
+    }
+    if (identity && identity.project_hash !== expectedProjectHash) {
+      return identity; // different project — caller maps to port_in_use
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return probeServer(port);
+};
 
 const parseAllowedOrigins = (value) =>
   (value || '')
@@ -775,7 +812,9 @@ const main = () => {
   });
   server.once('error', async (error) => {
     if (error.code === 'EADDRINUSE') {
-      const identity = await probeServer(port);
+      // Wait for the peer collector to finish token persistence before
+      // claiming already_running; listen-only readiness is insufficient.
+      const identity = await probeReadyCollector(port, server.collectorProjectHash);
       // A syntactically valid collector identity is not enough: this
       // collector is single-project (one projectRoot per process), so an
       // instance answering for a DIFFERENT project must not be reported as
@@ -786,7 +825,7 @@ const main = () => {
       // createDebugServer) against this invocation's own hash before
       // concluding it is the same collector; a mismatch falls through to the
       // port_in_use_by_other_process failure below, same as no identity at all.
-      if (identity && identity.project_hash === server.collectorProjectHash) {
+      if (identity && identity.project_hash === server.collectorProjectHash && identity.ready) {
         process.stdout.write(
           `${JSON.stringify({
             status: 'already_running',
@@ -898,6 +937,9 @@ const main = () => {
       } finally {
         await handle.close();
       }
+      // Only after the token file is on disk may relaunch probes claim
+      // already_running for this project.
+      server.markCollectorReady();
       process.stdout.write(
         `${JSON.stringify({
           status: 'started',

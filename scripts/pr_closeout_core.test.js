@@ -219,6 +219,19 @@ test('distinguishes status signals from passing failure-path test names', () => 
     classifyOutput({ exitCode: 0, stdout: '--- SKIP: TestNeedsDocker (0.00s)' }).status,
     'FAIL',
   );
+  // Zero-work summaries from Go, Rust, and Python unittest runners.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: '?   \texample.com/mod\t[no test files]' }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'running 0 tests\n\ntest result: ok. 0 passed; 0 failed' }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'Ran 0 tests in 0.001s\n\nOK' }).status,
+    'FAIL',
+  );
   assert.equal(classifyOutput({ exitCode: 0, stdout: '1 skipped' }).status, 'FAIL');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'todo: 2' }).status, 'FAIL');
 });

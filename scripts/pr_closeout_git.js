@@ -85,6 +85,26 @@ const MULTILINE_WEAKENING_PATTERNS = [
   /(?:coverage|threshold)["']?\s*[:=][\s\S]{0,160}?\b(?:statements|branches|functions|lines)["']?\s*[:=]\s*["']?0(?:\.0+)?["']?(?![\w.])/i,
 ];
 
+// Removed validation-bearing lines inside a still-present gate file (e.g.
+// deleting `run: npm test` or a CodeQL `uses:` step while the workflow file
+// remains). Whole-file deletion is covered by deletedFiles; these patterns
+// cover in-place step removal. Keep aligned with tools/scan_touched_suppressions.js.
+const VALIDATION_REMOVAL_PATTERNS = [
+  /^\-\s*run:\s*/i,
+  /^\-\s*-\s*run:\s*/i,
+  /^\-\s*uses:\s*\S+/i,
+  /^\-\s*-\s*uses:\s*\S+/i,
+  /^\-.*\buses:\s+(?:github\/codeql-action|aquasecurity\/trivy-action|securego\/gosec|golangci\/golangci-lint-action|github\/super-linter|oxsecurity\/megalinter|codecov\/codecov-action|sonarsource\/sonarcloud)\S*/i,
+  /^\-.*\bnpm\s+(?:ci|test|run\b|audit\b)/i,
+  /^\-.*\bpnpm\s+(?:test|run\b|audit\b)/i,
+  /^\-.*\bscan:suppressions\b/i,
+  /^\-.*\bnode\s+--test\b/i,
+  /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
+  /^\-\s*-\s*name:\s*.*\b(?:test|validate|audit|scan|lint|codeql|security|coverage)\b/i,
+  /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
+  /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
+];
+
 /**
  * Decides whether changes to validation-defining "gate" files (CI configs,
  * lockfiles, linters, Makefiles, the closeout config itself, ...) preserve
@@ -103,7 +123,7 @@ const MULTILINE_WEAKENING_PATTERNS = [
  * @returns {{status: 'PASS'|'FAIL'|'BLOCKED', evidence: string}}
  */
 const classifyGateIntegrity = ({
-  changedFiles = [], addedLines = [], deletedFiles = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
+  changedFiles = [], addedLines = [], removedLines = [], deletedFiles = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
 } = {}) => {
   const gateFiles = changedFiles.filter(isGateFile);
   const configured = [...new Set(configuredCommands)].sort();
@@ -118,6 +138,20 @@ const classifyGateIntegrity = ({
       deletedFiles: deletedGateFiles,
       configuredCommands: configured,
       evidence: `Validation-defining gate files were deleted: ${deletedGateFiles.slice(0, 5).join(' | ')}`,
+    };
+  }
+  // In-place removal of validation steps from a still-present gate file
+  // (e.g. deleting `run: npm test` while the workflow remains) must FAIL even
+  // with an otherwise valid not-weakened attestation.
+  const validationRemovals = removedLines.filter((line) => (
+    VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(line))
+  ));
+  if (validationRemovals.length) {
+    return {
+      status: 'FAIL',
+      changedFiles: gateFiles,
+      configuredCommands: configured,
+      evidence: `Validation steps were removed from gate files: ${validationRemovals.slice(0, 5).join(' | ')}`,
     };
   }
   const suppressionFindings = scanSuppressionText('__gate__.json', addedLines.join('\n'));
@@ -616,11 +650,23 @@ const verifyBaseline = async ({
     };
   });
   if (!comparison.baseline) {
+    // A confirmed head FAIL must not be downgraded to BLOCKED just because
+    // disposable baseline setup failed — the validation command already
+    // proved a failure; baseline attribution is optional evidence only.
+    const setupEvidence = `Baseline dependency setup was not clean. ${comparison.setupResult?.evidence || ''}`.trim();
+    if (headResult.status === 'FAIL') {
+      return {
+        ...headResult,
+        status: 'FAIL',
+        baselineSetup: comparison.setupResult,
+        evidence: `${headResult.evidence || ''} ${setupEvidence} (no baseline attribution).`.trim(),
+      };
+    }
     return {
       ...headResult,
       status: 'BLOCKED',
       baselineSetup: comparison.setupResult,
-      evidence: `Baseline dependency setup was not clean. ${comparison.setupResult?.evidence || ''}`.trim(),
+      evidence: setupEvidence,
     };
   }
   const baseline = comparison.baseline;

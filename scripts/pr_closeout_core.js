@@ -363,7 +363,16 @@ const classifyOutput = ({
   // no-test run must not fall through to PASS. Targeted at the no-work
   // summaries; ordinary "no tests were skipped" is not matched.
   const combined = `${stdout}\n${stderr}`;
-  if (/\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined) || /\bno\s+test\s+files?\s+found\b/i.test(combined)) {
+  if (/\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i.test(combined)
+    || /\bno\s+test\s+files?\s+found\b/i.test(combined)
+    // Go: `[no test files]` / `testing: warning: no tests to run`
+    || /\[no test files\]/i.test(combined)
+    || /\bno tests to run\b/i.test(combined)
+    // Rust/cargo test: `running 0 tests`
+    || /\brunning\s+0\s+tests?\b/i.test(combined)
+    // Python unittest: `Ran 0 tests`
+    || /\bran\s+0\s+tests?\b/i.test(combined)
+    || /\b0\s+tests?\s+(?:run|ran|executed)\b/i.test(combined)) {
     return { status: 'FAIL', evidence: 'Test runner reported no tests found/executed; closeout requires authoritative test evidence.' };
   }
   // Numeric no-work summaries from common runners: Node's TAP `# tests 0` /

@@ -198,6 +198,12 @@ test('exposes collector-specific health without exposing credentials or paths', 
     assert.notEqual(response.body.project_hash, projectRoot);
     assert.equal(response.body.project_hash.includes(projectRoot), false);
     assert.equal(response.body.project_hash, server.collectorProjectHash);
+    // Before markCollectorReady(), /health must report ready:false so a
+    // concurrent relaunch cannot claim already_running mid token write.
+    assert.equal(response.body.ready, false);
+    server.markCollectorReady();
+    const readyResponse = await requestJson(baseUrl, { pathname: '/health' });
+    assert.equal(readyResponse.body.ready, true);
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });

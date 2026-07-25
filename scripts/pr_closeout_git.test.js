@@ -140,6 +140,23 @@ test('requires an exact review tuple even when the tree and command mapping are 
       decision: 'not-weakened',
     },
   }).status, 'BLOCKED');
+  // In-place removal of a validation step must FAIL even with attestation.
+  assert.equal(
+    classifyGateIntegrity({
+      ...clean,
+      removedLines: ['-      - run: npm test'],
+      attestation: liveAttestation({ headSha: 'head123' }),
+    }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyGateIntegrity({
+      ...clean,
+      removedLines: ['-      - uses: github/codeql-action/analyze@v3'],
+      attestation: liveAttestation({ headSha: 'head123' }),
+    }).status,
+    'FAIL',
+  );
 });
 
 test('detects multiline gate weakening and produces stable config digests', () => {
@@ -544,7 +561,9 @@ test('refuses a baseline label when tool versions differ', async () => {
   assert.match(result.evidence, /tool versions differ/i);
 });
 
-test('blocks baseline classification when deterministic dependency setup fails', async () => {
+test('preserves head FAIL when deterministic dependency setup fails', async () => {
+  // A proven head FAIL must not be downgraded to BLOCKED solely because the
+  // disposable baseline worktree could not install dependencies.
   const result = await verifyBaseline({
     repo: 'C:/repo',
     baseSha: 'base123',
@@ -553,6 +572,21 @@ test('blocks baseline classification when deterministic dependency setup fails',
     withWorktree: async (_options, callback) => callback('C:/temp/baseline'),
     setup: async () => ({ status: 'FAIL', exitCode: 1, evidence: 'lockfile install failed' }),
     execute: async () => ({ status: 'FAIL', exitCode: 1, stderr: 'same error' }),
+  });
+  assert.equal(result.status, 'FAIL');
+  assert.match(result.evidence, /dependency setup was not clean/i);
+  assert.match(result.evidence, /no baseline attribution/i);
+});
+
+test('blocks when head is non-FAIL and baseline dependency setup fails', async () => {
+  const result = await verifyBaseline({
+    repo: 'C:/repo',
+    baseSha: 'base123',
+    check: { id: 'typecheck', command: 'pnpm typecheck', baselineSafe: true },
+    headResult: { status: 'PASS', exitCode: 0, stderr: '' },
+    withWorktree: async (_options, callback) => callback('C:/temp/baseline'),
+    setup: async () => ({ status: 'FAIL', exitCode: 1, evidence: 'lockfile install failed' }),
+    execute: async () => ({ status: 'PASS', exitCode: 0, stderr: '' }),
   });
   assert.equal(result.status, 'BLOCKED');
   assert.match(result.evidence, /dependency setup was not clean/i);

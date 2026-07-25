@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
-const { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
+const { linkSync } = require('node:fs');
+const { mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -275,6 +276,37 @@ test('writeEvidenceReport writes report.json and report.md into outputDir', asyn
     assert.match(markdownContents, /Overall status: \*\*PASS\*\*/);
   } finally {
     await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport does not clobber hard-linked outside files via staging paths', async () => {
+  // Staging names are pid+ms; pre-create hard links across a stamp window so
+  // O_EXCL either picks a free stamp or fails closed — never O_TRUNC on the
+  // shared outside inode.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-hl-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-hl-out-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.json');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    const now = Date.now();
+    for (let i = 0; i < 50; i += 1) {
+      linkSync(outsideTarget, path.join(outputDir, `.report.json.${process.pid}.${now + i}.tmp`));
+      linkSync(outsideTarget, path.join(outputDir, `.report.md.${process.pid}.${now + i}.tmp`));
+    }
+    let wrote = false;
+    try {
+      await writeEvidenceReport({ outputDir, report: minimalReport() });
+      wrote = true;
+    } catch (error) {
+      assert.match(String(error?.message || error), /pre-existing path/i);
+    }
+    assert.equal(await readFile(outsideTarget, 'utf8'), 'do not overwrite this\n');
+    if (wrote) {
+      assert.ok((await readdir(outputDir)).includes('report.json'));
+    }
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
   }
 });
 

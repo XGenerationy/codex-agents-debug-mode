@@ -798,7 +798,7 @@ const cleanTreeStatus = async (repo) => {
  * result to report against.
  * @param {string} repo - Absolute repository path.
  * @param {string} baseSha - Base commit SHA to diff gate files against.
- * @returns {Promise<{changedFiles: string[], addedLines: string[], deletedFiles: string[]}>}
+ * @returns {Promise<{changedFiles: string[], addedLines: string[], removedLines: string[], deletedFiles: string[]}>}
  */
 const readGateChanges = async (repo, baseSha) => {
   // A deleted gate file contributes no added lines, so surface it on a
@@ -812,7 +812,7 @@ const readGateChanges = async (repo, baseSha) => {
   ]);
   const changedFiles = [...new Set([...changed, ...untracked].filter(isGateFile))].sort();
   const deletedFiles = [...new Set(deleted.filter(isGateFile))].sort();
-  if (!changedFiles.length) return { changedFiles, addedLines: [], deletedFiles };
+  if (!changedFiles.length) return { changedFiles, addedLines: [], removedLines: [], deletedFiles };
   const tracked = changedFiles.filter((file) => !untracked.includes(file));
   // Contain a very large tracked gate-file diff (e.g. a regenerated
   // pnpm-lock.yaml or workspace manifest churn) that would exceed execFile's
@@ -824,14 +824,21 @@ const readGateChanges = async (repo, baseSha) => {
   let trackedDiffError = null;
   if (tracked.length) {
     try {
-      diff = await gitText(repo, ['diff', '--unified=0', '--no-ext-diff', baseSha, '--', ...tracked]);
+      // --no-textconv: a configured textconv filter must not rewrite deleted
+      // validation lines before classifyGateIntegrity scans removals.
+      diff = await gitText(repo, ['diff', '--unified=0', '--no-ext-diff', '--no-textconv', baseSha, '--', ...tracked]);
     } catch (error) {
       trackedDiffError = error;
     }
   }
+  const diffLines = trackedDiffError ? [] : diff.split(/\r?\n/);
   const addedLines = trackedDiffError
     ? [`+__decode_error__:${tracked.join(',')}:diff_buffer_exceeded:${trackedDiffError?.code || trackedDiffError?.message || trackedDiffError}`]
-    : diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+    : diffLines.filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+  // Removed lines from still-present gate files (in-place step deletion).
+  const removedLines = trackedDiffError
+    ? []
+    : diffLines.filter((line) => line.startsWith('-') && !line.startsWith('---'));
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
     let handle;
     try {
@@ -886,7 +893,7 @@ const readGateChanges = async (repo, baseSha) => {
       if (handle) await handle.close().catch(() => {});
     }
   }
-  return { changedFiles, addedLines, deletedFiles };
+  return { changedFiles, addedLines, removedLines, deletedFiles };
 };
 
 module.exports = {

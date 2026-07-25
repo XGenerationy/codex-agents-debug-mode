@@ -277,14 +277,31 @@ const writeNoFollow = async (target, contents) => {
   await assertNotSymlink(target);
   let handle;
   try {
-    handle = await openNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o666);
+    // Exclusive create: a predictable staging name (pid + ms) can be
+    // pre-created as a hard link to an outside file. O_TRUNC on open would
+    // wipe that outside inode before any nlink check. O_EXCL refuses any
+    // pre-existing path; a fresh exclusive regular file is always nlink=1.
+    handle = await openNoFollow(
+      target,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o666,
+    );
   } catch (error) {
     if (error?.code === 'ELOOP') {
       throw new Error(`Refusing to write evidence report through an existing symlink: ${target}`);
     }
+    if (error?.code === 'EEXIST') {
+      throw new Error(`Refusing to write evidence report through a pre-existing path: ${target}`);
+    }
     throw error;
   }
   try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1) {
+      throw new Error(
+        `Refusing to write evidence report through a non-private file (nlink=${info.nlink}): ${target}`,
+      );
+    }
     await handle.writeFile(contents, 'utf8');
   } finally {
     await handle.close();
