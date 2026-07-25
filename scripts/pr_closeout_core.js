@@ -82,6 +82,38 @@ const CONFIG_SILENCING = [
   /(?:^|[;&\n])\s*exit\s+0\b/i,
 ];
 
+/**
+ * Shell / runner constructs that force a zero exit (or hide failures) so
+ * classifyOutput would report PASS even when the real check failed. Applied
+ * to configured closeout commands and proof commands — including config
+ * stored outside the checkout, which the touched-file suppression scanner
+ * never sees.
+ */
+const COMMAND_FAILURE_NEUTRALIZERS = [
+  /\|\|\s*true\b/i,
+  // POSIX no-op success: `cmd || :`
+  /\|\|\s*:(?=\s|$|[;"'`&;\n])/i,
+  /\|\|\s*exit\s+0\b/i,
+  /(?:^|[;&\n])\s*exit\s+0\b/i,
+  /\bpassWithNoTests\b/i,
+  /\ballowNoTests\b/i,
+  /\b--passWithNoTests\b/i,
+];
+
+/**
+ * @param {string} command
+ * @returns {string|null} matched neutralizer fragment, or null if clean
+ */
+const findCommandFailureNeutralizer = (command) => {
+  const text = String(command ?? '');
+  if (!text.trim()) return null;
+  for (const pattern of COMMAND_FAILURE_NEUTRALIZERS) {
+    const match = text.match(pattern);
+    if (match) return match[0].trim();
+  }
+  return null;
+};
+
 const define = (id, label, options = {}) => ({ id, label, ...options });
 
 const MANDATORY_CHECKS = [
@@ -180,6 +212,14 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
   if (Object.hasOwn(config, 'gateIntegrityReview')) {
     errors.push('gateIntegrityReview self-attestation is forbidden; use the required live GitHub PR review attestation.');
   }
+  if (typeof config.baselineSetupCommand === 'string' && config.baselineSetupCommand.trim()) {
+    const baselineNeutralizer = findCommandFailureNeutralizer(config.baselineSetupCommand);
+    if (baselineNeutralizer) {
+      errors.push(
+        `baselineSetupCommand neutralizes failures (${baselineNeutralizer}); closeout cannot admit a failure-hiding setup command.`,
+      );
+    }
+  }
   const expand = (command) => expandCommand(command, touchedFiles, { mergeBaseSha });
   const checks = MANDATORY_CHECKS.map((definition) => {
     const configured = commands[definition.id];
@@ -206,7 +246,18 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
           evidence: `Replace the example placeholder for ${definition.label}.`,
         };
       }
-      return { ...definition, command: expand(configured.trim()), resolution: 'configured' };
+      const configuredCommand = expand(configured.trim());
+      const neutralizer = findCommandFailureNeutralizer(configuredCommand);
+      if (neutralizer) {
+        return {
+          ...definition,
+          command: configuredCommand,
+          status: 'BLOCKED',
+          resolution: 'configured',
+          evidence: `Configured command for ${definition.label} neutralizes failures (${neutralizer}); closeout cannot admit a failure-hiding command.`,
+        };
+      }
+      return { ...definition, command: configuredCommand, resolution: 'configured' };
     }
     const packageScript = definition.packageCandidates?.find((candidate) => packageScripts[candidate]);
     if (packageScript) {
@@ -241,6 +292,15 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
       resolved = resolved.status === 'BLOCKED'
         ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
         : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+    }
+    if (validCommand) {
+      const proofNeutralizer = findCommandFailureNeutralizer(proof.command);
+      if (proofNeutralizer) {
+        const proofEvidence = `Postcondition proof command for ${check.label} neutralizes failures (${proofNeutralizer}).`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      }
     }
     if (check.id === 'redis-integration' && !config.services?.redis) {
       const serviceEvidence = 'A real Redis service probe is required.';
@@ -914,12 +974,14 @@ const scanSuppressionText = (file, text) => {
 };
 
 module.exports = {
+  COMMAND_FAILURE_NEUTRALIZERS,
   CONFIG_SILENCING,
   MANDATORY_CHECKS,
   MARKERS,
   REQUIRED_PROOFS,
   buildCheckPlan,
   classifyOutput,
+  findCommandFailureNeutralizer,
   findStatusSignals,
   scanSuppressionText,
   shellQuote,

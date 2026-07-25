@@ -5,6 +5,7 @@ const {
   MANDATORY_CHECKS,
   buildCheckPlan,
   classifyOutput,
+  findCommandFailureNeutralizer,
   scanSuppressionText,
 } = require('./pr_closeout_core');
 
@@ -1018,6 +1019,41 @@ test('keeps example placeholders blocked instead of treating them as commands', 
   const producer = plan.checks.find(({ id }) => id === 'producer-tests');
   assert.equal(producer.status, 'BLOCKED');
   assert.equal(producer.resolution, 'placeholder');
+});
+
+test('blocks configured commands that neutralize failures', () => {
+  // Closeout config may live outside the checkout; the touched-file scanner
+  // never sees it. Failure-hiding shell constructs must be rejected at plan
+  // build time (Codex #4780229514).
+  assert.ok(findCommandFailureNeutralizer('pnpm test || true'));
+  assert.ok(findCommandFailureNeutralizer('actual-test >/dev/null 2>&1 || true'));
+  assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
+
+  const plan = buildCheckPlan({
+    config: {
+      commands: {
+        typecheck: 'pnpm typecheck || true',
+        'producer-tests': 'actual-test >/dev/null 2>&1 || true',
+      },
+      proofs: {
+        'make-sbom': {
+          type: 'command',
+          command: 'make sbom || exit 0',
+          expectedPattern: 'ok',
+        },
+      },
+      baselineSetupCommand: 'pnpm install || true',
+    },
+  });
+  const typecheck = plan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(typecheck.status, 'BLOCKED');
+  assert.match(typecheck.evidence, /neutralizes failures/i);
+  const producer = plan.checks.find(({ id }) => id === 'producer-tests');
+  assert.equal(producer.status, 'BLOCKED');
+  const sbom = plan.checks.find(({ id }) => id === 'make-sbom');
+  assert.equal(sbom.status, 'BLOCKED');
+  assert.match(sbom.evidence, /neutralizes failures|postcondition proof/i);
+  assert.ok(plan.errors.some((error) => /baselineSetupCommand/i.test(error)));
 });
 
 test('preserves the first BLOCKED reason when a check hits multiple BLOCKED conditions', () => {

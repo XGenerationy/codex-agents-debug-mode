@@ -1117,6 +1117,53 @@ test('probeCommandDefault runs commands through a non-login shell (--noprofile -
   });
   assert.equal(result.exitCode, 0, `default probe must succeed via non-login shell: ${JSON.stringify(result)}`);
   assert.equal(result.stdout, 'probe-default-ok');
+  assert.equal(result.terminationStatus, 'PASS');
+});
+
+test('probeCommandDefault clears timeout timers so a fast probe does not hold the process', async () => {
+  // Regression for Codex #4780229514: without clearTimeout on the close path,
+  // eight preflight probes left eight 120s timers and npm test hung ~152s.
+  const before = process.getActiveResourcesInfo
+    ? process.getActiveResourcesInfo().filter((name) => name === 'Timeout').length
+    : null;
+  const shell = resolveCommandShell({ env: process.env });
+  await probeCommandDefault({
+    command: 'true',
+    repo: process.cwd(),
+    shell,
+    env: process.env,
+    timeoutMs: 120_000,
+  });
+  if (before !== null) {
+    const after = process.getActiveResourcesInfo().filter((name) => name === 'Timeout').length;
+    // Allow incidental timers from the test harness; the probe itself must not
+    // leave a 120s timer behind.
+    assert.ok(after <= before + 1, `expected no leaked probe timeout (before=${before}, after=${after})`);
+  }
+});
+
+test('runPreflight BLOCKs when a probe reports process-tree cleanup failure', async () => {
+  // Even if a version probe exits 0, an unreaped descendant must refuse
+  // admission — matching the main command executor's terminationStatus latch.
+  const result = await runPreflight({
+    repo: process.cwd(),
+    config: { minFreeDiskGb: 0 },
+    env: process.env,
+    probeCommand: async () => ({
+      exitCode: 0,
+      stdout: 'v1.0.0',
+      stderr: '',
+      terminationStatus: 'BLOCKED',
+      terminationEvidence: 'Detached orphan still alive after SIGKILL.',
+    }),
+    diskFreeGb: async () => 10,
+  });
+  assert.equal(result.status, 'BLOCKED');
+  const blockedProbe = result.checks.find(
+    ({ name, status }) => name === 'git' && status === 'BLOCKED',
+  );
+  assert.ok(blockedProbe, `expected a BLOCKED tool probe: ${JSON.stringify(result.checks)}`);
+  assert.match(blockedProbe.evidence, /orphan|SIGKILL|process-tree|cleanup/i);
 });
 
 test('preflight resolves required env names case-insensitively', async () => {

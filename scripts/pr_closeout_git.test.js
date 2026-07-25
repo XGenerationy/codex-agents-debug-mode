@@ -51,10 +51,16 @@ test('recognizes files that define validation strength', () => {
     // actually discovers must be treated as gate changes.
     'GNUmakefile',
     'makefile',
+    // Local composite actions hold the same validation surfaces as workflows
+    // when a workflow does `uses: ./.github/actions/test`.
+    '.github/actions/test/action.yml',
+    '.github/actions/pr-check/action.yaml',
+    '.github/actions/nested/setup/action.yml',
   ]) {
     assert.equal(isGateFile(file), true, file);
   }
   assert.equal(isGateFile('src/worker.ts'), false);
+  assert.equal(isGateFile('.github/CODEOWNERS'), false);
 });
 
 test('blocks unreviewed gate changes and fails obvious weakening', () => {

@@ -2310,9 +2310,11 @@ const TOOL_PROBES = [
  * validation executor.
  *
  * Never throws: spawn errors and non-zero exits are normalized into the same
- * `{exitCode, stdout, stderr}` shape so every probe result can be handled
- * uniformly by the caller.
- * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string}>}
+ * `{exitCode, stdout, stderr, terminationStatus, terminationEvidence}` shape
+ * so every probe result can be handled uniformly by the caller. A successful
+ * exit with BLOCKED process-tree cleanup is still returned so preflight can
+ * refuse admission (matching the main command executor).
+ * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string, terminationStatus?: 'PASS'|'BLOCKED', terminationEvidence?: string}>}
  */
 const probeCommandDefault = async ({
   command,
@@ -2368,17 +2370,24 @@ const probeCommandDefault = async ({
   child.once('error', (error) => close({ exitCode: null, signal: null, spawnError: error }));
   child.once('close', (exitCode, signal) => close({ exitCode, signal }));
 
+  // Store the timeout handle so a clean exit does not leave an unref'd timer
+  // that keeps the Node process alive until timeoutMs (runPreflight runs many
+  // probes; leaked timers stacked to ~2 minutes of hang after PASS).
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+  });
   const first = await Promise.race([
     closePromise.then((outcome) => ({ kind: 'close', outcome })),
-    new Promise((resolve) => {
-      setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
-    }),
+    timeoutPromise,
   ]);
+  if (first.kind === 'close') clearTimeout(timer);
 
   let outcome = first.outcome;
+  let termination = { status: 'PASS', evidence: 'No process group was created.', escalated: false };
   if (first.kind === 'close') {
     if (!outcome?.spawnError) {
-      await terminateTree({
+      termination = await terminateTree({
         child,
         platform,
         env,
@@ -2390,7 +2399,7 @@ const probeCommandDefault = async ({
       });
     }
   } else {
-    await terminateTree({
+    termination = await terminateTree({
       child,
       platform,
       env,
@@ -2411,22 +2420,41 @@ const probeCommandDefault = async ({
         new Promise((resolve) => { setTimeout(() => resolve(null), terminationGraceMs); }),
       ]);
     }
+    if (!outcome && termination.status !== 'BLOCKED') {
+      termination = {
+        status: 'BLOCKED',
+        evidence: `${termination.evidence || 'Process-tree termination incomplete.'} The root process did not close after bounded termination.`,
+        escalated: true,
+      };
+    }
   }
+
+  const terminationFields = {
+    terminationStatus: termination.status === 'BLOCKED' ? 'BLOCKED' : 'PASS',
+    terminationEvidence: termination.evidence || '',
+  };
 
   if (outcome?.spawnError) {
     return {
       exitCode: null,
       stdout,
       stderr: outcome.spawnError.message || String(outcome.spawnError),
+      ...terminationFields,
     };
   }
   if (!outcome) {
-    return { exitCode: null, stdout, stderr: stderr || 'probe timed out' };
+    return {
+      exitCode: null,
+      stdout,
+      stderr: stderr || 'probe timed out',
+      ...terminationFields,
+    };
   }
   return {
     exitCode: Number.isInteger(outcome.exitCode) ? outcome.exitCode : null,
     stdout,
     stderr,
+    ...terminationFields,
   };
 };
 
@@ -2501,6 +2529,19 @@ const runPreflight = async ({
   }));
   for (const [name, command] of TOOL_PROBES) {
     const result = await runProbe(command);
+    // Process-tree cleanup failure is admission-blocking even when the probe
+    // itself exited 0: a surviving descendant can mutate the worktree after
+    // the seal, same as the main command executor.
+    if (result.terminationStatus === 'BLOCKED') {
+      const evidence = redactSecrets(
+        result.terminationEvidence
+          || 'Preflight process-tree cleanup could not prove descendants exited.',
+        env,
+        sensitiveEnvNames,
+      );
+      checks.push({ name, status: 'BLOCKED', evidence });
+      continue;
+    }
     const classification = classifyOutput(result);
     const status = result.exitCode === 0 ? classification.status : 'BLOCKED';
     const rawEvidence = status === 'PASS'

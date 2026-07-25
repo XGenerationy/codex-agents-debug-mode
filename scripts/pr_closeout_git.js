@@ -54,6 +54,10 @@ const isGateFile = (file) => {
   const normalized = normalizePath(file);
   const base = path.posix.basename(normalized).toLowerCase();
   return normalized.startsWith('.github/workflows/')
+    // Local composite actions (`uses: ./.github/actions/test`) hold the same
+    // validation surfaces as workflows. Without this, deleting `npm test` or
+    // CodeQL from an action.yml is invisible to readGateChanges / removal FAIL.
+    || normalized.startsWith('.github/actions/')
     || base === 'package.json'
     || /^\.(?:eslintrc|biomerc)(?:\..+)?$/.test(base)
     // Match all of GNU make's default filenames (GNUmakefile, makefile,
