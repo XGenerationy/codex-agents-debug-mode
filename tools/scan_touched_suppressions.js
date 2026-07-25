@@ -23,6 +23,7 @@
 
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
+const { TextDecoder } = require('node:util');
 
 const { classifyGateIntegrity, isGateFile } = require('../scripts/pr_closeout_git');
 const {
@@ -34,42 +35,77 @@ const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+// Fatal UTF-8: lossy decoding would replace invalid path bytes with U+FFFD
+// and hand scanTouchedSuppressions a different pathname (ENOENT skip), so a
+// touched non-UTF-8 path could evade the suppression gate entirely.
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 /**
- * Run git in the repository root and return raw stdout (not trimmed).
- * Path lists are NUL-delimited; individual entries may begin/end with
- * whitespace (legal Git paths). Callers that need a trimmed scalar SHA
- * still trim themselves via gitScalar.
+ * Run git in the repository root and return raw stdout as a Buffer
+ * (undecoded). Path lists are NUL-delimited; callers that need text must
+ * decode fatally (splitZ) or intentionally (gitScalar for ASCII SHAs).
  * @param {string[]} args
  * @param {object} [options]
- * @returns {string}
+ * @returns {Buffer}
  */
-const git = (args, options = {}) => {
+const gitBuffer = (args, options = {}) => {
   const { input, ...rest } = options;
   const stdout = execFileSync('git', args, {
     cwd: root,
-    encoding: 'utf8',
+    encoding: 'buffer',
     stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     maxBuffer: GIT_MAX_BUFFER,
     input: input === undefined ? undefined : input,
     ...rest,
   });
-  return String(stdout || '');
+  return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout || '');
 };
+
+/**
+ * Run git and return stdout decoded as UTF-8 (lossy only for non-path
+ * content such as unified diffs). Prefer gitBuffer + splitZ for path lists.
+ * @param {string[]} args
+ * @param {object} [options]
+ * @returns {string}
+ */
+const git = (args, options = {}) => gitBuffer(args, options).toString('utf8');
 
 /** @param {string[]} args @param {object} [options] @returns {string} trimmed git stdout */
 const gitScalar = (args, options = {}) => git(args, options).trim();
 
 /**
- * Split a NUL-delimited path list, preserving each nonempty segment
- * byte-for-byte (leading/trailing spaces are part of a legal Git path).
- * @param {string} text
+ * Split a NUL-delimited git path list with a fatal UTF-8 decode per segment.
+ * Preserves each nonempty segment (leading/trailing spaces are legal Git
+ * path characters). Throws when any segment is not valid UTF-8 so the CI
+ * gate fails closed instead of silently skipping a touched file.
+ * @param {Buffer|string} data
  * @returns {string[]}
  */
-const splitZ = (text) => {
-  const raw = String(text || '');
-  if (!raw) return [];
-  return raw.split('\0').filter((entry) => entry.length > 0);
+const splitZ = (data) => {
+  const buffer = Buffer.isBuffer(data)
+    ? data
+    : Buffer.from(String(data || ''), 'utf8');
+  if (!buffer.length) return [];
+  const paths = [];
+  let start = 0;
+  for (let i = 0; i <= buffer.length; i += 1) {
+    if (i === buffer.length || buffer[i] === 0) {
+      if (i > start) {
+        const slice = buffer.subarray(start, i);
+        let decoded;
+        try {
+          decoded = utf8Decoder.decode(slice);
+        } catch {
+          throw new Error(
+            `Git path is not valid UTF-8 (fail closed): ${Buffer.from(slice).toString('hex').slice(0, 48)}`,
+          );
+        }
+        if (decoded.length) paths.push(decoded);
+      }
+      start = i + 1;
+    }
+  }
+  return paths;
 };
 
 /**
@@ -196,9 +232,9 @@ const resolveBaseSha = () => {
  */
 const diffNameOnly = (baseSha) => {
   if (isEmptyTreeSha(baseSha)) {
-    return splitZ(git(['diff', '--name-only', '-z', baseSha, 'HEAD']));
+    return splitZ(gitBuffer(['diff', '--name-only', '-z', baseSha, 'HEAD']));
   }
-  return splitZ(git(['diff', '--name-only', '-z', `${baseSha}...HEAD`]));
+  return splitZ(gitBuffer(['diff', '--name-only', '-z', `${baseSha}...HEAD`]));
 };
 
 /**
@@ -224,9 +260,9 @@ const diffUnified = (baseSha, files) => {
  */
 const listTouchedFiles = (baseSha) => {
   const tracked = diffNameOnly(baseSha);
-  const unstaged = splitZ(git(['diff', '--name-only', '-z']));
-  const staged = splitZ(git(['diff', '--cached', '--name-only', '-z']));
-  const untracked = splitZ(git(['ls-files', '--others', '--exclude-standard', '-z']));
+  const unstaged = splitZ(gitBuffer(['diff', '--name-only', '-z']));
+  const staged = splitZ(gitBuffer(['diff', '--cached', '--name-only', '-z']));
+  const untracked = splitZ(gitBuffer(['ls-files', '--others', '--exclude-standard', '-z']));
   return [...new Set([...tracked, ...unstaged, ...staged, ...untracked])].sort();
 };
 

@@ -29,6 +29,13 @@ const assertNotSymlink = async (target, message) => {
  * assertNotSymlink first as the primary guard there. ELOOP is rethrown as-is
  * so callers can map it to a domain-specific message.
  *
+ * `O_NONBLOCK` is also OR'd when defined so a TOCTOU swap to a FIFO between
+ * the caller's lstat and this open cannot hang indefinitely waiting for a
+ * writer/reader. Callers that open for read then re-check `handle.stat()`
+ * and reject non-regular descriptors (suppression/gate scanners, hashFile,
+ * evidence logs). Regular-file I/O is unaffected; the constant is 0 on
+ * platforms that lack it (e.g. some Windows builds).
+ *
  * `flags` defaults to `O_RDONLY` so one-argument callers (suppression/gate
  * scanners that open for read) keep working. Explicit non-integer flags
  * (e.g. string modes like `'a'`) still throw TypeError so they cannot coerce
@@ -43,10 +50,30 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
     throw new TypeError('openNoFollow requires numeric fs.constants flags.');
   }
   const noFollow = constants.O_NOFOLLOW || 0;
+  const nonBlock = constants.O_NONBLOCK || 0;
+  const preferred = flags | noFollow | nonBlock;
   try {
-    return await open(target, flags | noFollow, mode);
+    return await open(target, preferred, mode);
   } catch (error) {
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    // Platform rejected the flag combo. Drop NOFOLLOW first (keep NONBLOCK
+    // so a FIFO still cannot hang), then plain flags as last resort.
+    if (noFollow) {
+      try {
+        return await open(target, flags | nonBlock, mode);
+      } catch (error2) {
+        if (!nonBlock || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error2?.code)) {
+          throw error2;
+        }
+      }
+    }
+    if (nonBlock) {
+      try {
+        return await open(target, flags | nonBlock, mode);
+      } catch (error3) {
+        if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error3?.code)) throw error3;
+      }
+    }
     return open(target, flags, mode);
   }
 };

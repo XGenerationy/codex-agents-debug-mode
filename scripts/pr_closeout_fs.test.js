@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const { constants } = require('node:fs');
 const { mkdtemp, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
@@ -69,4 +70,27 @@ test('openNoFollow accepts explicit numeric write flags', async () => {
 
 test('assertNotSymlink tolerates ENOENT', async () => {
   await assertNotSymlink(path.join(tmpdir(), 'no-such-closeout-fs-path'), 'should not throw');
+});
+
+test('openNoFollow does not hang when the path is a FIFO', { timeout: 10000 }, async () => {
+  // Suppression/gate scanners open after lstat. A TOCTOU swap to a FIFO would
+  // block forever on a blocking O_RDONLY open waiting for a writer. O_NONBLOCK
+  // keeps the open non-hanging so callers can fstat and reject non-regular
+  // descriptors. POSIX-only: Windows Node cannot see POSIX FIFOs.
+  if (process.platform === 'win32') return;
+  if (!(constants.O_NONBLOCK > 0)) return;
+  const dir = await mkdtemp(path.join(tmpdir(), 'closeout-fs-fifo-'));
+  const fifo = path.join(dir, 'raced.fifo');
+  try {
+    execFileSync('mkfifo', [fifo]);
+    const handle = await openNoFollow(fifo);
+    try {
+      const info = await handle.stat();
+      assert.equal(info.isFile(), false, 'FIFO must not report as a regular file');
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

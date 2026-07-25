@@ -27,13 +27,24 @@ const CONFIG_SILENCING = [
   // silently raise the lint warning budget via a package-scripts entry.
   /max[-_]?warnings["']?\s*[:=]\s*(?:-1|[1-9]\d*)/i,
   /--max-warnings\s+(?:-1|[1-9]\d*)\b/i,
-  // Increase the rules-object scan window so disabled rules are still caught
-  // when they sit more than 1000 chars after the `rules:` key in real-world
-  // ESLint/Biome configs. The bound stays finite to keep the regex linear.
-  /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["']off["']/i,
-  /["']?rules?["']?\s*[:=][\s\S]{0,4000}?["'][^"'\r\n]+["']\s*:\s*0\b/i,
+  // Disabled rules: do NOT bound the distance after a `rules`/`rule` key.
+  // A multi-KB ESLint/Biome config can place `"no-console": "off"` (or `: 0`)
+  // far past any fixed window; a 4 KB cap would miss that and accept
+  // config-level rule disabling. Non-greedy `[\s\S]*?` still stops at the
+  // first match and stays linear for typical config sizes. Also match
+  // standalone rule-id → "off"/"0" assignments (override blocks / flat
+  // config) without requiring a nearby `rules` key — rule ids are
+  // kebab/scoped forms, not bare words like "mode"/"power".
+  /["']?rules?["']?\s*[:=][\s\S]*?["']off["']/i,
+  /["']?rules?["']?\s*[:=][\s\S]*?["'][^"'\r\n]+["']\s*:\s*0\b/i,
+  // Scoped (@org/rule) and plugin/rule ids — one slash is enough for ESLint.
+  // Do not put \b after a closing quote of "off" (quote is non-word, so \b
+  // fails between " and ,/}). Use an explicit "off" alternative instead.
+  /["']@[\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
+  /["'][\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
+  /["'](?:no|prefer|require|max|min|eqeqeq|curly|strict|camelcase|semi|quotes|indent)-[\w-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
   /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled["']?\s*[:=]\s*false|disabled["']?\s*[:=]\s*true)/i,
-  /["']?linter["']?\s*:\s*\{[\s\S]{0,4000}?["']?enabled["']?\s*:\s*false/i,
+  /["']?linter["']?\s*:\s*\{[\s\S]*?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
   // Next.js: eslint.ignoreDuringBuilds lets production builds pass with ESLint errors.

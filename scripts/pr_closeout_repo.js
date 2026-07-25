@@ -1,6 +1,6 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { lstat, readFile, readdir, readlink } = require('node:fs/promises');
+const { lstat, readFile, readdir, readlink, realpath } = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
@@ -543,6 +543,42 @@ const hashFsEntry = async (absolute) => {
 };
 
 /**
+ * Hash a path Git consults as an excludes/ignore file. Unlike hashFsEntry
+ * (which deliberately does not follow symlinks for untracked seals), Git
+ * follows `core.excludesFile` / global excludes / XDG ignore paths and uses
+ * the target file's contents. Seal both the link identity (if any) and the
+ * followed regular-file material so rewriting the target cannot hide
+ * untracked files without moving the repository seal fingerprint.
+ * @param {string} absolute
+ * @returns {Promise<string>}
+ */
+const hashGitExcludePath = async (absolute) => {
+  let info;
+  try {
+    info = await lstat(absolute);
+  } catch (error) {
+    if (error.code === 'ENOENT') return hashBytes('missing');
+    throw error;
+  }
+  if (info.isSymbolicLink()) {
+    const target = await readlink(absolute);
+    let followed = 'missing';
+    try {
+      // realpath follows the symlink chain to the final path Git would read.
+      const resolved = await realpath(absolute);
+      followed = await hashFsEntry(resolved);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        // Broken link or non-file target: still seal the link text.
+        followed = `unresolved:${error?.code || error?.message || error}`;
+      }
+    }
+    return hashBytes(`symlink:${target}\0followed:${followed}`);
+  }
+  return hashFsEntry(absolute);
+};
+
+/**
  * Validate and resolve a config-supplied "extra" reproducibility path before
  * it is folded into workingTreeFingerprint. Rejects an absolute `requested`
  * value outright, then rejects any path that resolves outside `repo` (`..`
@@ -670,16 +706,18 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   } catch {
     excludePath = path.join(repo, '.git', 'info', 'exclude');
   }
-  entries.push({ path: '__git_info_exclude__', hash: await hashFsEntry(excludePath) });
+  entries.push({ path: '__git_info_exclude__', hash: await hashGitExcludePath(excludePath) });
   // Seal core.excludesFile: --exclude-standard honors that path for untracked
   // discovery, so mutating it can hide files without changing info/exclude.
+  // When the configured path is a symlink, Git follows it — hash both the
+  // link identity and the followed contents (hashGitExcludePath).
   try {
     const excludesFile = await gitText(repo, ['config', '--get', 'core.excludesFile']);
     const resolved = excludesFile ? expandGitPathname(excludesFile, repo) : '';
     entries.push({
       path: '__git_core_excludesFile__',
       hash: resolved
-        ? hashBytes(`path:${resolved}\0${await hashFsEntry(resolved)}`)
+        ? hashBytes(`path:${resolved}\0${await hashGitExcludePath(resolved)}`)
         : hashBytes('unset'),
     });
   } catch {
@@ -692,7 +730,7 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     const globalExcludes = await gitText(repo, ['config', '--global', '--get', 'core.excludesFile']);
     if (globalExcludes) {
       const resolved = expandGitPathname(globalExcludes, os.homedir());
-      globalExcludeParts.push(`globalCore:${resolved}\0${await hashFsEntry(resolved)}`);
+      globalExcludeParts.push(`globalCore:${resolved}\0${await hashGitExcludePath(resolved)}`);
     } else {
       globalExcludeParts.push('globalCore:unset');
     }
@@ -703,7 +741,7 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     ? process.env.XDG_CONFIG_HOME
     : path.join(os.homedir(), '.config');
   const xdgIgnore = path.join(xdgConfig, 'git', 'ignore');
-  globalExcludeParts.push(`xdg:${xdgIgnore}\0${await hashFsEntry(xdgIgnore)}`);
+  globalExcludeParts.push(`xdg:${xdgIgnore}\0${await hashGitExcludePath(xdgIgnore)}`);
   entries.push({
     path: '__git_global_excludes__',
     hash: hashBytes(globalExcludeParts.sort().join('\n')),

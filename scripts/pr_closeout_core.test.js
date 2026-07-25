@@ -693,6 +693,39 @@ test('flags extension-only ignore globs as config silencing', () => {
   );
 });
 
+test('detects disabled rules beyond a multi-kilobyte rules object', () => {
+  // A realistic .eslintrc can put `"no-console": "off"` many KB after the
+  // opening `rules` key. A fixed 4 KB scan window would miss it and accept
+  // config-level rule disabling under the zero-suppression policy.
+  const padding = `${'x'.repeat(80)},\n`.repeat(80); // well past 4 KB
+  const largeRules = [
+    'module.exports = {',
+    '  rules: {',
+    padding,
+    '    "no-console": "off",',
+    '  },',
+    '};',
+  ].join('\n');
+  assert.ok(
+    largeRules.length > 5000,
+    `fixture must exceed 4 KB (got ${largeRules.length})`,
+  );
+  assert.ok(
+    scanSuppressionText('.eslintrc.js', largeRules).some((f) => f.category === 'config-silencing'),
+    'disabled rule past 4 KB after rules: must be flagged',
+  );
+  // Independent kebab rule-id form (override block without a nearby rules key
+  // in the same 4 KB window — the assignment itself is the signal).
+  assert.ok(
+    scanSuppressionText('.eslintrc.js', '{ "no-debugger": 0 }').some((f) => f.category === 'config-silencing'),
+    'standalone no-* rule set to 0 must be flagged',
+  );
+  assert.ok(
+    scanSuppressionText('.eslintrc.js', '{ "@typescript-eslint/no-explicit-any": "off" }').some((f) => f.category === 'config-silencing'),
+    'scoped plugin rule set to off must be flagged',
+  );
+});
+
 test('detects quoted enabled/disabled JSON gate switches and --quiet lint scripts', () => {
   // JSON config disables a gate via a QUOTED key: "enabled":false. The pattern
   // must tolerate the closing quote before the colon so package.json-style

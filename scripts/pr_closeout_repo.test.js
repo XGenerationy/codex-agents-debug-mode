@@ -464,6 +464,33 @@ test('workingTreeFingerprint seals core.excludesFile path and contents', async (
   }
 });
 
+test('workingTreeFingerprint seals contents behind a core.excludesFile symlink', async () => {
+  // Git follows core.excludesFile when it is a symlink. Hashing only the link
+  // target string would leave the seal unchanged when the target file's
+  // contents are rewritten to ignore newly created untracked files.
+  if (process.platform === 'win32') return;
+  const repo = await fixtureRepo();
+  const outside = await mkdtemp(path.join(tmpdir(), 'closeout-excludes-symlink-'));
+  try {
+    const target = path.join(outside, 'real-excludes');
+    const link = path.join(outside, 'excludes-link');
+    await writeFile(target, 'hidden/\n');
+    await symlink(target, link);
+    git(repo, 'config', 'core.excludesFile', link);
+    const before = await workingTreeFingerprint(repo);
+    await writeFile(target, 'hidden/\nother/\n');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(
+      before,
+      after,
+      'mutating the file behind a core.excludesFile symlink must change the fingerprint',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
 test('workingTreeFingerprint expands a tilde core.excludesFile the way Git does', async () => {
   // Git expands a leading ~/ in pathname config values against $HOME. Without
   // that expansion a value like ~/gitignore would be hashed as a repo-relative
