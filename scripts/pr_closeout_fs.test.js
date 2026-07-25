@@ -6,7 +6,7 @@ const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { assertNotSymlink, openNoFollow } = require('./pr_closeout_fs');
+const { assertNotSymlink, openNoFollow, openNoFollowFlagAttempts } = require('./pr_closeout_fs');
 
 test('openNoFollow defaults to O_RDONLY when flags are omitted', async () => {
   // Suppression/gate scanners call openNoFollow(path) with no flags. After the
@@ -93,4 +93,30 @@ test('openNoFollow does not hang when the path is a FIFO', { timeout: 10000 }, a
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () => {
+  // Regression for Qodo review #4780104996: a broken fallback retried
+  // flags|NONBLOCK twice and never tried flags|NOFOLLOW, so platforms that
+  // reject NONBLOCK (or the combo) fell through to a plain following open
+  // even when NOFOLLOW alone would have worked.
+  const flags = 0;
+  const noFollow = 0x100;
+  const nonBlock = 0x800;
+  assert.deepEqual(openNoFollowFlagAttempts(flags, noFollow, nonBlock), [
+    flags | noFollow | nonBlock,
+    flags | nonBlock,
+    flags | noFollow,
+    flags,
+  ]);
+  // Single-extra platforms: preferred then plain only (no duplicate retries).
+  assert.deepEqual(openNoFollowFlagAttempts(flags, noFollow, 0), [
+    flags | noFollow,
+    flags,
+  ]);
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, nonBlock), [
+    flags | nonBlock,
+    flags,
+  ]);
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0), [flags]);
 });

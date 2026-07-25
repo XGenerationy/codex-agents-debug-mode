@@ -22,12 +22,45 @@ const assertNotSymlink = async (target, message) => {
 };
 
 /**
+ * Ordered open-flag attempts for openNoFollow when both O_NOFOLLOW and
+ * O_NONBLOCK may be unavailable on a given platform/FS.
+ *
+ * Order:
+ * 1. preferred = flags | NOFOLLOW | NONBLOCK
+ * 2. drop NOFOLLOW, keep NONBLOCK (FIFO hang defense)
+ * 3. drop NONBLOCK, keep NOFOLLOW (symlink TOCTOU defense when NONBLOCK is
+ *    the unsupported bit — never skip this after a failed NONBLOCK-only try)
+ * 4. plain flags (last resort; callers still use assertNotSymlink + fd.stat)
+ *
+ * Duplicates are collapsed so platforms missing one constant still get a
+ * short path (preferred → plain).
+ * @param {number} flags
+ * @param {number} noFollow
+ * @param {number} nonBlock
+ * @returns {number[]}
+ */
+const openNoFollowFlagAttempts = (flags, noFollow, nonBlock) => {
+  const attempts = [];
+  const add = (value) => {
+    if (!attempts.includes(value)) attempts.push(value);
+  };
+  add(flags | noFollow | nonBlock);
+  if (noFollow && nonBlock) {
+    add(flags | nonBlock);
+    add(flags | noFollow);
+  }
+  add(flags);
+  return attempts;
+};
+
+/**
  * Open `target` without following a symlinked final component.
  * `O_NOFOLLOW` is OR'd into `flags` when the platform defines it. On platforms
  * without the flag (or filesystems that reject it with EINVAL/ENOTSUP/
- * EOPNOTSUPP), falls back to a plain open — callers must still run
- * assertNotSymlink first as the primary guard there. ELOOP is rethrown as-is
- * so callers can map it to a domain-specific message.
+ * EOPNOTSUPP), falls back through openNoFollowFlagAttempts — callers must
+ * still run assertNotSymlink first as the primary guard when NOFOLLOW is
+ * unavailable. ELOOP is rethrown as-is so callers can map it to a
+ * domain-specific message.
  *
  * `O_NONBLOCK` is also OR'd when defined so a TOCTOU swap to a FIFO between
  * the caller's lstat and this open cannot hang indefinitely waiting for a
@@ -35,6 +68,11 @@ const assertNotSymlink = async (target, message) => {
  * and reject non-regular descriptors (suppression/gate scanners, hashFile,
  * evidence logs). Regular-file I/O is unaffected; the constant is 0 on
  * platforms that lack it (e.g. some Windows builds).
+ *
+ * Unsupported-flag recovery never retries the same combo twice. When both
+ * extras are present and the combo fails, it tries NONBLOCK-only, then
+ * NOFOLLOW-only, then plain flags — so a platform that rejects NONBLOCK still
+ * keeps NOFOLLOW protection instead of falling straight to a following open.
  *
  * `flags` defaults to `O_RDONLY` so one-argument callers (suppression/gate
  * scanners that open for read) keep working. Explicit non-integer flags
@@ -51,34 +89,24 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
   }
   const noFollow = constants.O_NOFOLLOW || 0;
   const nonBlock = constants.O_NONBLOCK || 0;
-  const preferred = flags | noFollow | nonBlock;
-  try {
-    return await open(target, preferred, mode);
-  } catch (error) {
-    if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    // Platform rejected the flag combo. Drop NOFOLLOW first (keep NONBLOCK
-    // so a FIFO still cannot hang), then plain flags as last resort.
-    if (noFollow) {
-      try {
-        return await open(target, flags | nonBlock, mode);
-      } catch (error2) {
-        if (!nonBlock || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error2?.code)) {
-          throw error2;
-        }
-      }
+  const attempts = openNoFollowFlagAttempts(flags, noFollow, nonBlock);
+  const unsupported = (code) => ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(code);
+
+  let lastError;
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      return await open(target, attempts[i], mode);
+    } catch (error) {
+      lastError = error;
+      const canRetry = i < attempts.length - 1 && unsupported(error?.code);
+      if (!canRetry) throw error;
     }
-    if (nonBlock) {
-      try {
-        return await open(target, flags | nonBlock, mode);
-      } catch (error3) {
-        if (!['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error3?.code)) throw error3;
-      }
-    }
-    return open(target, flags, mode);
   }
+  throw lastError;
 };
 
 module.exports = {
   assertNotSymlink,
   openNoFollow,
+  openNoFollowFlagAttempts,
 };
