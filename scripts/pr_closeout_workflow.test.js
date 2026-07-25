@@ -4,6 +4,7 @@ const test = require('node:test');
 const { MANDATORY_CHECKS } = require('./pr_closeout_core');
 const { digestValidationConfig } = require('./pr_closeout_git');
 const {
+  defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,
   prepareOutputDirectory,
@@ -265,6 +266,18 @@ test('passes only essential and explicitly configured environment variables to c
       else process.env[name] = value;
     }
   }
+});
+
+test('default evidence directories include process uniqueness for concurrent same-ms starts', () => {
+  // Codex #4780351874: timestamp-only names collide when two closeout
+  // processes for the same repo+head start in the same millisecond.
+  const a = defaultOutputDir('/tmp/my-repo', 'abcdef0123456789');
+  const b = defaultOutputDir('/tmp/my-repo', 'abcdef0123456789');
+  assert.notEqual(a, b);
+  assert.match(a, /codex-pr-closeout/);
+  assert.match(a, new RegExp(`${process.pid}-[0-9a-f]{8}`));
+  assert.match(b, new RegExp(`${process.pid}-[0-9a-f]{8}`));
+  assert.match(a, /abcdef012345/);
 });
 
 test('rejects a lexically external output whose physical target is inside the repository', async () => {

@@ -111,11 +111,25 @@ const classifyGateAttestation = ({
     headSha: expectedHeadSha,
     configDigest: expectedConfigDigest,
   });
-  const candidates = reviews.filter((review) => {
+  // Collapse each reviewer's history on this head to their latest submission
+  // before admitting APPROVED+marker. Otherwise an older APPROVED with the
+  // marker still admits after the same reviewer later posts CHANGES_REQUESTED
+  // (or a marker-less re-review) on the same head (Codex #4780351874).
+  const latestByReviewer = new Map();
+  for (const review of reviews) {
+    const reviewer = review?.user?.login;
+    if (typeof reviewer !== 'string' || !reviewer.trim()) continue;
+    if (review?.commit_id !== expectedHeadSha) continue;
+    const key = reviewer.toLowerCase();
+    const previous = latestByReviewer.get(key);
+    if (!previous || String(review.submitted_at || '') > String(previous.submitted_at || '')) {
+      latestByReviewer.set(key, review);
+    }
+  }
+  const candidates = [...latestByReviewer.values()].filter((review) => {
     const exactLines = String(review?.body || '').split(/\r?\n/).filter((line) => line === marker);
     const reviewer = review?.user?.login;
     return String(review?.state || '').toUpperCase() === 'APPROVED'
-      && review?.commit_id === expectedHeadSha
       && exactLines.length === 1
       && typeof reviewer === 'string'
       && reviewer.trim()

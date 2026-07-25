@@ -883,6 +883,38 @@ test('reports already_running when the SAME project root is relaunched on an occ
   }
 });
 
+test('refuses already_running when the peer is ready but collector_token is missing', { timeout: 20000 }, async () => {
+  // Codex #4780351874: readiness is latched in memory after token persistence.
+  // If `.debug/collector_token` is deleted afterward, a successful
+  // already_running exit would leave the documented client flow unable to
+  // authorize /session. Relaunch must fail closed with a specific reason.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-eaddrinuse-notoken-'));
+  let firstChild;
+  let secondChild;
+  try {
+    const port = await findFreePort();
+    const first = launchCli(projectRoot, port);
+    firstChild = first.child;
+    const firstResult = await first.outcome;
+    assert.equal(firstResult.status, 'started', firstResult.stderr);
+
+    await rm(path.join(projectRoot, '.debug', 'collector_token'));
+
+    const second = launchCli(projectRoot, port);
+    secondChild = second.child;
+    const secondResult = await second.outcome;
+
+    assert.equal(secondResult.status, null);
+    assert.equal(secondResult.exitCode, 1);
+    assert.equal(secondResult.stdout.includes('already_running'), false);
+    assert.match(secondResult.stderr, /already_running_token_unavailable/);
+  } finally {
+    if (secondChild) stopCli(secondChild);
+    if (firstChild) stopCli(firstChild);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('reports port_in_use_by_other_process (not a false already_running) when a DIFFERENT project root is launched on an occupied port', { timeout: 20000 }, async () => {
   // Finding: probeServer previously only verified /health's service/version/
   // instance_id, never which project the running instance actually serves.

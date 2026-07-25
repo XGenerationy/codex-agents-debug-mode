@@ -1,3 +1,4 @@
+const { randomBytes } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const { mkdir, realpath } = require('node:fs/promises');
 const path = require('node:path');
@@ -100,8 +101,12 @@ const planStatusFor = (plan) => {
 /**
  * Default evidence output directory when the caller doesn't supply one:
  * under the OS tmpdir, namespaced by a filesystem-safe repo basename, the
- * short head SHA, and a filesystem-safe timestamp, so concurrent runs
- * against different repos/commits never collide.
+ * short head SHA, a filesystem-safe timestamp, and a process-unique suffix
+ * (pid + random), so concurrent runs against the same repo/head never share
+ * an evidence directory even when they start in the same millisecond
+ * (Codex #4780351874). Without the unique suffix, independently numbered
+ * attempt logs and final reports can truncate/interleave and one run may
+ * return PASS while its on-disk evidence belongs partly to the other.
  * @param {string} repo
  * @param {string} headSha
  * @returns {string}
@@ -109,7 +114,8 @@ const planStatusFor = (plan) => {
 const defaultOutputDir = (repo, headSha) => {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const name = path.basename(repo).replace(/[^a-z0-9_-]/gi, '-');
-  return path.join(tmpdir(), 'codex-pr-closeout', `${name}-${headSha.slice(0, 12)}-${stamp}`);
+  const unique = `${process.pid}-${randomBytes(4).toString('hex')}`;
+  return path.join(tmpdir(), 'codex-pr-closeout', `${name}-${headSha.slice(0, 12)}-${stamp}-${unique}`);
 };
 
 /**
@@ -940,6 +946,7 @@ const runCloseoutWorkflow = async ({
 };
 
 module.exports = {
+  defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,
   prepareOutputDirectory,

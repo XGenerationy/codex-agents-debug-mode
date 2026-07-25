@@ -826,16 +826,40 @@ const main = () => {
       // concluding it is the same collector; a mismatch falls through to the
       // port_in_use_by_other_process failure below, same as no identity at all.
       if (identity && identity.project_hash === server.collectorProjectHash && identity.ready) {
-        process.stdout.write(
-          `${JSON.stringify({
-            status: 'already_running',
-            port,
-            service: identity.service,
-            version: identity.version,
-            instance_id: identity.instance_id,
-          })}\n`,
-        );
-        return;
+        // ready is latched in the peer's memory after token persistence, but
+        // the file can still be deleted/replaced afterward. The documented
+        // client flow authorizes /session via `cat .debug/collector_token`, so
+        // already_running without a usable token leaves the collector running
+        // and unusable. Revalidate the on-disk token before accepting the probe
+        // (Codex #4780351874).
+        const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
+        try {
+          await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
+          const tokenInfo = await lstat(tokenFile);
+          if (!tokenInfo.isFile() || tokenInfo.nlink > 1 || tokenInfo.size < 1) {
+            throw new Error('collector_token_unavailable');
+          }
+          process.stdout.write(
+            `${JSON.stringify({
+              status: 'already_running',
+              port,
+              service: identity.service,
+              version: identity.version,
+              instance_id: identity.instance_id,
+            })}\n`,
+          );
+          return;
+        } catch {
+          process.stderr.write(
+            `${JSON.stringify({
+              level: 'error',
+              event: 'startup.failed',
+              reason: 'already_running_token_unavailable',
+            })}\n`,
+          );
+          process.exitCode = 1;
+          return;
+        }
       }
     }
     process.stderr.write(

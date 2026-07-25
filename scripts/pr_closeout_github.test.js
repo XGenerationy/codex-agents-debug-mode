@@ -70,6 +70,51 @@ test('accepts only an independent exact GitHub review attestation marker', () =>
   assert.equal(classifyGateAttestation({ reviews: [approvedReview({ body: `${marker}-suffix` })], ...expected }).status, 'BLOCKED');
 });
 
+test('honors each reviewer latest decision on the attested head', () => {
+  // Codex #4780351874: an older APPROVED+marker must not admit after the same
+  // reviewer later submits CHANGES_REQUESTED (or a marker-less re-review) on
+  // the same head. Collapse per-reviewer history to the latest submission.
+  const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
+  const earlierApproval = approvedReview({
+    id: 10,
+    submitted_at: '2026-07-14T00:00:00Z',
+  });
+  const laterChangesRequested = approvedReview({
+    id: 11,
+    state: 'CHANGES_REQUESTED',
+    body: 'Please fix the gate bypass.',
+    submitted_at: '2026-07-14T01:00:00Z',
+  });
+  assert.equal(
+    classifyGateAttestation({ reviews: [earlierApproval, laterChangesRequested], ...expected }).status,
+    'BLOCKED',
+  );
+
+  const laterMarkerlessApproval = approvedReview({
+    id: 12,
+    body: 'LGTM without the marker.',
+    submitted_at: '2026-07-14T02:00:00Z',
+  });
+  assert.equal(
+    classifyGateAttestation({ reviews: [earlierApproval, laterMarkerlessApproval], ...expected }).status,
+    'BLOCKED',
+  );
+
+  // A second authorized reviewer whose latest decision is still APPROVED+marker
+  // remains admissible even if a different reviewer later requested changes.
+  const otherReviewerApproval = approvedReview({
+    id: 13,
+    user: { login: 'other-owner' },
+    submitted_at: '2026-07-14T00:30:00Z',
+  });
+  const stillPass = classifyGateAttestation({
+    reviews: [earlierApproval, laterChangesRequested, otherReviewerApproval],
+    ...expected,
+  });
+  assert.equal(stillPass.status, 'PASS');
+  assert.equal(stillPass.reviewer, 'other-owner');
+});
+
 test('requires the marker reviewer itself to have authoritative repository access', () => {
   const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
   const unrelatedTrustedApproval = approvedReview({
