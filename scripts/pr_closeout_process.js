@@ -990,22 +990,42 @@ const pathVariants = (value) => {
 };
 
 /**
+ * Expand a path to every spelling that may appear in evidence: the given
+ * form, and — when resolvable — its physical realpath. Symlinked worktrees
+ * otherwise leave the real directory unredacted when tools print `pwd`.
+ * @param {string} value
+ * @returns {string[]}
+ */
+const pathRootsForRedaction = (value) => {
+  if (typeof value !== 'string' || !value.trim()) return [];
+  const roots = [value, path.resolve(value)];
+  try {
+    const { realpathSync } = require('node:fs');
+    roots.push(realpathSync(value));
+  } catch {
+    // Path may not exist yet (output dir); keep resolve-only spellings.
+  }
+  return [...new Set(roots.filter(Boolean))];
+};
+
+/**
  * Builds the ordered [needle, placeholder] pairs used to normalize `cwd`,
  * `outputDir`, and the caller's home directory (HOME / USERPROFILE /
  * HOMEDRIVE+HOMEPATH) out of captured evidence, replacing each with
  * `<repo>`, `<output>`, or `<home>` respectively. Each path is expanded to
- * its pathVariants() so either separator style is caught.
+ * its pathVariants() so either separator style is caught, and realpath is
+ * included so a symlinked `--repo` still redacts the physical target.
  * @returns {Array<[string, string]>}
  */
 const buildPathReplacements = ({ cwd, outputDir, env = process.env } = {}) => {
   const entries = [
-    ...pathVariants(cwd).map((value) => [value, '<repo>']),
-    ...pathVariants(outputDir).map((value) => [value, '<output>']),
+    ...pathRootsForRedaction(cwd).flatMap((root) => pathVariants(root).map((value) => [value, '<repo>'])),
+    ...pathRootsForRedaction(outputDir).flatMap((root) => pathVariants(root).map((value) => [value, '<output>'])),
   ];
   for (const home of [env.USERPROFILE, env.HOME, env.HOMEDRIVE && env.HOMEPATH
     ? `${env.HOMEDRIVE}${env.HOMEPATH}`
     : null]) {
-    entries.push(...pathVariants(home).map((value) => [value, '<home>']));
+    entries.push(...pathRootsForRedaction(home).flatMap((root) => pathVariants(root).map((value) => [value, '<home>'])));
   }
   return entries;
 };
@@ -2015,6 +2035,26 @@ const createCommandExecutor = ({
   }
   const logsDir = path.join(outputDir, 'logs');
   await mkdir(logsDir, { recursive: true, mode: 0o700 });
+  // mkdir recursive accepts a pre-existing symlink named `logs`. Fail closed
+  // before any evidence open: only a real directory under outputDir is OK.
+  await assertNotSymlinkShared(
+    logsDir,
+    `Refusing to write evidence logs through a symlinked logs directory: ${logsDir}`,
+  );
+  try {
+    const realLogs = await realpath(logsDir);
+    const realOut = await realpath(outputDir);
+    const rel = path.relative(realOut, realLogs);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(
+        `Refusing to write evidence logs outside the output directory: ${logsDir}`,
+      );
+    }
+  } catch (error) {
+    if (error?.message?.startsWith('Refusing to write evidence logs')) throw error;
+    // realpath failure after mkdir is unexpected; surface it.
+    throw error;
+  }
   try {
     await chmod(logsDir, 0o700);
   } catch {

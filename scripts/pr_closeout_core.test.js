@@ -294,6 +294,9 @@ test('accepts zero-count failure buckets when real tests passed', () => {
     exitCode: 0,
     stdout: 'running 0 tests\ntest result: ok. 0 passed; 0 failed\n',
   }).status, 'FAIL');
+  // Empty TAP plan / zero-pass summary alone must not PASS.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '1..0\n' }).status, 'FAIL');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '# pass 0\n' }).status, 'FAIL');
 });
 
 test('flags focused or skipped tests in touched test files', () => {

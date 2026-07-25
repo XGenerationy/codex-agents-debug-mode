@@ -401,16 +401,21 @@ const classifyOutput = ({
     return { status: 'FAIL', evidence: 'Test runner reported no tests found/executed; closeout requires authoritative test evidence.' };
   }
   // Numeric no-work summaries from common runners: Node's TAP `# tests 0` /
-  // `# pass 0` and Vitest's `Tests 0 passed (0)` / `Test Files 0`. These exit 0
-  // while doing no work; the closeout gate requires authoritative test evidence.
-  // `Test Files 0` only counts as a zero total when it is not a bucket count in
-  // a richer summary: `Test Files 0 failed | 2 passed (2)` reports zero failed
-  // files alongside real passes, which IS authoritative test evidence.
+  // `# pass 0` / plan `1..0`, and Vitest's `Tests 0 passed (0)` / `Test Files 0`.
+  // These exit 0 while doing no work; the closeout gate requires authoritative
+  // test evidence. `Test Files 0` only counts as a zero total when it is not a
+  // bucket count in a richer summary: `Test Files 0 failed | 2 passed (2)`
+  // reports zero failed files alongside real passes, which IS authoritative.
+  // Empty TAP plan / `# pass 0` alone also FAILs unless independent evidence
+  // shows tests actually ran (mixed runners can emit a zero plan for a subfile).
+  const emptyTapPlan = /^[ \t]*1\.\.0\b/m.test(combined)
+    || /^[ \t]*#\s*pass\s+0\b/im.test(combined);
   if (/^[ \t]*#\s*tests?\s+0\b/im.test(combined)
     || /\btests?\s+0\s+passed\b/i.test(combined)
     || new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STATUS_TERM}\\b)`, 'i').test(combined)
     // Mocha-style no-work: "0 passing" with exit 0 (not "N passing" with failures).
-    || /(?:^|\n)\s*0\s+passing\b/i.test(combined)) {
+    || /(?:^|\n)\s*0\s+passing\b/i.test(combined)
+    || (emptyTapPlan && !hasAuthoritativeTestEvidence)) {
     return { status: 'FAIL', evidence: 'Test runner reported zero tests as the total; closeout requires authoritative test evidence.' };
   }
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
@@ -873,13 +878,17 @@ const scanSuppressionText = (file, text) => {
     if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
       const windowWeakening = new RegExp(testWeakening.source, 'i');
       const bareReceiver = /\b(?:describe|it|test|context|suite)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
+      // Lookahead window for bare-receiver splits. Three lines is not enough
+      // when blank/comment lines sit between `test` and `.only(...)`; keep a
+      // generous cap so the scan still terminates on huge files.
+      const RECEIVER_LOOKAHEAD = 16;
       for (let i = 0; i < lines.length; i += 1) {
         // Strip quotes across the full window first so a live receiver that
         // only becomes visible after `${...}` extraction (e.g. `${test` on
         // one line and `.only(...)}` on the next) can open the fallback.
         // Static template text is discarded and cannot open a window.
         const strippedWindow = stripQuotesPreserveTemplateExpr(
-          lines.slice(i, i + 3).join('\n')
+          lines.slice(i, i + RECEIVER_LOOKAHEAD).join('\n')
             .replace(/\/\*[\s\S]*?\*\//g, ' ')
             .replace(/\/\/[^\n]*/g, ' '),
         );

@@ -201,20 +201,29 @@ const gitPaths = async (repo, args) => {
  */
 const resolveRepositoryState = async ({ repo, baseRef }) => {
   if (!baseRef) throw new Error('A live PR base ref is required. Pass --base-ref or set baseRef in config.');
+  // Prefer the physical directory Git and child processes report (pwd, cwd),
+  // while still accepting a symlink path as input. Callers' path redaction
+  // tables also include both spellings via buildPathReplacements.
   const resolvedRepo = path.resolve(repo);
+  let physicalRepo = resolvedRepo;
+  try {
+    physicalRepo = await realpath(resolvedRepo);
+  } catch {
+    // Non-existent or unreadable path: keep path.resolve form for clearer errors.
+  }
   const [headSha, baseSha, mergeBaseSha] = await Promise.all([
-    gitText(resolvedRepo, ['rev-parse', 'HEAD']),
-    gitText(resolvedRepo, ['rev-parse', baseRef]),
-    gitText(resolvedRepo, ['merge-base', baseRef, 'HEAD']),
+    gitText(physicalRepo, ['rev-parse', 'HEAD']),
+    gitText(physicalRepo, ['rev-parse', baseRef]),
+    gitText(physicalRepo, ['merge-base', baseRef, 'HEAD']),
   ]);
   const groups = await Promise.all([
-    gitPaths(resolvedRepo, ['diff', '--name-only', '-z', `${mergeBaseSha}...HEAD`]),
-    gitPaths(resolvedRepo, ['diff', '--name-only', '-z']),
-    gitPaths(resolvedRepo, ['diff', '--name-only', '--cached', '-z']),
-    gitPaths(resolvedRepo, ['ls-files', '--others', '--exclude-standard', '-z']),
+    gitPaths(physicalRepo, ['diff', '--name-only', '-z', `${mergeBaseSha}...HEAD`]),
+    gitPaths(physicalRepo, ['diff', '--name-only', '-z']),
+    gitPaths(physicalRepo, ['diff', '--name-only', '--cached', '-z']),
+    gitPaths(physicalRepo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   return {
-    repo: resolvedRepo,
+    repo: physicalRepo,
     baseRef,
     baseSha,
     mergeBaseSha,
