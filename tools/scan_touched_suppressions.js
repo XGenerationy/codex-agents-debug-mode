@@ -25,7 +25,11 @@ const { execFileSync } = require('node:child_process');
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
-const { classifyGateIntegrity, isGateFile } = require('../scripts/pr_closeout_git');
+const {
+  VALIDATION_REMOVAL_PATTERNS,
+  classifyGateIntegrity,
+  isGateFile,
+} = require('../scripts/pr_closeout_git');
 const {
   readGateChanges,
   scanTouchedSuppressions,
@@ -269,32 +273,13 @@ const listTouchedFiles = (baseSha) => {
 // Deletion of validation-bearing lines inside a still-present gate file does
 // not produce a deletedFiles entry and may not match WEAKENING_PATTERNS on
 // added lines, so classifyGateIntegrity alone can return BLOCKED. Treat these
-// removals as FAIL in CI. Include multi-language test runners that commonly
-// appear inside `run: |` block steps (not only npm/pnpm/make).
-const VALIDATION_REMOVAL_PATTERNS = [
-  /^\-\s*run:\s*/i,
-  /^\-\s*-\s*run:\s*/i,
-  // Action-based validation steps (CodeQL, etc.): removed `uses:` lines.
-  /^\-\s*uses:\s*\S+/i,
-  /^\-\s*-\s*uses:\s*\S+/i,
-  /^\-.*\buses:\s+(?:github\/codeql-action|aquasecurity\/trivy-action|securego\/gosec|golangci\/golangci-lint-action|github\/super-linter|oxsecurity\/megalinter|codecov\/codecov-action|sonarsource\/sonarcloud)\S*/i,
-  /^\-.*\bnpm\s+(?:ci|test|run\b|audit\b)/i,
-  /^\-.*\bpnpm\s+(?:test|run\b|audit\b)/i,
-  /^\-.*\bscan:suppressions\b/i,
-  /^\-.*\bnode\s+--test\b/i,
-  /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
-  // Word-boundary the keywords so values like `windows-latest` or
-  // `attestation` do not match the bare `test` / `scan` substrings.
-  /^\-\s*-\s*name:\s*.*\b(?:test|validate|audit|scan|lint|codeql|security|coverage)\b/i,
-  // Common validation commands removed from block steps while `run: |` remains.
-  /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
-  /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
-];
+// removals as FAIL in CI. Patterns are owned by pr_closeout_git.js
+// (VALIDATION_REMOVAL_PATTERNS) so closeout and the CI scanner cannot drift.
 
 /**
- * Scan gate-file diffs for removed validation-bearing lines (run:/uses:/
- * test runners). Deletion-only weakening often lacks added-line markers, so
- * this complements classifyGateIntegrity.
+ * Scan gate-file diffs for removed validation-bearing lines (named security
+ * actions, test/lint/audit commands). Deletion-only weakening often lacks
+ * added-line markers, so this complements classifyGateIntegrity.
  * @param {string} baseSha
  * @param {string[]} gateFiles
  * @returns {string[]} truncated matching removed lines

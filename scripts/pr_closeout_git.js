@@ -88,19 +88,26 @@ const MULTILINE_WEAKENING_PATTERNS = [
 // Removed validation-bearing lines inside a still-present gate file (e.g.
 // deleting `run: npm test` or a CodeQL `uses:` step while the workflow file
 // remains). Whole-file deletion is covered by deletedFiles; these patterns
-// cover in-place step removal. Keep aligned with tools/scan_touched_suppressions.js.
+// cover in-place step removal.
+//
+// Intentionally NOT matching bare `run:` / `uses:` alone: removing
+// actions/checkout, setup-node, deploy, notify, or cleanup steps is not
+// validation weakening. Match validation *content* (named security actions,
+// test/lint/audit commands, validation-named steps). tools/scan_touched_suppressions.js
+// imports this same list — do not re-declare a drift-prone copy there.
 const VALIDATION_REMOVAL_PATTERNS = [
-  /^\-\s*run:\s*/i,
-  /^\-\s*-\s*run:\s*/i,
-  /^\-\s*uses:\s*\S+/i,
-  /^\-\s*-\s*uses:\s*\S+/i,
+  // Security / quality Actions (not every third-party uses: line).
   /^\-.*\buses:\s+(?:github\/codeql-action|aquasecurity\/trivy-action|securego\/gosec|golangci\/golangci-lint-action|github\/super-linter|oxsecurity\/megalinter|codecov\/codecov-action|sonarsource\/sonarcloud)\S*/i,
+  // Package-manager / make validation commands (covers `run: npm test` and
+  // indented block bodies that still contain the command text).
   /^\-.*\bnpm\s+(?:ci|test|run\b|audit\b)/i,
   /^\-.*\bpnpm\s+(?:test|run\b|audit\b)/i,
   /^\-.*\bscan:suppressions\b/i,
   /^\-.*\bnode\s+--test\b/i,
   /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
+  // Step names that declare a validation purpose.
   /^\-\s*-\s*name:\s*.*\b(?:test|validate|audit|scan|lint|codeql|security|coverage)\b/i,
+  // Common multi-language validation commands in block steps.
   /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
 ];
@@ -704,6 +711,7 @@ const verifyBaseline = async ({
 };
 
 module.exports = {
+  VALIDATION_REMOVAL_PATTERNS,
   classifyGateIntegrity,
   digestValidationConfig,
   failureSignature,

@@ -157,6 +157,27 @@ test('requires an exact review tuple even when the tree and command mapping are 
     }).status,
     'FAIL',
   );
+  // Non-validation workflow edits must not be treated as deletion-only
+  // validation weakening (CodeRabbit review #4780120134): checkout / setup /
+  // deploy / notify / echo cleanup removals stay attestation-gated (BLOCKED
+  // without attestation, PASS with a valid not-weakened review) rather than
+  // unconditional FAIL.
+  for (const line of [
+    '-      - uses: actions/checkout@v4',
+    '-      - uses: actions/setup-node@v4',
+    '-      - run: echo deploy',
+    '-      - run: |',
+  ]) {
+    assert.equal(
+      classifyGateIntegrity({
+        ...clean,
+        removedLines: [line],
+        attestation: liveAttestation({ headSha: 'head123' }),
+      }).status,
+      'PASS',
+      `non-validation removal must not FAIL: ${line}`,
+    );
+  }
 });
 
 test('detects multiline gate weakening and produces stable config digests', () => {
