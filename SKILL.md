@@ -215,14 +215,23 @@ const reportDebugTransportFailure = (error) => {
 };
 
 const debugLog = (msg, data = {}, hypothesisId = null) => {
-  const payload = JSON.stringify({
-    sessionId: SESSION_ID,
-    sessionToken: SESSION_TOKEN,
-    msg,
-    data,
-    hypothesisId,
-    loc: new Error().stack?.split('\n')[2],
-  });
+  let payload;
+  try {
+    // JSON.stringify throws synchronously for a circular reference or a
+    // BigInt in `data`; catch it here so a bad log call skips that one line
+    // instead of crashing the app being debugged.
+    payload = JSON.stringify({
+      sessionId: SESSION_ID,
+      sessionToken: SESSION_TOKEN,
+      msg,
+      data,
+      hypothesisId,
+      loc: new Error().stack?.split('\n')[2],
+    });
+  } catch (error) {
+    reportDebugTransportFailure(error);
+    return;
+  }
 
   if (navigator.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
@@ -254,14 +263,19 @@ def debug_log(msg, data=None, hypothesis_id=None):
             'msg': msg, 'data': data,
             'hypothesisId': hypothesis_id, 'loc': traceback.format_stack()[-2].strip()
         }, timeout=0.5).raise_for_status()
-    except requests.RequestException as error:
+    # json.dumps (inside requests) raises TypeError/ValueError directly for
+    # non-JSON-serializable data (e.g. a bare type/class object) rather than
+    # wrapping it as a requests.RequestException, so catching only
+    # RequestException lets a bad `data` value crash the app being debugged
+    # instead of just skipping that one log line.
+    except (requests.RequestException, TypeError, ValueError) as error:
         if not _debug_transport_failure_reported:
             _debug_transport_failure_reported = True
             print(f'Debug collector transport failed: {type(error).__name__}', file=sys.stderr)
 # #endregion
 
 # Usage
-debug_log('Function entry', {'user_id': user_id, 'type': type(user_id)}, 'H1')
+debug_log('Function entry', {'user_id': user_id, 'type': type(user_id).__name__}, 'H1')
 ```
 
 **Guidelines:**
@@ -533,6 +547,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 - Background scripts (service workers) have relaxed CSP and can fetch to localhost
 - `chrome.runtime.sendMessage` is the bridge between content script and background
 - Keep both debug regions tagged for easy cleanup
+
+**Manifest V3 permission required:** relaxed CSP alone does not authorize a cross-origin
+`fetch`. Without `http://localhost:8787/*` (or `http://localhost/*`) listed in the extension's
+`manifest.json` `host_permissions`, the background service worker's fetch is blocked and every
+relay call fails with `collector_transport_failed` — with no other symptom to point at the cause.
+Add it temporarily for the debug session and remove it afterward with the rest of the
+instrumentation:
+```json
+{
+  "host_permissions": ["http://localhost:8787/*"]
+}
+```
 
 **Injected scripts (MAIN world):**
 If debugging code injected via `<script>` into the page context, use `window.postMessage` to relay to content script, which then relays to background:

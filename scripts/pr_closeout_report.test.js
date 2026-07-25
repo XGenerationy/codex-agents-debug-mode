@@ -320,6 +320,37 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
 
     const untouched = await readFile(outsideTarget, 'utf8');
     assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+    const linkTarget = await readlink(path.join(outputDir, 'report.md'));
+    assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport never writes report.json when report.md is the rejected symlink', async () => {
+  // Both targets are validated up front, before either write happens: a
+  // symlink at report.md must not leave a real report.json sitting next to
+  // an untouched, attacker-controlled report.md symlink (an inconsistent
+  // evidence pair for what is meant to be a trustworthy compliance
+  // artifact).
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.md');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+      /symlink/i,
+    );
+
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.json must not be written when report.md fails validation',
+    );
   } finally {
     await rm(outputDir, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });

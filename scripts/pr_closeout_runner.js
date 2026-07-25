@@ -1,13 +1,20 @@
 /**
- * Rolls a list of check results up into one overall status. PASS only when
- * every result is PASS; a single FAIL outranks any BLOCKED/BASELINE so a
- * real failure is never masked by a merely-blocked check; BLOCKED/BASELINE
- * with no FAIL present rolls up to BLOCKED; any other/unrecognized status
- * combination fails closed to FAIL rather than defaulting to PASS.
+ * Rolls a list of check results up into one overall status. An empty list
+ * rolls up to BLOCKED rather than the vacuous PASS `Array.prototype.every`
+ * would produce, so a no-work rollup can never silently satisfy the gate;
+ * callers with a legitimately empty subset (e.g. runValidationPhases'
+ * qualification phase, which is optional by design) must special-case that
+ * themselves rather than routing it through this function. Otherwise: PASS
+ * only when every result is PASS; a single FAIL outranks any
+ * BLOCKED/BASELINE so a real failure is never masked by a merely-blocked
+ * check; BLOCKED/BASELINE with no FAIL present rolls up to BLOCKED; any
+ * other/unrecognized status combination fails closed to FAIL rather than
+ * defaulting to PASS.
  * @param {{status: string}[]} results
  * @returns {'PASS'|'FAIL'|'BLOCKED'}
  */
 const statusFrom = (results) => {
+  if (results.length === 0) return 'BLOCKED';
   if (results.every(({ status }) => status === 'PASS')) return 'PASS';
   if (results.some(({ status }) => status === 'FAIL')) return 'FAIL';
   if (results.some(({ status }) => ['BLOCKED', 'BASELINE'].includes(status))) return 'BLOCKED';
@@ -137,7 +144,12 @@ const runValidationPhases = async ({ checks, execute, parallelism = 4 } = {}) =>
     parallelism,
     (check) => executeQualification(check, 'qualification'),
   );
-  const qualificationStatus = statusFrom(qualification);
+  // An empty qualification subset (no check marked qualificationSafe) is not
+  // a no-work failure: it is a legitimate configuration where every check
+  // skips straight to the authoritative one-at-a-time confirmation pass
+  // below. Only route a non-empty qualification result through statusFrom's
+  // fail-closed rollup.
+  const qualificationStatus = qualification.length ? statusFrom(qualification) : 'PASS';
   if (qualificationStatus !== 'PASS') {
     return {
       status: qualificationStatus,

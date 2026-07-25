@@ -103,9 +103,13 @@ for entry in "${payload[@]}"; do
 done
 
 # Preflight all destinations before mutating any of them so multi-target
-# installs cannot leave one path updated and another absent/partial.
+# installs cannot leave one path updated and another absent/partial. -e alone
+# is false for a dangling symlink (it follows the link and tests the missing
+# target), which would let a non-forced install silently proceed over one
+# instead of refusing like it does for every other existing entry; -L catches
+# the symlink itself regardless of whether its target resolves.
 for destination in "${destinations[@]}"; do
-  if [[ -e "$destination" && "$force" != "true" ]]; then
+  if [[ ( -e "$destination" || -L "$destination" ) && "$force" != "true" ]]; then
     echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
     exit 1
   fi
@@ -154,7 +158,11 @@ restore_from_backup() {
   if ! rm -rf -- "$dest" 2>/dev/null; then
     echo "Rollback warning: could not remove $dest" >&2
   fi
-  if [[ -n "$backup" && -e "$backup" ]]; then
+  # -L alongside -e: if the original destination was itself a dangling
+  # symlink, unique_backup's mv carried that dangling symlink to $backup
+  # verbatim, and -e alone would miss it here too, silently skipping the
+  # restore of an otherwise-valid backup.
+  if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
     if ! mv -- "$backup" "$dest" 2>/dev/null; then
       echo "Rollback warning: could not restore $dest from backup" >&2
     fi
@@ -172,7 +180,12 @@ idx=0
 for destination in "${destinations[@]}"; do
   stage="${stage_paths[$idx]}"
   backup=""
-  if [[ -e "$destination" ]]; then
+  # Same dangling-symlink gap as the preflight check above: without -L, a
+  # dangling symlink at $destination would skip the backup step entirely, so
+  # the later mv over it and any subsequent rollback via restore_from_backup
+  # (which unconditionally removes $destination) would destroy it with
+  # nothing to put back, even though a real backup was never made.
+  if [[ -e "$destination" || -L "$destination" ]]; then
     backup="$(unique_backup "$destination")"
     # Guard the backup move: under set -e a bare mv failure in the then-body
     # would exit the script before rollback() runs, leaving previously
@@ -196,6 +209,15 @@ for destination in "${destinations[@]}"; do
   fi
   committed_dests+=("$destination")
   committed_backups+=("$backup")
-  emit_result "$destination" "$backup"
   idx=$((idx + 1))
+done
+
+# Emit results only after every destination has committed. Printing inside
+# the loop above would put a target's success record on stdout before later
+# targets are known to succeed; if a later commit then failed and rolled
+# every committed_dests entry back, that earlier line would already be
+# unrecoverably on stdout, letting a consumer that processes result lines
+# persist false state for an installation that no longer exists.
+for i in "${!committed_dests[@]}"; do
+  emit_result "${committed_dests[$i]}" "${committed_backups[$i]}"
 done

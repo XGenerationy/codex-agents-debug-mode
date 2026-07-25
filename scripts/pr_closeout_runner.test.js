@@ -13,6 +13,48 @@ test('reports FAIL when failures and blockers are both present', () => {
   assert.equal(statusFrom([{ status: 'BASELINE' }, { status: 'PASS' }]), 'BLOCKED');
 });
 
+test('rolls an empty result list up to BLOCKED instead of a vacuous PASS', () => {
+  // Array.prototype.every on an empty array is true, so without an explicit
+  // empty-list check a no-work rollup would silently satisfy the gate.
+  assert.equal(statusFrom([]), 'BLOCKED');
+});
+
+test('an empty overall checks plan rolls up to BLOCKED, not a vacuous PASS', async () => {
+  let executions = 0;
+  const result = await runValidationPhases({
+    checks: [],
+    execute: async () => {
+      executions += 1;
+      return { status: 'PASS' };
+    },
+  });
+  assert.equal(executions, 0);
+  assert.equal(result.status, 'BLOCKED');
+  assert.deepEqual(result.qualification, []);
+  assert.deepEqual(result.confirmation, []);
+});
+
+test('an empty qualificationSafe subset is not treated as a qualification failure', async () => {
+  // No check opts into the fast qualification pass; every check goes
+  // straight to confirmation. This must behave identically to a normal
+  // clean run, not get short-circuited by the empty-list-is-BLOCKED rule
+  // that statusFrom now applies (that rule is for the overall rollup, not
+  // for a subset that is intentionally allowed to be empty).
+  const checks = ['first', 'second'].map((id) => ({ id, command: `run ${id}` }));
+  let confirmationRuns = 0;
+  const result = await runValidationPhases({
+    checks,
+    execute: async (check, phase) => {
+      if (phase === 'confirmation') confirmationRuns += 1;
+      return { id: check.id, phase, status: 'PASS', exitCode: 0 };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.deepEqual(result.qualification, []);
+  assert.equal(confirmationRuns, checks.length);
+  assert.equal(result.confirmation.length, checks.length);
+});
+
 test('parallelizes safe qualification then confirms all checks sequentially', async () => {
   const checks = MANDATORY_CHECKS.map((check) => ({ ...check, command: check.command || `run ${check.id}`, status: undefined }));
   const events = [];

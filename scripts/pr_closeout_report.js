@@ -318,6 +318,15 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
   await mkdir(outputDir, { recursive: true });
   const json = path.join(outputDir, 'report.json');
   const markdown = path.join(outputDir, 'report.md');
+  // Validate both target paths before writing either. writeNoFollow already
+  // rejects a symlink at its own target, but checking json then markdown
+  // lazily (i.e. only right before each write) means a symlink at
+  // report.md is discovered only after report.json has already been
+  // written — leaving an inconsistent partial evidence pair (a real
+  // report.json next to an untouched, attacker-controlled report.md
+  // symlink) instead of failing before any bytes are written.
+  await assertNotSymlink(json);
+  await assertNotSymlink(markdown);
   const normalized = normalizeReportPaths(report, {
     repoRoot: report.repository,
     outputRoot: outputDir,

@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn } = require('node:child_process');
-const { access, link, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } = require('node:fs/promises');
+const { access, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -921,6 +921,74 @@ test('captures write-stream errors in logWriteError instead of crashing', async 
   assert.equal(typeof result.logWriteError, 'string');
 });
 
+test('refuses to write a raw evidence log through a pre-existing symlink, without crashing', async () => {
+  // A reused or caller-supplied outputDir can already contain this
+  // predictable log path as a symlink; the append-mode write stream must
+  // reject it instead of following it, and — like any other log open
+  // failure — degrade to logWriteError rather than aborting a command that
+  // has not even started yet.
+  const logDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-symlink-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-symlink-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
+  await symlink(outsideTarget, logPath);
+  try {
+    const result = await spawnCaptured({
+      command: "process.stdout.write('hello')",
+      cwd: process.cwd(),
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+      timeoutMs: 5000,
+      env: process.env,
+      logPath,
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, 'hello');
+    assert.match(result.logWriteError, /symlink/i);
+
+    const untouched = await readFile(outsideTarget, 'utf8');
+    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+    const linkInfo = await lstat(logPath);
+    assert.equal(linkInfo.isSymbolicLink(), true, 'the symlink itself must not be replaced');
+  } finally {
+    await rm(logDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('refuses to write a command executor log header through a pre-existing symlink', async () => {
+  // Same predictable-path threat as the append-stream case above, but for
+  // the "command: ...\ncwd: ..." header createCommandExecutor writes before
+  // spawnCaptured ever runs. This call has no local try/catch (matching the
+  // plain writeFile it replaced): a genuine open failure here propagates to
+  // whatever pool/phase runner is driving execute(), the same as it always
+  // has for any other log-open failure at this call site.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-header-symlink-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-header-symlink-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    await mkdir(path.join(outputDir, 'logs'), { recursive: true });
+    await symlink(outsideTarget, path.join(outputDir, 'logs', 'qualification.probe.attempt-001.log'));
+    const execute = createCommandExecutor({
+      repo: process.cwd(),
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+    });
+    await assert.rejects(
+      () => execute({ id: 'probe', command: "process.stdout.write('clean output')" }, 'qualification'),
+      /symlink/i,
+    );
+    const untouched = await readFile(outsideTarget, 'utf8');
+    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('treats common database password env vars as sensitive', () => {
   // PGPASSWORD and MYSQL_PWD are standard database credential names that do
   // not contain any of the generic sensitive tokens (PASSWORD/PWD match no
@@ -1182,9 +1250,11 @@ test('runs taskkill for a live Windows process tree', async () => {
   assert.deepEqual(calls[0][1], ['/PID', '1234', '/T', '/F']);
 });
 
-test('accepts a Windows tree that exits before taskkill lands', async () => {
-  // taskkill fails because the root already died mid-call; post-check ESRCH
-  // means the /T attempt still counts as proven termination.
+test('accepts a Windows tree that exits before taskkill lands, when no descendants survive', async () => {
+  // taskkill fails because the root already died mid-call: it never got to
+  // identify (let alone target) the tree, so a nonzero result here is not
+  // proof descendants are gone. Independent enumeration finding nothing is
+  // what actually proves the tree is clean.
   const result = await terminateProcessTree({
     child: { pid: 1234 },
     platform: 'win32',
@@ -1193,11 +1263,84 @@ test('accepts a Windows tree that exits before taskkill lands', async () => {
       error.code = 'ESRCH';
       throw error;
     },
-    runExecFile: async () => { throw new Error('taskkill failed'); },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed');
+      assert.match(file, /powershell\.exe$/i);
+      return { stdout: '', stderr: '' };
+    },
   });
   assert.equal(result.status, 'PASS');
   assert.equal(result.escalated, true);
-  assert.match(result.evidence, /taskkill/i);
+  assert.match(result.evidence, /no live descendants/i);
+});
+
+test('terminates and confirms descendants that outlived a Windows root taskkill could not target', async () => {
+  const killedPids = [];
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file, args) => {
+      if (/taskkill\.exe$/i.test(file)) {
+        if (args.includes('1234')) throw new Error('taskkill failed: root PID not found');
+        const pid = args[args.indexOf('/PID') + 1];
+        killedPids.push(pid);
+        return { stdout: 'SUCCESS', stderr: '' };
+      }
+      assert.match(file, /powershell\.exe$/i);
+      return { stdout: '5555\n5556\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.escalated, true);
+  assert.deepEqual(killedPids.sort(), ['5555', '5556']);
+  assert.match(result.evidence, /2 live descendant/i);
+});
+
+test('blocks a Windows tree when a descendant survives taskkill after the root already exited', async () => {
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file, args) => {
+      if (/taskkill\.exe$/i.test(file)) {
+        if (args.includes('1234')) throw new Error('taskkill failed: root PID not found');
+        throw new Error('taskkill failed: access denied');
+      }
+      assert.match(file, /powershell\.exe$/i);
+      return { stdout: '5555\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /5555/);
+  assert.match(result.evidence, /could not be confirmed terminated/i);
+});
+
+test('blocks a Windows tree when descendant enumeration itself fails after the root already exited', async () => {
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      throw new Error('powershell is not available');
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /enumeration failed/i);
+  assert.match(result.evidence, /powershell is not available/);
 });
 
 test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async () => {

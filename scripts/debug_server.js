@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { randomBytes, timingSafeEqual } = require('node:crypto');
+const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
 const { constants } = require('node:fs');
 const { lstat, mkdir, open, realpath } = require('node:fs/promises');
 const http = require('node:http');
@@ -23,33 +23,59 @@ const DEFAULT_LIMITS = Object.freeze({
  * the request handler and mapped straight to a response, so throwing this
  * (instead of a bare Error) is how a handler fails closed with a specific
  * status/code pair rather than falling through to a generic 500.
+ * `closeConnection` marks a failure where the server intentionally stopped
+ * reading the request body before it was fully drained (see readJson's
+ * body_too_large path): the response must close the underlying socket
+ * instead of returning it to a keep-alive pool, because whatever bytes the
+ * client still has in flight for the abandoned body would otherwise be
+ * misparsed as the start of the next request on a reused connection.
  */
 class RequestError extends Error {
-  constructor(code, status = 400) {
+  constructor(code, status = 400, { closeConnection = false } = {}) {
     super(code);
     this.name = 'RequestError';
     this.code = code;
     this.status = status;
+    this.closeConnection = closeConnection;
   }
 }
 
-const sendJson = (response, status, payload) => {
+const sendJson = (response, status, payload, close = false) => {
   // Guard against secondary throws when the client already closed the socket
-  // (e.g. after request_aborted); writableEnded/destroyed means we cannot respond.
+  // (e.g. after request_aborted); writableEnded/destroyed means we cannot
+  // respond. `close` sends `Connection: close` so the caller can request the
+  // socket be torn down cleanly right after this response flushes (see
+  // RequestError.closeConnection) instead of being returned to a keep-alive
+  // pool -- used when the server intentionally stopped reading an oversized
+  // body without draining it.
   if (response.writableEnded || response.destroyed) return;
+  if (close) response.setHeader('Connection', 'close');
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   response.end(`${JSON.stringify(payload)}\n`);
 };
 
 /**
  * Buffer an HTTP request body, enforce `maxBodyBytes`, and parse it as a JSON
- * object (arrays and primitives are rejected). Oversize uploads are aborted
- * mid-stream via `request.destroy()` rather than drained to completion, and
- * always surface as `RequestError('body_too_large', 413)` even if the
- * destroy itself throws through the async iterator. Client disconnects
- * (ECONNRESET/EPIPE/abort) map to `RequestError('request_aborted', 400)`;
- * any other stream failure maps to `RequestError('request_failed', 400)`
- * (logged to stderr) instead of bubbling up as an uncaught rejection.
+ * object (arrays and primitives are rejected). Oversize uploads stop being
+ * read as soon as the limit is crossed -- the loop `break`s instead of
+ * buffering further chunks -- and always surface as
+ * `RequestError('body_too_large', 413, { closeConnection: true })`. The
+ * break deliberately does NOT call `request.destroy()`: for a real
+ * `http.IncomingMessage`, the request and response share one HTTP/1.1
+ * socket, and destroying the request also destroys that shared socket
+ * (verified against Node's actual runtime behavior, not assumed), so the
+ * handler's 413 response would never reach the client -- it would observe
+ * ECONNRESET instead. Breaking out of the `for await...of` loop still
+ * releases the request object itself (Node's async-iterator `return()`
+ * protocol marks it destroyed) without touching the socket, so the caller
+ * can still write the response through it. `closeConnection: true` then
+ * tells the caller (see sendJson) to send `Connection: close`, because the
+ * remaining unread body bytes the client may still be sending are never
+ * drained and would otherwise corrupt the framing of a reused keep-alive
+ * connection. Client disconnects (ECONNRESET/EPIPE/abort) map to
+ * `RequestError('request_aborted', 400)`; any other stream failure maps to
+ * `RequestError('request_failed', 400)` (logged to stderr) instead of
+ * bubbling up as an uncaught rejection.
  * @param {AsyncIterable<Buffer>} request
  * @param {number} maxBodyBytes
  * @returns {Promise<object>} the parsed JSON body.
@@ -64,21 +90,23 @@ const readJson = async (request, maxBodyBytes) => {
       size += chunk.length;
       if (size > maxBodyBytes) {
         tooLarge = true;
-        // Abort the request immediately instead of continuing to drain the
-        // upload. Without this, a local client could keep the collector busy
-        // (bandwidth/CPU/socket time) with an arbitrarily large body even
-        // though the configured limit has already been exceeded.
-        request.destroy();
+        // Stop reading instead of continuing to drain the upload (a local
+        // client could otherwise keep the collector busy with an arbitrarily
+        // large body even though the limit was already exceeded), but do NOT
+        // call request.destroy(): for a real socket that also tears down the
+        // response's shared connection before the 413 can be written (see the
+        // JSDoc above). `break` alone still stops buffering and releases the
+        // request object without touching the socket.
         break;
       }
       chunks.push(chunk);
     }
   } catch (error) {
-    // The oversize path destroys the request to stop the upload; if that
-    // destroy surfaces as an async-iterator error, it must still map to the
-    // deterministic 413 limit violation rather than a 400-class abort, so an
-    // oversized upload is always reported as body_too_large.
-    if (tooLarge) throw new RequestError('body_too_large', 413);
+    // Defense in depth: if some other failure races with the oversize break
+    // above, still classify it as the deterministic 413 limit violation
+    // rather than a 400-class abort, so an oversized upload is always
+    // reported as body_too_large.
+    if (tooLarge) throw new RequestError('body_too_large', 413, { closeConnection: true });
     // Client disconnect / stream reset is not a server fault; map to a
     // structured RequestError so the handler does not log request.failed and
     // respond with 500 internal_error when a response can still be written.
@@ -95,7 +123,7 @@ const readJson = async (request, maxBodyBytes) => {
     throw new RequestError('request_failed', 400);
   }
 
-  if (tooLarge) throw new RequestError('body_too_large', 413);
+  if (tooLarge) throw new RequestError('body_too_large', 413, { closeConnection: true });
 
   try {
     const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -218,6 +246,25 @@ const openNoFollow = async (target, flags, mode) => {
   }
 };
 
+// True iff an already-realpath'd candidate still resolves strictly inside an
+// already-realpath'd root: reject an exact match (the candidate IS the root,
+// never valid for a file that must live under it), `..`, any `../`-prefixed
+// relative path, and any absolute `path.relative` result (a different drive
+// on Windows). Comparing resolved paths through path.relative -- rather than
+// a string-prefix check -- also refuses a sibling that merely shares a
+// prefix, e.g. root `/a/b` vs candidate `/a/b-evil`.
+//
+// This is the shared "did the filesystem move out from under an earlier
+// trust decision" check used everywhere a path is re-verified after a window
+// where it could have been mutated: the /session handler's .debug escape
+// check, appendSessionEvent's post-open session-log check, and the startup
+// token-file post-open check in main() (see the comment there for why the
+// parent directory, not just the final path component, needs this).
+const isInsideRoot = (resolvedRoot, candidateRealPath) => {
+  const rel = path.relative(resolvedRoot, candidateRealPath);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+};
+
 const configureOrigin = (request, response, allowedOrigins) => {
   const origin = request.headers.origin;
   if (origin === undefined) return true;
@@ -288,8 +335,7 @@ const appendSessionEvent = (session, serializedEvent) => {
         } catch {
           throw new RequestError('session_log_replaced', 409);
         }
-        const rel = path.relative(identity.projectRootReal, realLog);
-        if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        if (!isInsideRoot(identity.projectRootReal, realLog)) {
           throw new RequestError('session_log_replaced', 409);
         }
       }
@@ -311,8 +357,12 @@ const appendSessionEvent = (session, serializedEvent) => {
  * `token`, creates a session and its append-only NDJSON log under
  * `<projectRoot>/.debug`), and `POST /log` (requires that session's own
  * token — see authorizeRequest — and appends one redaction-free event line).
- * The returned server exposes `collectorToken`/`collectorInstanceId`
- * read-only properties for callers that built it with a generated token.
+ * The returned server exposes `collectorToken`/`collectorInstanceId`/
+ * `collectorProjectHash` read-only properties for callers that built it with
+ * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
+ * handler compares against a probed instance's reported `project_hash` to
+ * tell "the same collector already running" apart from "a different
+ * project's collector occupying this port" (see probeServer).
  * @param {object} [options]
  * @param {string} [options.projectRoot] - directory whose `.debug/` subdir holds session logs; defaults to cwd.
  * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
@@ -328,7 +378,19 @@ const createDebugServer = ({
   allowedOrigins = [],
   limits = {},
 } = {}) => {
-  const logDir = path.join(path.resolve(projectRoot), '.debug');
+  const resolvedProjectRoot = path.resolve(projectRoot);
+  const logDir = path.join(resolvedProjectRoot, '.debug');
+  // A one-way, non-reversible fingerprint of projectRoot. /health is
+  // deliberately unauthenticated (see isAllowedHost) and must never leak the
+  // raw path, but the EADDRINUSE probe in main() still needs a way for two
+  // invocations to agree they mean the SAME project without either being
+  // able to recover the other's path from what /health reports. SHA-256 is
+  // one-way, so this is safe to expose; it is an identity/UX signal (avoiding
+  // a false "already_running" report for an unrelated project's collector
+  // that happens to occupy the same port), not a security boundary --
+  // projectRoot is already visible locally via a running collector's own
+  // process argv regardless.
+  const projectHash = createHash('sha256').update(resolvedProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   const originSet = new Set(allowedOrigins);
@@ -375,6 +437,7 @@ const createDebugServer = ({
           service: COLLECTOR_SERVICE,
           version: COLLECTOR_VERSION,
           instance_id: instanceId,
+          project_hash: projectHash,
         });
         return;
       }
@@ -432,9 +495,8 @@ const createDebugServer = ({
             throw error;
           }
           const resolvedLogDir = await realpath(logDir);
-          const resolvedRoot = await realpath(path.resolve(projectRoot));
-          const rel = path.relative(resolvedRoot, resolvedLogDir);
-          if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+          const resolvedRoot = await realpath(resolvedProjectRoot);
+          if (!isInsideRoot(resolvedRoot, resolvedLogDir)) {
             throw new RequestError('debug_dir_escapes_root', 409);
           }
           // Create the empty session log through a no-follow descriptor and
@@ -535,7 +597,7 @@ const createDebugServer = ({
       sendJson(response, 404, { error: 'not_found' });
     } catch (error) {
       if (error instanceof RequestError) {
-        sendJson(response, error.status, { error: error.code });
+        sendJson(response, error.status, { error: error.code }, error.closeConnection);
         return;
       }
       process.stderr.write(`${JSON.stringify({ level: 'error', event: 'request.failed' })}\n`);
@@ -546,6 +608,7 @@ const createDebugServer = ({
   Object.defineProperties(server, {
     collectorToken: { value: token },
     collectorInstanceId: { value: instanceId },
+    collectorProjectHash: { value: projectHash },
   });
   return server;
 };
@@ -553,14 +616,22 @@ const createDebugServer = ({
 /**
  * Ask whatever is listening on `port` (127.0.0.1) whether it is this same
  * collector, by hitting `/health` and checking the reported service name,
- * version, and a well-formed instance_id — never assumed just because the
- * port answers. Used from the EADDRINUSE path in main() to tell "another
- * instance of this collector is already up" apart from "some unrelated
- * process (or an attacker) is squatting on the port". Resolves to the parsed
- * identity object on a valid match, or `null` for any failure, timeout,
- * malformed body, or non-200/non-matching response — this never rejects.
+ * version, a well-formed instance_id, and a well-formed project_hash — never
+ * assumed just because the port answers. Used from the EADDRINUSE path in
+ * main() to tell "another instance of this collector is already up" apart
+ * from "some unrelated process (or an attacker) is squatting on the port".
+ * This only validates that project_hash is well-formed, NOT that it matches
+ * any particular project: /health never leaks the raw projectRoot, and a
+ * collector for a genuinely different project answers with a syntactically
+ * valid but different hash. The caller is responsible for comparing the
+ * returned project_hash against its own (see main()'s EADDRINUSE handler,
+ * which compares it to `server.collectorProjectHash`) before treating this
+ * as "the same collector already running" rather than "a different
+ * collector occupying this port". Resolves to the parsed identity object on
+ * a valid match, or `null` for any failure, timeout, malformed body, or
+ * non-200/non-matching response — this never rejects.
  * @param {number} port
- * @returns {Promise<{service: string, version: number, instance_id: string}|null>}
+ * @returns {Promise<{service: string, version: number, instance_id: string, project_hash: string}|null>}
  */
 const probeServer = (port) =>
   new Promise((resolve) => {
@@ -595,7 +666,9 @@ const probeServer = (port) =>
               identity.service === COLLECTOR_SERVICE &&
               identity.version === COLLECTOR_VERSION &&
               typeof identity.instance_id === 'string' &&
-              /^[a-f0-9]{32}$/.test(identity.instance_id);
+              /^[a-f0-9]{32}$/.test(identity.instance_id) &&
+              typeof identity.project_hash === 'string' &&
+              /^[a-f0-9]{64}$/.test(identity.project_hash);
             finish(valid ? identity : null);
           } catch (error) {
             if (error instanceof SyntaxError) {
@@ -652,7 +725,17 @@ const main = () => {
   server.once('error', async (error) => {
     if (error.code === 'EADDRINUSE') {
       const identity = await probeServer(port);
-      if (identity) {
+      // A syntactically valid collector identity is not enough: this
+      // collector is single-project (one projectRoot per process), so an
+      // instance answering for a DIFFERENT project must not be reported as
+      // "already running" for THIS invocation -- that would leave the
+      // current project with neither a running collector nor a token file,
+      // while silently pointing it at an unrelated project's session store.
+      // Compare project_hash (a one-way fingerprint of projectRoot; see
+      // createDebugServer) against this invocation's own hash before
+      // concluding it is the same collector; a mismatch falls through to the
+      // port_in_use_by_other_process failure below, same as no identity at all.
+      if (identity && identity.project_hash === server.collectorProjectHash) {
         process.stdout.write(
           `${JSON.stringify({
             status: 'already_running',
@@ -693,8 +776,7 @@ const main = () => {
       await mkdir(debugDir, { recursive: true });
       const resolvedLogDir = await realpath(debugDir);
       const resolvedRoot = await realpath(path.resolve(projectRoot));
-      const rel = path.relative(resolvedRoot, resolvedLogDir);
-      if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      if (!isInsideRoot(resolvedRoot, resolvedLogDir)) {
         throw new Error('debug_dir_escapes_root');
       }
       // Refuse to reuse a pre-existing collector_token that is not a private
@@ -708,10 +790,17 @@ const main = () => {
       await assertPrivateRegularFile(tokenFile, 'collector_token_not_private');
       // Prefer create-exclusive for a fresh path; if the file already exists
       // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
-      // blocks a symlink swap after the lstat checks. Then re-verify through
-      // the descriptor and only then truncate + write. Permissions are applied
-      // through the descriptor before close: a path-based chmod after close
-      // could race a symlink swap and retarget an outside file.
+      // blocks a symlink swap of the FINAL path component after the lstat
+      // checks above -- but it cannot protect the PARENT directory chain: if
+      // .debug itself was renamed out and replaced with a symlink after the
+      // resolvedLogDir check above but before this open(), the open would
+      // transparently follow the substituted parent even though tokenFile's
+      // own final component was never a symlink. Node has no portable
+      // openat()-style "open relative to an already-verified directory
+      // descriptor" primitive, so this window cannot be fully closed in pure
+      // Node; the post-open isInsideRoot re-verification below (mirroring
+      // appendSessionEvent's post-open realpath check) narrows it instead of
+      // eliminating it.
       let handle;
       try {
         handle = await openNoFollow(
@@ -726,9 +815,35 @@ const main = () => {
       try {
         const info = await handle.stat();
         if (!info.isFile() || info.nlink > 1) throw new Error('collector_token_not_private');
+        // Re-verify the just-opened path still resolves inside projectRoot.
+        // This is the post-open half of the TOCTOU narrowing described
+        // above: if the parent was swapped for a symlink between the
+        // resolvedLogDir check and this open(), the descriptor above now
+        // points outside projectRoot even though O_NOFOLLOW never saw a
+        // symlink at the final component. Fail closed without writing.
+        let realTokenFile;
+        try {
+          realTokenFile = await realpath(tokenFile);
+        } catch {
+          throw new Error('collector_token_parent_replaced');
+        }
+        if (!isInsideRoot(resolvedRoot, realTokenFile)) {
+          throw new Error('collector_token_parent_replaced');
+        }
+        // Apply the private mode BEFORE truncating/writing the secret, not
+        // after. A freshly-created file already got 0600 atomically from
+        // O_CREAT's mode argument above, but the EEXIST/reuse branch (a
+        // few lines up) opens a PRE-EXISTING file whose mode is whatever it
+        // already was: assertPrivateRegularFile only checks isFile/nlink,
+        // never mode, and open()'s mode argument has no effect when O_CREAT
+        // does not actually create the file. Chmod through the descriptor
+        // first so a permissive pre-existing mode (e.g. a stale 0644 file
+        // left by a prior process or misconfiguration) can never expose the
+        // fresh secret to another local user, even for the brief window
+        // between write and close.
+        await handle.chmod(0o600);
         await handle.truncate(0);
         await handle.writeFile(token, 'utf8');
-        await handle.chmod(0o600);
       } finally {
         await handle.close();
       }
@@ -764,6 +879,7 @@ module.exports = {
   COLLECTOR_VERSION,
   RequestError,
   createDebugServer,
+  isInsideRoot,
   probeServer,
   readJson,
 };

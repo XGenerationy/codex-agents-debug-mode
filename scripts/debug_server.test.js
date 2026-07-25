@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const { existsSync } = require('node:fs');
-const { copyFile, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -12,6 +12,7 @@ const {
   COLLECTOR_VERSION,
   RequestError,
   createDebugServer,
+  isInsideRoot,
   probeServer,
   readJson,
 } = require('./debug_server');
@@ -35,7 +36,7 @@ const close = (server) =>
     });
   });
 
-const requestJson = (baseUrl, { body, headers = {}, method = 'GET', pathname = '/' } = {}) =>
+const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathname = '/' } = {}) =>
   new Promise((resolve, reject) => {
     const url = new URL(pathname, baseUrl);
     const request = http.request(
@@ -45,6 +46,7 @@ const requestJson = (baseUrl, { body, headers = {}, method = 'GET', pathname = '
         path: url.pathname,
         method,
         headers,
+        agent,
       },
       (response) => {
         let responseBody = '';
@@ -188,6 +190,14 @@ test('exposes collector-specific health without exposing credentials or paths', 
     assert.match(response.body.instance_id, /^[a-f0-9]{32}$/);
     assert.equal(JSON.stringify(response.body).includes(TEST_LAUNCH_TOKEN), false);
     assert.equal(JSON.stringify(response.body).includes(projectRoot), false);
+    // project_hash (added so main()'s EADDRINUSE handler can tell two
+    // invocations mean the same project apart from different ones sharing a
+    // port -- see probeServer) must be well-formed and must never be, or
+    // trivially contain, the raw path it was derived from.
+    assert.match(response.body.project_hash, /^[a-f0-9]{64}$/);
+    assert.notEqual(response.body.project_hash, projectRoot);
+    assert.equal(response.body.project_hash.includes(projectRoot), false);
+    assert.equal(response.body.project_hash, server.collectorProjectHash);
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
@@ -369,16 +379,18 @@ test('maps request stream errors to RequestError instead of bubbling as 500', as
 });
 
 test('reports an oversized body as a deterministic 413 body_too_large', async () => {
-  // Exceeding maxBodyBytes destroys the request mid-upload. If that destroy
-  // surfaces as an async-iterator error, readJson must still classify the
+  // Exceeding maxBodyBytes stops the read (break, not request.destroy() --
+  // see readJson's JSDoc for why: destroying a real IncomingMessage also
+  // destroys the shared response socket). readJson must still classify the
   // failure as the deterministic 413 limit violation (body_too_large), not a
-  // 400-class abort.
+  // 400-class abort, and must mark it closeConnection so the caller closes
+  // the connection instead of returning it to a keep-alive pool.
   const { Readable } = require('node:stream');
   const limit = 64 * 1024;
   const oversized = new Readable({
     read() {
-      // A single chunk larger than the limit forces the oversize branch and the
-      // immediate request.destroy() inside readJson.
+      // A single chunk larger than the limit forces the oversize branch and
+      // the loop `break` inside readJson.
       this.push(Buffer.alloc(limit + 1024, 0x61));
       this.push(null);
     },
@@ -387,8 +399,92 @@ test('reports an oversized body as a deterministic 413 body_too_large', async ()
     () => readJson(oversized, limit),
     (error) => error instanceof RequestError
       && error.status === 413
-      && error.code === 'body_too_large',
+      && error.code === 'body_too_large'
+      && error.closeConnection === true,
   );
+});
+
+test('delivers a real 413 body_too_large to the client instead of ECONNRESET', async () => {
+  // Regression for the request.destroy()-kills-the-shared-socket bug: for a
+  // REAL http.IncomingMessage (unlike the synthetic Readable used in the
+  // unit test above), request/response share one HTTP/1.1 socket, so
+  // destroying the request used to destroy the response's socket too --
+  // verified empirically against Node's actual runtime behavior before this
+  // fix landed, the client observed ECONNRESET and never saw the structured
+  // 413 body at all. This exercises the REAL createDebugServer end to end
+  // over a real HTTP client, which the direct-readJson unit tests above
+  // cannot: they never touch a real socket.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { maxBodyBytes: 1024 },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/session',
+      headers: { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` },
+      body: { name: 'x'.repeat(4096) },
+    });
+
+    assert.equal(response.status, 413);
+    assert.deepEqual(response.body, { error: 'body_too_large' });
+    assert.equal(response.headers.connection, 'close');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('keeps a keep-alive connection reusable after an oversized-body 413 closes it cleanly', { timeout: 10000 }, async () => {
+  // Justifies the Connection: close decision made in sendJson/RequestError:
+  // readJson intentionally stops reading an oversized body without draining
+  // the client's remaining in-flight bytes. Left on a reused keep-alive
+  // socket, those bytes would be misparsed as the start of the next request
+  // (verified empirically while designing this fix: without Connection:
+  // close, a second request on the same reused socket hangs indefinitely).
+  // Sending Connection: close makes the client's own keep-alive agent open a
+  // FRESH socket for the next request instead, so the collector keeps
+  // working normally right after a 413. Both requests share one Agent with
+  // maxSockets: 1 so the second request is FORCED to either reuse or replace
+  // the first connection -- it has no other socket available to fall back
+  // to, so a regression here would hang (bounded by the test's timeout)
+  // rather than silently passing via an unrelated fresh connection.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { maxBodyBytes: 1024 },
+  });
+  const baseUrl = await listen(server);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+
+  try {
+    const oversized = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/session',
+      agent,
+      headers: { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` },
+      body: { name: 'x'.repeat(4096) },
+    });
+    assert.equal(oversized.status, 413);
+    assert.deepEqual(oversized.body, { error: 'body_too_large' });
+    assert.equal(oversized.headers.connection, 'close');
+
+    // A second request through the SAME keep-alive agent (maxSockets: 1)
+    // must complete normally -- not hang -- right after the 413 closed the
+    // first socket.
+    const second = await requestJson(baseUrl, { pathname: '/health', agent });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.service, COLLECTOR_SERVICE);
+  } finally {
+    agent.destroy();
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test('requires the per-session token before accepting a log event', async () => {
@@ -548,6 +644,49 @@ test('enforces the aggregate log byte cap', async () => {
   }
 });
 
+test('isInsideRoot rejects a path that resolves outside the verified root', async () => {
+  // Unit-level regression for the startup token-file post-open
+  // re-verification (main()'s TOCTOU-narrowing fix, mirroring
+  // appendSessionEvent's post-open realpath check): openNoFollow's
+  // O_NOFOLLOW only protects the FINAL path component, not a parent
+  // directory swapped for a symlink between the earlier realpath(debugDir)
+  // check and the open() call. isInsideRoot is the predicate the post-open
+  // check calls to detect that the resolved path escaped the already-
+  // verified root. Exercised directly here (deterministic) rather than by
+  // racing a real filesystem swap against main()'s internal await points,
+  // which has no reliable external synchronization point and would be
+  // inherently flaky.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-inside-root-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'debug-skill-outside-root-'));
+  try {
+    const resolvedRoot = await realpath(projectRoot);
+    const resolvedOutside = await realpath(outsideDir);
+
+    // Simulates the parent (.debug) having been swapped for a symlink to an
+    // outside directory: the token file's realpath now lands under the
+    // outside tree even though the path STRING still says
+    // "<root>/.debug/collector_token".
+    const swappedTokenFile = path.join(resolvedOutside, 'collector_token');
+    assert.equal(isInsideRoot(resolvedRoot, swappedTokenFile), false);
+
+    // The legitimate, unswapped case must still pass.
+    const legitimateTokenFile = path.join(resolvedRoot, '.debug', 'collector_token');
+    assert.equal(isInsideRoot(resolvedRoot, legitimateTokenFile), true);
+
+    // Exact-match (candidate equals root itself) must be rejected -- a real
+    // token file can never legitimately BE the project root directory.
+    assert.equal(isInsideRoot(resolvedRoot, resolvedRoot), false);
+
+    // A sibling directory that merely shares a string prefix with the root
+    // (e.g. root vs root-evil) must not be treated as "inside" by a naive
+    // startsWith check; path.relative-based comparison must reject it.
+    assert.equal(isInsideRoot(resolvedRoot, `${resolvedRoot}-evil`), false);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('refuses to write the launch token through a hard-linked collector_token', { timeout: 20000 }, async () => {
   // A repo-controlled .debug/collector_token hard link shares its inode with
   // an outside file; a truncating startup write would clobber that file
@@ -609,6 +748,54 @@ test('rewrites an existing private collector_token without open-time truncation'
   }
 });
 
+test(
+  'tightens a pre-existing permissive token file to 0600 before writing the fresh secret',
+  { skip: process.platform === 'win32' && 'POSIX file mode bits are not meaningfully enforced on Windows', timeout: 20000 },
+  async () => {
+    // assertPrivateRegularFile only checks isFile/nlink, never mode, so a
+    // pre-existing collector_token left behind with a permissive mode (e.g.
+    // 0644 from a prior process or misconfiguration) reaches the EEXIST/reuse
+    // open branch unchanged. The fix chmods 0600 through the open descriptor
+    // BEFORE truncate+write (see main()'s startup flow), so by the time any
+    // fresh token bytes reach disk the file is already private -- previously
+    // chmod ran AFTER the write, leaving a window where the new secret sat
+    // under the file's old, possibly world/group-readable mode.
+    //
+    // This test cannot observe the mode DURING the write without
+    // instrumenting fs internals, which is not worth the complexity for a
+    // regression guard (a real race-timing test would be flaky with no
+    // reliable synchronization point from outside the process). It instead
+    // asserts the documented end state -- final mode is private regardless of
+    // the file's prior mode -- and relies on the inline comment at the chmod
+    // call site in debug_server.js to carry the ordering invariant.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+    let child;
+    try {
+      const debugDir = path.join(projectRoot, '.debug');
+      const tokenFile = path.join(debugDir, 'collector_token');
+      await mkdir(debugDir, { recursive: true });
+      await writeFile(tokenFile, 'stale-token-with-permissive-mode', { mode: 0o644 });
+      const preInfo = await stat(tokenFile);
+      assert.equal(preInfo.mode & 0o777, 0o644, 'fixture must start permissive to exercise the reuse branch');
+
+      const port = await findFreePort();
+      const launched = launchCli(projectRoot, port);
+      child = launched.child;
+      const result = await launched.outcome;
+
+      assert.equal(result.status, 'started');
+      const contents = await readFile(tokenFile, 'utf8');
+      assert.notEqual(contents, 'stale-token-with-permissive-mode');
+      assert.match(contents, /^[A-Za-z0-9_-]{43}$/);
+      const postInfo = await stat(tokenFile);
+      assert.equal(postInfo.mode & 0o777, 0o600, 'token file must end private regardless of its prior mode');
+    } finally {
+      if (child) stopCli(child);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 test('writes the launch token through the descriptor with owner-only permissions', { timeout: 20000 }, async () => {
   // The startup token write must succeed end to end through the opened file
   // descriptor (write + chmod before close), leaving a private regular file
@@ -633,6 +820,77 @@ test('writes the launch token through the descriptor with owner-only permissions
   } finally {
     if (child) stopCli(child);
     await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('reports already_running when the SAME project root is relaunched on an occupied port', { timeout: 20000 }, async () => {
+  // probeServer validates the /health identity shape but, on its own, cannot
+  // tell whether a running collector serves THIS invocation's project. The
+  // EADDRINUSE handler in main() must also compare project_hash before
+  // concluding already_running; here the two launches share a projectRoot,
+  // so the hashes match and the second launch must report already_running.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-eaddrinuse-same-'));
+  let firstChild;
+  let secondChild;
+  try {
+    const port = await findFreePort();
+    const first = launchCli(projectRoot, port);
+    firstChild = first.child;
+    const firstResult = await first.outcome;
+    assert.equal(firstResult.status, 'started', firstResult.stderr);
+
+    const second = launchCli(projectRoot, port);
+    secondChild = second.child;
+    const secondResult = await second.outcome;
+
+    assert.equal(secondResult.status, 'already_running', secondResult.stderr);
+    const parsedLine = JSON.parse(secondResult.stdout.split('\n').find((line) => line.trim().startsWith('{')));
+    assert.equal(parsedLine.service, COLLECTOR_SERVICE);
+    assert.equal(parsedLine.port, port);
+    assert.equal(JSON.stringify(parsedLine).includes(projectRoot), false);
+  } finally {
+    if (secondChild) stopCli(secondChild);
+    if (firstChild) stopCli(firstChild);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('reports port_in_use_by_other_process (not a false already_running) when a DIFFERENT project root is launched on an occupied port', { timeout: 20000 }, async () => {
+  // Finding: probeServer previously only verified /health's service/version/
+  // instance_id, never which project the running instance actually serves.
+  // A collector for project A occupying the port would make the EADDRINUSE
+  // handler report already_running for a totally unrelated project B launch,
+  // leaving B with neither a running collector nor a token file. The
+  // project_hash comparison must treat a hash mismatch as a DIFFERENT
+  // collector occupying the port, falling through to the existing
+  // port_in_use_by_other_process failure path instead.
+  const projectRootA = await mkdtemp(path.join(tmpdir(), 'debug-skill-eaddrinuse-a-'));
+  const projectRootB = await mkdtemp(path.join(tmpdir(), 'debug-skill-eaddrinuse-b-'));
+  let firstChild;
+  let secondChild;
+  try {
+    const port = await findFreePort();
+    const first = launchCli(projectRootA, port);
+    firstChild = first.child;
+    const firstResult = await first.outcome;
+    assert.equal(firstResult.status, 'started', firstResult.stderr);
+
+    const second = launchCli(projectRootB, port);
+    secondChild = second.child;
+    const secondResult = await second.outcome;
+
+    // The second process must fail (never bind, never write projectRootB's
+    // token) instead of reporting a false already_running for project A.
+    assert.equal(secondResult.status, null);
+    assert.equal(secondResult.exitCode, 1);
+    assert.equal(secondResult.stdout.includes('already_running'), false);
+    assert.match(secondResult.stderr, /port_in_use_by_other_process/);
+    assert.equal(existsSync(path.join(projectRootB, '.debug', 'collector_token')), false);
+  } finally {
+    if (secondChild) stopCli(secondChild);
+    if (firstChild) stopCli(firstChild);
+    await rm(projectRootA, { recursive: true, force: true });
+    await rm(projectRootB, { recursive: true, force: true });
   }
 });
 
@@ -841,6 +1099,43 @@ test(
 );
 
 test(
+  'install.sh treats a dangling target symlink as an existing target',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
+  async () => {
+    // bash's -e test follows a symlink and is false for one whose target is
+    // missing, even though the symlink itself is a real filesystem entry at
+    // that path. Without -L, that would let a non-forced install silently
+    // proceed over a dangling symlink (bypassing the "target exists" refusal)
+    // and then discard it with no backup ever made.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-dangling-home-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    const missingTarget = path.join(home, 'nowhere', 'does-not-exist');
+    try {
+      await mkdir(path.dirname(target), { recursive: true });
+      await symlink(missingTarget, target);
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      assert.notEqual(res.status, 0, 'installer must refuse a dangling-symlink target without --force');
+      assert.match(res.stderr || '', /target exists/i, `rejection message must mention the existing target: ${JSON.stringify(res)}`);
+
+      const linkInfo = await lstat(target);
+      assert.equal(linkInfo.isSymbolicLink(), true, 'the dangling symlink itself must still be there, not silently replaced');
+      await assert.rejects(() => stat(target), { code: 'ENOENT' }, 'the symlink must still be dangling (untouched), not resolved to new content');
+
+      const forced = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex', '--force'], { encoding: 'utf8' });
+      assert.equal(forced.status, 0, forced.stderr);
+      const forcedResult = JSON.parse(forced.stdout.trim());
+      assert.equal(forcedResult.status, 'installed');
+      assert.notEqual(forcedResult.backup, '', '--force must back up the dangling symlink it replaces, not silently discard it');
+      assert.equal(existsSync(path.join(target, 'SKILL.md')), true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'install.sh rejects a symlink payload entry before staging',
   { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
@@ -903,6 +1198,40 @@ test(
       await rm(root, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.sh never prints a stdout success record for a target that gets rolled back',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: chmod-based permission denial'), timeout: 30000 },
+  async () => {
+    // For --target both, .codex commits first and .agents second. Deny write
+    // on .agents/skills' parent so only the SECOND destination's commit
+    // fails, forcing rollback of the already-committed first destination. A
+    // consumer that processes emitted result lines must never see a success
+    // record for .codex: by the time the script exits non-zero, that
+    // destination has already been rolled back and no longer exists.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-partial-home-'));
+    const agentsSkillsDir = path.join(home, '.agents', 'skills');
+    await mkdir(agentsSkillsDir, { recursive: true });
+    await chmod(agentsSkillsDir, 0o555);
+    try {
+      const res = spawnSync(
+        'bash',
+        [toBashPath(path.join(__dirname, '..', 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'both'],
+        { encoding: 'utf8' },
+      );
+      assert.notEqual(res.status, 0, 'installer must exit non-zero when one of two targets fails to commit');
+      assert.equal((res.stdout || '').trim(), '', `stdout must be empty for a transaction that failed overall: ${JSON.stringify(res)}`);
+      assert.equal(
+        existsSync(path.join(home, '.codex', 'skills', 'debug')),
+        false,
+        'the target that committed then had to be rolled back must not remain installed',
+      );
+    } finally {
+      await chmod(agentsSkillsDir, 0o755);
+      await rm(home, { recursive: true, force: true });
     }
   },
 );

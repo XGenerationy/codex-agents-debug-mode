@@ -361,11 +361,14 @@ const classifyOutput = ({
  * line of a dedicated *ignore file is itself flagged. Runner-native test
  * focus/skip (describe.only, it.skip, fit/xdescribe, and their
  * optional-chaining, computed-property, and modifier-chain variants) is only
- * checked in test/spec-shaped files. The marker pass and the test-weakening
- * pass are both quote/comment/regex-literal aware: a bare quoted-string line
- * is skipped outright (so this scanner's own MARKERS vocabulary and quoted
- * test fixtures don't self-flag), a marker wrapped in matching quotes or
- * backticks is treated as inert prose, and test-weakening matches are
+ * checked in test/spec-shaped files. The marker pass is quote-aware only: a
+ * bare quoted-string line is skipped outright (so this scanner's own MARKERS
+ * vocabulary and quoted test fixtures don't self-flag) and a marker wrapped
+ * in matching quotes or backticks is treated as inert prose — a marker
+ * inside a line or block comment, or inside a regex literal, is still
+ * reported, which is intentional: a suppression directive is a directive
+ * regardless of what comment sits next to it. The test-weakening pass is,
+ * unlike the marker pass, comment- and regex-literal-aware: its matches are
  * checked against a per-line inertness map (see the nested
  * scanLineInertness) that tracks strings, line/block comments, and regex
  * literals, so a lookalike call inside a comment or string is ignored while

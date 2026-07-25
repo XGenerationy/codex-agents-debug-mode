@@ -1,12 +1,13 @@
 const { execFile, spawn } = require('node:child_process');
 const { createHash, randomBytes } = require('node:crypto');
 const { constants, createWriteStream, readdirSync, readFileSync } = require('node:fs');
-const { access, lstat, mkdir, open, realpath, statfs, writeFile } = require('node:fs/promises');
+const { access, lstat, mkdir, open, realpath, statfs } = require('node:fs/promises');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
+const { Writable } = require('node:stream');
 const { promisify } = require('node:util');
 
 /**
@@ -386,6 +387,35 @@ const sweepDetachedOrphans = async ({
 };
 
 /**
+ * Enumerate the PIDs of currently-live processes whose ParentProcessId is
+ * `parentPid`, via PowerShell's `Get-CimInstance Win32_Process`. Unlike
+ * `taskkill /PID <parentPid> /T`, this does not require `parentPid` itself
+ * to still exist: Windows records each live child's ParentProcessId as an
+ * attribute of the child process, independent of whether the parent is
+ * still alive, so a child that outlived its parent is still discoverable
+ * this way. Used when taskkill could not identify the tree because the root
+ * had already exited by the time it ran (see terminateProcessTree) — a
+ * failed `/T` invocation against an absent PID is not evidence the tree is
+ * clean, only that taskkill never got to look.
+ * @param {number} parentPid
+ * @param {{runExecFile: Function, powershell: string}} options
+ * @returns {Promise<number[]>} live child PIDs (empty if none).
+ */
+const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
+  const script = `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${Number(parentPid)}").ProcessId`;
+  const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8',
+    timeout: 10_000,
+    windowsHide: true,
+  });
+  return String(stdout)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\d+$/.test(line))
+    .map(Number);
+};
+
+/**
  * Proves the entire process tree a spawned command created is gone, not
  * just its root PID — a command can exit 0 while a detached descendant
  * keeps running and mutates evidence after the "clean" result is already
@@ -393,7 +423,15 @@ const sweepDetachedOrphans = async ({
  * taskkill.exe is resolved from SystemRoot only when that env value is an
  * absolute drive-letter path (never trust an injected value as an
  * executable path), and `/T` is attempted even when the root PID has
- * already exited, since children can outlive it. On POSIX, signals the
+ * already exited, since children can outlive it. If that invocation fails
+ * because the root no longer exists, taskkill never got to identify (let
+ * alone terminate) the tree — Microsoft documents `/T` as terminating the
+ * specified process and the children it started, so a nonzero result
+ * against an absent PID is not proof of anything about descendants. That
+ * case falls back to listWindowsChildPids to independently enumerate and
+ * individually taskkill any survivors, only concluding PASS once none
+ * remain (or none existed); enumeration failure or an unkillable survivor
+ * is reported BLOCKED rather than assumed clean. On POSIX, signals the
  * process group (`kill(-pgid, ...)`), escalating SIGTERM to SIGKILL across
  * `terminationGraceMs`; because `kill(-pgid, 0)` reports a group as alive
  * even when every member is an unreaped zombie (common in containers with a
@@ -454,13 +492,56 @@ const terminateProcessTree = async ({
           windowsHide: true,
         });
       } catch (error) {
-        // taskkill exits non-zero when the PID is already gone; that is OK only
-        // after we attempted /T (descendants were still targeted). If the root
-        // is still present, surface the failure.
+        // taskkill exits non-zero when the PID is already gone. If the root is
+        // still present, this is a genuine failure - surface it.
         if (!rootGone()) throw error;
+        // The root exited before taskkill could identify the tree, so this
+        // failure is not proof /T ever reached any children: taskkill needs
+        // the target PID to exist to walk its tree, and a nonzero result
+        // against an absent PID means it never got that far. Independently
+        // enumerate any live descendants (Windows tracks each child's
+        // ParentProcessId regardless of whether the parent is still alive)
+        // and terminate them directly; only PASS once none remain.
+        const powershell = path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        let survivors;
+        try {
+          survivors = await listWindowsChildPids(child.pid, { runExecFile, powershell });
+        } catch (enumerationError) {
+          return {
+            status: 'BLOCKED',
+            evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it, and descendant enumeration failed: ${enumerationError?.message || enumerationError}. Cannot prove the tree is clean.`,
+            escalated: true,
+          };
+        }
+        if (survivors.length === 0) {
+          return {
+            status: 'PASS',
+            evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found.`,
+            escalated: true,
+          };
+        }
+        const stillAlive = [];
+        for (const survivorPid of survivors) {
+          try {
+            await runExecFile(taskkill, ['/PID', String(survivorPid), '/T', '/F'], {
+              encoding: 'utf8',
+              timeout: Math.max(terminationGraceMs * 5, 10_000),
+              windowsHide: true,
+            });
+          } catch {
+            stillAlive.push(survivorPid);
+          }
+        }
+        if (stillAlive.length) {
+          return {
+            status: 'BLOCKED',
+            evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; descendant(s) ${stillAlive.join(', ')} could not be confirmed terminated.`,
+            escalated: true,
+          };
+        }
         return {
           status: 'PASS',
-          evidence: `Windows process tree ${child.pid} was targeted with taskkill /T /F; root already exited.`,
+          evidence: `Windows process tree ${child.pid}'s root already exited; ${survivors.length} live descendant(s) were independently found and terminated.`,
           escalated: true,
         };
       }
@@ -865,6 +946,75 @@ const safeStatusSignal = ({
   return `${category}: ${safe || 'redacted status signal'}`;
 };
 
+// Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
+// (the path is about to be created). A reused or caller-supplied outputDir
+// can already contain one of these predictable log paths (see nextLogPath)
+// as a symlink; both writeFile and createWriteStream follow symlinks by
+// default, which would clobber whatever the link points to instead of
+// writing evidence there. Mirrors debug_server.js's assertNotSymlink and
+// pr_closeout_report.js's assertNotSymlink.
+const assertLogNotSymlink = async (target) => {
+  let info;
+  try {
+    info = await lstat(target);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error(`Refusing to write evidence log through an existing symlink: ${target}`);
+  }
+};
+
+// Open a raw evidence log path without following a symlinked final
+// component. The lstat check above is the actual guard on platforms without
+// O_NOFOLLOW (e.g. Windows, where fs.constants.O_NOFOLLOW is undefined and
+// the flag below is a no-op); the O_NOFOLLOW open is defense-in-depth
+// against the TOCTOU gap between that lstat and this open everywhere else.
+const openLogNoFollow = async (target, flags) => {
+  await assertLogNotSymlink(target);
+  const noFollow = constants.O_NOFOLLOW || 0;
+  try {
+    return await open(target, flags | noFollow, 0o666);
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Refusing to write evidence log through an existing symlink: ${target}`);
+    }
+    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    return open(target, flags, 0o666);
+  }
+};
+
+/**
+ * Write a one-shot evidence log header (truncating any prior content),
+ * no-follow. Used for the "command: ...\ncwd: ..." header written before a
+ * command or command-proof spawn begins.
+ * @param {string} target
+ * @param {string} contents
+ */
+const writeLogHeaderNoFollow = async (target, contents) => {
+  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
+  try {
+    await handle.writeFile(contents, 'utf8');
+  } finally {
+    await handle.close();
+  }
+};
+
+/**
+ * Open an evidence log for streaming append, no-follow. Opens the
+ * descriptor directly (rather than letting createWriteStream open the path
+ * itself, which would follow a symlink) and hands the resulting FileHandle
+ * to createWriteStream via its `fd` option so the stream still owns normal
+ * close/error semantics.
+ * @param {string} target
+ * @returns {Promise<import('node:fs').WriteStream>}
+ */
+const createLogAppendStreamNoFollow = async (target) => {
+  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND);
+  return createWriteStream(undefined, { fd: handle, autoClose: true, encoding: 'utf8' });
+};
+
 /**
  * Spawns one command and captures its full lifecycle as report-safe
  * evidence. Every stdout/stderr chunk is decoded, redacted, and
@@ -907,8 +1057,21 @@ const spawnCaptured = async ({
   let stdout = '';
   let stderr = '';
   let timedOut = false;
-  const log = createWriteStream(logPath, { flags: 'a', encoding: 'utf8' });
+  // Opened no-follow (see createLogAppendStreamNoFollow): a pre-existing
+  // symlink at this predictable path is refused rather than followed. Like
+  // any other open failure (missing parent dir, permissions), that is
+  // captured softly as logWriteError below rather than aborting a command
+  // that has not even started yet — classifyExecution already treats a
+  // populated logWriteError as blocking regardless of the command's own
+  // exit code, so the incomplete evidence trail still cannot pass silently.
+  let log;
   let logError = null;
+  try {
+    log = await createLogAppendStreamNoFollow(logPath);
+  } catch (error) {
+    logError = error;
+    log = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+  }
   // Track sources paused on backpressure so they can be resumed if the log
   // stream errors mid-write. Without this, an append-mode open failure, disk
   // full, or locked-file error would leave 'drain' waiting forever and the
@@ -1678,7 +1841,7 @@ const createCommandExecutor = ({
   await mkdir(logsDir, { recursive: true });
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
-  await writeFile(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, 'utf8');
+  await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`);
   const execution = await spawnCaptured({
     command: check.command,
     cwd,
@@ -1721,7 +1884,7 @@ const createCommandExecutor = ({
       effectivePathReplacements,
       platform,
     );
-    await writeFile(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, 'utf8');
+    await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`);
     const proofExecution = await spawnCaptured({
       command: check.proof.command,
       cwd,
