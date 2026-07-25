@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { access, chmod, mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
+const { access, chmod, mkdtemp, mkdir, rename, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -442,6 +442,10 @@ test('fails closed when local filter.* enumeration is not a clean empty match', 
   // Swallowing every get-regexp error would skip filterOverrides and leave
   // process/required active during worktree add. Only exit code 1 (no matches)
   // is safe; other failures must abort baseline checkout.
+  //
+  // Force a non-1 git-config failure portably: replace `.git/config` with a
+  // directory. chmod(0o000) is not reliable on Windows (CI windows-latest),
+  // where file modes often still allow reads.
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-filter-scan-'));
   try {
     git(repo, 'init', '--quiet');
@@ -452,17 +456,18 @@ test('fails closed when local filter.* enumeration is not a clean empty match', 
     git(repo, 'add', 'tracked.txt');
     git(repo, 'commit', '--quiet', '-m', 'base');
     const baseSha = git(repo, 'rev-parse', 'HEAD');
-    // Make .git/config unreadable so `git config --get-regexp` fails with a
-    // non-1 error (permission denied), not the empty-match exit.
     const configPath = path.join(repo, '.git', 'config');
-    await chmod(configPath, 0o000);
+    const configBackup = path.join(repo, '.git', 'config.bak-closeout');
+    await rename(configPath, configBackup);
+    await mkdir(configPath);
     try {
       await assert.rejects(
         () => withDisposableWorktree({ repo, baseSha }, async () => 'should-not-run'),
         /enumerate local filter/i,
       );
     } finally {
-      await chmod(configPath, 0o644);
+      await rm(configPath, { recursive: true, force: true });
+      await rename(configBackup, configPath);
     }
   } finally {
     await rm(repo, { recursive: true, force: true });
