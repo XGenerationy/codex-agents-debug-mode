@@ -437,6 +437,38 @@ test('neutralizes filter.<driver>.process and required during baseline worktree 
   }
 });
 
+
+test('fails closed when local filter.* enumeration is not a clean empty match', async () => {
+  // Swallowing every get-regexp error would skip filterOverrides and leave
+  // process/required active during worktree add. Only exit code 1 (no matches)
+  // is safe; other failures must abort baseline checkout.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-filter-scan-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+    // Make .git/config unreadable so `git config --get-regexp` fails with a
+    // non-1 error (permission denied), not the empty-match exit.
+    const configPath = path.join(repo, '.git', 'config');
+    await chmod(configPath, 0o000);
+    try {
+      await assert.rejects(
+        () => withDisposableWorktree({ repo, baseSha }, async () => 'should-not-run'),
+        /enumerate local filter/i,
+      );
+    } finally {
+      await chmod(configPath, 0o644);
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('does not claim a baseline for an unsafe or non-matching failure', async () => {
   const unsafe = await verifyBaseline({
     repo: 'C:/repo',

@@ -393,8 +393,18 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
         '-c', `filter.${driver}.required=false`,
       );
     }
-  } catch {
-    // No local filter keys (exit 1 from --get-regexp) is fine.
+  } catch (error) {
+    // git config --get-regexp exits 1 when there are no matches. Only that
+    // specific "empty result" outcome is safe to treat as zero drivers.
+    // Timeouts, maxBuffer overflows, missing git, and unreadable config must
+    // fail closed — otherwise worktree add would proceed without knowing
+    // whether filter.<driver>.process (etc.) still needs neutralizing.
+    const exitCode = error?.code;
+    if (exitCode !== 1 && exitCode !== '1') {
+      throw new Error(
+        `Failed to enumerate local filter.* keys for baseline worktree safety: ${error?.message || error}`,
+      );
+    }
   }
   const withInternalSafety = (args) => [
     '-c', `core.hooksPath=${noHooksDir}`,
