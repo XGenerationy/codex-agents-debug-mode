@@ -1024,9 +1024,18 @@ test('keeps example placeholders blocked instead of treating them as commands', 
 test('blocks configured commands that neutralize failures', () => {
   // Closeout config may live outside the checkout; the touched-file scanner
   // never sees it. Failure-hiding shell constructs must be rejected at plan
-  // build time (Codex #4780229514).
+  // build time (Codex #4780229514 / Qodo #4780249069 / CodeRabbit #4780269384).
   assert.ok(findCommandFailureNeutralizer('pnpm test || true'));
   assert.ok(findCommandFailureNeutralizer('actual-test >/dev/null 2>&1 || true'));
+  // `|| :` with redirects/pipes still yields exit 0.
+  assert.ok(findCommandFailureNeutralizer('actual-test || :>/dev/null'));
+  assert.ok(findCommandFailureNeutralizer('actual-test || :| cat'));
+  // Semicolon-chained success no-ops.
+  assert.ok(findCommandFailureNeutralizer('actual-test; true'));
+  assert.ok(findCommandFailureNeutralizer('actual-test; :'));
+  assert.ok(findCommandFailureNeutralizer('actual-test; exit 0'));
+  // `&& exit 0` short-circuits on failure — not a neutralizer.
+  assert.equal(findCommandFailureNeutralizer('pnpm test && exit 0'), null);
   assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
 
   const plan = buildCheckPlan({

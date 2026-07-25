@@ -75,11 +75,14 @@ const CONFIG_SILENCING = [
   /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
   /\|\|\s*true\b/i,
   // Shell zero-exit neutralizers that hide command failure from classifyOutput
-  // the same way `|| true` does: `|| :` (POSIX no-op) and `|| exit 0`.
-  /\|\|\s*:(?=\s|$|[;"'`&;\n])/i,
+  // the same way `|| true` does. `|| :` matches even with redirects/pipes
+  // (`|| :>/dev/null`). Trailing `; true` / `; :` / `; exit 0` are covered
+  // without anchoring on bare `&` (which would false-positive on `&&`).
+  /\|\|\s*:/i,
   /\|\|\s*exit\s+0\b/i,
-  // Unconditional zero-exit tails that do not need ||, e.g. `jest; exit 0`.
-  /(?:^|[;&\n])\s*exit\s+0\b/i,
+  /(?:^|[;\n])\s*true\b/i,
+  /(?:^|[;\n])\s*:/i,
+  /(?:^|[;\n])\s*exit\s+0\b/i,
 ];
 
 /**
@@ -90,11 +93,20 @@ const CONFIG_SILENCING = [
  * never sees.
  */
 const COMMAND_FAILURE_NEUTRALIZERS = [
+  // OR-list success: `cmd || true`, `cmd || exit 0`
   /\|\|\s*true\b/i,
-  // POSIX no-op success: `cmd || :`
-  /\|\|\s*:(?=\s|$|[;"'`&;\n])/i,
+  // POSIX no-op after || — including redirects/pipes: `|| :`, `|| :>/dev/null`,
+  // `|| :| cat`. `:` is a complete always-success command; trailing I/O still
+  // yields exit 0 and must not evade the detector.
+  /\|\|\s*:/i,
   /\|\|\s*exit\s+0\b/i,
-  /(?:^|[;&\n])\s*exit\s+0\b/i,
+  // Trailing/chained success no-ops: `cmd; true`, `cmd; :`, or a lone `true`/
+  // `:` as the configured command. Anchored on start / `;` / newline only —
+  // not bare `&` — so `cmd && exit 0` (short-circuits on failure) is not a
+  // false positive.
+  /(?:^|[;\n])\s*true\b/i,
+  /(?:^|[;\n])\s*:/i,
+  /(?:^|[;\n])\s*exit\s+0\b/i,
   /\bpassWithNoTests\b/i,
   /\ballowNoTests\b/i,
   /\b--passWithNoTests\b/i,

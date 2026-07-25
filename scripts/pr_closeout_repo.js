@@ -208,8 +208,11 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
   let physicalRepo = resolvedRepo;
   try {
     physicalRepo = await realpath(resolvedRepo);
-  } catch {
-    // Non-existent or unreadable path: keep path.resolve form for clearer errors.
+  } catch (error) {
+    // Only ENOENT falls back to path.resolve so a missing path still yields a
+    // clearer downstream git error. ELOOP / EACCES / other failures must not
+    // silently drop the physical-path guarantee used for containment checks.
+    if (error?.code !== 'ENOENT') throw error;
   }
   const [headSha, baseSha, mergeBaseSha] = await Promise.all([
     gitText(physicalRepo, ['rev-parse', 'HEAD']),

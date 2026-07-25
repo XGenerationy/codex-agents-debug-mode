@@ -173,6 +173,10 @@ test('requires an exact review tuple even when the tree and command mapping are 
     '-      - uses: actions/setup-node@v4',
     '-      - run: echo deploy',
     '-      - run: |',
+    // Bare `npm run` / `pnpm run` must not treat deploy/release as validation.
+    '-      - run: npm run deploy',
+    '-      - run: pnpm run release',
+    '-        npm run changelog',
   ]) {
     assert.equal(
       classifyGateIntegrity({
@@ -184,6 +188,15 @@ test('requires an exact review tuple even when the tree and command mapping are 
       `non-validation removal must not FAIL: ${line}`,
     );
   }
+  // Explicit validation script names still FAIL.
+  assert.equal(
+    classifyGateIntegrity({
+      ...clean,
+      removedLines: ['-      - run: npm run typecheck'],
+      attestation: liveAttestation({ headSha: 'head123' }),
+    }).status,
+    'FAIL',
+  );
 });
 
 test('detects multiline gate weakening and produces stable config digests', () => {

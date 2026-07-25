@@ -103,9 +103,11 @@ const VALIDATION_REMOVAL_PATTERNS = [
   // Security / quality Actions (not every third-party uses: line).
   /^\-.*\buses:\s+(?:github\/codeql-action|aquasecurity\/trivy-action|securego\/gosec|golangci\/golangci-lint-action|github\/super-linter|oxsecurity\/megalinter|codecov\/codecov-action|sonarsource\/sonarcloud)\S*/i,
   // Package-manager / make validation commands (covers `run: npm test` and
-  // indented block bodies that still contain the command text).
-  /^\-.*\bnpm\s+(?:ci|test|run\b|audit\b)/i,
-  /^\-.*\bpnpm\s+(?:test|run\b|audit\b)/i,
+  // indented block bodies). Do NOT match bare `npm run` / `pnpm run` alone —
+  // that would treat `npm run deploy` / `pnpm run release` as validation
+  // removals. Named scripts are covered by the explicit list below.
+  /^\-.*\bnpm\s+(?:ci|test|audit)\b/i,
+  /^\-.*\bpnpm\s+(?:test|audit)\b/i,
   /^\-.*\bscan:suppressions\b/i,
   /^\-.*\bnode\s+--test\b/i,
   /^\-.*\bmake\s+(?:pr-check|verify|test|audit)\b/i,
@@ -113,7 +115,8 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-\s*-\s*name:\s*.*\b(?:test|validate|audit|scan|lint|codeql|security|coverage)\b/i,
   // Common multi-language validation commands in block steps.
   /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
-  /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
+  // npm/pnpm/yarn with an explicit validation script name (optional `run`).
+  /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build|check|verify|coverage)\b/i,
 ];
 
 /**
