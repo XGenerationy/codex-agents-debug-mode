@@ -9,6 +9,7 @@ const test = require('node:test');
 
 const {
   SPAWN_MARK_ENV,
+  MAX_ARTIFACT_HASH_BYTES,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
@@ -1292,7 +1293,7 @@ test('terminates and confirms descendants that outlived a Windows root taskkill 
         return { stdout: 'SUCCESS', stderr: '' };
       }
       assert.match(file, /powershell\.exe$/i);
-      return { stdout: '5555\n5556\n', stderr: '' };
+      return { stdout: '5555 1234\n5556 1234\n', stderr: '' };
     },
   });
   assert.equal(result.status, 'PASS');
@@ -1316,7 +1317,7 @@ test('blocks a Windows tree when a descendant survives taskkill after the root a
         throw new Error('taskkill failed: access denied');
       }
       assert.match(file, /powershell\.exe$/i);
-      return { stdout: '5555\n', stderr: '' };
+      return { stdout: '5555 1234\n', stderr: '' };
     },
   });
   assert.equal(result.status, 'BLOCKED');
@@ -1341,6 +1342,99 @@ test('blocks a Windows tree when descendant enumeration itself fails after the r
   assert.equal(result.status, 'BLOCKED');
   assert.match(result.evidence, /enumeration failed/i);
   assert.match(result.evidence, /powershell is not available/);
+});
+
+
+test('blocks a Windows tree when taskkill fails while the root is still alive', async () => {
+  let powershellRan = false;
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    env: { SystemRoot: 'C:\\Windows' },
+    kill: () => true, // root still present
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: access denied');
+      powershellRan = true;
+      return { stdout: '', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(powershellRan, false, 'descendant enumeration must not run while the root is alive');
+  assert.match(result.evidence, /access denied/);
+});
+
+test('enumerates multi-level Windows descendants from a full process table', async () => {
+  // Root 100 is gone; intermediate 200 was a direct child; grandchild 300 is
+  // still alive under 200. A ParentProcessId=root-only query would miss 300
+  // if 200 is still in the table as its parent — the full adjacency BFS finds it.
+  const killed = [];
+  const result = await terminateProcessTree({
+    child: { pid: 100 },
+    platform: 'win32',
+    env: { SystemRoot: 'C:\\Windows' },
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file, args) => {
+      if (/taskkill\.exe$/i.test(file)) {
+        if (args.includes('100')) throw new Error('taskkill failed: root PID not found');
+        killed.push(args[args.indexOf('/PID') + 1]);
+        return { stdout: 'SUCCESS', stderr: '' };
+      }
+      assert.match(file, /powershell\.exe$/i);
+      // Full table: pid parentPid pairs
+      return { stdout: '200 100\n300 200\n400 1\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.deepEqual(killed.sort(), ['200', '300']);
+  assert.match(result.evidence, /2 live descendant/i);
+});
+
+test('rejects an untrusted SystemRoot absolute path for Windows cleanup tools', async () => {
+  const calls = [];
+  const result = await terminateProcessTree({
+    child: { pid: 1234 },
+    platform: 'win32',
+    env: {
+      SystemRoot: 'C:\\Users\\attacker\\planted',
+      __closeoutPathExists: (candidate) => /planted/i.test(candidate),
+    },
+    kill: () => true,
+    runExecFile: async (file, args) => {
+      calls.push(file);
+      return { stdout: 'SUCCESS', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.equal(calls.length, 1);
+  // path.join on non-Windows hosts may mix separators; normalize before assert.
+  const normalized = calls[0].replace(/\\/g, '/').toLowerCase();
+  assert.equal(normalized, 'c:/windows/system32/taskkill.exe');
+  assert.doesNotMatch(calls[0], /planted/i);
+});
+
+test('fails artifact proof when the file exceeds the hash size ceiling', async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-huge-artifact-'));
+  try {
+    const artifact = path.join(repo, 'huge.bin');
+    // Sparse-ish large buffer without writing multi-GB to disk: create a small
+    // file then inject size via a custom hash? snapshotArtifactProof uses real
+    // lstat size before hashing. Write a file just over the limit is too big
+    // for CI (5MB is fine though).
+    const oversized = Buffer.alloc(MAX_ARTIFACT_HASH_BYTES + 1, 0x61);
+    await writeFile(artifact, oversized);
+    const result = await snapshotArtifactProof({
+      proof: { type: 'artifact', path: 'huge.bin' },
+      cwd: repo,
+    });
+    assert.equal(result.status, 'FAIL');
+    assert.match(result.evidence, /hash size limit/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async () => {

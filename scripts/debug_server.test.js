@@ -775,6 +775,9 @@ test(
       const tokenFile = path.join(debugDir, 'collector_token');
       await mkdir(debugDir, { recursive: true });
       await writeFile(tokenFile, 'stale-token-with-permissive-mode', { mode: 0o644 });
+      // writeFile's mode is masked by the process umask; chmod is not, so force
+      // the fixture mode explicitly before asserting the reuse-branch pre-state.
+      await chmod(tokenFile, 0o644);
       const preInfo = await stat(tokenFile);
       assert.equal(preInfo.mode & 0o777, 0o644, 'fixture must start permissive to exercise the reuse branch');
 
@@ -1204,7 +1207,15 @@ test(
 
 test(
   'install.sh never prints a stdout success record for a target that gets rolled back',
-  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: chmod-based permission denial'), timeout: 30000 },
+  {
+    // mode 0555 does not block the installer when the suite runs as UID 0
+    // (common in containers); skip rather than assert a permission model root
+    // can always bypass.
+    skip: (!bashAvailable && 'bash is required')
+      || (process.platform === 'win32' && 'POSIX-only: chmod-based permission denial')
+      || (typeof process.getuid === 'function' && process.getuid() === 0 && 'chmod denial is not observable as root'),
+    timeout: 30000,
+  },
   async () => {
     // For --target both, .codex commits first and .agents second. Deny write
     // on .agents/skills' parent so only the SECOND destination's commit

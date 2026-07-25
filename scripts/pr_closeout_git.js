@@ -1,6 +1,6 @@
 const { execFile } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdir, mkdtemp, rm } = require('node:fs/promises');
+const { mkdir, mkdtemp, rename, rm } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -354,17 +354,38 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //    by `git worktree add` when configured (it inherits the repo's fsmonitor),
   //    so a validation command that sets core.fsmonitor gets code executed.
   //  - core.attributesFile: a global attributes file plus a per-driver smudge
-  //    filter can run an external command during the worktree checkout; clearing
-  //    the global attributes source neutralizes that vector for this checkout.
-  //    (In-tree .gitattributes is reviewed/trusted; .git/info/attributes shares
-  //    the same per-repo trust boundary as the hooks config neutralized above.)
+  //    filter can run an external command during the worktree checkout.
+  //  - filter.<driver>.smudge / .clean: repository-local filter drivers are a
+  //    separate config surface from core.attributesFile; clearing only the
+  //    global attributes path still lets `.git/info/attributes` assign a
+  //    driver whose smudge command runs during checkout. Neutralize every
+  //    configured local filter.*.smudge/clean via -c overrides.
+  //  - `.git/info/attributes`: temporarily rename away during the internal
+  //    checkout so per-repo attributes cannot re-enable a filter driver even
+  //    if config discovery misses a name.
   const noHooksDir = path.join(parent, 'no-hooks');
   await mkdir(noHooksDir, { recursive: true });
+  const filterOverrides = [];
+  try {
+    const listed = await runGit(repo, ['config', '--local', '--get-regexp', '^filter\\..*\\.(smudge|clean)$'], {
+      ...(env ? { env } : {}),
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    });
+    for (const line of String(listed || '').split(/\r?\n/)) {
+      const key = line.trim().split(/\s+/, 1)[0];
+      if (key && key.startsWith('filter.')) {
+        filterOverrides.push('-c', `${key}=`);
+      }
+    }
+  } catch {
+    // No local filter keys (exit 1 from --get-regexp) is fine.
+  }
   const withInternalSafety = (args) => [
     '-c', `core.hooksPath=${noHooksDir}`,
     '-c', 'core.fsmonitor=',
     '-c', 'core.useBuiltinFSMonitor=false',
     '-c', 'core.attributesFile=',
+    ...filterOverrides,
     ...args,
   ];
   // Run internal baseline git with the workflow's sanitized environment (when
@@ -373,24 +394,44 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   const gitOptions = {};
   if (env) gitOptions.env = env;
   if (timeoutMs) gitOptions.timeout = timeoutMs;
+
+  const infoAttributes = path.join(repo, '.git', 'info', 'attributes');
+  const infoAttributesBackup = path.join(repo, '.git', 'info', `attributes.closeout-disabled.${process.pid}`);
+  let attributesMoved = false;
   try {
-    await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]), gitOptions);
-    added = true;
-    return await callback(worktree);
-  } catch (error) {
-    primaryError = error;
-    throw error;
-  } finally {
     try {
-      if (added) {
-        await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]), gitOptions);
-        await runGit(repo, withInternalSafety(['worktree', 'prune']), gitOptions);
-      }
+      await rename(infoAttributes, infoAttributesBackup);
+      attributesMoved = true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    try {
+      await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]), gitOptions);
+      added = true;
+      return await callback(worktree);
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
       try {
-        await rm(parent, { recursive: true, force: true });
-      } catch (cleanupError) {
-        if (!primaryError) throw cleanupError;
+        if (added) {
+          await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]), gitOptions);
+          await runGit(repo, withInternalSafety(['worktree', 'prune']), gitOptions);
+        }
+      } finally {
+        try {
+          await rm(parent, { recursive: true, force: true });
+        } catch (cleanupError) {
+          if (!primaryError) throw cleanupError;
+        }
+      }
+    }
+  } finally {
+    if (attributesMoved) {
+      try {
+        await rename(infoAttributesBackup, infoAttributes);
+      } catch (restoreError) {
+        if (!primaryError) throw restoreError;
       }
     }
   }

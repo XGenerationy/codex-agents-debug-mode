@@ -356,3 +356,18 @@ test('writeEvidenceReport never writes report.json when report.md is the rejecte
     await rm(outsideDir, { recursive: true, force: true });
   }
 });
+
+test('writeEvidenceReport commits report.json and report.md as a pair (no leftover temps)', async () => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-pair-'));
+  try {
+    await writeEvidenceReport({ outputDir, report: minimalReport() });
+    const entries = require('node:fs').readdirSync(outputDir).sort();
+    assert.deepEqual(entries, ['report.json', 'report.md']);
+    const json = JSON.parse(await readFile(path.join(outputDir, 'report.json'), 'utf8'));
+    const md = await readFile(path.join(outputDir, 'report.md'), 'utf8');
+    assert.equal(json.overallStatus, 'PASS');
+    assert.match(md, /\*\*PASS\*\*/);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});

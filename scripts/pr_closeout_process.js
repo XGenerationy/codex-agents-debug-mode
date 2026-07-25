@@ -46,8 +46,11 @@ const {
   createStreamingReplacer,
   createStreamingSignalScanner,
 } = require('./pr_closeout_stream');
+const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
 
 const CAPTURE_LIMIT = 2_000_000;
+/** Hard ceiling for artifact hashing so a multi-GB proof path cannot stall closeout. */
+const MAX_ARTIFACT_HASH_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const execFileAsync = promisify(execFile);
 
@@ -387,32 +390,48 @@ const sweepDetachedOrphans = async ({
 };
 
 /**
- * Enumerate the PIDs of currently-live processes whose ParentProcessId is
- * `parentPid`, via PowerShell's `Get-CimInstance Win32_Process`. Unlike
- * `taskkill /PID <parentPid> /T`, this does not require `parentPid` itself
- * to still exist: Windows records each live child's ParentProcessId as an
- * attribute of the child process, independent of whether the parent is
- * still alive, so a child that outlived its parent is still discoverable
- * this way. Used when taskkill could not identify the tree because the root
- * had already exited by the time it ran (see terminateProcessTree) — a
- * failed `/T` invocation against an absent PID is not evidence the tree is
- * clean, only that taskkill never got to look.
+ * Enumerate live descendant PIDs of `parentPid` via a full Windows process
+ * table snapshot (ProcessId + ParentProcessId), then BFS. Unlike a single
+ * `ParentProcessId=root` filter, this finds grandchildren while intermediate
+ * parents are still alive. Fully orphaned multi-level trees (every intermediate
+ * already exited) are unrecoverable via ParentProcessId alone.
  * @param {number} parentPid
  * @param {{runExecFile: Function, powershell: string}} options
- * @returns {Promise<number[]>} live child PIDs (empty if none).
+ * @returns {Promise<number[]>} live descendant PIDs (empty if none).
  */
 const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
-  const script = `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${Number(parentPid)}").ProcessId`;
+  const root = Number(parentPid);
+  const script = 'Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + [char]32 + $_.ParentProcessId.ToString() }';
   const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8',
-    timeout: 10_000,
+    timeout: 15_000,
     windowsHide: true,
   });
-  return String(stdout)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^\d+$/.test(line))
-    .map(Number);
+  const childrenByParent = new Map();
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parts = trimmed.split(/\s+/);
+    if (parts.length < 2) continue;
+    const pid = Number(parts[0]);
+    const parent = Number(parts[1]);
+    if (!Number.isInteger(pid) || !Number.isInteger(parent) || pid <= 0) continue;
+    if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+    childrenByParent.get(parent).push(pid);
+  }
+  const found = [];
+  const seen = new Set([root]);
+  const queue = [root];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const child of childrenByParent.get(current) || []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      found.push(child);
+      queue.push(child);
+    }
+  }
+  return found;
 };
 
 /**
@@ -459,14 +478,53 @@ const terminateProcessTree = async ({
   }
   try {
     if (platform === 'win32') {
-      // Resolve taskkill.exe from SystemRoot but fall back to the canonical
-      // C:\Windows\System32 location if SystemRoot is missing/relative/looks
-      // unusual. We never execute a path that was injected via the env: the
-      // value must be an absolute drive-letter Windows path that points at
-      // an existing directory, otherwise we use the hard-coded default.
-      const candidateRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim();
-      const isAbsoluteDrivePath = /^[A-Za-z]:[\\/]/.test(candidateRoot);
-      const safeRoot = isAbsoluteDrivePath ? candidateRoot : 'C:\\Windows';
+      // Resolve taskkill/powershell only from a verified Windows system root.
+      // An absolute drive path in SystemRoot is not enough: an attacker can
+      // point it at a planted tree with a fake System32\\taskkill.exe. Require
+      // the path to look like a Windows install (final component "Windows")
+      // and that the real taskkill + powershell binaries exist there; otherwise
+      // fall back to the hard-coded C:\\Windows default (which tests also use
+      // as a pure path-construction base when pathExists is not injected).
+      const pathExists = typeof env.__closeoutPathExists === 'function'
+        ? env.__closeoutPathExists
+        : (candidate) => {
+          try {
+            const { existsSync } = require('node:fs');
+            return existsSync(candidate);
+          } catch {
+            return false;
+          }
+        };
+      const looksLikeWindowsRoot = (root) => {
+        const normalized = path.normalize(root).replace(/[\\/]+$/u, '');
+        return /^[A-Za-z]:[\\/]/u.test(normalized)
+          && path.basename(normalized).toLowerCase() === 'windows';
+      };
+      const isTrustedSystemRoot = (root) => {
+        if (!looksLikeWindowsRoot(root)) return false;
+        const taskkillPath = path.join(root, 'System32', 'taskkill.exe');
+        const powershellPath = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        return pathExists(taskkillPath) && pathExists(powershellPath);
+      };
+      const envRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim();
+      const hardcodedRoot = 'C:\\Windows';
+      // Prefer the hard-coded system location whenever it is present and
+      // trusted. An attacker-controlled SystemRoot that merely looks like a
+      // Windows tree (and contains planted taskkill/powershell binaries) must
+      // never override a real system install.
+      let safeRoot = hardcodedRoot;
+      if (isTrustedSystemRoot(hardcodedRoot)) {
+        safeRoot = hardcodedRoot;
+      } else if (isTrustedSystemRoot(envRoot)) {
+        safeRoot = envRoot;
+      } else if (looksLikeWindowsRoot(envRoot)) {
+        // Unit tests / non-Windows hosts: no real install on disk. Still reject
+        // absolute non-Windows paths; accept only a Windows-shaped root for
+        // path construction used by mocked runExecFile.
+        safeRoot = envRoot;
+      } else {
+        safeRoot = hardcodedRoot;
+      }
       const taskkill = path.join(safeRoot, 'System32', 'taskkill.exe');
       // taskkill exits non-zero when the root PID is already gone (for
       // example a command that exited cleanly before termination was even
@@ -946,42 +1004,26 @@ const safeStatusSignal = ({
   return `${category}: ${safe || 'redacted status signal'}`;
 };
 
-// Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
-// (the path is about to be created). A reused or caller-supplied outputDir
-// can already contain one of these predictable log paths (see nextLogPath)
-// as a symlink; both writeFile and createWriteStream follow symlinks by
-// default, which would clobber whatever the link points to instead of
-// writing evidence there. Mirrors debug_server.js's assertNotSymlink and
-// pr_closeout_report.js's assertNotSymlink.
+// Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT.
+// Shared with report/collector via pr_closeout_fs.js so the guard stays one
+// implementation across security-critical write paths.
 const assertLogNotSymlink = async (target) => {
-  let info;
-  try {
-    info = await lstat(target);
-  } catch (error) {
-    if (error.code === 'ENOENT') return;
-    throw error;
-  }
-  if (info.isSymbolicLink()) {
-    throw new Error(`Refusing to write evidence log through an existing symlink: ${target}`);
-  }
+  await assertNotSymlinkShared(
+    target,
+    `Refusing to write evidence log through an existing symlink: ${target}`,
+  );
 };
 
-// Open a raw evidence log path without following a symlinked final
-// component. The lstat check above is the actual guard on platforms without
-// O_NOFOLLOW (e.g. Windows, where fs.constants.O_NOFOLLOW is undefined and
-// the flag below is a no-op); the O_NOFOLLOW open is defense-in-depth
-// against the TOCTOU gap between that lstat and this open everywhere else.
+// Open a raw evidence log path without following a symlinked final component.
 const openLogNoFollow = async (target, flags) => {
   await assertLogNotSymlink(target);
-  const noFollow = constants.O_NOFOLLOW || 0;
   try {
-    return await open(target, flags | noFollow, 0o666);
+    return await openNoFollowShared(target, flags, 0o666);
   } catch (error) {
     if (error?.code === 'ELOOP') {
       throw new Error(`Refusing to write evidence log through an existing symlink: ${target}`);
     }
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    return open(target, flags, 0o666);
+    throw error;
   }
 };
 
@@ -1362,12 +1404,24 @@ const hashArtifactDefault = async (artifact) => {
   const handle = await openArtifact(artifact);
   try {
     const before = await handle.stat();
+    if (Number(before.size) > MAX_ARTIFACT_HASH_BYTES) {
+      throw new Error(
+        `Artifact exceeds hash size limit (${before.size} > ${MAX_ARTIFACT_HASH_BYTES} bytes): ${artifact}`,
+      );
+    }
     const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
+    let totalRead = 0;
     while (true) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
       if (!bytesRead) break;
+      totalRead += bytesRead;
+      if (totalRead > MAX_ARTIFACT_HASH_BYTES) {
+        throw new Error(
+          `Artifact exceeded hash size limit while reading (> ${MAX_ARTIFACT_HASH_BYTES} bytes): ${artifact}`,
+        );
+      }
       hash.update(buffer.subarray(0, bytesRead));
       position += bytesRead;
     }
@@ -2274,6 +2328,7 @@ const runPreflight = async ({
 
 module.exports = {
   SPAWN_MARK_ENV,
+  MAX_ARTIFACT_HASH_BYTES,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,

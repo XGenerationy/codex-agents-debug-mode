@@ -446,13 +446,21 @@ const reportDebugTransportFailure = (error) => {
   console.warn('Debug collector transport failed', { kind: error?.name || 'TransportError' });
 };
 const debugLog = (msg, data = {}, hypothesisId = null) => {
-  const payload = JSON.stringify({
-    sessionId: SESSION_ID,
-    sessionToken: SESSION_TOKEN,
-    msg,
-    data,
-    hypothesisId,
-  });
+  let payload;
+  try {
+    // JSON.stringify throws synchronously for circular refs / BigInt; catch
+    // before sendBeacon/fetch so instrumentation cannot crash the app.
+    payload = JSON.stringify({
+      sessionId: SESSION_ID,
+      sessionToken: SESSION_TOKEN,
+      msg,
+      data,
+      hypothesisId,
+    });
+  } catch (error) {
+    reportDebugTransportFailure(error);
+    return;
+  }
   if (navigator.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
     .then((response) => {

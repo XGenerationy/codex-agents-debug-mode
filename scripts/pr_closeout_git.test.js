@@ -343,6 +343,49 @@ test('disables fsmonitor and global attributes for the internal baseline worktre
   }
 });
 
+
+test('neutralizes repository filter drivers and .git/info/attributes during baseline worktree checkout', async () => {
+  // A failed validation command can write .git/info/attributes + filter.*.smudge
+  // so that `git worktree add` runs an external smudge outside spawnCaptured
+  // containment. Clearing only core.attributesFile is not enough (reproduced
+  // against stock Git); the wrapper must also clear filter.*.smudge/clean and
+  // temporarily move .git/info/attributes away.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-filter-'));
+  let worktree;
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+    const infoDir = path.join(repo, '.git', 'info');
+    await mkdir(infoDir, { recursive: true });
+    await writeFile(path.join(infoDir, 'attributes'), 'tracked.txt filter=evil\n');
+    git(repo, 'config', 'filter.evil.smudge', 'sed "s/base/HACKED/"');
+    git(repo, 'config', 'filter.evil.clean', 'cat');
+    const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
+      worktree = created;
+      const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n');
+      assert.equal(content, 'base\n', 'smudge filter must not rewrite the baseline checkout');
+      // During the worktree lifetime the info attributes file is parked aside.
+      await assert.rejects(
+        () => require('node:fs/promises').access(path.join(infoDir, 'attributes')),
+        { code: 'ENOENT' },
+      );
+      return 'verified';
+    });
+    assert.equal(value, 'verified');
+    // Restored for the main repo after the helper finishes.
+    const restoredAfter = require('node:fs').readFileSync(path.join(infoDir, 'attributes'), 'utf8');
+    assert.match(restoredAfter, /filter=evil/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('does not claim a baseline for an unsafe or non-matching failure', async () => {
   const unsafe = await verifyBaseline({
     repo: 'C:/repo',

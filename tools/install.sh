@@ -120,7 +120,10 @@ unique_backup() {
   local base_ts backup
   base_ts="$(date -u +%Y%m%d%H%M%S)"
   backup="$destination.backup.$base_ts.$$"
-  while [[ -e "$backup" ]]; do
+  # -L alongside -e: a dangling symlink at the candidate backup path is
+  # invisible to bare -e, so the loop would accept it and mv would write
+  # through the link instead of choosing a free name.
+  while [[ -e "$backup" || -L "$backup" ]]; do
     backup="$destination.backup.$base_ts.$$.$RANDOM"
   done
   printf '%s\n' "$backup"

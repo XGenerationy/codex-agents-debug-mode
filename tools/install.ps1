@@ -120,6 +120,10 @@ try {
         }
     }
 
+    # Buffer success records until every destination commits. Emitting per
+    # destination would let a streaming consumer persist an "installed" line
+    # for a target that is later rolled back when a subsequent destination fails.
+    $pendingResults = @()
     foreach ($item in $staged) {
         $backup = $null
         if (Test-Path -LiteralPath $item.Destination) {
@@ -135,22 +139,33 @@ try {
         }
         catch {
             # Stage move failed: put the original destination back if we backed it up.
+            # Only clear $item.Backup after a confirmed successful restore; if the
+            # restore itself fails (e.g. destination locked), keep the reference so
+            # the outer catch can retry and report rather than stranding the backup.
             if ($item.Backup -and (Test-Path -LiteralPath $item.Backup)) {
                 if (Test-Path -LiteralPath $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
                 }
-                Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction SilentlyContinue
-                $item.Backup = $null
+                try {
+                    Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction Stop
+                    $item.Backup = $null
+                }
+                catch {
+                    Write-Warning "Immediate restore of $($item.Destination) from backup failed: $($_.Exception.Message)"
+                }
             }
             throw
         }
         $item.Committed = $true
         $item.Stage = $null
-        Write-Output ([pscustomobject]@{
+        $pendingResults += [pscustomobject]@{
             status = 'installed'
             target = $item.Destination
             backup = $backup
-        } | ConvertTo-Json -Compress)
+        }
+    }
+    foreach ($record in $pendingResults) {
+        Write-Output ($record | ConvertTo-Json -Compress)
     }
 }
 catch {

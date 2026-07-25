@@ -1,6 +1,7 @@
 const { constants } = require('node:fs');
-const { lstat, mkdir, open } = require('node:fs/promises');
+const { mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
+const { assertNotSymlink: assertNotSymlinkShared, openNoFollow } = require('./pr_closeout_fs');
 
 const safeText = (value) => String(value ?? '')
   .replace(/\r\n?|\n/g, ' ⏎ ')
@@ -255,23 +256,12 @@ const renderMarkdown = (report) => {
   return lines.join('\n');
 };
 
-// Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
-// (the path is about to be created). This is the primary guard on platforms
-// without O_NOFOLLOW (Node's fs.constants.O_NOFOLLOW is undefined on
-// Windows, so the open-time defense in writeNoFollow below is a silent
-// no-op there) and defense-in-depth everywhere else. Mirrors
-// debug_server.js's assertNotSymlink.
+// Domain wrapper: shared assertNotSymlink with report-specific message.
 const assertNotSymlink = async (target) => {
-  let info;
-  try {
-    info = await lstat(target);
-  } catch (error) {
-    if (error.code === 'ENOENT') return;
-    throw error;
-  }
-  if (info.isSymbolicLink()) {
-    throw new Error(`Refusing to write evidence report through an existing symlink: ${target}`);
-  }
+  await assertNotSymlinkShared(
+    target,
+    `Refusing to write evidence report through an existing symlink: ${target}`,
+  );
 };
 
 // Write without following a symlinked final component. writeFile follows a
@@ -280,23 +270,19 @@ const assertNotSymlink = async (target) => {
 // path-based write would silently overwrite whatever the link points to
 // instead of writing evidence there — and by this point the repository seal
 // has already run, so it cannot catch the divergence. Fail closed instead.
-// The lstat check above is what actually enforces this on platforms without
-// O_NOFOLLOW (e.g. Windows); the O_NOFOLLOW open flag below is
-// defense-in-depth against the TOCTOU gap between that lstat and this open
-// on platforms that do support it, matching the read-side openNoFollow
-// helpers elsewhere in this codebase (e.g. pr_closeout_repo.js).
+// assertNotSymlink is the primary guard on platforms without O_NOFOLLOW
+// (e.g. Windows); openNoFollow adds defense-in-depth on platforms that
+// support it. Shared implementation lives in pr_closeout_fs.js.
 const writeNoFollow = async (target, contents) => {
   await assertNotSymlink(target);
-  const noFollow = constants.O_NOFOLLOW || 0;
   let handle;
   try {
-    handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow, 0o666);
+    handle = await openNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o666);
   } catch (error) {
     if (error?.code === 'ELOOP') {
       throw new Error(`Refusing to write evidence report through an existing symlink: ${target}`);
     }
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o666);
+    throw error;
   }
   try {
     await handle.writeFile(contents, 'utf8');
@@ -308,9 +294,10 @@ const writeNoFollow = async (target, contents) => {
 /**
  * Persist the evidence report as `report.json` (normalized, machine-
  * readable) and `report.md` (rendered Markdown) under `outputDir`, creating
- * the directory if needed. Both files are opened no-follow (see
- * writeNoFollow) so a pre-existing symlink at either path is rejected
- * instead of silently redirecting the write outside `outputDir`.
+ * the directory if needed. Both final paths are validated up front, then
+ * content is staged to sibling temp files and renamed into place so a
+ * failure mid-commit cannot leave a final JSON claiming PASS beside an
+ * older provisional Markdown (or vice versa).
  * @param {{outputDir: string, report: object}} options
  * @returns {Promise<{json: string, markdown: string}>} the absolute paths written.
  */
@@ -318,21 +305,38 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
   await mkdir(outputDir, { recursive: true });
   const json = path.join(outputDir, 'report.json');
   const markdown = path.join(outputDir, 'report.md');
-  // Validate both target paths before writing either. writeNoFollow already
-  // rejects a symlink at its own target, but checking json then markdown
-  // lazily (i.e. only right before each write) means a symlink at
-  // report.md is discovered only after report.json has already been
-  // written — leaving an inconsistent partial evidence pair (a real
-  // report.json next to an untouched, attacker-controlled report.md
-  // symlink) instead of failing before any bytes are written.
+  // Validate both final targets before writing either temp or final path.
   await assertNotSymlink(json);
   await assertNotSymlink(markdown);
   const normalized = normalizeReportPaths(report, {
     repoRoot: report.repository,
     outputRoot: outputDir,
   });
-  await writeNoFollow(json, `${JSON.stringify(normalized, null, 2)}\n`);
-  await writeNoFollow(markdown, `${renderMarkdown(normalized)}\n`);
+  const stamp = `${process.pid}.${Date.now()}`;
+  const jsonTmp = path.join(outputDir, `.report.json.${stamp}.tmp`);
+  const markdownTmp = path.join(outputDir, `.report.md.${stamp}.tmp`);
+  const cleanupTemps = async () => {
+    await Promise.all([
+      unlink(jsonTmp).catch(() => {}),
+      unlink(markdownTmp).catch(() => {}),
+    ]);
+  };
+  try {
+    await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
+    await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
+    // Commit as a pair: if the second rename fails, remove the first final so
+    // consumers never observe contradictory report.json vs report.md.
+    await rename(jsonTmp, json);
+    try {
+      await rename(markdownTmp, markdown);
+    } catch (error) {
+      await unlink(json).catch(() => {});
+      throw error;
+    }
+  } catch (error) {
+    await cleanupTemps();
+    throw error;
+  }
   return { json, markdown };
 };
 

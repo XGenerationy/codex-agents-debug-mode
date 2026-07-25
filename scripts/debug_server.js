@@ -5,6 +5,7 @@ const { constants } = require('node:fs');
 const { lstat, mkdir, open, realpath } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
+const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
 
 const DEFAULT_PORT = 8787;
 const COLLECTOR_SERVICE = 'codex-debug-collector';
@@ -201,15 +202,10 @@ const isAllowedHost = (request) => {
 
 // Reject a path that is a symlink (fail-closed), tolerating ENOENT (the path
 // is about to be created). Used for both the .debug directory and the
-// collector_token file so the guard has one owner.
+// collector_token file so the guard has one owner. Implementation shared with
+// PR closeout evidence writers via pr_closeout_fs.js.
 const assertNotSymlink = async (target, label) => {
-  try {
-    const info = await lstat(target);
-    if (info.isSymbolicLink()) throw new Error(label);
-  } catch (error) {
-    if (error.message === label) throw error;
-    if (error.code !== 'ENOENT') throw error;
-  }
+  await assertNotSymlinkShared(target, label);
 };
 
 // Reject a pre-existing path that is not a private regular file: a hard link
@@ -231,19 +227,11 @@ const assertPrivateRegularFile = async (target, label) => {
 // appendFile follow symlinks, while O_NOFOLLOW rejects one with ELOOP at open
 // time. O_NONBLOCK keeps a FIFO at the path from parking a libuv worker (the
 // open then fails with ENXIO when no reader is attached); it has no effect on
-// regular files. On platforms without O_NOFOLLOW the flag is undefined and the
-// call reduces to a plain open; filesystems that reject O_NOFOLLOW get a
-// fallback open that still keeps O_NONBLOCK, paired with the lstat-based
-// guards callers run first.
+// regular files. Shared openNoFollow lives in pr_closeout_fs.js; this wrapper
+// always adds O_NONBLOCK for the collector's FIFO safety invariant.
 const openNoFollow = async (target, flags, mode) => {
-  const noFollow = constants.O_NOFOLLOW || 0;
   const nonBlock = constants.O_NONBLOCK || 0;
-  try {
-    return await open(target, flags | noFollow | nonBlock, mode);
-  } catch (error) {
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    return await open(target, flags | nonBlock, mode);
-  }
+  return openNoFollowShared(target, flags | nonBlock, mode);
 };
 
 // True iff an already-realpath'd candidate still resolves strictly inside an
