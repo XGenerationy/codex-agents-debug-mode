@@ -39,10 +39,37 @@ $targets = @(switch ($Target) {
     }
 })
 
+# Reject a symlink/junction/mount-point payload entry, or any nested entry
+# that is one: Test-Path alone follows a reparse point and would pass, then
+# Copy-Item -Recurse would stage the link (or its target) into the installed
+# skill, letting a reviewed payload point outside the tree. Walk one
+# directory level at a time with Get-ChildItem (no -Recurse) instead of
+# recursing wholesale, because -Recurse itself follows a reparse point while
+# traversing; checking each child's own Attributes before deciding whether to
+# descend means a nested reparse point is rejected before it is ever
+# followed.
+function Assert-PayloadEntrySafe {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force
+    $isReparsePoint = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    $isFile = $item -is [System.IO.FileInfo]
+    $isDirectory = $item -is [System.IO.DirectoryInfo]
+    if ($isReparsePoint -or (-not $isFile -and -not $isDirectory)) {
+        throw "Skill payload entry must be a regular file/directory, not a symlink, junction, or special file: $Label"
+    }
+    if ($isDirectory) {
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force) {
+            Assert-PayloadEntrySafe -Path $child.FullName -Label "$Label/$($child.Name)"
+        }
+    }
+}
+
 foreach ($entry in $payload) {
-    if (-not (Test-Path -LiteralPath (Join-Path $source $entry))) {
+    $entryPath = Join-Path $source $entry
+    if (-not (Test-Path -LiteralPath $entryPath)) {
         throw "Missing skill payload entry: $entry"
     }
+    Assert-PayloadEntrySafe -Path $entryPath -Label $entry
 }
 
 # Preflight all destinations before mutating any of them so multi-target

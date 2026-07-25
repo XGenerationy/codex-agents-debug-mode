@@ -5,11 +5,30 @@ const SENSITIVE_ENV_NAME = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|
 // npm_config__auth) which does not match the TOKEN/AUTH_TOKEN suffix patterns.
 const SENSITIVE_NPM_AUTH = /(?:^|_)_?AUTH$/i;
 
+/**
+ * True if an env var NAME (not its value) looks credential-bearing: the
+ * broad ACCESS_KEY/API_KEY/TOKEN/PASSWORD/... suffix pattern, or the bare
+ * npm basic-auth `_auth`/`_AUTH` key that config files like
+ * `NPM_CONFIG__AUTH` use and which the suffix pattern alone would miss.
+ * Drives both `buildChildEnvironment` (what to strip) and
+ * `buildSecretReplacements` (what values to redact).
+ * @param {string} name
+ * @returns {boolean}
+ */
 const isSensitiveEnvName = (name) => {
   const key = String(name);
   return SENSITIVE_ENV_NAME.test(key) || SENSITIVE_NPM_AUTH.test(key);
 };
 
+/**
+ * Filters `env` down to a child-process-safe environment: any name that
+ * `isSensitiveEnvName` flags is dropped unless it appears (case-insensitively)
+ * in `allowedSensitiveNames` — the opt-in list of secrets the workflow
+ * actually needs to pass through (e.g. required tool credentials).
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string[]} allowedSensitiveNames
+ * @returns {NodeJS.ProcessEnv}
+ */
 const buildChildEnvironment = (env = process.env, allowedSensitiveNames = []) => {
   const allowed = new Set(allowedSensitiveNames.map((name) => String(name).toUpperCase()));
   return Object.fromEntries(Object.entries(env).filter(([name]) => (
@@ -17,6 +36,17 @@ const buildChildEnvironment = (env = process.env, allowedSensitiveNames = []) =>
   )));
 };
 
+/**
+ * Expands one raw secret value into every encoded form it could plausibly
+ * appear as in captured stdout/stderr: URL-encoded (upper/lower hex, `+` for
+ * spaces, double-encoded), JSON-string-escaped, `\uXXXX` unicode-escaped
+ * (with surrogate pairs for astral code points), base64/base64url (padded
+ * and unpadded), and hex. A tool that re-encodes a secret before printing it
+ * (e.g. a URL-encoded token in a logged curl command) would otherwise slip
+ * past a literal-match redactor.
+ * @param {unknown} value
+ * @returns {string[]} variant strings, still needing dedupe/length filtering by the caller.
+ */
 const secretVariants = (value) => {
   const raw = String(value);
   const encoded = encodeURIComponent(raw);
@@ -46,6 +76,20 @@ const secretVariants = (value) => {
   ];
 };
 
+/**
+ * Extracts every credential-bearing sub-string embedded in one secret VALUE,
+ * not just the value itself: a URL's username/password and any
+ * credential-named query params (?token=...&api_key=...); or — for a
+ * non-URL value — key=value pairs from a semicolon/whitespace-delimited
+ * connection string (password=/token=/user=/...); or leaf string values
+ * under credential-named keys anywhere inside a JSON auth blob (e.g.
+ * `AUTH_CONFIG={"auth":{"token":"..."}}`). Needed because a tool can print
+ * just one fragment of a compound secret (the URL's password, a JSON leaf)
+ * without ever printing the whole original string, so redacting only the
+ * full value would miss it.
+ * @param {unknown} value
+ * @returns {string[]} the original stringified value plus every extracted component, deduplicated.
+ */
 const secretComponents = (value) => {
   const components = [String(value)];
   // Include bare Docker registry key `auth` (DOCKER_AUTH_CONFIG leaf) as well as
@@ -105,6 +149,20 @@ const secretComponents = (value) => {
 // always redacted regardless of length, because the user opted in.
 const MIN_AUTO_SECRET_LENGTH = 8;
 
+/**
+ * Builds the full [needle, '[REDACTED]'] replacement list for the streaming
+ * redactor: every value/variant/component of an explicitly-named secret
+ * (`names`, matched case-insensitively) is included regardless of length,
+ * since the caller opted in; auto-discovered sensitive env vars (matched by
+ * `isSensitiveEnvName`) are included only where the value — and each
+ * expanded variant — is at least `MIN_AUTO_SECRET_LENGTH`, so a short
+ * incidental value like "ok" or "true" doesn't get redacted throughout
+ * ordinary captured output. Results are deduplicated and sorted longest-first
+ * so a shorter needle can never shadow a longer overlapping one.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string[]} names explicit env-var names to always treat as secrets.
+ * @returns {[string, string][]} needle/replacement pairs, longest needle first.
+ */
 const buildSecretReplacements = (env = process.env, names = []) => {
   // Match explicit names case-insensitively against actual env keys, mirroring
   // buildChildEnvironment (which uppercases the allowlist): a config listing
@@ -143,6 +201,16 @@ const buildSecretReplacements = (env = process.env, names = []) => {
     .map((value) => [value, '[REDACTED]']);
 };
 
+/**
+ * Case-insensitive `replaceAll(needle, replacement)`: matches are located by
+ * lowercasing both strings, but the surrounding text is sliced from the
+ * original (unfolded) `value`, so casing outside the matched spans is left
+ * exactly as it was. Returns `value` unchanged when there is no match.
+ * @param {string} value
+ * @param {string} needle
+ * @param {string} replacement
+ * @returns {string}
+ */
 const replaceCaseInsensitive = (value, needle, replacement) => {
   const foldedValue = value.toLowerCase();
   const foldedNeedle = needle.toLowerCase();
@@ -158,6 +226,23 @@ const replaceCaseInsensitive = (value, needle, replacement) => {
   return output + value.slice(cursor);
 };
 
+/**
+ * Turns a one-shot find/replace list into an incremental streaming replacer
+ * safe for arbitrary chunk boundaries: a secret split across two `push()`
+ * calls is still redacted, because each call only emits the prefix of its
+ * buffer that cannot possibly be the start of a still-incoming needle. It
+ * holds back at least `maxLength - 1` characters (the longest needle) on
+ * every call, and — if a needle already fully present in the buffer happens
+ * to straddle that cutoff — walks the cutoff back further to the start of
+ * that match, so the whole needle stays buffered together rather than being
+ * torn across two emitted outputs. Needles are applied longest-first so a
+ * shorter needle can never re-match inside text a longer needle already
+ * turned into `[REDACTED]`. `flush()` must be called once the source is
+ * exhausted to emit whatever remains buffered.
+ * @param {[string, string][]} replacements needle/replacement pairs.
+ * @param {{caseInsensitive?: boolean}} [options]
+ * @returns {{push: (chunk: unknown) => string, flush: () => string}}
+ */
 const createStreamingReplacer = (replacements = [], { caseInsensitive = false } = {}) => {
   const entries = replacements
     .filter(([needle]) => typeof needle === 'string' && needle.length)
@@ -199,10 +284,29 @@ const createStreamingReplacer = (replacements = [], { caseInsensitive = false } 
   };
 };
 
+/**
+ * Convenience wrapper: builds the secret replacement list from `env`/`names`
+ * via `buildSecretReplacements` and feeds it straight into
+ * `createStreamingReplacer` (case-sensitive matching).
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string[]} names explicit secret env-var names, forwarded to `buildSecretReplacements`.
+ * @returns {{push: (chunk: unknown) => string, flush: () => string}}
+ */
 const createStreamingRedactor = (env = process.env, names = []) => createStreamingReplacer(
   buildSecretReplacements(env, names),
 );
 
+/**
+ * Layers UTF-8 decoding in front of `createStreamingRedactor` for raw process
+ * output: `StringDecoder` buffers any multi-byte character split across two
+ * `Buffer` chunks internally and only hands the redactor complete characters,
+ * so the redactor's own needle-boundary buffering never sees a chopped code
+ * point. Non-Buffer chunks are coerced to a string as-is. `flush()` drains
+ * both the decoder's trailing bytes and the redactor's held-back tail.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string[]} names explicit secret env-var names, forwarded to `createStreamingRedactor`.
+ * @returns {{push: (chunk: Buffer|string) => string, flush: () => string}}
+ */
 const createDecodedRedactor = (env = process.env, names = []) => {
   const decoder = new StringDecoder('utf8');
   const redactor = createStreamingRedactor(env, names);
@@ -217,6 +321,20 @@ const createDecodedRedactor = (env = process.env, names = []) => {
   };
 };
 
+/**
+ * Streaming line-buffered scanner: `findSignals` only ever sees complete
+ * lines (a partial trailing line is buffered until its newline arrives), and
+ * matches are deduplicated by `summarizeSignal(signal)` and capped at 20
+ * recorded entries. If a stream produces an unbounded line (or never emits a
+ * newline at all), `pending` is force-drained once it exceeds `maxPending`,
+ * scanning in `maxPending`-sized windows that retain `overlap` characters
+ * between windows so a pattern near the cut point is still likely to appear
+ * whole in one of the two overlapping scans — this is a memory/DoS bound,
+ * not a correctness guarantee for a signal wider than `overlap`.
+ * @param {(text: string) => Iterable<unknown>} findSignals called with each complete line (or forced window) to find raw signal matches.
+ * @param {{maxPending?: number, overlap?: number, summarizeSignal?: (signal: unknown) => string}} [options]
+ * @returns {{push: (chunk: unknown) => void, flush: () => void, values: () => string[]}}
+ */
 const createStreamingSignalScanner = (
   findSignals,
   {

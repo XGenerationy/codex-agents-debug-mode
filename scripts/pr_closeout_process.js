@@ -9,16 +9,38 @@ const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
 const { promisify } = require('node:util');
 
-// Injected into every validation spawn so descendants that leave the process
-// group (setsid / detached:true) can still be found via /proc/*/environ and
-// reaped. Name avoids isSensitiveEnvName TOKEN/SECRET patterns.
+/**
+ * Env var name injected into every validation spawn so descendants that
+ * leave the process group (setsid / detached:true) can still be found via
+ * /proc/<pid>/environ and reaped. The name itself avoids the
+ * isSensitiveEnvName TOKEN/SECRET patterns, so it is never stripped from the
+ * child environment or redacted out of captured evidence.
+ */
 const SPAWN_MARK_ENV = 'OMO_CLOSEOUT_SPAWN_MARK';
 
 const { classifyOutput, findStatusSignals } = require('./pr_closeout_core');
 const {
   buildChildEnvironment,
   buildSecretReplacements,
+  /**
+   * Wraps createStreamingRedactor with a StringDecoder so raw Buffer chunks
+   * are UTF-8-decoded before redaction — a multi-byte character split across
+   * two chunk boundaries is completed first, instead of being corrupted or
+   * letting a secret that straddles the split slip through. Defined in
+   * ./pr_closeout_stream; re-exported here as part of this module's public
+   * surface.
+   * @returns {{push(chunk: Buffer|string): string, flush(): string}}
+   */
   createDecodedRedactor,
+  /**
+   * Streaming secret redactor (push/flush) preloaded with the replacement
+   * list from buildSecretReplacements(env, names). Withholds up to
+   * (longest-replacement-length - 1) trailing characters on each push so a
+   * secret split across two chunks is still caught whole, emitting the
+   * withheld remainder on flush(). Defined in ./pr_closeout_stream;
+   * re-exported here as part of this module's public surface.
+   * @returns {{push(chunk: string): string, flush(): string}}
+   */
   createStreamingRedactor,
   createStreamingReplacer,
   createStreamingSignalScanner,
@@ -28,6 +50,15 @@ const CAPTURE_LIMIT = 2_000_000;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const execFileAsync = promisify(execFile);
 
+/**
+ * Picks the shell binary used to run every check and proof command. Honors
+ * an explicit override (`OMO_CODEX_SHELL_PATH` / `OMO_CODEX_GIT_BASH_PATH`)
+ * on either platform; otherwise falls back to the bare name `bash` on POSIX
+ * — resolved through PATH by child_process.spawn, not hard-coded to
+ * /bin/bash, so minimal/container images that only have bash on PATH still
+ * work — or the default Git Bash install path on Windows.
+ * @returns {string} A shell path or bare command name suitable for spawn().
+ */
 const resolveCommandShell = ({ platform = process.platform, env = process.env } = {}) => {
   if (platform !== 'win32') {
     // Allow an explicit override for *nix too, mirroring the Windows override
@@ -41,6 +72,17 @@ const resolveCommandShell = ({ platform = process.platform, env = process.env } 
   return env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe';
 };
 
+/**
+ * Confirms the shell resolved by resolveCommandShell is actually runnable
+ * before any check spawns it. fs.access on a bare command name (no path
+ * separator) only checks the process cwd, not PATH — but
+ * child_process.spawn resolves bare names through PATH — so a naive
+ * access(shell) check would report the default `bash` as BLOCKED on a
+ * normal Linux runner even though spawn would succeed. Manually walks PATH
+ * (and PATHEXT on Windows) for bare names; an explicit path is checked
+ * directly with fs.access.
+ * @throws {Error} When the shell cannot be found/executed anywhere searched.
+ */
 const probeCommandShell = async (shell, env = process.env) => {
   // A bare command name (no path separator) is resolved through PATH by
   // child_process.spawn, but fs.access checks only the process cwd. On normal
@@ -72,9 +114,14 @@ const probeCommandShell = async (shell, env = process.env) => {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-// Resolve per-check timeout budgets for primary and proof spawns. Baseline
-// comparison ids (`${checkId}-baseline-comparison`) inherit the parent check's
-// configured timeout so base reruns get the same budget as the head run.
+/**
+ * Resolves the timeout budget (ms) for a check's primary or proof spawn.
+ * Looks up `check.id` first, then `check.associatedCheckId`, then — for a
+ * synthesized `${checkId}-baseline-comparison` id — strips that suffix and
+ * looks up the parent check, so a baseline rerun inherits the same budget as
+ * the head run instead of falling through to the generic default.
+ * @returns {number} The timeout in milliseconds for this check.
+ */
 const resolveCheckTimeout = (check, timeoutsMs = {}, timeoutMs) => {
   if (timeoutsMs[check?.id] != null) return timeoutsMs[check.id];
   if (check?.associatedCheckId && timeoutsMs[check.associatedCheckId] != null) {
@@ -87,10 +134,14 @@ const resolveCheckTimeout = (check, timeoutsMs = {}, timeoutMs) => {
   return timeoutMs;
 };
 
-// Live non-zombie PIDs whose environ contains SPAWN_MARK_ENV=mark. Returns
-// null when /proc is unavailable (non-Linux). Used to re-find descendants that
-// left the original process group via setsid/detached:true after the group
-// itself looks empty.
+/**
+ * Finds live (non-zombie) PIDs whose /proc/<pid>/environ contains
+ * `SPAWN_MARK_ENV=mark`. Used to re-find descendants that escaped the
+ * original process group (setsid / detached:true) after that group already
+ * looks empty — a plain kill(-pgid) cannot reach them.
+ * @returns {number[]|null} Matching PIDs, or null when /proc is unavailable
+ *   (non-Linux), which callers must treat as "unknown", not "none".
+ */
 const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   if (!mark) return [];
   const target = `${SPAWN_MARK_ENV}=${mark}`;
@@ -121,10 +172,18 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   return live;
 };
 
-// Secondary containment for mark-stripped setsid orphans: live non-zombie
-// processes whose cwd is under the sealed worktree, started at/after the
-// spawn, AND that left our session (setsid/detached). Filtering on session
-// avoids killing parallel test workers that share process.cwd() as the repo.
+/**
+ * Secondary containment for setsid orphans that stripped the spawn mark
+ * (e.g. `env -u <mark> setsid sh -c '...'`): finds live, non-zombie
+ * processes that started at/after `minStarttime`, left the runner's session
+ * (a same-session peer is a parallel test worker sharing process.cwd() as
+ * the repo and must never be reaped), and either have a cwd under
+ * `rootCwd` or — for an orphan that already chdir'd away — hold an open
+ * file descriptor that resolves under `rootCwd`, a common precursor to a
+ * late absolute-path write.
+ * @returns {number[]|null} Matching PIDs, or null when /proc is unavailable
+ *   (non-Linux).
+ */
 const listLivePidsWithCwdUnder = (rootCwd, {
   selfPid = process.pid,
   minStarttime = 0,
@@ -240,6 +299,16 @@ const listLivePidsWithCwdUnder = (rootCwd, {
   return live;
 };
 
+/**
+ * Reaps descendants that survived terminateProcessTree's process-group kill
+ * by escaping via setsid/detached:true. Merges the spawn-mark and
+ * worktree-cwd PID lists, sends SIGTERM, gives the group a short soft wait
+ * (`min(terminationGraceMs, 500)`) to exit, then escalates to SIGKILL and
+ * waits up to the full `terminationGraceMs`. Returns BLOCKED only if PIDs
+ * are still alive after both signals; returns PASS (with `escalated: true`)
+ * as soon as the list is empty, even when SIGKILL was required.
+ * @returns {{status: 'PASS'|'BLOCKED', evidence: string, escalated: boolean}}
+ */
 const sweepDetachedOrphans = async ({
   mark,
   cwd,
@@ -316,6 +385,25 @@ const sweepDetachedOrphans = async ({
   };
 };
 
+/**
+ * Proves the entire process tree a spawned command created is gone, not
+ * just its root PID — a command can exit 0 while a detached descendant
+ * keeps running and mutates evidence after the "clean" result is already
+ * recorded. On Windows, shells out to `taskkill /PID <pid> /T /F`;
+ * taskkill.exe is resolved from SystemRoot only when that env value is an
+ * absolute drive-letter path (never trust an injected value as an
+ * executable path), and `/T` is attempted even when the root PID has
+ * already exited, since children can outlive it. On POSIX, signals the
+ * process group (`kill(-pgid, ...)`), escalating SIGTERM to SIGKILL across
+ * `terminationGraceMs`; because `kill(-pgid, 0)` reports a group as alive
+ * even when every member is an unreaped zombie (common in containers with a
+ * slow PID 1), it prefers enumerating /proc/<pid>/stat for live non-zombie
+ * members when /proc is available. Once the group is confirmed gone, hands
+ * off to sweepDetachedOrphans to catch descendants that escaped the group
+ * via setsid/detached:true. Never throws — unrecoverable errors become a
+ * BLOCKED result.
+ * @returns {{status: 'PASS'|'BLOCKED', evidence: string, escalated: boolean}}
+ */
 const terminateProcessTree = async ({
   child,
   platform = process.platform,
@@ -550,11 +638,14 @@ const terminateProcessTree = async ({
   }
 };
 
-// Variant of redactSecrets that takes a precomputed replacement list so hot
-// callers (safeStatusSignal, redactStructure during a single executor run)
-// do not rebuild the URL/base64/hex variants on every call. Use
-// buildSecretReplacements(env, names) once per executor and pass the result
-// here for each call.
+/**
+ * Variant of redactSecrets that takes a precomputed replacement list
+ * instead of rebuilding one. Hot callers (safeStatusSignal, redactStructure
+ * during a single executor run) call buildSecretReplacements(env, names)
+ * once and reuse the result here on every call, instead of paying the
+ * URL/base64/hex variant-generation cost per chunk.
+ * @param {Array<[string, string]>} replacements [value, replacement] pairs.
+ */
 const redactSecretsReplacements = (text, replacements) => {
   let redacted = String(text ?? '');
   for (const [value, replacement] of replacements) {
@@ -563,14 +654,37 @@ const redactSecretsReplacements = (text, replacements) => {
   return redacted;
 };
 
+/**
+ * Redacts every configured/auto-discovered secret value — and its
+ * URL/base64/hex-encoded variants — out of `text`. Rebuilds the replacement
+ * list from `env`/`names` on every call via buildSecretReplacements; fine
+ * for one-off calls, but code redacting many chunks against the same
+ * env/names should precompute the list once and call
+ * redactSecretsReplacements directly instead.
+ * @returns {string} `text` with every matched secret variant replaced by
+ *   `[REDACTED]`.
+ */
 const redactSecrets = (text, env = process.env, names = []) => (
   redactSecretsReplacements(text, buildSecretReplacements(env, names))
 );
 
-// Walk with a clone cache so legitimate shared references (e.g. report.toolVersions
-// and report.preflight.toolVersions pointing at the same object) are redacted once
-// and reused, while true cycles still terminate. A traversal-wide WeakSet that
-// returned "[Circular]" for every repeated ref corrupted shared evidence fields.
+/**
+ * Recursively redacts secrets from every string reachable inside a value
+ * (objects, arrays, Errors, Maps, Sets, Buffers, and object keys). Uses a
+ * per-branch `stack` to detect true cycles and a traversal-wide `clones` map
+ * to detect shared references: a re-visit while still on the current branch
+ * is a cycle and becomes `'[Circular]'`, but a re-visit of an object that
+ * already finished (e.g. report.toolVersions and
+ * report.preflight.toolVersions pointing at the same object) reuses its
+ * already-redacted clone instead of re-walking it or corrupting it with
+ * `'[Circular]'`. A non-plain-object instance (other than Error/Map/Set) is
+ * returned unredacted rather than risking corruption of an opaque
+ * structure.
+ * @param {WeakMap} clones Internal recursion accumulator; callers should not
+ *   pass this.
+ * @param {WeakSet} stack Internal recursion accumulator; callers should not
+ *   pass this.
+ */
 const redactStructure = (value, env = process.env, names = [], clones = new WeakMap(), stack = new WeakSet()) => {
   if (typeof value === 'string') return redactSecrets(value, env, names);
   if (Buffer.isBuffer(value)) return redactSecrets(value.toString('utf8'), env, names);
@@ -626,11 +740,25 @@ const redactStructure = (value, env = process.env, names = [], clones = new Weak
   }
 };
 
+/**
+ * Appends `chunk` to `current` and truncates to CAPTURE_LIMIT. Once
+ * `current` is already at the cap, returns it unchanged instead of
+ * concatenating first and slicing after, so a long-running, chatty command
+ * cannot force a repeated multi-megabyte string rebuild on every further
+ * chunk.
+ */
 const cappedAppend = (current, chunk) => {
   if (current.length >= CAPTURE_LIMIT) return current;
   return `${current}${chunk}`.slice(0, CAPTURE_LIMIT);
 };
 
+/**
+ * Returns `value` plus its forward-slash and back-slash variants, deduped.
+ * Captured command output can mix separator styles regardless of host
+ * platform (e.g. a tool printing forward-slash paths on Windows), so
+ * callers building replacement lists from this need every variant to match.
+ * @returns {string[]} Empty array for a non-string or blank input.
+ */
 const pathVariants = (value) => {
   if (typeof value !== 'string' || !value.trim()) return [];
   return [...new Set([
@@ -640,6 +768,14 @@ const pathVariants = (value) => {
   ])];
 };
 
+/**
+ * Builds the ordered [needle, placeholder] pairs used to normalize `cwd`,
+ * `outputDir`, and the caller's home directory (HOME / USERPROFILE /
+ * HOMEDRIVE+HOMEPATH) out of captured evidence, replacing each with
+ * `<repo>`, `<output>`, or `<home>` respectively. Each path is expanded to
+ * its pathVariants() so either separator style is caught.
+ * @returns {Array<[string, string]>}
+ */
 const buildPathReplacements = ({ cwd, outputDir, env = process.env } = {}) => {
   const entries = [
     ...pathVariants(cwd).map((value) => [value, '<repo>']),
@@ -653,11 +789,27 @@ const buildPathReplacements = ({ cwd, outputDir, env = process.env } = {}) => {
   return entries;
 };
 
+/**
+ * Applies a one-shot pass (push then immediately flush) of `replacements`
+ * over `text` via the streaming replacer, collapsing cwd/output/home paths
+ * to their placeholders. Matches case-insensitively on Windows, where paths
+ * are case-insensitive but the casing captured in command output is not
+ * guaranteed to match `replacements` exactly.
+ */
 const normalizePaths = (text, replacements, platform = process.platform) => {
   const replacer = createStreamingReplacer(replacements, { caseInsensitive: platform === 'win32' });
   return replacer.push(String(text ?? '')) + replacer.flush();
 };
 
+/**
+ * Recursively applies `transform` to every string in an arbitrary value
+ * (used to path-normalize a structure already redacted by redactStructure).
+ * Unlike redactStructure, `seen` is never pruned once an object has been
+ * visited, so this only distinguishes a first visit from every later one —
+ * a true cycle and a non-cyclic shared reference (the same object reachable
+ * from two branches) both collapse to the literal string `'[Circular]'` on
+ * the second visit.
+ */
 const mapStructureStrings = (value, transform, seen = new WeakSet()) => {
   if (typeof value === 'string') return transform(value);
   if (!value || typeof value !== 'object') return value;
@@ -671,6 +823,13 @@ const mapStructureStrings = (value, transform, seen = new WeakSet()) => {
   ]));
 };
 
+/**
+ * Categorizes a raw detected status signal into a fixed label by matching an
+ * ordered list of keyword patterns — first match wins, in the order
+ * BLOCKED, WARNING, PROBLEM, SKIPPED, TODO, FAIL — defaulting to ERROR when
+ * none match.
+ * @returns {string} `"<CATEGORY>: raw output contained a status signal."`
+ */
 const summarizeStatusSignal = (signal) => {
   const value = String(signal);
   if (/\bblocks?|blocked\b/i.test(value)) return 'BLOCKED: raw output contained a status signal.';
@@ -682,6 +841,15 @@ const summarizeStatusSignal = (signal) => {
   return 'ERROR: raw output contained a status signal.';
 };
 
+/**
+ * Turns a raw detected signal into a report-safe summary without ever
+ * exposing the raw text. Classification runs on the raw `signal` first (so
+ * an accurate category survives even when the triggering text is itself a
+ * secret); a separately redacted, path-normalized, whitespace-collapsed
+ * copy — capped at 500 characters — is what actually gets embedded in the
+ * returned string, and the raw signal itself is never returned.
+ * @returns {string} `"<CATEGORY>: <redacted, truncated evidence>"`
+ */
 const safeStatusSignal = ({
   signal,
   secretReplacements,
@@ -697,6 +865,28 @@ const safeStatusSignal = ({
   return `${category}: ${safe || 'redacted status signal'}`;
 };
 
+/**
+ * Spawns one command and captures its full lifecycle as report-safe
+ * evidence. Every stdout/stderr chunk is decoded, redacted, and
+ * path-normalized before it is ever appended to `stdout`/`stderr`, written
+ * to `logPath`, or hashed — raw unredacted bytes are never persisted or
+ * returned. The child is spawned detached (POSIX) under a unique per-call
+ * `spawnMark` env var so terminateProcessTree/sweepDetachedOrphans can later
+ * re-find descendants that escape the process group. Races the child's
+ * `close` against `timeoutMs`; either path always calls `terminateTree`
+ * before trusting the outcome, because a command can exit 0 while a
+ * detached descendant keeps mutating the worktree. On timeout, if the root
+ * still has not closed after `terminateTree` plus one grace period, sends a
+ * direct SIGKILL to the child handle and, failing that too, tears down the
+ * stdout/stderr listeners instead of waiting forever. Log-stream
+ * backpressure pauses the offending source and resumes it on `'drain'`; a
+ * log write error is captured in the result (`logWriteError`) instead of
+ * silently losing evidence or stalling the child on a full pipe.
+ * @returns {object} Includes `terminationStatus`/`terminationEvidence`/
+ *   `escalated` from `terminateTree`, `outputDigest` (sha256 of the full
+ *   normalized stdout/stderr, independent of the CAPTURE_LIMIT-capped
+ *   strings), and `detectedSignals` found by the raw, pre-redaction scanner.
+ */
 const spawnCaptured = async ({
   command,
   cwd,
@@ -947,12 +1137,29 @@ const spawnCaptured = async ({
   return result;
 };
 
+/**
+ * Checks whether `target` resolves inside `root` using path.relative (no
+ * leading `..` segment, not itself `..`, not absolute). Returns false when
+ * `target` equals `root` — `path.relative(root, root)` is `''`, which is
+ * falsy — so a caller that needs to treat an exact match as contained must
+ * check that separately.
+ */
 const isContainedPath = (root, target) => {
   const relative = path.relative(root, target);
   return Boolean(relative) && relative !== '..'
     && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
 
+/**
+ * Opens `artifact` read-only for TOCTOU-safe proof verification: O_NOFOLLOW
+ * rejects a symlink swapped in after the caller's lstat, and O_NONBLOCK
+ * (where the platform defines it) stops an open on a FIFO from hanging the
+ * proof instead of failing it cleanly. Falls back to a plain open only when
+ * the initial open fails because the platform itself rejects those flags
+ * (EINVAL/ENOTSUP/EOPNOTSUPP), never because the target turned out to be a
+ * symlink. Closes and throws if the opened handle is not a regular file.
+ * @returns {import('node:fs/promises').FileHandle}
+ */
 const openArtifact = async (artifact) => {
   const noFollow = constants.O_NOFOLLOW || 0;
   // A proof command can leave a background process that swaps the verified
@@ -979,6 +1186,15 @@ const openArtifact = async (artifact) => {
   return handle;
 };
 
+/**
+ * Hashes `artifact` (sha256, streamed in 64 KiB chunks) via an already-open,
+ * symlink/FIFO-safe handle from openArtifact. Stats the file before and
+ * after the read and reports `stable: false` if dev/ino/size/mtimeMs/ctimeMs
+ * changed in between, so a caller can detect a proof artifact that was
+ * mutated concurrently with verification instead of trusting a digest that
+ * may not describe the file's final contents.
+ * @returns {{digest: string, before: object, after: object, stable: boolean}}
+ */
 const hashArtifactDefault = async (artifact) => {
   const handle = await openArtifact(artifact);
   try {
@@ -1001,6 +1217,15 @@ const hashArtifactDefault = async (artifact) => {
   }
 };
 
+/**
+ * Walks up from `path.dirname(target)` until it finds an ancestor directory
+ * that actually exists, realpath-resolving it through any symlinks. Used to
+ * establish where a not-yet-created artifact's parent really points, so a
+ * proof path that does not exist yet can still be checked for worktree
+ * containment. Rethrows any error other than ENOENT, and stops once a
+ * candidate has no distinct parent left (filesystem root) to avoid an
+ * infinite loop.
+ */
 const resolveExistingParent = async (target, filesystem) => {
   let candidate = path.dirname(target);
   while (true) {
@@ -1014,6 +1239,25 @@ const resolveExistingParent = async (target, filesystem) => {
   }
 };
 
+/**
+ * Takes a TOCTOU-hardened snapshot of a proof artifact, used both as the
+ * "before" state (pre-command) and, via verifyArtifactProof, the "after"
+ * state (post-command). Rejects an absolute `proof.path`, any path segment
+ * that is literally `.git` (case-insensitive), and anything that resolves
+ * outside the command's `cwd` — checked both for the literal path and, once
+ * resolved, for its realpath, so a path component that is itself a symlink
+ * pointing outside the worktree is caught even though the final component
+ * is an ordinary file. When the artifact does not exist yet, still resolves
+ * its nearest existing ancestor through symlinks (resolveExistingParent)
+ * and requires that ancestor to be contained too, so a not-yet-created path
+ * cannot pre-snapshot as PASS via a symlinked parent that escapes the
+ * worktree. When it exists, rejects a symbolic link and a hard-linked file
+ * (nlink > 1 — a hard link lets another path mutate "the same" file without
+ * this recorded path ever changing) before hashing it, and fails if the
+ * hash step detects the file changed mid-read.
+ * @returns {{status: 'PASS'|'FAIL', evidence?: string, exists?: boolean,
+ *   digest?: string, dev?: number, ino?: number, size?: number}}
+ */
 const snapshotArtifactProof = async ({
   proof,
   cwd,
@@ -1083,6 +1327,16 @@ const snapshotArtifactProof = async ({
   }
 };
 
+/**
+ * Proves a command actually (re)produced its declared artifact, not just
+ * that the artifact happens to exist. Re-snapshots the artifact after the
+ * command via snapshotArtifactProof and requires it to exist as a
+ * non-empty file; if a `before` snapshot showed the artifact already
+ * existed, also requires its digest, dev, ino, or size to have actually
+ * changed — otherwise a stale leftover from a previous run would pass as
+ * fresh evidence. Short-circuits and returns `before` unchanged if `before`
+ * was already a FAIL.
+ */
 const verifyArtifactProof = async ({ proof, cwd, before }) => {
   if (before?.status === 'FAIL') return before;
   const after = await snapshotArtifactProof({ proof, cwd });
@@ -1103,6 +1357,15 @@ const verifyArtifactProof = async ({ proof, cwd, before }) => {
   };
 };
 
+/**
+ * Reads and parses a verified artifact as JSON, re-checking identity before
+ * and after the read against the already-verified `proofResult` (dev, ino,
+ * size, and — after reading — mtimeMs and digest) so a swap or edit that
+ * happens between snapshotArtifactProof and this read is caught instead of
+ * silently trusting stale bytes. Refuses anything without a realPath/size on
+ * `proofResult`, or larger than 1 MiB.
+ * @returns {{status: 'PASS', value: unknown}|{status: 'FAIL', evidence: string}}
+ */
 const readBoundArtifactJson = async (proofResult) => {
   if (!proofResult?.realPath || !Number.isFinite(proofResult.size) || proofResult.size > 1_000_000) {
     return { status: 'FAIL', evidence: 'Semantic artifact proof must be a verified JSON file no larger than 1 MiB.' };
@@ -1128,6 +1391,21 @@ const readBoundArtifactJson = async (proofResult) => {
   }
 };
 
+/**
+ * Validates that a `grafana-live-render` artifact JSON payload actually
+ * proves a live Grafana call was made, not just that some JSON file exists.
+ * Requires `proof.semantic === 'grafana-live-result'`, an http(s) `endpoint`
+ * matching `proof.grafanaOrigin` when configured, and a 2xx `httpStatus`.
+ * For a `query` operation, additionally requires the request to have
+ * targeted `/api/ds/query` with at least one query, every result entry to
+ * be error-free, and at least one result to carry a genuinely non-empty
+ * series — an empty frames array, a frame with only null/undefined/empty
+ * values, and the legacy single-result shape without real datapoints are
+ * all rejected alike. For a `render` operation, requires an image
+ * content-type, a positive byte count, and a well-formed sha256 in the
+ * response metadata. Any other operation, or a missing/malformed field,
+ * fails closed.
+ */
 const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
   if (proof.semantic !== 'grafana-live-result') {
     return { status: 'FAIL', evidence: 'Grafana live proof requires semantic=grafana-live-result.' };
@@ -1219,6 +1497,12 @@ const verifyGrafanaLiveArtifact = async ({ proof, proofResult }) => {
   return { status: 'FAIL', evidence: 'Grafana live proof operation must be query or render.' };
 };
 
+/**
+ * Parses `docker compose ps --format json` output, which can be either a
+ * single JSON array/object or NDJSON (one JSON value per line). Tries the
+ * whole text as JSON first, falls back to per-line parsing, and returns an
+ * empty array — fail closed, not throw — if neither succeeds.
+ */
 const parseDockerComposeRows = (text) => {
   const trimmed = String(text ?? '').trim();
   if (!trimmed) return [];
@@ -1234,6 +1518,19 @@ const parseDockerComposeRows = (text) => {
   }
 };
 
+/**
+ * Evaluates a command proof's output against its declared policy.
+ * `hunter-build` is a hard-coded semantic policy requiring
+ * `docker compose ps --format json` to include a `Service: "hunter"` row
+ * (rows without a `Service` field are ignored rather than treated as a
+ * match) with `State: running` and `Health: healthy`. Every other check
+ * must use a bounded `literal:<text>` policy — a case-insensitive substring
+ * match against combined stdout+stderr — capped at 264 characters with no
+ * control characters; anything else, in particular regex syntax, is
+ * rejected as an invalid policy rather than evaluated, so a check config
+ * can never smuggle in arbitrary pattern evaluation.
+ * @returns {{matched: boolean, policyValid: boolean, evidence: string}}
+ */
 const evaluateCommandProof = ({ check, execution }) => {
   const policy = String(check.proof.expectedPattern || '');
   if (check.id === 'hunter-build') {
@@ -1282,6 +1579,26 @@ const evaluateCommandProof = ({ check, execution }) => {
   };
 };
 
+/**
+ * Builds the executor function used to run every closeout check against one
+ * repo. Returns an async `(check, phase, cwd = repo) => result` closure;
+ * call this factory once per workflow run and reuse the returned function
+ * for every check so the per-check log-attempt counter, unsafe-termination
+ * latch, and precomputed path/env replacement lists are shared. Once any
+ * spawned command's process-tree termination cannot be proven (BLOCKED),
+ * the latch trips and every later call short-circuits to BLOCKED without
+ * spawning anything — a previous command's unaccounted-for escaped process
+ * could still be mutating the worktree, so running further commands
+ * concurrently with it is unsafe regardless of what they check. When `cwd`
+ * differs from `repo` (a baseline/worktree comparison run), extends the
+ * redaction set so the baseline path is also normalized to `<repo>` rather
+ * than leaking as a raw temp path. Handles both proof kinds: an `artifact`
+ * proof is snapshotted before the command runs and re-verified after (see
+ * verifyArtifactProof); a `command` proof runs as a second, separately
+ * logged spawn and is evaluated by evaluateCommandProof. Every returned
+ * field — including the check definition itself — passes through redaction
+ * and path normalization before it leaves this function.
+ */
 const createCommandExecutor = ({
   repo,
   outputDir,
@@ -1443,6 +1760,12 @@ const createCommandExecutor = ({
   };
 };
 
+/**
+ * Default TCP reachability probe: resolves true on `connect`, false on
+ * `error` or after `timeoutMs`, and always destroys the socket before
+ * resolving.
+ * @returns {Promise<boolean>}
+ */
 const probeTcpDefault = ({ host, port, timeoutMs = 1500 }) => new Promise((resolve) => {
   const socket = net.createConnection({ host, port: Number(port) });
   const done = (value) => {
@@ -1454,6 +1777,16 @@ const probeTcpDefault = ({ host, port, timeoutMs = 1500 }) => new Promise((resol
   socket.once('error', () => done(false));
 });
 
+/**
+ * Default Redis health probe: sends a raw RESP `PING` and requires an exact
+ * `+PONG\r\n` reply. Guards with an explicit `settled` flag — unlike the
+ * once-only 'connect'/'error' races used elsewhere in this file — because
+ * `'data'` is a persistent listener that can fire repeatedly; without the
+ * guard, a multi-chunk response would call `done()` more than once. Caps
+ * the accumulated response at 64 bytes and fails closed if that is exceeded
+ * without a terminating CRLF.
+ * @returns {Promise<boolean>}
+ */
 const probeRedisDefault = ({ host, port, timeoutMs = 1500 }) => new Promise((resolve) => {
   const socket = net.createConnection({ host, port: Number(port) });
   let response = '';
@@ -1475,6 +1808,17 @@ const probeRedisDefault = ({ host, port, timeoutMs = 1500 }) => new Promise((res
   socket.once('error', () => done(false));
 });
 
+/**
+ * Default Grafana health probe. Requires the URL to be http(s) with a path
+ * of exactly `/api/health` before issuing the request. Caps the response
+ * body at 64 KiB — destroying the response and failing closed if exceeded —
+ * requires a 2xx status with a JSON content-type, and then requires the
+ * parsed body to prove real Grafana identity (`database === 'ok'` plus
+ * non-empty `version` and `commit` strings) rather than treating any 2xx
+ * JSON response as healthy. Settles exactly once even though a response can
+ * emit `'close'` after a normal `'end'`, or before one on an abort.
+ * @returns {Promise<{healthy: boolean, evidence: string}>}
+ */
 const probeGrafanaHealthDefault = (url, timeoutMs = 2500) => new Promise((resolve) => {
   let parsedUrl;
   try {
@@ -1541,6 +1885,13 @@ const probeGrafanaHealthDefault = (url, timeoutMs = 2500) => new Promise((resolv
   request.once('error', () => done({ healthy: false, evidence: 'Grafana health endpoint was unavailable.' }));
 });
 
+/**
+ * Default free-disk-space probe. Uses `stats.bavail` (blocks available to
+ * an unprivileged user), not `bfree` (which includes blocks reserved for
+ * root), so the reported free space matches what the check-running user can
+ * actually consume.
+ * @returns {Promise<number>} Free space in GiB.
+ */
 const diskFreeGbDefault = async (repo) => {
   const stats = await statfs(repo, { bigint: true });
   return Number(stats.bavail * stats.bsize) / (1024 ** 3);
@@ -1557,6 +1908,16 @@ const TOOL_PROBES = [
   ['prisma', 'pnpm prisma --version'],
 ];
 
+/**
+ * Default tool-version probe used by runPreflight. Runs `command` through
+ * the same login-shell invocation (`<shell> -lc`) as the command executor,
+ * so preflight tool discovery matches what checks can actually resolve at
+ * run time. Never throws: a rejected execFile is normalized into the same
+ * `{exitCode, stdout, stderr}` shape as a successful run, using the
+ * rejection's `code`/`stdout`/`stderr` (falling back to `error.message`),
+ * so every probe result can be handled uniformly by the caller.
+ * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string}>}
+ */
 const probeCommandDefault = async ({ command, repo, shell, env }) => {
   try {
     // Use the same login-shell invocation as the command executor (`bash -lc`) so
@@ -1587,6 +1948,22 @@ const probeCommandDefault = async ({ command, repo, shell, env }) => {
   }
 };
 
+/**
+ * Runs every preflight gate before a closeout workflow is allowed to admit
+ * commands: the configured shell is executable, each tool in TOOL_PROBES
+ * resolves and reports a clean version (a probe that exits 0 but prints a
+ * warning/problem/skip/fail signal is still not PASS — see classifyOutput),
+ * every `config.requiredEnv` name is present AND at least 4 characters long
+ * (too short to redact reliably, so it is reported BLOCKED rather than
+ * risking an unredactable secret in evidence), free disk space meets
+ * `config.minFreeDiskGb`, and any configured Redis/Grafana/TCP-port
+ * services are reachable. Every probe is individually try/caught into a
+ * BLOCKED check with evidence instead of rejecting, so one flaky service
+ * probe cannot abort the whole preflight report. Overall `status` is FAIL
+ * if any individual check is FAIL, else BLOCKED if any check is not PASS,
+ * else PASS.
+ * @returns {{status: 'PASS'|'BLOCKED'|'FAIL', checks: object[], toolVersions: object}}
+ */
 const runPreflight = async ({
   repo,
   config = {},

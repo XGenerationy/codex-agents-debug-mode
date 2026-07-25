@@ -1,3 +1,12 @@
+/**
+ * Rolls a list of check results up into one overall status. PASS only when
+ * every result is PASS; a single FAIL outranks any BLOCKED/BASELINE so a
+ * real failure is never masked by a merely-blocked check; BLOCKED/BASELINE
+ * with no FAIL present rolls up to BLOCKED; any other/unrecognized status
+ * combination fails closed to FAIL rather than defaulting to PASS.
+ * @param {{status: string}[]} results
+ * @returns {'PASS'|'FAIL'|'BLOCKED'}
+ */
 const statusFrom = (results) => {
   if (results.every(({ status }) => status === 'PASS')) return 'PASS';
   if (results.some(({ status }) => status === 'FAIL')) return 'FAIL';
@@ -5,6 +14,17 @@ const statusFrom = (results) => {
   return 'FAIL';
 };
 
+/**
+ * Runs `execute` over `items` with at most `limit` concurrent workers,
+ * preserving each result at its original index regardless of completion
+ * order. A thrown error from `execute` is caught and converted into a
+ * BLOCKED row for that single item (see inline comment below) so one bad
+ * executor can never abort the pool or the rest of the results.
+ * @param {Array} items
+ * @param {number} limit max concurrent workers (clamped to at least 1 and at most items.length).
+ * @param {(item: *) => Promise<object>} execute
+ * @returns {Promise<object[]>} one result per item, in the same order as `items`.
+ */
 const runPool = async (items, limit, execute) => {
   const results = new Array(items.length);
   let next = 0;
@@ -34,6 +54,18 @@ const runPool = async (items, limit, execute) => {
   return results;
 };
 
+/**
+ * Synthesizes BLOCKED confirmation-phase rows for every check when
+ * confirmation cannot run at all (an unresolved plan, or a qualification
+ * phase that was not clean). Evidence prefers, in order: the check's own
+ * evidence (e.g. why its command never resolved), then the matching
+ * `priorResults` row's evidence (e.g. why it failed in qualification), and
+ * only falls back to the generic `evidence` message if neither is present.
+ * @param {object[]} checks
+ * @param {string} evidence fallback evidence text.
+ * @param {object[]} [priorResults] results from an earlier phase, matched to `checks` by `id`.
+ * @returns {object[]} one BLOCKED confirmation row per check.
+ */
 const blockedConfirmationRows = (checks, evidence, priorResults = []) => {
   const priorById = new Map(priorResults.map((result) => [result.id, result]));
   return checks.map((check) => ({
@@ -45,6 +77,17 @@ const blockedConfirmationRows = (checks, evidence, priorResults = []) => {
   }));
 };
 
+/**
+ * Wraps `execute` so calls that share a `check.resourceGroup` (e.g. a
+ * database or browser fixture that cannot be exercised concurrently) run
+ * strictly one at a time, chained in call order, while checks with no
+ * resourceGroup (or a different one) run unrestricted. Implemented as a
+ * per-group promise chain: each call waits on the previous holder before
+ * running, then releases and clears its group's lock entry only if it is
+ * still the current holder, so a later call is never clobbered.
+ * @param {(check: object, phase: string) => Promise<object>} execute
+ * @returns {(check: object, phase: string) => Promise<object>} a serialized version of `execute`.
+ */
 const resourceAwareExecutor = (execute) => {
   const locks = new Map();
   return async (check, phase) => {
@@ -63,6 +106,21 @@ const resourceAwareExecutor = (execute) => {
   };
 };
 
+/**
+ * Runs the two-phase closeout validation gate: a fast, resource-aware
+ * `qualification` pass over only the `qualificationSafe` subset of checks
+ * (bounded to `parallelism` concurrent workers) as an early fail-fast smoke
+ * test, followed — only if qualification is entirely clean — by a full,
+ * one-at-a-time `confirmation` pass over every check for an authoritative
+ * result. If the plan itself is unresolved (a check is already BLOCKED or
+ * has no command) or qualification is not clean, confirmation never runs
+ * and every check gets a synthesized BLOCKED confirmation row instead (via
+ * blockedConfirmationRows), so the report always has a confirmation row per
+ * check. A thrown confirmation executor error is caught per-check so it
+ * cannot abort the remaining confirmation checks or the report.
+ * @param {{checks: object[], execute: (check: object, phase: string) => Promise<object>, parallelism?: number}} options
+ * @returns {Promise<{status: string, qualification: object[], confirmation: object[]}>}
+ */
 const runValidationPhases = async ({ checks, execute, parallelism = 4 } = {}) => {
   const unresolved = checks.filter(({ status, command }) => status === 'BLOCKED' || !command);
   if (unresolved.length) {

@@ -18,6 +18,17 @@ Options:
   -h, --help           Show this help
 `;
 
+/**
+ * Parses CLI argv into `{ repo, plan, help, baseRef?, configPath?,
+ * outputDir? }`. `repo` defaults to `process.cwd()`. Flags that take a
+ * value (`--repo`, `--base-ref`, `--config`, `--output-dir`) throw if the
+ * next token is missing or itself looks like another flag (starts with
+ * `--`), so a dropped value can never silently swallow the next flag. Any
+ * unrecognized argument throws immediately rather than being ignored, so a
+ * typo'd or unexpected flag fails loudly instead of silently no-op'ing.
+ * @param {string[]} argv arguments after the node executable and script path.
+ * @returns {object} parsed options.
+ */
 const parseArgs = (argv) => {
   const options = { repo: process.cwd(), plan: false };
   for (let index = 0; index < argv.length; index += 1) {
@@ -42,6 +53,18 @@ const parseArgs = (argv) => {
   return options;
 };
 
+/**
+ * CLI entrypoint: parses argv, resolves the --help/--plan short-circuits,
+ * loads the optional --config JSON, and runs the full closeout workflow via
+ * runCloseoutWorkflow. Always writes one JSON line to stdout — the resolved
+ * plan when --plan is set, otherwise the final status/headSha/report paths
+ * — and exits non-zero whenever the result is not PASS: exit 2 means the
+ * gate ran and found a non-PASS result, exit 3 means it could not run at
+ * all (bad args, bad repo, missing base ref, unreadable config, ...), in
+ * which case a machine-readable BLOCKED record is still written to stdout
+ * (see inline comment below) alongside the human-readable stderr message.
+ * @returns {Promise<void>}
+ */
 const main = async () => {
   let options;
   try {

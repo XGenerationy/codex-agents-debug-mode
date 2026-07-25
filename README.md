@@ -92,6 +92,23 @@ The skill is fail-closed. Missing infrastructure, uncertain process ownership, i
 evidence, skipped checks, warning output, stale artifacts, and unverifiable service health block a
 clean result.
 
+### Debug collector trust model
+
+`scripts/debug_server.js` is a single-operator, loopback-only server: it binds to `127.0.0.1`,
+validates the TCP peer and Host header before anything else (`isAllowedHost`), and serves exactly
+one `projectRoot` per process. There is no multi-tenant or `client_id` concept because there is no
+multi-tenant deployment target — every authenticated write path is scoped by one of two random,
+unguessable tokens instead:
+
+- the server-wide **launch token** (persisted to `.debug/collector_token`, mode `0600`) authorizes
+  `POST /session`;
+- a **per-session token**, minted fresh in the `/session` response, authorizes `POST /log` for that
+  session only — a token valid for one session is rejected against every other session.
+
+Both checks funnel through the single `authorizeRequest` choke point in `debug_server.js` so a new
+authenticated endpoint cannot add an inline check and skip the timing-safe comparison or the `401`
+response shape.
+
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## License

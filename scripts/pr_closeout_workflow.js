@@ -38,6 +38,17 @@ const DEFAULTS = {
   writeEvidenceReport,
 };
 
+/**
+ * Reduces every sub-check's status to one final verdict. Any suppression
+ * marker found in touched files is an automatic FAIL regardless of what else
+ * passed — the Zero-Suppression policy overrides everything. Otherwise: any
+ * component FAIL wins; a BASELINE result (head failure reproduced exactly at
+ * base — pre-existing, not introduced by this PR) is treated the same as
+ * BLOCKED rather than silently passed; and PASS requires every tracked
+ * status to be exactly 'PASS', with any other combination falling back to
+ * BLOCKED rather than defaulting optimistically to PASS.
+ * @returns {'PASS'|'FAIL'|'BLOCKED'}
+ */
 const evaluateOverallStatus = ({
   planStatus,
   preflight,
@@ -67,23 +78,65 @@ const evaluateOverallStatus = ({
   return statuses.every((status) => status === 'PASS') ? 'PASS' : 'BLOCKED';
 };
 
+/**
+ * A check plan is only PASS if every configured check both resolved to a
+ * runnable `command` and isn't itself already BLOCKED (e.g. an unresolved
+ * dependency); a plan-building error is a hard FAIL, and any other gap
+ * (missing command, pre-blocked check) falls back to BLOCKED rather than
+ * silently passing.
+ * @param {{errors: unknown[], checks: {command?: string, status?: string}[]}} plan
+ * @returns {'PASS'|'FAIL'|'BLOCKED'}
+ */
 const planStatusFor = (plan) => {
   if (plan.errors.length) return 'FAIL';
   return plan.checks.every(({ command, status }) => command && status !== 'BLOCKED') ? 'PASS' : 'BLOCKED';
 };
 
+/**
+ * Default evidence output directory when the caller doesn't supply one:
+ * under the OS tmpdir, namespaced by a filesystem-safe repo basename, the
+ * short head SHA, and a filesystem-safe timestamp, so concurrent runs
+ * against different repos/commits never collide.
+ * @param {string} repo
+ * @param {string} headSha
+ * @returns {string}
+ */
 const defaultOutputDir = (repo, headSha) => {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const name = path.basename(repo).replace(/[^a-z0-9_-]/gi, '-');
   return path.join(tmpdir(), 'codex-pr-closeout', `${name}-${headSha.slice(0, 12)}-${stamp}`);
 };
 
+/**
+ * Throws unless `outputDir` resolves outside `repo`. Evidence must never be
+ * written inside the repository it is validating: it would then be
+ * (un)tracked content the working-tree/suppression scans have to reason
+ * about, and a later run could pick up a previous run's evidence as part of
+ * the very tree it is fingerprinting. Called against both logical and
+ * realpath'd (symlink-resolved) path pairs by `prepareOutputDirectory`.
+ * @param {string} repo
+ * @param {string} outputDir
+ */
 const assertOutputOutsideRepository = (repo, outputDir) => {
   const relative = path.relative(path.resolve(repo), path.resolve(outputDir));
   const inside = relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
   if (inside) throw new Error(`Evidence output must be outside the repository: ${outputDir}`);
 };
 
+/**
+ * Resolves the realpath `target` would have once created, even though it
+ * (and possibly several trailing segments) doesn't exist yet: `realpath`
+ * throws ENOENT on a nonexistent path, so this walks up to the nearest
+ * ancestor that does exist, resolves that ancestor through symlinks, and
+ * rejoins the missing trailing segments on top. Falls back to the original
+ * `target` if no ancestor exists at all (e.g. root). Lets
+ * `prepareOutputDirectory` check the *physical* output location against the
+ * repository before `mkdir` ever runs, so a symlinked ancestor can't make an
+ * outside-looking path actually land inside the repo.
+ * @param {string} target
+ * @param {(path: string) => Promise<string>} realpathPath
+ * @returns {Promise<string>}
+ */
 const resolvePhysicalTarget = async (target, realpathPath) => {
   const missing = [];
   let current = target;
@@ -101,6 +154,20 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
   }
 };
 
+/**
+ * Creates the evidence output directory, defending against symlink TOCTOU:
+ * checks `outputDir` against `repo` three times — the plain resolved paths,
+ * the physical (symlink-resolved) paths before `mkdir` runs (via
+ * `resolvePhysicalTarget`, since the directory doesn't exist yet), and the
+ * physical paths again after `mkdir` actually creates it. A symlink planted
+ * as the repo root or anywhere along the output path — even one that only
+ * becomes resolvable once the directory exists — cannot smuggle the evidence
+ * write inside the repository it describes. `mkdirPath`/`realpathPath` are
+ * injectable for tests; callers use the real `fs/promises` implementations.
+ * Invoked again later in the workflow immediately before each evidence
+ * write, not just once at startup.
+ * @returns {Promise<string>} the resolved output directory path.
+ */
 const prepareOutputDirectory = async ({
   repo,
   outputDir,
@@ -149,6 +216,17 @@ const ESSENTIAL_ENV = new Set([
   'OMO_CODEX_SHELL_PATH',
 ]);
 
+/**
+ * Builds the environment handed to every executed check: an allowlist, not a
+ * denylist — only names in `ESSENTIAL_ENV` (PATH, shell/tmp/home basics, the
+ * shell-override escape hatches) or explicitly named in `config.requiredEnv`
+ * / `config.safeEnv` survive. Everything else in the ambient `env` (CI
+ * secrets, unrelated tokens, etc.) is dropped by default rather than passed
+ * through and relied on to be redacted after the fact.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {{requiredEnv?: string[], safeEnv?: string[]}} config
+ * @returns {NodeJS.ProcessEnv}
+ */
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
     ...(config.requiredEnv || []),
@@ -159,8 +237,22 @@ const buildWorkflowEnvironment = (env, config) => {
   )));
 };
 
-// Clone-cache walk: shared references stay shared after path normalization;
-// only true cycles become "[Circular]" (same contract as redactStructure).
+/**
+ * Redacts absolute local paths from a persisted evidence value: recursively
+ * replaces every occurrence of `repo`/`outputDir` (and their forward- and
+ * backslash-normalized forms, case-insensitively for drive-letter paths)
+ * with `<repo>`/`<evidence>` placeholders, in both string values and object
+ * keys, so evidence written to disk is portable across machines and doesn't
+ * leak the local filesystem layout. A lookahead boundary keeps a match from
+ * firing inside a longer unrelated path segment. Walks objects/arrays with a
+ * clone cache: a value reachable via more than one reference stays a single
+ * shared reference after normalization (same contract as `redactStructure`),
+ * and only a genuine cycle collapses to the string `'[Circular]'`.
+ * @param {unknown} value
+ * @param {string} repo
+ * @param {string} outputDir
+ * @returns {unknown} a new value with paths/keys normalized; non-string primitives pass through unchanged.
+ */
 const normalizePersistedPaths = (value, repo, outputDir, clones = new WeakMap(), stack = new WeakSet()) => {
   const replacements = [
     [repo, '<repo>'],
@@ -206,10 +298,32 @@ const normalizePersistedPaths = (value, repo, outputDir, clones = new WeakMap(),
   }
 };
 
+/**
+ * Order-sensitive list equality (not set equality) — used to detect whether
+ * `touchedFiles` changed between two repository-state snapshots, where a
+ * reordering is as meaningful a change as an addition or removal.
+ * @param {unknown[]} left
+ * @param {unknown[]} right
+ * @returns {boolean}
+ */
 const sameList = (left = [], right = []) => (
   left.length === right.length && left.every((value, index) => value === right[index])
 );
 
+/**
+ * The "did the repository move under us" integrity check, run at multiple
+ * checkpoints during a closeout (once comparing validation-time state
+ * through the post-GitHub-verification and final-seal states, and again
+ * later comparing post-GitHub state through the post-evidence-write state).
+ * Compares base/merge-base/head SHAs and the ordered touched-files list
+ * across `validatedState` -> `observedState` -> `sealedState`, and compares
+ * working-tree fingerprints to catch content-level drift (untracked/ignored
+ * changes) that SHA/file-list comparisons alone would miss. Any mismatch —
+ * including the optional `initialFingerprint` differing from
+ * `afterFingerprint` — is accumulated and returned as BLOCKED with every
+ * reason concatenated; a clean comparison returns PASS.
+ * @returns {{status: 'PASS'|'BLOCKED', evidence: string, initialFingerprint?: string|null, beforeFingerprint: string|null, afterFingerprint: string|null}}
+ */
 const sealRepository = ({
   validatedState,
   observedState,
@@ -246,6 +360,15 @@ const sealRepository = ({
     };
 };
 
+/**
+ * Gates whether `runCloseoutWorkflow` is allowed to actually execute the
+ * configured checks: any FAIL among the plan/preflight/gate-integrity/
+ * initial-tree statuses, or any pre-existing suppression finding, is a hard
+ * FAIL; anything short of all four being exactly PASS is BLOCKED. Only a
+ * PASS here lets validation phases run — an incomplete or dirty admission
+ * never silently proceeds to executing checks.
+ * @returns {'PASS'|'FAIL'|'BLOCKED'}
+ */
 const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, initialSuppressions }) => {
   if (planStatus === 'FAIL' || preflight.status === 'FAIL' || gateIntegrity.status === 'FAIL'
     || initialTree.status === 'FAIL' || initialSuppressions.length) return 'FAIL';
@@ -254,6 +377,41 @@ const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, in
   return 'PASS';
 };
 
+/**
+ * Orchestrates a full PR closeout run end to end: resolve repo state, build
+ * and admit the check plan, run validation, independently verify GitHub's
+ * live gate/PR state, seal the repository against drift, and persist
+ * evidence. `planOnly` short-circuits after building the plan and returns a
+ * redacted preview without touching disk or running anything.
+ *
+ * Admission is gated on an independent live GitHub gate attestation
+ * (`readLiveGateAttestation`) matching this exact base/head/configDigest —
+ * only then do preflight, the initial suppression scan, and the initial
+ * clean-tree fingerprint run, and only a clean admission (`admissionStatus`)
+ * lets the configured checks actually execute. Each check runs through
+ * `executeChecked`, which re-runs generator checks twice to prove
+ * reproducibility and falls back to a serialized baseline comparison
+ * (`verifyBaseline`, one at a time — they share a disposable git worktree)
+ * when a check fails, to distinguish a pre-existing failure from one this PR
+ * introduced.
+ *
+ * The tail of the run enforces ordering deliberately: the tree is
+ * fingerprinted before and after the live-GitHub round trip
+ * (`beforeGithubFingerprint`/`afterGithubFingerprint`) so a mutation that
+ * happens purely around that network call is caught by `sealRepository`;
+ * gate integrity is then re-classified against the *final* observed gate
+ * changes and live attestation, not the initial local view. Evidence is
+ * written twice: a PROVISIONAL report (forced BLOCKED, with its
+ * evidence-write seal marked pending — that sub-seal cannot be computed
+ * before something is actually on disk to compare against) is written
+ * first, so a crash mid-run still leaves an unambiguously-incomplete report
+ * on disk rather than a false PASS; only after that write is the tree
+ * fingerprinted once more, the evidence-write seal computed by comparing
+ * pre- and post-write state, and the final report (true `overallStatus`,
+ * completed seal) written over it.
+ * @param {{repo: string, baseRef: string, config?: object, outputDir?: string, planOnly?: boolean, dependencies?: object}} options `dependencies` overrides any of `DEFAULTS` (repo-state/git/GitHub/process/report I/O) for tests.
+ * @returns {Promise<{report: object, paths: object}|object>} the full evidence report and its written paths; a redacted plan preview when `planOnly` is true.
+ */
 const runCloseoutWorkflow = async ({
   repo,
   baseRef,

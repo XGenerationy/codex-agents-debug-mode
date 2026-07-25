@@ -102,13 +102,51 @@ const REQUIRED_PROOFS = {
   'hunter-build': 'command',
 };
 
+/**
+ * POSIX single-quote a value for safe interpolation into a shell command
+ * string: wraps it in `'...'`, and for each embedded `'` closes the quote,
+ * inserts an escaped literal quote, and reopens it (the standard `'\''`
+ * pattern). Used by expandCommand to splice touched file paths into a
+ * configured check command.
+ * @param {*} value - Value to quote (coerced to a string).
+ * @returns {string} The single-quoted, shell-safe string.
+ */
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 
+/**
+ * Substitute the literal `{touchedFiles}` placeholder in a configured
+ * command string with the touched files, each shellQuote-escaped and
+ * space-joined, so a check command like `eslint {touchedFiles}` runs against
+ * exactly the files this PR touched.
+ * @param {string} command - Configured command template.
+ * @param {string[]} touchedFiles - Repo-relative touched file paths.
+ * @returns {string} The command with `{touchedFiles}` expanded.
+ */
 const expandCommand = (command, touchedFiles) => command.replaceAll(
   '{touchedFiles}',
   touchedFiles.map(shellQuote).join(' '),
 );
 
+/**
+ * Resolve every MANDATORY_CHECKS definition into either a runnable command
+ * or a documented BLOCKED reason. Resolution order per check: a `fixed`
+ * check always uses its own hardcoded command (a config override is an
+ * error, not a silent ignore); otherwise an explicit `config.commands[id]`
+ * wins (a placeholder like `<...>` or `REPLACE_...` is rejected as BLOCKED
+ * rather than run), then the first matching `package.json` script, then the
+ * first matching Makefile target; a check that resolves nothing is BLOCKED
+ * as "unresolved". A second pass then attaches `qualificationSafe`,
+ * `resourceGroup`, and `proof` from config, and independently BLOCKs a check
+ * that requires a postcondition proof (REQUIRED_PROOFS) without a valid one
+ * configured, `redis-integration` without a `services.redis` probe, and
+ * `grafana-live-render` without a `services.grafana.url` probe — a check can
+ * end up BLOCKED for more than one reason, in which case the first BLOCKED
+ * evidence is extended rather than replaced. A config that sets
+ * `gateIntegrityReview` (self-attestation) always produces a top-level
+ * error, since only a live GitHub PR review attestation is accepted.
+ * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], touchedFiles?: string[]}} options
+ * @returns {{checks: object[], errors: string[]}}
+ */
 const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], touchedFiles = [] } = {}) => {
   const commands = config.commands || {};
   const qualificationSafe = new Set(config.qualificationSafe || []);
@@ -188,6 +226,15 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
   return { checks, errors };
 };
 
+/**
+ * Strip zero-count / no-problem status summaries (`0 warnings`, `errors: 0`,
+ * `no failures`, ...) out of text before it reaches statusSignal. Some of
+ * statusSignal's patterns (e.g. a line simply labelled `Failed:`) don't
+ * require a nonzero count, so without this pass a clean run's own summary
+ * line could be misread as reporting a failure.
+ * @param {string} text - Raw text to clean.
+ * @returns {string} Text with zero-count status phrases removed.
+ */
 const cleanZeroSummaries = (text) => text
   .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
   .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
@@ -197,6 +244,20 @@ const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|s
 const COUNTED_SIGNAL = new RegExp(`(?:\\b[1-9]\\d*\\s+${STATUS_TERM}\\b|\\b${STATUS_TERM}\\s*(?::|=|\\s)\\s*[1-9]\\d*\\b)`, 'i');
 const BRACKETED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?\\[${STATUS_TERM}\\]`, 'i');
 const LABELLED_SIGNAL = new RegExp(`^\\s*(?:[-*]\\s*)?${STATUS_TERM}\\s*[:=]`, 'i');
+/**
+ * Classify a single output line as a status signal worth surfacing, by
+ * OR-ing several independent pattern families: a leading `✖`; a nonzero
+ * counted term (`3 errors`, `errors: 3`, via COUNTED_SIGNAL); a bracketed tag
+ * (`[FAIL]`) or labelled line (`Warnings:`) at line start; an all-caps
+ * leading status word; compiler-style diagnostics (`file.js:12:3: warning
+ * ...`); a runtime `SomeWarning:`/`SomeError:` class name; a leading
+ * `warning` word (including Node's `(node:1234) Warning:` form); `npm WARN`;
+ * and TAP/test-framework markers (`not ok`, `# skip`, bare
+ * `skipped`/`failed`/`blocked`/`pending`/`xfailed`/`xpassed`, or `ok N ... #
+ * skip`).
+ * @param {string} line - A single line of command output (already ANSI-stripped).
+ * @returns {boolean} True if the line matches any status-signal pattern.
+ */
 const statusSignal = (line) => {
   const uppercase = /^\s*(?:[-*]\s*)?(?:WARN(?:ING)?S?|ERRORS?|PROBLEMS?|FAIL(?:ED|URES?|ING)?|SKIPS?|SKIPPED|TODOS?|BLOCKS?|BLOCKED)\b/;
   const compiler = /(?:^|\s)(?:[^\s:]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)):\s*(?:warning|error)\b/i;
@@ -209,6 +270,16 @@ const statusSignal = (line) => {
     || runtime.test(line) || warning.test(line) || npmWarning.test(line) || framework.test(line);
 };
 
+/**
+ * Extract every line of `text` worth surfacing as evidence: strips ANSI
+ * escape codes, normalizes CR (both CRLF and lone-CR progress output) to LF,
+ * removes zero-count summaries (cleanZeroSummaries) so they cannot be
+ * mistaken for real signals, drops blank lines, and keeps only lines
+ * statusSignal classifies as an actual warning/error/skip/block/failure
+ * signal.
+ * @param {string} text - Raw combined stdout+stderr.
+ * @returns {string[]} The matching lines, in order.
+ */
 const findStatusSignals = (text) => cleanZeroSummaries(String(text ?? '')
   .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
   .replaceAll('\r', '\n'))
@@ -216,6 +287,24 @@ const findStatusSignals = (text) => cleanZeroSummaries(String(text ?? '')
   .filter((line) => line.trim())
   .filter(statusSignal);
 
+/**
+ * The single authoritative PASS/FAIL/BLOCKED classifier for a command's raw
+ * result, applied in strict precedence: a timeout, or a missing exit code,
+ * BLOCKs (incomplete proof); a nonzero exit FAILs; otherwise `stdout`+
+ * `stderr` are scanned via findStatusSignals and merged with any
+ * caller-supplied `detectedSignals` — a warning/error/fail/skip/todo/xfail/
+ * xpass/pending/"not ok" signal FAILs, a `block(ed)` signal BLOCKs, and any
+ * other detected-but-uncategorized signal still FAILs rather than passing
+ * through. An exit-0 run with zero signals is not automatically a PASS:
+ * output matching "no tests found/executed" phrasing, or a numeric no-work
+ * summary (TAP `# tests 0`, Vitest `Tests 0 passed`/`Test Files 0` when that
+ * isn't a zero-failures bucket inside a fuller summary, Mocha `0 passing`)
+ * also FAILs, because closeout requires authoritative evidence that
+ * something actually ran — an empty suite exiting 0 must not count as a
+ * passing check.
+ * @param {{exitCode: number|null|undefined, stdout?: string, stderr?: string, timedOut?: boolean, detectedSignals?: string[]}} result
+ * @returns {{status: 'PASS'|'FAIL'|'BLOCKED', evidence: string}}
+ */
 const classifyOutput = ({
   exitCode,
   stdout = '',
@@ -262,6 +351,30 @@ const classifyOutput = ({
   return { status: 'PASS', evidence: 'Exit 0 with no warning, error, block, problem, skip, or failure signal.' };
 };
 
+/**
+ * Scan one file's text for three independent categories of gate-weakening.
+ * Suppression markers (MARKERS — skipcq, eslint-disable, ts-ignore, noqa,
+ * etc.) are checked in every file. Config-level silencing (CONFIG_SILENCING
+ * — continue-on-error, a raised --max-warnings budget, a rule turned "off",
+ * ignoreBuildErrors, || true, and similar) is only checked in files
+ * classified as config/workflow/ignore-file-shaped, plus every non-comment
+ * line of a dedicated *ignore file is itself flagged. Runner-native test
+ * focus/skip (describe.only, it.skip, fit/xdescribe, and their
+ * optional-chaining, computed-property, and modifier-chain variants) is only
+ * checked in test/spec-shaped files. The marker pass and the test-weakening
+ * pass are both quote/comment/regex-literal aware: a bare quoted-string line
+ * is skipped outright (so this scanner's own MARKERS vocabulary and quoted
+ * test fixtures don't self-flag), a marker wrapped in matching quotes or
+ * backticks is treated as inert prose, and test-weakening matches are
+ * checked against a per-line inertness map (see the nested
+ * scanLineInertness) that tracks strings, line/block comments, and regex
+ * literals, so a lookalike call inside a comment or string is ignored while
+ * a real active call sharing the line is still caught. At most one finding
+ * per line per pass is recorded.
+ * @param {string} file - Repo-relative path; drives classification (config-like / ignore-file / test-like) and is echoed into each finding.
+ * @param {string} text - Full decoded file content to scan.
+ * @returns {Array<{file: string, line: number, category: 'marker'|'config-silencing'|'test-weakening', match: string}>}
+ */
 const scanSuppressionText = (file, text) => {
   const findings = [];
   const normalized = String(file).replaceAll('\\', '/').toLowerCase();
@@ -367,14 +480,20 @@ const scanSuppressionText = (file, text) => {
     // runner modifier chains (test.concurrent.only / it.only.each) on the dot
     // form. `\??\.` accepts both `.` and `?.` so it?.only / describe?.skip match.
     const testWeakening = /\b(?:describe|it|test|context)(?:\??\.[A-Za-z_]\w*)*\??\.(?:skip|only|todo)\b|\b(?:describe|it|test|context)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
-    // Scan a whole source line and mark every position that is inert (inside a
-    // string, line/block comment, or regex literal) so test-weakening matches
-    // the runner can never execute are not flagged. Block-comment state is
-    // carried across lines: a `/*` opened on a previous line makes the whole
-    // following line inert until its `*/`, so a focused test sketched inside a
-    // multi-line block comment is not flagged. Regex character classes are
-    // tracked too, so `/[/']/` does not terminate early and let the `'` open a
-    // bogus string around a later real .only call.
+    /**
+     * Scan a whole source line and mark every character position that is
+     * inert (inside a string, a line/block comment, or a regex literal), so
+     * a test-weakening match the runner could never actually execute is not
+     * flagged. Block-comment state carries across lines: a `/*` opened on a
+     * previous line makes this entire line inert until the comment closes,
+     * so a focused test merely sketched inside a multi-line block comment is
+     * not flagged. Regex character classes are tracked too, so `/[/']/`
+     * does not terminate early and let the `'` inside it open a bogus string
+     * around a later, real `.only` call.
+     * @param {string} line - One line of source text.
+     * @param {boolean} carryBlockComment - Whether a block comment opened on a prior line is still open entering this line.
+     * @returns {{inert: boolean[], blockComment: boolean}} Per-character inertness map, and whether a block comment is still open at line end (to carry into the next call).
+     */
     const scanLineInertness = (line, carryBlockComment) => {
       const inert = new Array(line.length).fill(false);
       let blockComment = Boolean(carryBlockComment);

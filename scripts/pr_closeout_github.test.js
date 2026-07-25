@@ -533,6 +533,40 @@ test('blocks when the full review list changes while the PR summary remains stab
   assert.equal(reviewReads, 2);
 });
 
+test('blocks when a reviewer permission downgrades from write to read between stability snapshots', async () => {
+  // Regression guard for the reviewer-permission cache-sharing revert: the two
+  // gate-attestation snapshots inside readLivePrState must each fetch
+  // collaborator permissions independently. If a second snapshot ever reused
+  // the first snapshot's permission map again, a reviewer whose write access
+  // is revoked mid-run would still attest PASS instead of being caught by the
+  // stability/race check.
+  let permissionReads = 0;
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview({ author_association: 'CONTRIBUTOR' })]];
+      if (args[1]?.endsWith('/permission')) {
+        permissionReads += 1;
+        return { permission: permissionReads === 1 ? 'write' : 'read' };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(permissionReads, 2, 'permissions must be re-fetched independently for each stability snapshot, never cached across them');
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /changed during verification/i);
+});
+
 test('reads the independent attestation from paginated GitHub review data', async () => {
   const result = await readLiveGateAttestation({
     repo: 'C:/repo',

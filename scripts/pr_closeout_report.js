@@ -1,4 +1,5 @@
-const { mkdir, writeFile } = require('node:fs/promises');
+const { constants } = require('node:fs');
+const { mkdir, open } = require('node:fs/promises');
 const path = require('node:path');
 
 const safeText = (value) => String(value ?? '')
@@ -75,6 +76,20 @@ const replacePathRoot = (value, root, replacement) => {
   return normalized;
 };
 
+/**
+ * Recursively replace absolute repository/output-directory path prefixes
+ * throughout a report value with the stable placeholders `<repo>` and
+ * `<evidence>`, so persisted evidence is reproducible across machines/CI
+ * runs and never leaks the local filesystem layout. Handles both path
+ * separators (a Windows-style root also matches its forward-slash and
+ * backslash variants) and de-duplicates object/array references via `seen`
+ * so shared references survive the walk unchanged while true cycles
+ * terminate instead of recursing forever.
+ * @param {*} value - a report (sub)value; strings are rewritten, objects/arrays are walked.
+ * @param {{repoRoot?: string, outputRoot?: string}} [roots]
+ * @param {WeakMap} [seen] - internal cycle/shared-reference tracker; callers should not pass this.
+ * @returns {*} the normalized value (same shape as `value`).
+ */
 const normalizeReportPaths = (value, {
   repoRoot,
   outputRoot,
@@ -96,6 +111,20 @@ const normalizeReportPaths = (value, {
   return normalized;
 };
 
+/**
+ * Render the full human-readable evidence report (preflight, qualification
+ * and final checks with rerun/baseline/fix-record evidence, live PR state,
+ * gate attestation, repository sealing/fingerprints, suppression findings,
+ * tool versions) as Markdown. Every dynamic value is routed through
+ * `safeText`/`cell`, which strips everything but a small allow-listed
+ * character set — this report is regularly rendered by GitHub and other
+ * Markdown viewers, so a check's `evidence` string (which can contain
+ * attacker- or repo-controlled text) must not be able to inject Markdown/
+ * HTML/script content. This function is pure: it never touches the
+ * filesystem (see writeEvidenceReport for persistence).
+ * @param {object} report - a report object, ideally already passed through normalizeReportPaths.
+ * @returns {string} the rendered Markdown document (no trailing newline).
+ */
 const renderMarkdown = (report) => {
   const lines = [
     '# PR Closeout Evidence',
@@ -226,6 +255,43 @@ const renderMarkdown = (report) => {
   return lines.join('\n');
 };
 
+// Write without following a symlinked final component. writeFile follows a
+// symlink; if outputDir already contains report.json/report.md as a symlink
+// (a reused temp directory or otherwise-populated output path), a
+// path-based write would silently overwrite whatever the link points to
+// instead of writing evidence there — and by this point the repository seal
+// has already run, so it cannot catch the divergence. Fail closed instead.
+// On platforms without O_NOFOLLOW the open falls back to following
+// semantics, matching the read-side openNoFollow helpers elsewhere in this
+// codebase (e.g. pr_closeout_repo.js).
+const writeNoFollow = async (target, contents) => {
+  const noFollow = constants.O_NOFOLLOW || 0;
+  let handle;
+  try {
+    handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow, 0o666);
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Refusing to write evidence report through an existing symlink: ${target}`);
+    }
+    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
+    handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o666);
+  }
+  try {
+    await handle.writeFile(contents, 'utf8');
+  } finally {
+    await handle.close();
+  }
+};
+
+/**
+ * Persist the evidence report as `report.json` (normalized, machine-
+ * readable) and `report.md` (rendered Markdown) under `outputDir`, creating
+ * the directory if needed. Both files are opened no-follow (see
+ * writeNoFollow) so a pre-existing symlink at either path is rejected
+ * instead of silently redirecting the write outside `outputDir`.
+ * @param {{outputDir: string, report: object}} options
+ * @returns {Promise<{json: string, markdown: string}>} the absolute paths written.
+ */
 const writeEvidenceReport = async ({ outputDir, report }) => {
   await mkdir(outputDir, { recursive: true });
   const json = path.join(outputDir, 'report.json');
@@ -234,8 +300,8 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
     repoRoot: report.repository,
     outputRoot: outputDir,
   });
-  await writeFile(json, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
-  await writeFile(markdown, `${renderMarkdown(normalized)}\n`, 'utf8');
+  await writeNoFollow(json, `${JSON.stringify(normalized, null, 2)}\n`);
+  await writeNoFollow(markdown, `${renderMarkdown(normalized)}\n`);
   return { json, markdown };
 };
 

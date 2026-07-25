@@ -416,6 +416,46 @@ test('requires the per-session token before accepting a log event', async () => 
   }
 });
 
+test('rejects a genuinely valid session token when presented against a different session', async () => {
+  // The collector has no multi-tenant/client_id concept; the per-session
+  // token is the only scoping boundary between concurrent sessions (see
+  // authorizeRequest in debug_server.js). A credential that is valid for
+  // session A must never authorize a write against session B, even though
+  // the token itself is real (not guessed/forged) and passes safeTokenEqual
+  // for its own session.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const baseUrl = await listen(server);
+
+  try {
+    const sessionA = (await createSession(baseUrl, 'session-a')).body;
+    const sessionB = (await createSession(baseUrl, 'session-b')).body;
+    assert.notEqual(sessionA.session_id, sessionB.session_id);
+    assert.notEqual(sessionA.session_token, sessionB.session_token);
+
+    const ownSessionWrite = await recordEvent(baseUrl, sessionA, 'writes to its own session');
+    assert.equal(ownSessionWrite.status, 202);
+
+    const crossSessionWrite = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: sessionB.session_id,
+        sessionToken: sessionA.session_token,
+        msg: 'cross-session write attempt',
+      },
+    });
+    assert.equal(crossSessionWrite.status, 401);
+    assert.deepEqual(crossSessionWrite.body, { error: 'unauthorized' });
+
+    const sessionBLog = await readFile(path.join(projectRoot, sessionB.log_file), 'utf8');
+    assert.equal(sessionBLog, '', "session B's log must not receive session A's event");
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('/log accepts both snake_case and camelCase session keys', async () => {
   // /session returns session_id / session_token (snake_case) but older docs
   // and several SDKs use sessionId / sessionToken (camelCase). A client that
@@ -824,6 +864,114 @@ test(
       const res = spawnSync('bash', [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       assert.notEqual(res.status, 0, 'installer must exit non-zero for a symlink payload entry');
       assert.match((res.stderr || '') + (res.stdout || ''), /symlink|regular file/i, `rejection message must mention symlink/regular file: ${JSON.stringify(res)}`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.sh rejects a nested symlink inside a payload directory before staging',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
+  async () => {
+    // The top-level entry check alone is not enough: 'scripts' itself is a
+    // real directory here (passes -f/-d/! -L), but a symlink one level
+    // inside it must still be caught before cp -R stages the link into the
+    // installed skill.
+    const root = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-src-'));
+    const home = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-home-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-out-'));
+    try {
+      await mkdir(path.join(root, 'tools'));
+      await writeFile(path.join(root, 'SKILL.md'), 'skill');
+      await mkdir(path.join(root, 'agents'));
+      await mkdir(path.join(root, 'assets'));
+      await mkdir(path.join(root, 'references'));
+      await mkdir(path.join(root, 'scripts'));
+      await writeFile(path.join(outside, 'secret'), 'x');
+      // Nested symlink: 'scripts' is a real directory, but 'scripts/helper.js'
+      // points outside the tree.
+      await symlink(path.join(outside, 'secret'), path.join(root, 'scripts', 'helper.js'));
+      await copyFile(path.join(__dirname, '..', 'tools', 'install.sh'), path.join(root, 'tools', 'install.sh'));
+      const res = spawnSync('bash', [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      assert.notEqual(res.status, 0, 'installer must exit non-zero for a nested symlink payload entry');
+      assert.match((res.stderr || '') + (res.stdout || ''), /symlink|special file/i, `rejection message must mention symlink/special file: ${JSON.stringify(res)}`);
+      assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug', 'scripts', 'helper.js')), false, 'nested symlink must never be staged into an installed skill');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], { encoding: 'utf8' });
+const pwshAvailable = !pwshProbe.error && pwshProbe.status === 0;
+
+const runInstallPs1 = (scriptPath, args) =>
+  spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args], { encoding: 'utf8' });
+
+test(
+  'install.ps1 rejects a reparse-point payload entry before staging',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: junction creation'), timeout: 30000 },
+  async () => {
+    // Mirrors 'install.sh rejects a symlink payload entry before staging'.
+    // Junctions (unlike file/directory symlinks) do not require elevation or
+    // Developer Mode on Windows, and set the same ReparsePoint attribute
+    // install.ps1 must reject, so they are used as the fixture here.
+    const root = await mkdtemp(path.join(tmpdir(), 'install-reject-src-'));
+    const home = await mkdtemp(path.join(tmpdir(), 'install-reject-home-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'install-reject-out-'));
+    try {
+      await mkdir(path.join(root, 'tools'));
+      await writeFile(path.join(root, 'SKILL.md'), 'skill');
+      await mkdir(path.join(root, 'agents'));
+      await mkdir(path.join(root, 'references'));
+      await mkdir(path.join(root, 'scripts'));
+      await writeFile(path.join(outside, 'o'), 'x');
+      // 'assets' payload entry is a junction to an outside directory.
+      await symlink(outside, path.join(root, 'assets'), 'junction');
+      await copyFile(path.join(__dirname, '..', 'tools', 'install.ps1'), path.join(root, 'tools', 'install.ps1'));
+      const res = runInstallPs1(path.join(root, 'tools', 'install.ps1'), ['-Target', 'Codex', '-HomePath', home]);
+      assert.notEqual(res.status, 0, 'installer must exit non-zero for a reparse-point payload entry');
+      assert.match((res.stderr || '') + (res.stdout || ''), /symlink|junction|reparse|regular file/i, `rejection message must mention symlink/junction/reparse: ${JSON.stringify(res)}`);
+      assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug')), false, 'reparse-point payload entry must never be staged into an installed skill');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.ps1 rejects a reparse point nested inside a payload directory before staging',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: junction creation'), timeout: 30000 },
+  async () => {
+    // Get-ChildItem -Recurse would normally follow a symlinked/junctioned
+    // subdirectory while walking the tree; the installer must instead walk
+    // one level at a time and reject a nested reparse point before ever
+    // recursing into it.
+    const root = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-src-'));
+    const home = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-home-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'install-reject-nested-out-'));
+    try {
+      await mkdir(path.join(root, 'tools'));
+      await writeFile(path.join(root, 'SKILL.md'), 'skill');
+      await mkdir(path.join(root, 'agents'));
+      await mkdir(path.join(root, 'assets'));
+      await mkdir(path.join(root, 'references'));
+      await mkdir(path.join(root, 'scripts'));
+      // Nested junction: 'scripts' is a real directory, but
+      // 'scripts/nested-dir' is a junction pointing outside the tree.
+      await symlink(outside, path.join(root, 'scripts', 'nested-dir'), 'junction');
+      await copyFile(path.join(__dirname, '..', 'tools', 'install.ps1'), path.join(root, 'tools', 'install.ps1'));
+      const res = runInstallPs1(path.join(root, 'tools', 'install.ps1'), ['-Target', 'Codex', '-HomePath', home]);
+      assert.notEqual(res.status, 0, 'installer must exit non-zero for a nested reparse-point payload entry');
+      assert.match((res.stderr || '') + (res.stdout || ''), /symlink|junction|reparse|regular file/i, `rejection message must mention symlink/junction/reparse: ${JSON.stringify(res)}`);
+      assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug')), false, 'nested reparse point must never be staged into an installed skill');
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });

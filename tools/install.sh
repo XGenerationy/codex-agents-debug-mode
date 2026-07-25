@@ -87,6 +87,19 @@ for entry in "${payload[@]}"; do
     echo "Skill payload entry must be a regular file/directory, not a symlink, special file, or missing: $entry" >&2
     exit 1
   }
+  # The check above only guards the entry itself; a directory entry can still
+  # contain a nested symlink or special file one or more levels down, and the
+  # top-level preflight passing would let cp -R stage that nested link (or
+  # FIFO) into the installed skill instead of failing closed. find's default
+  # -P mode never follows a symlink while traversing, so walking the subtree
+  # cannot be redirected outside the tree by the very link being checked for.
+  if [[ -d "$source_dir/$entry" ]]; then
+    nested="$(find "$source_dir/$entry" -not -type f -not -type d -print -quit)"
+    if [[ -n "$nested" ]]; then
+      echo "Skill payload contains a symlink or special file, not a regular file/directory: $nested" >&2
+      exit 1
+    fi
+  fi
 done
 
 # Preflight all destinations before mutating any of them so multi-target

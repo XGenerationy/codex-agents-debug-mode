@@ -29,6 +29,14 @@ const AUTHORITATIVE_ASSOCIATIONS = new Set(['OWNER']);
 const WRITE_PERMISSIONS = new Set(['ADMIN', 'MAINTAIN', 'PUSH', 'WRITE']);
 const MAX_REVIEW_THREAD_PAGES = 100;
 
+/**
+ * Build the exact-match line an independent reviewer's APPROVED review body
+ * must contain, verbatim, to count as the gate attestation. Binding the
+ * marker to `baseSha`/`headSha`/`configDigest` means a review approving one
+ * commit or config cannot be replayed to attest a different one.
+ * @param {{baseSha: string, headSha: string, configDigest: string}} shas
+ * @returns {string}
+ */
 const gateAttestationMarker = ({ baseSha, headSha, configDigest }) => (
   `PR-CLOSEOUT-ATTESTATION v1 base=${baseSha} head=${headSha} config=${configDigest} decision=not-weakened`
 );
@@ -59,6 +67,24 @@ const reviewerAuthorization = (review, reviewerPermissions) => {
   return { authorized, association: association || null, permission: permission || null };
 };
 
+/**
+ * Find the newest APPROVED review that independently attests this exact
+ * gate: authored by someone other than the PR author, submitted against
+ * `expectedHeadSha`, whose body contains the gateAttestationMarker line
+ * exactly once (not as a substring/prefix and not duplicated), and whose
+ * author is authorized (repository OWNER by association, or proven WRITE+
+ * permission via `reviewerPermissions` — see reviewerAuthorization). Returns
+ * `{status: 'PASS', ...}` with the winning review's identity, or
+ * `{status: 'BLOCKED', evidence}` if no candidate qualifies.
+ * @param {object} options
+ * @param {object[]} [options.reviews]
+ * @param {string} options.prAuthor
+ * @param {string} options.expectedBaseSha
+ * @param {string} options.expectedHeadSha
+ * @param {string} options.expectedConfigDigest
+ * @param {Map|object} [options.reviewerPermissions] - reviewer login (lowercased) -> GitHub collaborator-permission API response.
+ * @returns {object} the attestation result.
+ */
 const classifyGateAttestation = ({
   reviews = [],
   prAuthor,
@@ -151,6 +177,29 @@ const normalizeCheck = (value) => {
   };
 };
 
+/**
+ * Reduce one already-fetched snapshot of live GitHub PR state (metadata,
+ * status checks, unresolved review threads, gate attestation) to a single
+ * PASS/BLOCKED/FAIL verdict plus the evidence lines that justify it. A
+ * definite functional problem (PR closed, merge conflicts, changes
+ * requested, a FAILed check, a failed gate attestation) is FAIL; anything
+ * merely unresolved, pending, or unproven (draft, not-yet-mergeable,
+ * in-progress check, unresolved thread, unavailable attestation) is
+ * BLOCKED — SKIPPED is deliberately absent from the failure set (see
+ * FAILURE_CONCLUSIONS) so a skipped-but-applicable check blocks rather than
+ * silently passing. `expectedHeadSha`/`expectedBaseSha` are only used to
+ * annotate the returned snapshot, not to re-validate here — callers that
+ * need the "did the PR move" check should compare snapshots themselves (see
+ * readLivePrState).
+ * @param {object} options
+ * @param {string} [options.repository]
+ * @param {object} [options.pr] - a GitHub `pr view` JSON object.
+ * @param {object[]} [options.unresolvedThreads]
+ * @param {string} [options.expectedHeadSha]
+ * @param {string} [options.expectedBaseSha]
+ * @param {object} [options.gateAttestation] - result of classifyGateAttestation.
+ * @returns {object} `{status, evidence, ...}` plus the normalized checks/threads/gateAttestation.
+ */
 const classifyLivePrState = ({
   repository,
   pr = {},
@@ -323,6 +372,24 @@ const readGateAttestationForPr = async (options) => {
   return snapshot.attestation;
 };
 
+/**
+ * Fetch the current PR from GitHub (via `gh`) and classify its gate
+ * attestation, but only against the exact snapshot the caller expects: if
+ * the live head or base OID does not match `expectedHeadSha`/
+ * `expectedBaseSha`, this returns BLOCKED immediately rather than evaluating
+ * reviews against a PR that has already moved — an approval attesting an
+ * older head must never be read as attesting the current one. Any GitHub
+ * error (auth, network, malformed response) is caught and returned as
+ * BLOCKED with the error message as evidence; this never throws or invents
+ * a PASS.
+ * @param {object} options
+ * @param {string} options.repo - path passed as `--repo`/cwd to the `gh` invocations.
+ * @param {string} options.expectedBaseSha
+ * @param {string} options.expectedHeadSha
+ * @param {string} options.expectedConfigDigest
+ * @param {Function} [options.runGh] - defaults to shelling out to the real `gh` CLI; overridable for tests.
+ * @returns {Promise<object>} the attestation result.
+ */
 const readLiveGateAttestation = async ({
   repo,
   expectedBaseSha,
@@ -482,6 +549,38 @@ const capturePrStabilityTuple = (pr) => {
 
 const stabilityTuplesMatch = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 
+/**
+ * Verify live GitHub PR state is stable and clean enough to close out on,
+ * guarding against state changing mid-verification (a reviewer's access
+ * being revoked, a new push, a check flipping) rather than trusting a single
+ * point-in-time read.
+ *
+ * Takes two independent gate-attestation snapshots (`firstGateSnapshot`,
+ * `finalGateSnapshot`) around a single PR-metadata read pair. Each snapshot
+ * re-fetches reviewer collaborator permissions from scratch — a snapshot
+ * must never reuse the other's permission map, or a write-to-read
+ * permission downgrade (or a transient permission-API failure) between the
+ * two reads would go unnoticed and the two "independent" snapshots would no
+ * longer be independent. If the PR-metadata tuple or either gate-attestation
+ * stability tuple differs between the two reads, this returns BLOCKED
+ * ("changed during verification") without trusting either snapshot's
+ * classification.
+ *
+ * On the stable path, unresolved review threads are read exactly once (the
+ * final read) so the common case pays for one paginated thread walk instead
+ * of two; the unstable path pays for a second, separate read since it needs
+ * current evidence for the BLOCKED result.
+ *
+ * Never throws: GitHub/parse errors are caught and returned as BLOCKED with
+ * the error message as evidence.
+ * @param {object} options
+ * @param {string} options.repo - path passed as `--repo`/cwd to the `gh` invocations.
+ * @param {string} options.expectedHeadSha
+ * @param {string} options.expectedBaseSha
+ * @param {string} options.expectedConfigDigest
+ * @param {Function} [options.runGh] - defaults to shelling out to the real `gh` CLI; overridable for tests.
+ * @returns {Promise<object>} the classified live PR state (see classifyLivePrState), or a BLOCKED stub on instability/error.
+ */
 const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expectedConfigDigest, runGh = defaultRunGh } = {}) => {
   try {
     const repositoryResult = await runGh(['repo', 'view', '--json', 'nameWithOwner'], { repo });

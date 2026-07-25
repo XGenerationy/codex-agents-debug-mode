@@ -16,6 +16,14 @@ const DEFAULT_LIMITS = Object.freeze({
   maxTotalBytes: 16 * 1024 * 1024,
 });
 
+/**
+ * A structured, expected request failure: `code` is the machine-readable
+ * JSON `error` field returned to the client and `status` is the HTTP status
+ * to send. Thrown from request handling and readJson; caught at the top of
+ * the request handler and mapped straight to a response, so throwing this
+ * (instead of a bare Error) is how a handler fails closed with a specific
+ * status/code pair rather than falling through to a generic 500.
+ */
 class RequestError extends Error {
   constructor(code, status = 400) {
     super(code);
@@ -33,6 +41,19 @@ const sendJson = (response, status, payload) => {
   response.end(`${JSON.stringify(payload)}\n`);
 };
 
+/**
+ * Buffer an HTTP request body, enforce `maxBodyBytes`, and parse it as a JSON
+ * object (arrays and primitives are rejected). Oversize uploads are aborted
+ * mid-stream via `request.destroy()` rather than drained to completion, and
+ * always surface as `RequestError('body_too_large', 413)` even if the
+ * destroy itself throws through the async iterator. Client disconnects
+ * (ECONNRESET/EPIPE/abort) map to `RequestError('request_aborted', 400)`;
+ * any other stream failure maps to `RequestError('request_failed', 400)`
+ * (logged to stderr) instead of bubbling up as an uncaught rejection.
+ * @param {AsyncIterable<Buffer>} request
+ * @param {number} maxBodyBytes
+ * @returns {Promise<object>} the parsed JSON body.
+ */
 const readJson = async (request, maxBodyBytes) => {
   const chunks = [];
   let size = 0;
@@ -112,6 +133,25 @@ const bearerToken = (request) => {
   const authorization = request.headers.authorization;
   if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return undefined;
   return authorization.slice('Bearer '.length);
+};
+
+// Single choke point for every authenticated, evidence-mutating path: the
+// server-wide launch token gates /session and the per-session token gates
+// /log. Routing both through one function (instead of an inline
+// safeTokenEqual + sendJson pair at each call site) means a future
+// authenticated endpoint cannot add its own check and forget the
+// timing-safe comparison or the 401 response shape.
+//
+// There is no multi-tenant/client_id model here: this collector is a
+// single-operator, loopback-only server bound to one projectRoot per
+// process (see isAllowedHost). The per-session token — 256 bits of random
+// entropy, generated in /session and required by every subsequent /log call
+// for that session — is the actual scoping boundary between concurrent
+// sessions, and this function is what enforces it uniformly.
+const authorizeRequest = (response, suppliedToken, expectedToken) => {
+  if (safeTokenEqual(suppliedToken, expectedToken)) return true;
+  sendJson(response, 401, { error: 'unauthorized' });
+  return false;
 };
 
 const isLoopbackAddress = (address) => {
@@ -263,6 +303,24 @@ const appendSessionEvent = (session, serializedEvent) => {
   return run;
 };
 
+/**
+ * Build (but do not start) the loopback-only debug-session HTTP collector.
+ * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
+ * header must match) before any route logic runs. Routes: `GET /health`
+ * (unauthenticated identity probe), `POST /session` (requires the launch
+ * `token`, creates a session and its append-only NDJSON log under
+ * `<projectRoot>/.debug`), and `POST /log` (requires that session's own
+ * token — see authorizeRequest — and appends one redaction-free event line).
+ * The returned server exposes `collectorToken`/`collectorInstanceId`
+ * read-only properties for callers that built it with a generated token.
+ * @param {object} [options]
+ * @param {string} [options.projectRoot] - directory whose `.debug/` subdir holds session logs; defaults to cwd.
+ * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
+ * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
+ * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
+ * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, maxSessions, maxEventsPerSession, maxTotalBytes).
+ * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
+ */
 const createDebugServer = ({
   projectRoot = process.cwd(),
   token = randomBytes(32).toString('base64url'),
@@ -322,10 +380,7 @@ const createDebugServer = ({
       }
 
       if (request.method === 'POST' && pathname === '/session') {
-        if (!safeTokenEqual(bearerToken(request), token)) {
-          sendJson(response, 401, { error: 'unauthorized' });
-          return;
-        }
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
         if (sessions.size >= effectiveLimits.maxSessions) {
           throw new RequestError('session_limit_reached', 429);
         }
@@ -441,10 +496,7 @@ const createDebugServer = ({
         }
         const suppliedToken =
           request.headers['x-debug-session-token'] || payload.sessionToken || payload.session_token;
-        if (!safeTokenEqual(suppliedToken, session.sessionToken)) {
-          sendJson(response, 401, { error: 'unauthorized' });
-          return;
-        }
+        if (!authorizeRequest(response, suppliedToken, session.sessionToken)) return;
         if (typeof payload.msg !== 'string' || payload.msg.trim() === '') {
           throw new RequestError('invalid_message');
         }
@@ -498,6 +550,18 @@ const createDebugServer = ({
   return server;
 };
 
+/**
+ * Ask whatever is listening on `port` (127.0.0.1) whether it is this same
+ * collector, by hitting `/health` and checking the reported service name,
+ * version, and a well-formed instance_id — never assumed just because the
+ * port answers. Used from the EADDRINUSE path in main() to tell "another
+ * instance of this collector is already up" apart from "some unrelated
+ * process (or an attacker) is squatting on the port". Resolves to the parsed
+ * identity object on a valid match, or `null` for any failure, timeout,
+ * malformed body, or non-200/non-matching response — this never rejects.
+ * @param {number} port
+ * @returns {Promise<{service: string, version: number, instance_id: string}|null>}
+ */
 const probeServer = (port) =>
   new Promise((resolve) => {
     let settled = false;

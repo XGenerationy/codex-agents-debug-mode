@@ -1,7 +1,10 @@
 const assert = require('node:assert/strict');
+const { mkdtemp, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
-const { normalizeReportPaths, renderMarkdown } = require('./pr_closeout_report');
+const { normalizeReportPaths, renderMarkdown, writeEvidenceReport } = require('./pr_closeout_report');
 
 const hostile = '<script>alert(1)</script>\n# Injected\n[click](javascript:alert(1)) | extra';
 
@@ -249,4 +252,76 @@ test('renders initial-tree and evidence-write sealing evidence', () => {
   assert.match(markdown, /Evidence write seal/);
   assert.match(markdown, /postwrite123/);
   assert.match(markdown, /blocked provisional report/i);
+});
+
+const minimalReport = () => ({
+  overallStatus: 'PASS',
+  repository: '/repo',
+  baseSha: 'base123',
+  headSha: 'head123',
+  configDigest: 'cfg123',
+});
+
+test('writeEvidenceReport writes report.json and report.md into outputDir', async () => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+  try {
+    const { json, markdown } = await writeEvidenceReport({ outputDir, report: minimalReport() });
+    assert.equal(json, path.join(outputDir, 'report.json'));
+    assert.equal(markdown, path.join(outputDir, 'report.md'));
+
+    const jsonContents = JSON.parse(await readFile(json, 'utf8'));
+    assert.equal(jsonContents.overallStatus, 'PASS');
+    const markdownContents = await readFile(markdown, 'utf8');
+    assert.match(markdownContents, /Overall status: \*\*PASS\*\*/);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport refuses to write through a pre-existing symlinked report.json', async () => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.json');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    // A prior run, a reused temp directory, or repo-controlled content could
+    // leave report.json as a symlink pointing outside outputDir. writeFile
+    // would silently follow it and overwrite whatever it points to; the
+    // no-follow open must instead fail closed before any bytes are written.
+    await symlink(outsideTarget, path.join(outputDir, 'report.json'));
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+      /symlink/i,
+    );
+
+    const untouched = await readFile(outsideTarget, 'utf8');
+    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+    const linkTarget = await readlink(path.join(outputDir, 'report.json'));
+    assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport refuses to write through a pre-existing symlinked report.md', async () => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.md');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+      /symlink/i,
+    );
+
+    const untouched = await readFile(outsideTarget, 'utf8');
+    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
 });

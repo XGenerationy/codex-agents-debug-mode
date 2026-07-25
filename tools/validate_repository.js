@@ -35,12 +35,20 @@ const safetyScanRoots = [
 
 const failures = [];
 
-// Payload walker that fails closed on missing entries and never follows
-// symlinks. statSync() follows symlinks and would let a symlinked directory
-// or cycle trigger unbounded recursion; lstatSync() lets us detect symlinks
-// and treat them as validation failures so a reviewed branch cannot hang or
-// escape the payload tree during `npm run validate`. Non-regular files
-// (FIFO/socket/device) must not enter readFileSync / node --check either.
+/**
+ * Recursively walks a required payload entry (file or directory, relative to
+ * `root`) and returns the flat list of regular-file paths under it, pushing
+ * to the module-level `failures` array instead of throwing for any problem
+ * short of an unexpected fs error. Uses `lstatSync` (never `statSync`) so
+ * symlinks are detected and rejected rather than followed — a symlinked
+ * directory or a symlink cycle would otherwise let `readdirSync` recurse
+ * unbounded and hang or escape the payload tree during `npm run validate`.
+ * A missing entry or a non-regular file (FIFO/socket/device) is likewise
+ * recorded as a failure and excluded from the returned list, never handed to
+ * a later `readFileSync`/`node --check` step.
+ * @param {string} entry path relative to `root`.
+ * @returns {string[]} regular-file paths (relative to `root`) found under `entry`.
+ */
 const walk = (entry) => {
   const absolute = path.join(root, entry);
   let info;
@@ -65,8 +73,16 @@ const walk = (entry) => {
   return [];
 };
 
-// Soft walk for optional safety-scan roots: missing optional docs are skipped
-// rather than failing the whole validator.
+/**
+ * Same recursive, symlink-rejecting walk as `walk`, but for optional
+ * safety-scan roots: a missing entry is skipped silently (returns `[]`)
+ * instead of recording a failure, since these paths (docs, workflows,
+ * tooling) are not required payload files. A symlink or non-regular file
+ * that does exist is still recorded as a failure — optional presence does
+ * not relax the symlink/regular-file safety requirement.
+ * @param {string} entry path relative to `root`.
+ * @returns {string[]} regular-file paths (relative to `root`) found under `entry`, or `[]` if it doesn't exist.
+ */
 const walkOptional = (entry) => {
   const absolute = path.join(root, entry);
   let info;
@@ -153,6 +169,17 @@ const safetyScanFiles = [...new Set([
   ...safetyScanRoots.flatMap(walkOptional),
 ])].sort();
 
+/**
+ * Reads one file and records a failure for each `publicSafetyPatterns` entry
+ * it matches — credential-shaped tokens, private key headers, personal
+ * Windows/Unix home paths, or a generated-attribution line — so none of
+ * these ever ship in the public skill payload or its docs/tooling. Silently
+ * returns if the file has already disappeared (lstat ENOENT; a real error is
+ * still reported by the required/payload checks that ran earlier), and
+ * refuses to read a non-regular-file or oversize (`MAX_PAYLOAD_FILE_BYTES`)
+ * target rather than risk hanging or OOMing the validator.
+ * @param {string} file path relative to `root`.
+ */
 const scanFileForPublicSafety = (file) => {
   const abs = path.join(root, file);
   let info;

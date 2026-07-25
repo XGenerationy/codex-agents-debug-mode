@@ -9,6 +9,14 @@ const { scanSuppressionText } = require('./pr_closeout_core');
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Recursively canonicalizes `value` by sorting object keys (array order is
+ * left untouched) so JSON.stringify produces identical output regardless of
+ * property insertion order. digestValidationConfig relies on this so two
+ * configs that differ only in key order still hash identically.
+ * @param {*} value
+ * @returns {*} the same structure with every nested object's keys sorted.
+ */
 const stableValue = (value) => {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === 'object') {
@@ -17,12 +25,31 @@ const stableValue = (value) => {
   return value;
 };
 
+/**
+ * SHA-256 digest of `value` after canonicalizing key order (see
+ * stableValue), so semantically identical validation configs hash the same
+ * regardless of how their keys were written. classifyGateIntegrity binds a
+ * review attestation to this digest so an attestation cannot be replayed
+ * against a configuration that was edited after the review.
+ * @param {*} value
+ * @returns {string} hex-encoded SHA-256 digest.
+ */
 const digestValidationConfig = (value) => createHash('sha256')
   .update(JSON.stringify(stableValue(value)))
   .digest('hex');
 
 const normalizePath = (file) => String(file).replaceAll('\\', '/').replace(/^\.\//, '');
 
+/**
+ * True when `file` is one of the paths that define or configure validation
+ * strength: CI workflows, package manifests/lockfiles, linter/formatter
+ * configs, Makefiles (including GNU make's alternate default filenames),
+ * test-runner configs, and the closeout tool's own config file. This is the
+ * classifier classifyGateIntegrity uses to decide which changed files
+ * require a live review attestation instead of passing on trust.
+ * @param {string} file
+ * @returns {boolean}
+ */
 const isGateFile = (file) => {
   const normalized = normalizePath(file);
   const base = path.posix.basename(normalized).toLowerCase();
@@ -58,6 +85,23 @@ const MULTILINE_WEAKENING_PATTERNS = [
   /(?:coverage|threshold)["']?\s*[:=][\s\S]{0,160}?\b(?:statements|branches|functions|lines)["']?\s*[:=]\s*["']?0(?:\.0+)?["']?(?![\w.])/i,
 ];
 
+/**
+ * Decides whether changes to validation-defining "gate" files (CI configs,
+ * lockfiles, linters, Makefiles, the closeout config itself, ...) preserve
+ * or weaken enforcement. Deleted gate files, detected weakening patterns
+ * (test `.only`/`.skip`, `--no-verify`, zeroed coverage thresholds,
+ * suppression markers), or a gate diff that could not be fully decoded all
+ * FAIL unconditionally — even with an attestation — because the gate must
+ * fail closed whenever it cannot prove the change is safe. Otherwise, PASS
+ * requires an independent live GitHub PR review `attestation` bound to the
+ * exact baseSha/headSha/configDigest tuple with `decision: 'not-weakened'`;
+ * a caller-supplied `review` object (self-attestation) is never sufficient.
+ * Anything short of that is BLOCKED, pending human review.
+ * @param {object} options destructured: changedFiles, addedLines,
+ *   deletedFiles, configuredCommands, baseSha, headSha, configDigest,
+ *   attestation.
+ * @returns {{status: 'PASS'|'FAIL'|'BLOCKED', evidence: string}}
+ */
 const classifyGateIntegrity = ({
   changedFiles = [], addedLines = [], deletedFiles = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
 } = {}) => {
@@ -141,6 +185,14 @@ const classifyGateIntegrity = ({
   };
 };
 
+/**
+ * Hashes a set of `{path, hash}` entries into one order-independent
+ * SHA-256 digest, so a working tree's contents can be fingerprinted and
+ * compared for drift (e.g. across two generator runs) regardless of the
+ * order entries were collected in.
+ * @param {{path: string, hash: string}[]} entries
+ * @returns {string} hex-encoded SHA-256 digest.
+ */
 const fingerprintEntries = (entries) => {
   const hash = createHash('sha256');
   for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
@@ -149,6 +201,16 @@ const fingerprintEntries = (entries) => {
   return hash.digest('hex');
 };
 
+/**
+ * Proves a code generator (e.g. `prisma generate`) is deterministic by
+ * running it twice and comparing working-tree fingerprints in between. A
+ * dirty first or second run short-circuits with that run's own status; a
+ * clean pair whose fingerprints differ FAILs as non-reproducible generated
+ * output — a generator that only matches the tree on some runs would let
+ * committed generated code silently drift from its source of truth.
+ * @param {{executeGenerator: (attempt: number) => Promise<object>, fingerprint: () => Promise<string>}} options
+ * @returns {Promise<object>} a PASS/FAIL result with both attempts and both fingerprints attached.
+ */
 const verifyGeneratorReproducibility = async ({ executeGenerator, fingerprint }) => {
   const first = await executeGenerator(1);
   if (first.status !== 'PASS') {
@@ -179,21 +241,36 @@ const verifyGeneratorReproducibility = async ({ executeGenerator, fingerprint })
   };
 };
 
-// Reduce a proof result to its stable fields for baseline failure signatures.
-// proofResult carries volatile artifact-identity fields (path/realPath/realRoot
-// are absolute paths resolved against the per-run command worktree, so they
-// differ between the head repo and the disposable baseline worktree;
-// dev/ino/mtimeMs/ctimeMs/size change every run because the proof artifact is
-// regenerated, and logPath/durationMs vary per attempt). Without normalization,
-// failureSignature() cannot match the same logical failure across head and
-// baseline, so the baseline comparison always reports "did not reproduce" even
-// for identical failures.
 const STABLE_PROOF_KEYS = ['status', 'exists', 'digest', 'evidence', 'matched', 'matchPolicyValid', 'policyValid'];
+/**
+ * Reduces a captured proof result to the fields that identify a logical
+ * failure, dropping volatile artifact-identity fields: path/realPath/realRoot
+ * are absolute paths resolved against the per-run command worktree (so they
+ * differ between the head repo and the disposable baseline worktree), and
+ * dev/ino/mtimeMs/ctimeMs/size/logPath/durationMs vary every run because the
+ * proof artifact is regenerated. Without this normalization, failureSignature
+ * could never match the same logical failure across head and baseline, so
+ * the baseline comparison would always report "did not reproduce" even for
+ * identical failures.
+ * @param {object|null} proofResult
+ * @returns {object|null} only the stable subset of fields, or null if proofResult is absent.
+ */
 const stableProofResult = (proofResult) => {
   if (!proofResult || typeof proofResult !== 'object') return null;
   return Object.fromEntries(STABLE_PROOF_KEYS.filter((key) => key in proofResult).map((key) => [key, proofResult[key]]));
 };
 
+/**
+ * Renders a check result into canonical text for hashing into a failure
+ * signature. Prefers the pre-computed `outputDigest` (paired with the
+ * stable proof fields) when present; otherwise falls back to raw
+ * stdout/stderr with ANSI escapes stripped, CRLF normalized, and every
+ * variant of the run's absolute `cwd` (forward- and back-slash) replaced
+ * with `<repo>`, so the same logical failure hashes identically whether it
+ * ran in the head repo or a disposable baseline worktree at a different path.
+ * @param {object} result a check execution result.
+ * @returns {string} canonical text ready for hashing.
+ */
 const normalizeFailure = (result) => {
   if (result.outputDigest) {
     return `${result.status}\n${result.exitCode}\n${result.timedOut || false}\n${JSON.stringify(result.outputDigest)}\n${JSON.stringify(stableProofResult(result.proofResult))}`;
@@ -209,8 +286,25 @@ const normalizeFailure = (result) => {
   return output.trim();
 };
 
+/**
+ * SHA-256 digest of a check result's canonicalized failure text (see
+ * normalizeFailure), used to compare a head failure against a baseline
+ * failure for exact-match equality independent of volatile paths/formatting.
+ * @param {object} result a check execution result.
+ * @returns {string} hex digest identifying this logical failure.
+ */
 const failureSignature = (result) => createHash('sha256').update(normalizeFailure(result)).digest('hex');
 
+/**
+ * Runs `git` in `repo` and resolves to stdout only. Applies a large
+ * maxBuffer and a bounded default timeout (see the inline comment below) so
+ * a wedged internal git call cannot hang the closeout gate; `options` can
+ * override either per call.
+ * @param {string} repo working directory to run git in.
+ * @param {string[]} args git subcommand and arguments.
+ * @param {object} [options] overrides merged over the defaults (e.g. env, timeout).
+ * @returns {Promise<string>} stdout.
+ */
 const runGit = async (repo, args, options = {}) => {
   const result = await execFileAsync('git', args, {
     cwd: repo,
@@ -224,6 +318,24 @@ const runGit = async (repo, args, options = {}) => {
   return result.stdout;
 };
 
+/**
+ * Checks out `baseSha` into a disposable, detached git worktree under a
+ * fresh temp directory, runs `callback(worktreePath)`, and guarantees the
+ * worktree and its temp directory are removed afterward (even if the
+ * callback throws), so baseline comparisons never leak state into the real
+ * repo or persist across runs. Refuses to proceed if the generated temp
+ * path does not actually resolve inside the OS temp directory, so a hostile
+ * or misconfigured temp root cannot trick cleanup into acting outside it.
+ * Internal git calls that create/remove the worktree are hardened against
+ * executing attacker-controlled config from the checked-out commit (hooks,
+ * fsmonitor, attributes smudge filters — see the inline comments below)
+ * and, when `env`/`timeoutMs` are supplied, run with the workflow's
+ * sanitized environment and a bounded timeout so they cannot inherit
+ * ambient CI secrets or hang the gate.
+ * @param {{repo: string, baseSha: string, env?: object, timeoutMs?: number}} options
+ * @param {(worktreePath: string) => Promise<*>} callback
+ * @returns {Promise<*>} whatever `callback` resolves to.
+ */
 const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, callback) => {
   const parent = await mkdtemp(path.join(tmpdir(), 'codex-pr-baseline-'));
   const worktree = path.join(parent, 'worktree');
@@ -284,6 +396,29 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   }
 };
 
+/**
+ * Determines whether a head failure for `check` also reproduces at
+ * `baseSha`, so a pre-existing failure can be reported as inherited from
+ * the base rather than misattributed to this PR. Skips the comparison
+ * entirely when the check is not `baselineSafe` (some checks, like a Docker
+ * build, are unsafe or too expensive to duplicate in a throwaway worktree).
+ * Runs `setup` then `execute` inside a disposable worktree at the base
+ * commit (via `withWorktree`); a failed setup BLOCKs rather than trusting
+ * an incomplete baseline, and a `toolVersions` mismatch between head and
+ * baseline environments refuses to make any baseline claim at all. Only an
+ * exact `failureSignature` match against a non-PASS baseline result labels
+ * the head result `status: 'BASELINE'` — note this is still `blocking:
+ * true` (statusFrom rolls BASELINE into overall BLOCKED): a pre-existing
+ * failure is not attributed to this PR, but it must not silently pass the
+ * gate either. Any other outcome returns `headResult` with its original
+ * status untouched, i.e. a failure that does not reproduce at the base is
+ * treated as a regression introduced by this PR.
+ * @param {object} options destructured: repo, baseSha, check, headResult,
+ *   withWorktree, execute, toolVersions, captureVersions, setup, env,
+ *   baselineGitTimeoutMs (see body for how each is used).
+ * @returns {Promise<object>} headResult, possibly augmented with baseline
+ *   evidence and/or reclassified to `status: 'BASELINE'`.
+ */
 const verifyBaseline = async ({
   repo,
   baseSha,

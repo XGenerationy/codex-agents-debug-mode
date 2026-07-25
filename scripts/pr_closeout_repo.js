@@ -10,10 +10,17 @@ const { scanSuppressionText } = require('./pr_closeout_core');
 const { fingerprintEntries, isGateFile } = require('./pr_closeout_git');
 
 const execFileAsync = promisify(execFile);
-// Preserve literal backslashes on POSIX: Git can report a filename that
-// contains `\`, and converting every `\` to `/` would probe the wrong path and
-// skip suppression scans (ENOENT). Only normalize Windows path separators when
-// the path looks like a Windows absolute path or contains drive-style roots.
+/**
+ * Normalize a raw git-reported path for consistent comparison and lookup:
+ * strips a leading `./`, and — only when actually running on win32 —
+ * converts `\` separators to `/`. On POSIX, backslashes are left intact even
+ * if the path looks Windows-shaped, because Git can report a filename that
+ * legitimately contains a literal `\`; rewriting it there would probe the
+ * wrong path on disk and silently drop that file out of suppression scanning
+ * (ENOENT).
+ * @param {string} file - Raw path as reported by git (e.g. NUL-delimited `-z` output).
+ * @returns {string} The normalized path.
+ */
 const normalize = (file) => {
   const raw = String(file);
   const stripped = raw.replace(/^\.\//, '');
@@ -28,6 +35,17 @@ const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const utf16leDecoder = new TextDecoder('utf-16le', { fatal: true });
 const utf16beDecoder = new TextDecoder('utf-16be', { fatal: true });
 
+/**
+ * Decode raw file bytes into text, auto-detecting a UTF-16 BOM (LE `FF FE`
+ * or BE `FE FF`) before falling back to strict UTF-8. All three decoders run
+ * with `fatal: true`, so malformed sequences throw instead of silently
+ * producing replacement characters; a NUL byte with no recognized BOM is
+ * rejected up front as an unrecognized/binary encoding rather than handed to
+ * the UTF-8 decoder.
+ * @param {Uint8Array} bytes - Raw file contents.
+ * @returns {string} Decoded text.
+ * @throws {Error} If the bytes contain a NUL byte outside a recognized BOM, or fail strict decoding.
+ */
 const decodeTouchedText = (bytes) => {
   if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
     return utf16leDecoder.decode(bytes.subarray(2));
@@ -41,8 +59,15 @@ const decodeTouchedText = (bytes) => {
   return utf8Decoder.decode(bytes);
 };
 
-// Always pass --no-textconv on internal diffs/fingerprints so a repo-local
-// diff driver cannot run arbitrary converters during closeout validation.
+/**
+ * Force `--no-textconv` onto any `git diff` invocation so a repo-local diff
+ * driver (configured via `.gitattributes`/`textconv`) cannot run an
+ * arbitrary converter during internal closeout diffing or fingerprinting. A
+ * no-op for non-`diff` subcommands, and left untouched if the caller already
+ * passed `--no-textconv` or `--textconv` explicitly.
+ * @param {string[]} args - git argv (e.g. `['diff', '--name-only', ...]`).
+ * @returns {string[]} `args` with `--no-textconv` inserted right after `diff` when needed.
+ */
 const withNoTextconv = (args) => {
   if (!args.includes('diff')) return args;
   if (args.includes('--no-textconv') || args.includes('--textconv')) return args;
@@ -52,11 +77,16 @@ const withNoTextconv = (args) => {
   return out;
 };
 
-// Internal git must not run local fsmonitor/hooks configured in the repo or
-// user config — those would execute outside spawnCaptured containment.
-// core.fileMode=true forces executable-bit detection so a validation command
-// that sets core.fileMode=false cannot hide a chmod change to a tracked file
-// from the status/diff seal.
+/**
+ * Wrap git argv with the config flags every internal (non-user-facing) git
+ * call needs: disable fsmonitor/hooks so a repo- or user-configured local
+ * hook can never run outside spawnCaptured's containment, force
+ * `core.fileMode=true` so a validation command cannot flip
+ * `core.fileMode=false` to hide a chmod change to a tracked file from the
+ * status/diff seal, and apply withNoTextconv.
+ * @param {string[]} args - git argv.
+ * @returns {string[]} args prefixed with the safety `-c` flags.
+ */
 const withInternalGitSafety = (args) => ([
   '-c', 'core.fsmonitor=',
   '-c', 'core.useBuiltinFSMonitor=false',
@@ -108,6 +138,15 @@ const listIgnoreFiles = async (repo) => {
   return [...new Set([...visible, ...ignored])].sort();
 };
 
+/**
+ * Run git under withInternalGitSafety and return raw stdout as a Buffer
+ * (undecoded), capped at 50MB via execFile's `maxBuffer`. Callers decode as
+ * needed: gitText trims it to a UTF-8 string, gitPaths splits it on NUL and
+ * normalizes each path.
+ * @param {string} repo - Absolute repository path.
+ * @param {string[]} args - git argv.
+ * @returns {Promise<Buffer>} Raw stdout bytes.
+ */
 const gitBuffer = async (repo, args) => {
   const result = await execFileAsync('git', withInternalGitSafety(args), {
     cwd: repo,
@@ -124,6 +163,18 @@ const gitPaths = async (repo, args) => (await gitBuffer(repo, args))
   .filter(Boolean)
   .map(normalize);
 
+/**
+ * Resolve the repository snapshot the rest of closeout operates on: HEAD,
+ * `baseRef`, and their merge-base SHAs (resolved concurrently), plus the
+ * full touched-file set. `touchedFiles` is the union of everything the PR
+ * branch changed since the merge-base (three-dot diff) with whatever is
+ * currently staged, unstaged, or untracked in the working tree — so it
+ * reflects both committed branch history and any in-progress edits at scan
+ * time.
+ * @param {{repo: string, baseRef: string}} options - `repo` is resolved to an absolute path; `baseRef` is a required live PR base ref (branch or SHA).
+ * @returns {Promise<{repo: string, baseRef: string, baseSha: string, mergeBaseSha: string, headSha: string, touchedFiles: string[]}>}
+ * @throws {Error} If `baseRef` is not supplied.
+ */
 const resolveRepositoryState = async ({ repo, baseRef }) => {
   if (!baseRef) throw new Error('A live PR base ref is required. Pass --base-ref or set baseRef in config.');
   const resolvedRepo = path.resolve(repo);
@@ -148,14 +199,34 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
   };
 };
 
+/**
+ * Read the project metadata buildCheckPlan resolves checks against:
+ * `package.json` scripts, and the target names defined in whichever
+ * Makefile variant the repo uses. Makefile discovery follows GNU make's own
+ * documented default search order — GNUmakefile, then makefile, then
+ * Makefile — stopping at the first one present; target names are parsed from
+ * lines shaped like `name:` while excluding variable assignments like
+ * `name:=`. A missing file is silently treated as "no scripts" / "no
+ * targets" (ENOENT is swallowed); every other read failure — including the
+ * symlink/non-regular/oversized rejections from the nested safeReadFile
+ * guard — propagates.
+ * @param {string} repo - Absolute repository path.
+ * @returns {Promise<{packageScripts: Record<string, string>, makeTargets: string[]}>}
+ */
 const readProjectMetadata = async (repo) => {
   let packageScripts = {};
   let makeTargets = [];
-  // Reject symlinked and non-regular metadata before reading: a reviewed
-  // branch can make root package.json or a default Makefile a symlink to
-  // /dev/zero or an outside file, or replace it with a directory or FIFO
-  // whose read throws EISDIR or blocks before any later check can stop the
-  // read and before any structured evidence report exists.
+  /**
+   * Reject symlinked and non-regular metadata before reading it: a reviewed
+   * branch can make root `package.json` or a default Makefile a symlink to
+   * `/dev/zero` or an outside file, or replace it with a directory or FIFO
+   * whose read throws EISDIR or blocks — before any later check can stop the
+   * read and before any structured evidence report exists. Also enforces the
+   * shared MAX_SUPPRESSION_SCAN_BYTES cap.
+   * @param {string} relative - Path relative to `repo`.
+   * @returns {Promise<string|undefined>} File contents, or `undefined` if the path does not exist.
+   * @throws {Error} If the path is a symlink, a non-regular file, or exceeds the size cap.
+   */
   const safeReadFile = async (relative) => {
     const absolute = path.join(repo, relative);
     let info;
@@ -214,13 +285,19 @@ const MAX_SUPPRESSION_SCAN_BYTES = 5 * 1024 * 1024;
 // without loading the whole file.
 const BINARY_SAMPLE_BYTES = 4096;
 
-// Open with O_NOFOLLOW (where the platform supports it) so a final-component
-// symlink is rejected at open time, closing the lstat-then-readFile TOCTOU
-// race: between a plain lstat and a subsequent path-based read, a concurrent
-// replacement can redirect the read through a symlink. Reading through the
-// returned file descriptor cannot be redirected. On platforms without
-// O_NOFOLLOW (e.g. Windows), the caller's lstat symlink check still rejects
-// static symlinks. Mirrors the existing openArtifact behavior.
+/**
+ * Open a file with `O_NOFOLLOW` (where the platform supports it) so a
+ * final-component symlink is rejected at open time, closing the
+ * lstat-then-readFile TOCTOU race: between a caller's plain `lstat` and a
+ * later path-based read, a concurrent replacement could otherwise redirect
+ * the read through a symlink. Reading through the returned file descriptor
+ * cannot be redirected. Falls back to a plain open when the platform has no
+ * `O_NOFOLLOW` (e.g. Windows) or rejects the flag as unsupported — the
+ * caller's `lstat` symlink check still rejects a static symlink there.
+ * Mirrors the existing `openArtifact` behavior.
+ * @param {string} absolute - Absolute filesystem path.
+ * @returns {Promise<import('node:fs/promises').FileHandle>} An open file handle.
+ */
 const openNoFollow = async (absolute) => {
   const noFollow = constants.O_NOFOLLOW || 0;
   try {
@@ -237,6 +314,25 @@ const readHeadFromHandle = async (handle, size) => {
   return buffer.subarray(0, bytesRead);
 };
 
+/**
+ * Scan every touched file for suppression markers, config-level silencing,
+ * and test-weakening (via scanSuppressionText), while defending the read
+ * itself against a hostile or racing working tree. For each file: a missing
+ * file (ENOENT) is skipped silently; a symlink, a non-regular file
+ * (FIFO/socket/device), or a file over MAX_SUPPRESSION_SCAN_BYTES each
+ * produce a `scan-error` finding instead of being read. Surviving files are
+ * opened with `O_NOFOLLOW` (via openNoFollow) so a concurrent replacement
+ * between the `lstat` check and the open cannot redirect the read through a
+ * symlink — the same TOCTOU-closing pattern readGateChanges applies
+ * independently to untracked gate files. The first sampled bytes are
+ * checked for a NUL byte to reject binary content as a `scan-error`, except
+ * a UTF-16 BOM prefix (which legitimately starts with a NUL-adjacent byte
+ * pair); any other unexpected error becomes a `scan-error` finding rather
+ * than aborting the whole scan.
+ * @param {string} repo - Absolute repository path.
+ * @param {string[]} files - Repo-relative touched file paths to scan.
+ * @returns {Promise<Array<{file: string, line: number, category: string, match: string}>>} Combined findings across every file.
+ */
 const scanTouchedSuppressions = async (repo, files) => {
   const findings = [];
   for (const file of files) {
@@ -310,10 +406,15 @@ const scanTouchedSuppressions = async (repo, files) => {
 
 const hashBytes = (value) => createHash('sha256').update(value).digest('hex');
 
-// Stream the file through the hash instead of materializing the entire
-// contents in memory. The fingerprint runs several times per closeout (initial
-// tree, before/after GitHub verification, final seal), and a single large
-// untracked artifact is enough to spike memory if readFile() is used.
+/**
+ * Stream a file's contents through a SHA-256 hash rather than materializing
+ * it in memory. workingTreeFingerprint runs several times per closeout
+ * (initial tree, before/after GitHub verification, final seal), and a single
+ * large untracked artifact is enough to spike memory if `readFile()` were
+ * used instead.
+ * @param {string} absolute - Absolute filesystem path to a regular file.
+ * @returns {Promise<string>} Hex-encoded SHA-256 digest of the file's contents.
+ */
 const hashFile = async (absolute) => {
   const hash = createHash('sha256');
   const stream = createReadStream(absolute);
@@ -321,11 +422,21 @@ const hashFile = async (absolute) => {
   return hash.digest('hex');
 };
 
-// Shared filesystem-entry hasher used by both workingTreeFingerprint and
-// collectExtraEntries.visit so the symlink/lstat/ENOENT/hashFile guard has
-// one owner. Two independently-maintained copies of this safety-critical
-// guard is the pattern that produced the earlier decodeTouchedText-bypass
-// bug in this file.
+/**
+ * Shared filesystem-entry hasher used by both workingTreeFingerprint and
+ * collectExtraEntries's `visit` so the symlink/lstat/ENOENT/hashFile guard
+ * has exactly one owner — two independently-maintained copies of this
+ * safety-critical guard is the pattern that produced the earlier
+ * decodeTouchedText-bypass bug in this file. Produces a stable hash for
+ * every entry kind: a missing path and a non-regular path (FIFO/socket/
+ * device) each hash to a fixed marker, a symlink hashes its target text
+ * without dereferencing it, and a regular file is streamed through
+ * hashFile. A file that disappears between this function's `lstat` and the
+ * streamed read (a benign race, not tampering) is treated the same as
+ * already-missing rather than thrown.
+ * @param {string} absolute - Absolute filesystem path.
+ * @returns {Promise<string>} Hex-encoded SHA-256 digest identifying the entry's kind and content.
+ */
 const hashFsEntry = async (absolute) => {
   let info;
   try {
@@ -354,6 +465,17 @@ const hashFsEntry = async (absolute) => {
   }
 };
 
+/**
+ * Validate and resolve a config-supplied "extra" reproducibility path before
+ * it is folded into workingTreeFingerprint. Rejects an absolute `requested`
+ * value outright, then rejects any path that resolves outside `repo` (`..`
+ * traversal) or into `.git`/`.git/...` — config cannot use this mechanism to
+ * fingerprint, or let a validation command tamper with, git internals.
+ * @param {string} repo - Absolute repository path.
+ * @param {string} requested - Repo-relative path from config (e.g. an `extraPaths` entry).
+ * @returns {{absolute: string, relative: string}} The resolved absolute path and its normalized repo-relative form.
+ * @throws {Error} If `requested` is absolute, empty, escapes the repo, or targets `.git`.
+ */
 const resolveExtraPath = (repo, requested) => {
   if (!requested || path.isAbsolute(requested)) throw new Error(`Reproducibility path must be repository-relative: ${requested}`);
   const absolute = path.resolve(repo, requested);
@@ -366,6 +488,21 @@ const resolveExtraPath = (repo, requested) => {
   return { absolute, relative: normalized };
 };
 
+/**
+ * Resolve one config-supplied extra path (via resolveExtraPath) and
+ * recursively fold it into the shared `entries` array that
+ * workingTreeFingerprint later hashes. A missing path records a stable
+ * "missing" marker, a symlink records its target text without following it,
+ * a directory records a marker entry and then recurses into its children in
+ * sorted order (so traversal order never affects the resulting fingerprint),
+ * and a regular file delegates to hashFsEntry. Lets paths outside git's own
+ * tracked/untracked accounting (e.g. generated output) be sealed into the
+ * reproducibility fingerprint.
+ * @param {string} repo - Absolute repository path.
+ * @param {string} requested - Repo-relative extra path to fold in.
+ * @param {{path: string, hash: string}[]} entries - Shared accumulator array, mutated in place.
+ * @returns {Promise<void>}
+ */
 const collectExtraEntries = async (repo, requested, entries) => {
   const root = resolveExtraPath(repo, requested);
   const visit = async ({ absolute, relative }) => {
@@ -394,10 +531,18 @@ const collectExtraEntries = async (repo, requested, entries) => {
   await visit(root);
 };
 
-// Stream git stdout through a hash instead of buffering it via execFile's
-// maxBuffer. A sufficiently large tracked/staged diff can exceed the
-// execFile maxBuffer and throw, which used to reject the closeout workflow
-// before any evidence report was written. Streaming keeps memory bounded.
+/**
+ * Run git via `spawn` (not execFile) and stream stdout through a SHA-256
+ * hash instead of buffering it against execFile's `maxBuffer` ceiling. A
+ * sufficiently large tracked/staged diff can exceed that buffer and throw,
+ * which used to reject the whole closeout workflow before any evidence
+ * report was written; streaming keeps memory bounded regardless of diff
+ * size.
+ * @param {string} repo - Absolute repository path.
+ * @param {string[]} args - git argv.
+ * @returns {Promise<string>} Hex-encoded SHA-256 digest of stdout.
+ * @throws {Error} If git exits non-zero, including captured stderr in the message.
+ */
 const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
   const hash = createHash('sha256');
   const child = spawn('git', withInternalGitSafety(args), { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -414,6 +559,25 @@ const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
   });
 });
 
+/**
+ * Compute a single composite fingerprint of everything that can change the
+ * meaning of "clean working tree" between two points in the closeout
+ * workflow, so no individual channel git uses to hide or reveal a change can
+ * be manipulated without moving the seal. Combines: the tracked diff against
+ * HEAD (binary-safe, textconv disabled); `.git/info/exclude`, resolved via
+ * `git rev-parse --git-path` so a linked worktree still seals its real
+ * gitdir file; the local `core.excludesFile`; the global `core.excludesFile`
+ * and the XDG default global gitignore (both of which `--exclude-standard`
+ * also consults); every per-directory `.gitignore` in the repo, tracked or
+ * untracked, including a self-ignoring one; every untracked file's identity
+ * (via hashFsEntry); and any caller-supplied `extraPaths` (via
+ * collectExtraEntries). All entries are handed to fingerprintEntries, which
+ * sorts by path before hashing so entry-collection order never affects the
+ * result.
+ * @param {string} repo - Absolute repository path.
+ * @param {string[]} [extraPaths] - Additional repo-relative paths (files or directories) to fold into the seal.
+ * @returns {Promise<string>} Hex-encoded SHA-256 composite fingerprint.
+ */
 const workingTreeFingerprint = async (repo, extraPaths = []) => {
   const [diffHash, untracked] = await Promise.all([
     hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD']),
@@ -492,6 +656,20 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
   return fingerprintEntries(entries);
 };
 
+/**
+ * Two-layer "is the working tree clean" check. First runs `git status`
+ * forcing `--untracked-files=all` and `--ignore-submodules=none` so local or
+ * global config that would normally hide untracked files or dirty
+ * submodules cannot mask them here — any porcelain output FAILs with up to
+ * 20 lines of evidence. Second, even with clean porcelain output, checks
+ * `git ls-files -v` for assume-unchanged (lowercase tag) or skip-worktree
+ * (`S` tag) index bits on tracked files — both make `git status`/`git diff`
+ * blind to real edits on those files, so any tagged file also FAILs. Does
+ * not by itself detect a mutated `.git/info/exclude`; a caller that needs
+ * that sealed compares workingTreeFingerprint before/after instead.
+ * @param {string} repo - Absolute repository path.
+ * @returns {Promise<{status: 'PASS'|'FAIL', evidence: string}>}
+ */
 const cleanTreeStatus = async (repo) => {
   // Force untracked reporting even when status.showUntrackedFiles=no is set
   // locally/globally; otherwise porcelain omits untracked files and a dirty
@@ -525,6 +703,26 @@ const cleanTreeStatus = async (repo) => {
   return { status: 'PASS', evidence: 'Working tree is clean.' };
 };
 
+/**
+ * Extract what changed in "gate" files (isGateFile — CI workflows, package
+ * manifests/lockfiles, linter/Makefile/test-runner configs, and this tool's
+ * own config) between `baseSha` and the current working tree, so a caller
+ * like classifyGateIntegrity can fail closed on weakened or deleted
+ * validation. For tracked gate files, only added lines (`+...`, excluding
+ * the `+++` file header) are collected from a unified=0 diff against
+ * `baseSha` — the point is to see what new content entered the file, not
+ * what left. For untracked gate files (new in this PR), the whole file is
+ * read as "added" through the same symlink-safe, size-capped, `O_NOFOLLOW`
+ * guarded path used by scanTouchedSuppressions, closing the same
+ * lstat-then-read TOCTOU race. Any failure along either path — an oversized
+ * tracked diff exceeding execFile's `maxBuffer`, or a per-file read guard
+ * rejecting a file — degrades to a bounded `+__decode_error__:...` synthetic
+ * line instead of throwing, so the closeout workflow still gets a structured
+ * result to report against.
+ * @param {string} repo - Absolute repository path.
+ * @param {string} baseSha - Base commit SHA to diff gate files against.
+ * @returns {Promise<{changedFiles: string[], addedLines: string[], deletedFiles: string[]}>}
+ */
 const readGateChanges = async (repo, baseSha) => {
   // A deleted gate file contributes no added lines, so surface it on a
   // dedicated channel: classifyGateIntegrity must fail closed when a
