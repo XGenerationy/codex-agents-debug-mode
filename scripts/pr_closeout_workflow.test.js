@@ -622,6 +622,7 @@ test('overall status never treats baseline, residual findings, or dirty output a
     gateIntegrity: { status: 'PASS' },
     phases: { status: 'PASS' },
     reproducibility: { status: 'PASS' },
+    preGithubCleanTree: { status: 'PASS' },
     cleanTree: { status: 'PASS' },
     headConsistency: { status: 'PASS' },
     repositorySeal: { status: 'PASS' },
@@ -632,6 +633,10 @@ test('overall status never treats baseline, residual findings, or dirty output a
   assert.equal(evaluateOverallStatus({ ...base, phases: { status: 'BASELINE' } }), 'BLOCKED');
   assert.equal(evaluateOverallStatus({ ...base, suppressionFindings: [{}] }), 'FAIL');
   assert.equal(evaluateOverallStatus({ ...base, cleanTree: { status: 'FAIL' } }), 'FAIL');
+  // Pre-GitHub dirt is first-class: even when the final tree is clean, a dirty
+  // pre-GitHub probe must still fail (or block) overall status.
+  assert.equal(evaluateOverallStatus({ ...base, preGithubCleanTree: { status: 'FAIL' } }), 'FAIL');
+  assert.equal(evaluateOverallStatus({ ...base, preGithubCleanTree: { status: 'BLOCKED' } }), 'BLOCKED');
 });
 
 test('writes exactly 19 final mandatory rows when admission is blocked', async () => {

@@ -3,21 +3,44 @@ const { mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow } = require('./pr_closeout_fs');
 
+/**
+ * Escape untrusted report text for Markdown: collapse newlines and replace
+ * every non-allowlisted character with a numeric HTML entity so evidence
+ * cannot inject headings, links, tables, or HTML into the report.
+ * @param {*} value
+ * @returns {string}
+ */
 const safeText = (value) => String(value ?? '')
   .replace(/\r\n?|\n/g, ' ⏎ ')
   .replace(/[^A-Za-z0-9 ._⏎-]/gu, (character) => `&#${character.codePointAt(0)};`);
 
+/** @param {*} value @returns {string} table-cell-safe text */
 const cell = (value) => safeText(value);
 
+/**
+ * Render suppression findings as a Markdown bullet list (or `- None`).
+ * @param {object[]} [findings]
+ * @returns {string}
+ */
 const listFindings = (findings = []) => findings.length
   ? findings.map((finding) => `- ${safeText(finding.file)}: ${safeText(finding.line)} - ${safeText(finding.category)}: ${safeText(finding.match)}`).join('\n')
   : '- None';
 
+/**
+ * Count observed attempts on a check (array form or single-shot fields).
+ * @param {object} [check]
+ * @returns {number}
+ */
 const attemptCount = (check = {}) => {
   if (Array.isArray(check.attempts)) return check.attempts.length;
   return check.attemptId || check.startedAt || check.finishedAt || Number.isInteger(check.exitCode) ? 1 : 0;
 };
 
+/**
+ * Collect attempt IDs from a check for evidence tables.
+ * @param {object} [check]
+ * @returns {string[]}
+ */
 const attemptIds = (check = {}) => {
   if (Array.isArray(check.attempts)) {
     return check.attempts.map(({ attemptId }) => attemptId).filter(Boolean);
@@ -25,6 +48,12 @@ const attemptIds = (check = {}) => {
   return check.attemptId ? [check.attemptId] : [];
 };
 
+/**
+ * Human-readable attempt/rerun summary pairing qualification with confirmation.
+ * @param {object} check
+ * @param {object} [qualification]
+ * @returns {string}
+ */
 const attemptSummary = (check, qualification) => {
   const qualificationAttempts = attemptCount(qualification);
   const confirmationAttempts = attemptCount(check);
@@ -44,6 +73,11 @@ const attemptSummary = (check, qualification) => {
   ].join('; ');
 };
 
+/**
+ * Summarize baseline comparison or setup for a confirmation check row.
+ * @param {object} check
+ * @returns {string}
+ */
 const baselineComparison = (check) => {
   if (check.baseline) {
     return `Base result: ${check.baseline.status || 'unknown'}${check.baseline.attemptId ? ` (${check.baseline.attemptId})` : ''}`;
@@ -54,11 +88,25 @@ const baselineComparison = (check) => {
   return 'Not run; no baseline claim.';
 };
 
+/**
+ * Return the operator-supplied fix record, or a fixed “no fix” sentence.
+ * @param {object} check
+ * @returns {string}
+ */
 const fixRecord = (check) => check.fixRecord
   || 'No fix record was supplied; the runner does not perform or infer repairs.';
 
+/** @param {string} value @returns {string} regex-escaped literal */
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/**
+ * Replace absolute path-root prefixes (all separator variants) with a stable
+ * placeholder. Used by normalizeReportPaths for `<repo>` / `<evidence>`.
+ * @param {string} value
+ * @param {string} root
+ * @param {string} replacement
+ * @returns {string}
+ */
 const replacePathRoot = (value, root, replacement) => {
   if (!root || root === replacement) return value;
   const variants = [...new Set([
@@ -239,6 +287,11 @@ const renderMarkdown = (report) => {
     `- Evidence write evidence: ${safeText(report.repositorySeal?.evidenceWrite?.evidence || 'not recorded')}`,
     `- Evidence write fingerprint: ${safeText(report.repositorySeal?.evidenceWrite?.fingerprint || 'unresolved')}`,
     '',
+    '## Pre-GitHub clean tree',
+    '',
+    `- Status: ${safeText(report.preGithubCleanTree?.status || 'unknown')}`,
+    `- Evidence: ${safeText(report.preGithubCleanTree?.evidence || 'not recorded')}`,
+    '',
     '## Final clean tree',
     '',
     `- Status: ${safeText(report.cleanTree?.status || 'unknown')}`,
@@ -256,7 +309,11 @@ const renderMarkdown = (report) => {
   return lines.join('\n');
 };
 
-// Domain wrapper: shared assertNotSymlink with report-specific message.
+/**
+ * Domain wrapper: shared assertNotSymlink with report-specific message.
+ * @param {string} target
+ * @returns {Promise<void>}
+ */
 const assertNotSymlink = async (target) => {
   await assertNotSymlinkShared(
     target,
@@ -264,15 +321,21 @@ const assertNotSymlink = async (target) => {
   );
 };
 
-// Write without following a symlinked final component. writeFile follows a
-// symlink; if outputDir already contains report.json/report.md as a symlink
-// (a reused temp directory or otherwise-populated output path), a
-// path-based write would silently overwrite whatever the link points to
-// instead of writing evidence there — and by this point the repository seal
-// has already run, so it cannot catch the divergence. Fail closed instead.
-// assertNotSymlink is the primary guard on platforms without O_NOFOLLOW
-// (e.g. Windows); openNoFollow adds defense-in-depth on platforms that
-// support it. Shared implementation lives in pr_closeout_fs.js.
+/**
+ * Write without following a symlinked final component. writeFile follows a
+ * symlink; if outputDir already contains report.json/report.md as a symlink
+ * (a reused temp directory or otherwise-populated output path), a
+ * path-based write would silently overwrite whatever the link points to
+ * instead of writing evidence there — and by this point the repository seal
+ * has already run, so it cannot catch the divergence. Fail closed instead.
+ * assertNotSymlink is the primary guard on platforms without O_NOFOLLOW
+ * (e.g. Windows); openNoFollow adds defense-in-depth on platforms that
+ * support it. Staging uses O_EXCL so a pre-existing hard link cannot be
+ * truncated before the nlink check.
+ * @param {string} target
+ * @param {string} contents
+ * @returns {Promise<void>}
+ */
 const writeNoFollow = async (target, contents) => {
   await assertNotSymlink(target);
   let handle;

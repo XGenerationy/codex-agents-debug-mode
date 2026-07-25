@@ -41,6 +41,12 @@ const gateAttestationMarker = ({ baseSha, headSha, configDigest }) => (
   `PR-CLOSEOUT-ATTESTATION v1 base=${baseSha} head=${headSha} config=${configDigest} decision=not-weakened`
 );
 
+/**
+ * Look up a collaborator-permission record by reviewer login (case-insensitive).
+ * @param {Map|object|undefined} reviewerPermissions
+ * @param {string} reviewer
+ * @returns {object|undefined}
+ */
 const permissionRecordFor = (reviewerPermissions, reviewer) => {
   if (reviewerPermissions instanceof Map) {
     return reviewerPermissions.get(reviewer.toLowerCase());
@@ -51,6 +57,13 @@ const permissionRecordFor = (reviewerPermissions, reviewer) => {
   return undefined;
 };
 
+/**
+ * Decide whether a review author may attest the gate: OWNER/MEMBER/COLLABORATOR
+ * association, or a proven WRITE+ collaborator permission record.
+ * @param {object} review
+ * @param {Map|object} [reviewerPermissions]
+ * @returns {{authorized: boolean, association: string|null, permission: string|null}}
+ */
 const reviewerAuthorization = (review, reviewerPermissions) => {
   const association = String(review?.author_association || review?.authorAssociation || '').toUpperCase();
   if (AUTHORITATIVE_ASSOCIATIONS.has(association)) {

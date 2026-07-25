@@ -232,6 +232,14 @@ test('renders initial-tree and evidence-write sealing evidence', () => {
     evidence: 'Initial tree clean.',
     fingerprint: 'initial123',
   };
+  report.preGithubCleanTree = {
+    status: 'PASS',
+    evidence: 'Pre-GitHub working tree was clean.',
+  };
+  report.cleanTree = {
+    status: 'PASS',
+    evidence: 'Final working tree was clean.',
+  };
   report.repositorySeal = {
     status: 'PASS',
     evidence: 'Stable through report persistence.',
@@ -250,6 +258,10 @@ test('renders initial-tree and evidence-write sealing evidence', () => {
   assert.match(markdown, /## Initial working tree/);
   assert.match(markdown, /Initial tree clean\./);
   assert.match(markdown, /initial123/);
+  assert.match(markdown, /## Pre-GitHub clean tree/);
+  assert.match(markdown, /Pre-GitHub working tree was clean\./);
+  assert.match(markdown, /## Final clean tree/);
+  assert.match(markdown, /Final working tree was clean\./);
   assert.match(markdown, /Evidence write seal/);
   assert.match(markdown, /postwrite123/);
   assert.match(markdown, /blocked provisional report/i);

@@ -35,10 +35,16 @@ const root = path.resolve(__dirname, '..');
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
+/**
+ * Run git in the repository root and return raw stdout (not trimmed).
+ * Path lists are NUL-delimited; individual entries may begin/end with
+ * whitespace (legal Git paths). Callers that need a trimmed scalar SHA
+ * still trim themselves via gitScalar.
+ * @param {string[]} args
+ * @param {object} [options]
+ * @returns {string}
+ */
 const git = (args, options = {}) => {
-  // Do not trim the full stdout: path lists are NUL-delimited and individual
-  // entries may begin/end with whitespace (legal Git paths). Callers that need
-  // a trimmed scalar SHA still trim themselves.
   const { input, ...rest } = options;
   const stdout = execFileSync('git', args, {
     cwd: root,
@@ -51,16 +57,28 @@ const git = (args, options = {}) => {
   return String(stdout || '');
 };
 
+/** @param {string[]} args @param {object} [options] @returns {string} trimmed git stdout */
 const gitScalar = (args, options = {}) => git(args, options).trim();
 
+/**
+ * Split a NUL-delimited path list, preserving each nonempty segment
+ * byte-for-byte (leading/trailing spaces are part of a legal Git path).
+ * @param {string} text
+ * @returns {string[]}
+ */
 const splitZ = (text) => {
-  // Preserve each nonempty NUL-delimited segment byte-for-byte. Do not trim:
-  // a leading/trailing space is part of a legal Git path.
   const raw = String(text || '');
   if (!raw) return [];
   return raw.split('\0').filter((entry) => entry.length > 0);
 };
 
+/**
+ * True when value is a usable commit/tree object ID (not empty, not the
+ * all-zero push-create sentinel). Accepts abbreviated (7+) SHA-1 and full
+ * SHA-256 object IDs.
+ * @param {*} value
+ * @returns {boolean}
+ */
 const isUsableSha = (value) => {
   const sha = String(value || '').trim();
   // GitHub push "before" is 40 zeros when the ref is newly created.
@@ -71,6 +89,12 @@ const isUsableSha = (value) => {
 
 // Repository-specific empty tree (SHA-1 constant or SHA-256 hash-object result).
 let cachedEmptyTreeSha = null;
+
+/**
+ * Resolve this repository's empty-tree object ID (SHA-1 well-known constant
+ * or the SHA-256 hash-object result for an empty tree).
+ * @returns {string}
+ */
 const resolveEmptyTreeSha = () => {
   if (cachedEmptyTreeSha) return cachedEmptyTreeSha;
   try {
@@ -83,10 +107,15 @@ const resolveEmptyTreeSha = () => {
   return cachedEmptyTreeSha;
 };
 
+/**
+ * True when `sha` denotes the empty tree. Comparison is case-insensitive and
+ * accepts abbreviated empty-tree IDs (7+) so CLOSEOUT_BASE_SHA=4b825dc (or an
+ * uppercase form) still selects the two-dot empty-tree diff path instead of a
+ * three-dot commit range Git rejects.
+ * @param {*} sha
+ * @returns {boolean}
+ */
 const isEmptyTreeSha = (sha) => {
-  // Compare case-insensitively and accept abbreviated empty-tree IDs (7+)
-  // so CLOSEOUT_BASE_SHA=4b825dc (or an uppercase form) still uses the
-  // two-dot empty-tree diff path instead of a three-dot commit range Git rejects.
   const value = String(sha || '').trim().toLowerCase();
   if (!value || !/^[0-9a-f]{7,64}$/.test(value)) return false;
   const known = EMPTY_TREE.toLowerCase();
@@ -97,6 +126,12 @@ const isEmptyTreeSha = (sha) => {
   return false;
 };
 
+/**
+ * Resolve the comparison base SHA for the CI suppression/gate scan from
+ * env (CLOSEOUT_BASE_SHA / GITHUB_BASE_SHA / GITHUB_EVENT_BEFORE), then
+ * merge-base with the PR base ref or main/master, else the empty tree.
+ * @returns {string}
+ */
 const resolveBaseSha = () => {
   const explicit = [
     process.env.CLOSEOUT_BASE_SHA,
@@ -181,14 +216,16 @@ const diffUnified = (baseSha, files) => {
   return git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', `${baseSha}...HEAD`, '--', ...files]);
 };
 
+/**
+ * Build the complete touched-file set: PR/push range + unstaged + staged +
+ * untracked. Fail closed: git errors propagate instead of becoming [].
+ * @param {string} baseSha
+ * @returns {string[]}
+ */
 const listTouchedFiles = (baseSha) => {
-  // Fail closed: do not swallow git errors into an empty touched set.
   const tracked = diffNameOnly(baseSha);
-  // Unstaged working-tree changes.
   const unstaged = splitZ(git(['diff', '--name-only', '-z']));
-  // Index-only (staged) changes that are not yet in HEAD.
   const staged = splitZ(git(['diff', '--cached', '--name-only', '-z']));
-  // Untracked files.
   const untracked = splitZ(git(['ls-files', '--others', '--exclude-standard', '-z']));
   return [...new Set([...tracked, ...unstaged, ...staged, ...untracked])].sort();
 };
@@ -218,6 +255,14 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build)\b/i,
 ];
 
+/**
+ * Scan gate-file diffs for removed validation-bearing lines (run:/uses:/
+ * test runners). Deletion-only weakening often lacks added-line markers, so
+ * this complements classifyGateIntegrity.
+ * @param {string} baseSha
+ * @param {string[]} gateFiles
+ * @returns {string[]} truncated matching removed lines
+ */
 const detectValidationRemovals = (baseSha, gateFiles) => {
   if (!gateFiles.length) return [];
   let diff = '';
@@ -236,6 +281,11 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
   return findings;
 };
 
+/**
+ * CLI entry: resolve base/head, scan suppressions + gate integrity, exit
+ * non-zero on FAIL findings or validation-step removals.
+ * @returns {Promise<void>}
+ */
 const main = async () => {
   const baseSha = resolveBaseSha();
   const headSha = gitScalar(['rev-parse', 'HEAD']);

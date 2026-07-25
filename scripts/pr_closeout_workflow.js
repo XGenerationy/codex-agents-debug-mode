@@ -55,6 +55,7 @@ const evaluateOverallStatus = ({
   gateIntegrity,
   phases,
   reproducibility,
+  preGithubCleanTree,
   cleanTree,
   headConsistency,
   repositorySeal,
@@ -68,6 +69,10 @@ const evaluateOverallStatus = ({
     gateIntegrity?.status,
     phases?.status,
     reproducibility?.status,
+    // Pre-GitHub dirty-tree probes are first-class status inputs so a
+    // transient dirt that later cleans up cannot be ignored even if the
+    // fold-into-cleanTree path is skipped or mis-wired.
+    preGithubCleanTree?.status,
     cleanTree?.status,
     headConsistency?.status,
     repositorySeal?.status,
@@ -794,6 +799,7 @@ const runCloseoutWorkflow = async ({
     gateIntegrity,
     phases,
     reproducibility,
+    preGithubCleanTree,
     cleanTree,
     headConsistency,
     repositorySeal,
@@ -853,6 +859,7 @@ const runCloseoutWorkflow = async ({
     gateIntegrity,
     phases,
     reproducibility,
+    preGithubCleanTree,
     cleanTree,
     headConsistency,
     repositorySeal,
@@ -895,6 +902,7 @@ const runCloseoutWorkflow = async ({
         gateIntegrity,
         phases,
         reproducibility,
+        preGithubCleanTree,
         cleanTree,
         headConsistency,
         repositorySeal,

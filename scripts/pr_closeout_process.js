@@ -77,6 +77,22 @@ const resolveCommandShell = ({ platform = process.platform, env = process.env } 
 };
 
 /**
+ * Default argv for every check/proof/preflight spawn. Uses a non-login,
+ * non-interactive bash (`--noprofile --norc -c`) so `~/.bash_profile`,
+ * `~/.bashrc`, and other shell startup files cannot inject PATH rewrites,
+ * aliases, or arbitrary commands into the validation trust domain.
+ *
+ * Profile-dependent tool discovery is intentionally NOT performed here:
+ * callers must put required tools on the parent process `PATH` (CI runners
+ * and developer terminals already do). Isolating PATH setup outside the
+ * per-command shell is the safe alternative to `bash -lc`.
+ *
+ * @param {string} command shell command string to execute
+ * @returns {string[]} argv for spawn/execFile after the shell binary
+ */
+const defaultShellArgs = (command) => ['--noprofile', '--norc', '-c', command];
+
+/**
  * Confirms the shell resolved by resolveCommandShell is actually runnable
  * before any check spawns it. fs.access on a bare command name (no path
  * separator) only checks the process cwd, not PATH — but
@@ -1893,7 +1909,7 @@ const createCommandExecutor = ({
   outputDir,
   env = process.env,
   shell = resolveCommandShell({ env }),
-  shellArgs = (command) => ['-lc', command],
+  shellArgs = defaultShellArgs,
   secretNames = [],
   timeoutMs = DEFAULT_TIMEOUT_MS,
   timeoutsMs = {},
@@ -2204,9 +2220,12 @@ const TOOL_PROBES = [
 
 /**
  * Default tool-version probe used by runPreflight. Runs `command` through
- * the same login-shell invocation (`<shell> -lc`) as the command executor,
- * so preflight tool discovery matches what checks can actually resolve at
- * run time. Never throws: a rejected execFile is normalized into the same
+ * the same non-login shell argv as the command executor
+ * (`--noprofile --norc -c`), so preflight tool discovery matches what
+ * checks can actually resolve at run time and shell profiles cannot inject
+ * side effects. Tools must already be on the parent process PATH.
+ *
+ * Never throws: a rejected execFile is normalized into the same
  * `{exitCode, stdout, stderr}` shape as a successful run, using the
  * rejection's `code`/`stdout`/`stderr` (falling back to `error.message`),
  * so every probe result can be handled uniformly by the caller.
@@ -2214,17 +2233,7 @@ const TOOL_PROBES = [
  */
 const probeCommandDefault = async ({ command, repo, shell, env }) => {
   try {
-    // Use the same login-shell invocation as the command executor (`bash -lc`) so
-    // preflight tool discovery matches what the executor can actually resolve.
-    // An earlier hardening pass tried `--noprofile --norc` here to stop an
-    // injected ~/.bash_profile from running during preflight, but that broke
-    // discovery of tools whose PATH is set up by login/profile init — preflight
-    // marked them BLOCKED and admission blocked the workflow even though the
-    // executor (which kept `-lc`) would have resolved them. The profile-injection
-    // vector is accepted as a known P2: preflight runs in the parent process
-    // trust domain, and fully containing it would mean routing these probes
-    // through spawnCaptured (a separate change).
-    const result = await execFileAsync(shell, ['-lc', command], {
+    const result = await execFileAsync(shell, defaultShellArgs(command), {
       cwd: repo,
       env,
       encoding: 'utf8',
@@ -2409,6 +2418,7 @@ module.exports = {
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  defaultShellArgs,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeCommandDefault,

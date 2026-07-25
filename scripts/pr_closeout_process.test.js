@@ -1095,11 +1095,13 @@ test('preflight preserves and redacts safeEnv credentials', async () => {
   assert.ok(Object.values(result.toolVersions).every((version) => !version.includes(secret)));
 });
 
-test('probeCommandDefault runs commands through the login shell (bash -lc) and resolves PATH', async () => {
+test('probeCommandDefault runs commands through a non-login shell (--noprofile --norc -c)', async () => {
   // Exercise the DEFAULT preflight probe path (not a stubbed probeCommand) to
-  // guard the shell invocation: probeCommandDefault must run `bash -lc <cmd>`
-  // so profile/PATH-managed tools stay discoverable, matching the command
-  // executor. A malformed shell-args change would make this exit non-zero.
+  // guard the shell invocation: probeCommandDefault must use the same safe
+  // argv as the executor (`--noprofile --norc -c`) so shell profiles cannot
+  // inject side effects, while still resolving tools already on PATH.
+  const { defaultShellArgs } = require('./pr_closeout_process');
+  assert.deepEqual(defaultShellArgs('true'), ['--noprofile', '--norc', '-c', 'true']);
   const shell = resolveCommandShell({ env: process.env });
   const result = await probeCommandDefault({
     command: 'printf %s probe-default-ok',
@@ -1107,7 +1109,7 @@ test('probeCommandDefault runs commands through the login shell (bash -lc) and r
     shell,
     env: process.env,
   });
-  assert.equal(result.exitCode, 0, `default probe must succeed via the login shell: ${JSON.stringify(result)}`);
+  assert.equal(result.exitCode, 0, `default probe must succeed via non-login shell: ${JSON.stringify(result)}`);
   assert.equal(result.stdout, 'probe-default-ok');
 });
 
