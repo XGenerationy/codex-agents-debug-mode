@@ -112,7 +112,10 @@ const findFreePort = () =>
 // Spawn the real CLI against a temp project root. Resolves with the parsed
 // startup outcome as soon as the single structured startup line appears on
 // stdout, or with the exit code when the process exits before printing one.
-const launchCli = (projectRoot, port) => {
+// A hard timeout kills the child so a hung collector cannot park the whole
+// suite (Node 24 / windows-latest previously hit the 45m job timeout when a
+// single EADDRINUSE child never settled).
+const launchCli = (projectRoot, port, { timeoutMs = 12_000 } = {}) => {
   const child = spawn(
     process.execPath,
     [path.join(__dirname, 'debug_server.js'), projectRoot],
@@ -125,8 +128,13 @@ const launchCli = (projectRoot, port) => {
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve(value);
     };
+    const timer = setTimeout(() => {
+      stopCli(child);
+      finish({ status: null, stdout, stderr, exitCode: child.exitCode, timedOut: true });
+    }, timeoutMs);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -149,7 +157,24 @@ const launchCli = (projectRoot, port) => {
 };
 
 const stopCli = (child) => {
-  if (child.exitCode === null && !child.killed) child.kill();
+  if (!child || child.exitCode !== null || child.killed) return;
+  try {
+    if (process.platform === 'win32') {
+      // Plain child.kill() does not tear down the process tree on Windows.
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } else {
+      child.kill('SIGKILL');
+    }
+  } catch {
+    try {
+      child.kill();
+    } catch {
+      // already gone
+    }
+  }
 };
 
 const bashProbe = spawnSync('bash', ['-c', 'true']);

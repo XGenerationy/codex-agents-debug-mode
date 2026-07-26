@@ -848,7 +848,10 @@ const main = () => {
               instance_id: identity.instance_id,
             })}\n`,
           );
-          return;
+          // Force-exit: after a failed listen some Node/Windows builds can
+          // leave the Server handle alive and park the process, which hung
+          // the Node 24 / windows-latest suite for the full job timeout.
+          process.exit(0);
         } catch {
           process.stderr.write(
             `${JSON.stringify({
@@ -857,8 +860,7 @@ const main = () => {
               reason: 'already_running_token_unavailable',
             })}\n`,
           );
-          process.exitCode = 1;
-          return;
+          process.exit(1);
         }
       }
     }
@@ -869,7 +871,7 @@ const main = () => {
         reason: error.code === 'EADDRINUSE' ? 'port_in_use_by_other_process' : 'listen_failed',
       })}\n`,
     );
-    process.exitCode = 1;
+    process.exit(1);
   });
   server.listen(port, '127.0.0.1', async () => {
     // Persist the runtime collector_token to a 0600 file under .debug/ and
