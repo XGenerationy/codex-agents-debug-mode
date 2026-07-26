@@ -7,6 +7,7 @@ const test = require('node:test');
 
 const {
   cleanTreeStatus,
+  gitChildEnv,
   readGateChanges,
   readProjectMetadata,
   resolveRepositoryState,
@@ -16,6 +17,29 @@ const {
 } = require('./pr_closeout_repo');
 
 const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+
+test('gitChildEnv strips GIT_* keys case-insensitively (Windows env bypass)', () => {
+  // On Windows env names are case-insensitive; Git still honors git_dir /
+  // Git_Config_* as GIT_* routing/config. Uppercase-only scrub was insufficient
+  // (Qodo #4781532944).
+  const sanitized = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    GIT_DIR: '/evil/git',
+    git_dir: '/evil/lower',
+    Git_Work_Tree: '/evil/work',
+    GIT_EXTERNAL_DIFF: '/evil/diff',
+    Git_Config_Count: '1',
+    Git_Config_Key_0: 'diff.external',
+    Git_Config_Value_0: '/evil/diff',
+    OMO_CODEX_SHELL_PATH: '/bin/bash',
+    NOT_GIT_RELATED: 'keep',
+  });
+  const remaining = Object.keys(sanitized).sort();
+  assert.deepEqual(remaining, ['HOME', 'NOT_GIT_RELATED', 'OMO_CODEX_SHELL_PATH', 'PATH']);
+  assert.equal(sanitized.PATH, '/usr/bin');
+  assert.equal(sanitized.NOT_GIT_RELATED, 'keep');
+});
 
 const fixtureRepo = async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-repo-'));

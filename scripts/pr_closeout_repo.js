@@ -152,12 +152,16 @@ const listIgnoreFiles = async (repo) => {
  * variable so caller-controlled routing (GIT_DIR / GIT_WORK_TREE), external
  * helpers (GIT_EXTERNAL_DIFF), and config overrides (GIT_CONFIG_*) cannot
  * redirect, execute, or reconfigure internal git work (CodeRabbit #4781498400).
+ * Match case-insensitively: Windows env names are case-insensitive, so a
+ * differently-cased key (git_dir / Git_Config_Count) is still observed by
+ * Git as GIT_* (Qodo #4781532944).
+ * @param {NodeJS.ProcessEnv} [source=process.env] - Env map to sanitize.
  * @returns {NodeJS.ProcessEnv}
  */
-const gitChildEnv = () => {
-  const env = { ...process.env };
+const gitChildEnv = (source = process.env) => {
+  const env = { ...source };
   for (const key of Object.keys(env)) {
-    if (key.startsWith('GIT_')) delete env[key];
+    if (key.toUpperCase().startsWith('GIT_')) delete env[key];
   }
   return env;
 };
@@ -997,6 +1001,7 @@ const readGateChanges = async (repo, baseSha) => {
 module.exports = {
   cleanTreeStatus,
   decodeTouchedText,
+  gitChildEnv,
   normalize,
   readGateChanges,
   readProjectMetadata,
