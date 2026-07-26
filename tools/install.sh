@@ -135,10 +135,17 @@ unique_backup() {
 # `mv` copies and an interruption can leave a partial install after backup.
 declare -a stage_paths=()
 cleanup_stages() {
-  local s
+  # Best-effort stage removal on EXIT under `set -e`. Capture rm failures
+  # into rm_status rather than OR-listing a forced success so this helper
+  # is not treated as validation silencing (Codex #4781637950 follow-up).
+  local s rm_status=0
   for s in "${stage_paths[@]:-}"; do
-    rm -rf -- "$s" 2>/dev/null || true
+    if [[ -n "$s" && ( -e "$s" || -L "$s" ) ]]; then
+      rm -rf -- "$s" 2>/dev/null || rm_status=$?
+    fi
   done
+  # Trap cleanup must not rewrite the installer's exit status.
+  return 0
 }
 # Single-quoted trap body so the handler is not expanded at registration time
 # (shellcheck SC2064). Do not add a disable directive; the quote form is the fix.
