@@ -167,19 +167,38 @@ const isEmptyTreeSha = (sha) => {
 };
 
 /**
+ * Comparison style for name-only / unified diffs against the resolved base.
+ * - three-dot: PR / merge-base ranges (`base...HEAD`)
+ * - two-dot: push preimage (`GITHUB_EVENT_BEFORE..HEAD`) so force-push
+ *   removals against the actual previous tip are visible (Codex #4781637950)
+ * - empty-tree: first-commit bootstrap
+ * @type {'three-dot'|'two-dot'|'empty-tree'}
+ */
+let comparisonStyle = 'three-dot';
+
+/**
  * Resolve the comparison base SHA for the CI suppression/gate scan from
  * env (CLOSEOUT_BASE_SHA / GITHUB_BASE_SHA / GITHUB_EVENT_BEFORE), then
  * merge-base with the PR base ref or main/master, else the empty tree.
  * @returns {string}
  */
 const resolveBaseSha = () => {
-  const explicit = [
-    process.env.CLOSEOUT_BASE_SHA,
-    process.env.GITHUB_BASE_SHA,
-    process.env.GITHUB_EVENT_BEFORE,
-  ];
-  for (const candidate of explicit) {
-    if (isUsableSha(candidate)) return candidate.trim();
+  // Explicit operator override: default three-dot (PR-range semantics).
+  if (isUsableSha(process.env.CLOSEOUT_BASE_SHA)) {
+    comparisonStyle = 'three-dot';
+    return process.env.CLOSEOUT_BASE_SHA.trim();
+  }
+  // PR base tip from Actions — three-dot against merge-base of this value.
+  if (isUsableSha(process.env.GITHUB_BASE_SHA)) {
+    comparisonStyle = 'three-dot';
+    return process.env.GITHUB_BASE_SHA.trim();
+  }
+  // Push event preimage: compare against the actual previous tip (two-dot),
+  // not merge-base, so a force-push cannot drop suppressions from the old
+  // side without them appearing in the touched inventory / gate diff.
+  if (isUsableSha(process.env.GITHUB_EVENT_BEFORE)) {
+    comparisonStyle = 'two-dot';
+    return process.env.GITHUB_EVENT_BEFORE.trim();
   }
 
   const baseRef = (process.env.GITHUB_BASE_REF || '').trim();
@@ -193,7 +212,10 @@ const resolveBaseSha = () => {
     for (const ref of candidates) {
       try {
         const mb = gitScalar(['merge-base', 'HEAD', ref]);
-        if (isUsableSha(mb)) return mb;
+        if (isUsableSha(mb)) {
+          comparisonStyle = 'three-dot';
+          return mb;
+        }
       } catch {
         // try next candidate
       }
@@ -206,7 +228,10 @@ const resolveBaseSha = () => {
       const mb = gitScalar(['merge-base', 'HEAD', ref]);
       // On a push checkout, origin/main often equals HEAD; that yields an
       // empty range. Prefer a merge-base that is not HEAD.
-      if (isUsableSha(mb) && mb !== head) return mb;
+      if (isUsableSha(mb) && mb !== head) {
+        comparisonStyle = 'three-dot';
+        return mb;
+      }
     } catch {
       // try next
     }
@@ -216,12 +241,16 @@ const resolveBaseSha = () => {
   // (SHA-1 well-known ID or the repository's SHA-256 empty tree).
   try {
     const empty = resolveEmptyTreeSha();
-    if (isUsableSha(empty) || isEmptyTreeSha(empty)) return empty;
+    if (isUsableSha(empty) || isEmptyTreeSha(empty)) {
+      comparisonStyle = 'empty-tree';
+      return empty;
+    }
   } catch {
     // fall through
   }
   try {
     gitScalar(['cat-file', '-t', EMPTY_TREE]);
+    comparisonStyle = 'empty-tree';
     return EMPTY_TREE;
   } catch {
     // fall through
@@ -232,10 +261,10 @@ const resolveBaseSha = () => {
 
 /**
  * Name-only diff from base to HEAD. Commit bases use three-dot (PR range);
- * the empty tree uses two-dot because `tree...commit` is rejected by Git.
+ * push preimages and the empty tree use two-dot.
  */
 const diffNameOnly = (baseSha) => {
-  if (isEmptyTreeSha(baseSha)) {
+  if (isEmptyTreeSha(baseSha) || comparisonStyle === 'two-dot') {
     return splitZ(gitBuffer(['diff', '--name-only', '-z', baseSha, 'HEAD']));
   }
   return splitZ(gitBuffer(['diff', '--name-only', '-z', `${baseSha}...HEAD`]));
@@ -248,13 +277,21 @@ const diffUnified = (baseSha, files) => {
   if (!files.length) return '';
   // --no-textconv: a configured textconv filter must not rewrite deleted
   // validation lines before detectValidationRemovals scans the diff.
-  if (isEmptyTreeSha(baseSha)) {
+  if (isEmptyTreeSha(baseSha) || comparisonStyle === 'two-dot') {
     return git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', baseSha, 'HEAD', '--', ...files]);
   }
   // Three-dot: only PR-range changes (merge-base...HEAD), not base-branch-only
   // edits that would appear in a two-endpoint diff against a moved base tip.
   return git(['diff', '--unified=0', '--no-ext-diff', '--no-textconv', `${baseSha}...HEAD`, '--', ...files]);
 };
+
+/**
+ * True when a unified-diff line is a file header (`--- a/path`, `--- /dev/null`)
+ * rather than a removed source line such as `--coverage` → `---coverage`.
+ * @param {string} line
+ * @returns {boolean}
+ */
+const isUnifiedDiffFileHeader = (line) => /^--- (?:a\/|b\/|\/dev\/null)/.test(line);
 
 /**
  * Build the complete touched-file set: PR/push range + unstaged + staged +
@@ -294,7 +331,7 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
   }
   const findings = [];
   for (const line of diff.split(/\r?\n/)) {
-    if (!line.startsWith('-') || line.startsWith('---')) continue;
+    if (!line.startsWith('-') || isUnifiedDiffFileHeader(line)) continue;
     if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(line))) {
       findings.push(line.slice(0, 200));
     }
@@ -320,7 +357,8 @@ const detectGateContentRemovals = (baseSha, gateFiles) => {
   }
   const findings = [];
   for (const line of diff.split(/\r?\n/)) {
-    if (!line.startsWith('-') || line.startsWith('---')) continue;
+    // Keep `--coverage` / `--strict` removals: only skip real file headers.
+    if (!line.startsWith('-') || isUnifiedDiffFileHeader(line)) continue;
     const body = line.slice(1).trim();
     if (!body || body.startsWith('#')) continue;
     findings.push(line.slice(0, 200));
@@ -358,10 +396,11 @@ const main = async () => {
 
   // readGateChanges uses two-dot `git diff <base>` semantics. When baseSha is
   // the PR base *tip* (GITHUB_BASE_SHA), that can report base-only gate files
-  // as deleted. Resolve merge-base(base, HEAD) for commit bases so the gate
-  // scan matches PR-range / three-dot semantics used by the touched-file list.
+  // as deleted. Resolve merge-base(base, HEAD) for PR/three-dot bases so the
+  // gate scan matches PR-range semantics. For push preimages (two-dot), keep
+  // the actual previous tip so force-push removals stay visible.
   let gateBaseSha = baseSha;
-  if (!isEmptyTreeSha(baseSha)) {
+  if (!isEmptyTreeSha(baseSha) && comparisonStyle !== 'two-dot') {
     try {
       const mb = gitScalar(['merge-base', baseSha, headSha]);
       if (isUsableSha(mb)) gateBaseSha = mb;

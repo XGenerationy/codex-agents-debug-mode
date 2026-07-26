@@ -210,9 +210,19 @@ const isAllowedHost = (request) => {
   const host = request.headers.host;
   // IPv4, localhost, and bracketed IPv6 loopback authorities are accepted.
   // Node HTTP clients targeting ::1 send Host: [::1]:<port>.
-  return host === `127.0.0.1:${port}`
+  if (
+    host === `127.0.0.1:${port}`
     || host === `localhost:${port}`
-    || host === `[::1]:${port}`;
+    || host === `[::1]:${port}`
+  ) {
+    return true;
+  }
+  // Conforming HTTP clients omit the default port on HTTP/80, so Host is
+  // `127.0.0.1` / `localhost` / `[::1]` without `:80` (Codex #4781637950).
+  if (port === 80) {
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+  }
+  return false;
 };
 
 // Reject a path that is a symlink (fail-closed), tolerating ENOENT (the path
@@ -1021,13 +1031,35 @@ const main = () => {
           await handle.close().catch(() => {});
         }
       };
-      const peerStillReady = async (peerPort) => {
+      // A peer is "active" when it answers as this project's collector,
+      // whether or not it has latched ready yet. Requiring ready alone let a
+      // second launch reclaim the claim mid token-persist (Qodo #4781599754 /
+      // CodeRabbit #4781622077 / Codex #4781637950).
+      const peerStillActive = async (peerPort) => {
         if (!Number.isInteger(peerPort) || peerPort <= 0 || peerPort === port) return false;
-        const peer = await probeReadyCollector(peerPort, server.collectorProjectHash, {
-          attempts: 4,
-          delayMs: 40,
-        });
-        return Boolean(peer && peer.project_hash === server.collectorProjectHash && peer.ready);
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const peer = await probeServer(peerPort);
+          if (peer && peer.project_hash === server.collectorProjectHash) return true;
+          if (peer && peer.project_hash !== server.collectorProjectHash) {
+            // Different project on that port still owns the listener; do not
+            // treat the claim as free for token overwrite.
+            return true;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        return false;
+      };
+      const claimOwnerAlive = (claimText) => {
+        const pidLine = String(claimText || '').split(/\r?\n/)[2];
+        const pid = Number(String(pidLine || '').trim());
+        if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          // EPERM means the PID exists but we cannot signal it — still live.
+          return error?.code === 'EPERM';
+        }
       };
       let claimHeld = false;
       for (let attempt = 0; attempt < 5 && !claimHeld; attempt += 1) {
@@ -1047,16 +1079,23 @@ const main = () => {
         } catch (error) {
           if (error?.code !== 'EEXIST') throw error;
           let claimedPort = null;
+          let claimText = null;
           try {
-            const claimText = await readSmallRegularFile(claimFile, MAX_CLAIM_FILE_BYTES);
+            claimText = await readSmallRegularFile(claimFile, MAX_CLAIM_FILE_BYTES);
             if (claimText) {
               const firstLine = claimText.split(/\r?\n/, 1)[0];
               claimedPort = Number(String(firstLine).trim());
             }
           } catch {
             claimedPort = null;
+            claimText = null;
           }
-          if (await peerStillReady(claimedPort)) {
+          // Owner PID is authoritative: a starting peer is not ready yet but
+          // still holds the claim and must not be unlinked.
+          if (claimOwnerAlive(claimText)) {
+            throw new Error('collector_already_running_on_other_port');
+          }
+          if (await peerStillActive(claimedPort)) {
             throw new Error('collector_already_running_on_other_port');
           }
           // Also honor collector_port when the claim file is unreadable but a
@@ -1064,7 +1103,7 @@ const main = () => {
           try {
             const portText = await readSmallRegularFile(portFile, MAX_PORT_FILE_BYTES);
             const existingPort = portText ? Number(portText.trim()) : null;
-            if (await peerStillReady(existingPort)) {
+            if (await peerStillActive(existingPort)) {
               throw new Error('collector_already_running_on_other_port');
             }
           } catch (portError) {
@@ -1082,6 +1121,29 @@ const main = () => {
         }
       }
       if (!claimHeld) throw new Error('collector_claim_failed');
+      // Release our claim on clean shutdown so a restart does not always burn
+      // an EEXIST+reclaim cycle (CodeRabbit #4781622077).
+      const releaseOwnedClaim = () => {
+        try {
+          const { unlinkSync, readFileSync } = require('node:fs');
+          let text = '';
+          try {
+            text = readFileSync(claimFile, 'utf8');
+          } catch {
+            return;
+          }
+          const lines = String(text).split(/\r?\n/);
+          const claimInstance = String(lines[1] || '').trim();
+          const claimPid = Number(String(lines[2] || '').trim());
+          if (claimInstance === server.collectorInstanceId || claimPid === process.pid) {
+            unlinkSync(claimFile);
+          }
+        } catch {
+          // Best-effort release; stale reclaim handles crash leftovers.
+        }
+      };
+      server.once('close', releaseOwnedClaim);
+      process.once('exit', releaseOwnedClaim);
       // Prefer create-exclusive for a fresh path; if the file already exists
       // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
       // blocks a symlink swap of the FINAL path component after the lstat

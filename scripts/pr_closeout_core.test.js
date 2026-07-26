@@ -547,6 +547,20 @@ test('detects every forbidden suppression family and config-level silencing', ()
   assert.deepEqual(new Set(findings.map(({ category }) => category)), new Set(['marker', 'config-silencing']));
 });
 
+test('scans shell validation helpers for failure-neutralizing constructs', () => {
+  // Codex #4781637950: .sh helpers invoked by make smoke must not hide || true.
+  const shell = scanSuppressionText('ci/check.sh', 'npm test || true\n');
+  assert.ok(
+    shell.some(({ category, match }) => category === 'config-silencing' && /\|\|\s*true/i.test(match)),
+    JSON.stringify(shell),
+  );
+  // Ordinary source .js is still not config-like for this construct.
+  assert.deepEqual(
+    scanSuppressionText('src/util.js', 'const x = a || true;\n').filter(({ category }) => category === 'config-silencing'),
+    [],
+  );
+});
+
 test('detects extended suppression markers and flexible type-ignore whitespace', () => {
   const markers = [
     '/* istanbul ignore next */',
@@ -1095,6 +1109,11 @@ test('blocks auto-discovered package scripts that neutralize failures', () => {
   assert.equal(queue.resolution, 'package-script');
   assert.match(queue.evidence, /neutralizes failures/i);
   assert.match(queue.evidence, /\|\|\s*true/i);
+  // Benign package script is the negative control for findCommandFailureNeutralizer
+  // (CodeRabbit #4781622077).
+  const typecheck = plan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(typecheck.resolution, 'package-script');
+  assert.notEqual(typecheck.status, 'BLOCKED', JSON.stringify(typecheck));
 });
 
 test('blocks configured commands that neutralize failures', () => {

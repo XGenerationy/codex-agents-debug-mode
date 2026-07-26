@@ -119,9 +119,12 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build|check|verify|coverage)\b/i,
   // Installer / smoke / existence assertions often used as required CI gates
   // but not covered by the package-manager patterns above (Codex #4781495663).
-  /^\-.*\b(?:\.\/)?install\.sh\b/i,
+  // Match executable invocations only — not prose, compose `healthcheck:`
+  // keys, or dependency names containing these words (CodeRabbit #4781622077).
+  /^\-.*\binstall\.sh\b/i,
   /^\-.*\btest\s+-[efdxL]\b/i,
-  /^\-.*\b(?:smoke|healthcheck|doctor)\b/i,
+  /^\-\s*(?:-\s*)?(?:name|run):\s*.*\b(?:smoke[-_ ]?test|health[-_ ]?check|doctor)\b/i,
+  /^\-.*\b(?:npm|pnpm|yarn|make)\s+(?:run\s+)?(?:smoke|healthcheck|doctor)\b/i,
 ];
 
 /**

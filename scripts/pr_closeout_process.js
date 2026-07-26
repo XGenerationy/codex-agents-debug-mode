@@ -112,9 +112,11 @@ const defaultShellArgs = (command, shell = 'bash') => (
     // records PASS; without pipefail, `false | cat` is the same class of
     // silent success (Codex #4781366510 / #4781495663).
     ? ['--noprofile', '--norc', '-c', `set -eo pipefail; ${command}`]
-    // Non-bash shells lack portable pipefail; still enable errexit so
-    // `false; true` does not PASS.
-    : ['-c', `set -e; ${command}`]
+    // Non-bash shells (dash/sh/ksh/zsh): still require pipefail semantics.
+    // `set -o pipefail` is accepted by zsh/ksh and bash-as-sh; dash rejects
+    // it and the command fails closed rather than PASS-ing a failed left
+    // pipeline leg (Codex #4781637950). Errexit remains enabled either way.
+    : ['-c', `set -e; set -o pipefail; ${command}`]
 );
 
 /**
@@ -520,29 +522,83 @@ const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
  * Live PIDs whose CommandLine contains `cwd` (case-insensitive). Used on
  * Windows when ParentProcessId BFS cannot reconstruct multi-level orphans
  * after intermediate parents exit (Codex #4781560042).
+ *
+ * Tightened (CodeRabbit #4781622077 / Windows CI): exclude the caller
+ * ancestor chain and processes started before `minStartMs`, so editors,
+ * CI agents, and package-manager parents that merely mention the worktree
+ * path do not false-BLOCK a clean tree.
  * @param {string} cwd
- * @param {{runExecFile: Function, powershell: string, excludePids?: Set<number>}} options
+ * @param {{
+ *   runExecFile: Function,
+ *   powershell: string,
+ *   excludePids?: Set<number>,
+ *   minStartMs?: number,
+ *   selfPid?: number,
+ * }} options
  * @returns {Promise<number[]>}
  */
-const listWindowsPidsWithCommandLineHint = async (cwd, { runExecFile, powershell, excludePids = new Set() }) => {
+const listWindowsPidsWithCommandLineHint = async (cwd, {
+  runExecFile,
+  powershell,
+  excludePids = new Set(),
+  minStartMs = 0,
+  selfPid = process.pid,
+} = {}) => {
   const needle = String(cwd || '').trim();
   if (!needle) return [];
-  // Pass cwd via env to avoid PowerShell injection through path characters.
+  // Pass filters via env to avoid PowerShell injection through path chars.
+  // Do not forward the ambient process.env (CI secrets) into powershell
+  // (CodeRabbit #4781622077).
   const script = [
     '$needle = $env:OMO_CLOSEOUT_CWD_HINT',
     'if (-not $needle) { return }',
-    'Get-CimInstance Win32_Process | ForEach-Object {',
-    '  $cl = $_.CommandLine',
-    '  if ($cl -and ($cl.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {',
-    '    $_.ProcessId.ToString()',
+    '$minMs = 0L',
+    'if ($env:OMO_CLOSEOUT_MIN_START_MS) { [void][long]::TryParse($env:OMO_CLOSEOUT_MIN_START_MS, [ref]$minMs) }',
+    '$exclude = New-Object "System.Collections.Generic.HashSet[int]"',
+    'foreach ($part in (($env:OMO_CLOSEOUT_EXCLUDE_PIDS) -split ",")) {',
+    '  $n = 0; if ([int]::TryParse($part.Trim(), [ref]$n) -and $n -gt 0) { [void]$exclude.Add($n) }',
+    '}',
+    '$self = 0; [void][int]::TryParse(($env:OMO_CLOSEOUT_SELF_PID), [ref]$self)',
+    'if ($self -gt 0) {',
+    '  $walk = $self',
+    '  $seen = New-Object "System.Collections.Generic.HashSet[int]"',
+    '  while ($walk -gt 0 -and $seen.Add($walk)) {',
+    '    [void]$exclude.Add($walk)',
+    '    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue',
+    '    if (-not $proc) { break }',
+    '    $walk = [int]$proc.ParentProcessId',
     '  }',
     '}',
+    '$epoch = [DateTime]::SpecifyKind([DateTime]::Parse("1970-01-01T00:00:00"), [DateTimeKind]::Utc)',
+    'Get-CimInstance Win32_Process | ForEach-Object {',
+    // Avoid $PID automatic variable; use $procId for the candidate ProcessId.
+    '  $procId = [int]$_.ProcessId',
+    '  if ($exclude.Contains($procId)) { return }',
+    '  $cl = $_.CommandLine',
+    '  if (-not $cl) { return }',
+    '  if ($cl.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return }',
+    '  if ($minMs -gt 0 -and $_.CreationDate) {',
+    '    $createdMs = [int64]($_.CreationDate.ToUniversalTime() - $epoch).TotalMilliseconds',
+    '    if ($createdMs -lt $minMs) { return }',
+    '  }',
+    '  $procId.ToString()',
+    '}',
   ].join('; ');
+  const minimalEnv = {
+    SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
+    SYSTEMROOT: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
+    PATHEXT: process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS',
+    ComSpec: process.env.ComSpec || process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe',
+    OMO_CLOSEOUT_CWD_HINT: needle,
+    OMO_CLOSEOUT_MIN_START_MS: String(Number.isFinite(minStartMs) ? Math.max(0, Math.floor(minStartMs)) : 0),
+    OMO_CLOSEOUT_SELF_PID: String(Number.isInteger(selfPid) ? selfPid : 0),
+    OMO_CLOSEOUT_EXCLUDE_PIDS: [...excludePids].filter((p) => Number.isInteger(p) && p > 0).join(','),
+  };
   const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8',
     timeout: 15_000,
     windowsHide: true,
-    env: { ...process.env, OMO_CLOSEOUT_CWD_HINT: needle },
+    env: minimalEnv,
   });
   const found = [];
   for (const line of String(stdout).split(/\r?\n/)) {
@@ -706,10 +762,15 @@ const terminateProcessTree = async ({
           if (cwd) {
             let cwdHints;
             try {
+              // minStarttime is wall-clock epoch ms on Windows (set at spawn).
+              // Exclude self+child and the ancestor chain so CI agents / npm
+              // parents that embed the repo path do not false-BLOCK.
               cwdHints = await listWindowsPidsWithCommandLineHint(cwd, {
                 runExecFile,
                 powershell,
                 excludePids: new Set([child.pid, process.pid]),
+                minStartMs: Number.isFinite(minStarttime) ? minStarttime : 0,
+                selfPid: process.pid,
               });
             } catch (hintError) {
               return {
@@ -1376,10 +1437,11 @@ const spawnCaptured = async ({
   const spawnEnv = spawnMark
     ? { ...env, [SPAWN_MARK_ENV]: spawnMark }
     : env;
-  // Capture approximate starttime for /proc-based cwd sweeps. On Linux this
-  // is jiffies since boot; we re-read the child's starttime after spawn when
-  // /proc is available so the orphan filter is exact.
-  let minStarttime = 0;
+  // Capture approximate starttime for orphan filters:
+  // - POSIX: /proc starttime jiffies (exact after spawn when available)
+  // - Windows: wall-clock epoch ms for CommandLine CreationDate filtering
+  //   so pre-existing editors/CI agents are not treated as orphans.
+  let minStarttime = platform === 'win32' ? Date.now() : 0;
   const child = spawnProcess(shell, shellArgs(command, shell), {
     cwd,
     env: spawnEnv,
@@ -2391,7 +2453,8 @@ const probeCommandDefault = async ({
 }) => {
   const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
   const spawnEnv = spawnMark ? { ...env, [SPAWN_MARK_ENV]: spawnMark } : env;
-  let minStarttime = 0;
+  // Windows: wall-clock ms for CommandLine CreationDate filter; POSIX: jiffies.
+  let minStarttime = platform === 'win32' ? Date.now() : 0;
   let stdout = '';
   let stderr = '';
   const child = spawnProcess(shell, defaultShellArgs(command, shell), {

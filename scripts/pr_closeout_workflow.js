@@ -188,9 +188,14 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * @param {string} outputDir
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
+/**
+ * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, release: () => Promise<void> }} OutputDirLock
+ */
+
 const acquireOutputDirLock = async (outputDir) => {
   const lockPath = path.join(outputDir, '.closeout.lock');
-  const payload = `${process.pid}\n${new Date().toISOString()}\n`;
+  const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const payload = `${process.pid}\n${nonce}\n${new Date().toISOString()}\n`;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const handle = await openFile(
@@ -204,15 +209,51 @@ const acquireOutputDirLock = async (outputDir) => {
         await handle.close().catch(() => {});
         throw error;
       }
-      return handle;
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        try {
+          await handle.close().catch(() => {});
+        } finally {
+          try {
+            // Only unlink if we still own the nonce (another process must not
+            // have reclaimed and rewritten the lock after a crash).
+            const text = await readFile(lockPath, 'utf8').catch(() => '');
+            const lines = String(text).split(/\r?\n/);
+            if (String(lines[1] || '').trim() === nonce) {
+              await unlink(lockPath).catch(() => {});
+            }
+          } catch {
+            // Best-effort; stale reclaim handles leftovers.
+          }
+        }
+      };
+      // Safety net for abrupt exits (CodeRabbit #4781622077).
+      const onExit = () => {
+        try {
+          const { unlinkSync, readFileSync } = require('node:fs');
+          const text = readFileSync(lockPath, 'utf8');
+          const lines = String(text).split(/\r?\n/);
+          if (String(lines[1] || '').trim() === nonce) unlinkSync(lockPath);
+        } catch {
+          // ignore
+        }
+      };
+      process.once('exit', onExit);
+      return { handle, path: lockPath, nonce, release };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
       let holderPid = null;
+      let holderNonce = null;
       try {
         const text = await readFile(lockPath, 'utf8');
-        holderPid = Number(String(text).split(/\r?\n/, 1)[0].trim());
+        const lines = String(text).split(/\r?\n/);
+        holderPid = Number(String(lines[0] || '').trim());
+        holderNonce = String(lines[1] || '').trim() || null;
       } catch {
         holderPid = null;
+        holderNonce = null;
       }
       // Same-process re-entry: the lock file still names us while we hold the
       // FD. Unlink+recreate would not provide exclusion (Unix allows O_EXCL on
@@ -231,6 +272,9 @@ const acquireOutputDirLock = async (outputDir) => {
           holderAlive = probeError?.code !== 'ESRCH';
         }
       }
+      // PID reuse: a live PID with no matching nonce lineage still blocks;
+      // only dead PIDs are reclaimed. Nonce is recorded so release cannot
+      // unlink a successor's lock.
       if (holderAlive) {
         throw new Error(
           `Evidence output directory is already locked by closeout pid ${holderPid}: ${outputDir}`,
@@ -267,14 +311,30 @@ const prepareOutputDirectory = async ({
   const physicalOutput = await realpathPath(outputDir);
   assertOutputOutsideRepository(physicalRepo, physicalOutput);
   if (exclusive) {
-    // Hold the lock handle on the process; closeout is a short-lived CLI so
-    // process exit releases the FD. Stale reclaim handles crashed peers.
-    const lockHandle = await acquireOutputDirLock(resolvedOutput);
-    // Keep a ref so GC does not close the lock FD mid-run.
+    // Hold the lock for the run; release() unlinks on completion so later
+    // runs do not always burn the stale-PID reclaim path (CodeRabbit
+    // #4781622077). process exit is a safety net only.
+    const lock = await acquireOutputDirLock(resolvedOutput);
     prepareOutputDirectory._heldLocks = prepareOutputDirectory._heldLocks || new Set();
-    prepareOutputDirectory._heldLocks.add(lockHandle);
+    prepareOutputDirectory._heldLocks.add(lock);
+    prepareOutputDirectory._releaseLocks = prepareOutputDirectory._releaseLocks || new Set();
+    prepareOutputDirectory._releaseLocks.add(lock.release);
   }
   return resolvedOutput;
+};
+
+/**
+ * Release exclusive output-dir locks acquired by prepareOutputDirectory.
+ * Safe to call multiple times; each release is idempotent.
+ * @returns {Promise<void>}
+ */
+const releaseOutputDirLocks = async () => {
+  const releases = prepareOutputDirectory._releaseLocks;
+  if (!releases || releases.size === 0) return;
+  const pending = [...releases];
+  prepareOutputDirectory._releaseLocks.clear();
+  prepareOutputDirectory._heldLocks?.clear();
+  await Promise.all(pending.map((release) => release().catch(() => {})));
 };
 
 DEFAULTS.prepareOutputDirectory = prepareOutputDirectory;
@@ -502,6 +562,31 @@ const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, in
  * @returns {Promise<{report: object, paths: object}|object>} the full evidence report and its written paths; a redacted plan preview when `planOnly` is true.
  */
 const runCloseoutWorkflow = async ({
+  repo,
+  baseRef,
+  config = {},
+  outputDir,
+  planOnly = false,
+  dependencies = {},
+} = {}) => {
+  try {
+    return await runCloseoutWorkflowBody({
+      repo,
+      baseRef,
+      config,
+      outputDir,
+      planOnly,
+      dependencies,
+    });
+  } finally {
+    // Always drop exclusive --output-dir locks on completion or failure so
+    // the next run does not depend on PID-liveness reclaim (CodeRabbit
+    // #4781622077).
+    await releaseOutputDirLocks();
+  }
+};
+
+const runCloseoutWorkflowBody = async ({
   repo,
   baseRef,
   config = {},
@@ -1036,6 +1121,7 @@ module.exports = {
   evaluateOverallStatus,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  releaseOutputDirLocks,
   runCloseoutWorkflow,
   sealRepository,
 };

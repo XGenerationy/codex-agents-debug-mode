@@ -1106,9 +1106,10 @@ test('probeCommandDefault runs commands through a non-login shell (--noprofile -
   assert.deepEqual(defaultShellArgs('true'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
   assert.deepEqual(defaultShellArgs('true', 'bash'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
   assert.deepEqual(defaultShellArgs('true', '/bin/bash'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
-  // Non-bash shells get errexit only; bash-only flags would be rejected.
-  assert.deepEqual(defaultShellArgs('true', 'zsh'), ['-c', 'set -e; true']);
-  assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'set -e; true']);
+  // Non-bash shells still require pipefail (fail closed if unsupported) so
+  // pipeline left-hand failures cannot PASS (Codex #4781637950).
+  assert.deepEqual(defaultShellArgs('true', 'zsh'), ['-c', 'set -e; set -o pipefail; true']);
+  assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'set -e; set -o pipefail; true']);
   assert.deepEqual(defaultShellArgs('true', 'C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
   const shell = resolveCommandShell({ env: process.env });
   const result = await probeCommandDefault({

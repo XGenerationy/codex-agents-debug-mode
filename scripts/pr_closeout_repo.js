@@ -823,9 +823,13 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     ':(exclude).git',
     ':(exclude)**/.git/**',
     ':(exclude)dist',
+    ':(exclude)**/dist/**',
     ':(exclude)build',
+    ':(exclude)**/build/**',
     ':(exclude)coverage',
+    ':(exclude)**/coverage/**',
     ':(exclude).next',
+    ':(exclude)**/.next/**',
     ':(exclude)**/.pnpm/**',
     ':(exclude)**/.cache/**',
   ];
@@ -846,11 +850,13 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     // drop mid-run inputs from the seal.
     entries.push({ path: '__ignored_untracked_error__', hash: hashBytes('list_failed') });
   }
-  const extraSet = new Set(extraPaths.map((p) => String(p).replaceAll('\\', '/')));
+  // Hoist once: spreading a Set per ignored file was O(n*m) allocations
+  // (CodeRabbit #4781622077).
+  const extraPrefixes = [...new Set(extraPaths.map((p) => String(p).replaceAll('\\', '/')))];
   for (const file of ignoredUntracked) {
     const normalized = String(file).replaceAll('\\', '/');
     // extraPaths (permitted generator outputs) are hashed via collectExtraEntries.
-    if ([...extraSet].some((extra) => normalized === extra || normalized.startsWith(`${extra}/`))) {
+    if (extraPrefixes.some((extra) => normalized === extra || normalized.startsWith(`${extra}/`))) {
       continue;
     }
     const absolute = path.join(repo, file);
@@ -965,7 +971,10 @@ const readGateChanges = async (repo, baseSha) => {
   // Removed lines from still-present gate files (in-place step deletion).
   const removedLines = trackedDiffError
     ? []
-    : diffLines.filter((line) => line.startsWith('-') && !line.startsWith('---'));
+    // Diff file headers are `--- a/path` / `--- /dev/null`. A removed source
+    // line such as `--coverage` becomes `---coverage` and must still scan
+    // (CodeRabbit #4781622077).
+    : diffLines.filter((line) => line.startsWith('-') && !/^--- (?:a\/|b\/|\/dev\/null)/.test(line));
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
     let handle;
     try {
@@ -1029,7 +1038,14 @@ const readGateChanges = async (repo, baseSha) => {
         if (bytesRead === 0) break;
         offset += bytesRead;
       }
-      const text = decodeTouchedText(bytes.subarray(0, offset));
+      // Short reads (file shrunk between stat and read) must fail closed with
+      // the same decode-error marker as other incomplete reads — a truncated
+      // prefix would hide weakening past the cut (CodeRabbit #4781622077).
+      if (offset < opened.size) {
+        addedLines.push(`+__decode_error__:${file}:short_read:${offset}/${opened.size}`);
+        continue;
+      }
+      const text = decodeTouchedText(bytes);
       for (const line of text.split(/\r?\n/)) {
         addedLines.push(`+${line}`);
       }

@@ -293,11 +293,26 @@ test('exclusive output-dir lock rejects a second concurrent holder', async () =>
       acquireOutputDirLock(tmp),
       /already locked by (this closeout process|closeout pid)/i,
     );
-    await first.close();
-    await fs.unlink(nodePath.join(tmp, '.closeout.lock')).catch(() => {});
-    // After release + unlink, a new lock can be acquired.
+    // release() alone must free the directory (CodeRabbit #4781622077).
+    await first.release();
     const second = await acquireOutputDirLock(tmp);
-    await second.close();
+    await second.release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('exclusive output-dir lock reclaims a stale lock from a dead PID', async () => {
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-stale-lock-'));
+  try {
+    // Seed a lock naming a PID that cannot be alive on this host.
+    await fs.writeFile(nodePath.join(tmp, '.closeout.lock'), '2147483646\nstale-nonce\n', 'utf8');
+    const lock = await acquireOutputDirLock(tmp);
+    assert.ok(lock.nonce);
+    await lock.release();
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

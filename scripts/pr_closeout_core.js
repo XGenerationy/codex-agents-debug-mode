@@ -568,7 +568,15 @@ const scanSuppressionText = (file, text) => {
   const normalized = String(file).replaceAll('\\', '/').toLowerCase();
   const base = normalized.split('/').at(-1);
   const ignoreFile = /^\.(?:eslint|biome|prettier|stylelint|ruff)ignore$/.test(base);
-  const configLike = ignoreFile || /\.(?:jsonc?|ya?ml|toml|ini|conf)$/.test(base)
+  // Shell validation helpers (ci/*.sh, scripts/*check*.sh, install.sh, …)
+  // can neutralize failures with `|| true` / `set +e` and still return 0 to
+  // make smoke/audit targets. Treat them as config-like so CONFIG_SILENCING
+  // applies (Codex #4781637950).
+  const shellHelper = /\.(?:sh|bash|zsh|ksh)$/.test(base)
+    || base === 'install.sh'
+    || /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized) && /\.(?:sh|bash)$/.test(base);
+  const configLike = ignoreFile || shellHelper
+    || /\.(?:jsonc?|ya?ml|toml|ini|conf)$/.test(base)
     || /(?:^|\.)config\.[a-z0-9]+$/.test(base)
     || /^\.(?:eslintrc|biomerc)(?:\.[a-z0-9]+)?$/.test(base)
     || ['package.json', 'makefile', '.eslintrc', '.biomerc'].includes(base)
