@@ -113,6 +113,22 @@ test('honors each reviewer latest decision on the attested head', () => {
   });
   assert.equal(stillPass.status, 'PASS');
   assert.equal(stillPass.reviewer, 'other-owner');
+
+  // Same submitted_at: higher review id wins (withdrawal after marker).
+  const sameTsApproval = approvedReview({
+    id: 20,
+    submitted_at: '2026-07-14T03:00:00Z',
+  });
+  const sameTsChanges = approvedReview({
+    id: 21,
+    state: 'CHANGES_REQUESTED',
+    body: 'Withdrawn.',
+    submitted_at: '2026-07-14T03:00:00Z',
+  });
+  assert.equal(
+    classifyGateAttestation({ reviews: [sameTsApproval, sameTsChanges], ...expected }).status,
+    'BLOCKED',
+  );
 });
 
 test('requires the marker reviewer itself to have authoritative repository access', () => {

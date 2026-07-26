@@ -116,13 +116,22 @@ const classifyGateAttestation = ({
   // marker still admits after the same reviewer later posts CHANGES_REQUESTED
   // (or a marker-less re-review) on the same head (Codex #4780351874).
   const latestByReviewer = new Map();
+  const isLaterReview = (candidate, previous) => {
+    const candidateAt = String(candidate.submitted_at || '');
+    const previousAt = String(previous.submitted_at || '');
+    if (candidateAt !== previousAt) return candidateAt > previousAt;
+    // Deterministic tie-break when submitted_at collides: GitHub review ids
+    // are monotonic, so the higher id is the later decision (Codex open
+    // finding on same-timestamp CHANGES_REQUESTED after APPROVED+marker).
+    return Number(candidate.id || 0) > Number(previous.id || 0);
+  };
   for (const review of reviews) {
     const reviewer = review?.user?.login;
     if (typeof reviewer !== 'string' || !reviewer.trim()) continue;
     if (review?.commit_id !== expectedHeadSha) continue;
     const key = reviewer.toLowerCase();
     const previous = latestByReviewer.get(key);
-    if (!previous || String(review.submitted_at || '') > String(previous.submitted_at || '')) {
+    if (!previous || isLaterReview(review, previous)) {
       latestByReviewer.set(key, review);
     }
   }

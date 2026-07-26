@@ -147,9 +147,28 @@ const listIgnoreFiles = async (repo) => {
  * @param {string[]} args - git argv.
  * @returns {Promise<Buffer>} Raw stdout bytes.
  */
+/**
+ * Git env for internal closeout invocations: drop worktree/dir overrides so
+ * a caller-supplied GIT_WORK_TREE / GIT_DIR cannot redirect operations away
+ * from the explicit `--repo` path (Codex open finding).
+ * @returns {NodeJS.ProcessEnv}
+ */
+const gitChildEnv = () => {
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  delete env.GIT_NAMESPACE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_OBJECT_DIRECTORY;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  return env;
+};
+
 const gitBuffer = async (repo, args) => {
   const result = await execFileAsync('git', withInternalGitSafety(args), {
     cwd: repo,
+    env: gitChildEnv(),
     encoding: 'buffer',
     maxBuffer: 50_000_000,
   });
@@ -679,7 +698,11 @@ const collectExtraEntries = async (repo, requested, entries) => {
  */
 const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
   const hash = createHash('sha256');
-  const child = spawn('git', withInternalGitSafety(args), { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn('git', withInternalGitSafety(args), {
+    cwd: repo,
+    env: gitChildEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let stderr = '';
   child.stdout.on('data', (chunk) => hash.update(chunk));
   child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });

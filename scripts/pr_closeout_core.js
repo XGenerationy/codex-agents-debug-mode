@@ -40,10 +40,17 @@ const CONFIG_SILENCING = [
   // Scoped (@org/rule) and plugin/rule ids — one slash is enough for ESLint.
   // Do not put \b after a closing quote of "off" (quote is non-word, so \b
   // fails between " and ,/}). Use an explicit "off" alternative instead.
-  /["']@[\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
-  /["'][\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
-  /["'](?:no|prefer|require|max|min|eqeqeq|curly|strict|camelcase|semi|quotes|indent)-[\w-]+["']\s*:\s*(?:["']off["']|\b0\b)/i,
+  /["']@[\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
+  /["'][\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
+  /["'](?:no|prefer|require|max|min|eqeqeq|curly|strict|camelcase|semi|quotes|indent)-[\w-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
+  // ESLint array-form severity zero: 'no-console': [0, { allow: ['warn'] }]
+  // (Codex #4781366510). Also covered above via `\[\s*0\b` on rule-id keys.
+  /["']?rules?["']?\s*[:=][\s\S]*?["'][^"'\r\n]+["']\s*:\s*\[\s*0\b/i,
   /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled["']?\s*[:=]\s*false|disabled["']?\s*[:=]\s*true)/i,
+  // GitHub Actions step disable: `if: false` / `if: ${{ false }}` silences a
+  // validation step without touching continue-on-error (Codex open finding).
+  /\bif\s*:\s*(?:false\b|["']false["']|\$\{\{\s*false\s*\}\})/i,
+
   /["']?linter["']?\s*:\s*\{[\s\S]*?["']?enabled["']?\s*:\s*false/i,
   /["']?skipLibCheck["']?\s*:\s*true/i,
   /["']?ignoreBuildErrors["']?\s*:\s*true/i,
@@ -66,20 +73,25 @@ const CONFIG_SILENCING = [
   // is flagged. The alternation is anchored with \b so common values that only
   // contain the token as a substring (windows-latest, attestation, contest)
   // do not false-positive.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i,
+  // Bound the ignore-array scan window high enough that a long list of
+  // generated-directory globs before `'src/**'` still matches (Codex
+  // #4781366510). The previous 200-char cap missed real eslint ignore arrays.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i,
   // Extension-only ignore globs (e.g. ignorePatterns: ["**/*.ts"]) suppress an
   // entire source language from the lint gate without naming a src/test/spec
   // directory, so the token-based pattern above never fires. Flag ignore /
   // exclude values that are bare source-extension globs; build artifacts such
   // as **/*.d.ts, dist, or node_modules stay unflagged.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,200}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
   /\|\|\s*true\b/i,
   // Shell zero-exit neutralizers that hide command failure from classifyOutput
   // the same way `|| true` does. `|| :` matches even with redirects/pipes
   // (`|| :>/dev/null`). Trailing `; true` / `; :` / `; exit 0` are covered
   // without anchoring on bare `&` (which would false-positive on `&&`).
+  // `|| echo …` also forces zero exit and must be flagged.
   /\|\|\s*:/i,
   /\|\|\s*exit\s+0\b/i,
+  /\|\|\s*echo\b/i,
   /(?:^|[;\n])\s*true\b/i,
   /(?:^|[;\n])\s*:/i,
   /(?:^|[;\n])\s*exit\s+0\b/i,
@@ -98,13 +110,15 @@ const CONFIG_SILENCING = [
  * never sees.
  */
 const COMMAND_FAILURE_NEUTRALIZERS = [
-  // OR-list success: `cmd || true`, `cmd || exit 0`
+  // OR-list success: `cmd || true`, `cmd || exit 0`, `cmd || echo ok`
   /\|\|\s*true\b/i,
   // POSIX no-op after || — including redirects/pipes: `|| :`, `|| :>/dev/null`,
   // `|| :| cat`. `:` is a complete always-success command; trailing I/O still
   // yields exit 0 and must not evade the detector.
   /\|\|\s*:/i,
   /\|\|\s*exit\s+0\b/i,
+  // `|| echo …` always yields exit 0 after a failed left-hand command.
+  /\|\|\s*echo\b/i,
   // Trailing/chained success no-ops: `cmd; true`, `cmd; :`, or a lone `true`/
   // `:` as the configured command. Anchored on start / `;` / newline only —
   // not bare `&` — so `cmd && exit 0` (short-circuits on failure) is not a
@@ -643,7 +657,9 @@ const scanSuppressionText = (file, text) => {
     // cannot evade the scan. Multiline receiver splits are handled below.
     // Include Mocha TDD / Vitest `suite` alias alongside describe/it/test/context
     // so suite.only / suite.skip cannot focus a suite while the scan reports clean.
-    const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // Optional chaining before computed members: test?.['only'] / describe?.["skip"]
+    // is `?.[` (question + dot + bracket), not bare `?[` (Codex open finding).
+    const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     /**
      * Scan a whole source line and mark every character position that is
      * inert (inside a string, a line/block comment, or a regex literal), so

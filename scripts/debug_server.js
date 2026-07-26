@@ -1,11 +1,22 @@
 #!/usr/bin/env node
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
-const { constants, realpathSync } = require('node:fs');
-const { lstat, mkdir, open, realpath, unlink } = require('node:fs/promises');
+const { constants, realpathSync, writeSync } = require('node:fs');
+const { lstat, mkdir, open, readFile, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
+
+/**
+ * Synchronous stdout/stderr writes for CLI terminal paths that call
+ * process.exit immediately afterward. Stream `.write()` is async when piped
+ * and can be truncated by process.exit (CodeRabbit #4781360793).
+ * @param {1|2} fd
+ * @param {string} text
+ */
+const writeFdSync = (fd, text) => {
+  writeSync(fd, text);
+};
 
 const DEFAULT_PORT = 8787;
 const COLLECTOR_SERVICE = 'codex-debug-collector';
@@ -445,6 +456,15 @@ const createDebugServer = ({
         return;
       }
 
+      // Non-mutating launch-token probe for already_running relaunch checks.
+      // Proves the on-disk collector_token still authorizes this peer without
+      // creating a session (Codex #4781366510).
+      if (request.method === 'GET' && pathname === '/auth') {
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+
       if (request.method === 'POST' && pathname === '/session') {
         if (!authorizeRequest(response, bearerToken(request), token)) return;
         if (sessions.size >= effectiveLimits.maxSessions) {
@@ -781,6 +801,47 @@ const probeReadyCollector = async (port, expectedProjectHash, { attempts = 20, d
   return probeServer(port);
 };
 
+/**
+ * Non-mutating check that `token` is the peer collector's current launch token.
+ * Used before already_running so a replaced on-disk token cannot claim success
+ * while /session would 401 (Codex #4781366510).
+ * @param {number} port
+ * @param {string} token
+ * @returns {Promise<boolean>}
+ */
+const probeLaunchToken = (port, token) => new Promise((resolve) => {
+  let settled = false;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    resolve(value);
+  };
+  const request = http.request(
+    {
+      hostname: '127.0.0.1',
+      port,
+      path: '/auth',
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Host: `127.0.0.1:${port}`,
+      },
+      timeout: 500,
+    },
+    (response) => {
+      response.resume();
+      response.on('end', () => finish(response.statusCode === 200));
+      response.on('error', () => finish(false));
+    },
+  );
+  request.on('timeout', () => {
+    request.destroy();
+    finish(false);
+  });
+  request.on('error', () => finish(false));
+  request.end();
+});
+
 const parseAllowedOrigins = (value) =>
   (value || '')
     .split(',')
@@ -830,8 +891,9 @@ const main = () => {
         // the file can still be deleted/replaced afterward. The documented
         // client flow authorizes /session via `cat .debug/collector_token`, so
         // already_running without a usable token leaves the collector running
-        // and unusable. Revalidate the on-disk token before accepting the probe
-        // (Codex #4780351874).
+        // and unusable. Revalidate the on-disk token and authenticate it
+        // against the peer before accepting the probe (Codex #4780351874 /
+        // #4781366510).
         const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
         try {
           await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
@@ -839,38 +901,37 @@ const main = () => {
           if (!tokenInfo.isFile() || tokenInfo.nlink > 1 || tokenInfo.size < 1) {
             throw new Error('collector_token_unavailable');
           }
-          process.stdout.write(
-            `${JSON.stringify({
-              status: 'already_running',
-              port,
-              service: identity.service,
-              version: identity.version,
-              instance_id: identity.instance_id,
-            })}\n`,
-          );
-          // Force-exit: after a failed listen some Node/Windows builds can
-          // leave the Server handle alive and park the process, which hung
-          // the Node 24 / windows-latest suite for the full job timeout.
+          const diskToken = (await readFile(tokenFile, 'utf8')).trim();
+          if (!diskToken || !(await probeLaunchToken(port, diskToken))) {
+            throw new Error('collector_token_auth_failed');
+          }
+          // Sync write + force-exit: piped stdout.write can be truncated by
+          // process.exit, and a failed-listen Server handle can park the
+          // process on some Node/Windows builds (CodeRabbit #4781360793 /
+          // Node 24 windows hang).
+          writeFdSync(1, `${JSON.stringify({
+            status: 'already_running',
+            port,
+            service: identity.service,
+            version: identity.version,
+            instance_id: identity.instance_id,
+          })}\n`);
           process.exit(0);
         } catch {
-          process.stderr.write(
-            `${JSON.stringify({
-              level: 'error',
-              event: 'startup.failed',
-              reason: 'already_running_token_unavailable',
-            })}\n`,
-          );
+          writeFdSync(2, `${JSON.stringify({
+            level: 'error',
+            event: 'startup.failed',
+            reason: 'already_running_token_unavailable',
+          })}\n`);
           process.exit(1);
         }
       }
     }
-    process.stderr.write(
-      `${JSON.stringify({
-        level: 'error',
-        event: 'startup.failed',
-        reason: error.code === 'EADDRINUSE' ? 'port_in_use_by_other_process' : 'listen_failed',
-      })}\n`,
-    );
+    writeFdSync(2, `${JSON.stringify({
+      level: 'error',
+      event: 'startup.failed',
+      reason: error.code === 'EADDRINUSE' ? 'port_in_use_by_other_process' : 'listen_failed',
+    })}\n`);
     process.exit(1);
   });
   server.listen(port, '127.0.0.1', async () => {
@@ -904,6 +965,26 @@ const main = () => {
       // private regular file.
       await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
       await assertPrivateRegularFile(tokenFile, 'collector_token_not_private');
+      // Refuse to overwrite a token still owned by another live same-project
+      // collector on a different DEBUG_PORT (Codex multi-port finding). The
+      // companion collector_port file records which port last claimed the
+      // token; if that peer is still ready, leave its token intact.
+      const portFile = path.join(debugDir, 'collector_port');
+      try {
+        const existingPort = Number((await readFile(portFile, 'utf8')).trim());
+        if (Number.isInteger(existingPort) && existingPort > 0 && existingPort !== port) {
+          const peer = await probeReadyCollector(existingPort, server.collectorProjectHash, {
+            attempts: 4,
+            delayMs: 40,
+          });
+          if (peer && peer.project_hash === server.collectorProjectHash && peer.ready) {
+            throw new Error('collector_already_running_on_other_port');
+          }
+        }
+      } catch (error) {
+        if (error?.message === 'collector_already_running_on_other_port') throw error;
+        // Missing/unreadable port file: proceed with this instance's claim.
+      }
       // Prefer create-exclusive for a fresh path; if the file already exists
       // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
       // blocks a symlink swap of the FINAL path component after the lstat
@@ -962,6 +1043,21 @@ const main = () => {
         await handle.writeFile(token, 'utf8');
       } finally {
         await handle.close();
+      }
+      // Record which port owns the shared collector_token so a second
+      // same-project collector on a different DEBUG_PORT cannot silently
+      // overwrite it while the first is still ready.
+      await assertNotSymlink(portFile, 'collector_port_is_symlink');
+      const portHandle = await openNoFollow(
+        portFile,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+        0o600,
+      );
+      try {
+        await portHandle.chmod(0o600);
+        await portHandle.writeFile(String(port), 'utf8');
+      } finally {
+        await portHandle.close();
       }
       // Only after the token file is on disk may relaunch probes claim
       // already_running for this project.

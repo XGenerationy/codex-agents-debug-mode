@@ -107,7 +107,10 @@ const isBashCompatibleShell = (shell) => {
  */
 const defaultShellArgs = (command, shell = 'bash') => (
   isBashCompatibleShell(shell)
-    ? ['--noprofile', '--norc', '-c', command]
+    // Enable pipefail so `false | cat` is not a silent PASS: without it Bash
+    // returns only the final pipeline stage's status and classifyOutput would
+    // treat a failed left-hand command as success (Codex #4781366510).
+    ? ['--noprofile', '--norc', '-c', `set -o pipefail; ${command}`]
     : ['-c', command]
 );
 
@@ -385,38 +388,51 @@ const sweepDetachedOrphans = async ({
       escalated: false,
     };
   }
-  if (remaining.length === 0) {
+  // After marked PIDs are gone (initially or post-reap), always run the
+  // mark-free cwd/fd probe. Otherwise a descendant that stripped
+  // OMO_CLOSEOUT_SPAWN_MARK while a sibling was still marked would be skipped
+  // on the first scan and never rechecked after the marked set empties
+  // (Codex #4781366510).
+  const afterMarkedEmpty = (evidence, escalated) => {
     if (cwd) {
       const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
       if (unmarked === null) {
         if (platform === 'linux') {
           return {
             status: 'BLOCKED',
-            evidence: 'No detached spawn-mark descendants remained, but cwd/fd orphan probe is unavailable on Linux; cannot prove mark-free descendants exited.',
-            escalated: false,
+            evidence: `${evidence} cwd/fd orphan probe is unavailable on Linux; cannot prove mark-free descendants exited.`,
+            escalated,
           };
         }
         return {
           status: 'PASS',
-          evidence: 'No detached spawn-mark descendants remained; cwd/fd orphan probe unavailable (process-group containment only).',
-          escalated: false,
+          evidence: `${evidence} cwd/fd orphan probe unavailable (process-group containment only).`,
+          escalated,
         };
       }
       if (unmarked.length > 0) {
         return {
           status: 'BLOCKED',
           evidence: `Detached mark-free descendant(s) still live under the worktree (pids ${unmarked.slice(0, 8).join(', ')}); cannot safely attribute/terminate without spawn mark.`,
-          escalated: false,
+          escalated,
         };
       }
     }
     return {
       status: 'PASS',
       evidence: mark
+        ? evidence
+        : 'Detached orphan sweep skipped (no spawn mark; refusing cwd-only reaping).',
+      escalated,
+    };
+  };
+  if (remaining.length === 0) {
+    return afterMarkedEmpty(
+      mark
         ? 'No detached spawn-mark descendants remained.'
         : 'Detached orphan sweep skipped (no spawn mark; refusing cwd-only reaping).',
-      escalated: false,
-    };
+      false,
+    );
   }
   for (const pid of remaining) {
     try { kill(pid, 'SIGTERM'); } catch {}
@@ -425,11 +441,7 @@ const sweepDetachedOrphans = async ({
   while (Date.now() < softDeadline) {
     remaining = list() || [];
     if (remaining.length === 0) {
-      return {
-        status: 'PASS',
-        evidence: 'Detached descendants stopped after SIGTERM (spawn-mark sweep).',
-        escalated: false,
-      };
+      return afterMarkedEmpty('Detached descendants stopped after SIGTERM (spawn-mark sweep).', false);
     }
     await delay(25);
   }
@@ -441,21 +453,13 @@ const sweepDetachedOrphans = async ({
   while (Date.now() < hardDeadline) {
     remaining = list() || [];
     if (remaining.length === 0) {
-      return {
-        status: 'PASS',
-        evidence: 'Detached descendants required SIGKILL and are gone (spawn-mark sweep).',
-        escalated: true,
-      };
+      return afterMarkedEmpty('Detached descendants required SIGKILL and are gone (spawn-mark sweep).', true);
     }
     await delay(25);
   }
   remaining = list() || [];
   if (remaining.length === 0) {
-    return {
-      status: 'PASS',
-      evidence: 'Detached descendants required SIGKILL and are gone (spawn-mark sweep).',
-      escalated: true,
-    };
+    return afterMarkedEmpty('Detached descendants required SIGKILL and are gone (spawn-mark sweep).', true);
   }
   return {
     status: 'BLOCKED',
@@ -1499,23 +1503,12 @@ const isContainedPath = (root, target) => {
  * @returns {import('node:fs/promises').FileHandle}
  */
 const openArtifact = async (artifact) => {
-  const noFollow = constants.O_NOFOLLOW || 0;
-  // A proof command can leave a background process that swaps the verified
-  // artifact for a FIFO (or another non-regular file) between the lstat in
-  // snapshotArtifactProof and this open. On POSIX, opening a FIFO read-only
-  // without O_NONBLOCK waits for a writer, so the proof would hang instead of
-  // returning a structured FAIL. Open with O_NONBLOCK where the platform
-  // supports it (regular-file reads are unaffected; the constant is absent on
-  // Windows) and fail closed below if the opened handle is not a regular
-  // file, before any read can block or stream unbounded device data.
-  const nonBlock = constants.O_NONBLOCK || 0;
-  let handle;
-  try {
-    handle = await open(artifact, constants.O_RDONLY | noFollow | nonBlock);
-  } catch (error) {
-    if (!noFollow || !['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(error?.code)) throw error;
-    handle = await open(artifact, constants.O_RDONLY | nonBlock);
-  }
+  // Use the shared openNoFollow attempt sequence (NOFOLLOW+NONBLOCK →
+  // NONBLOCK-only → NOFOLLOW-only → plain) so a platform that rejects only
+  // O_NONBLOCK still keeps O_NOFOLLOW, and vice versa (Codex #4781366510).
+  // The previous two-step fallback dropped NOFOLLOW whenever the combined
+  // open failed, which broke ordinary proof artifacts on NONBLOCK-hostile FS.
+  const handle = await openNoFollowShared(artifact, constants.O_RDONLY);
   const info = await handle.stat();
   if (!info.isFile()) {
     await handle.close();

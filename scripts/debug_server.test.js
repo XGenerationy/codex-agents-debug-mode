@@ -151,7 +151,16 @@ const launchCli = (projectRoot, port, { timeoutMs = 12_000 } = {}) => {
       stderr += chunk;
     });
     child.on('exit', (code) => finish({ status: null, stdout, stderr, exitCode: code }));
-    child.on('error', reject);
+    // Route spawn errors through finish so the 12s force-exit timer is cleared
+    // (CodeRabbit #4781360793). A bare reject left the timer armed and could
+    // call stopCli long after the test settled.
+    child.on('error', (error) => {
+      stopCli(child);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
   });
   return { child, outcome };
 };

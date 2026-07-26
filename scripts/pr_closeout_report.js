@@ -419,11 +419,14 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
   try {
     await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
     await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
-    // Commit Markdown first, PASS/final JSON last. If the process is
-    // SIGKILL'd between renames, consumers still see provisional/old JSON
-    // (not a machine-readable PASS with stale BLOCKED Markdown). On a
-    // recoverable second-rename failure, remove the committed Markdown so
-    // the pair stays consistent.
+    // Invalidate any previous final report.json BEFORE committing Markdown.
+    // If an explicit --output-dir is reused after a PASS run and we crash
+    // between MD rename and JSON rename, consumers must not keep reading the
+    // stale PASS JSON from the prior generation (Codex #4781366510).
+    await unlink(json).catch(() => {});
+    // Commit Markdown first, PASS/final JSON last. On a recoverable
+    // second-rename failure, remove the committed Markdown so the pair stays
+    // consistent (JSON already removed above).
     await rename(markdownTmp, markdown);
     try {
       await rename(jsonTmp, json);

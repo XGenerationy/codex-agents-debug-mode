@@ -405,6 +405,8 @@ test('flags computed-property focus/skip forms in touched test files', () => {
     'describe["skip"]("suite");',
     'test[`only`]("focused");',
     "context['todo'](\"unfinished\");",
+    "test?.['only'](\"focused\");",
+    'describe?.["skip"]("suite");',
   ];
   for (const line of fixtures) {
     const matches = scanSuppressionText('src/foo.test.js', line)
@@ -802,6 +804,30 @@ test('detects quoted enabled/disabled JSON gate switches and --quiet lint script
       .some((f) => f.category === 'config-silencing'),
     '| exit 0 must be flagged',
   );
+  assert.ok(
+    scanSuppressionText('package.json', JSON.stringify({ scripts: { t: 'jest || echo ok' } }))
+      .some((f) => f.category === 'config-silencing'),
+    '|| echo ok must be flagged',
+  );
+  // Array-form ESLint severity zero (Codex #4781366510).
+  assert.ok(
+    scanSuppressionText('eslint.config.js', "module.exports = { rules: { 'no-console': [0, { allow: ['warn'] }] } };")
+      .some((f) => f.category === 'config-silencing'),
+    "array-form 'no-console': [0, ...] must be flagged",
+  );
+  // Long ignore arrays still catch a late source exclusion.
+  const longIgnore = `ignorePatterns: [${Array.from({ length: 40 }, (_, i) => `"generated-${i}/**"`).join(', ')}, "src/**"]`;
+  assert.ok(
+    scanSuppressionText('eslint.config.js', longIgnore)
+      .some((f) => f.category === 'config-silencing'),
+    'source exclusion after a long ignore list must be flagged',
+  );
+  // Workflow step disable.
+  assert.ok(
+    scanSuppressionText('.github/workflows/validate.yml', '  - name: Run tests\n    if: false\n    run: npm test')
+      .some((f) => f.category === 'config-silencing'),
+    'if: false must be flagged',
+  );
 });
 
 test('flags active test-weakening after a quoted fixture on the same line', () => {
@@ -820,6 +846,14 @@ test('flags active test-weakening after a block-comment apostrophe on the same l
   ).filter(({ category }) => category === 'test-weakening');
   assert.equal(findings.length, 1, JSON.stringify(findings));
   assert.match(findings[0].match, /it\.only/i);
+});
+
+test('flags optional-chaining computed focus/skip members', () => {
+  const findings = scanSuppressionText(
+    'tests/foo.test.js',
+    "test?.['only']('focused', () => {}); describe?.[\"skip\"]('x', () => {});",
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.ok(findings.length >= 1, JSON.stringify(findings));
 });
 
 test('flags multiline focused/skipped test member access', () => {
@@ -1055,6 +1089,8 @@ test('blocks configured commands that neutralize failures', () => {
   assert.ok(findCommandFailureNeutralizer('actual-test | true'));
   assert.ok(findCommandFailureNeutralizer('actual-test | :'));
   assert.ok(findCommandFailureNeutralizer('actual-test | exit 0'));
+  // `|| echo ok` also forces zero exit after a failed left-hand command.
+  assert.ok(findCommandFailureNeutralizer('npm test || echo ok'));
   // `&& exit 0` short-circuits on failure — not a neutralizer.
   assert.equal(findCommandFailureNeutralizer('pnpm test && exit 0'), null);
   assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
