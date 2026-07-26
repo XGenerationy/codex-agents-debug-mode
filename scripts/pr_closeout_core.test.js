@@ -1082,6 +1082,21 @@ test('keeps example placeholders blocked instead of treating them as commands', 
   assert.equal(producer.resolution, 'placeholder');
 });
 
+test('blocks auto-discovered package scripts that neutralize failures', () => {
+  // Codex #4781560042: package-script resolution must inspect script bodies.
+  const plan = buildCheckPlan({
+    packageScripts: {
+      'test:queue-registry': 'vitest run queue-registry || true',
+      typecheck: 'tsc --noEmit',
+    },
+  });
+  const queue = plan.checks.find(({ id }) => id === 'queue-registry-tests');
+  assert.equal(queue.status, 'BLOCKED', JSON.stringify(queue));
+  assert.equal(queue.resolution, 'package-script');
+  assert.match(queue.evidence, /neutralizes failures/i);
+  assert.match(queue.evidence, /\|\|\s*true/i);
+});
+
 test('blocks configured commands that neutralize failures', () => {
   // Closeout config may live outside the checkout; the touched-file scanner
   // never sees it. Failure-hiding shell constructs must be rejected at plan

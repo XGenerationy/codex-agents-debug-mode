@@ -4,6 +4,7 @@ const test = require('node:test');
 const { MANDATORY_CHECKS } = require('./pr_closeout_core');
 const { digestValidationConfig } = require('./pr_closeout_git');
 const {
+  acquireOutputDirLock,
   defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,
@@ -278,6 +279,28 @@ test('default evidence directories include process uniqueness for concurrent sam
   assert.match(a, new RegExp(`${process.pid}-[0-9a-f]{8}`));
   assert.match(b, new RegExp(`${process.pid}-[0-9a-f]{8}`));
   assert.match(a, /abcdef012345/);
+});
+
+test('exclusive output-dir lock rejects a second concurrent holder', async () => {
+  // Codex #4781560042: explicit --output-dir must not be shared.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-lock-'));
+  try {
+    const first = await acquireOutputDirLock(tmp);
+    await assert.rejects(
+      acquireOutputDirLock(tmp),
+      /already locked by (this closeout process|closeout pid)/i,
+    );
+    await first.close();
+    await fs.unlink(nodePath.join(tmp, '.closeout.lock')).catch(() => {});
+    // After release + unlink, a new lock can be acquired.
+    const second = await acquireOutputDirLock(tmp);
+    await second.close();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 test('rejects a lexically external output whose physical target is inside the repository', async () => {

@@ -812,6 +812,50 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     const absolute = path.join(repo, file);
     entries.push({ path: file, hash: await hashFsEntry(absolute) });
   }
+  // Seal ignored untracked inputs (e.g. a gitignored `.env` created mid-run)
+  // that `--exclude-standard` omits from the list above. Without this, a
+  // validation command can create ignored inputs later checks consume while
+  // initial/final fingerprints stay identical (Codex #4781560042). Bulk vendor
+  // trees are pathspec-excluded so node_modules does not explode the seal.
+  const ignoredBulkExcludes = [
+    ':(exclude)node_modules',
+    ':(exclude)**/node_modules/**',
+    ':(exclude).git',
+    ':(exclude)**/.git/**',
+    ':(exclude)dist',
+    ':(exclude)build',
+    ':(exclude)coverage',
+    ':(exclude).next',
+    ':(exclude)**/.pnpm/**',
+    ':(exclude)**/.cache/**',
+  ];
+  let ignoredUntracked = [];
+  try {
+    ignoredUntracked = await gitPaths(repo, [
+      'ls-files',
+      '--others',
+      '--ignored',
+      '--exclude-standard',
+      '-z',
+      '--',
+      '.',
+      ...ignoredBulkExcludes,
+    ]);
+  } catch {
+    // Fail closed with a marker so a broken ignored listing cannot silently
+    // drop mid-run inputs from the seal.
+    entries.push({ path: '__ignored_untracked_error__', hash: hashBytes('list_failed') });
+  }
+  const extraSet = new Set(extraPaths.map((p) => String(p).replaceAll('\\', '/')));
+  for (const file of ignoredUntracked) {
+    const normalized = String(file).replaceAll('\\', '/');
+    // extraPaths (permitted generator outputs) are hashed via collectExtraEntries.
+    if ([...extraSet].some((extra) => normalized === extra || normalized.startsWith(`${extra}/`))) {
+      continue;
+    }
+    const absolute = path.join(repo, file);
+    entries.push({ path: `__ignored__/${normalized}`, hash: await hashFsEntry(absolute) });
+  }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);
   return fingerprintEntries(entries);
 };

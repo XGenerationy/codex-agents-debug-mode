@@ -517,6 +517,43 @@ const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
 };
 
 /**
+ * Live PIDs whose CommandLine contains `cwd` (case-insensitive). Used on
+ * Windows when ParentProcessId BFS cannot reconstruct multi-level orphans
+ * after intermediate parents exit (Codex #4781560042).
+ * @param {string} cwd
+ * @param {{runExecFile: Function, powershell: string, excludePids?: Set<number>}} options
+ * @returns {Promise<number[]>}
+ */
+const listWindowsPidsWithCommandLineHint = async (cwd, { runExecFile, powershell, excludePids = new Set() }) => {
+  const needle = String(cwd || '').trim();
+  if (!needle) return [];
+  // Pass cwd via env to avoid PowerShell injection through path characters.
+  const script = [
+    '$needle = $env:OMO_CLOSEOUT_CWD_HINT',
+    'if (-not $needle) { return }',
+    'Get-CimInstance Win32_Process | ForEach-Object {',
+    '  $cl = $_.CommandLine',
+    '  if ($cl -and ($cl.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {',
+    '    $_.ProcessId.ToString()',
+    '  }',
+    '}',
+  ].join('; ');
+  const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8',
+    timeout: 15_000,
+    windowsHide: true,
+    env: { ...process.env, OMO_CLOSEOUT_CWD_HINT: needle },
+  });
+  const found = [];
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const pid = Number(line.trim());
+    if (!Number.isInteger(pid) || pid <= 0 || excludePids.has(pid)) continue;
+    found.push(pid);
+  }
+  return [...new Set(found)];
+};
+
+/**
  * Proves the entire process tree a spawned command created is gone, not
  * just its root PID — a command can exit 0 while a detached descendant
  * keeps running and mutates evidence after the "clean" result is already
@@ -660,9 +697,38 @@ const terminateProcessTree = async ({
           };
         }
         if (survivors.length === 0) {
+          // ParentProcessId BFS cannot reach multi-level orphans once every
+          // intermediate PID is gone (grandchild's parent is dead and absent
+          // from the live table). A second CommandLine scan for the worktree
+          // path catches typical `node path/to/repo/...` grandchildren; any
+          // hit is fail-closed BLOCKED because we cannot safely attribute
+          // kill without spawn-tree identity (Codex #4781560042).
+          if (cwd) {
+            let cwdHints;
+            try {
+              cwdHints = await listWindowsPidsWithCommandLineHint(cwd, {
+                runExecFile,
+                powershell,
+                excludePids: new Set([child.pid, process.pid]),
+              });
+            } catch (hintError) {
+              return {
+                status: 'BLOCKED',
+                evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants and CommandLine worktree probe failed: ${hintError?.message || hintError}. Cannot prove multi-level orphans exited.`,
+                escalated: true,
+              };
+            }
+            if (cwdHints.length > 0) {
+              return {
+                status: 'BLOCKED',
+                evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants but CommandLine still references the worktree (pids ${cwdHints.slice(0, 8).join(', ')}). Multi-level orphan ancestry is unproven.`,
+                escalated: true,
+              };
+            }
+          }
           return {
             status: 'PASS',
-            evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found.`,
+            evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found (ParentProcessId BFS empty; worktree CommandLine probe clean or skipped).`,
             escalated: true,
           };
         }

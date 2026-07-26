@@ -475,13 +475,14 @@ test('workingTreeFingerprint seals core.excludesFile path and contents', async (
     assert.notEqual(before, afterConfig, 'setting core.excludesFile must change the fingerprint');
     await mkdir(path.join(repo, 'hidden'));
     await writeFile(path.join(repo, 'hidden', 'x'), 'secret');
-    // hidden/x is ignored via core.excludesFile, so it must not appear as an
-    // untracked entry — but the seal already recorded the excludes file.
+    // hidden/x is ignored via core.excludesFile. The seal must still move when
+    // ignored inputs appear on disk (Codex #4781560042); --exclude-standard
+    // alone would hide them from the untracked list.
     const withHidden = await workingTreeFingerprint(repo);
-    assert.equal(withHidden, afterConfig, 'ignored untracked files must not change fingerprint beyond excludes seal');
+    assert.notEqual(withHidden, afterConfig, 'creating ignored untracked inputs must change the fingerprint');
     await writeFile(excludesPath, 'hidden/\nother/\n');
     const afterContents = await workingTreeFingerprint(repo);
-    assert.notEqual(afterConfig, afterContents, 'mutating core.excludesFile contents must change the fingerprint');
+    assert.notEqual(withHidden, afterContents, 'mutating core.excludesFile contents must change the fingerprint');
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
@@ -557,6 +558,25 @@ test('workingTreeFingerprint expands a tilde core.excludesFile the way Git does'
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals newly created ignored inputs like .env', async () => {
+  // Codex #4781560042: gitignored inputs created mid-run must move the seal.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), '.env\n', 'utf8');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore env');
+    const before = await workingTreeFingerprint(repo);
+    await writeFile(path.join(repo, '.env'), 'SECRET=1\n', 'utf8');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(before, after, 'creating a gitignored .env must change the fingerprint');
+    await writeFile(path.join(repo, '.env'), 'SECRET=2\n', 'utf8');
+    const afterMutate = await workingTreeFingerprint(repo);
+    assert.notEqual(after, afterMutate, 'mutating a gitignored .env must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
   }
 });
 

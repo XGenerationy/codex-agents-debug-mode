@@ -1,6 +1,7 @@
 const { randomBytes } = require('node:crypto');
+const { constants: fsConstants } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { mkdir, realpath } = require('node:fs/promises');
+const { mkdir, open: openFile, readFile, realpath, unlink } = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -179,11 +180,80 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * write, not just once at startup.
  * @returns {Promise<string>} the resolved output directory path.
  */
+/**
+ * Acquire an exclusive run lock under an explicit --output-dir so two closeout
+ * processes cannot share report.json / command logs (Codex #4781560042).
+ * Default (process-unique) dirs do not need this; stale locks from dead PIDs
+ * are reclaimed.
+ * @param {string} outputDir
+ * @returns {Promise<import('node:fs/promises').FileHandle>}
+ */
+const acquireOutputDirLock = async (outputDir) => {
+  const lockPath = path.join(outputDir, '.closeout.lock');
+  const payload = `${process.pid}\n${new Date().toISOString()}\n`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const handle = await openFile(
+        lockPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        0o600,
+      );
+      try {
+        await handle.writeFile(payload, 'utf8');
+      } catch (error) {
+        await handle.close().catch(() => {});
+        throw error;
+      }
+      return handle;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      let holderPid = null;
+      try {
+        const text = await readFile(lockPath, 'utf8');
+        holderPid = Number(String(text).split(/\r?\n/, 1)[0].trim());
+      } catch {
+        holderPid = null;
+      }
+      // Same-process re-entry: the lock file still names us while we hold the
+      // FD. Unlink+recreate would not provide exclusion (Unix allows O_EXCL on
+      // a new inode after unlink of an open file).
+      if (holderPid === process.pid) {
+        throw new Error(
+          `Evidence output directory is already locked by this closeout process: ${outputDir}`,
+        );
+      }
+      let holderAlive = false;
+      if (Number.isInteger(holderPid) && holderPid > 0) {
+        try {
+          process.kill(holderPid, 0);
+          holderAlive = true;
+        } catch (probeError) {
+          holderAlive = probeError?.code !== 'ESRCH';
+        }
+      }
+      if (holderAlive) {
+        throw new Error(
+          `Evidence output directory is already locked by closeout pid ${holderPid}: ${outputDir}`,
+        );
+      }
+      try {
+        await unlink(lockPath);
+      } catch (unlinkError) {
+        if (unlinkError?.code !== 'ENOENT') {
+          throw new Error(`Failed to reclaim stale evidence lock in ${outputDir}: ${unlinkError.message}`);
+        }
+      }
+    }
+  }
+  throw new Error(`Failed to acquire exclusive evidence lock in ${outputDir}`);
+};
+
 const prepareOutputDirectory = async ({
   repo,
   outputDir,
   mkdirPath = mkdir,
   realpathPath = realpath,
+  exclusive = false,
 }) => {
   const resolvedRepo = path.resolve(repo);
   const resolvedOutput = path.resolve(outputDir);
@@ -196,6 +266,14 @@ const prepareOutputDirectory = async ({
   await mkdirPath(resolvedOutput, { recursive: true });
   const physicalOutput = await realpathPath(outputDir);
   assertOutputOutsideRepository(physicalRepo, physicalOutput);
+  if (exclusive) {
+    // Hold the lock handle on the process; closeout is a short-lived CLI so
+    // process exit releases the FD. Stale reclaim handles crashed peers.
+    const lockHandle = await acquireOutputDirLock(resolvedOutput);
+    // Keep a ref so GC does not close the lock FD mid-run.
+    prepareOutputDirectory._heldLocks = prepareOutputDirectory._heldLocks || new Set();
+    prepareOutputDirectory._heldLocks.add(lockHandle);
+  }
   return resolvedOutput;
 };
 
@@ -495,9 +573,16 @@ const runCloseoutWorkflow = async ({
     }, process.env, [...(config.requiredEnv || []), ...(config.safeEnv || [])]);
   }
 
+  // Explicit --output-dir is shared-name; take an exclusive lock. Default dirs
+  // already include pid+random uniqueness (Codex #4781560042).
+  const explicitOutputDir = Boolean(outputDir);
   const requestedOutput = path.resolve(outputDir || defaultOutputDir(initial.repo, initial.headSha));
   assertOutputOutsideRepository(initial.repo, requestedOutput);
-  const resolvedOutput = await d.prepareOutputDirectory({ repo: initial.repo, outputDir: requestedOutput });
+  const resolvedOutput = await d.prepareOutputDirectory({
+    repo: initial.repo,
+    outputDir: requestedOutput,
+    exclusive: explicitOutputDir,
+  });
   const childEnv = buildWorkflowEnvironment(process.env, config);
   const execute = d.execute || d.createCommandExecutor({
     repo: initial.repo,
@@ -946,6 +1031,7 @@ const runCloseoutWorkflow = async ({
 };
 
 module.exports = {
+  acquireOutputDirLock,
   defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,

@@ -300,6 +300,21 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
     }
     const packageScript = definition.packageCandidates?.find((candidate) => packageScripts[candidate]);
     if (packageScript) {
+      // Auto-discovered scripts are not covered by the touched-file scan when
+      // package.json is untouched. Reject failure-hiding bodies (e.g. vitest
+      // || true) the same way as explicitly configured commands (Codex
+      // #4781560042).
+      const scriptBody = packageScripts[packageScript];
+      const packageNeutralizer = findCommandFailureNeutralizer(scriptBody);
+      if (packageNeutralizer) {
+        return {
+          ...definition,
+          command: `pnpm run ${packageScript}`,
+          status: 'BLOCKED',
+          resolution: 'package-script',
+          evidence: `Package script "${packageScript}" for ${definition.label} neutralizes failures (${packageNeutralizer}); closeout cannot admit a failure-hiding package script.`,
+        };
+      }
       return { ...definition, command: `pnpm run ${packageScript}`, resolution: 'package-script' };
     }
     const makeTarget = definition.makeCandidates?.find((candidate) => targets.has(candidate));

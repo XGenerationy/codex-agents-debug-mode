@@ -993,56 +993,95 @@ const main = () => {
       // private regular file.
       await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
       await assertPrivateRegularFile(tokenFile, 'collector_token_not_private');
-      // Refuse to overwrite a token still owned by another live same-project
-      // collector on a different DEBUG_PORT (Codex multi-port finding). The
-      // companion collector_port file records which port last claimed the
-      // token; if that peer is still ready, leave its token intact.
+      // Atomic per-project ownership before mutating token/port files.
+      // Two concurrent launches on different DEBUG_PORTs can both observe a
+      // missing collector_port and race to write the shared token; O_EXCL on
+      // collector_claim serializes the winner (Codex #4781560042). A stale
+      // claim from a dead peer is reclaimed only after probing its port.
       const portFile = path.join(debugDir, 'collector_port');
-      // Read collector_port through openNoFollow + regular-file checks: a
-      // FIFO at this path would block path-based readFile indefinitely after
-      // listen(), hanging both this launch and subsequent ones (Codex
-      // #4781495663). Port is a small decimal string; cap the read.
+      const claimFile = path.join(debugDir, 'collector_claim');
       const MAX_PORT_FILE_BYTES = 32;
-      try {
-        const existingPortHandle = await openNoFollow(portFile, constants.O_RDONLY);
+      const MAX_CLAIM_FILE_BYTES = 256;
+      const readSmallRegularFile = async (target, maxBytes) => {
+        const handle = await openNoFollow(target, constants.O_RDONLY);
         try {
-          const portInfo = await existingPortHandle.stat();
-          if (
-            portInfo.isFile()
-            && portInfo.nlink === 1
-            && portInfo.size >= 1
-            && portInfo.size <= MAX_PORT_FILE_BYTES
-          ) {
-            const portBuf = Buffer.alloc(portInfo.size);
-            let portOffset = 0;
-            while (portOffset < portInfo.size) {
-              const { bytesRead } = await existingPortHandle.read(
-                portBuf,
-                portOffset,
-                portInfo.size - portOffset,
-                portOffset,
-              );
-              if (bytesRead === 0) break;
-              portOffset += bytesRead;
+          const info = await handle.stat();
+          if (!info.isFile() || info.nlink > 1 || info.size < 1 || info.size > maxBytes) {
+            return null;
+          }
+          const buf = Buffer.alloc(info.size);
+          let offset = 0;
+          while (offset < info.size) {
+            const { bytesRead } = await handle.read(buf, offset, info.size - offset, offset);
+            if (bytesRead === 0) break;
+            offset += bytesRead;
+          }
+          return buf.subarray(0, offset).toString('utf8');
+        } finally {
+          await handle.close().catch(() => {});
+        }
+      };
+      const peerStillReady = async (peerPort) => {
+        if (!Number.isInteger(peerPort) || peerPort <= 0 || peerPort === port) return false;
+        const peer = await probeReadyCollector(peerPort, server.collectorProjectHash, {
+          attempts: 4,
+          delayMs: 40,
+        });
+        return Boolean(peer && peer.project_hash === server.collectorProjectHash && peer.ready);
+      };
+      let claimHeld = false;
+      for (let attempt = 0; attempt < 5 && !claimHeld; attempt += 1) {
+        try {
+          const claimHandle = await openNoFollow(
+            claimFile,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+            0o600,
+          );
+          try {
+            await claimHandle.chmod(0o600);
+            await claimHandle.writeFile(`${port}\n${server.collectorInstanceId}\n${process.pid}\n`, 'utf8');
+          } finally {
+            await claimHandle.close();
+          }
+          claimHeld = true;
+        } catch (error) {
+          if (error?.code !== 'EEXIST') throw error;
+          let claimedPort = null;
+          try {
+            const claimText = await readSmallRegularFile(claimFile, MAX_CLAIM_FILE_BYTES);
+            if (claimText) {
+              const firstLine = claimText.split(/\r?\n/, 1)[0];
+              claimedPort = Number(String(firstLine).trim());
             }
-            const existingPort = Number(portBuf.subarray(0, portOffset).toString('utf8').trim());
-            if (Number.isInteger(existingPort) && existingPort > 0 && existingPort !== port) {
-              const peer = await probeReadyCollector(existingPort, server.collectorProjectHash, {
-                attempts: 4,
-                delayMs: 40,
-              });
-              if (peer && peer.project_hash === server.collectorProjectHash && peer.ready) {
-                throw new Error('collector_already_running_on_other_port');
-              }
+          } catch {
+            claimedPort = null;
+          }
+          if (await peerStillReady(claimedPort)) {
+            throw new Error('collector_already_running_on_other_port');
+          }
+          // Also honor collector_port when the claim file is unreadable but a
+          // live peer still owns the port file from a prior build.
+          try {
+            const portText = await readSmallRegularFile(portFile, MAX_PORT_FILE_BYTES);
+            const existingPort = portText ? Number(portText.trim()) : null;
+            if (await peerStillReady(existingPort)) {
+              throw new Error('collector_already_running_on_other_port');
+            }
+          } catch (portError) {
+            if (portError?.message === 'collector_already_running_on_other_port') throw portError;
+          }
+          // Stale claim: remove and retry exclusive create.
+          try {
+            await assertNotSymlink(claimFile, 'collector_claim_is_symlink');
+            await unlink(claimFile);
+          } catch (unlinkError) {
+            if (unlinkError?.code !== 'ENOENT') {
+              throw new Error('collector_claim_contention');
             }
           }
-        } finally {
-          await existingPortHandle.close().catch(() => {});
         }
-      } catch (error) {
-        if (error?.message === 'collector_already_running_on_other_port') throw error;
-        // Missing/unreadable/non-regular port file: proceed with this instance's claim.
       }
+      if (!claimHeld) throw new Error('collector_claim_failed');
       // Prefer create-exclusive for a fresh path; if the file already exists
       // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
       // blocks a symlink swap of the FINAL path component after the lstat
