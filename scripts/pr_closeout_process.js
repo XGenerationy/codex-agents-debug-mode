@@ -549,41 +549,49 @@ const listWindowsPidsWithCommandLineHint = async (cwd, {
   // Pass filters via env to avoid PowerShell injection through path chars.
   // Do not forward the ambient process.env (CI secrets) into powershell
   // (CodeRabbit #4781622077).
+  //
+  // Critical Windows CI fix (ccd7833 regression): joining statements with
+  // `; ` inserted empty statements after `{` and nested full-property
+  // Get-CimInstance walks, which routinely exceeded the 15s timeout and
+  // BLOCKED every createCommandExecutor test. Use a newline script, one
+  // property-limited CIM query, and a shallow ancestor walk with -Filter.
   const script = [
+    '$ErrorActionPreference = "Stop"',
     '$needle = $env:OMO_CLOSEOUT_CWD_HINT',
-    'if (-not $needle) { return }',
+    'if ([string]::IsNullOrEmpty($needle)) { exit 0 }',
     '$minMs = 0L',
-    'if ($env:OMO_CLOSEOUT_MIN_START_MS) { [void][long]::TryParse($env:OMO_CLOSEOUT_MIN_START_MS, [ref]$minMs) }',
+    '[void][long]::TryParse($env:OMO_CLOSEOUT_MIN_START_MS, [ref]$minMs)',
     '$exclude = New-Object "System.Collections.Generic.HashSet[int]"',
     'foreach ($part in (($env:OMO_CLOSEOUT_EXCLUDE_PIDS) -split ",")) {',
-    '  $n = 0; if ([int]::TryParse($part.Trim(), [ref]$n) -and $n -gt 0) { [void]$exclude.Add($n) }',
+    '  $n = 0',
+    '  if ([int]::TryParse($part.Trim(), [ref]$n) -and $n -gt 0) { [void]$exclude.Add($n) }',
     '}',
-    '$self = 0; [void][int]::TryParse(($env:OMO_CLOSEOUT_SELF_PID), [ref]$self)',
+    '$self = 0',
+    '[void][int]::TryParse($env:OMO_CLOSEOUT_SELF_PID, [ref]$self)',
     'if ($self -gt 0) {',
     '  $walk = $self',
-    '  $seen = New-Object "System.Collections.Generic.HashSet[int]"',
-    '  while ($walk -gt 0 -and $seen.Add($walk)) {',
-    '    [void]$exclude.Add($walk)',
-    '    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue',
-    '    if (-not $proc) { break }',
-    '    $walk = [int]$proc.ParentProcessId',
+    '  for ($i = 0; $i -lt 64 -and $walk -gt 0; $i++) {',
+    '    if (-not $exclude.Add($walk)) { break }',
+    '    $parentProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$walk" -Property ParentProcessId -ErrorAction SilentlyContinue',
+    '    if (-not $parentProc) { break }',
+    '    $walk = [int]$parentProc.ParentProcessId',
     '  }',
     '}',
-    '$epoch = [DateTime]::SpecifyKind([DateTime]::Parse("1970-01-01T00:00:00"), [DateTimeKind]::Utc)',
-    'Get-CimInstance Win32_Process | ForEach-Object {',
-    // Avoid $PID automatic variable; use $procId for the candidate ProcessId.
+    'Get-CimInstance -ClassName Win32_Process -Property ProcessId,CommandLine,CreationDate | ForEach-Object {',
     '  $procId = [int]$_.ProcessId',
     '  if ($exclude.Contains($procId)) { return }',
     '  $cl = $_.CommandLine',
     '  if (-not $cl) { return }',
     '  if ($cl.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return }',
     '  if ($minMs -gt 0 -and $_.CreationDate) {',
-    '    $createdMs = [int64]($_.CreationDate.ToUniversalTime() - $epoch).TotalMilliseconds',
-    '    if ($createdMs -lt $minMs) { return }',
+    '    try {',
+    '      $createdMs = [DateTimeOffset]::new([DateTime]$_.CreationDate).ToUnixTimeMilliseconds()',
+    '      if ($createdMs -lt $minMs) { return }',
+    '    } catch { }',
     '  }',
-    '  $procId.ToString()',
+    '  $procId',
     '}',
-  ].join('; ');
+  ].join('\n');
   const minimalEnv = {
     SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
     SYSTEMROOT: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
@@ -594,9 +602,16 @@ const listWindowsPidsWithCommandLineHint = async (cwd, {
     OMO_CLOSEOUT_SELF_PID: String(Number.isInteger(selfPid) ? selfPid : 0),
     OMO_CLOSEOUT_EXCLUDE_PIDS: [...excludePids].filter((p) => Number.isInteger(p) && p > 0).join(','),
   };
-  const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+  const { stdout } = await runExecFile(powershell, [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    script,
+  ], {
     encoding: 'utf8',
-    timeout: 15_000,
+    timeout: 20_000,
     windowsHide: true,
     env: minimalEnv,
   });

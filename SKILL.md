@@ -138,10 +138,23 @@ output handling.
 # (not the shell cwd — a relative `.debug/collector_token` would read the wrong tree).
 # export so the python3 subprocess can read PROJECT via os.environ.
 export PROJECT=/absolute/path/to/project
+# Truncate any prior startup capture so we never parse a stale empty file.
+: > /tmp/debug-collector-start.json
 node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT" > /tmp/debug-collector-start.json 2>&1 &
-# Wait for the started (or already_running) record before reading the token.
-for i in 1 2 3 4 5 6 7 8 9 10; do
+COLLECTOR_PID=$!
+# Wait for a terminal startup record. When port 8787 is occupied by a listener
+# that accepts TCP but does not answer /health, the server can spend ~10s on
+# its probe budget before writing started/already_running/error — so poll for
+# at least 15s, not 2s (Codex #4782132804).
+for i in $(seq 1 75); do
   if grep -qE '"status":"(started|already_running)"' /tmp/debug-collector-start.json 2>/dev/null; then
+    break
+  fi
+  if grep -qE '"level":"error"|"event":"startup\.failed"' /tmp/debug-collector-start.json 2>/dev/null; then
+    break
+  fi
+  # Child exited without a parseable status — stop waiting.
+  if ! kill -0 "$COLLECTOR_PID" 2>/dev/null; then
     break
   fi
   sleep 0.2
@@ -155,12 +168,24 @@ project = os.environ.get('PROJECT') or ''
 if not project:
     sys.stderr.write('PROJECT is not set; export PROJECT=/absolute/path/to/project\n')
     sys.exit(1)
-data = json.load(open('/tmp/debug-collector-start.json'))
+path = Path('/tmp/debug-collector-start.json')
+if not path.is_file() or path.stat().st_size < 2:
+    sys.stderr.write('collector startup output missing or empty; wait longer or inspect the process\n')
+    sys.exit(1)
+try:
+    data = json.loads(path.read_text(encoding='utf-8').splitlines()[-1])
+except Exception as error:
+    sys.stderr.write(f'collector startup JSON parse failed: {error}\n')
+    sys.exit(1)
+status = data.get('status') or ''
+if status not in ('started', 'already_running'):
+    sys.stderr.write(f'collector startup not ready: {data!r}\n')
+    sys.exit(1)
 token = data.get('collector_token') or ''
 if not token:
     rel = data.get('token_file') or '.debug/collector_token'
-    path = Path(rel) if os.path.isabs(rel) else Path(project) / rel
-    token = path.read_text(encoding='utf-8').strip() if path.is_file() else ''
+    token_path = Path(rel) if os.path.isabs(rel) else Path(project) / rel
+    token = token_path.read_text(encoding='utf-8').strip() if token_path.is_file() else ''
 print(token)
 ")
 ```

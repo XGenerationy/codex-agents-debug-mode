@@ -54,8 +54,9 @@ matches.
 The true live Grafana artifact must set `semantic` to `grafana-live-result`. A query proof binds a
 Grafana `/api/ds/query` request to a successful HTTP response with non-empty request queries and
 response results. A render proof binds a `/render/` endpoint to an image content type, positive byte
-count, and SHA-256 digest. Set `grafanaOrigin` when the proof must be restricted to a specific live
-Grafana origin. Arbitrary proof regular expressions are rejected.
+count, and SHA-256 digest. The accepted live origin is always derived from
+`services.grafana.url` (the independently probed service); do not set a separate `grafanaOrigin`
+proof field — the executor ignores it. Arbitrary proof regular expressions are rejected.
 
 First resolve the plan without running commands:
 

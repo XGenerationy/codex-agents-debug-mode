@@ -1151,7 +1151,7 @@ test('blocks configured commands that neutralize failures', () => {
         'make-sbom': {
           type: 'command',
           command: 'make sbom || exit 0',
-          expectedPattern: 'ok',
+          expectedPattern: 'literal:ok',
         },
       },
       baselineSetupCommand: 'pnpm install || true',

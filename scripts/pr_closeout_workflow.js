@@ -298,6 +298,9 @@ const prepareOutputDirectory = async ({
   mkdirPath = mkdir,
   realpathPath = realpath,
   exclusive = false,
+  // Optional box `{ lock: null }` filled when exclusive so callers can release
+  // only their own lock without a process-global drain (Codex #4782132804).
+  lockOut = null,
 }) => {
   const resolvedRepo = path.resolve(repo);
   const resolvedOutput = path.resolve(outputDir);
@@ -315,26 +318,21 @@ const prepareOutputDirectory = async ({
     // runs do not always burn the stale-PID reclaim path (CodeRabbit
     // #4781622077). process exit is a safety net only.
     const lock = await acquireOutputDirLock(resolvedOutput);
-    prepareOutputDirectory._heldLocks = prepareOutputDirectory._heldLocks || new Set();
-    prepareOutputDirectory._heldLocks.add(lock);
-    prepareOutputDirectory._releaseLocks = prepareOutputDirectory._releaseLocks || new Set();
-    prepareOutputDirectory._releaseLocks.add(lock.release);
+    if (lockOut && typeof lockOut === 'object') {
+      lockOut.lock = lock;
+    }
   }
   return resolvedOutput;
 };
 
 /**
- * Release exclusive output-dir locks acquired by prepareOutputDirectory.
- * Safe to call multiple times; each release is idempotent.
+ * Release a specific exclusive output-dir lock acquired for one workflow run.
+ * @param {OutputDirLock|null|undefined} lock
  * @returns {Promise<void>}
  */
-const releaseOutputDirLocks = async () => {
-  const releases = prepareOutputDirectory._releaseLocks;
-  if (!releases || releases.size === 0) return;
-  const pending = [...releases];
-  prepareOutputDirectory._releaseLocks.clear();
-  prepareOutputDirectory._heldLocks?.clear();
-  await Promise.all(pending.map((release) => release().catch(() => {})));
+const releaseOutputDirLock = async (lock) => {
+  if (!lock || typeof lock.release !== 'function') return;
+  await lock.release().catch(() => {});
 };
 
 DEFAULTS.prepareOutputDirectory = prepareOutputDirectory;
@@ -569,6 +567,15 @@ const runCloseoutWorkflow = async ({
   planOnly = false,
   dependencies = {},
 } = {}) => {
+  // Per-invocation lock box so concurrent runCloseoutWorkflow calls only
+  // release their own exclusive --output-dir lock (Codex #4782132804).
+  const lockOut = { lock: null };
+  const d = { ...DEFAULTS, ...dependencies };
+  const prepareWrapped = async (args) => d.prepareOutputDirectory({
+    ...args,
+    // Only the first exclusive prepare for this invocation owns the lock.
+    lockOut: args.exclusive && !lockOut.lock ? lockOut : null,
+  });
   try {
     return await runCloseoutWorkflowBody({
       repo,
@@ -576,13 +583,10 @@ const runCloseoutWorkflow = async ({
       config,
       outputDir,
       planOnly,
-      dependencies,
+      dependencies: { ...d, prepareOutputDirectory: prepareWrapped },
     });
   } finally {
-    // Always drop exclusive --output-dir locks on completion or failure so
-    // the next run does not depend on PID-liveness reclaim (CodeRabbit
-    // #4781622077).
-    await releaseOutputDirLocks();
+    await releaseOutputDirLock(lockOut.lock);
   }
 };
 
@@ -1121,7 +1125,7 @@ module.exports = {
   evaluateOverallStatus,
   normalizePersistedPaths,
   prepareOutputDirectory,
-  releaseOutputDirLocks,
+  releaseOutputDirLock,
   runCloseoutWorkflow,
   sealRepository,
 };

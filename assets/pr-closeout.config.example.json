@@ -54,8 +54,7 @@
     "grafana-live-render": {
       "type": "artifact",
       "path": "artifacts/grafana-live-render.json",
-      "semantic": "grafana-live-result",
-      "grafanaOrigin": "http://127.0.0.1:3000"
+      "semantic": "grafana-live-result"
     },
     "hunter-build": {
       "type": "command",

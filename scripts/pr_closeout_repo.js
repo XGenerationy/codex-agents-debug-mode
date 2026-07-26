@@ -321,7 +321,19 @@ const readProjectMetadata = async (repo) => {
       if (opened.size > MAX_SUPPRESSION_SCAN_BYTES) {
         throw new Error(`Refusing to read oversized metadata (${opened.size} > ${MAX_SUPPRESSION_SCAN_BYTES} bytes): ${relative}`);
       }
-      return await handle.readFile('utf8');
+      // Read at most the verified size so a concurrent grow cannot force an
+      // unbounded buffer despite the size check (Codex #4782132804).
+      const bytes = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < opened.size) {
+        const { bytesRead } = await handle.read(bytes, offset, opened.size - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset !== opened.size) {
+        throw new Error(`Metadata short-read during plan construction (${offset}/${opened.size} bytes): ${relative}`);
+      }
+      return bytes.toString('utf8');
     } finally {
       await handle.close().catch(() => {});
     }
@@ -468,7 +480,10 @@ const scanTouchedSuppressions = async (repo, files) => {
         }
       }
       // Bound the read to the re-stated size so a concurrent grow during
-      // readFile cannot force an unbounded buffer allocation.
+      // readFile cannot force an unbounded buffer allocation. A short read
+      // (file shrunk/replaced mid-loop) must fail closed as scan-error so a
+      // concurrent writer cannot hide a marker in the unread tail (Codex
+      // #4782132804).
       const bytes = Buffer.alloc(opened.size);
       let offset = 0;
       while (offset < opened.size) {
@@ -476,7 +491,16 @@ const scanTouchedSuppressions = async (repo, files) => {
         if (bytesRead === 0) break;
         offset += bytesRead;
       }
-      findings.push(...scanSuppressionText(file, decodeTouchedText(bytes.subarray(0, offset))));
+      if (offset !== opened.size) {
+        findings.push({
+          file,
+          line: 0,
+          category: 'scan-error',
+          match: `Touched file short-read during suppression scan (${offset}/${opened.size} bytes).`,
+        });
+        continue;
+      }
+      findings.push(...scanSuppressionText(file, decodeTouchedText(bytes)));
     } catch (error) {
       if (error.code !== 'ENOENT') {
         findings.push({ file, line: 0, category: 'scan-error', match: error.message });

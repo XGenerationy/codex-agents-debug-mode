@@ -1,3 +1,5 @@
+const path = require('node:path');
+
 const MARKERS = [
   'skipcq',
   'biome-ignore',
@@ -347,10 +349,43 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
         ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
         : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
     }
+    // Validate proof policies at plan time so unusable proofs cannot be
+    // attested as admissible (Codex #4782132804). Mirrors executor rules.
+    if (validArtifact) {
+      const rel = String(proof.path).replaceAll('\\', '/').trim();
+      if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
+        || rel.split('/').includes('..') || rel.startsWith('../')) {
+        const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      }
+      if (check.id === 'grafana-live-render' && proof.semantic !== 'grafana-live-result') {
+        const proofEvidence = 'Grafana live proof requires semantic=grafana-live-result at plan time.';
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      }
+    }
     if (validCommand) {
       const proofNeutralizer = findCommandFailureNeutralizer(proof.command);
       if (proofNeutralizer) {
         const proofEvidence = `Postcondition proof command for ${check.label} neutralizes failures (${proofNeutralizer}).`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      }
+      const policy = String(proof.expectedPattern || '').trim();
+      const hunterOk = check.id === 'hunter-build'
+        && policy === 'semantic:docker-compose-running-healthy';
+      const literalOk = policy.startsWith('literal:')
+        && policy.length <= 264
+        && policy.length > 'literal:'.length
+        && !/[\u0000-\u001f\u007f]/u.test(policy);
+      if (!hunterOk && !literalOk) {
+        const proofEvidence = check.id === 'hunter-build'
+          ? 'Hunter proof requires expectedPattern semantic:docker-compose-running-healthy at plan time.'
+          : 'Command proof expectedPattern must use a bounded literal:<text> policy or a supported semantic policy at plan time.';
         resolved = resolved.status === 'BLOCKED'
           ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
           : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
