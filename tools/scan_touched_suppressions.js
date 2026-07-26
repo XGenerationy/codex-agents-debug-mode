@@ -303,6 +303,32 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
 };
 
 /**
+ * Any substantive deleted content in gate files (not blank/comment-only).
+ * Used by CI to fail-closed on replacements that neutralize smoke checks
+ * without matching VALIDATION_REMOVAL_PATTERNS (Codex #4781495663).
+ * @param {string} baseSha
+ * @param {string[]} gateFiles
+ * @returns {string[]} truncated removed lines
+ */
+const detectGateContentRemovals = (baseSha, gateFiles) => {
+  if (!gateFiles.length) return [];
+  let diff = '';
+  try {
+    diff = diffUnified(baseSha, gateFiles);
+  } catch (error) {
+    throw new Error(`Failed to read gate diff for content-removal scan: ${error.message}`);
+  }
+  const findings = [];
+  for (const line of diff.split(/\r?\n/)) {
+    if (!line.startsWith('-') || line.startsWith('---')) continue;
+    const body = line.slice(1).trim();
+    if (!body || body.startsWith('#')) continue;
+    findings.push(line.slice(0, 200));
+  }
+  return findings;
+};
+
+/**
  * CLI entry: resolve base/head, scan suppressions + gate integrity, exit
  * non-zero on FAIL findings or validation-step removals.
  * @returns {Promise<void>}
@@ -360,11 +386,13 @@ const main = async () => {
     process.exitCode = 1;
   } else if (integrity.status === 'BLOCKED') {
     // Additive gate changes still need live review for closeout, but CI must
-    // not treat deletion-only weakening as success. Inspect removed lines.
-    const removals = detectValidationRemovals(
-      gateBaseSha,
-      [...new Set([...gate.changedFiles, ...gate.deletedFiles])].filter(isGateFile),
-    );
+    // not treat deletion/replacement weakening as success. Pattern-matched
+    // validation removals fail first; any other substantive deleted gate
+    // content also fails closed so a smoke block replaced by `echo passed`
+    // cannot exit 0 when it evades VALIDATION_REMOVAL_PATTERNS (Codex
+    // #4781495663). Pure additive BLOCKED remains a non-failing notice.
+    const gateTargets = [...new Set([...gate.changedFiles, ...gate.deletedFiles])].filter(isGateFile);
+    const removals = detectValidationRemovals(gateBaseSha, gateTargets);
     if (removals.length) {
       process.stderr.write(
         `FAIL: gate diff removes validation step(s) without a FAIL-class weakening match:\n`,
@@ -374,9 +402,20 @@ const main = async () => {
       }
       process.exitCode = 1;
     } else {
-      process.stdout.write(
-        `gate-scan: BLOCKED (no validation-step removals detected): ${integrity.evidence}\n`,
-      );
+      const contentRemovals = detectGateContentRemovals(gateBaseSha, gateTargets);
+      if (contentRemovals.length) {
+        process.stderr.write(
+          `FAIL: gate diff removes content without a FAIL-class weakening match (fail-closed):\n`,
+        );
+        for (const line of contentRemovals.slice(0, 20)) {
+          process.stderr.write(`  ${line}\n`);
+        }
+        process.exitCode = 1;
+      } else {
+        process.stdout.write(
+          `gate-scan: BLOCKED (additive-only; no gate content removals): ${integrity.evidence}\n`,
+        );
+      }
     }
   } else {
     process.stdout.write(`gate-scan: ${integrity.status}\n`);

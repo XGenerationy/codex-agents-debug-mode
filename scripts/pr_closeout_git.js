@@ -117,6 +117,11 @@ const VALIDATION_REMOVAL_PATTERNS = [
   /^\-.*\b(?:cargo\s+test|go\s+test|pytest|python\s+-m\s+pytest|dotnet\s+test|mvn\s+test|gradlew?\s+test|bun\s+test|yarn\s+test|vitest|jest|mocha|phpunit|rspec|ctest)\b/i,
   // npm/pnpm/yarn with an explicit validation script name (optional `run`).
   /^\-.*\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|typecheck|validate|audit|build|check|verify|coverage)\b/i,
+  // Installer / smoke / existence assertions often used as required CI gates
+  // but not covered by the package-manager patterns above (Codex #4781495663).
+  /^\-.*\b(?:\.\/)?install\.sh\b/i,
+  /^\-.*\btest\s+-[efdxL]\b/i,
+  /^\-.*\b(?:smoke|healthcheck|doctor)\b/i,
 ];
 
 /**

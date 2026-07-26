@@ -107,11 +107,14 @@ const isBashCompatibleShell = (shell) => {
  */
 const defaultShellArgs = (command, shell = 'bash') => (
   isBashCompatibleShell(shell)
-    // Enable pipefail so `false | cat` is not a silent PASS: without it Bash
-    // returns only the final pipeline stage's status and classifyOutput would
-    // treat a failed left-hand command as success (Codex #4781366510).
-    ? ['--noprofile', '--norc', '-c', `set -o pipefail; ${command}`]
-    : ['-c', command]
+    // Enable errexit + pipefail so compound forms cannot discard earlier
+    // failures: without `-e`, `false; printf done` exits 0 and classifyOutput
+    // records PASS; without pipefail, `false | cat` is the same class of
+    // silent success (Codex #4781366510 / #4781495663).
+    ? ['--noprofile', '--norc', '-c', `set -eo pipefail; ${command}`]
+    // Non-bash shells lack portable pipefail; still enable errexit so
+    // `false; true` does not PASS.
+    : ['-c', `set -e; ${command}`]
 );
 
 /**

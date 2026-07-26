@@ -2,7 +2,7 @@
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
 const { constants, realpathSync, writeSync } = require('node:fs');
-const { lstat, mkdir, open, readFile, realpath, unlink } = require('node:fs/promises');
+const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
@@ -895,16 +895,43 @@ const main = () => {
         // against the peer before accepting the probe (Codex #4780351874 /
         // #4781366510).
         const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
+        // Read through openNoFollow (not path-based readFile): a TOCTOU
+        // symlink swap between lstat and read would otherwise send arbitrary
+        // file bytes as Authorization: Bearer … (CodeRabbit #4781498400).
+        // Tokens are base64url(32 bytes) ≈ 43 chars; cap well above that.
+        const MAX_LAUNCH_TOKEN_BYTES = 256;
+        let tokenHandle;
         try {
-          await assertNotSymlink(tokenFile, 'collector_token_is_symlink');
-          const tokenInfo = await lstat(tokenFile);
-          if (!tokenInfo.isFile() || tokenInfo.nlink > 1 || tokenInfo.size < 1) {
+          tokenHandle = await openNoFollow(tokenFile, constants.O_RDONLY);
+          const tokenInfo = await tokenHandle.stat();
+          if (
+            !tokenInfo.isFile()
+            || tokenInfo.nlink > 1
+            || tokenInfo.size < 1
+            || tokenInfo.size > MAX_LAUNCH_TOKEN_BYTES
+          ) {
             throw new Error('collector_token_unavailable');
           }
-          const diskToken = (await readFile(tokenFile, 'utf8')).trim();
+          const tokenBuf = Buffer.alloc(tokenInfo.size);
+          let tokenOffset = 0;
+          while (tokenOffset < tokenInfo.size) {
+            const { bytesRead } = await tokenHandle.read(
+              tokenBuf,
+              tokenOffset,
+              tokenInfo.size - tokenOffset,
+              tokenOffset,
+            );
+            if (bytesRead === 0) break;
+            tokenOffset += bytesRead;
+          }
+          const diskToken = tokenBuf.subarray(0, tokenOffset).toString('utf8').trim();
           if (!diskToken || !(await probeLaunchToken(port, diskToken))) {
             throw new Error('collector_token_auth_failed');
           }
+          // Close before process.exit: an async finally would not run after
+          // the force-exit used for the EADDRINUSE hang path.
+          await tokenHandle.close().catch(() => {});
+          tokenHandle = null;
           // Sync write + force-exit: piped stdout.write can be truncated by
           // process.exit, and a failed-listen Server handle can park the
           // process on some Node/Windows builds (CodeRabbit #4781360793 /
@@ -918,6 +945,7 @@ const main = () => {
           })}\n`);
           process.exit(0);
         } catch {
+          if (tokenHandle) await tokenHandle.close().catch(() => {});
           writeFdSync(2, `${JSON.stringify({
             level: 'error',
             event: 'startup.failed',
@@ -970,20 +998,50 @@ const main = () => {
       // companion collector_port file records which port last claimed the
       // token; if that peer is still ready, leave its token intact.
       const portFile = path.join(debugDir, 'collector_port');
+      // Read collector_port through openNoFollow + regular-file checks: a
+      // FIFO at this path would block path-based readFile indefinitely after
+      // listen(), hanging both this launch and subsequent ones (Codex
+      // #4781495663). Port is a small decimal string; cap the read.
+      const MAX_PORT_FILE_BYTES = 32;
       try {
-        const existingPort = Number((await readFile(portFile, 'utf8')).trim());
-        if (Number.isInteger(existingPort) && existingPort > 0 && existingPort !== port) {
-          const peer = await probeReadyCollector(existingPort, server.collectorProjectHash, {
-            attempts: 4,
-            delayMs: 40,
-          });
-          if (peer && peer.project_hash === server.collectorProjectHash && peer.ready) {
-            throw new Error('collector_already_running_on_other_port');
+        const existingPortHandle = await openNoFollow(portFile, constants.O_RDONLY);
+        try {
+          const portInfo = await existingPortHandle.stat();
+          if (
+            portInfo.isFile()
+            && portInfo.nlink === 1
+            && portInfo.size >= 1
+            && portInfo.size <= MAX_PORT_FILE_BYTES
+          ) {
+            const portBuf = Buffer.alloc(portInfo.size);
+            let portOffset = 0;
+            while (portOffset < portInfo.size) {
+              const { bytesRead } = await existingPortHandle.read(
+                portBuf,
+                portOffset,
+                portInfo.size - portOffset,
+                portOffset,
+              );
+              if (bytesRead === 0) break;
+              portOffset += bytesRead;
+            }
+            const existingPort = Number(portBuf.subarray(0, portOffset).toString('utf8').trim());
+            if (Number.isInteger(existingPort) && existingPort > 0 && existingPort !== port) {
+              const peer = await probeReadyCollector(existingPort, server.collectorProjectHash, {
+                attempts: 4,
+                delayMs: 40,
+              });
+              if (peer && peer.project_hash === server.collectorProjectHash && peer.ready) {
+                throw new Error('collector_already_running_on_other_port');
+              }
+            }
           }
+        } finally {
+          await existingPortHandle.close().catch(() => {});
         }
       } catch (error) {
         if (error?.message === 'collector_already_running_on_other_port') throw error;
-        // Missing/unreadable port file: proceed with this instance's claim.
+        // Missing/unreadable/non-regular port file: proceed with this instance's claim.
       }
       // Prefer create-exclusive for a fresh path; if the file already exists
       // (previous run), open it for write WITHOUT truncation. O_NOFOLLOW
@@ -1046,15 +1104,33 @@ const main = () => {
       }
       // Record which port owns the shared collector_token so a second
       // same-project collector on a different DEBUG_PORT cannot silently
-      // overwrite it while the first is still ready.
+      // overwrite it while the first is still ready. Mirror collector_token
+      // hardening: no O_TRUNC at open, refuse hard-linked/non-private inodes,
+      // re-check containment after open (Qodo/Codex/CodeRabbit #4781478035 /
+      // #4781495663 / #4781498400).
       await assertNotSymlink(portFile, 'collector_port_is_symlink');
+      await assertPrivateRegularFile(portFile, 'collector_port_not_private');
       const portHandle = await openNoFollow(
         portFile,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+        constants.O_WRONLY | constants.O_CREAT,
         0o600,
       );
       try {
+        const portWriteInfo = await portHandle.stat();
+        if (!portWriteInfo.isFile() || portWriteInfo.nlink > 1) {
+          throw new Error('collector_port_not_private');
+        }
+        let realPortFile;
+        try {
+          realPortFile = await realpath(portFile);
+        } catch {
+          throw new Error('collector_port_parent_replaced');
+        }
+        if (!isInsideRoot(resolvedRoot, realPortFile)) {
+          throw new Error('collector_port_parent_replaced');
+        }
         await portHandle.chmod(0o600);
+        await portHandle.truncate(0);
         await portHandle.writeFile(String(port), 'utf8');
       } finally {
         await portHandle.close();

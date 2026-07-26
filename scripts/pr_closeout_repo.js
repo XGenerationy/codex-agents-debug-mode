@@ -148,20 +148,17 @@ const listIgnoreFiles = async (repo) => {
  * @returns {Promise<Buffer>} Raw stdout bytes.
  */
 /**
- * Git env for internal closeout invocations: drop worktree/dir overrides so
- * a caller-supplied GIT_WORK_TREE / GIT_DIR cannot redirect operations away
- * from the explicit `--repo` path (Codex open finding).
+ * Git env for internal closeout invocations: drop every inherited GIT_*
+ * variable so caller-controlled routing (GIT_DIR / GIT_WORK_TREE), external
+ * helpers (GIT_EXTERNAL_DIFF), and config overrides (GIT_CONFIG_*) cannot
+ * redirect, execute, or reconfigure internal git work (CodeRabbit #4781498400).
  * @returns {NodeJS.ProcessEnv}
  */
 const gitChildEnv = () => {
   const env = { ...process.env };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_COMMON_DIR;
-  delete env.GIT_NAMESPACE;
-  delete env.GIT_INDEX_FILE;
-  delete env.GIT_OBJECT_DIRECTORY;
-  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GIT_')) delete env[key];
+  }
   return env;
 };
 
@@ -965,7 +962,26 @@ const readGateChanges = async (repo, baseSha) => {
         }
         throw error;
       }
-      const text = decodeTouchedText(await handle.readFile());
+      // Re-stat the opened descriptor and read at most that size so a
+      // concurrent grow after the pre-open lstat cannot bypass the 5 MiB
+      // cap via unbounded handle.readFile() (Codex #4781495663).
+      const opened = await handle.stat();
+      if (!opened.isFile()) {
+        addedLines.push(`+__decode_error__:${file}:non_regular_file`);
+        continue;
+      }
+      if (opened.size > MAX_SUPPRESSION_SCAN_BYTES) {
+        addedLines.push(`+__decode_error__:${file}:exceeds_scan_limit`);
+        continue;
+      }
+      const bytes = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < opened.size) {
+        const { bytesRead } = await handle.read(bytes, offset, opened.size - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      const text = decodeTouchedText(bytes.subarray(0, offset));
       for (const line of text.split(/\r?\n/)) {
         addedLines.push(`+${line}`);
       }

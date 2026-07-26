@@ -423,7 +423,14 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
     // If an explicit --output-dir is reused after a PASS run and we crash
     // between MD rename and JSON rename, consumers must not keep reading the
     // stale PASS JSON from the prior generation (Codex #4781366510).
-    await unlink(json).catch(() => {});
+    // Ignore only ENOENT; any other unlink failure must surface so a
+    // permission/lock problem cannot leave stale PASS evidence readable
+    // (CodeRabbit #4781498400).
+    try {
+      await unlink(json);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
     // Commit Markdown first, PASS/final JSON last. On a recoverable
     // second-rename failure, remove the committed Markdown so the pair stays
     // consistent (JSON already removed above).

@@ -1101,14 +1101,15 @@ test('probeCommandDefault runs commands through a non-login shell (--noprofile -
   // argv as the executor (`--noprofile --norc -c`) so shell profiles cannot
   // inject side effects, while still resolving tools already on PATH.
   const { defaultShellArgs } = require('./pr_closeout_process');
-  // Bash-compatible shells enable pipefail so failed pipeline stages cannot PASS.
-  assert.deepEqual(defaultShellArgs('true'), ['--noprofile', '--norc', '-c', 'set -o pipefail; true']);
-  assert.deepEqual(defaultShellArgs('true', 'bash'), ['--noprofile', '--norc', '-c', 'set -o pipefail; true']);
-  assert.deepEqual(defaultShellArgs('true', '/bin/bash'), ['--noprofile', '--norc', '-c', 'set -o pipefail; true']);
-  // Non-bash shells must not receive bash-only flags (zsh/dash/ksh reject them).
-  assert.deepEqual(defaultShellArgs('true', 'zsh'), ['-c', 'true']);
-  assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'true']);
-  assert.deepEqual(defaultShellArgs('true', 'C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe'), ['--noprofile', '--norc', '-c', 'set -o pipefail; true']);
+  // Bash-compatible shells enable errexit + pipefail so compound/pipeline
+  // failures cannot PASS (Codex #4781495663).
+  assert.deepEqual(defaultShellArgs('true'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
+  assert.deepEqual(defaultShellArgs('true', 'bash'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
+  assert.deepEqual(defaultShellArgs('true', '/bin/bash'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
+  // Non-bash shells get errexit only; bash-only flags would be rejected.
+  assert.deepEqual(defaultShellArgs('true', 'zsh'), ['-c', 'set -e; true']);
+  assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'set -e; true']);
+  assert.deepEqual(defaultShellArgs('true', 'C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
   const shell = resolveCommandShell({ env: process.env });
   const result = await probeCommandDefault({
     command: 'printf %s probe-default-ok',

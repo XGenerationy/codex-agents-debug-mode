@@ -45,7 +45,10 @@ const CONFIG_SILENCING = [
   /["'](?:no|prefer|require|max|min|eqeqeq|curly|strict|camelcase|semi|quotes|indent)-[\w-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
   // ESLint array-form severity zero: 'no-console': [0, { allow: ['warn'] }]
   // (Codex #4781366510). Also covered above via `\[\s*0\b` on rule-id keys.
-  /["']?rules?["']?\s*[:=][\s\S]*?["'][^"'\r\n]+["']\s*:\s*\[\s*0\b/i,
+  // Bound the scan window like the ignore/exclude siblings so a multi-MB
+  // configLike file cannot force an unbounded walk, and a distant unrelated
+  // `[0, ...]` cannot be misattributed (CodeRabbit #4781498400).
+  /["']?rules?["']?\s*[:=][\s\S]{0,50000}?["'][^"'\r\n]+["']\s*:\s*\[\s*0\b/i,
   /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled["']?\s*[:=]\s*false|disabled["']?\s*[:=]\s*true)/i,
   // GitHub Actions step disable: `if: false` / `if: ${{ false }}` silences a
   // validation step without touching continue-on-error (Codex open finding).

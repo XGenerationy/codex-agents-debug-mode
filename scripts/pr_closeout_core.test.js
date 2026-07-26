@@ -849,11 +849,21 @@ test('flags active test-weakening after a block-comment apostrophe on the same l
 });
 
 test('flags optional-chaining computed focus/skip members', () => {
+  // One finding per line is intentional; put each form on its own line so a
+  // single-branch regex regression fails the test (CodeRabbit #4781498400).
   const findings = scanSuppressionText(
     'tests/foo.test.js',
-    "test?.['only']('focused', () => {}); describe?.[\"skip\"]('x', () => {});",
+    "test?.['only']('focused', () => {});\ndescribe?.[\"skip\"]('x', () => {});",
   ).filter(({ category }) => category === 'test-weakening');
-  assert.ok(findings.length >= 1, JSON.stringify(findings));
+  assert.equal(findings.length, 2, JSON.stringify(findings));
+  assert.ok(
+    findings.some(({ match }) => /only/i.test(match)),
+    `expected test?.['only'] finding: ${JSON.stringify(findings)}`,
+  );
+  assert.ok(
+    findings.some(({ match }) => /skip/i.test(match)),
+    `expected describe?.["skip"] finding: ${JSON.stringify(findings)}`,
+  );
 });
 
 test('flags multiline focused/skipped test member access', () => {
