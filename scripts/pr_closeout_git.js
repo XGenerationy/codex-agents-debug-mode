@@ -577,6 +577,37 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   }
   try {
     try {
+      // Recover a stale `.closeout-disabled.<pid>` backup left by a previous
+      // run that was killed without a catchable signal (SIGKILL / hard crash)
+      // before its finally restored .git/info/attributes. The PID-suffixed
+      // name means a stale backup never collides with this run's own backup;
+      // restore the most recent one only when the real attributes file is
+      // missing, so a crashed prior closeout does not leave the repo with
+      // filter/attribute behavior disabled (Codex M6UFnGP). Best-effort:
+      // never block the baseline comparison on recovery.
+      try {
+        const nodeFs = require('node:fs');
+        const attrsDir = path.dirname(infoAttributes);
+        const base = path.basename(infoAttributes);
+        const stalePrefix = `${base}.closeout-disabled.`;
+        let staleBackups = [];
+        try {
+          staleBackups = nodeFs.readdirSync(attrsDir)
+            .filter((entry) => entry.startsWith(stalePrefix))
+            .map((entry) => path.join(attrsDir, entry));
+        } catch { /* dir missing — nothing to recover */ }
+        let realAttributesExists = false;
+        try { nodeFs.statSync(infoAttributes); realAttributesExists = true; } catch { realAttributesExists = false; }
+        if (!realAttributesExists && staleBackups.length > 0) {
+          staleBackups.sort((a, b) => {
+            try { return nodeFs.statSync(b).mtimeMs - nodeFs.statSync(a).mtimeMs; } catch { return 0; }
+          });
+          await rename(staleBackups[0], infoAttributes);
+          for (const extra of staleBackups.slice(1)) {
+            process.stderr.write(`Warning: additional orphaned attributes backup left at ${extra}\n`);
+          }
+        }
+      } catch { /* recovery is best-effort */ }
       await rename(infoAttributes, infoAttributesBackup);
       attributesMoved = true;
     } catch (error) {
