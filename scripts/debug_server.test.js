@@ -118,7 +118,7 @@ const findFreePort = () =>
 // A hard timeout kills the child so a hung collector cannot park the whole
 // suite (Node 24 / windows-latest previously hit the 45m job timeout when a
 // single EADDRINUSE child never settled).
-const launchCli = (projectRoot, port, { timeoutMs = 12_000 } = {}) => {
+const launchCli = (projectRoot, port, { timeoutMs = 20_000 } = {}) => {
   const child = spawn(
     process.execPath,
     [path.join(__dirname, 'debug_server.js'), projectRoot],
@@ -154,7 +154,7 @@ const launchCli = (projectRoot, port, { timeoutMs = 12_000 } = {}) => {
       stderr += chunk;
     });
     child.on('exit', (code) => finish({ status: null, stdout, stderr, exitCode: code }));
-    // Route spawn errors through finish so the 12s force-exit timer is cleared
+    // Route spawn errors through finish so the startup force-exit timer is cleared
     // (CodeRabbit #4781360793). A bare reject left the timer armed and could
     // call stopCli long after the test settled.
     child.on('error', (error) => {

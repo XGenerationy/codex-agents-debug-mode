@@ -47,7 +47,11 @@ const protectWindowsTokenFile = (tokenFile) => {
   execFileSync(
     'powershell.exe',
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { stdio: 'ignore', timeout: 5_000, windowsHide: true },
+    // Hosted and freshly provisioned Windows profiles can take more than five
+    // seconds to load PowerShell/.NET ACL types. Keep the operation bounded
+    // and fail closed, but allow a realistic startup budget before reporting
+    // token_write_failed.
+    { stdio: 'ignore', timeout: 15_000, windowsHide: true },
   );
 };
 
