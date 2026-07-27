@@ -189,6 +189,22 @@ const stopCli = (child) => {
   }
 };
 
+const windowsAclIsCurrentUserOnly = (filePath) => {
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
+  const script = [
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    'if ($acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
+  ].join('; ');
+  return spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { encoding: 'utf8', windowsHide: true },
+  );
+};
+
 const bashProbe = spawnSync('bash', ['-c', 'true']);
 const bashAvailable = !bashProbe.error && bashProbe.status === 0;
 
@@ -346,6 +362,21 @@ test('probeLaunchToken settles within a bounded wall-clock period against a tric
     assert.ok(elapsedMs < 5_000, `launch-token probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
   } finally {
     await close(trickler);
+  }
+});
+
+test('launch-token proof authenticates a collector without putting the bearer in HTTP headers', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-proof-'));
+  const collector = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const collectorUrl = await listen(collector);
+
+  try {
+    const port = Number(new URL(collectorUrl).port);
+    assert.equal(await probeLaunchToken(port, TEST_LAUNCH_TOKEN), true);
+    assert.equal(await probeLaunchToken(port, 'wrong-token'), false);
+  } finally {
+    await close(collector);
+    await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
@@ -803,6 +834,34 @@ test('enforces bounded sessions and events', async () => {
   }
 });
 
+test('retires inactive sessions before enforcing the session cap', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-session-retire-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { maxSessions: 1, sessionIdleTimeoutMs: 40 },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const first = await createSession(baseUrl);
+    assert.equal(first.status, 201);
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    const second = await createSession(baseUrl, 'fresh-debugging-run');
+    assert.equal(second.status, 201, JSON.stringify(second.body));
+
+    // Retirement revokes only the in-memory credential. The old evidence file
+    // remains on disk and still counts toward aggregate storage accounting.
+    const staleWrite = await recordEvent(baseUrl, first.body);
+    assert.equal(staleWrite.status, 404);
+    assert.deepEqual(staleWrite.body, { error: 'unknown_session' });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('enforces the aggregate log byte cap', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({
@@ -1005,6 +1064,30 @@ test('writes the launch token through the descriptor with owner-only permissions
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
+
+test(
+  'writes collector_token with a protected current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-windows-token-acl-'));
+    let child;
+    try {
+      const port = await findFreePort();
+      const launched = launchCli(projectRoot, port);
+      child = launched.child;
+      const result = await launched.outcome;
+      assert.equal(result.status, 'started', result.stderr);
+
+      const tokenFile = path.join(projectRoot, '.debug', 'collector_token');
+      const acl = windowsAclIsCurrentUserOnly(tokenFile);
+      assert.equal(acl.status, 0, `${acl.stdout}\n${acl.stderr}`);
+      assert.equal(acl.stdout.trim(), 'ok');
+    } finally {
+      if (child) stopCli(child);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test('releases its own collector_claim when startup fails after the claim is held', { timeout: 20000 }, async () => {
   // releaseOwnedClaim runs on server 'close' / process 'exit'. The externally
@@ -1318,6 +1401,68 @@ test('reports already_running when the SAME project root is relaunched on an occ
   } finally {
     if (secondChild) stopCli(secondChild);
     if (firstChild) stopCli(firstChild);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('refuses a forged same-project listener without disclosing collector_token', { timeout: 20000 }, async () => {
+  // The project hash is deliberately not a secret, so an attacker can forge a
+  // plausible /health response. The relaunch must demand an HMAC proof and
+  // never put collector_token in Authorization or any other request field.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-forged-peer-'));
+  const identitySource = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const diskToken = 'private-token-that-must-not-reach-the-forged-listener';
+  let forged;
+  let secondChild;
+  let observedAuthorization;
+  let observedChallenge;
+  try {
+    const port = await findFreePort();
+    await mkdir(path.join(projectRoot, '.debug'), { recursive: true });
+    await writeFile(path.join(projectRoot, '.debug', 'collector_token'), diskToken, { mode: 0o600 });
+    if (process.platform !== 'win32') await chmod(path.join(projectRoot, '.debug', 'collector_token'), 0o600);
+
+    forged = http.createServer((request, response) => {
+      const url = new URL(request.url, 'http://127.0.0.1');
+      if (url.pathname === '/health') {
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(`${JSON.stringify({
+          service: COLLECTOR_SERVICE,
+          version: COLLECTOR_VERSION,
+          instance_id: 'f'.repeat(32),
+          project_hash: identitySource.collectorProjectHash,
+          ready: true,
+        })}\n`);
+        return;
+      }
+      if (url.pathname === '/auth') {
+        observedAuthorization = request.headers.authorization;
+        observedChallenge = url.searchParams.get('challenge');
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end('{"proof":"forged"}\n');
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+    await new Promise((resolve, reject) => {
+      forged.once('error', reject);
+      forged.listen(port, '127.0.0.1', resolve);
+    });
+
+    const second = launchCli(projectRoot, port);
+    secondChild = second.child;
+    const result = await second.outcome;
+
+    assert.equal(result.status, null);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /already_running_token_unavailable/);
+    assert.equal(observedAuthorization, undefined);
+    assert.match(observedChallenge, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(observedChallenge.includes(diskToken), false);
+  } finally {
+    if (secondChild) stopCli(secondChild);
+    if (forged) await close(forged);
     await rm(projectRoot, { recursive: true, force: true });
   }
 });

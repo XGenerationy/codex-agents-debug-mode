@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
+const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
@@ -18,6 +19,41 @@ const writeFdSync = (fd, text) => {
   writeSync(fd, text);
 };
 
+// Windows does not implement POSIX 0600 semantics: fs.chmod() only affects
+// the writable bit, leaving inherited DACL entries able to read a token in a
+// shared checkout. Configure an explicit, protected DACL before the secret is
+// written. The PowerShell program is fixed and the path is embedded only as
+// UTF-16 base64, so repository-controlled path characters cannot become code.
+// If PowerShell, the filesystem, or ACL verification fails, startup fails
+// before collector_token receives any token bytes.
+const protectWindowsTokenFile = (tokenFile) => {
+  if (process.platform !== 'win32') return;
+  const encodedPath = Buffer.from(tokenFile, 'utf16le').toString('base64');
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$acl.SetAccessRuleProtection($true, $false)',
+    'foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }',
+    '$ownerRule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)',
+    '$acl.SetAccessRule($ownerRule)',
+    '[IO.File]::SetAccessControl($path, $acl)',
+    '$verified = [IO.File]::GetAccessControl($path)',
+    'if (-not $verified.AreAccessRulesProtected) { exit 1 }',
+    '$rules = @($verified.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    'if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)) { exit 1 }',
+  ].join('; ');
+  execFileSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { stdio: 'ignore', timeout: 5_000, windowsHide: true },
+  );
+};
+
+const launchTokenProof = (token, challenge) =>
+  createHmac('sha256', token).update(`codex-debug-collector-auth-v1:${challenge}`, 'utf8').digest('base64url');
+
 const DEFAULT_PORT = 8787;
 const COLLECTOR_SERVICE = 'codex-debug-collector';
 const COLLECTOR_VERSION = 1;
@@ -25,6 +61,9 @@ const DEFAULT_LIMITS = Object.freeze({
   maxBodyBytes: 64 * 1024,
   bodyTimeoutMs: 30_000,
   maxSessions: 32,
+  // Completed sessions are retired after inactivity so a long-lived reused
+  // collector does not permanently exhaust maxSessions (Codex #4781596467).
+  sessionIdleTimeoutMs: 15 * 60 * 1_000,
   maxEventsPerSession: 2_000,
   maxTotalBytes: 16 * 1024 * 1024,
 });
@@ -439,7 +478,7 @@ const appendSessionEvent = (session, serializedEvent) => {
  * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
- * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, maxEventsPerSession, maxTotalBytes).
+ * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -471,11 +510,28 @@ const createDebugServer = ({
   const projectHash = createHash('sha256').update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
+  const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
+    && effectiveLimits.sessionIdleTimeoutMs >= 1
+    ? effectiveLimits.sessionIdleTimeoutMs
+    : DEFAULT_LIMITS.sessionIdleTimeoutMs;
   const originSet = new Set(allowedOrigins);
   let totalBytes = 0;
   // Token-file persistence finishes after listen(); until then the collector
   // is not ready for already_running relaunch claims.
   let collectorReady = false;
+
+  // Session logs deliberately remain on disk and continue to count toward the
+  // aggregate byte cap; this only retires in-memory credentials after client
+  // inactivity. A subsequent /log therefore gets unknown_session instead of
+  // reviving an old bearer capability.
+  const retireInactiveSessions = () => {
+    const expiration = Date.now() - sessionIdleTimeoutMs;
+    for (const [sessionId, session] of sessions) {
+      if (!session.provisional && session.lastActivityAt <= expiration) {
+        sessions.delete(sessionId);
+      }
+    }
+  };
 
   const server = http.createServer(async (request, response) => {
     if (!isAllowedHost(request)) {
@@ -524,17 +580,23 @@ const createDebugServer = ({
         return;
       }
 
-      // Non-mutating launch-token probe for already_running relaunch checks.
-      // Proves the on-disk collector_token still authorizes this peer without
-      // creating a session (Codex #4781366510).
+      // Non-mutating launch-token proof for already_running relaunch checks.
+      // The probe sends a fresh public challenge and verifies this HMAC proof
+      // locally; it never transmits the bearer token to an unverified port
+      // occupant (Codex #4781637950 / #4781645480).
       if (request.method === 'GET' && pathname === '/auth') {
-        if (!authorizeRequest(response, bearerToken(request), token)) return;
-        sendJson(response, 200, { ok: true });
+        const challenge = new URL(request.url, 'http://127.0.0.1').searchParams.get('challenge');
+        if (typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge)) {
+          sendJson(response, 400, { error: 'invalid_auth_challenge' });
+          return;
+        }
+        sendJson(response, 200, { proof: launchTokenProof(token, challenge) });
         return;
       }
 
       if (request.method === 'POST' && pathname === '/session') {
         if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
         if (sessions.size >= effectiveLimits.maxSessions) {
           throw new RequestError('session_limit_reached', 429);
         }
@@ -562,7 +624,13 @@ const createDebugServer = ({
         if (sessions.size >= effectiveLimits.maxSessions) {
           throw new RequestError('session_limit_reached', 429);
         }
-        sessions.set(sessionId, { eventCount: 0, logFile, sessionToken, provisional: true });
+        sessions.set(sessionId, {
+          eventCount: 0,
+          lastActivityAt: Date.now(),
+          logFile,
+          sessionToken,
+          provisional: true,
+        });
         try {
           // Reject a symlinked, non-directory, or escaped .debug path before
           // writing session evidence. A regular *file* named .debug would make
@@ -705,6 +773,10 @@ const createDebugServer = ({
         if (typeof payload.msg !== 'string' || payload.msg.trim() === '') {
           throw new RequestError('invalid_message');
         }
+        // Refresh after authentication and message validation, before the
+        // awaited append, so concurrent allocation cannot retire a session
+        // whose valid event is in flight.
+        session.lastActivityAt = Date.now();
         if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
           throw new RequestError('event_limit_reached', 429);
         }
@@ -899,9 +971,11 @@ const probeReadyCollector = async (
 };
 
 /**
- * Non-mutating check that `token` is the peer collector's current launch token.
+ * Non-mutating proof that `token` is the peer collector's current launch
+ * token. A random challenge is sent to the peer; the caller verifies an HMAC
+ * proof locally, so a forged listener never receives the bearer credential.
  * Used before already_running so a replaced on-disk token cannot claim success
- * while /session would 401 (Codex #4781366510).
+ * while /session would 401 (Codex #4781645480).
  * @param {number} port
  * @param {string} token
  * @returns {Promise<boolean>}
@@ -909,6 +983,8 @@ const probeReadyCollector = async (
 const probeLaunchToken = (port, token) => new Promise((resolve) => {
   let settled = false;
   let deadline;
+  const challenge = randomBytes(32).toString('base64url');
+  const expectedProof = launchTokenProof(token, challenge);
   const finish = (value) => {
     if (settled) return;
     settled = true;
@@ -919,17 +995,35 @@ const probeLaunchToken = (port, token) => new Promise((resolve) => {
     {
       hostname: '127.0.0.1',
       port,
-      path: '/auth',
+      path: `/auth?challenge=${encodeURIComponent(challenge)}`,
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${token}`,
         Host: `127.0.0.1:${port}`,
       },
       timeout: 500,
     },
     (response) => {
-      response.resume();
-      response.on('end', () => finish(response.statusCode === 200));
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 4_096) {
+          request.destroy();
+          finish(false);
+        }
+      });
+      response.on('end', () => {
+        if (response.statusCode !== 200) {
+          finish(false);
+          return;
+        }
+        try {
+          const proof = JSON.parse(body)?.proof;
+          finish(typeof proof === 'string' && safeTokenEqual(proof, expectedProof));
+        } catch {
+          finish(false);
+        }
+      });
       response.on('close', () => finish(false));
       response.on('error', () => finish(false));
     },
@@ -1361,18 +1455,16 @@ const main = () => {
         if (!isInsideRoot(resolvedRoot, realTokenFile)) {
           throw new Error('collector_token_parent_replaced');
         }
-        // Apply the private mode BEFORE truncating/writing the secret, not
-        // after. A freshly-created file already got 0600 atomically from
-        // O_CREAT's mode argument above, but the EEXIST/reuse branch (a
-        // few lines up) opens a PRE-EXISTING file whose mode is whatever it
-        // already was: assertPrivateRegularFile only checks isFile/nlink,
-        // never mode, and open()'s mode argument has no effect when O_CREAT
-        // does not actually create the file. Chmod through the descriptor
-        // first so a permissive pre-existing mode (e.g. a stale 0644 file
-        // left by a prior process or misconfiguration) can never expose the
-        // fresh secret to another local user, even for the brief window
-        // between write and close.
-        await handle.chmod(0o600);
+        // Apply private access BEFORE truncating/writing the secret, not
+        // after. POSIX uses the descriptor chmod; Windows requires an actual
+        // protected DACL because Node's chmod cannot remove inherited reader
+        // permissions there. Either protection is established before fresh
+        // token bytes reach disk, or startup fails closed.
+        if (process.platform === 'win32') {
+          protectWindowsTokenFile(tokenFile);
+        } else {
+          await handle.chmod(0o600);
+        }
         await handle.truncate(0);
         await handle.writeFile(token, 'utf8');
       } finally {
