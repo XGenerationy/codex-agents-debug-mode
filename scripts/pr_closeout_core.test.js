@@ -203,6 +203,31 @@ test('distinguishes status signals from passing failure-path test names', () => 
     }).status,
     'PASS',
   );
+  // Passing titles that embed incidental counted/npm signals must not FAIL
+  // (Codex M6UFnGH): failure-path test names routinely mention `N errors` or
+  // `npm WARN`, and only runtimeHit previously honored the passing-title
+  // prefix. A real counted/uppercase signal on a non-title line still fails.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'ok 1 - reports 2 errors for malformed config' }).status,
+    'PASS',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: '# Subtest: ignores npm WARN fixture' }).status,
+    'PASS',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'ok 3 - covers 3 problems and 5 warnings edge case' }).status,
+    'PASS',
+  );
+  // The same words outside a passing title still FAIL.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'found 2 errors while validating config' }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stderr: 'npm WARN deprecated package' }).status,
+    'FAIL',
+  );
   // Failing TAP counterpart of the passing-title exemption must still FAIL.
   assert.equal(
     classifyOutput({ exitCode: 0, stdout: 'not ok 1 - handles TypeError: invalid value' }).status,
@@ -495,6 +520,36 @@ test('flags optional-chaining focus/skip forms and Cypress spec files', () => {
   // A lookalike non-spec extension must not be treated as a Cypress spec.
   assert.deepEqual(
     scanSuppressionText('src/login.cy.map.js', 'it.only("nope");')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
+test('flags focus/skip after parameterized-test factories (.each(...).only)', () => {
+  // Jest/Vitest `.each(table)` returns a factory whose `.only`/`.skip` member
+  // still focuses/skips the suite; the call between the receiver chain and
+  // the weakening member must not evade the scan (Codex M6UFnGV).
+  const cases = [
+    'test.each(cases).only("focused parameterized");',
+    'describe.each(table).skip("skipped parameterized");',
+    'it.each([1, 2, 3]).only("row focus");',
+    'test.concurrent.each(rows).only("concurrent focus");',
+  ];
+  for (const line of cases) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(matches.length, 1, `${line} must be flagged, got: ${JSON.stringify(matches)}`);
+  }
+  // The non-weakening `.each(...)` call without a trailing .only/.skip must
+  // NOT be flagged, and a plain receiver member call is still inert in a
+  // non-test file.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'test.each(cases)("normal run");')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.js', 'test.each(cases).only("not a test file");')
       .filter(({ category }) => category === 'test-weakening'),
     [],
   );
@@ -1387,4 +1442,36 @@ test('flags pytest, Go, and Rust native skip forms in touched test files', () =>
       .filter(({ category }) => category === 'test-weakening'),
     [],
   );
+});
+
+test('rules silencing stays within the rules object and ignores sibling zeros', () => {
+  // A sibling numeric zero outside the rules object must NOT be flagged as a
+  // disabled rule (Codex M6UFnGF): the old unbounded `rules? [\s\S]*?` regex
+  // crossed the closing brace and matched `server.port:0`.
+  const clean = scanSuppressionText('config.json', '{"rules":{"retry":3},"server":{"port":0}}')
+    .filter((f) => f.category === 'config-silencing');
+  assert.equal(clean.length, 0, `sibling zero must not be flagged, got: ${JSON.stringify(clean)}`);
+
+  // A real disabled rule inside the rules object (JSON, nested, and at depth)
+  // is still detected — including the array-form severity zero.
+  for (const text of [
+    '{"rules":{"no-console":"off"}}',
+    '{ "rules": { "extends": { "meta": { "docs": {} }, "no-console": 0 } } }',
+    "rules: { 'no-console': [0, { allow: ['warn'] }] }",
+    'rules:\n  no-console: "off"\nserver:\n  port: 0',
+  ]) {
+    const flagged = scanSuppressionText('.eslintrc.json', text)
+      .some((f) => f.category === 'config-silencing');
+    assert.equal(flagged, true, `disabled rule must be flagged: ${text}`);
+  }
+
+  // The multi-KB-distance case must still work: a disabled rule many KB after
+  // the rules key, with an unrelated sibling zero after the object closes.
+  const large = ['{', '  "rules": {']
+    .concat(Array.from({ length: 2000 }, (_, i) => `    "filler${i}": ${i},`))
+    .concat(['    "no-console": "off"', '  },', '  "server": { "port": 0 }', '}'])
+    .join('\n');
+  const farFlags = scanSuppressionText('.eslintrc.json', large)
+    .filter((f) => f.category === 'config-silencing');
+  assert.ok(farFlags.length > 0, 'a disabled rule far inside the rules object must be flagged');
 });

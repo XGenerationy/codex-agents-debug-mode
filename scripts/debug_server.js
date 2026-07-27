@@ -92,10 +92,23 @@ const sendJson = (response, status, payload, close = false) => {
  * @param {number} maxBodyBytes
  * @returns {Promise<object>} the parsed JSON body.
  */
-const readJson = async (request, maxBodyBytes) => {
+const readJson = async (request, maxBodyBytes, bodyTimeoutMs = 30_000) => {
   const chunks = [];
   let size = 0;
   let tooLarge = false;
+  let timedOut = false;
+  // Bound the body read by wall-clock time: an authenticated client can send
+  // /session headers and a partial chunked body without ever ending the
+  // request, which would otherwise keep a provisional session slot reserved
+  // forever (repeated up to maxSessions → permanent session_limit_reached).
+  // On deadline we destroy the request so the `for await` rejects and the
+  // caller frees its reservation (Codex M6UFnGz). `unref` keeps a lone timer
+  // from holding the event loop open.
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { request.destroy(); } catch { /* already closed */ }
+  }, bodyTimeoutMs);
+  if (typeof timer.unref === 'function') timer.unref();
 
   try {
     for await (const chunk of request) {
@@ -114,6 +127,9 @@ const readJson = async (request, maxBodyBytes) => {
       chunks.push(chunk);
     }
   } catch (error) {
+    // A timed-out incomplete body is reported as 408 before any other
+    // classification so the caller can free the provisional /session slot.
+    if (timedOut) throw new RequestError('request_body_timeout', 408);
     // Defense in depth: if some other failure races with the oversize break
     // above, still classify it as the deterministic 413 limit violation
     // rather than a 400-class abort, so an oversized upload is always
@@ -133,6 +149,8 @@ const readJson = async (request, maxBodyBytes) => {
       `${JSON.stringify({ level: 'error', event: 'request.body_read_failed', reason: code || error?.message || String(error) })}\n`,
     );
     throw new RequestError('request_failed', 400);
+  } finally {
+    clearTimeout(timer);
   }
 
   if (tooLarge) throw new RequestError('body_too_large', 413, { closeConnection: true });
@@ -1089,18 +1107,6 @@ const main = () => {
         }
         return false;
       };
-      const claimOwnerAlive = (claimText) => {
-        const pidLine = String(claimText || '').split(/\r?\n/)[2];
-        const pid = Number(String(pidLine || '').trim());
-        if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch (error) {
-          // EPERM means the PID exists but we cannot signal it — still live.
-          return error?.code === 'EPERM';
-        }
-      };
       let claimHeld = false;
       for (let attempt = 0; attempt < 5 && !claimHeld; attempt += 1) {
         try {
@@ -1132,9 +1138,15 @@ const main = () => {
           }
           // Owner PID is authoritative: a starting peer is not ready yet but
           // still holds the claim and must not be unlinked.
-          if (claimOwnerAlive(claimText)) {
-            throw new Error('collector_already_running_on_other_port');
-          }
+          // Require a matching collector probe before treating the claim as
+          // held: an alive owner PID alone is not authoritative because the OS
+          // can reuse a holder's PID for an unrelated process after it died,
+          // which would lock startup with collector_already_running_on_other_port
+          // forever. peerStillActive probes the actual collector identity on the
+          // recorded port (with a short retry grace for a still-starting holder
+          // that has not bound its port yet), so only a real serving collector
+          // blocks; a live-but-portless PID is treated as reuse and falls
+          // through to stale reclaim (Codex M6UFnGI).
           if (await peerStillActive(claimedPort)) {
             throw new Error('collector_already_running_on_other_port');
           }

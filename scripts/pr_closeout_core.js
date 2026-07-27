@@ -29,28 +29,23 @@ const CONFIG_SILENCING = [
   // silently raise the lint warning budget via a package-scripts entry.
   /max[-_]?warnings["']?\s*[:=]\s*(?:-1|[1-9]\d*)/i,
   /--max-warnings\s+(?:-1|[1-9]\d*)\b/i,
-  // Disabled rules: do NOT bound the distance after a `rules`/`rule` key.
-  // A multi-KB ESLint/Biome config can place `"no-console": "off"` (or `: 0`)
-  // far past any fixed window; a 4 KB cap would miss that and accept
-  // config-level rule disabling. Non-greedy `[\s\S]*?` still stops at the
-  // first match and stays linear for typical config sizes. Also match
-  // standalone rule-id → "off"/"0" assignments (override blocks / flat
-  // config) without requiring a nearby `rules` key — rule ids are
-  // kebab/scoped forms, not bare words like "mode"/"power".
-  /["']?rules?["']?\s*[:=][\s\S]*?["']off["']/i,
-  /["']?rules?["']?\s*[:=][\s\S]*?["'][^"'\r\n]+["']\s*:\s*0\b/i,
+  // Disabled rules under a `rules`/`rule` key are detected by the
+  // brace/indentation-aware `findRulesScopedSilencings` helper (applied in
+  // scanSuppressionText) instead of an unbounded `rules? [\s\S]*?` regex,
+  // which crossed closing braces and false-positive on an unrelated sibling
+  // zero such as `{"rules":{...},"server":{"port":0}}` (Codex M6UFnGF).
+  // Standalone rule-id → "off"/"0" assignments (override blocks / flat
+  // config) are still matched by the scoped/`no-*` patterns below without a
+  // nearby `rules` key — rule ids are kebab/scoped forms, not bare words.
   // Scoped (@org/rule) and plugin/rule ids — one slash is enough for ESLint.
   // Do not put \b after a closing quote of "off" (quote is non-word, so \b
   // fails between " and ,/}). Use an explicit "off" alternative instead.
   /["']@[\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
   /["'][\w.-]+\/[\w./-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
   /["'](?:no|prefer|require|max|min|eqeqeq|curly|strict|camelcase|semi|quotes|indent)-[\w-]+["']\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i,
-  // ESLint array-form severity zero: 'no-console': [0, { allow: ['warn'] }]
-  // (Codex #4781366510). Also covered above via `\[\s*0\b` on rule-id keys.
-  // Bound the scan window like the ignore/exclude siblings so a multi-MB
-  // configLike file cannot force an unbounded walk, and a distant unrelated
-  // `[0, ...]` cannot be misattributed (CodeRabbit #4781498400).
-  /["']?rules?["']?\s*[:=][\s\S]{0,50000}?["'][^"'\r\n]+["']\s*:\s*\[\s*0\b/i,
+  // ESLint array-form severity zero ('no-console': [0, { allow: ['warn'] }])
+  // and any other disabled/zero rule inside a `rules`/`rule` object are
+  // detected by findRulesScopedSilencings (Codex #4781366510 array form).
   /(?:lint|typecheck|audit|test|coverage)[^\n]*(?:enabled["']?\s*[:=]\s*false|disabled["']?\s*[:=]\s*true)/i,
   // GitHub Actions step disable: `if: false` / `if: ${{ false }}` silences a
   // validation step without touching continue-on-error (Codex open finding).
@@ -507,10 +502,30 @@ const statusSignal = (line) => {
   // Go test SKIP records (`--- SKIP: TestFoo`) exit 0 while omitting coverage.
   const goSkip = /^\s*---\s*SKIP:\s+\S/;
   const framework = /(?:^\s*(?:not ok\b|#\s*(?:skip|skipped)\b|(?:skipped|failed|blocked|pending|xfailed|xpassed)\b)|\bok\s+\d+\b.*#\s*skip\b)/i;
-  const runtimeHit = runtime.test(line) && !passingTestTitle.test(line);
-  return /^\s*✖/u.test(line) || COUNTED_SIGNAL.test(line) || BRACKETED_SIGNAL.test(line)
-    || LABELLED_SIGNAL.test(line) || uppercase.test(line) || compiler.test(line)
-    || runtimeHit || warning.test(line) || npmWarning.test(line) || goSkip.test(line)
+  const isPassingTitle = passingTestTitle.test(line);
+  const runtimeHit = runtime.test(line) && !isPassingTitle;
+  // Passing test titles (TAP `ok 1 -`, Node `# Subtest:`, ✓/√/✔, `PASS`/`passed`)
+  // routinely embed status words in fixture/prose text — e.g.
+  // `ok 1 - reports 2 errors for malformed config` or
+  // `# Subtest: ignores npm WARN fixture`. Previously only runtimeHit honored
+  // the title, so the other detectors misread a green suite with failure-path
+  // tests as FAIL. Apply the same exclusion to the incidental
+  // counted/bracketed/labelled/compiler/npm detectors (Codex M6UFnGH).
+  // NOT excluded: the explicit ✖ fail marker; anchored uppercase/`warning:`
+  // headers (a line that actually starts with WARN/ERROR/warning is never a
+  // passing title); and real TAP/Go SKIP markers (framework/goSkip) —
+  // `ok N ... # skip` is a genuine TAP skip even though it also matches the
+  // passing-title prefix.
+  return /^\s*✖/u.test(line)
+    || (COUNTED_SIGNAL.test(line) && !isPassingTitle)
+    || (BRACKETED_SIGNAL.test(line) && !isPassingTitle)
+    || (LABELLED_SIGNAL.test(line) && !isPassingTitle)
+    || uppercase.test(line)
+    || (compiler.test(line) && !isPassingTitle)
+    || runtimeHit
+    || warning.test(line)
+    || (npmWarning.test(line) && !isPassingTitle)
+    || goSkip.test(line)
     || framework.test(line);
 };
 
@@ -650,6 +665,80 @@ const classifyOutput = ({
  * @param {string} text - Full decoded file content to scan.
  * @returns {Array<{file: string, line: number, category: 'marker'|'config-silencing'|'test-weakening', match: string}>}
  */
+/**
+ * Brace/indentation-aware `rules`/`rule` silencing detector (Codex M6UFnGF).
+ * Replaces the unbounded `rules? [\s\S]*? off/0` regex, which crossed
+ * closing braces and flagged an unrelated sibling setting such as
+ * `{"rules":{...},"server":{"port":0}}`. For a brace-delimited
+ * (JSON/JSONC/JS object) value the rules object is brace-matched (string-
+ * aware, so braces inside string values do not corrupt depth) and scanned for
+ * a disabled/zero rule entry at any depth or distance; for an indentation-
+ * scoped (YAML) value only the more-indented block under the key is scanned.
+ * An unrelated sibling zero outside the rules object no longer matches.
+ * @param {string} text
+ * @returns {string[]} concise fragment strings for each disabled/zero rule
+ *   found inside a `rules`/`rule` scope.
+ */
+const findRulesScopedSilencings = (text) => {
+  const findings = [];
+  const keyRe = /(["']?rules?["']?)\s*[:=]/g;
+  // A disabled/zero rule entry: "rule-id": "off" | 0 | [0, ...].
+  const disabledRule = /["']?[A-Za-z_][\w./-]*["']?\s*:\s*(?:["']off["']|\b0\b|\[\s*0\b)/i;
+  let km;
+  while ((km = keyRe.exec(text)) !== null) {
+    const afterKey = km.index + km[0].length;
+    let i = afterKey;
+    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i += 1;
+    let scope = '';
+    let consumedTo = i;
+    if (text[i] === '{') {
+      // String-aware brace match so `{`/`}` inside string values do not
+      // corrupt the depth count (e.g. a rule named "a}b").
+      let depth = 0;
+      let inStr = null;
+      const start = i;
+      for (; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inStr) {
+          if (ch === '\\') { i += 1; continue; }
+          if (ch === inStr) inStr = null;
+          continue;
+        }
+        if (ch === '"' || ch === "'") { inStr = ch; continue; }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) { i += 1; break; }
+        }
+      }
+      scope = text.slice(start, i);
+      consumedTo = i;
+    } else {
+      // Indentation-scoped (YAML): take following non-blank lines that are
+      // strictly more indented than the `rules:` key line.
+      const lineStart = text.lastIndexOf('\n', km.index - 1) + 1;
+      const keyIndent = text.slice(lineStart, km.index).match(/^[ \t]*/)[0].length;
+      const restLines = text.slice(afterKey).split(/\r?\n/);
+      const block = [];
+      for (const ln of restLines) {
+        if (ln.trim() === '') continue;
+        const ind = ln.match(/^[ \t]*/)[0].length;
+        if (ind <= keyIndent) break;
+        block.push(ln);
+      }
+      scope = block.join('\n');
+      consumedTo = afterKey;
+    }
+    if (scope && disabledRule.test(scope)) {
+      findings.push(`${km[1].replace(/\s+$/, '')}: { ...disabled/zero rule ... }`);
+    }
+    // Skip past the consumed brace scope so a `rules` key nested inside this
+    // object is not re-evaluated against an outer scope.
+    if (consumedTo > keyRe.lastIndex) keyRe.lastIndex = consumedTo;
+  }
+  return findings;
+};
+
 const scanSuppressionText = (file, text) => {
   const findings = [];
   const normalized = String(file).replaceAll('\\', '/').toLowerCase();
@@ -746,6 +835,13 @@ const scanSuppressionText = (file, text) => {
       const line = text.slice(0, match.index).split(/\r?\n/).length;
       findings.push({ file, line, category: 'config-silencing', match: match[0].trim() });
     }
+    // Brace/indentation-aware `rules`/`rule` silencing (Codex M6UFnGF):
+    // scans only inside the rules object/block so an unrelated sibling zero
+    // (e.g. `server.port:0`) no longer false-positives while a disabled rule
+    // at any depth/distance is still detected.
+    for (const frag of findRulesScopedSilencings(text)) {
+      findings.push({ file, line: 1, category: 'config-silencing', match: frag });
+    }
   }
   if (testLike) {
     // Jasmine/Jest aliases fit/fdescribe (focus) and xit/xdescribe (skip) are
@@ -787,7 +883,13 @@ const scanSuppressionText = (file, text) => {
     // skip marker, while Go's abort method is exactly `t.Skip(`/t.Skipf(`
     // (capital S — lowercase would not compile).
     const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skipf?\s*\(|#\s*\[\s*ignore\b/;
-    const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+    // The optional `(?:\s*\([^()]*\))?` after an intermediate chain member lets
+  // the parameterized-test factory forms `test.each(cases).only(...)` /
+  // `describe.each(cases).skip(...)` match: Jest/Vitest return a new test
+  // function from `.each(...)`, and `.only`/`.skip` on THAT member still
+  // focuses/skips the suite, so a chain with a call between the receiver and
+  // the weakening member must not evade the scan (Codex M6UFnGV).
+  const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     /**
      * Scan a whole source line and mark every character position that is
      * inert (inside a string, a line/block comment, or a regex literal), so

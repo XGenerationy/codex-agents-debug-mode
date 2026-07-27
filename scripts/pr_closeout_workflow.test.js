@@ -470,6 +470,10 @@ test('requires a clean initial tree before executing validation commands', async
   assert.equal(result.report.overallStatus, 'FAIL');
   assert.equal(result.report.initialTree.status, 'FAIL');
   assert.equal(fixture.executions.length, 0);
+  // A dirty tree must also gate executable PREFLIGHT probes (Codex M6UFnGb):
+  // they may run repository-local binaries or contact services, so they must
+  // not launch against an unclean snapshot that admission will reject.
+  assert.equal(fixture.events.includes('preflight'), false);
 });
 
 test('gives baseline setup and comparison executions unique parent and attempt identities', async () => {

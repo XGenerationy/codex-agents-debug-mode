@@ -40,6 +40,33 @@ const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+// Mechanical lockfiles are pure generated dependency manifests: a routine
+// dependency upgrade replaces hundreds of old records with new ones, so the
+// fail-closed content-removal catch-all would flag every removed line as a
+// validation weakening and fail CI even though no validation command or
+// threshold changed. These files hold no validation steps, so exclude them
+// from the content-removal scan; pattern-matched validation removals are
+// still scanned separately and never match lockfile data (Codex M6UFnGM).
+const LOCKFILE_PATTERNS = [
+  /(^|[/\\])package-lock\.json$/i,
+  /(^|[/\\])npm-shrinkwrap\.json$/i,
+  /(^|[/\\])pnpm-lock\.yaml$/i,
+  /(^|[/\\])yarn\.lock$/i,
+  /(^|[/\\])bun\.lockb$/i,
+  /(^|[/\\])bun\.lock$/i,
+  /(^|[/\\])cargo\.lock$/i,
+  /(^|[/\\])poetry\.lock$/i,
+  /(^|[/\\])pipenv\.lock$/i,
+  /(^|[/\\])go\.sum$/i,
+  /(^|[/\\])composer\.lock$/i,
+  /(^|[/\\])gemfile\.lock$/i,
+  /(^|[/\\])mix\.lock$/i,
+  /(^|[/\\])podfile\.lock$/i,
+  /(^|[/\\])pubspec\.lock$/i,
+  /(^|[/\\])gradle\.lockfile$/i,
+];
+const isMechanicalLockfile = (filePath) => LOCKFILE_PATTERNS.some((pattern) => pattern.test(filePath));
 // Fatal UTF-8: lossy decoding would replace invalid path bytes with U+FFFD
 // and hand scanTouchedSuppressions a different pathname (ENOENT skip), so a
 // touched non-UTF-8 path could evade the suppression gate entirely.
@@ -459,7 +486,15 @@ const main = async () => {
       }
       process.exitCode = 1;
     } else {
-      const contentRemovals = detectGateContentRemovals(gateBaseSha, gateTargets);
+      // Mechanical lockfiles (package-lock.json, pnpm-lock.yaml, Cargo.lock,
+      // ...) are pure generated dependency manifests: a routine dependency
+      // bump replaces old records with new ones, so their removed lines are
+      // not validation weakening. Exclude them from the fail-closed
+      // content-removal catch-all so legitimate dependency upgrades do not
+      // fail CI; pattern-matched validation removals above still scan every
+      // gate file and never match lockfile data (Codex M6UFnGM).
+      const contentGateTargets = gateTargets.filter((file) => !isMechanicalLockfile(file));
+      const contentRemovals = detectGateContentRemovals(gateBaseSha, contentGateTargets);
       if (contentRemovals.length) {
         process.stderr.write(
           `FAIL: gate diff removes content without a FAIL-class weakening match (fail-closed):\n`,
@@ -501,4 +536,6 @@ if (require.main === module) {
 module.exports = {
   getComparisonStyle,
   resolveBaseSha,
+  detectGateContentRemovals,
+  isMechanicalLockfile,
 };

@@ -77,3 +77,19 @@ test('GITHUB_EVENT_BEFORE naming a fetched commit selects the two-dot preimage b
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+test('isMechanicalLockfile recognizes generated dependency lockfiles', () => {
+  const { isMechanicalLockfile } = require('./scan_touched_suppressions');
+  for (const file of [
+    'package-lock.json', 'dir/package-lock.json', 'pnpm-lock.yaml',
+    'yarn.lock', 'Cargo.lock', 'poetry.lock', 'go.sum', 'composer.lock',
+    'Gemfile.lock', 'gradle.lockfile', 'bun.lockb',
+  ]) {
+    assert.equal(isMechanicalLockfile(file), true, `${file} should be a lockfile`);
+  }
+  // Non-lockfile gate/config files must NOT be excluded — they can hold real
+  // validation steps/scripts and must remain in the fail-closed scan.
+  for (const file of ['package.json', 'tsconfig.json', '.eslintrc.json', 'Makefile']) {
+    assert.equal(isMechanicalLockfile(file), false, `${file} must not be treated as a lockfile`);
+  }
+});

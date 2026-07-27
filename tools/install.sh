@@ -198,10 +198,43 @@ rollback() {
   done
 }
 
+# Per-destination mutex (Codex M6UFnGw): mkdir is atomic on POSIX, so two
+# concurrent --force installers cannot interleave backup/commit/rollback — one
+# would otherwise observe the temporary gap after the other's backup move and
+# clobber/restore the wrong tree. Held across this destination's backup,
+# commit, and (on failure) rollback, then released. A stale lockdir from a
+# crashed installer is removed only when provably empty (never a real backup).
+dest_lock=""
+lock_destination() {
+  local dest="$1" tries=0
+  while ! mkdir -- "${dest}.install-lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [[ $tries -gt 120 ]]; then
+      return 1
+    fi
+    sleep 0.5
+  done
+  dest_lock="${dest}.install-lock"
+  return 0
+}
+release_destination_lock() {
+  if [[ -n "$dest_lock" ]]; then
+    rmdir -- "$dest_lock" 2>/dev/null || true
+    dest_lock=""
+  fi
+}
+
 idx=0
 for destination in "${destinations[@]}"; do
   stage="${stage_paths[$idx]}"
   backup=""
+  # Acquire the per-destination mutex before any backup/commit/rollback so a
+  # concurrent --force installer cannot observe an in-flight gap (Codex M6UFnGw).
+  if ! lock_destination "$destination"; then
+    rollback
+    echo "Could not acquire install lock for $destination (another installer is active)" >&2
+    exit 1
+  fi
   # Same dangling-symlink gap as the preflight check above: without -L, a
   # dangling symlink at $destination would skip the backup step entirely, so
   # the later mv over it and any subsequent rollback via restore_from_backup
@@ -214,6 +247,7 @@ for destination in "${destinations[@]}"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     if [[ "$force" != "true" ]]; then
       rollback
+      release_destination_lock
       echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
       exit 1
     fi
@@ -224,6 +258,7 @@ for destination in "${destinations[@]}"; do
     # explicitly like the staged-tree move below.
     if ! mv -- "$destination" "$backup"; then
       rollback
+      release_destination_lock
       echo "Failed to back up $destination" >&2
       exit 1
     fi
@@ -235,11 +270,13 @@ for destination in "${destinations[@]}"; do
   if ! mv -- "$stage" "$destination"; then
     restore_from_backup "$destination" "$backup"
     rollback
+    release_destination_lock
     echo "Failed to install to $destination" >&2
     exit 1
   fi
   committed_dests+=("$destination")
   committed_backups+=("$backup")
+  release_destination_lock
   idx=$((idx + 1))
 done
 

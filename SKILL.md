@@ -139,18 +139,26 @@ output handling.
 # export so the python3 subprocess can read PROJECT via os.environ.
 export PROJECT=/absolute/path/to/project
 # Truncate any prior startup capture so we never parse a stale empty file.
-: > /tmp/debug-collector-start.json
-node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT" > /tmp/debug-collector-start.json 2>&1 &
+# Allocate a PRIVATE per-run startup capture file: a predictable global path
+# lets two concurrent debug sessions overwrite/parse each other's records,
+# and a pre-existing symlink at that path would truncate its target via the
+# initial redirection. mktemp (0600) avoids both; keep the path and remove it
+# after parsing (Codex M6UFnGh).
+STARTUP_CAPTURE="$(mktemp -t debug-collector-start.XXXXXX.json 2>/dev/null || mktemp)"
+chmod 600 "$STARTUP_CAPTURE"
+export STARTUP_CAPTURE
+trap 'rm -f "$STARTUP_CAPTURE"' EXIT
+node /absolute/path/to/debug/scripts/debug_server.js "$PROJECT" > "$STARTUP_CAPTURE" 2>&1 &
 COLLECTOR_PID=$!
 # Wait for a terminal startup record. When port 8787 is occupied by a listener
 # that accepts TCP but does not answer /health, the server can spend ~10s on
 # its probe budget before writing started/already_running/error — so poll for
 # at least 15s, not 2s (Codex #4782132804).
 for i in $(seq 1 75); do
-  if grep -qE '"status":"(started|already_running)"' /tmp/debug-collector-start.json 2>/dev/null; then
+  if grep -qE '"status":"(started|already_running)"' "$STARTUP_CAPTURE" 2>/dev/null; then
     break
   fi
-  if grep -qE '"level":"error"|"event":"startup\.failed"' /tmp/debug-collector-start.json 2>/dev/null; then
+  if grep -qE '"level":"error"|"event":"startup\.failed"' "$STARTUP_CAPTURE" 2>/dev/null; then
     break
   fi
   # Child exited without a parseable status — stop waiting.
@@ -168,8 +176,8 @@ project = os.environ.get('PROJECT') or ''
 if not project:
     sys.stderr.write('PROJECT is not set; export PROJECT=/absolute/path/to/project\n')
     sys.exit(1)
-path = Path('/tmp/debug-collector-start.json')
-if not path.is_file() or path.stat().st_size < 2:
+path = Path(os.environ.get('STARTUP_CAPTURE') or '')
+if not path.is_absolute() or not path.is_file() or path.stat().st_size < 2:
     sys.stderr.write('collector startup output missing or empty; wait longer or inspect the process\n')
     sys.exit(1)
 try:

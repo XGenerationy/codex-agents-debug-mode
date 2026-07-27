@@ -301,7 +301,18 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         const lines = String(text).split(/\r?\n/);
         holderPid = Number(String(lines[0] || '').trim());
         holderNonce = String(lines[1] || '').trim() || null;
-      } catch {
+      } catch (readError) {
+        // A permission/transient-I/O error (EACCES/EPERM/EIO) means a live
+        // holder wrote a 0o600 lock this process cannot inspect; reclaiming it
+        // would silently break exclusivity for explicit --output-dir runs
+        // (qodo M6UGbRZ). Only genuinely corrupt/stale/empty locks (ENOENT,
+        // parse failure, or the FIFO/symlink/oversized guard above) fall
+        // through to the reclaim path; permission errors fail closed instead.
+        if (readError?.code === 'EACCES' || readError?.code === 'EPERM' || readError?.code === 'EIO') {
+          throw new Error(
+            `Evidence output directory lock is unreadable (${readError.code}) and may be held by a live closeout process: ${outputDir}`,
+          );
+        }
         holderPid = null;
         holderNonce = null;
       }
@@ -766,24 +777,32 @@ const runCloseoutWorkflowBody = async ({
   ])];
   const attestationAdmitted = initialAttestation.status === 'PASS';
   if (attestationAdmitted) {
-    const [observedPreflight, initialGateChanges, observedSuppressions, observedTree] = await Promise.all([
-      d.runPreflight({ repo: initial.repo, config, env: childEnv }),
-      d.readGateChanges(initial.repo, initial.mergeBaseSha || initial.baseSha),
-      d.scanTouchedSuppressions(initial.repo, initial.touchedFiles),
-      d.cleanTreeStatus(initial.repo),
-    ]);
-    preflight = observedPreflight;
-    initialSuppressions = observedSuppressions;
-    initialTree = observedTree;
-    if (initialTree.status === 'PASS') initialFingerprint = await d.workingTreeFingerprint(initial.repo, reproducibilityPaths);
-    gateIntegrity = classifyGateIntegrity({
-      ...initialGateChanges,
-      configuredCommands,
-      baseSha: initial.baseSha,
-      headSha: initial.headSha,
-      configDigest,
-      attestation: initialAttestation,
-    });
+    // Inspect and fingerprint the working tree BEFORE launching any executable
+    // preflight probe. runPreflight may run repository-local binaries or
+    // contact services, and admission will reject a dirty tree anyway, so do
+    // not execute unreviewed commands against an unclean snapshot (Codex
+    // M6UFnGb). readGateChanges and scanTouchedSuppressions are read-only
+    // analysis (no spawned commands), so they stay concurrent with preflight
+    // once the tree is confirmed clean.
+    initialTree = await d.cleanTreeStatus(initial.repo);
+    if (initialTree.status === 'PASS') {
+      initialFingerprint = await d.workingTreeFingerprint(initial.repo, reproducibilityPaths);
+      const [observedPreflight, initialGateChanges, observedSuppressions] = await Promise.all([
+        d.runPreflight({ repo: initial.repo, config, env: childEnv }),
+        d.readGateChanges(initial.repo, initial.mergeBaseSha || initial.baseSha),
+        d.scanTouchedSuppressions(initial.repo, initial.touchedFiles),
+      ]);
+      preflight = observedPreflight;
+      initialSuppressions = observedSuppressions;
+      gateIntegrity = classifyGateIntegrity({
+        ...initialGateChanges,
+        configuredCommands,
+        baseSha: initial.baseSha,
+        headSha: initial.headSha,
+        configDigest,
+        attestation: initialAttestation,
+      });
+    }
   }
   const admitted = admissionStatus({
     planStatus,
