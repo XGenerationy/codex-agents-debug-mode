@@ -83,7 +83,7 @@ test('isMechanicalLockfile recognizes generated dependency lockfiles', () => {
   for (const file of [
     'package-lock.json', 'dir/package-lock.json', 'pnpm-lock.yaml',
     'yarn.lock', 'Cargo.lock', 'poetry.lock', 'go.sum', 'composer.lock',
-    'Gemfile.lock', 'gradle.lockfile', 'bun.lockb',
+    'Gemfile.lock', 'gradle.lockfile', 'bun.lockb', 'Pipfile.lock',
   ]) {
     assert.equal(isMechanicalLockfile(file), true, `${file} should be a lockfile`);
   }

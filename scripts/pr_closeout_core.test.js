@@ -144,6 +144,12 @@ test('distinguishes status signals from passing failure-path test names', () => 
     classifyOutput({ exitCode: 0, stdout: '# Subtest: handles TypeError: invalid value' }).status,
     'PASS',
   );
+  // A summary key is not a passing test title: it can contain a real failed
+  // count later on the same line and must keep that signal visible.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'passed: 0 failed: 2' }).status,
+    'FAIL',
+  );
   // A real runtime diagnostic still fails.
   assert.equal(
     classifyOutput({ exitCode: 0, stdout: 'TypeError: invalid value\n    at Object.<anonymous>' }).status,
@@ -1385,6 +1391,8 @@ test('blocks shell options that disable failure propagation', () => {
   // `set +o pipefail` lets a successful pipeline tail hide a failed leg.
   assert.ok(findCommandFailureNeutralizer('set +e; false; printf ok'));
   assert.ok(findCommandFailureNeutralizer('set   +e; pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('set +ex; pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('set +eo pipefail; pnpm test'));
   assert.ok(findCommandFailureNeutralizer('set +o errexit; pnpm test'));
   assert.ok(findCommandFailureNeutralizer('set +o pipefail; pnpm test | tail'));
   // The hardening forms (`set -e`, `set -o pipefail`) are not neutralizers.
@@ -1394,6 +1402,10 @@ test('blocks shell options that disable failure propagation', () => {
   // Scanned validation helpers flag the same options as config-silencing.
   assert.ok(
     scanSuppressionText('ci/check.sh', 'set +e\nfalse\nprintf ok\n')
+      .some(({ category }) => category === 'config-silencing'),
+  );
+  assert.ok(
+    scanSuppressionText('ci/check.sh', 'set +ex\nfalse\nprintf ok\n')
       .some(({ category }) => category === 'config-silencing'),
   );
   assert.deepEqual(
@@ -1425,8 +1437,9 @@ test('flags pytest, Go, and Rust native skip forms in touched test files', () =>
   const go = scanSuppressionText('pkg/foo_test.go', [
     't.Skip("skip this")',
     't.Skipf("skip %d", 1)',
+    't.SkipNow()',
   ].join('\n')).filter(({ category }) => category === 'test-weakening');
-  assert.equal(go.length, 2, `expected 2 Go findings: ${JSON.stringify(go)}`);
+  assert.equal(go.length, 3, `expected 3 Go findings: ${JSON.stringify(go)}`);
   const rust = scanSuppressionText('tests/lib.rs', '#[ignore]')
     .filter(({ category }) => category === 'test-weakening');
   assert.equal(rust.length, 1, `expected 1 Rust finding: ${JSON.stringify(rust)}`);
@@ -1434,6 +1447,11 @@ test('flags pytest, Go, and Rust native skip forms in touched test files', () =>
   // inside a string, produces no finding.
   assert.deepEqual(
     scanSuppressionText('src/api.py', '@pytest.mark.skip(reason="slow")')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('tests/test_api.py', '# @pytest.mark.skip(reason="documented")')
       .filter(({ category }) => category === 'test-weakening'),
     [],
   );
@@ -1464,6 +1482,15 @@ test('rules silencing stays within the rules object and ignores sibling zeros', 
       .some((f) => f.category === 'config-silencing');
     assert.equal(flagged, true, `disabled rule must be flagged: ${text}`);
   }
+
+  const lineAware = scanSuppressionText('.eslintrc.json', [
+    '{',
+    '  "rules": {',
+    '    "no-console": "off"',
+    '  }',
+    '}',
+  ].join('\n')).find((f) => f.category === 'config-silencing' && f.match.includes('rules'));
+  assert.equal(lineAware?.line, 2, `rules finding should report its key line: ${JSON.stringify(lineAware)}`);
 
   // The multi-KB-distance case must still work: a disabled rule many KB after
   // the rules key, with an unrelated sibling zero after the object closes.

@@ -57,7 +57,7 @@ const LOCKFILE_PATTERNS = [
   /(^|[/\\])bun\.lock$/i,
   /(^|[/\\])cargo\.lock$/i,
   /(^|[/\\])poetry\.lock$/i,
-  /(^|[/\\])pipenv\.lock$/i,
+  /(^|[/\\])Pipfile\.lock$/i,
   /(^|[/\\])go\.sum$/i,
   /(^|[/\\])composer\.lock$/i,
   /(^|[/\\])gemfile\.lock$/i,

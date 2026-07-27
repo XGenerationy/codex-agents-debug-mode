@@ -102,7 +102,7 @@ const CONFIG_SILENCING = [
   /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
   // `set +e` / `set +o errexit` / `set +o pipefail` in a scanned validation
   // helper disable failure propagation the same way (Codex UDDQR).
-  /\bset\s+\+e\b/i,
+  /\bset\s+\+[a-z]*e[a-z]*\b/i,
   /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
 ];
 
@@ -153,7 +153,7 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // success command can exit 0; `set +o pipefail` lets a successful pipeline
   // tail hide a failed leg. The literal `+` is required, so the hardening
   // forms `set -e` / `set -o pipefail` are not flagged.
-  /\bset\s+\+e\b/i,
+  /\bset\s+\+[a-z]*e[a-z]*\b/i,
   /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
@@ -464,7 +464,7 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
 // guard: the count precedes the label, so it cannot consume a diagnostic's
 // `Label:` prefix.
 const cleanZeroSummaries = (text) => text
-  .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
+  .replace(/(?<!:\s)\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
   .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0[ \t]*\.?(?=$|[,;|)\]}])/gim, '')
   .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
@@ -496,7 +496,7 @@ const statusSignal = (line) => {
   // words (TAP `ok 1 - handles TypeError:` or Node `# Subtest: handles
   // TypeError: ...`).
   const runtime = /(?:^|[^A-Za-z0-9_])(?:[A-Za-z]+(?:Warning|Error)|Warning|Error)(?:\s+\[[^\]]+\])?:\s*\S/;
-  const passingTestTitle = /^\s*(?:ok\s+\d+\b|#\s*Subtest:|✓|√|✔|PASS\b|passed\b)/i;
+  const passingTestTitle = /^\s*(?:ok\s+\d+\b|#\s*Subtest:|✓|√|✔|PASS\b|passed\b(?!\s*:))/i;
   const warning = /^\s*(?:[-*]\s*)?(?:\([^)]*\)\s*)?warning\b(?:\s+|:)/i;
   const npmWarning = /\bnpm\s+WARN\b/i;
   // Go test SKIP records (`--- SKIP: TestFoo`) exit 0 while omitting coverage.
@@ -676,8 +676,8 @@ const classifyOutput = ({
  * scoped (YAML) value only the more-indented block under the key is scanned.
  * An unrelated sibling zero outside the rules object no longer matches.
  * @param {string} text
- * @returns {string[]} concise fragment strings for each disabled/zero rule
- *   found inside a `rules`/`rule` scope.
+ * @returns {{index: number, match: string}[]} concise fragments and source
+ *   offsets for each disabled/zero rule found inside a `rules`/`rule` scope.
  */
 const findRulesScopedSilencings = (text) => {
   const findings = [];
@@ -730,7 +730,10 @@ const findRulesScopedSilencings = (text) => {
       consumedTo = afterKey;
     }
     if (scope && disabledRule.test(scope)) {
-      findings.push(`${km[1].replace(/\s+$/, '')}: { ...disabled/zero rule ... }`);
+      findings.push({
+        index: km.index,
+        match: `${km[1].replace(/\s+$/, '')}: { ...disabled/zero rule ... }`,
+      });
     }
     // Skip past the consumed brace scope so a `rules` key nested inside this
     // object is not re-evaluated against an outer scope.
@@ -840,7 +843,8 @@ const scanSuppressionText = (file, text) => {
     // (e.g. `server.port:0`) no longer false-positives while a disabled rule
     // at any depth/distance is still detected.
     for (const frag of findRulesScopedSilencings(text)) {
-      findings.push({ file, line: 1, category: 'config-silencing', match: frag });
+      const line = text.slice(0, frag.index).split(/\r?\n/).length;
+      findings.push({ file, line, category: 'config-silencing', match: frag.match });
     }
   }
   if (testLike) {
@@ -882,7 +886,7 @@ const scanSuppressionText = (file, text) => {
     // legitimate conditional `t.skip(...)` platform gate (lowercase) is not a
     // skip marker, while Go's abort method is exactly `t.Skip(`/t.Skipf(`
     // (capital S — lowercase would not compile).
-    const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skipf?\s*\(|#\s*\[\s*ignore\b/;
+    const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skip(?:Now|f)?\s*\(|#\s*\[\s*ignore\b/;
     // The optional `(?:\s*\([^()]*\))?` after an intermediate chain member lets
   // the parameterized-test factory forms `test.each(cases).only(...)` /
   // `describe.each(cases).skip(...)` match: Jest/Vitest return a new test
@@ -1021,6 +1025,12 @@ const scanSuppressionText = (file, text) => {
           } else if (ch === quote) {
             quote = null;
           }
+          i += 1;
+          continue;
+        }
+        if (/\.pyi?$/i.test(base) && ch === '#') {
+          lineComment = true;
+          inert[i] = true;
           i += 1;
           continue;
         }

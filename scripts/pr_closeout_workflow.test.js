@@ -474,6 +474,8 @@ test('requires a clean initial tree before executing validation commands', async
   // they may run repository-local binaries or contact services, so they must
   // not launch against an unclean snapshot that admission will reject.
   assert.equal(fixture.events.includes('preflight'), false);
+  assert.match(result.report.preflight.evidence, /initial working tree was not clean/i);
+  assert.match(result.report.gateIntegrity.evidence, /initial working tree was not clean/i);
 });
 
 test('gives baseline setup and comparison executions unique parent and attempt identities', async () => {

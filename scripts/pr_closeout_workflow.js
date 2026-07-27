@@ -802,6 +802,15 @@ const runCloseoutWorkflowBody = async ({
         configDigest,
         attestation: initialAttestation,
       });
+    } else {
+      preflight = {
+        ...preflight,
+        evidence: `Preflight did not run because the initial working tree was not clean: ${initialTree.evidence}`,
+      };
+      gateIntegrity = {
+        status: 'BLOCKED',
+        evidence: `Gate integrity was not classified because the initial working tree was not clean: ${initialTree.evidence}`,
+      };
     }
   }
   const admitted = admissionStatus({
@@ -1024,7 +1033,7 @@ const runCloseoutWorkflowBody = async ({
       beforeFingerprint: null,
       afterFingerprint: null,
     };
-  if (attestationAdmitted) {
+  if (attestationAdmitted && initialTree.status === 'PASS') {
     gateIntegrity = classifyGateIntegrity({
       ...finalGateChanges,
       configuredCommands,

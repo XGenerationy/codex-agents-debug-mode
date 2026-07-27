@@ -1370,6 +1370,7 @@ test('cwd/fd probe excludes a same-repo sibling still running under the runner',
   if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-sibling-sweep-'));
   let siblingPid = 0;
+  let siblingHandle = null;
   try {
     // An exited stand-in for this spawn's root pid.
     const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
@@ -1383,6 +1384,7 @@ test('cwd/fd probe excludes a same-repo sibling still running under the runner',
       { stdio: ['ignore', 'pipe', 'ignore'], cwd: repo, detached: true },
     );
     sibling.unref();
+    siblingHandle = sibling;
     sibling.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
     for (let i = 0; i < 40 && !siblingPid; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1412,7 +1414,10 @@ test('cwd/fd probe excludes a same-repo sibling still running under the runner',
     });
     assert.equal(sweep.status, 'PASS', statusDiag(sweep));
   } finally {
-    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    for (const pid of new Set([siblingPid, siblingHandle?.pid].filter(Boolean))) {
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+    }
+    siblingHandle?.stdout?.destroy();
     await rm(repo, { recursive: true, force: true });
   }
 });

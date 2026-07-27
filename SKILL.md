@@ -300,7 +300,7 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
     return;
   }
 
-  if (navigator.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
+  if (globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
     .then((response) => {
       if (!response.ok) throw new Error(`DebugCollectorHTTP${response.status}`);
@@ -540,7 +540,7 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
     reportDebugTransportFailure(error);
     return;
   }
-  if (navigator.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
+  if (globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
     .then((response) => {
       if (!response.ok) throw new Error(`DebugCollectorHTTP${response.status}`);

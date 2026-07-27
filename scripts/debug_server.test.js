@@ -319,7 +319,7 @@ test('probeServer settles within a bounded wall-clock period against a trickling
     const result = await probeServer(Number(new URL(tricklerUrl).port));
     const elapsedMs = Date.now() - startedAt;
     assert.equal(result, null);
-    assert.ok(elapsedMs < 10_000, `probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
+    assert.ok(elapsedMs < 5_000, `probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
   } finally {
     await close(trickler);
   }
