@@ -393,34 +393,25 @@ test('exclusive output-dir lock lets only one concurrent stale reclaimer take ov
   }
 });
 
-test('exclusive output-dir lock release refuses a symlinked successor', async () => {
+test('exclusive output-dir lock release refuses an unverified successor', async () => {
   const fs = require('node:fs/promises');
   const os = require('node:os');
   const nodePath = require('node:path');
-  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-release-symlink-'));
-  let successorPath = null;
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-release-unverified-'));
   try {
-    const lock = await acquireOutputDirLock(tmp);
-    const replacement = nodePath.join(tmp, 'replacement-lock');
-    const replacementPayload = `${process.pid}\n${lock.nonce}\n`;
-    await fs.unlink(lock.path);
-    await fs.writeFile(replacement, replacementPayload, 'utf8');
-    try {
-      await fs.symlink(replacement, lock.path, 'file');
-    } catch (error) {
-      if (['EACCES', 'EPERM', 'ENOSYS'].includes(error?.code)) return;
-      throw error;
-    }
-    successorPath = lock.path;
+    // The guarded reader is the same no-follow, bounded descriptor reader
+    // used for actual symlink/FIFO successors. Inject its rejection so this
+    // release test exercises the fail-closed path on every supported Node,
+    // including Node 20 Windows where reparse-point metadata is unavailable.
+    const lock = await acquireOutputDirLock(tmp, {
+      readLockFile: async () => {
+        throw new Error('Evidence lock is not a size-bounded regular file.');
+      },
+    });
     await lock.release();
-    // Node 20 on hosted Windows can report EPERM for lstat/realpath on a
-    // symlink it just created. Reading through it proves the relevant
-    // contract without metadata inspection: release left the successor path.
-    assert.equal(await fs.readFile(lock.path, 'utf8'), replacementPayload);
+    const retained = await fs.readFile(lock.path, 'utf8');
+    assert.match(retained, new RegExp(`\\n${lock.nonce.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\n`));
   } finally {
-    // Avoid recursive cleanup's Node 20 Windows metadata path for a known
-    // symlink. unlink removes the test-created link itself, not its target.
-    if (successorPath) await fs.unlink(successorPath).catch(() => {});
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });

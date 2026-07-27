@@ -340,7 +340,7 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           try {
             // Only unlink if we still own the nonce (another process must not
             // have reclaimed and rewritten the lock after a crash).
-            const holder = outputDirLockHolder(await readOutputDirLockFile(lockPath));
+            const holder = outputDirLockHolder(await readLockFile(lockPath));
             if (holder?.nonce === nonce) {
               await unlink(lockPath).catch(() => {});
             }
