@@ -134,6 +134,12 @@ unique_backup() {
 # on a different device than $HOME (NFS home, container bind mounts); then
 # `mv` copies and an interruption can leave a partial install after backup.
 declare -a stage_paths=()
+declare -a acquired_locks=()
+lock_host="${HOSTNAME:-}"
+if [[ -z "$lock_host" ]]; then
+  lock_host="$(hostname)"
+fi
+lock_owner="pid=$$"$'\n'"host=$lock_host"$'\n'"token=$$.$RANDOM.$RANDOM"
 cleanup_stages() {
   # Best-effort stage removal on EXIT under `set -e`. Capture rm failures
   # into rm_status rather than OR-listing a forced success so this helper
@@ -151,9 +157,35 @@ cleanup_stages() {
   # Trap cleanup must not rewrite the installer's exit status.
   return 0
 }
+release_destination_locks() {
+  local i lock_path owner
+  for ((i = ${#acquired_locks[@]} - 1; i >= 0; i--)); do
+    lock_path="${acquired_locks[$i]}"
+    # Never unlink a lock that no longer identifies this process. A live
+    # owner cannot be replaced while its lock name exists, and the equality
+    # check also keeps cleanup from deleting an unrelated file after a manual
+    # repair of a stale lock.
+    if [[ -f "$lock_path" && ! -L "$lock_path" ]]; then
+      owner="$(<"$lock_path")"
+      if [[ "$owner" == "$lock_owner" ]]; then
+        if ! rm -- "$lock_path" 2>/dev/null; then
+          echo "Cleanup warning: could not release install lock $lock_path" >&2
+        fi
+      fi
+    fi
+  done
+  acquired_locks=()
+}
+cleanup_on_exit() {
+  local status=$?
+  cleanup_stages
+  release_destination_locks
+  return "$status"
+}
 # Single-quoted trap body so the handler is not expanded at registration time
 # (shellcheck SC2064). Do not add a disable directive; the quote form is the fix.
-trap 'cleanup_stages' EXIT
+trap 'cleanup_on_exit' EXIT
+trap 'exit 128' HUP INT TERM
 
 for destination in "${destinations[@]}"; do
   parent="$(dirname -- "$destination")"
@@ -198,47 +230,123 @@ rollback() {
   done
 }
 
-# Per-destination mutex (Codex M6UFnGw): mkdir is atomic on POSIX, so two
-# concurrent --force installers cannot interleave backup/commit/rollback — one
-# would otherwise observe the temporary gap after the other's backup move and
-# clobber/restore the wrong tree. Held across this destination's backup,
-# commit, and (on failure) rollback, then released. A stale lockdir from a
-# crashed installer is removed only when provably empty (never a real backup).
-dest_lock=""
+# Per-destination mutex: link(2) is atomic, so linking a fully written owner
+# record creates a lock with no empty-directory initialization window. That
+# lets a later installer prove that a local owner PID has exited before it
+# reclaims a stale lock. Lock files are held for the entire multi-target
+# transaction, including rollback, so a later installer cannot be reverted by
+# an earlier transaction that fails on a different destination.
+lock_owner_is_dead() {
+  local lock_path="$1" contents after_pid owner_pid owner_host owner_token ps_status
+  [[ -f "$lock_path" && ! -L "$lock_path" ]] || return 1
+  contents="$(<"$lock_path")"
+  [[ "$contents" == pid=* ]] || return 1
+  after_pid="${contents#pid=}"
+  owner_pid="${after_pid%%$'\n'*}"
+  after_pid="${after_pid#*$'\n'}"
+  [[ "$after_pid" == host=* ]] || return 1
+  owner_host="${after_pid#host=}"
+  owner_host="${owner_host%%$'\n'*}"
+  owner_token="${after_pid#*$'\n'}"
+  owner_token="${owner_token#token=}"
+  [[ "$contents" == "pid=$owner_pid"$'\n'"host=$owner_host"$'\n'"token=$owner_token" ]] || return 1
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ && -n "$owner_host" && -n "$owner_token" ]] || return 1
+  # A lock on another host may be on a shared volume; this installer cannot
+  # prove that owner dead, so it leaves the lock intact.
+  [[ "$owner_host" == "$lock_host" ]] || return 1
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    return 1
+  fi
+  command -v ps >/dev/null 2>&1 || return 1
+  ps -p "$owner_pid" -o pid= >/dev/null 2>&1
+  ps_status=$?
+  # ps returns one only when no matching process exists. Other failures are
+  # not proof that reclaiming is safe.
+  [[ $ps_status -eq 1 ]]
+}
+reclaim_stale_lock() {
+  local lock_path="$1" original guard current
+  [[ -f "$lock_path" && ! -L "$lock_path" ]] || return 1
+  original="$(<"$lock_path")"
+  lock_owner_is_dead "$lock_path" || return 1
+  guard="${lock_path}.reclaim"
+  # Only one reclaimer may remove a stale lock. It rechecks the exact owner
+  # record after taking this guard so it never unlinks a replacement lock.
+  mkdir "$guard" 2>/dev/null || return 1
+  current=""
+  if [[ -f "$lock_path" && ! -L "$lock_path" ]]; then
+    current="$(<"$lock_path")"
+  fi
+  if [[ "$current" == "$original" ]] && lock_owner_is_dead "$lock_path"; then
+    if rm -- "$lock_path" 2>/dev/null; then
+      if ! rmdir "$guard" 2>/dev/null; then
+        echo "Cleanup warning: could not release stale-lock reclaim guard $guard" >&2
+      fi
+      return 0
+    fi
+  fi
+  if ! rmdir "$guard" 2>/dev/null; then
+    echo "Cleanup warning: could not release stale-lock reclaim guard $guard" >&2
+  fi
+  return 1
+}
 lock_destination() {
-  local dest="$1" tries=0
-  while ! mkdir -- "${dest}.install-lock" 2>/dev/null; do
+  local dest="$1" lock_path owner_path tries=0 link_status
+  lock_path="${dest}.install-lock"
+  while :; do
+    owner_path="$(mktemp "$(dirname -- "$lock_path")/.debug-install-lock-owner.XXXXXX")" || return 2
+    printf '%s\n' "$lock_owner" > "$owner_path"
+    if ln "$owner_path" "$lock_path" 2>/dev/null; then
+      # POSIX ln treats an existing directory as a destination directory. A
+      # pre-upgrade directory lock must remain contention; never mistake the
+      # link it creates inside that directory for ownership of the lock path.
+      if [[ -f "$lock_path" && ! -L "$lock_path" ]]; then
+        if ! rm -- "$owner_path" 2>/dev/null; then
+          echo "Cleanup warning: could not remove temporary lock owner file $owner_path" >&2
+        fi
+        acquired_locks+=("$lock_path")
+        return 0
+      fi
+      if [[ -d "$lock_path" ]]; then
+        rm -f -- "$lock_path/$(basename -- "$owner_path")"
+      fi
+      link_status=1
+    else
+      link_status=$?
+    fi
+    rm -f -- "$owner_path"
+    # A failed link with no existing lock is a real filesystem error (for
+    # example, a missing parent), not evidence of another installer.
+    if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
+      echo "Could not create install lock $lock_path (ln exit $link_status)" >&2
+      return 2
+    fi
+    if reclaim_stale_lock "$lock_path"; then
+      continue
+    fi
     tries=$((tries + 1))
     if [[ $tries -gt 120 ]]; then
       return 1
     fi
     sleep 0.5
   done
-  dest_lock="${dest}.install-lock"
-  return 0
 }
-release_destination_lock() {
-  if [[ -n "$dest_lock" ]]; then
-    local rmdir_status=0
-    rmdir -- "$dest_lock" 2>/dev/null || rmdir_status=$?
-    if [[ $rmdir_status -ne 0 ]]; then
-      echo "Cleanup warning: could not release install lock $dest_lock (rmdir exit $rmdir_status)" >&2
-    fi
-    dest_lock=""
+
+# Acquire every lock in a stable order before a destination is backed up or
+# committed. Sorting prevents a codex-only installer and a both-target
+# installer from deadlocking each other, while the original destination order
+# remains intact for result emission and rollback.
+while IFS= read -r destination; do
+  if ! lock_destination "$destination"; then
+    echo "Could not acquire install lock for $destination (another installer is active or lock creation failed)" >&2
+    exit 1
   fi
-}
+done < <(printf '%s\n' "${destinations[@]}" | LC_ALL=C sort)
 
 idx=0
 for destination in "${destinations[@]}"; do
   stage="${stage_paths[$idx]}"
   backup=""
-  # Acquire the per-destination mutex before any backup/commit/rollback so a
-  # concurrent --force installer cannot observe an in-flight gap (Codex M6UFnGw).
-  if ! lock_destination "$destination"; then
-    rollback
-    echo "Could not acquire install lock for $destination (another installer is active)" >&2
-    exit 1
-  fi
   # Same dangling-symlink gap as the preflight check above: without -L, a
   # dangling symlink at $destination would skip the backup step entirely, so
   # the later mv over it and any subsequent rollback via restore_from_backup
@@ -251,7 +359,6 @@ for destination in "${destinations[@]}"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     if [[ "$force" != "true" ]]; then
       rollback
-      release_destination_lock
       echo "Target exists: $destination. Rerun with --force to preserve it as a backup and replace it." >&2
       exit 1
     fi
@@ -262,7 +369,6 @@ for destination in "${destinations[@]}"; do
     # explicitly like the staged-tree move below.
     if ! mv -- "$destination" "$backup"; then
       rollback
-      release_destination_lock
       echo "Failed to back up $destination" >&2
       exit 1
     fi
@@ -274,13 +380,11 @@ for destination in "${destinations[@]}"; do
   if ! mv -- "$stage" "$destination"; then
     restore_from_backup "$destination" "$backup"
     rollback
-    release_destination_lock
     echo "Failed to install to $destination" >&2
     exit 1
   fi
   committed_dests+=("$destination")
   committed_backups+=("$backup")
-  release_destination_lock
   idx=$((idx + 1))
 done
 

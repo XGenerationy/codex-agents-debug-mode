@@ -1833,6 +1833,36 @@ test(
 );
 
 test(
+  'install.sh reclaims a lock whose recorded local owner is gone',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: process ownership probe'), timeout: 30000 },
+  async () => {
+    // Lock files are created atomically with their owner metadata. A later
+    // installer may reclaim one only after it can prove that the recorded
+    // local PID no longer exists; this models an interrupted previous run
+    // without ever removing an anonymous directory lock.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-stale-lock-home-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    try {
+      const hostname = spawnSync('hostname', [], { encoding: 'utf8' }).stdout.trim();
+      assert.notEqual(hostname, '', 'hostname is required for the stale-lock fixture');
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(
+        `${target}.install-lock`,
+        `pid=999999999\nhost=${hostname}\ntoken=interrupted-fixture\n`,
+      );
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(existsSync(target), true, 'installer must proceed after reclaiming the proven-stale lock');
+      assert.equal(existsSync(`${target}.install-lock`), false, 'EXIT cleanup must release the newly acquired lock');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'install.sh rejects a symlink payload entry before staging',
   { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
