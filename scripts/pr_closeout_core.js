@@ -887,6 +887,7 @@ const scanSuppressionText = (file, text) => {
     // skip marker, while Go's abort method is exactly `t.Skip(`/t.Skipf(`
     // (capital S — lowercase would not compile).
     const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skip(?:Now|f)?\s*\(|#\s*\[\s*ignore\b/;
+    const isPythonFile = /\.pyi?$/i.test(base);
     // The optional `(?:\s*\([^()]*\))?` after an intermediate chain member lets
   // the parameterized-test factory forms `test.each(cases).only(...)` /
   // `describe.each(cases).skip(...)` match: Jest/Vitest return a new test
@@ -1028,7 +1029,7 @@ const scanSuppressionText = (file, text) => {
           i += 1;
           continue;
         }
-        if (/\.pyi?$/i.test(base) && ch === '#') {
+        if (isPythonFile && ch === '#') {
           lineComment = true;
           inert[i] = true;
           i += 1;

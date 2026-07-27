@@ -745,6 +745,28 @@ test('requires verified Grafana API health JSON identity and status', async () =
   }
 });
 
+test('bounds a trickling Grafana health response by wall-clock time', { timeout: 10000 }, async () => {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    const interval = setInterval(() => {
+      if (!response.destroyed) response.write(' ');
+    }, 20);
+    response.once('close', () => clearInterval(interval));
+    response.once('error', () => clearInterval(interval));
+  });
+  const port = await listen(server);
+  try {
+    const startedAt = Date.now();
+    const result = await probeGrafanaHealthDefault(`http://127.0.0.1:${port}/api/health`, 100);
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(result.healthy, false);
+    assert.match(result.evidence, /wall-clock deadline/i);
+    assert.ok(elapsedMs < 1_000, `Grafana probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test('binds live Grafana artifact proof to a query result contract', async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-grafana-live-'));
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-grafana-live-logs-'));

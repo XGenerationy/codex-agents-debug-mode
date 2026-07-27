@@ -2638,9 +2638,11 @@ const probeGrafanaHealthDefault = (url, timeoutMs = 2500) => new Promise((resolv
   }
   const client = parsedUrl.protocol === 'https:' ? https : http;
   let settled = false;
+  let deadline;
   const done = (value) => {
     if (settled) return;
     settled = true;
+    clearTimeout(deadline);
     resolve(value);
   };
   const request = client.get(parsedUrl, { timeout: timeoutMs }, (response) => {
@@ -2687,6 +2689,14 @@ const probeGrafanaHealthDefault = (url, timeoutMs = 2500) => new Promise((resolv
     done({ healthy: false, evidence: 'Grafana health request timed out.' });
   });
   request.once('error', () => done({ healthy: false, evidence: 'Grafana health endpoint was unavailable.' }));
+  // A request timeout is reset by every received byte. Bound the total health
+  // probe as well, so a peer cannot keep preflight waiting indefinitely by
+  // trickling a small response without ever ending it (M6UJi6O).
+  deadline = setTimeout(() => {
+    request.destroy();
+    done({ healthy: false, evidence: 'Grafana health request exceeded its wall-clock deadline.' });
+  }, timeoutMs);
+  deadline.unref();
 });
 
 /**
