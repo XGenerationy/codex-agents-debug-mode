@@ -410,7 +410,10 @@ test('exclusive output-dir lock release refuses a symlinked successor', async ()
       throw error;
     }
     await lock.release();
-    assert.equal((await fs.lstat(lock.path)).isSymbolicLink(), true);
+    // Node 20 on hosted Windows can report EPERM for lstat on a symlink it
+    // just created. Resolving the successor still proves the relevant
+    // contract: release did not unlink or replace the untrusted lock path.
+    assert.equal(await fs.realpath(lock.path), await fs.realpath(replacement));
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
