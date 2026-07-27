@@ -318,6 +318,30 @@ test('exclusive output-dir lock reclaims a stale lock from a dead PID', async ()
   }
 });
 
+test('exclusive output-dir lock does not reclaim a freshly created incomplete holder record', async () => {
+  // `O_EXCL` exposes the path before writeFile(payload) resolves. A concurrent
+  // contender must treat that short empty/partial window as owned, not unlink
+  // the first process's active lock. Once the record is old, stale recovery
+  // remains available for a creator that crashed before writing its payload.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-initializing-lock-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  try {
+    await fs.writeFile(lockPath, '', 'utf8');
+    await assert.rejects(acquireOutputDirLock(tmp), /still initializing/i);
+
+    const old = new Date(Date.now() - 10_000);
+    await fs.utimes(lockPath, old, old);
+    const lock = await acquireOutputDirLock(tmp);
+    assert.ok(lock.nonce);
+    await lock.release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('exclusive output-dir lock treats a special-file lock as corrupt and reclaims it', async () => {
   // Codex #UDDQC: a FIFO/symlinked .closeout.lock must never be followed or
   // block the recovery read; a guard failure takes the corrupt-lock path.

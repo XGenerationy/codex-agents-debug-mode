@@ -1,7 +1,7 @@
 const { randomBytes } = require('node:crypto');
 const { constants: fsConstants } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { mkdir, open: openFile, readFile, realpath, unlink } = require('node:fs/promises');
+const { mkdir, open: openFile, readFile, realpath, stat, unlink } = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -201,6 +201,10 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
 // Upper bound for a .closeout.lock payload (`pid\nnonce\niso\n` — well under
 // 1 KiB). Anything larger is foreign/corrupt, not a live holder record.
 const OUTPUT_DIR_LOCK_MAX_BYTES = 4096;
+// `open(O_CREAT|O_EXCL)` makes the name visible before the initial payload
+// write completes. Never reclaim an empty/incomplete lock from that short
+// creation window, or a second closeout can unlink an active holder.
+const OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS = 5_000;
 
 /**
  * Read an existing .closeout.lock for stale-holder recovery without ever
@@ -301,6 +305,20 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         const lines = String(text).split(/\r?\n/);
         holderPid = Number(String(lines[0] || '').trim());
         holderNonce = String(lines[1] || '').trim() || null;
+        if (!Number.isInteger(holderPid) || holderPid <= 0 || !holderNonce) {
+          // A fresh empty/partial record is an active contender between its
+          // exclusive create and awaited payload write (M6UIcIK). Treat it as
+          // held during a short bounded window; after that, stale/corrupt
+          // records retain the existing reclaim behavior.
+          const info = await stat(lockPath);
+          if (Date.now() - info.mtimeMs < OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS) {
+            throw new Error(
+              `Evidence output directory lock is still initializing and may be held by a live closeout process: ${outputDir}`,
+            );
+          }
+          holderPid = null;
+          holderNonce = null;
+        }
       } catch (readError) {
         // A permission/transient-I/O error (EACCES/EPERM/EIO) means a live
         // holder wrote a 0o600 lock this process cannot inspect; reclaiming it
@@ -312,6 +330,9 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           throw new Error(
             `Evidence output directory lock is unreadable (${readError.code}) and may be held by a live closeout process: ${outputDir}`,
           );
+        }
+        if (/still initializing/.test(String(readError?.message || ''))) {
+          throw readError;
         }
         holderPid = null;
         holderNonce = null;

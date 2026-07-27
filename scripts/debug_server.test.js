@@ -14,6 +14,7 @@ const {
   createDebugServer,
   isInsideRoot,
   openNoFollowSync,
+  probeLaunchToken,
   probeServer,
   readJson,
 } = require('./debug_server');
@@ -325,6 +326,28 @@ test('probeServer settles within a bounded wall-clock period against a trickling
   }
 });
 
+test('probeLaunchToken settles within a bounded wall-clock period against a trickling /auth response', { timeout: 15000 }, async () => {
+  const trickler = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    const interval = setInterval(() => {
+      if (!response.destroyed) response.write('x');
+    }, 100);
+    response.on('close', () => clearInterval(interval));
+    response.on('error', () => clearInterval(interval));
+  });
+  const tricklerUrl = await listen(trickler);
+
+  try {
+    const startedAt = Date.now();
+    const result = await probeLaunchToken(Number(new URL(tricklerUrl).port), TEST_LAUNCH_TOKEN);
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(result, false);
+    assert.ok(elapsedMs < 5_000, `launch-token probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
+  } finally {
+    await close(trickler);
+  }
+});
+
 test('requires the launch token and returns only an opaque relative log path', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
@@ -519,6 +542,49 @@ test('delivers a real 413 body_too_large to the client instead of ECONNRESET', a
 
     assert.equal(response.status, 413);
     assert.deepEqual(response.body, { error: 'body_too_large' });
+    assert.equal(response.headers.connection, 'close');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('delivers a real 408 request_body_timeout to a stalled client instead of ECONNRESET', { timeout: 10000 }, async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { bodyTimeoutMs: 50 },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const url = new URL('/session', baseUrl);
+      const request = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` },
+      }, (incoming) => {
+        let text = '';
+        incoming.setEncoding('utf8');
+        incoming.on('data', (chunk) => { text += chunk; });
+        incoming.on('end', () => {
+          try {
+            resolve({ status: incoming.statusCode, headers: incoming.headers, body: JSON.parse(text) });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      request.on('error', reject);
+      request.write('{"name":"incomplete');
+    });
+
+    assert.equal(response.status, 408);
+    assert.deepEqual(response.body, { error: 'request_body_timeout' });
     assert.equal(response.headers.connection, 'close');
   } finally {
     await close(server);
@@ -1297,6 +1363,30 @@ test('reports port_in_use_by_other_process (not a false already_running) when a 
     if (firstChild) stopCli(firstChild);
     await rm(projectRootA, { recursive: true, force: true });
     await rm(projectRootB, { recursive: true, force: true });
+  }
+});
+
+test('reclaims a stale collector_claim whose recorded port now serves a different project', { timeout: 20000 }, async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-claim-owner-a-'));
+  const otherRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-claim-owner-b-'));
+  const other = createDebugServer({ projectRoot: otherRoot, token: TEST_LAUNCH_TOKEN });
+  const otherUrl = await listen(other);
+  const port = await findFreePort();
+  const claimPath = path.join(projectRoot, '.debug', 'collector_claim');
+  await mkdir(path.dirname(claimPath), { recursive: true });
+  await writeFile(claimPath, `${new URL(otherUrl).port}\nold-claim\n2147483646\n`, 'utf8');
+
+  let launched;
+  try {
+    launched = launchCli(projectRoot, port);
+    const result = await launched.outcome;
+    assert.equal(result.status, 'started', result.stderr);
+    assert.equal(await readFile(path.join(projectRoot, '.debug', 'collector_port'), 'utf8'), String(port));
+  } finally {
+    if (launched?.child) stopCli(launched.child);
+    await close(other);
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(otherRoot, { recursive: true, force: true });
   }
 });
 

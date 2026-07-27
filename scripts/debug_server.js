@@ -23,6 +23,7 @@ const COLLECTOR_SERVICE = 'codex-debug-collector';
 const COLLECTOR_VERSION = 1;
 const DEFAULT_LIMITS = Object.freeze({
   maxBodyBytes: 64 * 1024,
+  bodyTimeoutMs: 30_000,
   maxSessions: 32,
   maxEventsPerSession: 2_000,
   maxTotalBytes: 16 * 1024 * 1024,
@@ -101,35 +102,46 @@ const readJson = async (request, maxBodyBytes, bodyTimeoutMs = 30_000) => {
   // /session headers and a partial chunked body without ever ending the
   // request, which would otherwise keep a provisional session slot reserved
   // forever (repeated up to maxSessions → permanent session_limit_reached).
-  // On deadline we destroy the request so the `for await` rejects and the
-  // caller frees its reservation (Codex M6UFnGz). `unref` keeps a lone timer
-  // from holding the event loop open.
+  // Do not destroy IncomingMessage on deadline: it shares the response
+  // socket, so destruction prevents the handler from returning its 408.
+  // Pause the unread body, reject the foreground read, and let the handler
+  // close the connection after it has flushed the structured response.
+  let rejectTimeout;
+  const timeout = new Promise((_, reject) => {
+    rejectTimeout = reject;
+  });
   const timer = setTimeout(() => {
     timedOut = true;
-    try { request.destroy(); } catch { /* already closed */ }
+    try { request.pause?.(); } catch { /* already closed */ }
+    rejectTimeout(new RequestError('request_body_timeout', 408, { closeConnection: true }));
   }, bodyTimeoutMs);
   if (typeof timer.unref === 'function') timer.unref();
 
   try {
-    for await (const chunk of request) {
-      size += chunk.length;
-      if (size > maxBodyBytes) {
-        tooLarge = true;
-        // Stop reading instead of continuing to drain the upload (a local
-        // client could otherwise keep the collector busy with an arbitrarily
-        // large body even though the limit was already exceeded), but do NOT
-        // call request.destroy(): for a real socket that also tears down the
-        // response's shared connection before the 413 can be written (see the
-        // JSDoc above). `break` alone still stops buffering and releases the
-        // request object without touching the socket.
-        break;
-      }
-      chunks.push(chunk);
-    }
+    await Promise.race([
+      (async () => {
+        for await (const chunk of request) {
+          size += chunk.length;
+          if (size > maxBodyBytes) {
+            tooLarge = true;
+            // Stop reading instead of continuing to drain the upload (a local
+            // client could otherwise keep the collector busy with an arbitrarily
+            // large body even though the limit was already exceeded), but do NOT
+            // call request.destroy(): for a real socket that also tears down the
+            // response's shared connection before the 413 can be written (see the
+            // JSDoc above). `break` alone still stops buffering and releases the
+            // request object without touching the socket.
+            break;
+          }
+          chunks.push(chunk);
+        }
+      })(),
+      timeout,
+    ]);
   } catch (error) {
     // A timed-out incomplete body is reported as 408 before any other
     // classification so the caller can free the provisional /session slot.
-    if (timedOut) throw new RequestError('request_body_timeout', 408);
+    if (timedOut) throw new RequestError('request_body_timeout', 408, { closeConnection: true });
     // Defense in depth: if some other failure races with the oversize break
     // above, still classify it as the deterministic 413 limit violation
     // rather than a 400-class abort, so an oversized upload is always
@@ -427,7 +439,7 @@ const appendSessionEvent = (session, serializedEvent) => {
  * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
- * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, maxSessions, maxEventsPerSession, maxTotalBytes).
+ * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, maxEventsPerSession, maxTotalBytes).
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -535,7 +547,7 @@ const createDebugServer = ({
         sessions.set(reservationId, { eventCount: 0, logFile: null, sessionToken: null, provisional: true });
         let payload;
         try {
-          payload = await readJson(request, effectiveLimits.maxBodyBytes);
+          payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
         } catch (error) {
           sessions.delete(reservationId);
           throw error;
@@ -672,7 +684,7 @@ const createDebugServer = ({
       }
 
       if (request.method === 'POST' && pathname === '/log') {
-        const payload = await readJson(request, effectiveLimits.maxBodyBytes);
+        const payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
         // /session returns snake_case keys (session_id, session_token) but
         // older docs and several SDKs use camelCase (sessionId, sessionToken).
         // Accept both shapes so a client that reuses the /session response
@@ -879,9 +891,11 @@ const probeReadyCollector = async (port, expectedProjectHash, { attempts = 20, d
  */
 const probeLaunchToken = (port, token) => new Promise((resolve) => {
   let settled = false;
+  let deadline;
   const finish = (value) => {
     if (settled) return;
     settled = true;
+    clearTimeout(deadline);
     resolve(value);
   };
   const request = http.request(
@@ -899,6 +913,7 @@ const probeLaunchToken = (port, token) => new Promise((resolve) => {
     (response) => {
       response.resume();
       response.on('end', () => finish(response.statusCode === 200));
+      response.on('close', () => finish(false));
       response.on('error', () => finish(false));
     },
   );
@@ -907,6 +922,15 @@ const probeLaunchToken = (port, token) => new Promise((resolve) => {
     finish(false);
   });
   request.on('error', () => finish(false));
+  request.on('close', () => finish(false));
+  // `timeout` is an inactivity timeout. A peer that continuously trickles
+  // /auth bytes can reset it forever, pinning the EADDRINUSE path after the
+  // health probe already succeeded. Bound total probe time independently.
+  deadline = setTimeout(() => {
+    request.destroy();
+    finish(false);
+  }, 2_000);
+  deadline.unref();
   request.end();
 });
 
@@ -1099,9 +1123,12 @@ const main = () => {
           const peer = await probeServer(peerPort);
           if (peer && peer.project_hash === server.collectorProjectHash) return true;
           if (peer && peer.project_hash !== server.collectorProjectHash) {
-            // Different project on that port still owns the listener; do not
-            // treat the claim as free for token overwrite.
-            return true;
+            // A claim belongs to one project root. A different collector can
+            // legitimately reuse the recorded port after this project's old
+            // owner died; it does not own this project's token/claim files.
+            // Reclaim the stale claim and let this invocation start on its
+            // own requested port (Codex M6UI75x).
+            return false;
           }
           await new Promise((resolve) => setTimeout(resolve, 40));
         }
@@ -1371,6 +1398,7 @@ module.exports = {
   createDebugServer,
   isInsideRoot,
   openNoFollowSync,
+  probeLaunchToken,
   probeServer,
   readJson,
 };
