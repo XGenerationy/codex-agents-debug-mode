@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
-const { constants, realpathSync, writeSync } = require('node:fs');
+const { closeSync, constants, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
-const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
+const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared, openNoFollowFlagAttempts } = require('./pr_closeout_fs');
 
 /**
  * Synchronous stdout/stderr writes for CLI terminal paths that call
@@ -257,6 +257,28 @@ const assertPrivateRegularFile = async (target, label) => {
 const openNoFollow = async (target, flags, mode) => {
   const nonBlock = constants.O_NONBLOCK || 0;
   return openNoFollowShared(target, flags | nonBlock, mode);
+};
+
+// Synchronous sibling of openNoFollow for code that must run inside a
+// process 'exit' listener, where awaits are impossible. Reuses the shared
+// openNoFollowFlagAttempts ladder so O_NOFOLLOW/O_NONBLOCK degrade exactly
+// like the async version on platforms that lack or reject them (both are
+// undefined on Windows, collapsing the ladder to plain flags). Callers must
+// still run an lstat-based guard first as the primary check -- the same
+// contract the async wrapper documents (CodeRabbit discussion_r3652923124).
+const openNoFollowSync = (target, flags) => {
+  const attempts = openNoFollowFlagAttempts(flags, constants.O_NOFOLLOW || 0, constants.O_NONBLOCK || 0);
+  const unsupported = (code) => ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(code);
+  let lastError;
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      return openSync(target, attempts[i]);
+    } catch (error) {
+      lastError = error;
+      if (i >= attempts.length - 1 || !unsupported(error?.code)) throw error;
+    }
+  }
+  throw lastError;
 };
 
 // True iff an already-realpath'd candidate still resolves strictly inside an
@@ -1125,10 +1147,41 @@ const main = () => {
       // an EEXIST+reclaim cycle (CodeRabbit #4781622077).
       const releaseOwnedClaim = () => {
         try {
-          const { unlinkSync, readFileSync } = require('node:fs');
           let text = '';
           try {
-            text = readFileSync(claimFile, 'utf8');
+            // Read through an lstat guard + no-follow descriptor, not a
+            // path-based readFileSync: .debug is writable by the debugged
+            // project, so claimFile can be swapped for a symlink (or a hard
+            // link to an outside inode) between acquire and this read, and a
+            // following read would let that outside content drive the
+            // ownership unlink below (CodeRabbit discussion_r3652923124).
+            // Sync mirrors of the async guards are required because this runs
+            // from server 'close' and process 'exit', where awaits are
+            // impossible; the lstat guard stays the primary check, with
+            // O_NOFOLLOW as defense-in-depth where the platform has it.
+            const info = lstatSync(claimFile);
+            if (
+              info.isSymbolicLink()
+              || !info.isFile()
+              || info.nlink > 1
+              || info.size < 1
+              || info.size > MAX_CLAIM_FILE_BYTES
+            ) {
+              return;
+            }
+            const fd = openNoFollowSync(claimFile, constants.O_RDONLY);
+            try {
+              const buf = Buffer.alloc(info.size);
+              let offset = 0;
+              while (offset < info.size) {
+                const bytesRead = readSync(fd, buf, offset, info.size - offset, offset);
+                if (bytesRead === 0) break;
+                offset += bytesRead;
+              }
+              text = buf.subarray(0, offset).toString('utf8');
+            } finally {
+              closeSync(fd);
+            }
           } catch {
             return;
           }

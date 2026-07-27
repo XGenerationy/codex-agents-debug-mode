@@ -1506,6 +1506,214 @@ test('enumerates multi-level Windows descendants from a full process table', asy
   assert.match(result.evidence, /2 live descendant/i);
 });
 
+test('proves a clean Windows tree from ONE process-table snapshot', async () => {
+  // Windows CI flake regression: the root-gone clean-exit path used to run
+  // TWO sequential full-system CIM serializations (BFS table, then a second
+  // CommandLine table) — 8-19s each on loaded windows-latest runners — so
+  // the 15s/20s probe timeouts raced and clean commands flaked BLOCKED
+  // (GitHub Actions, Node 20/22/24). Both proofs must reuse one snapshot:
+  // exactly one powershell invocation even when cwd is provided.
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return { stdout: '400 1 500 services.exe\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.match(result.evidence, /no live descendants/i);
+  assert.equal(powershellCalls, 1, 'BFS and the CommandLine worktree scan must share one snapshot');
+});
+
+test('blocks multi-level Windows orphans via the CommandLine scan over the same snapshot', async () => {
+  // The orphan's parent (999999) is dead and absent from the table, so
+  // ParentProcessId BFS can never reach it; only the worktree CommandLine
+  // scan catches it (Codex #4781560042) — and it must not cost a second
+  // snapshot.
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return { stdout: '565656 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /CommandLine/i);
+  assert.match(result.evidence, /565656/);
+  assert.equal(powershellCalls, 1, 'CommandLine scan must reuse the BFS snapshot, not re-query CIM');
+});
+
+test('does not block a clean Windows tree on worktree processes started before the spawn', async () => {
+  // A pre-existing editor/CI process whose CommandLine mentions the repo but
+  // whose CreationDate predates the spawn must not false-BLOCK the tree
+  // (CodeRabbit #4781622077 semantics, preserved through the single-snapshot
+  // refactor).
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return { stdout: '565657 999999 500 C:\\tools\\editor.exe C:\\work\\repo\\README.md\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'PASS');
+  assert.match(result.evidence, /no live descendants/i);
+  assert.equal(powershellCalls, 1);
+});
+
+test('does not block on a worktree CommandLine match whose unbroken ancestor chain predates the spawn', async () => {
+  // Second Windows flake root cause (local full-suite evidence + original CI
+  // failure analysis): under `node --test`, sibling per-file worker processes
+  // carry the repo path in their command lines and start AFTER the checked
+  // command's minStartMs, so neither the self/ancestor exclusion nor the
+  // young-match age filter excludes them. Windows never reassigns
+  // ParentProcessId: such a sibling's UNBROKEN chain reaches the pre-existing
+  // runner (700001, createdMs 500 < minStarttime 1000), which proves it
+  // cannot be an orphan of our exited child — excluding it is sound.
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return {
+        stdout: '700001 1 500 C:\\tools\\runner.exe\n700002 700001 2000 node.exe C:\\work\\repo\\scripts\\other.test.js\n',
+        stderr: '',
+      };
+    },
+  });
+  assert.equal(result.status, 'PASS', `sibling chaining to a pre-existing root must not BLOCK, got: ${result.evidence}`);
+  assert.match(result.evidence, /no live descendants/i);
+  assert.equal(powershellCalls, 1);
+});
+
+test('still blocks a worktree CommandLine match whose ancestor chain breaks at an absent pid', async () => {
+  // Guard: the pre-existing-root exclusion must not weaken orphan detection.
+  // 700003's parent (999999) is absent from the table — exactly the broken
+  // chain a real multi-level orphan has — so it stays flagged (fail-closed).
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return { stdout: '700003 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /CommandLine/i);
+  assert.match(result.evidence, /700003/);
+  assert.equal(powershellCalls, 1);
+});
+
+test('still blocks a worktree CommandLine match whose ancestor chain reaches unknown-age processes', async () => {
+  // Guard: an ancestor whose CreationDate is unreadable (createdMs 0) cannot
+  // prove the chain predates the spawn — the walk stops there and the match
+  // stays flagged (fail-closed), even though the chain then breaks.
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return {
+        stdout: '700004 700005 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n700005 999999 0\n',
+        stderr: '',
+      };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /CommandLine/i);
+  assert.match(result.evidence, /700004/);
+  assert.equal(powershellCalls, 1);
+});
+
+test('retries a failed Windows table snapshot once, then fails closed', async () => {
+  // The snapshot probe is read-only/idempotent, so exactly one retry is
+  // allowed to absorb transient shared-runner CIM slowness; persistent
+  // failure must still BLOCK (never assume the tree is clean).
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      powershellCalls += 1;
+      throw new Error('CIM provider hung');
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /enumeration failed/i);
+  assert.match(result.evidence, /CIM provider hung/);
+  assert.equal(powershellCalls, 2, 'probe gets exactly one retry, never more');
+});
+
 test('rejects an untrusted SystemRoot absolute path for Windows cleanup tools', async () => {
   const calls = [];
   const result = await terminateProcessTree({

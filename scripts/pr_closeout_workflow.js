@@ -213,6 +213,10 @@ const acquireOutputDirLock = async (outputDir) => {
       const release = async () => {
         if (released) return;
         released = true;
+        // Unregister the abrupt-exit safety net so long-lived processes that
+        // run closeout repeatedly do not accumulate exit listeners
+        // (CodeRabbit discussion_r3652923142 / Codex discussion_r3652957330).
+        process.removeListener('exit', onExit);
         try {
           await handle.close().catch(() => {});
         } finally {

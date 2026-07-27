@@ -121,7 +121,11 @@ const VALIDATION_REMOVAL_PATTERNS = [
   // but not covered by the package-manager patterns above (Codex #4781495663).
   // Match executable invocations only — not prose, compose `healthcheck:`
   // keys, or dependency names containing these words (CodeRabbit #4781622077).
-  /^\-.*\binstall\.sh\b/i,
+  // `install.sh` requires an explicit invocation prefix (`./`, `bash`, `sh`,
+  // `source`) so prose like `# see install.sh for setup` does not FAIL
+  // (CodeRabbit discussion_r3652923138). The `\b` sits inside the alternation:
+  // a boundary before the non-word `./` prefix would never match.
+  /^\-.*(?:\b(?:bash|sh|source)\s+|\.\/)install\.sh\b/i,
   /^\-.*\btest\s+-[efdxL]\b/i,
   /^\-\s*(?:-\s*)?(?:name|run):\s*.*\b(?:smoke[-_ ]?test|health[-_ ]?check|doctor)\b/i,
   /^\-.*\b(?:npm|pnpm|yarn|make)\s+(?:run\s+)?(?:smoke|healthcheck|doctor)\b/i,

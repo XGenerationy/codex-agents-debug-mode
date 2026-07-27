@@ -113,6 +113,16 @@ const CONFIG_SILENCING = [
  * to configured closeout commands and proof commands — including config
  * stored outside the checkout, which the touched-file suppression scanner
  * never sees.
+ *
+ * OR-lists are handled conservatively (Codex discussion_r3652957333): bash
+ * exempts the left side of `||` from errexit and the OR-list exits with the
+ * RIGHT operand's status, so ANY `||` fallback is flagged unless the right
+ * operand provably re-fails — `exit N` with N != 0, `false`, or `return N`
+ * with N != 0. Those allowed forms keep the failure visible to the executor
+ * (nonzero exit status), so they are not neutralizers; everything else
+ * (`|| true`, `|| :`, `|| echo ok`, `|| printf ok`, arbitrary commands)
+ * masks it. The specific patterns run before the catch-all so the reported
+ * fragment names the exact neutralizer.
  */
 const COMMAND_FAILURE_NEUTRALIZERS = [
   // OR-list success: `cmd || true`, `cmd || exit 0`, `cmd || echo ok`
@@ -136,6 +146,13 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // status and mask a failed left-hand command (CodeRabbit #4780344655).
   // Single-pipe only: lookaround excludes `||` which is handled above.
   /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
+  // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
+  // whose right operand does not provably re-fail — see the JSDoc above for
+  // the rationale. The negative lookahead admits only `false`,
+  // `exit <nonzero>`, and `return <nonzero>`; `|| true`, `|| :`,
+  // `|| exit 0`, and `|| echo …` still match their specific patterns above,
+  // which run first so the reported fragment names the exact neutralizer.
+  /\|\|(?!\s*(?:false\b|exit\s*[1-9]\d*\b|return\s*[1-9]\d*\b))/i,
   /\bpassWithNoTests\b/i,
   /\ballowNoTests\b/i,
   /\b--passWithNoTests\b/i,
@@ -375,7 +392,13 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
           ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
           : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
       }
-      const policy = String(proof.expectedPattern || '').trim();
+      // Validate the RAW configured string: the executor
+      // (pr_closeout_process.js evaluateCommandProof) exact-compares the
+      // untrimmed expectedPattern for the hunter semantic policy, so trimming
+      // here would admit a whitespace-padded policy at plan time that
+      // deterministically fails at runtime. Plan admissibility must mirror
+      // executor rules and fail closed (Qodo discussion_r3652936843).
+      const policy = String(proof.expectedPattern || '');
       const hunterOk = check.id === 'hunter-build'
         && policy === 'semantic:docker-compose-running-healthy';
       const literalOk = policy.startsWith('literal:')
@@ -418,9 +441,19 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
  * @returns {string} Text with zero-count status phrases removed.
  */
 // Include runner-native skip buckets: Rust `ignored`, pytest `deselected`.
+// The label-first form (`errors: 0`) only strips COMPLETE count buckets: the
+// zero must be followed by end-of-line or a summary delimiter (`, ; | ) ] }`),
+// never by arbitrary prose or a `-byte`-style continuation. Otherwise
+// diagnostics like `Error: 0 is not a valid threshold` or
+// `Warning: 0-byte artifact was ignored` would lose their `Error:`/`Warning:`
+// prefix, the remainder would no longer match statusSignal, and
+// classifyOutput would misreport the run as PASS (Codex
+// discussion_r3652957339). The count-first form (`0 warnings`) needs no such
+// guard: the count precedes the label, so it cannot consume a diagnostic's
+// `Label:` prefix.
 const cleanZeroSummaries = (text) => text
   .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
-  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0\b/gi, '')
+  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0[ \t]*(?=$|[,;|)\]}])/gim, '')
   .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
 const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
@@ -603,13 +636,16 @@ const scanSuppressionText = (file, text) => {
   const normalized = String(file).replaceAll('\\', '/').toLowerCase();
   const base = normalized.split('/').at(-1);
   const ignoreFile = /^\.(?:eslint|biome|prettier|stylelint|ruff)ignore$/.test(base);
-  // Shell validation helpers (ci/*.sh, scripts/*check*.sh, install.sh, …)
-  // can neutralize failures with `|| true` / `set +e` and still return 0 to
-  // make smoke/audit targets. Treat them as config-like so CONFIG_SILENCING
-  // applies (Codex #4781637950).
-  const shellHelper = /\.(?:sh|bash|zsh|ksh)$/.test(base)
-    || base === 'install.sh'
-    || /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized) && /\.(?:sh|bash)$/.test(base);
+  // Shell validation helpers — install.sh and shell scripts located under
+  // ci/, scripts/, tools/, or bin/ — can neutralize failures with `|| true` /
+  // `set +e` and still return 0 to make smoke/audit targets. Treat them as
+  // config-like so CONFIG_SILENCING applies (Codex #4781637950). The scoping
+  // is deliberately location-based: matching every shell extension would
+  // reclassify ordinary application/deploy scripts (e.g. src/deploy.sh) as
+  // config, running config-silencing neutrality checks on shell code that is
+  // not a validation helper (CodeRabbit discussion_r3652923133).
+  const shellHelper = base === 'install.sh'
+    || /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized) && /\.(?:sh|bash|zsh|ksh)$/.test(base);
   const configLike = ignoreFile || shellHelper
     || /\.(?:jsonc?|ya?ml|toml|ini|conf)$/.test(base)
     || /(?:^|\.)config\.[a-z0-9]+$/.test(base)
@@ -938,16 +974,41 @@ const scanSuppressionText = (file, text) => {
     // naive backtick strip would drop `${test\n  .only(...)}` entirely and
     // re-open a multiline bypass. Single/double-quoted strings are removed
     // wholesale; template literals keep only their `${...}` expression bodies
-    // (static template text is inert and discarded).
+    // (static template text is inert and discarded). Line and block comments
+    // are blanked in the SAME lexical pass: stripping comments with a
+    // quote-blind regex first would cut `//`/`/*` sequences inside string
+    // literals and leave unterminated quotes that corrupt every following
+    // line of the whole-file strip (Codex discussion_r3652957336). Newlines
+    // consumed inside strings/templates/comments are re-emitted so the
+    // stripped output stays line-aligned with the source — the multiline
+    // fallback below indexes code-bearing lines across the whole file.
     const stripQuotesPreserveTemplateExpr = (text) => {
       let out = '';
       let i = 0;
       while (i < text.length) {
         const ch = text[i];
+        if (ch === '/' && text[i + 1] === '/') {
+          // Line comment: consume to end of line; the newline itself is
+          // emitted by the ordinary-char path, keeping line alignment.
+          while (i < text.length && text[i] !== '\n') i += 1;
+          continue;
+        }
+        if (ch === '/' && text[i + 1] === '*') {
+          // Block comment: consume through the closer, preserving newlines.
+          i += 2;
+          while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+            if (text[i] === '\n') out += '\n';
+            i += 1;
+          }
+          i = Math.min(i + 2, text.length);
+          out += ' ';
+          continue;
+        }
         if (ch === "'" || ch === '"') {
           const quote = ch;
           i += 1;
           while (i < text.length) {
+            if (text[i] === '\n') out += '\n';
             if (text[i] === '\\') {
               i += 2;
               continue;
@@ -1023,7 +1084,9 @@ const scanSuppressionText = (file, text) => {
               }
               continue;
             }
-            // Static template text is inert — drop it.
+            // Static template text is inert — drop it, but keep newlines so
+            // the stripped output stays line-aligned with the source.
+            if (text[i] === '\n') out += '\n';
             i += 1;
           }
           out += ' ';
@@ -1037,23 +1100,36 @@ const scanSuppressionText = (file, text) => {
     if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
       const windowWeakening = new RegExp(testWeakening.source, 'i');
       const bareReceiver = /\b(?:describe|it|test|context|suite)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
-      // Lookahead window for bare-receiver splits. Three lines is not enough
-      // when blank/comment lines sit between `test` and `.only(...)`; keep a
-      // generous cap so the scan still terminates on huge files.
+      // Lookahead window for bare-receiver splits, counted in CODE-BEARING
+      // lines (non-blank after comment/quote stripping) rather than raw lines:
+      // a raw line-count cap is reachable purely by blank/comment padding, so
+      // `test` followed by >=cap padding lines and then `.only(...)` would
+      // escape detection (Codex discussion_r3652957336). Blank and
+      // comment-only lines therefore do not consume the window. The whole
+      // file is stripped once (linear in file size) and each window covers at
+      // most RECEIVER_LOOKAHEAD code-bearing lines, so the fallback stays
+      // O(lines × RECEIVER_LOOKAHEAD) on huge files.
       const RECEIVER_LOOKAHEAD = 16;
-      for (let i = 0; i < lines.length; i += 1) {
-        // Strip quotes across the full window first so a live receiver that
-        // only becomes visible after `${...}` extraction (e.g. `${test` on
-        // one line and `.only(...)}` on the next) can open the fallback.
-        // Static template text is discarded and cannot open a window.
-        const strippedWindow = stripQuotesPreserveTemplateExpr(
-          lines.slice(i, i + RECEIVER_LOOKAHEAD).join('\n')
-            .replace(/\/\*[\s\S]*?\*\//g, ' ')
-            .replace(/\/\/[^\n]*/g, ' '),
-        );
-        const lead = (strippedWindow.split('\n')[0] ?? '');
-        if (!bareReceiver.test(lead.trimEnd())) continue;
-        const windowText = strippedWindow
+      // Blank comments and quotes across the full file once (single lexical
+      // pass, so comment markers inside string literals cannot unbalance the
+      // quote handling) so a live receiver that only becomes visible after
+      // `${...}` extraction (e.g. `${test` on one line and `.only(...)}` on
+      // the next) can open the fallback. Static template text is discarded
+      // and cannot open a window.
+      const strippedLines = stripQuotesPreserveTemplateExpr(lines.join('\n')).split('\n');
+      const codeIndices = [];
+      strippedLines.forEach((stripped, index) => {
+        if (stripped.trim()) codeIndices.push(index);
+      });
+      for (let c = 0; c < codeIndices.length; c += 1) {
+        const i = codeIndices[c];
+        // Only start a window when the stripped line ends with a bare test
+        // receiver (so quoted fixtures like `'describe.only(...)'` on a
+        // single line are not re-scanned without string inertness).
+        if (!bareReceiver.test(strippedLines[i].trimEnd())) continue;
+        const windowText = codeIndices.slice(c, c + RECEIVER_LOOKAHEAD)
+          .map((index) => strippedLines[index])
+          .join('\n')
           .replace(/\s+/g, ' ')
           // Join `test .only` / `describe .skip` / `suite .only` after collapse.
           .replace(/\b(describe|it|test|context|suite)\s+\./gi, '$1.');

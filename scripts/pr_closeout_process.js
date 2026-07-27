@@ -474,34 +474,105 @@ const sweepDetachedOrphans = async ({
 };
 
 /**
- * Enumerate live descendant PIDs of `parentPid` via a full Windows process
- * table snapshot (ProcessId + ParentProcessId), then BFS. Unlike a single
- * `ParentProcessId=root` filter, this finds grandchildren while intermediate
- * parents are still alive. Fully orphaned multi-level trees (every intermediate
- * already exited) are unrecoverable via ParentProcessId alone.
- * @param {number} parentPid
- * @param {{runExecFile: Function, powershell: string}} options
- * @returns {Promise<number[]>} live descendant PIDs (empty if none).
+ * Parse the line-per-process snapshot emitted by snapshotWindowsProcessTable
+ * (`pid parentPid createdMs commandLine...`). Rows with only the two numeric
+ * fields are accepted as well so existing table fixtures stay valid. An
+ * unreadable/absent CreationDate becomes createdMs 0 ("unknown age"); such
+ * rows are never excluded by the minStartMs filter, keeping the worktree
+ * scan fail-closed.
+ * @returns {Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>}
  */
-const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
-  const root = Number(parentPid);
-  const script = 'Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + [char]32 + $_.ParentProcessId.ToString() }';
-  const { stdout } = await runExecFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8',
-    timeout: 15_000,
-    windowsHide: true,
-  });
-  const childrenByParent = new Map();
+const parseWindowsProcessTable = (stdout) => {
+  const rows = [];
   for (const line of String(stdout).split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const parts = trimmed.split(/\s+/);
-    if (parts.length < 2) continue;
-    const pid = Number(parts[0]);
-    const parent = Number(parts[1]);
-    if (!Number.isInteger(pid) || !Number.isInteger(parent) || pid <= 0) continue;
-    if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
-    childrenByParent.get(parent).push(pid);
+    const match = /^(\d+)\s+(\d+)(?:\s+(\d+))?(?:\s+(.*))?$/u.exec(trimmed);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    if (!Number.isInteger(pid) || !Number.isInteger(parentPid) || pid <= 0) continue;
+    rows.push({
+      pid,
+      parentPid,
+      createdMs: match[3] ? Number(match[3]) : 0,
+      commandLine: match[4] || '',
+    });
+  }
+  return rows;
+};
+
+/**
+ * Snapshot the full Windows process table (ProcessId, ParentProcessId,
+ * CommandLine, CreationDate) with ONE property-limited CIM query. A single
+ * snapshot feeds both termination proofs (ParentProcessId BFS and the
+ * worktree CommandLine scan); previously each proof serialized the whole
+ * table separately — the first one unfiltered, every Win32_Process property —
+ * plus one filtered CIM round-trip per ancestor-walk hop, which on loaded
+ * windows-latest CI runners took 8-19s apiece and raced the 15s/20s probe
+ * timeouts, flaking clean-exit commands into BLOCKED. (ccd7833 regression
+ * lesson, preserved: newline script, no `;`-joined statements, one
+ * property-limited CIM query.) The query takes no external input — the
+ * worktree needle and time floor are applied in JS afterwards — so the
+ * probe's own CommandLine can never match the needle, and no ambient env
+ * (CI secrets) is forwarded to powershell (CodeRabbit #4781622077).
+ * @param {{runExecFile: Function, powershell: string}} options
+ * @returns {Promise<Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>>}
+ */
+const snapshotWindowsProcessTable = async ({ runExecFile, powershell }) => {
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CommandLine,CreationDate | ForEach-Object {',
+    '  $createdMs = 0L',
+    '  if ($_.CreationDate) {',
+    '    try { $createdMs = [DateTimeOffset]::new([DateTime]$_.CreationDate).ToUnixTimeMilliseconds() } catch { }',
+    '  }',
+    '  $cl = [string]$_.CommandLine',
+    '  if ($cl) { $cl = $cl -replace "[`r`n]+", " " }',
+    '  "{0} {1} {2} {3}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs, $cl',
+    '}',
+  ].join('\n');
+  const minimalEnv = {
+    SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
+    SYSTEMROOT: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
+    PATHEXT: process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS',
+    ComSpec: process.env.ComSpec || process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe',
+  };
+  const { stdout } = await runExecFile(powershell, [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    script,
+  ], {
+    encoding: 'utf8',
+    // Same budget as the heavier of the two previous probes; a single bounded
+    // retry at the call site absorbs transient shared-runner load.
+    timeout: 20_000,
+    windowsHide: true,
+    env: minimalEnv,
+  });
+  return parseWindowsProcessTable(stdout);
+};
+
+/**
+ * Enumerate live descendant PIDs of `parentPid` from a parsed process-table
+ * snapshot via ParentProcessId BFS. Unlike a single `ParentProcessId=root`
+ * filter, this finds grandchildren while intermediate parents are still
+ * alive. Fully orphaned multi-level trees (every intermediate already
+ * exited) are unrecoverable via ParentProcessId alone — the caller covers
+ * those with findWindowsPidsWithCommandLineHint over the same snapshot.
+ * @param {Array<{pid: number, parentPid: number}>} table
+ * @param {number} parentPid
+ * @returns {number[]} live descendant PIDs (empty if none).
+ */
+const listWindowsChildPids = (table, parentPid) => {
+  const root = Number(parentPid);
+  const childrenByParent = new Map();
+  for (const row of table) {
+    if (!childrenByParent.has(row.parentPid)) childrenByParent.set(row.parentPid, []);
+    childrenByParent.get(row.parentPid).push(row.pid);
   }
   const found = [];
   const seen = new Set([root]);
@@ -519,107 +590,91 @@ const listWindowsChildPids = async (parentPid, { runExecFile, powershell }) => {
 };
 
 /**
- * Live PIDs whose CommandLine contains `cwd` (case-insensitive). Used on
- * Windows when ParentProcessId BFS cannot reconstruct multi-level orphans
- * after intermediate parents exit (Codex #4781560042).
+ * Live PIDs in a parsed snapshot whose CommandLine contains `cwd`
+ * (case-insensitive). Catches multi-level orphans the ParentProcessId BFS
+ * cannot reconstruct once intermediate parents have exited
+ * (Codex #4781560042). Pure JS over the already-fetched snapshot: the
+ * ancestor-chain exclusion walks the same ParentProcessId data instead of
+ * paying one filtered CIM query per hop. Excludes the caller ancestor chain
+ * and processes provably started before `minStartMs` so editors, CI agents,
+ * and package-manager parents that merely mention the worktree path do not
+ * false-BLOCK a clean tree (CodeRabbit #4781622077 semantics, preserved);
+ * rows of unknown age are kept (fail-closed).
  *
- * Tightened (CodeRabbit #4781622077 / Windows CI): exclude the caller
- * ancestor chain and processes started before `minStartMs`, so editors,
- * CI agents, and package-manager parents that merely mention the worktree
- * path do not false-BLOCK a clean tree.
+ * Pre-existing-root exclusion (second Windows CI flake root cause — local
+ * full-suite flake evidence + original CI failure analysis): under a full
+ * `node --test` run, sibling per-file worker processes carry the repo path
+ * in their command lines and start AFTER the checked command's minStartMs,
+ * so neither the caller-ancestor exclusion nor the young-match age filter
+ * excludes them, and a plain needle match false-BLOCKs a clean tree. The
+ * invariant that makes excluding them sound rather than a weakening:
+ * Windows never reassigns a process's ParentProcessId, so any real orphan
+ * of the validated child has a BROKEN ancestor chain by construction (it
+ * dead-ends at the exited child or another absent PID). A match whose
+ * UNBROKEN chain reaches a process with confidently-known createdMs <
+ * minStartMs chains to a pre-existing root (the `node --test` runner, a CI
+ * agent) and cannot be our orphan. Everything unproven stays flagged:
+ * chain broken at an absent PID, an ancestor of unknown age (createdMs 0),
+ * a cycle, the hop bound, or no time floor at all.
+ * @param {Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>} table
  * @param {string} cwd
- * @param {{
- *   runExecFile: Function,
- *   powershell: string,
- *   excludePids?: Set<number>,
- *   minStartMs?: number,
- *   selfPid?: number,
- * }} options
- * @returns {Promise<number[]>}
+ * @param {{excludePids?: Set<number>, minStartMs?: number, selfPid?: number}} options
+ * @returns {number[]}
  */
-const listWindowsPidsWithCommandLineHint = async (cwd, {
-  runExecFile,
-  powershell,
+const findWindowsPidsWithCommandLineHint = (table, cwd, {
   excludePids = new Set(),
   minStartMs = 0,
   selfPid = process.pid,
 } = {}) => {
-  const needle = String(cwd || '').trim();
+  const needle = String(cwd || '').trim().toLowerCase();
   if (!needle) return [];
-  // Pass filters via env to avoid PowerShell injection through path chars.
-  // Do not forward the ambient process.env (CI secrets) into powershell
-  // (CodeRabbit #4781622077).
-  //
-  // Critical Windows CI fix (ccd7833 regression): joining statements with
-  // `; ` inserted empty statements after `{` and nested full-property
-  // Get-CimInstance walks, which routinely exceeded the 15s timeout and
-  // BLOCKED every createCommandExecutor test. Use a newline script, one
-  // property-limited CIM query, and a shallow ancestor walk with -Filter.
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    '$needle = $env:OMO_CLOSEOUT_CWD_HINT',
-    'if ([string]::IsNullOrEmpty($needle)) { exit 0 }',
-    '$minMs = 0L',
-    '[void][long]::TryParse($env:OMO_CLOSEOUT_MIN_START_MS, [ref]$minMs)',
-    '$exclude = New-Object "System.Collections.Generic.HashSet[int]"',
-    'foreach ($part in (($env:OMO_CLOSEOUT_EXCLUDE_PIDS) -split ",")) {',
-    '  $n = 0',
-    '  if ([int]::TryParse($part.Trim(), [ref]$n) -and $n -gt 0) { [void]$exclude.Add($n) }',
-    '}',
-    '$self = 0',
-    '[void][int]::TryParse($env:OMO_CLOSEOUT_SELF_PID, [ref]$self)',
-    'if ($self -gt 0) {',
-    '  $walk = $self',
-    '  for ($i = 0; $i -lt 64 -and $walk -gt 0; $i++) {',
-    '    if (-not $exclude.Add($walk)) { break }',
-    '    $parentProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$walk" -Property ParentProcessId -ErrorAction SilentlyContinue',
-    '    if (-not $parentProc) { break }',
-    '    $walk = [int]$parentProc.ParentProcessId',
-    '  }',
-    '}',
-    'Get-CimInstance -ClassName Win32_Process -Property ProcessId,CommandLine,CreationDate | ForEach-Object {',
-    '  $procId = [int]$_.ProcessId',
-    '  if ($exclude.Contains($procId)) { return }',
-    '  $cl = $_.CommandLine',
-    '  if (-not $cl) { return }',
-    '  if ($cl.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return }',
-    '  if ($minMs -gt 0 -and $_.CreationDate) {',
-    '    try {',
-    '      $createdMs = [DateTimeOffset]::new([DateTime]$_.CreationDate).ToUnixTimeMilliseconds()',
-    '      if ($createdMs -lt $minMs) { return }',
-    '    } catch { }',
-    '  }',
-    '  $procId',
-    '}',
-  ].join('\n');
-  const minimalEnv = {
-    SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
-    SYSTEMROOT: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
-    PATHEXT: process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS',
-    ComSpec: process.env.ComSpec || process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe',
-    OMO_CLOSEOUT_CWD_HINT: needle,
-    OMO_CLOSEOUT_MIN_START_MS: String(Number.isFinite(minStartMs) ? Math.max(0, Math.floor(minStartMs)) : 0),
-    OMO_CLOSEOUT_SELF_PID: String(Number.isInteger(selfPid) ? selfPid : 0),
-    OMO_CLOSEOUT_EXCLUDE_PIDS: [...excludePids].filter((p) => Number.isInteger(p) && p > 0).join(','),
+  const parentByPid = new Map();
+  const rowByPid = new Map();
+  for (const row of table) {
+    parentByPid.set(row.pid, row.parentPid);
+    rowByPid.set(row.pid, row);
+  }
+  const excluded = new Set(excludePids);
+  const visited = new Set();
+  let walk = Number.isInteger(selfPid) && selfPid > 0 ? selfPid : 0;
+  for (let hop = 0; hop < 64 && walk > 0 && !visited.has(walk); hop += 1) {
+    visited.add(walk);
+    excluded.add(walk);
+    const parent = parentByPid.get(walk);
+    walk = Number.isInteger(parent) && parent > 0 ? parent : 0;
+  }
+  // Walk a match's OWN ancestor chain (cycle-safe, bounded) looking for a
+  // process provably older than the spawn. Only a confidently-known
+  // createdMs < minStartMs proves the chain predates the spawn; an absent
+  // link, an unknown-age link, a cycle, or the hop bound all stop the walk
+  // without proof (fail-closed — the caller keeps the match flagged).
+  const reachesPreExistingRoot = (startPid) => {
+    if (minStartMs <= 0) return false;
+    const chainVisited = new Set();
+    let current = startPid;
+    for (let hop = 0; hop < 64 && current > 0; hop += 1) {
+      if (chainVisited.has(current)) return false;
+      chainVisited.add(current);
+      const row = rowByPid.get(current);
+      if (!row) return false; // broken chain at an absent PID — cannot prove.
+      if (row.createdMs <= 0) return false; // unknown-age link — cannot prove.
+      if (row.createdMs < minStartMs) return true; // provably pre-existing.
+      current = row.parentPid;
+    }
+    return false;
   };
-  const { stdout } = await runExecFile(powershell, [
-    '-NoProfile',
-    '-NonInteractive',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-Command',
-    script,
-  ], {
-    encoding: 'utf8',
-    timeout: 20_000,
-    windowsHide: true,
-    env: minimalEnv,
-  });
   const found = [];
-  for (const line of String(stdout).split(/\r?\n/)) {
-    const pid = Number(line.trim());
-    if (!Number.isInteger(pid) || pid <= 0 || excludePids.has(pid)) continue;
-    found.push(pid);
+  for (const row of table) {
+    if (excluded.has(row.pid)) continue;
+    if (!row.commandLine) continue;
+    if (!row.commandLine.toLowerCase().includes(needle)) continue;
+    // Only confidently-older rows are skipped; unknown age stays (fail-closed).
+    if (minStartMs > 0 && row.createdMs > 0 && row.createdMs < minStartMs) continue;
+    // A match whose unbroken chain reaches a pre-existing root (e.g. a
+    // sibling `node --test` worker under the suite runner) cannot be an
+    // orphan of the validated child — exclude it (see invariant above).
+    if (reachesPreExistingRoot(row.pid)) continue;
+    found.push(row.pid);
   }
   return [...new Set(found)];
 };
@@ -637,10 +692,12 @@ const listWindowsPidsWithCommandLineHint = async (cwd, {
  * alone terminate) the tree — Microsoft documents `/T` as terminating the
  * specified process and the children it started, so a nonzero result
  * against an absent PID is not proof of anything about descendants. That
- * case falls back to listWindowsChildPids to independently enumerate and
- * individually taskkill any survivors, only concluding PASS once none
- * remain (or none existed); enumeration failure or an unkillable survivor
- * is reported BLOCKED rather than assumed clean. On POSIX, signals the
+ * case falls back to a single full-table snapshot (one property-limited CIM
+ * query with one bounded probe-only retry) to independently enumerate and
+ * individually taskkill any survivors, cross-checked by a CommandLine
+ * worktree scan over the same rows, only concluding PASS once none remain
+ * (or none existed); snapshot failure or an unkillable survivor is reported
+ * BLOCKED rather than assumed clean. On POSIX, signals the
  * process group (`kill(-pgid, ...)`), escalating SIGTERM to SIGKILL across
  * `terminationGraceMs`; because `kill(-pgid, 0)` reports a group as alive
  * even when every member is an unreaped zombie (common in containers with a
@@ -757,43 +814,49 @@ const terminateProcessTree = async ({
         // ParentProcessId regardless of whether the parent is still alive)
         // and terminate them directly; only PASS once none remain.
         const powershell = path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-        let survivors;
-        try {
-          survivors = await listWindowsChildPids(child.pid, { runExecFile, powershell });
-        } catch (enumerationError) {
+        // One process-table snapshot feeds BOTH termination proofs below
+        // (ParentProcessId BFS + worktree CommandLine scan). The snapshot is
+        // read-only and idempotent, so a single bounded retry of the PROBE
+        // ONLY — never of taskkill or of the validated command — absorbs
+        // transient CIM slowness on shared CI runners; two failed attempts
+        // still fail closed to BLOCKED, so the gate is not weakened.
+        let table;
+        let enumerationError = null;
+        for (let attempt = 1; attempt <= 2 && !table; attempt += 1) {
+          try {
+            table = await snapshotWindowsProcessTable({ runExecFile, powershell });
+          } catch (error) {
+            enumerationError = error;
+            if (attempt < 2) await delay(250);
+          }
+        }
+        if (!table) {
           return {
             status: 'BLOCKED',
             evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it, and descendant enumeration failed: ${enumerationError?.message || enumerationError}. Cannot prove the tree is clean.`,
             escalated: true,
           };
         }
+        const survivors = listWindowsChildPids(table, child.pid);
         if (survivors.length === 0) {
           // ParentProcessId BFS cannot reach multi-level orphans once every
           // intermediate PID is gone (grandchild's parent is dead and absent
-          // from the live table). A second CommandLine scan for the worktree
-          // path catches typical `node path/to/repo/...` grandchildren; any
-          // hit is fail-closed BLOCKED because we cannot safely attribute
-          // kill without spawn-tree identity (Codex #4781560042).
+          // from the live table). The CommandLine scan over the SAME snapshot
+          // catches typical `node path/to/repo/...` grandchildren; any hit is
+          // fail-closed BLOCKED because we cannot safely attribute kill
+          // without spawn-tree identity (Codex #4781560042). Being pure JS
+          // over the already-fetched rows, this scan cannot fail.
           if (cwd) {
-            let cwdHints;
-            try {
-              // minStarttime is wall-clock epoch ms on Windows (set at spawn).
-              // Exclude self+child and the ancestor chain so CI agents / npm
-              // parents that embed the repo path do not false-BLOCK.
-              cwdHints = await listWindowsPidsWithCommandLineHint(cwd, {
-                runExecFile,
-                powershell,
-                excludePids: new Set([child.pid, process.pid]),
-                minStartMs: Number.isFinite(minStarttime) ? minStarttime : 0,
-                selfPid: process.pid,
-              });
-            } catch (hintError) {
-              return {
-                status: 'BLOCKED',
-                evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants and CommandLine worktree probe failed: ${hintError?.message || hintError}. Cannot prove multi-level orphans exited.`,
-                escalated: true,
-              };
-            }
+            // minStarttime is wall-clock epoch ms on Windows (set at spawn).
+            // Exclude self+child and the ancestor chain so CI agents / npm
+            // parents that embed the repo path do not false-BLOCK; matches
+            // whose unbroken ancestor chain predates the spawn (sibling
+            // `node --test` workers) are excluded the same way.
+            const cwdHints = findWindowsPidsWithCommandLineHint(table, cwd, {
+              excludePids: new Set([child.pid, process.pid]),
+              minStartMs: Number.isFinite(minStarttime) ? minStarttime : 0,
+              selfPid: process.pid,
+            });
             if (cwdHints.length > 0) {
               return {
                 status: 'BLOCKED',

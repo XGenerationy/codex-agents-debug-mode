@@ -199,6 +199,46 @@ test('requires an exact review tuple even when the tree and command mapping are 
   );
 });
 
+test('install.sh removal requires an executable invocation prefix', () => {
+  // CodeRabbit discussion_r3652923138: bare `install.sh` matched prose such
+  // as `# see install.sh for setup`, FAILing unconditionally like the bare
+  // `npm run` false positive. Only executable invocations count as removals.
+  const clean = {
+    changedFiles: ['.github/workflows/validate.yml'],
+    addedLines: [],
+    removedLines: [],
+    deletedFiles: [],
+    baseSha: 'base123',
+    headSha: 'head123',
+    configDigest: 'cfg123',
+  };
+  assert.equal(
+    classifyGateIntegrity({
+      ...clean,
+      removedLines: ['-      # see install.sh for setup'],
+      attestation: liveAttestation({ headSha: 'head123' }),
+    }).status,
+    'PASS',
+    'prose mention of install.sh must not FAIL',
+  );
+  for (const line of [
+    '-      - run: ./install.sh',
+    '-      - run: bash install.sh',
+    '-      - run: sh install.sh',
+    '-      - run: source install.sh',
+  ]) {
+    assert.equal(
+      classifyGateIntegrity({
+        ...clean,
+        removedLines: [line],
+        attestation: liveAttestation({ headSha: 'head123' }),
+      }).status,
+      'FAIL',
+      `executable install.sh removal must FAIL: ${line}`,
+    );
+  }
+});
+
 test('detects multiline gate weakening and produces stable config digests', () => {
   const gate = classifyGateIntegrity({
     changedFiles: ['.eslintrc.json'],

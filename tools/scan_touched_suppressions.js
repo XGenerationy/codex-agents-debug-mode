@@ -9,8 +9,9 @@
  * otherwise only yields BLOCKED without attestation).
  *
  * Resolves the comparison base from (in order):
- *   CLOSEOUT_BASE_SHA, GITHUB_BASE_SHA, GITHUB_EVENT_BEFORE (push preimage),
- *   merge-base with GITHUB_BASE_REF / origin/main / main, else the empty tree.
+ *   CLOSEOUT_BASE_SHA, GITHUB_BASE_SHA, GITHUB_EVENT_BEFORE (push preimage,
+ *   only when the commit exists locally), merge-base with GITHUB_BASE_REF /
+ *   origin/main / main, else the empty tree.
  *
  * Touched-file Git queries fail closed: any enumeration error aborts the
  * gate with a non-zero exit instead of treating the failure as an empty set.
@@ -133,12 +134,13 @@ let cachedEmptyTreeSha = null;
 /**
  * Resolve this repository's empty-tree object ID (SHA-1 well-known constant
  * or the SHA-256 hash-object result for an empty tree).
+ * @param {string} [repoRoot] repository to query; defaults to the module root
  * @returns {string}
  */
-const resolveEmptyTreeSha = () => {
+const resolveEmptyTreeSha = (repoRoot = root) => {
   if (cachedEmptyTreeSha) return cachedEmptyTreeSha;
   try {
-    cachedEmptyTreeSha = gitScalar(['hash-object', '-t', 'tree', '--stdin'], { input: '' });
+    cachedEmptyTreeSha = gitScalar(['hash-object', '-t', 'tree', '--stdin'], { input: '', cwd: repoRoot });
     if (cachedEmptyTreeSha) return cachedEmptyTreeSha;
   } catch {
     // fall through to the well-known SHA-1 empty tree
@@ -180,9 +182,12 @@ let comparisonStyle = 'three-dot';
  * Resolve the comparison base SHA for the CI suppression/gate scan from
  * env (CLOSEOUT_BASE_SHA / GITHUB_BASE_SHA / GITHUB_EVENT_BEFORE), then
  * merge-base with the PR base ref or main/master, else the empty tree.
+ * @param {string} [repoRoot] repository the git queries run against; defaults
+ *   to the module root. Test seam: unit tests point base resolution at a
+ *   temporary repository; the CLI always uses the default.
  * @returns {string}
  */
-const resolveBaseSha = () => {
+const resolveBaseSha = (repoRoot = root) => {
   // Explicit operator override: default three-dot (PR-range semantics).
   if (isUsableSha(process.env.CLOSEOUT_BASE_SHA)) {
     comparisonStyle = 'three-dot';
@@ -197,8 +202,21 @@ const resolveBaseSha = () => {
   // not merge-base, so a force-push cannot drop suppressions from the old
   // side without them appearing in the touched inventory / gate diff.
   if (isUsableSha(process.env.GITHUB_EVENT_BEFORE)) {
-    comparisonStyle = 'two-dot';
-    return process.env.GITHUB_EVENT_BEFORE.trim();
+    // actions/checkout defaults to fetch-depth: 1, so a format-valid preimage
+    // can name a commit that was never fetched. Returning it would make the
+    // name-only diff die on an unknown revision before the gate evaluates, so
+    // verify the object exists locally first; any error means "not available"
+    // (CodeRabbit discussion_r3652923145).
+    const beforeSha = process.env.GITHUB_EVENT_BEFORE.trim();
+    try {
+      gitBuffer(['cat-file', '-e', `${beforeSha}^{commit}`], { cwd: repoRoot });
+      comparisonStyle = 'two-dot';
+      return beforeSha;
+    } catch {
+      // Unfetched/unavailable preimage: fall through to GITHUB_BASE_REF /
+      // origin/main / merge-base / empty-tree resolution instead of
+      // selecting a base the diff cannot resolve.
+    }
   }
 
   const baseRef = (process.env.GITHUB_BASE_REF || '').trim();
@@ -211,7 +229,7 @@ const resolveBaseSha = () => {
     ];
     for (const ref of candidates) {
       try {
-        const mb = gitScalar(['merge-base', 'HEAD', ref]);
+        const mb = gitScalar(['merge-base', 'HEAD', ref], { cwd: repoRoot });
         if (isUsableSha(mb)) {
           comparisonStyle = 'three-dot';
           return mb;
@@ -224,8 +242,8 @@ const resolveBaseSha = () => {
 
   for (const ref of ['origin/main', 'main', 'origin/master', 'master']) {
     try {
-      const head = gitScalar(['rev-parse', 'HEAD']);
-      const mb = gitScalar(['merge-base', 'HEAD', ref]);
+      const head = gitScalar(['rev-parse', 'HEAD'], { cwd: repoRoot });
+      const mb = gitScalar(['merge-base', 'HEAD', ref], { cwd: repoRoot });
       // On a push checkout, origin/main often equals HEAD; that yields an
       // empty range. Prefer a merge-base that is not HEAD.
       if (isUsableSha(mb) && mb !== head) {
@@ -240,7 +258,7 @@ const resolveBaseSha = () => {
   // Last resort for a first commit on a new repo: the empty tree object
   // (SHA-1 well-known ID or the repository's SHA-256 empty tree).
   try {
-    const empty = resolveEmptyTreeSha();
+    const empty = resolveEmptyTreeSha(repoRoot);
     if (isUsableSha(empty) || isEmptyTreeSha(empty)) {
       comparisonStyle = 'empty-tree';
       return empty;
@@ -249,7 +267,7 @@ const resolveBaseSha = () => {
     // fall through
   }
   try {
-    gitScalar(['cat-file', '-t', EMPTY_TREE]);
+    gitScalar(['cat-file', '-t', EMPTY_TREE], { cwd: repoRoot });
     comparisonStyle = 'empty-tree';
     return EMPTY_TREE;
   } catch {
@@ -465,7 +483,22 @@ const main = async () => {
   }
 };
 
-main().catch((error) => {
-  process.stderr.write(`suppression-scan error: ${error?.stack || error}\n`);
-  process.exitCode = 1;
-});
+/**
+ * Comparison style chosen by the most recent resolveBaseSha call. Test seam
+ * for asserting which base branch was selected; the CLI reads the module
+ * binding directly.
+ * @returns {'three-dot'|'two-dot'|'empty-tree'}
+ */
+const getComparisonStyle = () => comparisonStyle;
+
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`suppression-scan error: ${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  getComparisonStyle,
+  resolveBaseSha,
+};

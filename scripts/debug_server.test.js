@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { existsSync } = require('node:fs');
+const { existsSync, renameSync, rmSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
@@ -883,6 +883,204 @@ test('writes the launch token through the descriptor with owner-only permissions
     if (child) stopCli(child);
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('releases its own collector_claim when startup fails after the claim is held', { timeout: 20000 }, async () => {
+  // releaseOwnedClaim runs on server 'close' / process 'exit'. The externally
+  // reachable path to it is a startup failure AFTER the claim is acquired:
+  // here collector_port is pre-planted as a hard link to an outside file, so
+  // the post-claim private-file assert fails the startup and closes the
+  // server. The child's own regular claim must be read back through the
+  // guarded sync read and unlinked, so a restart does not burn an
+  // EEXIST+reclaim cycle (CodeRabbit #4781622077).
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-release-claim-'));
+  let child;
+  try {
+    const debugDir = path.join(projectRoot, '.debug');
+    const outsidePortFile = path.join(projectRoot, 'outside-port.txt');
+    await mkdir(debugDir, { recursive: true });
+    await writeFile(outsidePortFile, '1', 'utf8');
+    await link(outsidePortFile, path.join(debugDir, 'collector_port'));
+
+    const port = await findFreePort();
+    const launched = launchCli(projectRoot, port);
+    child = launched.child;
+    const result = await launched.outcome;
+
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /collector_port_not_private/);
+    // The claim was acquired before the port-file failure and the ownership
+    // check matched, so the release must have unlinked it.
+    assert.equal(existsSync(path.join(debugDir, 'collector_claim')), false);
+    // The token write precedes the port-file write, so it is on disk.
+    assert.match(await readFile(path.join(debugDir, 'collector_token'), 'utf8'), /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(await readFile(outsidePortFile, 'utf8'), '1');
+  } finally {
+    if (child) stopCli(child);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+// Watch for the collector child to create its own regular collector_claim,
+// then swap a pre-staged stand-in onto it, racing the release that runs when
+// the sabotaged startup closes the server. POSIX renameSync replaces the
+// claim atomically; Windows renameSync fails EPERM over an existing path, so
+// it falls back to rmSync+renameSync -- a sub-millisecond gap that is NOT
+// atomic, which is why callers must also require a measured swap->exit
+// margin (see runClaimSwapAttempt) before treating an attempt as decisive:
+// the release runs immediately before process exit, so a swap that completed
+// well before the exit event necessarily preceded the release. The child is
+// a separate process, so this setImmediate poll cannot starve it, and the
+// token write between claim creation and the port-file failure leaves a wide
+// window for the swap.
+const swapClaimAfterCreate = (claimFile, stagedFile) => {
+  const state = { landed: false, stopped: false, swapAt: 0 };
+  const poll = async () => {
+    while (!state.stopped && !state.landed) {
+      let info = null;
+      try {
+        info = await lstat(claimFile);
+      } catch {
+        // Not created yet (or already released); keep polling.
+      }
+      if (info && info.isFile() && !info.isSymbolicLink() && info.nlink === 1) {
+        try {
+          try {
+            renameSync(stagedFile, claimFile);
+          } catch (error) {
+            if (error?.code !== 'EPERM') throw error;
+            rmSync(claimFile);
+            renameSync(stagedFile, claimFile);
+          }
+          state.landed = true;
+          state.swapAt = Date.now();
+        } catch {
+          // Lost the race against the child's own release; stop and let the
+          // caller retry with a fresh launch.
+          state.stopped = true;
+        }
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  poll().catch(() => {});
+  return state;
+};
+
+// One sabotaged launch for the claim-swap tests: collector_port is a hard
+// link to an outside file so startup fails at the post-claim port-file
+// assert, which closes the server and runs releaseOwnedClaim. plantStaged
+// receives { stagedFile, childPid, projectRoot } and must place the stand-in
+// at stagedFile (swapClaimAfterCreate renames it onto the claim); it returns
+// the exact stand-in target content for later intactness assertions.
+const runClaimSwapAttempt = async (plantStaged) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-claim-swap-'));
+  const debugDir = path.join(projectRoot, '.debug');
+  const claimFile = path.join(debugDir, 'collector_claim');
+  const outsidePortFile = path.join(projectRoot, 'outside-port.txt');
+  await mkdir(debugDir, { recursive: true });
+  await writeFile(outsidePortFile, '1', 'utf8');
+  await link(outsidePortFile, path.join(debugDir, 'collector_port'));
+
+  const port = await findFreePort();
+  const launched = launchCli(projectRoot, port);
+  const { child } = launched;
+  try {
+    const stagedFile = path.join(debugDir, 'collector_claim.staged');
+    const standInContent = await plantStaged({ stagedFile, childPid: child.pid, projectRoot });
+    const swap = swapClaimAfterCreate(claimFile, stagedFile);
+    const result = await launched.outcome;
+    const exitAt = Date.now();
+    swap.stopped = true;
+    return { projectRoot, debugDir, claimFile, result, swapped: swap.landed, swapAt: swap.swapAt, exitAt, standInContent };
+  } finally {
+    stopCli(child);
+  }
+};
+
+// Shared driver for the swapped-claim release tests. plantStaged builds the
+// stand-in (symlink or hard link) and verifyStandIn asserts the guarded
+// release left it untouched at collector_claim. An attempt only counts when
+// the swap landed measurably BEFORE the child exited (the release runs right
+// before exit, so a >=3ms margin proves the release saw the stand-in, not
+// the child's own claim) AND the exit came from the port-file sabotage;
+// anything else is retried, never failed. The stand-in's pid line names the
+// CHILD, so a release that followed the swap and parsed it WOULD pass the
+// ownership check and unlink the path -- the stand-in's survival is what
+// proves the read was refused (CodeRabbit discussion_r3652923124).
+const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) => {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const { projectRoot, claimFile, result, swapped, swapAt, exitAt, standInContent } = await runClaimSwapAttempt(plantStaged);
+    try {
+      const decisive = swapped
+        && exitAt - swapAt >= 3
+        && result.exitCode === 1
+        && /collector_port_not_private/.test(result.stderr);
+      if (!decisive) continue;
+      await verifyStandIn(claimFile);
+      assert.equal(await readFile(path.join(projectRoot, 'swap-target.txt'), 'utf8'), standInContent);
+      return;
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+  t.skip('claim swap never landed ahead of the release; nothing asserted');
+};
+
+test('does not read or unlink a collector_claim swapped for a symlink before release', { timeout: 30000 }, async (t) => {
+  // A local attacker with .debug write access can replace collector_claim
+  // with a symlink between acquire and the shutdown release. The release must
+  // not follow it: no read of the target's bytes (which would pass the
+  // ownership check here) and no unlink driven by them (CodeRabbit
+  // discussion_r3652923124).
+  const probeRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-symlink-probe-'));
+  try {
+    const probeTarget = path.join(probeRoot, 'target');
+    await writeFile(probeTarget, 'x', 'utf8');
+    await symlink(probeTarget, path.join(probeRoot, 'link'), 'file');
+  } catch (error) {
+    // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+    t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+    return;
+  } finally {
+    await rm(probeRoot, { recursive: true, force: true });
+  }
+
+  await assertReleaseRefusesSwappedClaim(
+    t,
+    async ({ stagedFile, childPid, projectRoot }) => {
+      const content = `1\nnot-the-child\n${childPid}\n`;
+      await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
+      await symlink(path.join(projectRoot, 'swap-target.txt'), stagedFile, 'file');
+      return content;
+    },
+    async (claimFile) => {
+      const info = await lstat(claimFile);
+      assert.equal(info.isSymbolicLink(), true, 'claim symlink must survive the release unread and unlinked');
+    },
+  );
+});
+
+test('does not read or unlink a collector_claim swapped for a hard link before release', { timeout: 30000 }, async (t) => {
+  // Hard-link variant of the symlink swap: claimFile renamed onto an inode
+  // shared with an outside file (nlink > 1). The guarded release must refuse
+  // it exactly like readSmallRegularFile does for the reclaim path, leaving
+  // both names of the shared inode in place. Runs without the privileges
+  // file symlinks need on Windows.
+  await assertReleaseRefusesSwappedClaim(
+    t,
+    async ({ stagedFile, childPid, projectRoot }) => {
+      const content = `1\nnot-the-child\n${childPid}\n`;
+      await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
+      await link(path.join(projectRoot, 'swap-target.txt'), stagedFile);
+      return content;
+    },
+    async (claimFile) => {
+      const info = await lstat(claimFile);
+      assert.equal(info.isFile(), true, 'hard-linked claim must survive the release');
+      assert.equal(info.nlink, 2, 'hard-linked claim inode must keep both names');
+    },
+  );
 });
 
 test('reports already_running when the SAME project root is relaunched on an occupied port', { timeout: 20000 }, async () => {

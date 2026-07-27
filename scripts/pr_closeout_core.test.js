@@ -1181,3 +1181,128 @@ test('preserves the first BLOCKED reason when a check hits multiple BLOCKED cond
   assert.match(grafana.evidence, /postcondition proof/i);
   assert.match(grafana.evidence, /Grafana health probe/i);
 });
+
+
+test('scopes shell-helper config scanning to validation helper locations', () => {
+  // CodeRabbit discussion_r3652923133: an ordinary application/deploy shell
+  // script is not a validation helper, so neutralizing constructs in it must
+  // NOT be reclassified as config-silencing. Helper locations stay in scope.
+  assert.deepEqual(
+    scanSuppressionText('src/deploy.sh', 'deploy || true\n')
+      .filter(({ category }) => category === 'config-silencing'),
+    [],
+    'out-of-scope src/deploy.sh must not be treated as config-like',
+  );
+  assert.ok(
+    scanSuppressionText('ci/check.sh', 'npm test || true\n')
+      .some(({ category }) => category === 'config-silencing'),
+    'ci/check.sh must stay config-like',
+  );
+  assert.ok(
+    scanSuppressionText('tools/run.bash', 'npm test || true\n')
+      .some(({ category }) => category === 'config-silencing'),
+    'tools/*.bash helper must stay config-like',
+  );
+  assert.ok(
+    scanSuppressionText('install.sh', 'npm test || true\n')
+      .some(({ category }) => category === 'config-silencing'),
+    'install.sh must stay config-like',
+  );
+});
+
+test('blocks whitespace-padded hunter proof policies at plan time', () => {
+  // Qodo discussion_r3652936843: the executor exact-compares the RAW
+  // expectedPattern for the hunter semantic policy, so a padded policy that
+  // would deterministically fail at runtime must fail closed at plan time.
+  const padded = buildCheckPlan({
+    config: {
+      proofs: {
+        'hunter-build': {
+          type: 'command',
+          command: 'docker compose ps --format json hunter',
+          expectedPattern: 'semantic:docker-compose-running-healthy ',
+        },
+      },
+    },
+  });
+  const blockedHunter = padded.checks.find(({ id }) => id === 'hunter-build');
+  assert.equal(blockedHunter.status, 'BLOCKED');
+  assert.match(blockedHunter.evidence, /semantic:docker-compose-running-healthy/i);
+  // The exact (unpadded) semantic policy remains admissible.
+  const exact = buildCheckPlan({
+    config: {
+      proofs: {
+        'hunter-build': {
+          type: 'command',
+          command: 'docker compose ps --format json hunter',
+          expectedPattern: 'semantic:docker-compose-running-healthy',
+        },
+      },
+    },
+  });
+  const admittedHunter = exact.checks.find(({ id }) => id === 'hunter-build');
+  assert.notEqual(admittedHunter.status, 'BLOCKED', JSON.stringify(admittedHunter));
+});
+
+test('flags OR-list fallbacks whose right operand does not provably re-fail', () => {
+  // Codex discussion_r3652957333: bash exempts the left side of `||` from
+  // errexit and the OR-list exits with the RIGHT operand's status, so an
+  // arbitrary right operand (printf, a function call, ...) masks the failure
+  // exactly like `|| true` does. Only right operands that themselves
+  // guarantee a nonzero exit keep the failure visible and stay allowed.
+  assert.ok(findCommandFailureNeutralizer('validator || printf ok'));
+  assert.ok(findCommandFailureNeutralizer('validator || logger -t ci failed'));
+  assert.equal(findCommandFailureNeutralizer('validator || exit 1'), null);
+  assert.equal(findCommandFailureNeutralizer('validator || exit 2'), null);
+  assert.equal(findCommandFailureNeutralizer('validator || false'), null);
+  assert.equal(findCommandFailureNeutralizer('validator || return 1'), null);
+  // Plan-level: a configured command with a masking OR-list is BLOCKED.
+  const plan = buildCheckPlan({
+    config: { commands: { typecheck: 'validator || printf ok' } },
+  });
+  const typecheck = plan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(typecheck.status, 'BLOCKED');
+  assert.match(typecheck.evidence, /neutralizes failures/i);
+});
+
+test('flags a receiver split across deep blank/comment padding', () => {
+  // Codex discussion_r3652957336: the multiline receiver lookahead counts
+  // code-bearing lines only, so blank/comment padding cannot push `.only`
+  // out of the window. Build the focus token via concat so this test file
+  // itself stays clean under a full-file suppression scan.
+  const only = 'on' + 'ly';
+  const padding = Array.from(
+    { length: 20 },
+    (unused, index) => (index % 2 ? '// padding comment' : ''),
+  ).join('\n');
+  const text = ['test', padding, `  .${only}('x', function () {});`].join('\n');
+  const findings = scanSuppressionText('src/foo.test.js', text)
+    .filter(({ category }) => category === 'test-weakening');
+  assert.equal(
+    findings.length,
+    1,
+    `padded receiver split must be flagged: ${JSON.stringify(findings)}`,
+  );
+  assert.equal(findings[0].line, 1);
+});
+
+test('does not strip the label prefix from zero-count diagnostic prose', () => {
+  // Codex discussion_r3652957339: label-first zero-summary removal only
+  // applies to complete count buckets. `Error: 0 is not a valid threshold`
+  // and `Warning: 0-byte artifact was ignored` are diagnostics, not buckets;
+  // stripping their `Error:`/`Warning:` prefix would let them slip to PASS.
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'Error: 0 is not a valid threshold' }).status,
+    'FAIL',
+  );
+  assert.equal(
+    classifyOutput({ exitCode: 0, stdout: 'Warning: 0-byte artifact was ignored' }).status,
+    'FAIL',
+  );
+  // Genuine zero summaries are still stripped (end-of-line or summary
+  // delimiter after the zero).
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'errors: 0' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '0 warnings' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: '# fail 0' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'errors: 0, warnings: 0' }).status, 'PASS');
+});

@@ -318,6 +318,38 @@ test('exclusive output-dir lock reclaims a stale lock from a dead PID', async ()
   }
 });
 
+test('release() unregisters the abrupt-exit listener across repeated runs', async () => {
+  // Codex discussion_r3652957330 / CodeRabbit discussion_r3652923142: a
+  // long-lived process running closeout repeatedly must not accumulate exit
+  // listeners (the eleventh unreleased run would emit
+  // MaxListenersExceededWarning).
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-exit-listeners-'));
+  const warnings = [];
+  const onWarning = (warning) => warnings.push(warning);
+  process.on('warning', onWarning);
+  const baseline = process.listenerCount('exit');
+  try {
+    for (let i = 0; i < 12; i += 1) {
+      const lock = await acquireOutputDirLock(tmp);
+      assert.equal(process.listenerCount('exit'), baseline + 1);
+      await lock.release();
+      assert.equal(process.listenerCount('exit'), baseline);
+      await assert.rejects(fs.stat(nodePath.join(tmp, '.closeout.lock')));
+    }
+    assert.equal(process.listenerCount('exit'), baseline);
+    assert.deepEqual(
+      warnings.filter(({ name }) => name === 'MaxListenersExceededWarning'),
+      [],
+    );
+  } finally {
+    process.removeListener('warning', onWarning);
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('rejects a lexically external output whose physical target is inside the repository', async () => {
   const physical = new Map([
     ['C:/repo', 'C:/physical/repo'],
