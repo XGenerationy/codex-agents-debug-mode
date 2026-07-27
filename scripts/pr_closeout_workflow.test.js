@@ -373,6 +373,26 @@ test('exclusive output-dir lock revalidates a stale holder before reclaiming it'
   }
 });
 
+test('exclusive output-dir lock lets only one concurrent stale reclaimer take over', async () => {
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-concurrent-reclaim-'));
+  try {
+    await fs.writeFile(nodePath.join(tmp, '.closeout.lock'), '2147483646\nstale-nonce\n', 'utf8');
+    const attempts = await Promise.allSettled([
+      acquireOutputDirLock(tmp),
+      acquireOutputDirLock(tmp),
+    ]);
+    const acquired = attempts.filter(({ status }) => status === 'fulfilled').map(({ value }) => value);
+    assert.equal(acquired.length, 1);
+    assert.ok(acquired[0].nonce);
+    await acquired[0].release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('exclusive output-dir lock release refuses a symlinked successor', async () => {
   const fs = require('node:fs/promises');
   const os = require('node:os');

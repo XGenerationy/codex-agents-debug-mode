@@ -8,7 +8,7 @@ const {
   readSync,
 } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { lstat, mkdir, open: openFile, realpath, stat, unlink } = require('node:fs/promises');
+const { lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -428,12 +428,12 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         );
       }
       try {
-        // Re-read immediately before the single reclaim unlink. A stale
-        // snapshot must never authorize deletion of a record a concurrent
-        // contender created after our first read. After unlink, restart at
-        // O_EXCL acquisition; if another contender wins that atomic create,
-        // the next iteration observes its own holder record instead of
-        // applying this stale decision to the successor.
+        // Re-read immediately before atomically moving the stale entry out
+        // of the lock name. A stale snapshot must never authorize deletion of
+        // a record a concurrent contender created after our first read. The
+        // rename means concurrent reclaimers cannot both unlink/recreate the
+        // same pathname: the winner quarantines the old entry, while losers
+        // restart at O_EXCL acquisition and observe any successor normally.
         // A read guard failure has no trustworthy payload to compare, so it
         // retains the established corrupt-lock recovery path. Parsed and
         // incomplete records, however, must still match byte-for-byte before
@@ -441,11 +441,20 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         if (staleSnapshot !== null && String(await readLockFile(lockPath)) !== staleSnapshot) {
           continue;
         }
-        await unlink(lockPath);
-      } catch (unlinkError) {
-        if (unlinkError?.code !== 'ENOENT') {
-          throw new Error(`Failed to reclaim stale evidence lock in ${outputDir}: ${unlinkError.message}`);
+        const quarantinePath = `${lockPath}.reclaim-${process.pid}-${randomBytes(8).toString('hex')}`;
+        try {
+          await rename(lockPath, quarantinePath);
+        } catch (renameError) {
+          if (renameError?.code === 'ENOENT') continue;
+          throw new Error(`Failed to quarantine stale evidence lock in ${outputDir}: ${renameError.message}`);
         }
+        try {
+          await unlink(quarantinePath);
+        } catch (unlinkError) {
+          throw new Error(`Failed to remove quarantined evidence lock in ${outputDir}: ${unlinkError.message}`);
+        }
+      } catch (reclaimError) {
+        if (reclaimError?.code !== 'ENOENT') throw reclaimError;
       }
     }
   }
