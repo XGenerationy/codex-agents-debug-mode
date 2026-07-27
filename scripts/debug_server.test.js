@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { existsSync, renameSync, rmSync } = require('node:fs');
+const { constants, existsSync, renameSync, rmSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
@@ -13,6 +13,7 @@ const {
   RequestError,
   createDebugServer,
   isInsideRoot,
+  openNoFollowSync,
   probeServer,
   readJson,
 } = require('./debug_server');
@@ -294,6 +295,33 @@ test('probeServer still settles when the /health response closes without end or 
   } finally {
     await close(oversized);
     await close(dropped);
+  }
+});
+
+test('probeServer settles within a bounded wall-clock period against a trickling /health response', { timeout: 15000 }, async () => {
+  // The 500ms socket timeout is an inactivity timer: a peer emitting a byte
+  // every <500ms resets it forever, and a slow trickle never reaches the
+  // 4 KiB abort threshold or 'end'. An independent wall-clock deadline must
+  // still destroy the request and settle null so the EADDRINUSE startup path
+  // stays bounded (Codex review: trickling listener pinned the probe).
+  const trickler = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    const interval = setInterval(() => {
+      if (!response.destroyed) response.write('x');
+    }, 100);
+    response.on('close', () => clearInterval(interval));
+    response.on('error', () => clearInterval(interval));
+  });
+  const tricklerUrl = await listen(trickler);
+
+  try {
+    const startedAt = Date.now();
+    const result = await probeServer(Number(new URL(tricklerUrl).port));
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(result, null);
+    assert.ok(elapsedMs < 10_000, `probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
+  } finally {
+    await close(trickler);
   }
 });
 
@@ -921,6 +949,22 @@ test('releases its own collector_claim when startup fails after the claim is hel
   }
 });
 
+test('openNoFollowSync rejects non-integer flags before opening anything', () => {
+  // Parity with the async openNoFollow guard in pr_closeout_fs.js: a
+  // non-integer flags value must fail closed with a TypeError instead of
+  // silently coercing through the attempt ladder's `|` (CodeRabbit review).
+  const target = path.join(tmpdir(), 'debug-skill-nofollow-sync-flags');
+  for (const flags of [undefined, null, 'r', 0.5, NaN]) {
+    assert.throws(
+      () => openNoFollowSync(target, flags),
+      { name: 'TypeError', message: 'openNoFollowSync requires numeric fs.constants flags.' },
+    );
+  }
+  // An integer flags value passes the guard and reaches the attempt ladder,
+  // failing only on the missing target.
+  assert.throws(() => openNoFollowSync(target, constants.O_RDONLY), { code: 'ENOENT' });
+});
+
 // Watch for the collector child to create its own regular collector_claim,
 // then swap a pre-staged stand-in onto it, racing the release that runs when
 // the sabotaged startup closes the server. POSIX renameSync replaces the
@@ -985,15 +1029,29 @@ const runClaimSwapAttempt = async (plantStaged) => {
   const port = await findFreePort();
   const launched = launchCli(projectRoot, port);
   const { child } = launched;
+  let swap = null;
   try {
     const stagedFile = path.join(debugDir, 'collector_claim.staged');
     const standInContent = await plantStaged({ stagedFile, childPid: child.pid, projectRoot });
-    const swap = swapClaimAfterCreate(claimFile, stagedFile);
+    swap = swapClaimAfterCreate(claimFile, stagedFile);
     const result = await launched.outcome;
     const exitAt = Date.now();
-    swap.stopped = true;
     return { projectRoot, debugDir, claimFile, result, swapped: swap.landed, swapAt: swap.swapAt, exitAt, standInContent };
+  } catch (error) {
+    // On any throw (plantStaged failed, outcome rejected) the caller never
+    // receives projectRoot, so its finally-based rm cannot run -- remove the
+    // temp root here or every failed attempt leaks one (CodeRabbit review).
+    // Kill the child FIRST: a still-booting child can otherwise recreate the
+    // root between this rm and the finally's stopCli. stopCli is idempotent,
+    // so the finally call below stays as the backstop.
+    stopCli(child);
+    await rm(projectRoot, { recursive: true, force: true });
+    throw error;
   } finally {
+    // Stop the swap poller on every path; left running it would keep lstat-ing
+    // a deleted claim path on every setImmediate tick for the rest of the
+    // process (CodeRabbit review).
+    if (swap) swap.stopped = true;
     stopCli(child);
   }
 };
@@ -1079,6 +1137,62 @@ test('does not read or unlink a collector_claim swapped for a hard link before r
       const info = await lstat(claimFile);
       assert.equal(info.isFile(), true, 'hard-linked claim must survive the release');
       assert.equal(info.nlink, 2, 'hard-linked claim inode must keep both names');
+    },
+  );
+});
+
+test('runClaimSwapAttempt removes the temp root and stops the poller when plantStaged throws', async () => {
+  // Before the finally-based cleanup, a throwing plantStaged leaked the
+  // debug-skill-claim-swap-* directory and left the swap poller lstat-ing a
+  // deleted path on every setImmediate tick (CodeRabbit review).
+  let failedRoot = null;
+  await assert.rejects(
+    runClaimSwapAttempt(async ({ projectRoot }) => {
+      failedRoot = projectRoot;
+      throw new Error('plant failed on purpose');
+    }),
+    /plant failed on purpose/,
+  );
+  assert.equal(existsSync(failedRoot), false, 'error path must remove the temp project root');
+});
+
+test('reads and unlinks a collector_claim swapped for a still-valid regular file before release', { timeout: 30000 }, async (t) => {
+  // The descriptor re-stat must not break the legitimate release path: a
+  // swapped-in claim that still passes every post-open check (regular file,
+  // single link, in-bounds size) is read through the descriptor and, because
+  // its pid line names the child, drives the ownership unlink. The final
+  // assertion inverts the refusal tests via the same measured-swap driver.
+  await assertReleaseRefusesSwappedClaim(
+    t,
+    async ({ stagedFile, childPid, projectRoot }) => {
+      const content = `1\nnot-the-child\n${childPid}\n`;
+      await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
+      await writeFile(stagedFile, content, 'utf8');
+      return content;
+    },
+    async (claimFile) => {
+      assert.equal(existsSync(claimFile), false, 'valid swapped-in claim must be parsed and unlinked');
+    },
+  );
+});
+
+test('does not parse a collector_claim grown beyond the claim size cap before release', { timeout: 30000 }, async (t) => {
+  // A swapped-in claim larger than MAX_CLAIM_FILE_BYTES must be refused even
+  // though its leading lines parse as a valid claim naming the child pid:
+  // the release re-stats the opened descriptor and enforces the size bound on
+  // the descriptor's own metadata, so the oversized file survives unparsed
+  // and unlinked (CodeRabbit discussion_r3652923124 follow-up).
+  await assertReleaseRefusesSwappedClaim(
+    t,
+    async ({ stagedFile, childPid, projectRoot }) => {
+      const content = `1\nnot-the-child\n${childPid}\n${'x'.repeat(512)}\n`;
+      await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
+      await writeFile(stagedFile, content, 'utf8');
+      return content;
+    },
+    async (claimFile) => {
+      const info = await lstat(claimFile);
+      assert.equal(info.isFile() && !info.isSymbolicLink(), true, 'oversized claim must survive the release unread and unlinked');
     },
   );
 });

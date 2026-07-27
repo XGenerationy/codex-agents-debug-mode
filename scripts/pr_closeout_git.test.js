@@ -221,11 +221,28 @@ test('install.sh removal requires an executable invocation prefix', () => {
     'PASS',
     'prose mention of install.sh must not FAIL',
   );
+  // CodeRabbit #UC4NI / #UC4NN: a commented-out invocation is prose, not an
+  // executable removal — even when it is path-qualified.
+  assert.equal(
+    classifyGateIntegrity({
+      ...clean,
+      removedLines: ['-      # run scripts/install.sh manually'],
+      attestation: liveAttestation({ headSha: 'head123' }),
+    }).status,
+    'PASS',
+    'commented-out install.sh invocation must not FAIL',
+  );
   for (const line of [
     '-      - run: ./install.sh',
     '-      - run: bash install.sh',
     '-      - run: sh install.sh',
     '-      - run: source install.sh',
+    // CodeRabbit #UC4NI / #UC4NN: path-qualified, rooted, dot-sourced, and
+    // exec'd invocations are executable removals too.
+    '-      - run: scripts/install.sh',
+    '-      - run: /opt/ci/install.sh',
+    '-      - run: . install.sh',
+    '-      - run: exec install.sh',
   ]) {
     assert.equal(
       classifyGateIntegrity({

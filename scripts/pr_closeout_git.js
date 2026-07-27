@@ -122,10 +122,13 @@ const VALIDATION_REMOVAL_PATTERNS = [
   // Match executable invocations only — not prose, compose `healthcheck:`
   // keys, or dependency names containing these words (CodeRabbit #4781622077).
   // `install.sh` requires an explicit invocation prefix (`./`, `bash`, `sh`,
-  // `source`) so prose like `# see install.sh for setup` does not FAIL
+  // `source`, `exec`, a dot-source `. `, or a path prefix such as `scripts/`
+  // or `/opt/ci/`) so prose like `# see install.sh for setup` does not FAIL
   // (CodeRabbit discussion_r3652923138). The `\b` sits inside the alternation:
-  // a boundary before the non-word `./` prefix would never match.
-  /^\-.*(?:\b(?:bash|sh|source)\s+|\.\/)install\.sh\b/i,
+  // a boundary before the non-word `./` prefix would never match. `[^#]*`
+  // keeps even a path-qualified invocation inside a `#` comment (e.g.
+  // `# run scripts/install.sh manually`) unmatched (CodeRabbit #UC4NI).
+  /^\-[^#]*(?:\b(?:bash|sh|source|exec)\s+|\.\s+|\.\/|(?:\/)?(?:[\w.-]+\/)+)install\.sh\b/i,
   /^\-.*\btest\s+-[efdxL]\b/i,
   /^\-\s*(?:-\s*)?(?:name|run):\s*.*\b(?:smoke[-_ ]?test|health[-_ ]?check|doctor)\b/i,
   /^\-.*\b(?:npm|pnpm|yarn|make)\s+(?:run\s+)?(?:smoke|healthcheck|doctor)\b/i,

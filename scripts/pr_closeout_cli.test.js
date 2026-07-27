@@ -81,3 +81,61 @@ test('rejects unknown arguments as a usage error', () => {
   assert.equal(result.status, 3);
   assert.match(result.stderr, /Unknown argument/);
 });
+
+test('readCloseoutConfig parses a bounded regular config file', async () => {
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-config-'));
+  try {
+    const configPath = path.join(repo, 'closeout.json');
+    await writeFile(configPath, JSON.stringify({ baseRef: 'HEAD' }));
+    assert.deepEqual(await readCloseoutConfig(configPath), { baseRef: 'HEAD' });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('rejects a --config that exceeds the regular-file size cap', async () => {
+  // Codex #UDDQK: the descriptor-verified cap rejects before JSON.parse, and
+  // the CLI surfaces it as a config error (exit 3 + BLOCKED record).
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-config-cap-'));
+  try {
+    const configPath = path.join(repo, 'closeout.json');
+    await writeFile(configPath, `{"padding":"${'x'.repeat(1_100_000)}"}`);
+    await assert.rejects(readCloseoutConfig(configPath), /regular file/);
+    const result = spawnSync(process.execPath, [script, '--repo', repo, '--config', configPath, '--plan'], { encoding: 'utf8' });
+    assert.equal(result.status, 3);
+    assert.match(result.stderr, /regular file/);
+    const record = JSON.parse(result.stdout);
+    assert.equal(record.status, 'BLOCKED');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('rejects a non-regular --config target through the descriptor guard', async () => {
+  // Codex #UDDQK: a FIFO/device behind the config path must be rejected from
+  // the opened descriptor, never read. Windows cannot create FIFOs without
+  // admin, so the opener is injected — the same seam openNoFollow provides.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => false, size: 12 }),
+    read: async () => { throw new Error('read must not be reached for a non-regular config'); },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-fifo.json', { openFile: async () => fakeHandle }),
+    /regular file/,
+  );
+});
+
+test('rejects a symlinked --config without following it', async () => {
+  // Codex #UDDQK: no real symlink (Windows needs admin); the injected opener
+  // rejects with ELOOP exactly as openNoFollow does where O_NOFOLLOW exists.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const eloop = Object.assign(new Error('ELOOP: too many symbolic links encountered'), { code: 'ELOOP' });
+  await assert.rejects(
+    readCloseoutConfig('closeout-link.json', { openFile: async () => { throw eloop; } }),
+    /must not be a symlink/,
+  );
+});

@@ -5,6 +5,7 @@ const { mkdir, open: openFile, readFile, realpath, unlink } = require('node:fs/p
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
+const { openNoFollow } = require('./pr_closeout_fs');
 const {
   classifyGateIntegrity,
   digestValidationConfig,
@@ -184,15 +185,58 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * Acquire an exclusive run lock under an explicit --output-dir so two closeout
  * processes cannot share report.json / command logs (Codex #4781560042).
  * Default (process-unique) dirs do not need this; stale locks from dead PIDs
- * are reclaimed.
+ * are reclaimed. The stale-holder recovery read goes through `readLockFile`
+ * (see readOutputDirLockFile) so a special lock file — FIFO, symlink, device —
+ * can neither block the read nor redirect it outside the evidence directory
+ * (Codex #UDDQC). `readLockFile` is injectable for tests, matching the
+ * mkdirPath/realpathPath seam of prepareOutputDirectory.
  * @param {string} outputDir
+ * @param {{readLockFile?: (lockPath: string) => Promise<string>}} [deps]
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
 /**
  * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, release: () => Promise<void> }} OutputDirLock
  */
 
-const acquireOutputDirLock = async (outputDir) => {
+// Upper bound for a .closeout.lock payload (`pid\nnonce\niso\n` — well under
+// 1 KiB). Anything larger is foreign/corrupt, not a live holder record.
+const OUTPUT_DIR_LOCK_MAX_BYTES = 4096;
+
+/**
+ * Read an existing .closeout.lock for stale-holder recovery without ever
+ * blocking or following a link: open through openNoFollow (the shared
+ * no-follow/nonblocking attempt ladder from pr_closeout_fs.js) and re-verify
+ * via the descriptor that the lock is still a regular file within
+ * OUTPUT_DIR_LOCK_MAX_BYTES before reading — the same guarded bounded-read
+ * pattern hashFile and the debug collector's readSmallRegularFile use. A FIFO
+ * would otherwise park readFile waiting for a writer and a symlink could
+ * redirect the read to an unbounded file (Codex #UDDQC). Any guard failure
+ * throws so the caller's catch treats the lock exactly like a corrupt/foreign
+ * one (dead-holder reclaim), preserving today's recovery semantics.
+ * @param {string} lockPath
+ * @returns {Promise<string>} raw lock payload.
+ */
+const readOutputDirLockFile = async (lockPath) => {
+  const handle = await openNoFollow(lockPath, fsConstants.O_RDONLY);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+      throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
+    }
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < info.size) {
+      const { bytesRead } = await handle.read(buffer, offset, info.size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+  } finally {
+    await handle.close().catch(() => {});
+  }
+};
+
+const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile } = {}) => {
   const lockPath = path.join(outputDir, '.closeout.lock');
   const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const payload = `${process.pid}\n${nonce}\n${new Date().toISOString()}\n`;
@@ -251,7 +295,9 @@ const acquireOutputDirLock = async (outputDir) => {
       let holderPid = null;
       let holderNonce = null;
       try {
-        const text = await readFile(lockPath, 'utf8');
+        // Guarded bounded read (Codex #UDDQC): a FIFO/symlinked/oversized
+        // lock throws here and is treated exactly like a corrupt lock below.
+        const text = await readLockFile(lockPath);
         const lines = String(text).split(/\r?\n/);
         holderPid = Number(String(lines[0] || '').trim());
         holderNonce = String(lines[1] || '').trim() || null;

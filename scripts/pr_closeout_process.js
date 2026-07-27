@@ -228,6 +228,14 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
  * `rootCwd` or — for an orphan that already chdir'd away — hold an open
  * file descriptor that resolves under `rootCwd`, a common precursor to a
  * late absolute-path write.
+ *
+ * When `rootPid` (the spawn's root pid) is given, a candidate whose UNBROKEN
+ * PPID chain reaches the runner (`selfPid`) without passing through `rootPid`
+ * is excluded: it belongs to the runner's own tree — e.g. a concurrent
+ * validation check sharing the repo cwd in its own session — and is not a
+ * detached orphan of this spawn. A genuine orphan's chain is broken by
+ * construction (it dead-ends at the exited spawn root or below it), so it
+ * stays flagged; unknown/unreadable chains stay flagged too (fail-closed).
  * @returns {number[]|null} Matching PIDs, or null when /proc is unavailable
  *   (non-Linux).
  */
@@ -235,6 +243,7 @@ const listLivePidsWithCwdUnder = (rootCwd, {
   selfPid = process.pid,
   minStarttime = 0,
   selfSession = null,
+  rootPid = 0,
 } = {}) => {
   if (!rootCwd) return [];
   let entries;
@@ -304,6 +313,37 @@ const listLivePidsWithCwdUnder = (rootCwd, {
     }
     return false;
   };
+  // Walk a candidate's PPID chain (bounded, cycle-safe). Only an UNBROKEN
+  // chain that reaches the runner without passing through this spawn's root
+  // proves the candidate is a sibling spawned by the runner's own tree
+  // (e.g. a concurrent qualification check sharing the repo cwd), never a
+  // detached orphan of this spawn — exclude it. Every uncertain outcome
+  // (broken or unreadable link, chain through the spawn root, cycle, hop
+  // bound, chain leaving the runner's tree) keeps the candidate flagged.
+  const chainsToRunner = (pid) => {
+    if (!Number.isInteger(rootPid) || rootPid <= 0) return false;
+    const chainVisited = new Set();
+    let current = pid;
+    for (let hop = 0; hop < 64 && current > 1; hop += 1) {
+      if (chainVisited.has(current)) return false;
+      chainVisited.add(current);
+      let stat;
+      try {
+        stat = readFileSync(`/proc/${current}/stat`, 'utf8');
+      } catch {
+        return false; // broken chain (e.g. dead-ended at the exited spawn root).
+      }
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm < 0) return false;
+      // /proc/pid/stat: after (comm) → state(0) ppid(1).
+      const ppid = Number(stat.slice(afterComm + 1).trimStart().split(/\s+/)[1]);
+      if (!Number.isInteger(ppid) || ppid <= 0) return false;
+      if (ppid === rootPid) return false; // chain through the spawn root — keep flagged.
+      if (ppid === selfPid) return true; // unbroken chain to the runner — sibling.
+      current = ppid;
+    }
+    return false;
+  };
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
@@ -334,9 +374,11 @@ const listLivePidsWithCwdUnder = (rootCwd, {
         // cwd unreadable (EACCES on another user's process, or the orphan
         // chdir'd somewhere odd); fall through to fd probing below.
       }
-      if (cwdLink && underRoot(path.resolve(cwdLink))) {
-        live.push(pid);
-      } else if (hasOpenFdUnder(pid)) {
+      const underTree = (cwdLink && underRoot(path.resolve(cwdLink))) || hasOpenFdUnder(pid);
+      // A sibling check still running under the runner (unbroken PPID chain
+      // to the runner that never passes through this spawn's root) must not
+      // be attributed to this spawn as a mark-free detached descendant.
+      if (underTree && !chainsToRunner(pid)) {
         live.push(pid);
       }
     } catch {
@@ -353,7 +395,11 @@ const listLivePidsWithCwdUnder = (rootCwd, {
  * (`min(terminationGraceMs, 500)`) to exit, then escalates to SIGKILL and
  * waits up to the full `terminationGraceMs`. Returns BLOCKED only if PIDs
  * are still alive after both signals; returns PASS (with `escalated: true`)
- * as soon as the list is empty, even when SIGKILL was required.
+ * as soon as the list is empty, even when SIGKILL was required. The
+ * mark-free cwd/fd probe excludes live processes whose unbroken PPID chain
+ * reaches the runner without passing through `rootPid` — those are sibling
+ * checks spawned by the runner itself (default parallelism 4), not detached
+ * descendants of this spawn.
  * @returns {{status: 'PASS'|'BLOCKED', evidence: string, escalated: boolean}}
  */
 const sweepDetachedOrphans = async ({
@@ -363,6 +409,7 @@ const sweepDetachedOrphans = async ({
   kill = process.kill.bind(process),
   terminationGraceMs = 2000,
   selfPid = process.pid,
+  rootPid = 0,
   platform = process.platform,
 } = {}) => {
   // Only *reap* PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
@@ -400,7 +447,7 @@ const sweepDetachedOrphans = async ({
   // (Codex #4781366510).
   const afterMarkedEmpty = (evidence, escalated) => {
     if (cwd) {
-      const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime });
+      const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime, rootPid });
       if (unmarked === null) {
         if (platform === 'linux') {
           return {
@@ -503,35 +550,52 @@ const parseWindowsProcessTable = (stdout) => {
 };
 
 /**
- * Snapshot the full Windows process table (ProcessId, ParentProcessId,
- * CommandLine, CreationDate) with ONE property-limited CIM query. A single
- * snapshot feeds both termination proofs (ParentProcessId BFS and the
- * worktree CommandLine scan); previously each proof serialized the whole
- * table separately — the first one unfiltered, every Win32_Process property —
- * plus one filtered CIM round-trip per ancestor-walk hop, which on loaded
- * windows-latest CI runners took 8-19s apiece and raced the 15s/20s probe
- * timeouts, flaking clean-exit commands into BLOCKED. (ccd7833 regression
- * lesson, preserved: newline script, no `;`-joined statements, one
- * property-limited CIM query.) The query takes no external input — the
+ * Snapshot the Windows process table (ProcessId, ParentProcessId,
+ * CreationDate, and optionally CommandLine) with ONE property-limited CIM
+ * query. With the default `withCommandLine: false` the query omits the
+ * CommandLine column: reading a process command line requires a per-process
+ * PEB read, which is the dominant cost of this probe — on loaded
+ * windows-latest CI runners a CommandLine-bearing full-table query
+ * consistently exceeded the 20s probe budget (twice, BLOCKING every
+ * createCommandExecutor test with "descendant enumeration failed"), while
+ * the ParentProcessId/CreationDate-only table comes from cheap kernel
+ * metadata. The caller therefore runs the cheap table first and pays for
+ * CommandLine rows only when the cheap rows contain young/unknown-age
+ * processes that actually need worktree attribution (typically none). The
+ * earlier single-snapshot design (both proofs reusing one CommandLine table)
+ * remains the fallback shape when attribution is required. (ccd7833
+ * regression lesson, preserved: newline script, no `;`-joined statements,
+ * property-limited queries.) The query takes no external input — the
  * worktree needle and time floor are applied in JS afterwards — so the
  * probe's own CommandLine can never match the needle, and no ambient env
  * (CI secrets) is forwarded to powershell (CodeRabbit #4781622077).
- * @param {{runExecFile: Function, powershell: string}} options
+ * @param {{runExecFile: Function, powershell: string, withCommandLine?: boolean}} options
  * @returns {Promise<Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>>}
  */
-const snapshotWindowsProcessTable = async ({ runExecFile, powershell }) => {
-  const script = [
+const snapshotWindowsProcessTable = async ({ runExecFile, powershell, withCommandLine = false }) => {
+  const scriptLines = [
     '$ErrorActionPreference = "Stop"',
-    'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CommandLine,CreationDate | ForEach-Object {',
+    withCommandLine
+      ? 'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CommandLine,CreationDate | ForEach-Object {'
+      : 'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object {',
     '  $createdMs = 0L',
     '  if ($_.CreationDate) {',
     '    try { $createdMs = [DateTimeOffset]::new([DateTime]$_.CreationDate).ToUnixTimeMilliseconds() } catch { }',
     '  }',
-    '  $cl = [string]$_.CommandLine',
-    '  if ($cl) { $cl = $cl -replace "[`r`n]+", " " }',
-    '  "{0} {1} {2} {3}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs, $cl',
-    '}',
-  ].join('\n');
+  ];
+  if (withCommandLine) {
+    scriptLines.push(
+      '  $cl = [string]$_.CommandLine',
+      '  if ($cl) { $cl = $cl -replace "[`r`n]+", " " }',
+      '  "{0} {1} {2} {3}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs, $cl',
+    );
+  } else {
+    scriptLines.push(
+      '  "{0} {1} {2}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs',
+    );
+  }
+  scriptLines.push('}');
+  const script = scriptLines.join('\n');
   const minimalEnv = {
     SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
     SYSTEMROOT: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
@@ -590,16 +654,16 @@ const listWindowsChildPids = (table, parentPid) => {
 };
 
 /**
- * Live PIDs in a parsed snapshot whose CommandLine contains `cwd`
- * (case-insensitive). Catches multi-level orphans the ParentProcessId BFS
- * cannot reconstruct once intermediate parents have exited
- * (Codex #4781560042). Pure JS over the already-fetched snapshot: the
- * ancestor-chain exclusion walks the same ParentProcessId data instead of
- * paying one filtered CIM query per hop. Excludes the caller ancestor chain
- * and processes provably started before `minStartMs` so editors, CI agents,
- * and package-manager parents that merely mention the worktree path do not
- * false-BLOCK a clean tree (CodeRabbit #4781622077 semantics, preserved);
- * rows of unknown age are kept (fail-closed).
+ * Shared orphan-candidate classification over a parsed process-table
+ * snapshot. Catches the multi-level orphans the ParentProcessId BFS cannot
+ * reconstruct once intermediate parents have exited (Codex #4781560042).
+ * Pure JS over the already-fetched rows: the ancestor-chain exclusion walks
+ * the same ParentProcessId data instead of paying one filtered CIM query
+ * per hop. Excludes the caller ancestor chain and processes provably
+ * started before `minStartMs` so editors, CI agents, and package-manager
+ * parents that merely mention the worktree path do not false-BLOCK a clean
+ * tree (CodeRabbit #4781622077 semantics, preserved); rows of unknown age
+ * are kept (fail-closed).
  *
  * Pre-existing-root exclusion (second Windows CI flake root cause — local
  * full-suite flake evidence + original CI failure analysis): under a full
@@ -616,18 +680,20 @@ const listWindowsChildPids = (table, parentPid) => {
  * agent) and cannot be our orphan. Everything unproven stays flagged:
  * chain broken at an absent PID, an ancestor of unknown age (createdMs 0),
  * a cycle, the hop bound, or no time floor at all.
+ *
+ * The classifier is shared by the orphan-attribution gate in
+ * terminateProcessTree: the same exclusions decide whether a cheap
+ * CommandLine-free snapshot contains any rows that still need the
+ * CommandLine-bearing attribution probe at all.
  * @param {Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>} table
- * @param {string} cwd
  * @param {{excludePids?: Set<number>, minStartMs?: number, selfPid?: number}} options
- * @returns {number[]}
+ * @returns {{isOrphanCandidate: (row: object) => boolean}}
  */
-const findWindowsPidsWithCommandLineHint = (table, cwd, {
+const createWindowsOrphanClassifier = (table, {
   excludePids = new Set(),
   minStartMs = 0,
   selfPid = process.pid,
 } = {}) => {
-  const needle = String(cwd || '').trim().toLowerCase();
-  if (!needle) return [];
   const parentByPid = new Map();
   const rowByPid = new Map();
   for (const row of table) {
@@ -643,11 +709,11 @@ const findWindowsPidsWithCommandLineHint = (table, cwd, {
     const parent = parentByPid.get(walk);
     walk = Number.isInteger(parent) && parent > 0 ? parent : 0;
   }
-  // Walk a match's OWN ancestor chain (cycle-safe, bounded) looking for a
+  // Walk a row's OWN ancestor chain (cycle-safe, bounded) looking for a
   // process provably older than the spawn. Only a confidently-known
   // createdMs < minStartMs proves the chain predates the spawn; an absent
   // link, an unknown-age link, a cycle, or the hop bound all stop the walk
-  // without proof (fail-closed — the caller keeps the match flagged).
+  // without proof (fail-closed — the caller keeps the row flagged).
   const reachesPreExistingRoot = (startPid) => {
     if (minStartMs <= 0) return false;
     const chainVisited = new Set();
@@ -663,17 +729,41 @@ const findWindowsPidsWithCommandLineHint = (table, cwd, {
     }
     return false;
   };
+  // A row still needs worktree attribution when it is not excluded, is not
+  // provably pre-existing (young or unknown age — fail-closed), and its
+  // chain cannot reach a pre-existing root (not a sibling of the runner).
+  const isOrphanCandidate = (row) => {
+    if (excluded.has(row.pid)) return false;
+    // Only confidently-older rows are skipped; unknown age stays (fail-closed).
+    if (minStartMs > 0 && row.createdMs > 0 && row.createdMs < minStartMs) return false;
+    if (reachesPreExistingRoot(row.pid)) return false;
+    return true;
+  };
+  return { isOrphanCandidate };
+};
+
+/**
+ * Live PIDs in a parsed snapshot whose CommandLine contains `cwd`
+ * (case-insensitive, separators canonicalized to `/` on both sides).
+ * Pure JS over the already-fetched snapshot: candidate selection reuses
+ * createWindowsOrphanClassifier (see its rationale for the exclusion
+ * invariants).
+ * @param {Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>} table
+ * @param {string} cwd
+ * @param {{excludePids?: Set<number>, minStartMs?: number, selfPid?: number}} options
+ * @returns {number[]}
+ */
+const findWindowsPidsWithCommandLineHint = (table, cwd, options = {}) => {
+  // Canonicalize separators on both sides: a descendant that spells the
+  // worktree with `/` instead of `\` must not escape the scan.
+  const needle = String(cwd || '').trim().toLowerCase().replaceAll('\\', '/');
+  if (!needle) return [];
+  const { isOrphanCandidate } = createWindowsOrphanClassifier(table, options);
   const found = [];
   for (const row of table) {
-    if (excluded.has(row.pid)) continue;
     if (!row.commandLine) continue;
-    if (!row.commandLine.toLowerCase().includes(needle)) continue;
-    // Only confidently-older rows are skipped; unknown age stays (fail-closed).
-    if (minStartMs > 0 && row.createdMs > 0 && row.createdMs < minStartMs) continue;
-    // A match whose unbroken chain reaches a pre-existing root (e.g. a
-    // sibling `node --test` worker under the suite runner) cannot be an
-    // orphan of the validated child — exclude it (see invariant above).
-    if (reachesPreExistingRoot(row.pid)) continue;
+    if (!row.commandLine.toLowerCase().replaceAll('\\', '/').includes(needle)) continue;
+    if (!isOrphanCandidate(row)) continue;
     found.push(row.pid);
   }
   return [...new Set(found)];
@@ -814,21 +904,35 @@ const terminateProcessTree = async ({
         // ParentProcessId regardless of whether the parent is still alive)
         // and terminate them directly; only PASS once none remain.
         const powershell = path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-        // One process-table snapshot feeds BOTH termination proofs below
-        // (ParentProcessId BFS + worktree CommandLine scan). The snapshot is
-        // read-only and idempotent, so a single bounded retry of the PROBE
-        // ONLY — never of taskkill or of the validated command — absorbs
-        // transient CIM slowness on shared CI runners; two failed attempts
-        // still fail closed to BLOCKED, so the gate is not weakened.
+        // The cheap CommandLine-free snapshot feeds the ParentProcessId BFS
+        // and the orphan-candidate classification below; the expensive
+        // CommandLine-bearing table is queried ONLY when the cheap rows
+        // still contain young/unknown-age processes that need worktree
+        // attribution — on a clean tree that is typically zero rows, so the
+        // per-process PEB reads that blew the 20s probe budget on loaded
+        // windows-latest CI runners never happen. Each snapshot is read-only
+        // and idempotent, so a single bounded retry of the PROBE ONLY —
+        // never of taskkill or of the validated command — absorbs transient
+        // CIM slowness on shared CI runners; two failed attempts still fail
+        // closed to BLOCKED, so the gate is not weakened.
+        const snapshotWithRetry = async (withCommandLine) => {
+          let lastError = null;
+          for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+              return await snapshotWindowsProcessTable({ runExecFile, powershell, withCommandLine });
+            } catch (error) {
+              lastError = error;
+              if (attempt < 2) await delay(250);
+            }
+          }
+          throw lastError;
+        };
         let table;
         let enumerationError = null;
-        for (let attempt = 1; attempt <= 2 && !table; attempt += 1) {
-          try {
-            table = await snapshotWindowsProcessTable({ runExecFile, powershell });
-          } catch (error) {
-            enumerationError = error;
-            if (attempt < 2) await delay(250);
-          }
+        try {
+          table = await snapshotWithRetry(false);
+        } catch (error) {
+          enumerationError = error;
         }
         if (!table) {
           return {
@@ -841,33 +945,57 @@ const terminateProcessTree = async ({
         if (survivors.length === 0) {
           // ParentProcessId BFS cannot reach multi-level orphans once every
           // intermediate PID is gone (grandchild's parent is dead and absent
-          // from the live table). The CommandLine scan over the SAME snapshot
-          // catches typical `node path/to/repo/...` grandchildren; any hit is
-          // fail-closed BLOCKED because we cannot safely attribute kill
-          // without spawn-tree identity (Codex #4781560042). Being pure JS
-          // over the already-fetched rows, this scan cannot fail.
+          // from the live table). Young or unknown-age rows that survive the
+          // orphan-candidate exclusions still need worktree attribution via
+          // the CommandLine probe; any hit is fail-closed BLOCKED because we
+          // cannot safely attribute kill without spawn-tree identity
+          // (Codex #4781560042).
           if (cwd) {
             // minStarttime is wall-clock epoch ms on Windows (set at spawn).
             // Exclude self+child and the ancestor chain so CI agents / npm
             // parents that embed the repo path do not false-BLOCK; matches
             // whose unbroken ancestor chain predates the spawn (sibling
             // `node --test` workers) are excluded the same way.
-            const cwdHints = findWindowsPidsWithCommandLineHint(table, cwd, {
+            const orphanScanOptions = {
               excludePids: new Set([child.pid, process.pid]),
               minStartMs: Number.isFinite(minStarttime) ? minStarttime : 0,
               selfPid: process.pid,
-            });
-            if (cwdHints.length > 0) {
+            };
+            const { isOrphanCandidate } = createWindowsOrphanClassifier(table, orphanScanOptions);
+            const candidates = table.filter(isOrphanCandidate);
+            if (candidates.length > 0) {
+              let attributed;
+              let attributionError = null;
+              try {
+                attributed = await snapshotWithRetry(true);
+              } catch (error) {
+                attributionError = error;
+              }
+              if (!attributed) {
+                return {
+                  status: 'BLOCKED',
+                  evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants but ${candidates.length} young or unknown-age process(es) still need worktree attribution and the CommandLine probe failed: ${attributionError?.message || attributionError}. Cannot prove the tree is clean.`,
+                  escalated: true,
+                };
+              }
+              const cwdHints = findWindowsPidsWithCommandLineHint(attributed, cwd, orphanScanOptions);
+              if (cwdHints.length > 0) {
+                return {
+                  status: 'BLOCKED',
+                  evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants but CommandLine still references the worktree (pids ${cwdHints.slice(0, 8).join(', ')}). Multi-level orphan ancestry is unproven.`,
+                  escalated: true,
+                };
+              }
               return {
-                status: 'BLOCKED',
-                evidence: `Windows process tree ${child.pid}'s root exited before taskkill /T could target it; ParentProcessId BFS found no descendants but CommandLine still references the worktree (pids ${cwdHints.slice(0, 8).join(', ')}). Multi-level orphan ancestry is unproven.`,
+                status: 'PASS',
+                evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found (ParentProcessId BFS empty; worktree CommandLine probe clean for ${candidates.length} attributed process(es)).`,
                 escalated: true,
               };
             }
           }
           return {
             status: 'PASS',
-            evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found (ParentProcessId BFS empty; worktree CommandLine probe clean or skipped).`,
+            evidence: `Windows process tree ${child.pid}'s root already exited and no live descendants were found (ParentProcessId BFS empty; no unattributed young processes needed the worktree CommandLine probe).`,
             escalated: true,
           };
         }
@@ -990,6 +1118,7 @@ const terminateProcessTree = async ({
         kill,
         terminationGraceMs,
         platform,
+        rootPid: child.pid,
       });
       if (sweep.status === 'BLOCKED') {
         return {
@@ -1392,12 +1521,29 @@ const writeLogHeaderNoFollow = async (target, contents) => {
  * descriptor directly (rather than letting createWriteStream open the path
  * itself, which would follow a symlink) and hands the resulting FileHandle
  * to createWriteStream via its `fd` option so the stream still owns normal
- * close/error semantics.
+ * close/error semantics. Like the header writer, the opened descriptor is
+ * revalidated before use: a pre-existing hard link — or a swap between the
+ * header write and this open — must fail softly (the caller's logWriteError
+ * path) rather than append command evidence to an outside file.
  * @param {string} target
  * @returns {Promise<import('node:fs').WriteStream>}
  */
 const createLogAppendStreamNoFollow = async (target) => {
   const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error(`Refusing to append evidence log that is not a regular file: ${target}`);
+    }
+    if (info.nlink !== 1) {
+      throw new Error(
+        `Refusing to append evidence log with hard links (nlink=${info.nlink}): ${target}`,
+      );
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
   return createWriteStream(undefined, { fd: handle, autoClose: true, encoding: 'utf8' });
 };
 

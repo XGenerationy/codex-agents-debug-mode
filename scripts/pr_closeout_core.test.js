@@ -1256,6 +1256,14 @@ test('flags OR-list fallbacks whose right operand does not provably re-fail', ()
   assert.equal(findCommandFailureNeutralizer('validator || exit 2'), null);
   assert.equal(findCommandFailureNeutralizer('validator || false'), null);
   assert.equal(findCommandFailureNeutralizer('validator || return 1'), null);
+  // `|| exit $?` / `|| return $?` propagate the left operand's own nonzero
+  // status, so the failure stays fully visible (CodeRabbit UC4ND).
+  assert.equal(findCommandFailureNeutralizer('pnpm test || exit $?'), null);
+  assert.equal(findCommandFailureNeutralizer('pnpm test || return $?'), null);
+  // Zero-exit and output-only fallbacks stay flagged.
+  assert.ok(findCommandFailureNeutralizer('pnpm test || exit 0'));
+  assert.ok(findCommandFailureNeutralizer('pnpm test || true'));
+  assert.ok(findCommandFailureNeutralizer('pnpm test || echo ok'));
   // Plan-level: a configured command with a masking OR-list is BLOCKED.
   const plan = buildCheckPlan({
     config: { commands: { typecheck: 'validator || printf ok' } },
@@ -1305,4 +1313,78 @@ test('does not strip the label prefix from zero-count diagnostic prose', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: '0 warnings' }).status, 'PASS');
   assert.equal(classifyOutput({ exitCode: 0, stdout: '# fail 0' }).status, 'PASS');
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'errors: 0, warnings: 0' }).status, 'PASS');
+});
+
+test('strips label-first zero summaries followed by a period', () => {
+  // Qodo UC056: a trailing period is summary punctuation (`errors: 0.`), not
+  // a numeric continuation; the bucket must strip like `errors: 0` while a
+  // decimal tail (`0.5`) is never stripped and stays a failure signal.
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'errors: 0.' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'warnings: 0.' }).status, 'PASS');
+  assert.equal(classifyOutput({ exitCode: 0, stdout: 'errors: 0.5' }).status, 'FAIL');
+});
+
+test('blocks shell options that disable failure propagation', () => {
+  // Codex UDDQR: `set +e` / `set +o errexit` override the executor's
+  // prepended `set -e` so a later command exits 0 after a failure, and
+  // `set +o pipefail` lets a successful pipeline tail hide a failed leg.
+  assert.ok(findCommandFailureNeutralizer('set +e; false; printf ok'));
+  assert.ok(findCommandFailureNeutralizer('set   +e; pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('set +o errexit; pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('set +o pipefail; pnpm test | tail'));
+  // The hardening forms (`set -e`, `set -o pipefail`) are not neutralizers.
+  assert.equal(findCommandFailureNeutralizer('set -e; pnpm test'), null);
+  assert.equal(findCommandFailureNeutralizer('set -o pipefail; pnpm test'), null);
+  assert.equal(findCommandFailureNeutralizer('set -eo pipefail; pnpm test'), null);
+  // Scanned validation helpers flag the same options as config-silencing.
+  assert.ok(
+    scanSuppressionText('ci/check.sh', 'set +e\nfalse\nprintf ok\n')
+      .some(({ category }) => category === 'config-silencing'),
+  );
+  assert.deepEqual(
+    scanSuppressionText('ci/check.sh', 'set -e\npnpm test\n')
+      .filter(({ category }) => category === 'config-silencing'),
+    [],
+  );
+  // Plan level: a configured check using `set +e` is BLOCKED.
+  const plan = buildCheckPlan({
+    config: { commands: { typecheck: 'set +e; tsc --noEmit' } },
+  });
+  const typecheck = plan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(typecheck.status, 'BLOCKED');
+  assert.match(typecheck.evidence, /neutralizes failures/i);
+});
+
+test('flags pytest, Go, and Rust native skip forms in touched test files', () => {
+  // Codex UDDQN: the weakening scan only knew JavaScript/Jest forms; the
+  // native skip forms of the other test ecosystems the scanner treats as
+  // test-like must be caught under the same gating and finding shape.
+  const python = scanSuppressionText('tests/test_api.py', [
+    '@pytest.mark.skip(reason="slow")',
+    '@pytest.mark.skipif(sys.platform == "win32")',
+    '@pytest.mark.xfail(reason="broken")',
+    'pytest.skip("not supported")',
+    'pytestmark = pytest.mark.skip(reason="module disabled")',
+  ].join('\n')).filter(({ category }) => category === 'test-weakening');
+  assert.equal(python.length, 5, `expected 5 pytest findings: ${JSON.stringify(python)}`);
+  const go = scanSuppressionText('pkg/foo_test.go', [
+    't.Skip("skip this")',
+    't.Skipf("skip %d", 1)',
+  ].join('\n')).filter(({ category }) => category === 'test-weakening');
+  assert.equal(go.length, 2, `expected 2 Go findings: ${JSON.stringify(go)}`);
+  const rust = scanSuppressionText('tests/lib.rs', '#[ignore]')
+    .filter(({ category }) => category === 'test-weakening');
+  assert.equal(rust.length, 1, `expected 1 Rust finding: ${JSON.stringify(rust)}`);
+  // Gating is unchanged: the same text outside a test-like file, or inert
+  // inside a string, produces no finding.
+  assert.deepEqual(
+    scanSuppressionText('src/api.py', '@pytest.mark.skip(reason="slow")')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'const s = "pytest.mark.skip";')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
 });

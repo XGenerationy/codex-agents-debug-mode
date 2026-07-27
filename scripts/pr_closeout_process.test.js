@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn } = require('node:child_process');
+const { readFileSync } = require('node:fs');
 const { access, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
@@ -24,6 +25,7 @@ const {
   runPreflight,
   snapshotArtifactProof,
   spawnCaptured,
+  sweepDetachedOrphans,
   terminateProcessTree,
 } = require('./pr_closeout_process');
 
@@ -1011,6 +1013,40 @@ test('refuses to write a raw evidence log through a pre-existing symlink, withou
   }
 });
 
+test('refuses to append a raw evidence log through a pre-existing hard link, without crashing', async () => {
+  // Hard links need no symlink privilege and give a second name to the same
+  // inode: appending through the predictable log path would modify the
+  // outside file. The append stream must revalidate the opened descriptor
+  // (regular file, nlink === 1, mirroring the header writer) and degrade to
+  // logWriteError instead of appending.
+  const logDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-hardlink-'));
+  const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-hardlink-outside-'));
+  const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
+  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
+  await link(outsideTarget, logPath);
+  try {
+    const result = await spawnCaptured({
+      command: "process.stdout.write('hello')",
+      cwd: process.cwd(),
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+      timeoutMs: 5000,
+      env: process.env,
+      logPath,
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, 'hello');
+    assert.match(result.logWriteError, /hard links/i);
+
+    const untouched = await readFile(outsideTarget, 'utf8');
+    assert.equal(untouched, 'do not overwrite this\n', 'the hard-linked outside file must not be modified');
+  } finally {
+    await rm(logDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('refuses to write a command executor log header through a pre-existing symlink', async () => {
   // Same predictable-path threat as the append-stream case above, but for
   // the "command: ...\ncwd: ..." header createCommandExecutor writes before
@@ -1324,6 +1360,123 @@ test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { t
   }
 });
 
+test('cwd/fd probe excludes a same-repo sibling still running under the runner', { timeout: 15000 }, async () => {
+  // Codex UDDP_: with the runner's default parallelism 4, concurrent checks
+  // share the repo as cwd in their own sessions. The mark-free cwd/fd
+  // fallback must not attribute such a still-running SIBLING — an unbroken
+  // PPID chain to the runner that never passes through this spawn's root —
+  // to this spawn as a detached descendant. POSIX + /proc only.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-sibling-sweep-'));
+  let siblingPid = 0;
+  try {
+    // An exited stand-in for this spawn's root pid.
+    const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise((resolve) => exited.once('exit', resolve));
+    const rootPid = exited.pid;
+    // Sibling: detached (own session), cwd inside the repo, no spawn mark,
+    // parented directly to this test process (the runner).
+    const sibling = spawn(
+      process.execPath,
+      ['-e', 'process.stdout.write(String(process.pid));setInterval(()=>{},10000);'],
+      { stdio: ['ignore', 'pipe', 'ignore'], cwd: repo, detached: true },
+    );
+    sibling.unref();
+    sibling.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
+    for (let i = 0; i < 40 && !siblingPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(siblingPid > 0, 'sibling must report its pid');
+
+    // Fixture validity: without a root pid the bare cwd probe does match it.
+    const attributed = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(
+      (attributed || []).includes(siblingPid),
+      `sibling ${siblingPid} must match the bare cwd probe, got: ${JSON.stringify(attributed)}`,
+    );
+    // With the spawn's root pid known, the sibling's unbroken chain to the
+    // runner excludes it: it is not this spawn's detached orphan.
+    const excluded = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid });
+    assert.ok(
+      !(excluded || []).includes(siblingPid),
+      `sibling ${siblingPid} chaining to the runner must be excluded, got: ${JSON.stringify(excluded)}`,
+    );
+    // End to end: the sweep must not BLOCK an otherwise-clean check over it.
+    const sweep = await sweepDetachedOrphans({
+      mark: 'probe-sibling-sweep-mark',
+      cwd: repo,
+      rootPid,
+      kill: () => {},
+      selfPid: process.pid,
+    });
+    assert.equal(sweep.status, 'PASS', statusDiag(sweep));
+  } finally {
+    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is broken', { timeout: 15000 }, async () => {
+  // Fail-closed guard for the sibling exclusion (Codex UDDP_): a genuine
+  // detached orphan's PPID chain dead-ends at the exited spawn root (absent
+  // pid), so it must stay attributed and force BLOCKED. POSIX + /proc only.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-broken-chain-'));
+  let orphanPid = 0;
+  let rootPid = 0;
+  try {
+    // Intermediate "spawn root": launches a detached, mark-free grandchild
+    // with cwd inside the repo, reports the grandchild pid, then exits — the
+    // grandchild is reparented and its chain to the runner breaks.
+    const launcher = [
+      'const {spawn}=require("node:child_process");',
+      'const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true});',
+      'process.stdout.write(String(child.pid));',
+      'child.unref();',
+      'setTimeout(()=>process.exit(0),200);',
+    ].join('');
+    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
+    rootPid = root.pid;
+    root.stdout.on('data', (chunk) => { orphanPid = Number(String(chunk).trim()); });
+    await new Promise((resolve) => root.once('exit', resolve));
+    for (let i = 0; i < 40 && !orphanPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(orphanPid > 0, 'orphan pid must be reported');
+    // Wait until the orphan is reparented away from the exited root, so its
+    // PPID chain no longer passes through rootPid (broken chain).
+    let ppid = rootPid;
+    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
+      try {
+        const stat = readFileSync(`/proc/${orphanPid}/stat`, 'utf8');
+        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual(ppid, rootPid, 'orphan must be reparented after the root exited');
+
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid });
+    assert.ok(
+      (found || []).includes(orphanPid),
+      `broken-chain orphan ${orphanPid} must stay flagged, got: ${JSON.stringify(found)}`,
+    );
+    const sweep = await sweepDetachedOrphans({
+      mark: 'probe-broken-chain-mark',
+      cwd: repo,
+      rootPid,
+      kill: () => {},
+      selfPid: process.pid,
+    });
+    assert.equal(sweep.status, 'BLOCKED', statusDiag(sweep));
+    assert.match(sweep.evidence, /mark-free/i);
+  } finally {
+    if (orphanPid) { try { process.kill(orphanPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('still runs taskkill /T when the Windows root PID has already exited', async () => {
   // A clean root exit does not prove descendants are gone; always run
   // taskkill /T so children are targeted. Non-zero taskkill after the root is
@@ -1512,13 +1665,13 @@ test('enumerates multi-level Windows descendants from a full process table', asy
   assert.match(result.evidence, /2 live descendant/i);
 });
 
-test('proves a clean Windows tree from ONE process-table snapshot', async () => {
-  // Windows CI flake regression: the root-gone clean-exit path used to run
-  // TWO sequential full-system CIM serializations (BFS table, then a second
-  // CommandLine table) — 8-19s each on loaded windows-latest runners — so
-  // the 15s/20s probe timeouts raced and clean commands flaked BLOCKED
-  // (GitHub Actions, Node 20/22/24). Both proofs must reuse one snapshot:
-  // exactly one powershell invocation even when cwd is provided.
+test('proves a clean Windows tree from ONE cheap process-table snapshot', async () => {
+  // Windows CI root cause: a CommandLine-bearing full-table CIM query costs
+  // one PEB read per process and consistently exceeded the 20s probe budget
+  // on windows-latest runners (every createCommandExecutor test BLOCKED).
+  // The clean path must need only the cheap CommandLine-free snapshot: with
+  // no young/unknown-age orphan candidates in the table, the expensive
+  // attribution probe must not run at all — exactly one powershell call.
   let powershellCalls = 0;
   const result = await terminateProcessTree({
     child: { pid: 424242 },
@@ -1530,23 +1683,29 @@ test('proves a clean Windows tree from ONE process-table snapshot', async () => 
       error.code = 'ESRCH';
       throw error;
     },
-    runExecFile: async (file) => {
+    runExecFile: async (file, args, options) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
       assert.match(file, /powershell\.exe$/i);
+      assert.deepEqual(
+        Object.keys(options.env).sort(),
+        ['ComSpec', 'PATHEXT', 'SYSTEMROOT', 'SystemRoot'],
+        'snapshot probe must not forward ambient environment',
+      );
       powershellCalls += 1;
       return { stdout: '400 1 500 services.exe\n', stderr: '' };
     },
   });
   assert.equal(result.status, 'PASS', statusDiag(result));
   assert.match(result.evidence, /no live descendants/i);
-  assert.equal(powershellCalls, 1, 'BFS and the CommandLine worktree scan must share one snapshot');
+  assert.equal(powershellCalls, 1, 'clean tree must not pay for the CommandLine attribution probe');
 });
 
-test('blocks multi-level Windows orphans via the CommandLine scan over the same snapshot', async () => {
+test('blocks multi-level Windows orphans via the CommandLine attribution probe', async () => {
   // The orphan's parent (999999) is dead and absent from the table, so
   // ParentProcessId BFS can never reach it; only the worktree CommandLine
-  // scan catches it (Codex #4781560042) — and it must not cost a second
-  // snapshot.
+  // scan catches it (Codex #4781560042). The cheap snapshot comes first and
+  // flags the young broken-chain row as an attribution candidate, so the
+  // CommandLine-bearing probe runs exactly once more.
   let powershellCalls = 0;
   const result = await terminateProcessTree({
     child: { pid: 424242 },
@@ -1568,7 +1727,35 @@ test('blocks multi-level Windows orphans via the CommandLine scan over the same 
   assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /565656/);
-  assert.equal(powershellCalls, 1, 'CommandLine scan must reuse the BFS snapshot, not re-query CIM');
+  assert.equal(powershellCalls, 2, 'cheap snapshot plus one attribution probe for the candidate');
+});
+
+test('blocks multi-level Windows orphans whose CommandLine spells the worktree with forward slashes', async () => {
+  // Separator variation must not escape the worktree scan: the orphan below
+  // references C:/work/repo while cwd is C:\work\repo — same directory, so
+  // the scan must still attribute it and BLOCK (CodeRabbit UC4NQ/UC4NX).
+  let powershellCalls = 0;
+  const result = await terminateProcessTree({
+    child: { pid: 424242 },
+    platform: 'win32',
+    cwd: 'C:\\work\\repo',
+    minStarttime: 1000,
+    kill: () => {
+      const error = new Error('no such process');
+      error.code = 'ESRCH';
+      throw error;
+    },
+    runExecFile: async (file) => {
+      if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
+      assert.match(file, /powershell\.exe$/i);
+      powershellCalls += 1;
+      return { stdout: '565656 999999 2000 node.exe C:/work/repo/scripts/orphan.js\n', stderr: '' };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
+  assert.match(result.evidence, /CommandLine/i);
+  assert.match(result.evidence, /565656/);
+  assert.equal(powershellCalls, 2, 'cheap snapshot plus one attribution probe for the candidate');
 });
 
 test('does not block a clean Windows tree on worktree processes started before the spawn', async () => {
@@ -1659,7 +1846,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain breaks at a
   assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /700003/);
-  assert.equal(powershellCalls, 1);
+  assert.equal(powershellCalls, 2, 'cheap snapshot plus one attribution probe for the candidate');
 });
 
 test('still blocks a worktree CommandLine match whose ancestor chain reaches unknown-age processes', async () => {
@@ -1690,7 +1877,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain reaches unk
   assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /700004/);
-  assert.equal(powershellCalls, 1);
+  assert.equal(powershellCalls, 2, 'cheap snapshot plus one attribution probe for the candidates');
 });
 
 test('retries a failed Windows table snapshot once, then fails closed', async () => {

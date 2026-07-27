@@ -142,6 +142,10 @@ cleanup_stages() {
   for s in "${stage_paths[@]:-}"; do
     if [[ -n "$s" && ( -e "$s" || -L "$s" ) ]]; then
       rm -rf -- "$s" 2>/dev/null || rm_status=$?
+      if [[ $rm_status -ne 0 ]]; then
+        echo "Cleanup warning: could not remove staging directory $s (rm exit $rm_status)" >&2
+        rm_status=0
+      fi
     fi
   done
   # Trap cleanup must not rewrite the installer's exit status.

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { createHash, randomBytes, timingSafeEqual } = require('node:crypto');
-const { closeSync, constants, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
+const { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
@@ -267,6 +267,12 @@ const openNoFollow = async (target, flags, mode) => {
 // still run an lstat-based guard first as the primary check -- the same
 // contract the async wrapper documents (CodeRabbit discussion_r3652923124).
 const openNoFollowSync = (target, flags) => {
+  // Same fail-closed flags guard the async openNoFollow enforces: a
+  // non-integer would silently coerce through `|` in the attempt ladder and
+  // defeat the no-follow intent instead of throwing.
+  if (!Number.isInteger(flags)) {
+    throw new TypeError('openNoFollowSync requires numeric fs.constants flags.');
+  }
   const attempts = openNoFollowFlagAttempts(flags, constants.O_NOFOLLOW || 0, constants.O_NONBLOCK || 0);
   const unsupported = (code) => ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(code);
   let lastError;
@@ -748,9 +754,11 @@ const createDebugServer = ({
 const probeServer = (port) =>
   new Promise((resolve) => {
     let settled = false;
+    let deadline;
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       resolve(value);
     };
     const request = http.get(
@@ -809,6 +817,16 @@ const probeServer = (port) =>
     });
     request.on('error', () => finish(null));
     request.on('close', () => finish(null));
+    // Independent wall-clock deadline: the socket `timeout` above is an
+    // inactivity timer, so a peer trickling a byte every <500ms resets it
+    // forever and can pin the EADDRINUSE startup path for as long as it keeps
+    // the response open. Settle null after a bounded period regardless of
+    // ongoing traffic; unref so the timer itself cannot hold the process open.
+    deadline = setTimeout(() => {
+      request.destroy();
+      finish(null);
+    }, 2_000);
+    deadline.unref();
   });
 
 /**
@@ -1171,10 +1189,25 @@ const main = () => {
             }
             const fd = openNoFollowSync(claimFile, constants.O_RDONLY);
             try {
-              const buf = Buffer.alloc(info.size);
+              // Re-stat the opened descriptor before reading, mirroring
+              // readSmallRegularFile's post-open handle.stat(): the lstat
+              // metadata above is stale the instant the path could be swapped
+              // between lstat and open, so size/link checks and the buffer
+              // sizing must come from the descriptor actually being read
+              // (CodeRabbit discussion_r3652923124).
+              const opened = fstatSync(fd);
+              if (
+                !opened.isFile()
+                || opened.nlink > 1
+                || opened.size < 1
+                || opened.size > MAX_CLAIM_FILE_BYTES
+              ) {
+                return;
+              }
+              const buf = Buffer.alloc(opened.size);
               let offset = 0;
-              while (offset < info.size) {
-                const bytesRead = readSync(fd, buf, offset, info.size - offset, offset);
+              while (offset < opened.size) {
+                const bytesRead = readSync(fd, buf, offset, opened.size - offset, offset);
                 if (bytesRead === 0) break;
                 offset += bytesRead;
               }
@@ -1325,6 +1358,7 @@ module.exports = {
   RequestError,
   createDebugServer,
   isInsideRoot,
+  openNoFollowSync,
   probeServer,
   readJson,
 };

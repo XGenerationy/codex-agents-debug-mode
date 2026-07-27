@@ -318,6 +318,58 @@ test('exclusive output-dir lock reclaims a stale lock from a dead PID', async ()
   }
 });
 
+test('exclusive output-dir lock treats a special-file lock as corrupt and reclaims it', async () => {
+  // Codex #UDDQC: a FIFO/symlinked .closeout.lock must never be followed or
+  // block the recovery read; a guard failure takes the corrupt-lock path.
+  // Windows cannot create FIFOs/symlinks without admin, so the special file
+  // is simulated by injecting the guarded reader's rejection — the same
+  // rejection readOutputDirLockFile raises for a non-regular descriptor.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-special-lock-'));
+  try {
+    // Seed content naming this process: if the guard were bypassed and the
+    // raw file parsed, acquisition would throw "already locked" instead of
+    // reclaiming — so this test fails unless the injected rejection ran.
+    await fs.writeFile(nodePath.join(tmp, '.closeout.lock'), `${process.pid}\nforeign-nonce\n`, 'utf8');
+    let guardCalls = 0;
+    const lock = await acquireOutputDirLock(tmp, {
+      readLockFile: async () => {
+        guardCalls += 1;
+        throw new Error('Evidence lock is not a size-bounded regular file.');
+      },
+    });
+    assert.ok(guardCalls >= 1, 'recovery read must go through the guarded reader');
+    assert.ok(lock.nonce);
+    await lock.release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('exclusive output-dir lock rejects an oversized lock as not size-bounded', async () => {
+  // Codex #UDDQC: the descriptor-verified cap rejects before the PID line is
+  // parsed. The payload names this process, so a bypass of the size guard
+  // would parse it and throw "already locked" instead of reclaiming.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-oversized-lock-'));
+  try {
+    await fs.writeFile(
+      nodePath.join(tmp, '.closeout.lock'),
+      `${process.pid}\n${'x'.repeat(8192)}\n`,
+      'utf8',
+    );
+    const lock = await acquireOutputDirLock(tmp);
+    assert.ok(lock.nonce);
+    await lock.release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('release() unregisters the abrupt-exit listener across repeated runs', async () => {
   // Codex discussion_r3652957330 / CodeRabbit discussion_r3652923142: a
   // long-lived process running closeout repeatedly must not accumulate exit

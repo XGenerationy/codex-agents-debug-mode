@@ -105,6 +105,10 @@ const CONFIG_SILENCING = [
   // status and mask a failed left-hand command (CodeRabbit #4780344655).
   // Single-pipe only: lookaround excludes `||` which is handled above.
   /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
+  // `set +e` / `set +o errexit` / `set +o pipefail` in a scanned validation
+  // helper disable failure propagation the same way (Codex UDDQR).
+  /\bset\s+\+e\b/i,
+  /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
 ];
 
 /**
@@ -118,8 +122,10 @@ const CONFIG_SILENCING = [
  * exempts the left side of `||` from errexit and the OR-list exits with the
  * RIGHT operand's status, so ANY `||` fallback is flagged unless the right
  * operand provably re-fails — `exit N` with N != 0, `false`, or `return N`
- * with N != 0. Those allowed forms keep the failure visible to the executor
- * (nonzero exit status), so they are not neutralizers; everything else
+ * with N != 0. `exit $?` / `return $?` are admitted too: they propagate the
+ * left operand's own nonzero status (CodeRabbit UC4ND). Those allowed forms
+ * keep the failure visible to the executor (nonzero exit status), so they
+ * are not neutralizers; everything else
  * (`|| true`, `|| :`, `|| echo ok`, `|| printf ok`, arbitrary commands)
  * masks it. The specific patterns run before the catch-all so the reported
  * fragment names the exact neutralizer.
@@ -146,13 +152,22 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // status and mask a failed left-hand command (CodeRabbit #4780344655).
   // Single-pipe only: lookaround excludes `||` which is handled above.
   /(?<!\|)\|(?!\|)\s*(?:true\b|:|exit\s+0\b)/i,
+  // Shell option flips that disable failure propagation (Codex UDDQR):
+  // `set +e` / `set +o errexit` override the executor's prepended `set -e`,
+  // so a failing command no longer aborts the script and a later always-
+  // success command can exit 0; `set +o pipefail` lets a successful pipeline
+  // tail hide a failed leg. The literal `+` is required, so the hardening
+  // forms `set -e` / `set -o pipefail` are not flagged.
+  /\bset\s+\+e\b/i,
+  /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,
-  // `exit <nonzero>`, and `return <nonzero>`; `|| true`, `|| :`,
+  // `exit <nonzero>`, `return <nonzero>`, and the status-propagating
+  // `exit $?` / `return $?` (CodeRabbit UC4ND); `|| true`, `|| :`,
   // `|| exit 0`, and `|| echo …` still match their specific patterns above,
   // which run first so the reported fragment names the exact neutralizer.
-  /\|\|(?!\s*(?:false\b|exit\s*[1-9]\d*\b|return\s*[1-9]\d*\b))/i,
+  /\|\|(?!\s*(?:false\b|exit\s*(?:[1-9]\d*\b|\$\?)|return\s*(?:[1-9]\d*\b|\$\?)))/i,
   /\bpassWithNoTests\b/i,
   /\ballowNoTests\b/i,
   /\b--passWithNoTests\b/i,
@@ -443,7 +458,9 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
 // Include runner-native skip buckets: Rust `ignored`, pytest `deselected`.
 // The label-first form (`errors: 0`) only strips COMPLETE count buckets: the
 // zero must be followed by end-of-line or a summary delimiter (`, ; | ) ] }`),
-// never by arbitrary prose or a `-byte`-style continuation. Otherwise
+// never by arbitrary prose or a `-byte`-style continuation. A single trailing
+// period counts as summary punctuation (`errors: 0.`), but a decimal tail is
+// not punctuation — `0.5` is never stripped (Qodo UC056). Otherwise
 // diagnostics like `Error: 0 is not a valid threshold` or
 // `Warning: 0-byte artifact was ignored` would lose their `Error:`/`Warning:`
 // prefix, the remainder would no longer match statusSignal, and
@@ -453,7 +470,7 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
 // `Label:` prefix.
 const cleanZeroSummaries = (text) => text
   .replace(/\b0\s+(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '')
-  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0[ \t]*(?=$|[,;|)\]}])/gim, '')
+  .replace(/\b(?:warnings?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\s*(?::|=|\s)\s*0[ \t]*\.?(?=$|[,;|)\]}])/gim, '')
   .replace(/\bno\s+(?:warnings?|errors?|problems?|failures?|failing|skips?|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)\b/gi, '');
 
 const STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
@@ -613,7 +630,9 @@ const classifyOutput = ({
  * classified as config/workflow/ignore-file-shaped, plus every non-comment
  * line of a dedicated *ignore file is itself flagged. Runner-native test
  * focus/skip (describe.only, it.skip, fit/xdescribe, and their
- * optional-chaining, computed-property, and modifier-chain variants) is only
+ * optional-chaining, computed-property, and modifier-chain variants, plus the
+ * native skip forms of the other test stacks: pytest mark decorators and
+ * pytest.skip, Go t.Skip/t.Skipf, Rust #[ignore]) is only
  * checked in test/spec-shaped files. The marker pass is quote-aware only: a
  * bare quoted-string line is skipped outright (so this scanner's own MARKERS
  * vocabulary and quoted test fixtures don't self-flag) and a marker wrapped
@@ -756,6 +775,18 @@ const scanSuppressionText = (file, text) => {
     // so suite.only / suite.skip cannot focus a suite while the scan reports clean.
     // Optional chaining before computed members: test?.['only'] / describe?.["skip"]
     // is `?.[` (question + dot + bracket), not bare `?[` (Codex open finding).
+    // Non-JavaScript ecosystems (Codex UDDQN): pytest mark decorators
+    // (@pytest.mark.skip/.skipif/.xfail — also the bare pytest.mark.* form so a
+    // module-level pytestmark assignment is caught), a plain pytest.skip(...)
+    // call, Go's t.Skip(/t.Skipf(, and Rust's #[ignore] attribute are the
+    // native skip forms of the other test stacks this scanner classifies as
+    // test-like. They run under the same testLike gating and inertness map, so
+    // quoted mentions (e.g. "pytest.mark.skip" in a JS string) stay unflagged.
+    // The native pattern stays case-SENSITIVE in its own regex: node:test's
+    // legitimate conditional `t.skip(...)` platform gate (lowercase) is not a
+    // skip marker, while Go's abort method is exactly `t.Skip(`/t.Skipf(`
+    // (capital S — lowercase would not compile).
+    const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skipf?\s*\(|#\s*\[\s*ignore\b/;
     const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
     /**
      * Scan a whole source line and mark every character position that is
@@ -952,6 +983,7 @@ const scanSuppressionText = (file, text) => {
       return { inert, blockComment };
     };
     const globalWeakening = new RegExp(testWeakening.source, 'gi');
+    const globalNativeWeakening = new RegExp(nativeTestWeakening.source, 'g');
     let blockComment = false;
     lines.forEach((line, index) => {
       const { inert, blockComment: outgoing } = scanLineInertness(line, blockComment);
@@ -959,6 +991,11 @@ const scanSuppressionText = (file, text) => {
       // Inspect every occurrence: a quoted fixture before a real call on the
       // same line must not hide the later active .skip/.only.
       for (const match of line.matchAll(globalWeakening)) {
+        if (inert[match.index ?? 0]) continue;
+        findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
+        break;
+      }
+      for (const match of line.matchAll(globalNativeWeakening)) {
         if (inert[match.index ?? 0]) continue;
         findings.push({ file, line: index + 1, category: 'test-weakening', match: match[0] });
         break;
