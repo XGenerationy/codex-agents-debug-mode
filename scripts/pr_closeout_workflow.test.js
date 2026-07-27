@@ -398,24 +398,29 @@ test('exclusive output-dir lock release refuses a symlinked successor', async ()
   const os = require('node:os');
   const nodePath = require('node:path');
   const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-release-symlink-'));
+  let successorPath = null;
   try {
     const lock = await acquireOutputDirLock(tmp);
     const replacement = nodePath.join(tmp, 'replacement-lock');
+    const replacementPayload = `${process.pid}\n${lock.nonce}\n`;
     await fs.unlink(lock.path);
-    await fs.writeFile(replacement, `${process.pid}\n${lock.nonce}\n`, 'utf8');
+    await fs.writeFile(replacement, replacementPayload, 'utf8');
     try {
       await fs.symlink(replacement, lock.path, 'file');
     } catch (error) {
       if (['EACCES', 'EPERM', 'ENOSYS'].includes(error?.code)) return;
       throw error;
     }
+    successorPath = lock.path;
     await lock.release();
     // Node 20 on hosted Windows can report EPERM for lstat/realpath on a
-    // symlink it just created. Listing the parent avoids dereferencing it and
-    // directly proves the relevant contract: release did not unlink the
-    // untrusted successor entry.
-    assert.ok((await fs.readdir(tmp)).includes('.closeout.lock'));
+    // symlink it just created. Reading through it proves the relevant
+    // contract without metadata inspection: release left the successor path.
+    assert.equal(await fs.readFile(lock.path, 'utf8'), replacementPayload);
   } finally {
+    // Avoid recursive cleanup's Node 20 Windows metadata path for a known
+    // symlink. unlink removes the test-created link itself, not its target.
+    if (successorPath) await fs.unlink(successorPath).catch(() => {});
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
