@@ -550,11 +550,11 @@ const parseWindowsProcessTable = (stdout) => {
 };
 
 /**
- * Snapshot Windows PID/PPID data without asking the Win32_Process provider
- * for CreationDate or CommandLine across the full process table. Both fields
- * can trigger per-process inspection and repeatedly exceeded the 20s budget
- * on loaded windows-latest runners. Start times come from Get-Process; CIM is
- * used only for the PID/PPID adjacency table.
+ * Snapshot Windows PID/PPID/start-time data from PowerShell 7's Get-Process
+ * Parent adapter. Do not ask the Win32_Process provider for a full process
+ * table: even a property-limited PID/PPID CIM query repeatedly exceeded the
+ * 20s budget on windows-latest runners. PowerShell 7 resolves Parent through
+ * the native process API, so the clean path has no WMI dependency.
  *
  * When CommandLine attribution is required, query only the candidate PIDs
  * plus processes that appeared after the command started. This preserves the
@@ -568,6 +568,7 @@ const parseWindowsProcessTable = (stdout) => {
  *   withCommandLine?: boolean,
  *   candidatePids?: number[],
  *   minStartMs?: number,
+ *   useNativeParent?: boolean,
  * }} options
  * @returns {Promise<Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>>}
  */
@@ -577,6 +578,7 @@ const snapshotWindowsProcessTable = async ({
   withCommandLine = false,
   candidatePids = [],
   minStartMs = 0,
+  useNativeParent = false,
 }) => {
   const safeCandidatePids = [...new Set(candidatePids)]
     .filter((pid) => Number.isInteger(pid) && pid > 0);
@@ -593,6 +595,13 @@ const snapshotWindowsProcessTable = async ({
     '  $pidValue = [int]$_.Id',
     '  $createdByPid[$pidValue] = $createdMs',
     '  [void]$livePids.Add($pidValue)',
+    ...(useNativeParent
+      ? [
+        '  $parentPid = 0',
+        '  try { if ($_.Parent) { $parentPid = [int]$_.Parent.Id } } catch { }',
+        '  "{0} {1} {2}" -f $pidValue, $parentPid, $createdMs',
+      ]
+      : []),
     '}',
   ];
   if (withCommandLine) {
@@ -616,7 +625,7 @@ const snapshotWindowsProcessTable = async ({
       '  }',
       '}',
     );
-  } else {
+  } else if (!useNativeParent) {
     scriptLines.push(
       'Get-CimInstance -Query "SELECT ProcessId,ParentProcessId FROM Win32_Process" | ForEach-Object {',
       '  $pidValue = [int]$_.ProcessId',
@@ -934,14 +943,22 @@ const terminateProcessTree = async ({
         // enumerate any live descendants (Windows tracks each child's
         // ParentProcessId regardless of whether the parent is still alive)
         // and terminate them directly; only PASS once none remain.
-        const powershell = path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        const windowsPowershell = path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        const pwsh = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe';
+        // PowerShell 7 exposes Get-Process.Parent through a native adapter;
+        // Windows PowerShell 5 does not. Prefer the fixed, existence-checked
+        // pwsh installation path used by hosted Windows runners. If it is not
+        // installed, the legacy fallback stays fail-closed.
+        const powershell = existsCheck(pwsh) ? pwsh : windowsPowershell;
+        const useNativeParent = powershell === pwsh;
         // The cheap CommandLine-free snapshot feeds the ParentProcessId BFS
         // and the orphan-candidate classification below; the expensive
         // CommandLine-bearing table is queried ONLY when the cheap rows
         // still contain young/unknown-age processes that need worktree
         // attribution — on a clean tree that is typically zero rows, so the
         // per-process PEB reads that blew the 20s probe budget on loaded
-        // windows-latest CI runners never happen. Each snapshot is read-only
+        // windows-latest CI runners never happen. The full adjacency snapshot
+        // itself is native Get-Process.Parent rather than WMI. Each snapshot is read-only
         // and idempotent, so a single bounded retry of the PROBE ONLY —
         // never of taskkill or of the validated command — absorbs transient
         // CIM slowness on shared CI runners; two failed attempts still fail
@@ -950,7 +967,12 @@ const terminateProcessTree = async ({
           let lastError = null;
           for (let attempt = 1; attempt <= 2; attempt += 1) {
             try {
-              return await snapshotWindowsProcessTable({ runExecFile, powershell, ...options });
+              return await snapshotWindowsProcessTable({
+                runExecFile,
+                powershell,
+                useNativeParent,
+                ...options,
+              });
             } catch (error) {
               lastError = error;
               if (attempt < 2) await delay(250);

@@ -1538,7 +1538,7 @@ test('accepts a Windows tree that exits before taskkill lands, when no descendan
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       return { stdout: '', stderr: '' };
     },
   });
@@ -1564,7 +1564,7 @@ test('terminates and confirms descendants that outlived a Windows root taskkill 
         killedPids.push(pid);
         return { stdout: 'SUCCESS', stderr: '' };
       }
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       return { stdout: '5555 1234\n5556 1234\n', stderr: '' };
     },
   });
@@ -1588,7 +1588,7 @@ test('blocks a Windows tree when a descendant survives taskkill after the root a
         if (args.includes('1234')) throw new Error('taskkill failed: root PID not found');
         throw new Error('taskkill failed: access denied');
       }
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       return { stdout: '5555 1234\n', stderr: '' };
     },
   });
@@ -1655,7 +1655,7 @@ test('enumerates multi-level Windows descendants from a full process table', asy
         killed.push(args[args.indexOf('/PID') + 1]);
         return { stdout: 'SUCCESS', stderr: '' };
       }
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       // Full table: pid parentPid pairs
       return { stdout: '200 100\n300 200\n400 1\n', stderr: '' };
     },
@@ -1665,11 +1665,11 @@ test('enumerates multi-level Windows descendants from a full process table', asy
   assert.match(result.evidence, /2 live descendant/i);
 });
 
-test('proves a clean Windows tree from ONE cheap process-table snapshot', async () => {
-  // Windows CI root cause: a CommandLine-bearing full-table CIM query costs
-  // one PEB read per process and consistently exceeded the 20s probe budget
-  // on windows-latest runners (every createCommandExecutor test BLOCKED).
-  // The clean path must need only the cheap CommandLine-free snapshot: with
+test('proves a clean Windows tree from ONE native process-table snapshot', async () => {
+  // Windows CI root cause: every full-table CIM query, including the
+  // property-limited PID/PPID form, can exceed the 20s probe budget on
+  // windows-latest runners (every createCommandExecutor test BLOCKED).
+  // The clean path must need only the native CommandLine-free snapshot: with
   // no young/unknown-age orphan candidates in the table, the expensive
   // attribution probe must not run at all — exactly one powershell call.
   let powershellCalls = 0;
@@ -1678,6 +1678,7 @@ test('proves a clean Windows tree from ONE cheap process-table snapshot', async 
     platform: 'win32',
     cwd: 'C:\\work\\repo',
     minStarttime: 1000,
+    pathExists: (candidate) => /pwsh\.exe$/i.test(candidate),
     kill: () => {
       const error = new Error('no such process');
       error.code = 'ESRCH';
@@ -1685,7 +1686,7 @@ test('proves a clean Windows tree from ONE cheap process-table snapshot', async 
     },
     runExecFile: async (file, args, options) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       assert.deepEqual(
         Object.keys(options.env).sort(),
         ['ComSpec', 'PATHEXT', 'SYSTEMROOT', 'SystemRoot'],
@@ -1693,7 +1694,8 @@ test('proves a clean Windows tree from ONE cheap process-table snapshot', async 
       );
       const script = args.at(-1);
       assert.match(script, /Get-Process \| ForEach-Object/);
-      assert.match(script, /SELECT ProcessId,ParentProcessId FROM Win32_Process/);
+      assert.match(script, /\$_\.Parent\.Id/);
+      assert.doesNotMatch(script, /SELECT ProcessId,ParentProcessId FROM Win32_Process/);
       assert.doesNotMatch(script, /SELECT .*CommandLine/);
       assert.doesNotMatch(script, /CreationDate/);
       powershellCalls += 1;
@@ -1724,7 +1726,7 @@ test('blocks multi-level Windows orphans via the CommandLine attribution probe',
     },
     runExecFile: async (file, args) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       if (powershellCalls === 2) {
         const script = args.at(-1);
@@ -1758,7 +1760,7 @@ test('blocks multi-level Windows orphans whose CommandLine spells the worktree w
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       return { stdout: '565656 999999 2000 node.exe C:/work/repo/scripts/orphan.js\n', stderr: '' };
     },
@@ -1787,7 +1789,7 @@ test('does not block a clean Windows tree on worktree processes started before t
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       return { stdout: '565657 999999 500 C:\\tools\\editor.exe C:\\work\\repo\\README.md\n', stderr: '' };
     },
@@ -1819,7 +1821,7 @@ test('does not block on a worktree CommandLine match whose unbroken ancestor cha
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       return {
         stdout: '700001 1 500 C:\\tools\\runner.exe\n700002 700001 2000 node.exe C:\\work\\repo\\scripts\\other.test.js\n',
@@ -1849,7 +1851,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain breaks at a
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       return { stdout: '700003 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
     },
@@ -1877,7 +1879,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain reaches unk
     },
     runExecFile: async (file) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
-      assert.match(file, /powershell\.exe$/i);
+      assert.match(file, /(?:pwsh|powershell)\.exe$/i);
       powershellCalls += 1;
       return {
         stdout: '700004 700005 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n700005 999999 0\n',
