@@ -219,7 +219,11 @@ lock_destination() {
 }
 release_destination_lock() {
   if [[ -n "$dest_lock" ]]; then
-    rmdir -- "$dest_lock" 2>/dev/null || true
+    local rmdir_status=0
+    rmdir -- "$dest_lock" 2>/dev/null || rmdir_status=$?
+    if [[ $rmdir_status -ne 0 ]]; then
+      echo "Cleanup warning: could not release install lock $dest_lock (rmdir exit $rmdir_status)" >&2
+    fi
     dest_lock=""
   fi
 }
