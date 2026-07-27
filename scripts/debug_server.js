@@ -1111,6 +1111,13 @@ const main = () => {
       const claimFile = path.join(debugDir, 'collector_claim');
       const MAX_PORT_FILE_BYTES = 32;
       const MAX_CLAIM_FILE_BYTES = 256;
+      // `O_EXCL` publishes the claim pathname before writeFile() persists its
+      // owner record. A concurrent launcher must not reclaim that short,
+      // ordinary-file creation window merely because there is no probeable
+      // port yet; doing so would let both launches mutate shared token/port
+      // files. An old incomplete record remains reclaimable after this bounded
+      // grace, just as explicit closeout output locks do.
+      const COLLECTOR_CLAIM_INITIALIZING_GRACE_MS = 5_000;
       const readSmallRegularFile = async (target, maxBytes) => {
         const handle = await openNoFollow(target, constants.O_RDONLY);
         try {
@@ -1179,6 +1186,32 @@ const main = () => {
           } catch {
             claimedPort = null;
             claimText = null;
+          }
+          // A valid completed claim has port, opaque instance ID, and PID.
+          // Treat only a fresh, private regular-file record that is incomplete
+          // as initializing; malformed old files must still be reclaimable,
+          // and links/special files are never trusted for the grace.
+          const claimLines = String(claimText || '').split(/\r?\n/);
+          const completeClaim = Number.isInteger(claimedPort) && claimedPort > 0
+            && Boolean(String(claimLines[1] || '').trim())
+            && Number.isInteger(Number(String(claimLines[2] || '').trim()))
+            && Number(String(claimLines[2] || '').trim()) > 0;
+          if (!completeClaim) {
+            try {
+              const claimInfo = await lstat(claimFile);
+              const freshPrivateRegularClaim = claimInfo.isFile()
+                && !claimInfo.isSymbolicLink()
+                && claimInfo.nlink === 1
+                && claimInfo.size <= MAX_CLAIM_FILE_BYTES
+                && Date.now() - claimInfo.mtimeMs < COLLECTOR_CLAIM_INITIALIZING_GRACE_MS;
+              if (freshPrivateRegularClaim) {
+                throw new Error('collector_claim_initializing');
+              }
+            } catch (claimInfoError) {
+              if (claimInfoError?.message === 'collector_claim_initializing') throw claimInfoError;
+              // A disappeared or uninspectable record can proceed to the
+              // guarded stale-reclaim path below, which still refuses links.
+            }
           }
           // Owner PID is authoritative: a starting peer is not ready yet but
           // still holds the claim and must not be unlinked.

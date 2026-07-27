@@ -1417,6 +1417,30 @@ test('reclaims a stale collector_claim whose recorded port now serves a differen
   }
 });
 
+test('does not reclaim a freshly created incomplete collector_claim', { timeout: 20000 }, async () => {
+  // O_EXCL makes the claim visible before the creator's awaited writeFile.
+  // A concurrent launcher must leave that fresh, empty regular file alone
+  // rather than letting both processes acquire the same project ownership.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-claim-initializing-'));
+  const port = await findFreePort();
+  const claimPath = path.join(projectRoot, '.debug', 'collector_claim');
+  await mkdir(path.dirname(claimPath), { recursive: true });
+  await writeFile(claimPath, '', 'utf8');
+
+  let launched;
+  try {
+    launched = launchCli(projectRoot, port);
+    const result = await launched.outcome;
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /collector_claim_initializing/);
+    assert.equal(await readFile(claimPath, 'utf8'), '');
+    assert.equal(existsSync(path.join(projectRoot, '.debug', 'collector_token')), false);
+  } finally {
+    if (launched?.child) stopCli(launched.child);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('rejects appends after the session log is swapped for a hard link', async () => {
   // The debugged project can mutate .debug after session creation. Swapping
   // the session log for a hard link to an outside file must fail closed
