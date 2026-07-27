@@ -88,6 +88,17 @@ test('discovers authoritative named checks and refuses fixed-command overrides',
   assert.equal(plan.checks.find(({ id }) => id === 'producer-tests').status, 'BLOCKED');
 });
 
+test('expands dash-prefixed root files as operands rather than command options', () => {
+  const plan = buildCheckPlan({
+    config: { commands: { 'biome-touched': 'biome check {touchedFiles}' } },
+    touchedFiles: ['--write', 'src/normal.js'],
+  });
+  assert.equal(
+    plan.checks.find(({ id }) => id === 'biome-touched').command,
+    "biome check './--write' 'src/normal.js'",
+  );
+});
+
 test('treats warning-like output as failure but accepts canonical zero summaries', () => {
   assert.equal(classifyOutput({ exitCode: 0, stdout: 'Tests: 42 passed, 0 failed, 0 skipped\nWarnings: 0' }).status, 'PASS');
   assert.equal(classifyOutput({ exitCode: 0, stdout: '4 passed; 0 failed; 0 ignored' }).status, 'PASS');

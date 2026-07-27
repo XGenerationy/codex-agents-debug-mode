@@ -243,7 +243,10 @@ const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
   let expanded = String(command).replaceAll(
     '{touchedFiles}',
-    touchedFiles.map(shellQuote).join(' '),
+    // Shell quoting prevents injection, but it does not stop an operand such
+    // as `--write` from being interpreted as a program option. Git emits
+    // repo-relative paths, so only a root-level dash needs `./` disambiguation.
+    touchedFiles.map((file) => shellQuote(String(file).startsWith('-') ? `./${file}` : file)).join(' '),
   );
   if (mergeBaseSha) {
     expanded = expanded.replaceAll('{mergeBaseSha}', shellQuote(mergeBaseSha));
