@@ -397,7 +397,7 @@ test('classifies a matching disposable-worktree failure as a blocking baseline',
   assert.deepEqual(calls, ['worktree:base123', 'C:/temp/baseline:pnpm typecheck']);
 });
 
-test('creates and removes a real detached baseline worktree', async () => {
+test('creates and removes a real detached isolated baseline clone', async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-repo-'));
   let worktree;
   try {
@@ -422,7 +422,7 @@ test('creates and removes a real detached baseline worktree', async () => {
   }
 });
 
-test('disables fsmonitor and global attributes for the internal baseline worktree', async () => {
+test('disables fsmonitor and global attributes for the isolated baseline clone', async () => {
   // A validation command can set core.fsmonitor or a global attribute smudge
   // filter that would execute during `git worktree add`. The internal worktree
   // wrapper overrides core.fsmonitor / core.useBuiltinFSMonitor /
@@ -458,12 +458,11 @@ test('disables fsmonitor and global attributes for the internal baseline worktre
 });
 
 
-test('neutralizes repository filter drivers and .git/info/attributes during baseline worktree checkout', async () => {
+test('does not inherit repository filter drivers or .git/info/attributes into the baseline clone', async () => {
   // A failed validation command can write .git/info/attributes + filter.*.smudge
-  // so that `git worktree add` runs an external smudge outside spawnCaptured
-  // containment. Clearing only core.attributesFile is not enough (reproduced
-  // against stock Git); the wrapper must also clear filter.*.smudge/clean and
-  // temporarily move .git/info/attributes away.
+  // so that a linked worktree checkout runs an external smudge outside
+  // spawnCaptured containment. The source file must remain untouched while
+  // the isolated clone's fresh Git directory excludes its attributes.
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-filter-'));
   let worktree;
   try {
@@ -484,15 +483,15 @@ test('neutralizes repository filter drivers and .git/info/attributes during base
       worktree = created;
       const content = require('node:fs').readFileSync(path.join(created, 'tracked.txt'), 'utf8').replace(/\r\n/g, '\n');
       assert.equal(content, 'base\n', 'smudge filter must not rewrite the baseline checkout');
-      // During the worktree lifetime the info attributes file is parked aside.
-      await assert.rejects(
-        () => require('node:fs/promises').access(path.join(infoDir, 'attributes')),
-        { code: 'ENOENT' },
+      assert.equal(
+        require('node:fs').readFileSync(path.join(infoDir, 'attributes'), 'utf8'),
+        'tracked.txt filter=evil\n',
+        'baseline checkout must not park or mutate source-repository attributes',
       );
       return 'verified';
     });
     assert.equal(value, 'verified');
-    // Restored for the main repo after the helper finishes.
+    // The source repo was never touched.
     const restoredAfter = require('node:fs').readFileSync(path.join(infoDir, 'attributes'), 'utf8');
     assert.match(restoredAfter, /filter=evil/);
   } finally {

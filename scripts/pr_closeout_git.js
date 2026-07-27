@@ -1,6 +1,6 @@
 const { execFile } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { lstat, mkdir, mkdtemp, rename, rm } = require('node:fs/promises');
+const { lstat, mkdir, mkdtemp, rm } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -382,11 +382,13 @@ const runGit = async (repo, args, options = {}) => {
 };
 
 /**
- * Checks out `baseSha` into a disposable, detached git worktree under a
- * fresh temp directory, runs `callback(worktreePath)`, and guarantees the
- * worktree and its temp directory are removed afterward (even if the
- * callback throws), so baseline comparisons never leak state into the real
- * repo or persist across runs. Refuses to proceed if the generated temp
+ * Checks out `baseSha` into an isolated disposable clone under a fresh temp
+ * directory, runs `callback(worktreePath)`, and guarantees the clone and its
+ * temp directory are removed afterward (even if the callback throws), so
+ * baseline comparisons never leak state into the real repo or persist across
+ * runs. Unlike a linked worktree, the clone has its own Git directory and
+ * never mutates the source repository's shared `.git/info/attributes`.
+ * Refuses to proceed if the generated temp
  * path does not actually resolve inside the OS temp directory, so a hostile
  * or misconfigured temp root cannot trick cleanup into acting outside it.
  * Internal git calls that create/remove the worktree are hardened against
@@ -407,7 +409,6 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   if (!relativeToTemp || relativeToTemp === '..' || relativeToTemp.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToTemp)) {
     throw new Error('Refusing unsafe baseline path.');
   }
-  let added = false;
   let primaryError;
   // Disable hooks AND the internal Git mechanisms that can execute attacker
   // code during an internal worktree create/remove, outside the command
@@ -429,9 +430,8 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //    force smudge=/clean=/process= empty and required=false via -c overrides.
   //    Global drivers must be included: a base `.gitattributes` can select a
   //    driver defined only in the operator's global Git config.
-  //  - `.git/info/attributes`: temporarily rename away during the internal
-  //    checkout so per-repo attributes cannot re-enable a filter driver even
-  //    if config discovery misses a name.
+  //  - `.git/info/attributes`: an isolated clone gets a fresh Git directory,
+  //    so source-repository info attributes are never inherited or mutated.
   const noHooksDir = path.join(parent, 'no-hooks');
   await mkdir(noHooksDir, { recursive: true });
   const filterOverrides = [];
@@ -515,149 +515,22 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   if (env) gitOptions.env = env;
   if (timeoutMs) gitOptions.timeout = timeoutMs;
 
-  // Resolve through git so linked worktrees (where .git is a file) still
-  // locate the shared info/attributes path. path.join(repo, '.git', ...) is
-  // ENOTDIR in that case and would block every baseline comparison.
-  const infoAttributesRaw = String(await runGit(repo, ['rev-parse', '--git-path', 'info/attributes'], gitOptions)).trim();
-  const infoAttributes = path.isAbsolute(infoAttributesRaw)
-    ? infoAttributesRaw
-    : path.resolve(repo, infoAttributesRaw);
-  const infoAttributesBackup = `${infoAttributes}.closeout-disabled.${process.pid}`;
-  let attributesMoved = false;
-  // Sync restore for signal handlers: async finally may not run on SIGINT/
-  // SIGTERM/SIGHUP/SIGBREAK before process exit, which would leave the
-  // validated repo without .git/info/attributes and an orphaned
-  // closeout-disabled backup.
-  const restoreAttributesSync = () => {
-    if (!attributesMoved) return;
-    try {
-      // eslint-friendly: use renameSync from fs for signal-safe restore.
-      require('node:fs').renameSync(infoAttributesBackup, infoAttributes);
-      attributesMoved = false;
-    } catch (restoreError) {
-      try {
-        process.stderr.write(
-          `Failed to restore ${infoAttributes} on signal: ${restoreError?.message || restoreError}\n`,
-        );
-      } catch {
-        // stderr may be closed
-      }
-    }
-  };
-  // After restore, re-deliver the signal so default Node termination runs.
-  // Leaving the handler installed would swallow Ctrl-C / CI SIGTERM and let
-  // closeout continue after attributes were restored.
-  const signalExitCodes = {
-    SIGINT: 130,
-    SIGTERM: 143,
-    SIGHUP: 129,
-    SIGBREAK: 1,
-  };
-  const restoreSignals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-  if (process.platform === 'win32') restoreSignals.push('SIGBREAK');
-  const signalHandlers = new Map();
-  const detachAllSignalHandlers = () => {
-    for (const [signal, handler] of signalHandlers) {
-      process.removeListener(signal, handler);
-    }
-    signalHandlers.clear();
-  };
-  for (const signal of restoreSignals) {
-    const handler = () => {
-      restoreAttributesSync();
-      detachAllSignalHandlers();
-      try {
-        process.kill(process.pid, signal);
-      } catch {
-        process.exit(signalExitCodes[signal] ?? 1);
-      }
-    };
-    signalHandlers.set(signal, handler);
-    process.on(signal, handler);
-  }
   try {
-    try {
-      // Recover a stale `.closeout-disabled.<pid>` backup left by a previous
-      // run that was killed without a catchable signal (SIGKILL / hard crash)
-      // before its finally restored .git/info/attributes. The PID-suffixed
-      // name means a stale backup never collides with this run's own backup;
-      // restore the most recent one only when the real attributes file is
-      // missing, so a crashed prior closeout does not leave the repo with
-      // filter/attribute behavior disabled (Codex M6UFnGP). Best-effort:
-      // never block the baseline comparison on recovery.
-      try {
-        const nodeFs = require('node:fs');
-        const attrsDir = path.dirname(infoAttributes);
-        const base = path.basename(infoAttributes);
-        const stalePrefix = `${base}.closeout-disabled.`;
-        let staleBackups = [];
-        try {
-          staleBackups = nodeFs.readdirSync(attrsDir)
-            .filter((entry) => entry.startsWith(stalePrefix))
-            .map((entry) => path.join(attrsDir, entry));
-        } catch { /* dir missing — nothing to recover */ }
-        let realAttributesExists = false;
-        try { nodeFs.statSync(infoAttributes); realAttributesExists = true; } catch { realAttributesExists = false; }
-        if (!realAttributesExists && staleBackups.length > 0) {
-          staleBackups.sort((a, b) => {
-            try { return nodeFs.statSync(b).mtimeMs - nodeFs.statSync(a).mtimeMs; } catch { return 0; }
-          });
-          await rename(staleBackups[0], infoAttributes);
-          for (const extra of staleBackups.slice(1)) {
-            process.stderr.write(`Warning: additional orphaned attributes backup left at ${extra}\n`);
-          }
-        }
-      } catch { /* recovery is best-effort */ }
-      await rename(infoAttributes, infoAttributesBackup);
-      attributesMoved = true;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-    try {
-      await runGit(repo, withInternalSafety(['worktree', 'add', '--detach', worktree, baseSha]), gitOptions);
-      added = true;
-      return await callback(worktree);
-    } catch (error) {
-      primaryError = error;
-      throw error;
-    } finally {
-      try {
-        if (added) {
-          await runGit(repo, withInternalSafety(['worktree', 'remove', '--force', worktree]), gitOptions);
-          await runGit(repo, withInternalSafety(['worktree', 'prune']), gitOptions);
-        }
-      } finally {
-        try {
-          await rm(parent, { recursive: true, force: true });
-        } catch (cleanupError) {
-          if (!primaryError) throw cleanupError;
-        }
-      }
-    }
+    // A normal clone copies objects and refs but creates a fresh .git/info
+    // directory. `--no-local` avoids shared-object/hard-link optimizations,
+    // keeping the disposable baseline independent even when `repo` is local.
+    await runGit(repo, withInternalSafety(['clone', '--no-checkout', '--no-local', repo, worktree]), gitOptions);
+    await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+    return await callback(worktree);
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    // Restore attributes while signal handlers still cover the async rename
-    // window, then detach. A signal mid-restore still runs restoreAttributesSync.
-    if (attributesMoved) {
-      try {
-        await rename(infoAttributesBackup, infoAttributes);
-        attributesMoved = false;
-      } catch (restoreError) {
-        if (!primaryError) {
-          detachAllSignalHandlers();
-          throw restoreError;
-        }
-        // Primary path already failed; still surface that the repo was left
-        // without its .git/info/attributes (orphaned closeout-disabled file).
-        const detail = `Failed to restore ${infoAttributes}: ${restoreError?.message || restoreError}`;
-        primaryError.restoreFailure = detail;
-        try {
-          process.stderr.write(`${detail}\n`);
-        } catch {
-          // stderr may be closed; property attachment above is enough.
-        }
-      }
+    try {
+      await rm(parent, { recursive: true, force: true });
+    } catch (cleanupError) {
+      if (!primaryError) throw cleanupError;
     }
-    detachAllSignalHandlers();
   }
 };
 
