@@ -1691,6 +1691,11 @@ test('proves a clean Windows tree from ONE cheap process-table snapshot', async 
         ['ComSpec', 'PATHEXT', 'SYSTEMROOT', 'SystemRoot'],
         'snapshot probe must not forward ambient environment',
       );
+      const script = args.at(-1);
+      assert.match(script, /Get-Process \| ForEach-Object/);
+      assert.match(script, /SELECT ProcessId,ParentProcessId FROM Win32_Process/);
+      assert.doesNotMatch(script, /SELECT .*CommandLine/);
+      assert.doesNotMatch(script, /CreationDate/);
       powershellCalls += 1;
       return { stdout: '400 1 500 services.exe\n', stderr: '' };
     },
@@ -1717,10 +1722,16 @@ test('blocks multi-level Windows orphans via the CommandLine attribution probe',
       error.code = 'ESRCH';
       throw error;
     },
-    runExecFile: async (file) => {
+    runExecFile: async (file, args) => {
       if (/taskkill\.exe$/i.test(file)) throw new Error('taskkill failed: root PID not found');
       assert.match(file, /powershell\.exe$/i);
       powershellCalls += 1;
+      if (powershellCalls === 2) {
+        const script = args.at(-1);
+        assert.match(script, /SELECT ProcessId,ParentProcessId,CommandLine FROM Win32_Process WHERE/);
+        assert.match(script, /\$candidatePids\.Add\(565656\)/);
+        assert.doesNotMatch(script, /SELECT .*CreationDate/);
+      }
       return { stdout: '565656 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
     },
   });

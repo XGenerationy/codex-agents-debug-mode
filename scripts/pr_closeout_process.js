@@ -550,51 +550,82 @@ const parseWindowsProcessTable = (stdout) => {
 };
 
 /**
- * Snapshot the Windows process table (ProcessId, ParentProcessId,
- * CreationDate, and optionally CommandLine) with ONE property-limited CIM
- * query. With the default `withCommandLine: false` the query omits the
- * CommandLine column: reading a process command line requires a per-process
- * PEB read, which is the dominant cost of this probe — on loaded
- * windows-latest CI runners a CommandLine-bearing full-table query
- * consistently exceeded the 20s probe budget (twice, BLOCKING every
- * createCommandExecutor test with "descendant enumeration failed"), while
- * the ParentProcessId/CreationDate-only table comes from cheap kernel
- * metadata. The caller therefore runs the cheap table first and pays for
- * CommandLine rows only when the cheap rows contain young/unknown-age
- * processes that actually need worktree attribution (typically none). The
- * earlier single-snapshot design (both proofs reusing one CommandLine table)
- * remains the fallback shape when attribution is required. (ccd7833
- * regression lesson, preserved: newline script, no `;`-joined statements,
- * property-limited queries.) The query takes no external input — the
- * worktree needle and time floor are applied in JS afterwards — so the
- * probe's own CommandLine can never match the needle, and no ambient env
- * (CI secrets) is forwarded to powershell (CodeRabbit #4781622077).
- * @param {{runExecFile: Function, powershell: string, withCommandLine?: boolean}} options
+ * Snapshot Windows PID/PPID data without asking the Win32_Process provider
+ * for CreationDate or CommandLine across the full process table. Both fields
+ * can trigger per-process inspection and repeatedly exceeded the 20s budget
+ * on loaded windows-latest runners. Start times come from Get-Process; CIM is
+ * used only for the PID/PPID adjacency table.
+ *
+ * When CommandLine attribution is required, query only the candidate PIDs
+ * plus processes that appeared after the command started. This preserves the
+ * fail-closed young/unknown-age sweep and catches processes born between the
+ * two snapshots without paying for every process's PEB. Inputs interpolated
+ * into the PowerShell are validated integers only, and the probe receives no
+ * ambient environment or CI secrets.
+ * @param {{
+ *   runExecFile: Function,
+ *   powershell: string,
+ *   withCommandLine?: boolean,
+ *   candidatePids?: number[],
+ *   minStartMs?: number,
+ * }} options
  * @returns {Promise<Array<{pid: number, parentPid: number, createdMs: number, commandLine: string}>>}
  */
-const snapshotWindowsProcessTable = async ({ runExecFile, powershell, withCommandLine = false }) => {
+const snapshotWindowsProcessTable = async ({
+  runExecFile,
+  powershell,
+  withCommandLine = false,
+  candidatePids = [],
+  minStartMs = 0,
+}) => {
+  const safeCandidatePids = [...new Set(candidatePids)]
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  const safeMinStartMs = Number.isFinite(minStartMs) && minStartMs > 0
+    ? Math.floor(minStartMs)
+    : 0;
   const scriptLines = [
     '$ErrorActionPreference = "Stop"',
-    withCommandLine
-      ? 'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CommandLine,CreationDate | ForEach-Object {'
-      : 'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object {',
+    '$createdByPid = @{}',
+    '$livePids = New-Object "System.Collections.Generic.HashSet[int]"',
+    'Get-Process | ForEach-Object {',
     '  $createdMs = 0L',
-    '  if ($_.CreationDate) {',
-    '    try { $createdMs = [DateTimeOffset]::new([DateTime]$_.CreationDate).ToUnixTimeMilliseconds() } catch { }',
-    '  }',
+    '  try { $createdMs = [DateTimeOffset]::new($_.StartTime).ToUnixTimeMilliseconds() } catch { }',
+    '  $pidValue = [int]$_.Id',
+    '  $createdByPid[$pidValue] = $createdMs',
+    '  [void]$livePids.Add($pidValue)',
+    '}',
   ];
   if (withCommandLine) {
     scriptLines.push(
-      '  $cl = [string]$_.CommandLine',
-      '  if ($cl) { $cl = $cl -replace "[`r`n]+", " " }',
-      '  "{0} {1} {2} {3}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs, $cl',
+      `$candidatePids = New-Object "System.Collections.Generic.HashSet[int]"`,
+      ...safeCandidatePids.map((pid) => `[void]$candidatePids.Add(${pid})`),
+      '$livePids | ForEach-Object {',
+      '  $createdMs = [long]$createdByPid[$_]',
+      `  if ($createdMs -eq 0 -or $createdMs -ge ${safeMinStartMs}L) { [void]$candidatePids.Add([int]$_) }`,
+      '}',
+      'if ($candidatePids.Count -gt 0) {',
+      '  $where = (($candidatePids | Sort-Object) | ForEach-Object { "ProcessId = $_" }) -join " OR "',
+      '  $query = "SELECT ProcessId,ParentProcessId,CommandLine FROM Win32_Process WHERE $where"',
+      '  Get-CimInstance -Query $query | ForEach-Object {',
+      '    $pidValue = [int]$_.ProcessId',
+      '    $createdMs = 0L',
+      '    if ($createdByPid.ContainsKey($pidValue)) { $createdMs = [long]$createdByPid[$pidValue] }',
+      '    $cl = [string]$_.CommandLine',
+      '    if ($cl) { $cl = $cl -replace "[`r`n]+", " " }',
+      '    "{0} {1} {2} {3}" -f $pidValue, [int]$_.ParentProcessId, $createdMs, $cl',
+      '  }',
+      '}',
     );
   } else {
     scriptLines.push(
-      '  "{0} {1} {2}" -f [int]$_.ProcessId, [int]$_.ParentProcessId, $createdMs',
+      'Get-CimInstance -Query "SELECT ProcessId,ParentProcessId FROM Win32_Process" | ForEach-Object {',
+      '  $pidValue = [int]$_.ProcessId',
+      '  $createdMs = 0L',
+      '  if ($createdByPid.ContainsKey($pidValue)) { $createdMs = [long]$createdByPid[$pidValue] }',
+      '  "{0} {1} {2}" -f $pidValue, [int]$_.ParentProcessId, $createdMs',
+      '}',
     );
   }
-  scriptLines.push('}');
   const script = scriptLines.join('\n');
   const minimalEnv = {
     SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
@@ -915,11 +946,11 @@ const terminateProcessTree = async ({
         // never of taskkill or of the validated command — absorbs transient
         // CIM slowness on shared CI runners; two failed attempts still fail
         // closed to BLOCKED, so the gate is not weakened.
-        const snapshotWithRetry = async (withCommandLine) => {
+        const snapshotWithRetry = async (options = {}) => {
           let lastError = null;
           for (let attempt = 1; attempt <= 2; attempt += 1) {
             try {
-              return await snapshotWindowsProcessTable({ runExecFile, powershell, withCommandLine });
+              return await snapshotWindowsProcessTable({ runExecFile, powershell, ...options });
             } catch (error) {
               lastError = error;
               if (attempt < 2) await delay(250);
@@ -930,7 +961,7 @@ const terminateProcessTree = async ({
         let table;
         let enumerationError = null;
         try {
-          table = await snapshotWithRetry(false);
+          table = await snapshotWithRetry();
         } catch (error) {
           enumerationError = error;
         }
@@ -967,7 +998,22 @@ const terminateProcessTree = async ({
               let attributed;
               let attributionError = null;
               try {
-                attributed = await snapshotWithRetry(true);
+                const commandLineRows = await snapshotWithRetry({
+                  withCommandLine: true,
+                  candidatePids: candidates.map((row) => row.pid),
+                  minStartMs: orphanScanOptions.minStartMs,
+                });
+                const commandLineByPid = new Map(
+                  commandLineRows.map((row) => [row.pid, row.commandLine]),
+                );
+                const knownPids = new Set(table.map((row) => row.pid));
+                attributed = table.map((row) => ({
+                  ...row,
+                  commandLine: commandLineByPid.get(row.pid) || '',
+                }));
+                for (const row of commandLineRows) {
+                  if (!knownPids.has(row.pid)) attributed.push(row);
+                }
               } catch (error) {
                 attributionError = error;
               }
