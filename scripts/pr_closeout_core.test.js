@@ -1265,6 +1265,11 @@ test('scopes shell-helper config scanning to validation helper locations', () =>
     'tools/*.bash helper must stay config-like',
   );
   assert.ok(
+    scanSuppressionText('tools/validate', '#!/bin/sh\nnpm test || true\n')
+      .some(({ category }) => category === 'config-silencing'),
+    'extensionless validation helpers with a shell shebang must stay config-like',
+  );
+  assert.ok(
     scanSuppressionText('install.sh', 'npm test || true\n')
       .some(({ category }) => category === 'config-silencing'),
     'install.sh must stay config-like',

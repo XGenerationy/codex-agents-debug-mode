@@ -15,6 +15,7 @@ const {
   isInsideRoot,
   openNoFollowSync,
   probeLaunchToken,
+  probeReadyCollector,
   probeServer,
   readJson,
 } = require('./debug_server');
@@ -343,6 +344,32 @@ test('probeLaunchToken settles within a bounded wall-clock period against a tric
     const elapsedMs = Date.now() - startedAt;
     assert.equal(result, false);
     assert.ok(elapsedMs < 5_000, `launch-token probe must respect its wall-clock deadline (took ${elapsedMs}ms)`);
+  } finally {
+    await close(trickler);
+  }
+});
+
+test('probeReadyCollector bounds all retries against a trickling /health response', { timeout: 10000 }, async () => {
+  const trickler = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    const interval = setInterval(() => {
+      if (!response.destroyed) response.write('x');
+    }, 100);
+    response.on('close', () => clearInterval(interval));
+    response.on('error', () => clearInterval(interval));
+  });
+  const tricklerUrl = await listen(trickler);
+
+  try {
+    const startedAt = Date.now();
+    const result = await probeReadyCollector(
+      Number(new URL(tricklerUrl).port),
+      'a'.repeat(64),
+      { attempts: 20, delayMs: 50, deadlineMs: 2_500 },
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(result, null);
+    assert.ok(elapsedMs < 4_000, `ready probe retries must honor one deadline (took ${elapsedMs}ms)`);
   } finally {
     await close(trickler);
   }

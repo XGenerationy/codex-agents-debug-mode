@@ -779,9 +779,10 @@ const createDebugServer = ({
  * a valid match, or `null` for any failure, timeout, malformed body, or
  * non-200/non-matching response — this never rejects.
  * @param {number} port
+ * @param {{deadlineMs?: number}} [options]
  * @returns {Promise<{service: string, version: number, instance_id: string, project_hash: string, ready: boolean}|null>}
  */
-const probeServer = (port) =>
+const probeServer = (port, { deadlineMs = 2_000 } = {}) =>
   new Promise((resolve) => {
     let settled = false;
     let deadline;
@@ -855,7 +856,7 @@ const probeServer = (port) =>
     deadline = setTimeout(() => {
       request.destroy();
       finish(null);
-    }, 2_000);
+    }, deadlineMs);
     deadline.unref();
   });
 
@@ -865,20 +866,36 @@ const probeServer = (port) =>
  * process is still mid token-file write after listen().
  * @param {number} port
  * @param {string} expectedProjectHash
- * @param {{attempts?: number, delayMs?: number}} [options]
+ * @param {{attempts?: number, delayMs?: number, deadlineMs?: number}} [options]
  */
-const probeReadyCollector = async (port, expectedProjectHash, { attempts = 20, delayMs = 50 } = {}) => {
+const probeReadyCollector = async (
+  port,
+  expectedProjectHash,
+  { attempts = 20, delayMs = 50, deadlineMs = 10_000 } = {},
+) => {
+  const deadlineAt = Date.now() + deadlineMs;
   for (let i = 0; i < attempts; i += 1) {
-    const identity = await probeServer(port);
+    const remainingBeforeProbe = deadlineAt - Date.now();
+    if (remainingBeforeProbe <= 0) return null;
+    const identity = await probeServer(port, { deadlineMs: Math.min(2_000, remainingBeforeProbe) });
     if (identity && identity.project_hash === expectedProjectHash && identity.ready) {
       return identity;
     }
     if (identity && identity.project_hash !== expectedProjectHash) {
       return identity; // different project — caller maps to port_in_use
     }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) return null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remainingMs)));
   }
-  return probeServer(port);
+  // The final health probe must fit in the same overall startup budget. Each
+  // probe has an inactivity and wall-clock timeout, but without this outer
+  // deadline a continuously trickling listener could multiply those costs by
+  // every retry and outlive the documented startup-capture polling window.
+  const remainingBeforeFinalProbe = deadlineAt - Date.now();
+  return remainingBeforeFinalProbe > 0
+    ? probeServer(port, { deadlineMs: Math.min(2_000, remainingBeforeFinalProbe) })
+    : null;
 };
 
 /**
@@ -1399,6 +1416,7 @@ module.exports = {
   isInsideRoot,
   openNoFollowSync,
   probeLaunchToken,
+  probeReadyCollector,
   probeServer,
   readJson,
 };

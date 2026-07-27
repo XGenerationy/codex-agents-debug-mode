@@ -755,8 +755,10 @@ const scanSuppressionText = (file, text) => {
   // reclassify ordinary application/deploy scripts (e.g. src/deploy.sh) as
   // config, running config-silencing neutrality checks on shell code that is
   // not a validation helper (CodeRabbit discussion_r3652923133).
+  const helperDirectory = /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized);
+  const shellShebang = /^#!\s*(?:(?:\/usr\/bin\/env)\s+|(?:\/\S+\/))?(?:ba)?(?:sh|zsh|ksh)\b/m.test(text);
   const shellHelper = base === 'install.sh'
-    || /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized) && /\.(?:sh|bash|zsh|ksh)$/.test(base);
+    || helperDirectory && (/\.(?:sh|bash|zsh|ksh)$/.test(base) || shellShebang);
   const configLike = ignoreFile || shellHelper
     || /\.(?:jsonc?|ya?ml|toml|ini|conf)$/.test(base)
     || /(?:^|\.)config\.[a-z0-9]+$/.test(base)
