@@ -331,12 +331,66 @@ test('exclusive output-dir lock does not reclaim a freshly created incomplete ho
   try {
     await fs.writeFile(lockPath, '', 'utf8');
     await assert.rejects(acquireOutputDirLock(tmp), /still initializing/i);
+    // A rejecting contender must leave the possibly live creator's record
+    // alone; otherwise the rejection itself would break exclusivity.
+    await fs.stat(lockPath);
 
     const old = new Date(Date.now() - 10_000);
     await fs.utimes(lockPath, old, old);
     const lock = await acquireOutputDirLock(tmp);
     assert.ok(lock.nonce);
     await lock.release();
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('exclusive output-dir lock revalidates a stale holder before reclaiming it', async () => {
+  // A contender can only use the stale record it actually observed. This
+  // simulates a newer holder appearing between the initial recovery read and
+  // the reclaim step; the newer record must survive untouched.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-revalidate-lock-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  const successor = `${process.pid}\nsuccessor-nonce\n`;
+  let reads = 0;
+  try {
+    await fs.writeFile(lockPath, successor, 'utf8');
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: async () => {
+          reads += 1;
+          return reads === 1 ? '2147483646\nstale-nonce\n' : successor;
+        },
+      }),
+      /already locked by this closeout process/i,
+    );
+    assert.equal(await fs.readFile(lockPath, 'utf8'), successor);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('exclusive output-dir lock release refuses a symlinked successor', async () => {
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-release-symlink-'));
+  try {
+    const lock = await acquireOutputDirLock(tmp);
+    const replacement = nodePath.join(tmp, 'replacement-lock');
+    await fs.unlink(lock.path);
+    await fs.writeFile(replacement, `${process.pid}\n${lock.nonce}\n`, 'utf8');
+    try {
+      await fs.symlink(replacement, lock.path, 'file');
+    } catch (error) {
+      if (['EACCES', 'EPERM', 'ENOSYS'].includes(error?.code)) return;
+      throw error;
+    }
+    await lock.release();
+    assert.equal((await fs.lstat(lock.path)).isSymbolicLink(), true);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

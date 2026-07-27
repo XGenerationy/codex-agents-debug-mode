@@ -19,21 +19,14 @@ const requiredFiles = [
   'scripts/pr_closeout.js',
 ];
 
-// Non-payload paths that still ship in the public repo and must pass the
-// public-distribution safety scan (docs, workflows, tooling).
-const safetyScanRoots = [
-  'README.md',
-  'SECURITY.md',
-  'CONTRIBUTING.md',
-  'NOTICE.md',
-  'LICENSE',
-  'package.json',
-  'package-lock.json',
-  '.gitattributes',
-  '.codereview.yml',
-  '.github/workflows',
-  'tools',
-];
+// `git ls-files` is the source of truth for what the public repository ships.
+// Keep exclusions explicit rather than relying on an incomplete list of roots:
+// these local/VCS directories are intentionally neither tracked nor shipped.
+const safetyScanExcludedPrefixes = new Map([
+  ['.git/', 'Git object and worktree metadata'],
+  ['node_modules/', 'locally installed third-party dependencies'],
+  ['.tmp/', 'local audit artifacts'],
+]);
 
 const failures = [];
 
@@ -76,35 +69,27 @@ const walk = (entry) => {
 };
 
 /**
- * Same recursive, symlink-rejecting walk as `walk`, but for optional
- * safety-scan roots: a missing entry is skipped silently (returns `[]`)
- * instead of recording a failure, since these paths (docs, workflows,
- * tooling) are not required payload files. A symlink or non-regular file
- * that does exist is still recorded as a failure — optional presence does
- * not relax the symlink/regular-file safety requirement.
- * @param {string} entry path relative to `root`.
- * @returns {string[]} regular-file paths (relative to `root`) found under `entry`, or `[]` if it doesn't exist.
+ * Enumerate every tracked file rather than a hand-maintained collection of
+ * payload/docs/tooling roots. A new public path therefore enters the safety
+ * scan automatically. NUL-delimited output preserves unusual valid Git paths
+ * without shell interpolation or line-splitting ambiguity.
+ * @returns {string[]}
  */
-const walkOptional = (entry) => {
-  const absolute = path.join(root, entry);
-  let info;
-  try {
-    info = lstatSync(absolute);
-  } catch (error) {
-    if (error.code === 'ENOENT') return [];
-    throw error;
-  }
-  if (info.isSymbolicLink()) {
-    failures.push(`Safety-scan path must not be a symlink: ${entry}`);
+const listTrackedRepositoryFiles = () => {
+  const result = spawnSync('git', ['-C', root, 'ls-files', '-z'], { encoding: 'buffer' });
+  if (result.error) {
+    failures.push(`Unable to enumerate tracked repository files: ${result.error.message}`);
     return [];
   }
-  if (info.isDirectory()) {
-    return readdirSync(absolute).flatMap((name) => walkOptional(path.join(entry, name)));
+  if (result.status !== 0) {
+    failures.push(`Unable to enumerate tracked repository files: ${String(result.stderr || '').trim() || 'git ls-files failed'}`);
+    return [];
   }
-  if (info.isFile()) return [entry];
-  failures.push(`Safety-scan path must be a regular file: ${entry}`);
-  return [];
+  return Buffer.from(result.stdout || []).toString('utf8').split('\0').filter(Boolean);
 };
+
+const isSafetyScanExcluded = (file) => [...safetyScanExcludedPrefixes.keys()]
+  .some((prefix) => file === prefix.slice(0, -1) || file.startsWith(prefix));
 
 for (const file of requiredFiles) {
   try {
@@ -166,20 +151,18 @@ const publicSafetyPatterns = [
   ['generated attribution line', /^\s*Generated with \[Claude Code\]/m],
 ];
 
-const safetyScanFiles = [...new Set([
-  ...payloadFiles,
-  ...safetyScanRoots.flatMap(walkOptional),
-])].sort();
+const safetyScanFiles = listTrackedRepositoryFiles()
+  .filter((file) => !isSafetyScanExcluded(file))
+  .sort();
 
 /**
  * Reads one file and records a failure for each `publicSafetyPatterns` entry
  * it matches — credential-shaped tokens, private key headers, personal
  * Windows/Unix home paths, or a generated-attribution line — so none of
- * these ever ship in the public skill payload or its docs/tooling. Silently
- * returns if the file has already disappeared (lstat ENOENT; a real error is
- * still reported by the required/payload checks that ran earlier), and
- * refuses to read a non-regular-file or oversize (`MAX_PAYLOAD_FILE_BYTES`)
- * target rather than risk hanging or OOMing the validator.
+ * these ever ship in the public repository. A tracked file that disappears or
+ * becomes unreadable is a validator failure, never a silently skipped scan.
+ * The validator also refuses to read a non-regular-file or oversize
+ * (`MAX_PAYLOAD_FILE_BYTES`) target rather than risk hanging or OOMing.
  * @param {string} file path relative to `root`.
  */
 const scanFileForPublicSafety = (file) => {
@@ -187,7 +170,8 @@ const scanFileForPublicSafety = (file) => {
   let info;
   try {
     info = lstatSync(abs);
-  } catch {
+  } catch (error) {
+    failures.push(`Safety scan target cannot be inspected: ${file}: ${error.message}`);
     return;
   }
   if (!info.isFile()) {
@@ -198,7 +182,13 @@ const scanFileForPublicSafety = (file) => {
     failures.push(`Safety scan file exceeds validator size bound: ${file}`);
     return;
   }
-  const content = readFileSync(abs, 'utf8');
+  let content;
+  try {
+    content = readFileSync(abs, 'utf8');
+  } catch (error) {
+    failures.push(`Safety scan target cannot be read: ${file}: ${error.message}`);
+    return;
+  }
   for (const [label, pattern] of publicSafetyPatterns) {
     if (pattern.test(content)) failures.push(`${file} contains ${label}`);
   }
@@ -206,14 +196,9 @@ const scanFileForPublicSafety = (file) => {
 
 for (const file of safetyScanFiles) scanFileForPublicSafety(file);
 
-// Derive the JavaScript list from payloadFiles (scripts/ is already a payload
-// entry) plus the optional tools/ walk, instead of re-walking scripts/ — that
-// duplicate traversal repeated filesystem work and could surface walk() failures
-// twice for missing/symlinked/non-regular entries.
-const javascriptFiles = [
-  ...payloadFiles.filter((name) => name.endsWith('.js')),
-  ...walkOptional('tools').filter((name) => name.endsWith('.js')),
-];
+// The tracked-file census above covers scripts, tooling, tests, and any future
+// JavaScript path, so syntax validation has the same complete scope.
+const javascriptFiles = safetyScanFiles.filter((name) => name.endsWith('.js'));
 for (const file of javascriptFiles) {
   const abs = path.join(root, file);
   try {

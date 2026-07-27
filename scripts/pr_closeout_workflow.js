@@ -1,7 +1,14 @@
 const { randomBytes } = require('node:crypto');
-const { constants: fsConstants } = require('node:fs');
+const {
+  closeSync,
+  constants: fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+} = require('node:fs');
 const { tmpdir } = require('node:os');
-const { mkdir, open: openFile, readFile, realpath, stat, unlink } = require('node:fs/promises');
+const { lstat, mkdir, open: openFile, realpath, stat, unlink } = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -207,6 +214,59 @@ const OUTPUT_DIR_LOCK_MAX_BYTES = 4096;
 const OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS = 5_000;
 
 /**
+ * Extract the holder identity from a complete lock payload. The timestamp is
+ * intentionally not part of identity: pid + nonce is the ownership tuple
+ * that release and stale recovery must agree on.
+ * @param {string} text
+ * @returns {{pid: number, nonce: string}|null}
+ */
+const outputDirLockHolder = (text) => {
+  const lines = String(text).split(/\r?\n/);
+  const pid = Number(String(lines[0] || '').trim());
+  const nonce = String(lines[1] || '').trim();
+  return Number.isInteger(pid) && pid > 0 && nonce ? { pid, nonce } : null;
+};
+
+/**
+ * Synchronous counterpart to readOutputDirLockFile for the process `exit`
+ * handler. Exit hooks cannot await, but they must retain the same no-follow,
+ * regular-file, bounded-read, and descriptor-identity checks before they
+ * consider unlinking a lock. If any guard cannot be established, the handler
+ * fails closed and stale recovery cleans up later.
+ * @param {string} lockPath
+ * @returns {string}
+ */
+const readOutputDirLockFileSync = (lockPath) => {
+  const before = lstatSync(lockPath);
+  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+    throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
+  }
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0);
+  const descriptor = openSync(lockPath, flags);
+  try {
+    const info = fstatSync(descriptor);
+    if (
+      !info.isFile()
+      || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+      || info.dev !== before.dev
+      || info.ino !== before.ino
+    ) {
+      throw new Error(`Evidence lock changed while opening: ${lockPath}`);
+    }
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < info.size) {
+      const bytesRead = readSync(descriptor, buffer, offset, info.size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+  } finally {
+    closeSync(descriptor);
+  }
+};
+
+/**
  * Read an existing .closeout.lock for stale-holder recovery without ever
  * blocking or following a link: open through openNoFollow (the shared
  * no-follow/nonblocking attempt ladder from pr_closeout_fs.js) and re-verify
@@ -221,11 +281,20 @@ const OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS = 5_000;
  * @returns {Promise<string>} raw lock payload.
  */
 const readOutputDirLockFile = async (lockPath) => {
+  const before = await lstat(lockPath);
+  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+    throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
+  }
   const handle = await openNoFollow(lockPath, fsConstants.O_RDONLY);
   try {
     const info = await handle.stat();
-    if (!info.isFile() || info.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
-      throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
+    if (
+      !info.isFile()
+      || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+      || info.dev !== before.dev
+      || info.ino !== before.ino
+    ) {
+      throw new Error(`Evidence lock changed while opening: ${lockPath}`);
     }
     const buffer = Buffer.alloc(info.size);
     let offset = 0;
@@ -271,9 +340,8 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           try {
             // Only unlink if we still own the nonce (another process must not
             // have reclaimed and rewritten the lock after a crash).
-            const text = await readFile(lockPath, 'utf8').catch(() => '');
-            const lines = String(text).split(/\r?\n/);
-            if (String(lines[1] || '').trim() === nonce) {
+            const holder = outputDirLockHolder(await readOutputDirLockFile(lockPath));
+            if (holder?.nonce === nonce) {
               await unlink(lockPath).catch(() => {});
             }
           } catch {
@@ -284,10 +352,9 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // Safety net for abrupt exits (CodeRabbit #4781622077).
       const onExit = () => {
         try {
-          const { unlinkSync, readFileSync } = require('node:fs');
-          const text = readFileSync(lockPath, 'utf8');
-          const lines = String(text).split(/\r?\n/);
-          if (String(lines[1] || '').trim() === nonce) unlinkSync(lockPath);
+          const { unlinkSync } = require('node:fs');
+          const holder = outputDirLockHolder(readOutputDirLockFileSync(lockPath));
+          if (holder?.nonce === nonce) unlinkSync(lockPath);
         } catch {
           // ignore
         }
@@ -296,28 +363,27 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       return { handle, path: lockPath, nonce, release };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      let holderPid = null;
-      let holderNonce = null;
+      let holder = null;
+      let staleSnapshot = null;
       try {
         // Guarded bounded read (Codex #UDDQC): a FIFO/symlinked/oversized
         // lock throws here and is treated exactly like a corrupt lock below.
         const text = await readLockFile(lockPath);
-        const lines = String(text).split(/\r?\n/);
-        holderPid = Number(String(lines[0] || '').trim());
-        holderNonce = String(lines[1] || '').trim() || null;
-        if (!Number.isInteger(holderPid) || holderPid <= 0 || !holderNonce) {
+        staleSnapshot = String(text);
+        holder = outputDirLockHolder(text);
+        if (!holder) {
           // A fresh empty/partial record is an active contender between its
           // exclusive create and awaited payload write (M6UIcIK). Treat it as
           // held during a short bounded window; after that, stale/corrupt
           // records retain the existing reclaim behavior.
           const info = await stat(lockPath);
           if (Date.now() - info.mtimeMs < OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS) {
-            throw new Error(
+            const initializingError = new Error(
               `Evidence output directory lock is still initializing and may be held by a live closeout process: ${outputDir}`,
             );
+            initializingError.code = 'ECLOSEOUTLOCKINIT';
+            throw initializingError;
           }
-          holderPid = null;
-          holderNonce = null;
         }
       } catch (readError) {
         // A permission/transient-I/O error (EACCES/EPERM/EIO) means a live
@@ -331,24 +397,23 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
             `Evidence output directory lock is unreadable (${readError.code}) and may be held by a live closeout process: ${outputDir}`,
           );
         }
-        if (/still initializing/.test(String(readError?.message || ''))) {
+        if (readError?.code === 'ECLOSEOUTLOCKINIT') {
           throw readError;
         }
-        holderPid = null;
-        holderNonce = null;
+        holder = null;
       }
       // Same-process re-entry: the lock file still names us while we hold the
       // FD. Unlink+recreate would not provide exclusion (Unix allows O_EXCL on
       // a new inode after unlink of an open file).
-      if (holderPid === process.pid) {
+      if (holder?.pid === process.pid) {
         throw new Error(
           `Evidence output directory is already locked by this closeout process: ${outputDir}`,
         );
       }
       let holderAlive = false;
-      if (Number.isInteger(holderPid) && holderPid > 0) {
+      if (holder) {
         try {
-          process.kill(holderPid, 0);
+          process.kill(holder.pid, 0);
           holderAlive = true;
         } catch (probeError) {
           holderAlive = probeError?.code !== 'ESRCH';
@@ -359,10 +424,23 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // unlink a successor's lock.
       if (holderAlive) {
         throw new Error(
-          `Evidence output directory is already locked by closeout pid ${holderPid}: ${outputDir}`,
+          `Evidence output directory is already locked by closeout pid ${holder.pid}: ${outputDir}`,
         );
       }
       try {
+        // Re-read immediately before the single reclaim unlink. A stale
+        // snapshot must never authorize deletion of a record a concurrent
+        // contender created after our first read. After unlink, restart at
+        // O_EXCL acquisition; if another contender wins that atomic create,
+        // the next iteration observes its own holder record instead of
+        // applying this stale decision to the successor.
+        // A read guard failure has no trustworthy payload to compare, so it
+        // retains the established corrupt-lock recovery path. Parsed and
+        // incomplete records, however, must still match byte-for-byte before
+        // this contender may remove them.
+        if (staleSnapshot !== null && String(await readLockFile(lockPath)) !== staleSnapshot) {
+          continue;
+        }
         await unlink(lockPath);
       } catch (unlinkError) {
         if (unlinkError?.code !== 'ENOENT') {
