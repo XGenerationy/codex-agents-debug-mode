@@ -38,6 +38,12 @@ const closeServer = (server) => new Promise((resolve, reject) => {
   server.close((error) => (error ? reject(error) : resolve()));
 });
 
+// CI failure diagnostics: when a status assertion fails, print the executor's
+// evidence so the remote runner log carries the root cause.
+const statusDiag = (result) =>
+  `evidence: ${result?.evidence || ''} | terminationEvidence: ${result?.terminationEvidence || ''}`;
+
+
 test('uses an explicit absolute Git Bash path on Windows', () => {
   const shell = resolveCommandShell({
     platform: 'win32',
@@ -66,7 +72,7 @@ test('preflight blocks missing tools, credentials, service health, and disk', as
     probeRedis: async () => false,
     probeHttp: async () => true,
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.ok(result.checks.some(({ name, status }) => name === 'pnpm' && status === 'BLOCKED'));
   assert.ok(result.checks.some(({ name, status }) => name === 'env:REDIS_PASSWORD' && status === 'BLOCKED'));
   assert.ok(result.checks.some(({ name, status }) => name === 'redis' && status === 'BLOCKED'));
@@ -251,7 +257,7 @@ test('command executor records timestamps, exit code, output, and a log', async 
     { id: 'probe', command: "process.stdout.write('clean output')" },
     'qualification',
   );
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.exitCode, 0);
   assert.match(result.startedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.match(result.finishedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -297,7 +303,7 @@ test('classifies warning output that appears after the report capture cap', asyn
   }, 'qualification');
   assert.equal(result.stdout.length, 2_000_000);
   assert.doesNotMatch(result.stdout, /UserWarning/);
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /UserWarning/);
 });
 
@@ -354,7 +360,7 @@ test('rejects a stale artifact that existed unchanged before the command', async
     command: "process.stdout.write('clean')",
     proof: { type: 'artifact', path: 'render.json' },
   }, 'confirmation');
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /not refreshed by this run/i);
 });
 
@@ -374,7 +380,7 @@ test('rejects timestamp-only artifact refreshes', async () => {
     command: "const fs=require('node:fs'); const now=new Date(); fs.utimesSync('render.json', now, now)",
     proof: { type: 'artifact', path: 'render.json' },
   }, 'confirmation');
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /not refreshed/i);
 });
 
@@ -386,7 +392,7 @@ test('rejects hard-linked artifact proof files', async () => {
   await link(outside, artifact);
   const result = await snapshotArtifactProof({ proof: { type: 'artifact', path: 'render.json' }, cwd: repo });
   assert.equal((await stat(artifact)).nlink > 1, true);
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /hard-linked/i);
 });
 
@@ -410,7 +416,7 @@ test('rejects artifact proof paths whose real target escapes through a link', as
     },
     hashArtifact: async () => 'digest',
   });
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /resolves outside/i);
 });
 
@@ -433,7 +439,7 @@ test('requires explicit health evidence from a postcondition command', async () 
       expectedPattern: 'semantic:docker-compose-running-healthy',
     },
   }, 'confirmation');
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.proofResult.matched, true);
 });
 
@@ -456,7 +462,7 @@ test('rejects hunter proof when Docker reports running but unhealthy', async () 
       expectedPattern: 'semantic:docker-compose-running-healthy',
     },
   }, 'confirmation');
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.equal(result.proofResult.matched, false);
   assert.match(result.evidence, /running.*healthy/i);
 });
@@ -478,7 +484,7 @@ test('rejects arbitrary proof regex syntax instead of evaluating it', async () =
       expectedPattern: '^(a+)+$',
     },
   }, 'confirmation');
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /literal:|semantic:/i);
 });
 
@@ -502,7 +508,7 @@ test('never returns raw secrets embedded in primary or proof commands', async ()
       expectedPattern: 'literal:healthy',
     },
   }, 'confirmation');
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
   assert.match(result.command, /\[REDACTED\]/);
   assert.match(result.proof.command, /\[REDACTED\]/);
@@ -528,7 +534,7 @@ test('classifies status signals before redaction without retaining the raw secre
     path.join(outputDir, 'logs', 'qualification.redacted-error.attempt-001.log'),
     'utf8',
   );
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.doesNotMatch(serialized, /super-sensitive-raw-signal/);
   assert.doesNotMatch(log, /super-sensitive-raw-signal/);
   assert.match(result.stdout, /\[REDACTED\]/);
@@ -554,7 +560,7 @@ test('does not pass ambient credentials to child commands', async () => {
     id: 'child-env',
     command: "process.stdout.write(JSON.stringify({docker:process.env.DOCKER_AUTH_CONFIG||null,allowed:process.env.API_TOKEN||null}))",
   }, 'qualification');
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.stdout, '{"docker":null,"allowed":"[REDACTED]"}');
   assert.doesNotMatch(JSON.stringify(result), /ambient-secret|explicit-required-secret/);
 });
@@ -869,7 +875,7 @@ test('timeout terminates descendants before they can mutate evidence', async () 
   const result = await execute({ id: 'timeout-tree', command }, 'qualification');
   await access(ready);
   await new Promise((resolve) => setTimeout(resolve, 1000));
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.equal(result.timedOut, true);
   assert.equal(result.terminationStatus, 'PASS', result.terminationEvidence);
   await assert.rejects(access(marker));
@@ -914,7 +920,7 @@ test('preflight treats warning output from a successful probe as failure', async
     }),
     diskFreeGb: async () => 10,
   });
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.ok(result.checks.some(({ name, status }) => name === 'node' && status === 'FAIL'));
 });
 
@@ -940,7 +946,7 @@ test('preflight converts rejecting service probes into BLOCKED checks instead of
     probeHttp: explodingHttp,
   });
   assert.notEqual(result.status, 'FAIL');
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   const redis = result.checks.find((c) => c.name === 'redis');
   const grafana = result.checks.find((c) => c.name === 'grafana');
   const port = result.checks.find((c) => c.name.startsWith('port:'));
@@ -1161,7 +1167,7 @@ test('runPreflight BLOCKs when a probe reports process-tree cleanup failure', as
     }),
     diskFreeGb: async () => 10,
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   const blockedProbe = result.checks.find(
     ({ name, status }) => name === 'git' && status === 'BLOCKED',
   );
@@ -1339,7 +1345,7 @@ test('still runs taskkill /T when the Windows root PID has already exited', asyn
       return { stdout: '', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.escalated, true);
   assert.equal(taskkillRan, true);
   assert.match(result.evidence, /taskkill/i);
@@ -1357,7 +1363,7 @@ test('runs taskkill for a live Windows process tree', async () => {
       return { stdout: 'SUCCESS', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.escalated, true);
   assert.equal(calls.length, 1);
   assert.match(calls[0][0], /taskkill\.exe$/i);
@@ -1383,7 +1389,7 @@ test('accepts a Windows tree that exits before taskkill lands, when no descendan
       return { stdout: '', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.escalated, true);
   assert.match(result.evidence, /no live descendants/i);
 });
@@ -1409,7 +1415,7 @@ test('terminates and confirms descendants that outlived a Windows root taskkill 
       return { stdout: '5555 1234\n5556 1234\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.escalated, true);
   assert.deepEqual(killedPids.sort(), ['5555', '5556']);
   assert.match(result.evidence, /2 live descendant/i);
@@ -1433,7 +1439,7 @@ test('blocks a Windows tree when a descendant survives taskkill after the root a
       return { stdout: '5555 1234\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /5555/);
   assert.match(result.evidence, /could not be confirmed terminated/i);
 });
@@ -1452,7 +1458,7 @@ test('blocks a Windows tree when descendant enumeration itself fails after the r
       throw new Error('powershell is not available');
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /enumeration failed/i);
   assert.match(result.evidence, /powershell is not available/);
 });
@@ -1471,7 +1477,7 @@ test('blocks a Windows tree when taskkill fails while the root is still alive', 
       return { stdout: '', stderr: '' };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.equal(powershellRan, false, 'descendant enumeration must not run while the root is alive');
   assert.match(result.evidence, /access denied/);
 });
@@ -1501,7 +1507,7 @@ test('enumerates multi-level Windows descendants from a full process table', asy
       return { stdout: '200 100\n300 200\n400 1\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.deepEqual(killed.sort(), ['200', '300']);
   assert.match(result.evidence, /2 live descendant/i);
 });
@@ -1531,7 +1537,7 @@ test('proves a clean Windows tree from ONE process-table snapshot', async () => 
       return { stdout: '400 1 500 services.exe\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.match(result.evidence, /no live descendants/i);
   assert.equal(powershellCalls, 1, 'BFS and the CommandLine worktree scan must share one snapshot');
 });
@@ -1559,7 +1565,7 @@ test('blocks multi-level Windows orphans via the CommandLine scan over the same 
       return { stdout: '565656 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /565656/);
   assert.equal(powershellCalls, 1, 'CommandLine scan must reuse the BFS snapshot, not re-query CIM');
@@ -1588,7 +1594,7 @@ test('does not block a clean Windows tree on worktree processes started before t
       return { stdout: '565657 999999 500 C:\\tools\\editor.exe C:\\work\\repo\\README.md\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.match(result.evidence, /no live descendants/i);
   assert.equal(powershellCalls, 1);
 });
@@ -1650,7 +1656,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain breaks at a
       return { stdout: '700003 999999 2000 node.exe C:\\work\\repo\\scripts\\orphan.js\n', stderr: '' };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /700003/);
   assert.equal(powershellCalls, 1);
@@ -1681,7 +1687,7 @@ test('still blocks a worktree CommandLine match whose ancestor chain reaches unk
       };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /CommandLine/i);
   assert.match(result.evidence, /700004/);
   assert.equal(powershellCalls, 1);
@@ -1708,7 +1714,7 @@ test('retries a failed Windows table snapshot once, then fails closed', async ()
       throw new Error('CIM provider hung');
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.match(result.evidence, /enumeration failed/i);
   assert.match(result.evidence, /CIM provider hung/);
   assert.equal(powershellCalls, 2, 'probe gets exactly one retry, never more');
@@ -1729,7 +1735,7 @@ test('rejects an untrusted SystemRoot absolute path for Windows cleanup tools', 
       return { stdout: 'SUCCESS', stderr: '' };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(calls.length, 1);
   // path.join on non-Windows hosts may mix separators; normalize before assert.
   const normalized = calls[0].replace(/\\/g, '/').toLowerCase();
@@ -1750,7 +1756,7 @@ test('fails artifact proof when the file exceeds the hash size ceiling', async (
       proof: { type: 'artifact', path: 'huge.bin' },
       cwd: repo,
     });
-    assert.equal(result.status, 'FAIL');
+    assert.equal(result.status, 'FAIL', statusDiag(result));
     assert.match(result.evidence, /hash size limit/i);
   } finally {
     await rm(repo, { recursive: true, force: true });
@@ -1779,7 +1785,7 @@ test('does not hang when the verified artifact is swapped for a FIFO', { timeout
       realpath,
     },
   });
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /not a regular file/i);
 });
 

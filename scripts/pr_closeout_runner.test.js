@@ -8,6 +8,12 @@ const { MANDATORY_CHECKS } = require('./pr_closeout_core');
 const { writeEvidenceReport } = require('./pr_closeout_report');
 const { runValidationPhases, statusFrom } = require('./pr_closeout_runner');
 
+// CI failure diagnostics: when a status assertion fails, print the executor's
+// evidence so the remote runner log carries the root cause.
+const statusDiag = (result) =>
+  `evidence: ${result?.evidence || ''} | terminationEvidence: ${result?.terminationEvidence || ''}`;
+
+
 test('reports FAIL when failures and blockers are both present', () => {
   assert.equal(statusFrom([{ status: 'BLOCKED' }, { status: 'FAIL' }]), 'FAIL');
   assert.equal(statusFrom([{ status: 'BASELINE' }, { status: 'PASS' }]), 'BLOCKED');
@@ -29,7 +35,7 @@ test('an empty overall checks plan rolls up to BLOCKED, not a vacuous PASS', asy
     },
   });
   assert.equal(executions, 0);
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.deepEqual(result.qualification, []);
   assert.deepEqual(result.confirmation, []);
 });
@@ -49,7 +55,7 @@ test('an empty qualificationSafe subset is not treated as a qualification failur
       return { id: check.id, phase, status: 'PASS', exitCode: 0 };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.deepEqual(result.qualification, []);
   assert.equal(confirmationRuns, checks.length);
   assert.equal(result.confirmation.length, checks.length);
@@ -73,7 +79,7 @@ test('parallelizes safe qualification then confirms all checks sequentially', as
 
   const result = await runValidationPhases({ checks, execute, parallelism: 3 });
   assert.ok(maxQualificationConcurrency > 1);
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.deepEqual(result.confirmation.map(({ id }) => id), MANDATORY_CHECKS.map(({ id }) => id));
   const lastQualification = Math.max(...events.map((event, index) => event.startsWith('end:qualification:') ? index : -1));
   const firstConfirmation = events.findIndex((event) => event.startsWith('start:confirmation:'));
@@ -95,7 +101,7 @@ test('does not start confirmation when qualification is not clean', async () => 
       return { id: check.id, phase, status: check.id === 'typecheck' ? 'FAIL' : 'PASS', exitCode: check.id === 'typecheck' ? 1 : 0 };
     },
   });
-  assert.equal(result.status, 'FAIL');
+  assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.equal(confirmationRuns, 0);
   assert.equal(result.confirmation.length, MANDATORY_CHECKS.length);
   assert.ok(result.confirmation.every(({ phase, status, evidence }) => (
@@ -127,7 +133,7 @@ test('serializes qualification checks that share a resource group', async () => 
       return { ...check, phase, status: 'PASS', exitCode: 0 };
     },
   });
-  assert.equal(result.status, 'PASS');
+  assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(maxDatabaseActive, 1);
 });
 
@@ -145,7 +151,7 @@ test('contains a thrown executor error to a single BLOCKED qualification row', a
       return { ...check, phase: 'qualification', status: 'PASS', exitCode: 0 };
     },
   });
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   const failed = result.qualification.find(({ id }) => id === 'thrower');
   assert.equal(failed.status, 'BLOCKED');
   assert.match(failed.evidence, /boom/);
@@ -171,7 +177,7 @@ test('materializes all mandatory confirmation rows when the plan is unresolved',
   });
 
   assert.equal(executions, 0);
-  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
   assert.equal(result.confirmation.length, MANDATORY_CHECKS.length);
   assert.deepEqual(result.confirmation.map(({ id }) => id), MANDATORY_CHECKS.map(({ id }) => id));
   assert.ok(result.confirmation.every(({ phase, status }) => phase === 'confirmation' && status === 'BLOCKED'));
