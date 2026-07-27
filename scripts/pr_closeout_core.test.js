@@ -1269,6 +1269,12 @@ test('scopes shell-helper config scanning to validation helper locations', () =>
       .some(({ category }) => category === 'config-silencing'),
     'extensionless validation helpers with a shell shebang must stay config-like',
   );
+  assert.deepEqual(
+    scanSuppressionText('tools/fixture', 'const sample = `\n#!/bin/sh\nnpm test || true\n`;\n')
+      .filter(({ category }) => category === 'config-silencing'),
+    [],
+    'a shell-like line after line one must not classify a fixture as a shell helper',
+  );
   assert.ok(
     scanSuppressionText('install.sh', 'npm test || true\n')
       .some(({ category }) => category === 'config-silencing'),

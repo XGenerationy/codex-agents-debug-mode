@@ -756,7 +756,9 @@ const scanSuppressionText = (file, text) => {
   // config, running config-silencing neutrality checks on shell code that is
   // not a validation helper (CodeRabbit discussion_r3652923133).
   const helperDirectory = /(?:^|\/)(?:ci|scripts|tools|bin)\//.test(normalized);
-  const shellShebang = /^#!\s*(?:(?:\/usr\/bin\/env)\s+|(?:\/\S+\/))?(?:ba)?(?:sh|zsh|ksh)\b/m.test(text);
+  // A shebang is meaningful only at byte zero. A later heredoc or fixture
+  // line that resembles one must not reclassify a non-shell helper.
+  const shellShebang = /^#!\s*(?:(?:\/usr\/bin\/env)\s+|(?:\/\S+\/))?(?:ba)?(?:sh|zsh|ksh)\b/.test(text);
   const shellHelper = base === 'install.sh'
     || helperDirectory && (/\.(?:sh|bash|zsh|ksh)$/.test(base) || shellShebang);
   const configLike = ignoreFile || shellHelper

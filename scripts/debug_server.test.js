@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const { constants, existsSync, renameSync, rmSync } = require('node:fs');
-const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -1574,6 +1574,11 @@ test('does not reclaim a freshly created incomplete collector_claim', { timeout:
 
   let launched;
   try {
+    // The reclaim grace starts at the claim mtime. Refresh it immediately
+    // before spawning so startup latency cannot consume the test fixture's
+    // entire grace window on a busy runner.
+    const now = new Date();
+    await utimes(claimPath, now, now);
     launched = launchCli(projectRoot, port);
     const result = await launched.outcome;
     assert.equal(result.exitCode, 1);
