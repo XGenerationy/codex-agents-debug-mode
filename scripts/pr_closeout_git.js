@@ -520,7 +520,19 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
     // directory. `--no-local` avoids shared-object/hard-link optimizations,
     // keeping the disposable baseline independent even when `repo` is local.
     await runGit(repo, withInternalSafety(['clone', '--no-checkout', '--no-local', repo, worktree]), gitOptions);
-    await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+    try {
+      await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+    } catch {
+      // baseSha can be unreachable from any ref in `repo` (e.g. a local base
+      // branch that has since moved on, leaving baseSha reachable only
+      // through the reflog) even though the object itself still exists in
+      // repo's object database. The clone above only transfers objects
+      // reachable from refs, so checkout fails with "unable to read tree".
+      // Fetch the exact commit by SHA directly from repo into a throwaway
+      // ref and retry checkout once before giving up.
+      await runGit(worktree, withInternalSafety(['fetch', repo, `${baseSha}:refs/codex-baseline-fallback`]), gitOptions);
+      await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+    }
     return await callback(worktree);
   } catch (error) {
     primaryError = error;

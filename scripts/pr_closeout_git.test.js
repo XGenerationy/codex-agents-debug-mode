@@ -422,6 +422,48 @@ test('creates and removes a real detached isolated baseline clone', async () => 
   }
 });
 
+test('recovers when baseSha is unreachable from any ref but still present in the source odb', async () => {
+  // A base branch that has been fast-forwarded or rebased locally since the
+  // PR was opened can leave baseSha reachable only through the source repo's
+  // reflog, not through any ref a plain `clone --no-local` would walk. Without
+  // a fallback, checkout fails with "unable to read tree" even though the
+  // commit object still exists in repo's object database.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-unreachable-'));
+  let worktree;
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    const initialBranch = git(repo, 'symbolic-ref', '--short', 'HEAD');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    const baseSha = git(repo, 'rev-parse', 'HEAD');
+    // Move the branch onto unrelated orphan history so baseSha is reachable
+    // only through the deleted branch's reflog, never through a live ref.
+    git(repo, 'checkout', '--quiet', '--orphan', 'newmain');
+    git(repo, 'commit', '--quiet', '--allow-empty', '-m', 'unrelated new history');
+    git(repo, 'branch', '-D', initialBranch);
+    git(repo, 'branch', '-m', 'newmain', initialBranch);
+
+    assert.throws(
+      () => git(repo, 'merge-base', '--is-ancestor', baseSha, 'HEAD'),
+      'fixture must make baseSha unreachable from the current branch',
+    );
+
+    const value = await withDisposableWorktree({ repo, baseSha }, async (created) => {
+      worktree = created;
+      assert.equal(git(created, 'rev-parse', 'HEAD'), baseSha);
+      return 'verified';
+    });
+    assert.equal(value, 'verified');
+    await assert.rejects(access(worktree), { code: 'ENOENT' });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('disables fsmonitor and global attributes for the isolated baseline clone', async () => {
   // A validation command can set core.fsmonitor or a global attribute smudge
   // filter that would execute during `git worktree add`. The internal worktree
