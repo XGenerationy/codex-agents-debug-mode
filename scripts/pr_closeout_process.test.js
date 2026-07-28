@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn } = require('node:child_process');
 const { readFileSync } = require('node:fs');
-const { access, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { access, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -21,6 +21,7 @@ const {
   redactStructure,
   probeGrafanaHealthDefault,
   probeRedisDefault,
+  readBoundArtifactJson,
   resolveCommandShell,
   runPreflight,
   snapshotArtifactProof,
@@ -420,6 +421,105 @@ test('rejects artifact proof paths whose real target escapes through a link', as
   });
   assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /resolves outside/i);
+});
+
+// Wraps a real FileHandle so a test can observe exactly how many bytes
+// readBoundArtifactJson requested per read() call, without changing what the
+// reads actually return.
+const trackReads = (handle, reads) => ({
+  stat: (...args) => handle.stat(...args),
+  close: (...args) => handle.close(...args),
+  read: async (buffer, offset, length, position) => {
+    reads.push(length);
+    return handle.read(buffer, offset, length, position);
+  },
+  // Recorded too so a regression back to the unbounded handle.readFile()
+  // shows up as an unexpected 'readFile' entry instead of a thrown
+  // "not a function", keeping the assertion failure legible.
+  readFile: async (...args) => {
+    reads.push('readFile');
+    return handle.readFile(...args);
+  },
+});
+
+test('readBoundArtifactJson parses an unchanged verified artifact via a bounded read', async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'closeout-bound-read-'));
+  try {
+    const payload = { provider: 'grafana', ok: true };
+    await writeFile(path.join(cwd, 'proof.json'), JSON.stringify(payload), 'utf8');
+    const proofResult = await snapshotArtifactProof({ proof: { path: 'proof.json' }, cwd });
+    assert.equal(proofResult.status, 'PASS', statusDiag(proofResult));
+
+    const reads = [];
+    const openArtifactFn = async (target) => trackReads(await open(target, 'r'), reads);
+    const result = await readBoundArtifactJson(proofResult, { openArtifactFn });
+
+    assert.equal(result.status, 'PASS', statusDiag(result));
+    assert.deepEqual(result.value, payload);
+    // Exactly the verified size, plus the one-byte growth probe -- never
+    // however large the underlying file happens to be.
+    assert.deepEqual(reads, [proofResult.size, 1]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('readBoundArtifactJson rejects and never reads past the verified size when the artifact grows mid-verification', async () => {
+  // chatgpt-codex-connector scripts/pr_closeout_process.js:2145: the previous
+  // implementation used handle.readFile(), which reads to whatever EOF
+  // exists at read time. A writer that keeps appending to the proof file
+  // after snapshotArtifactProof took its "before" measurement could make this
+  // allocate arbitrarily far past the documented 1 MiB bound before the
+  // dev/ino/size/mtimeMs/digest comparison ever got a chance to reject the
+  // mutation. Prove the fix reads exactly the verified size (positionally,
+  // via handle.read) and detects any growth with a single one-byte probe --
+  // never touching however much a concurrent writer actually appended.
+  const cwd = await mkdtemp(path.join(tmpdir(), 'closeout-bound-read-grown-'));
+  try {
+    const payload = { provider: 'grafana', ok: true };
+    const proofPath = path.join(cwd, 'proof.json');
+    await writeFile(proofPath, JSON.stringify(payload), 'utf8');
+    const proofResult = await snapshotArtifactProof({ proof: { path: 'proof.json' }, cwd });
+    assert.equal(proofResult.status, 'PASS', statusDiag(proofResult));
+
+    // Simulate a writer appending well past the verified size at the exact
+    // moment readBoundArtifactJson performs its main bounded read -- after
+    // the pre-read identity stat (which must still see the original size to
+    // reach the read at all) but before the post-read growth probe.
+    const reads = [];
+    let appended = false;
+    const openArtifactFn = async (target) => {
+      const handle = await open(target, 'r');
+      return {
+        stat: (...args) => handle.stat(...args),
+        close: (...args) => handle.close(...args),
+        read: async (buffer, offset, length, position) => {
+          reads.push(length);
+          if (!appended && length === proofResult.size) {
+            appended = true;
+            await writeFile(target, 'x'.repeat(2_000_000), { flag: 'a' });
+          }
+          return handle.read(buffer, offset, length, position);
+        },
+        readFile: async (...args) => {
+          reads.push('readFile');
+          if (!appended) {
+            appended = true;
+            await writeFile(target, 'x'.repeat(2_000_000), { flag: 'a' });
+          }
+          return handle.readFile(...args);
+        },
+      };
+    };
+    const result = await readBoundArtifactJson(proofResult, { openArtifactFn });
+
+    assert.equal(result.status, 'FAIL', statusDiag(result));
+    assert.match(result.evidence, /changed while it was being verified/);
+    // Bounded read plus the one-byte probe -- not the ~2 MB actually on disk.
+    assert.deepEqual(reads, [proofResult.size, 1]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test('requires explicit health evidence from a postcondition command', async () => {

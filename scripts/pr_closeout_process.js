@@ -2132,17 +2132,40 @@ const verifyArtifactProof = async ({ proof, cwd, before }) => {
  * `proofResult`, or larger than 1 MiB.
  * @returns {{status: 'PASS', value: unknown}|{status: 'FAIL', evidence: string}}
  */
-const readBoundArtifactJson = async (proofResult) => {
+const readBoundArtifactJson = async (proofResult, { openArtifactFn = openArtifact } = {}) => {
   if (!proofResult?.realPath || !Number.isFinite(proofResult.size) || proofResult.size > 1_000_000) {
     return { status: 'FAIL', evidence: 'Semantic artifact proof must be a verified JSON file no larger than 1 MiB.' };
   }
-  const handle = await openArtifact(proofResult.realPath);
+  const handle = await openArtifactFn(proofResult.realPath);
   try {
     const before = await handle.stat();
     if (before.dev !== proofResult.dev || before.ino !== proofResult.ino || before.size !== proofResult.size) {
       return { status: 'FAIL', evidence: 'Semantic artifact identity changed after artifact verification.' };
     }
-    const content = await handle.readFile();
+    // Read exactly the verified size at fixed positions instead of
+    // handle.readFile(), which reads to whatever EOF exists at read time: a
+    // writer that keeps appending after the stat above would otherwise let
+    // this allocate far past the documented 1 MiB bound (or stall) before the
+    // dev/ino/size/mtimeMs/digest comparison below ever gets a chance to
+    // reject the mutation.
+    const size = proofResult.size;
+    const content = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const { bytesRead } = await handle.read(content, offset, size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== size) {
+      return { status: 'FAIL', evidence: 'Semantic artifact was truncated while it was being verified.' };
+    }
+    // A concurrent writer could still have appended past the verified size;
+    // confirm no extra byte exists there before trusting the bounded read.
+    const probe = Buffer.alloc(1);
+    const { bytesRead: extraBytesRead } = await handle.read(probe, 0, 1, size);
+    if (extraBytesRead > 0) {
+      return { status: 'FAIL', evidence: 'Semantic artifact changed while it was being verified.' };
+    }
     const after = await handle.stat();
     const digest = createHash('sha256').update(content).digest('hex');
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
@@ -3071,6 +3094,7 @@ module.exports = {
   probeCommandDefault,
   probeGrafanaHealthDefault,
   probeRedisDefault,
+  readBoundArtifactJson,
   redactSecrets,
   redactStructure,
   resolveCheckTimeout,
