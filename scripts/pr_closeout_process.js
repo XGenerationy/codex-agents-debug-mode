@@ -18,6 +18,9 @@ const { promisify } = require('node:util');
  * child environment or redacted out of captured evidence.
  */
 const SPAWN_MARK_ENV = 'OMO_CLOSEOUT_SPAWN_MARK';
+// Shared empty default for callers that omit a sibling-mark registry: no
+// mark is "known", so the fail-closed default is to exclude nothing.
+const EMPTY_MARK_SET = new Set();
 
 const { classifyOutput, findStatusSignals } = require('./pr_closeout_core');
 const {
@@ -196,22 +199,35 @@ const resolveCheckTimeout = (check, timeoutsMs = {}, timeoutMs) => {
  *   (non-Linux), which callers must treat as "unknown", not "none".
  */
 /**
- * Whether raw `/proc/<pid>/environ` bytes contain ANY `SPAWN_MARK_ENV=...`
- * entry, regardless of its value. A process carrying some other check's own
- * spawn mark is not "mark-free" -- it is (or was) tracked by that other
- * check's own primary mark-based sweep -- so listLivePidsWithCwdUnder's
- * mark-free fallback must exclude it rather than attribute it to an unrelated
- * spawn (Codex UfzOf: with the default test-runner parallelism, check B's
- * still-alive descendant can have a PPID chain broken relative to check A,
- * causing A's cwd/fd probe to misattribute B's legitimate, actively-tracked
- * process as A's mark-free orphan and spuriously BLOCK).
+ * Whether raw `/proc/<pid>/environ` bytes contain a `SPAWN_MARK_ENV=...`
+ * entry whose value is a member of `knownMarks`. A process carrying some
+ * other check's own spawn mark is not "mark-free" -- it is (or was) tracked
+ * by that other check's own primary mark-based sweep -- so
+ * listLivePidsWithCwdUnder's mark-free fallback must exclude it rather than
+ * attribute it to an unrelated spawn (Codex UfzOf: with the default
+ * test-runner parallelism, check B's still-alive descendant can have a PPID
+ * chain broken relative to check A, causing A's cwd/fd probe to misattribute
+ * B's legitimate, actively-tracked process as A's mark-free orphan and
+ * spuriously BLOCK).
+ *
+ * `knownMarks` must be the closeout run's own registry of marks it actually
+ * generated for still-in-flight sibling spawns -- matching ANY self-reported
+ * value (the prior behavior) let a hostile detached descendant simply set
+ * `SPAWN_MARK_ENV` to an arbitrary string and escape both the primary
+ * mark-based reap (its forged mark never matches the spawn hunting it) and
+ * this mark-free fallback (Codex UikN4). A mark is a 128-bit random hex
+ * string, so forging an actual match against `knownMarks` is infeasible.
+ * Omitting `knownMarks` defaults to the empty set -- nothing is "known", so
+ * nothing is excluded and every candidate stays fail-closed/flagged.
  * @param {Buffer|string} environBuffer - Raw contents of /proc/<pid>/environ.
+ * @param {Set<string>} [knownMarks] - Marks this run generated for
+ *   currently-in-flight sibling spawns.
  * @returns {boolean}
  */
-const environHasAnySpawnMark = (environBuffer) => {
+const environHasAnySpawnMark = (environBuffer, knownMarks = EMPTY_MARK_SET) => {
   const prefix = `${SPAWN_MARK_ENV}=`;
   const vars = environBuffer.toString('utf8').split('\0');
-  return vars.some((entry) => entry.startsWith(prefix));
+  return vars.some((entry) => entry.startsWith(prefix) && knownMarks.has(entry.slice(prefix.length)));
 };
 
 const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
@@ -279,6 +295,7 @@ const listLivePidsWithCwdUnder = (rootCwd, {
   minStarttime = 0,
   selfSession = null,
   rootPid = 0,
+  knownSiblingMarks = EMPTY_MARK_SET,
 } = {}) => {
   if (!rootCwd) return [];
   let entries;
@@ -413,15 +430,16 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       // A sibling check still running under the runner (unbroken PPID chain
       // to the runner that never passes through this spawn's root) must not
       // be attributed to this spawn as a mark-free detached descendant.
-      // Nor must a live process that carries SOME check's spawn mark (its
-      // own or a different parallel check's) -- this fallback only exists
-      // for genuinely mark-free escapees; an unreadable environ (EACCES,
-      // exited between readdir and read) is treated as mark-free and stays
-      // flagged, matching this function's fail-closed default for every
-      // other uncertain outcome.
+      // Nor must a live process that carries a REGISTERED sibling's spawn
+      // mark (its own or a different parallel check's, per knownSiblingMarks
+      // -- Codex UikN4: a self-reported mark with no registry match proves
+      // nothing) -- this fallback only exists for genuinely mark-free
+      // escapees; an unreadable environ (EACCES, exited between readdir and
+      // read) is treated as mark-free and stays flagged, matching this
+      // function's fail-closed default for every other uncertain outcome.
       let carriesSpawnMark = false;
       try {
-        carriesSpawnMark = environHasAnySpawnMark(readFileSync(`/proc/${pid}/environ`));
+        carriesSpawnMark = environHasAnySpawnMark(readFileSync(`/proc/${pid}/environ`), knownSiblingMarks);
       } catch {
         carriesSpawnMark = false;
       }
@@ -465,6 +483,7 @@ const sweepDetachedOrphans = async ({
   terminationGraceMs = 2000,
   selfPid = process.pid,
   rootPid = 0,
+  knownSiblingMarks = EMPTY_MARK_SET,
 } = {}) => {
   // Only *reap* PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
   // unrelated processes that merely work in the same repository and must not
@@ -495,7 +514,7 @@ const sweepDetachedOrphans = async ({
   // (Codex #4781366510).
   const afterMarkedEmpty = (evidence, escalated) => {
     if (cwd) {
-      const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime, rootPid });
+      const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime, rootPid, knownSiblingMarks });
       if (unmarked === null) {
         return {
           status: 'BLOCKED',
@@ -891,6 +910,7 @@ const terminateProcessTree = async ({
   spawnMark,
   cwd,
   minStarttime = 0,
+  knownSiblingMarks = EMPTY_MARK_SET,
 } = {}) => {
   if (!Number.isInteger(child?.pid) || child.pid <= 0) {
     return { status: 'BLOCKED', evidence: 'Process-tree termination has no valid process identifier.', escalated: false };
@@ -1226,6 +1246,7 @@ const terminateProcessTree = async ({
         kill,
         terminationGraceMs,
         rootPid: child.pid,
+        knownSiblingMarks,
       });
       if (sweep.status === 'BLOCKED') {
         return {
@@ -1745,6 +1766,11 @@ const spawnCaptured = async ({
   spawnProcess = spawn,
   terminateTree = terminateProcessTree,
   terminationGraceMs = 2000,
+  // Registry of marks this closeout run has generated for still-in-flight
+  // sibling spawns (shared across a run's parallel checks; see
+  // createCommandExecutor). Optional so direct/unit-test callers keep
+  // working with the safe empty-registry default.
+  knownSiblingMarks,
 }) => {
   const startedAt = new Date().toISOString();
   let stdout = '';
@@ -1822,6 +1848,11 @@ const spawnCaptured = async ({
   const spawnEnv = spawnMark
     ? { ...env, [SPAWN_MARK_ENV]: spawnMark }
     : env;
+  // Register this mark as belonging to a genuine, currently-in-flight spawn
+  // for the run's whole duration so a concurrent sibling's orphan sweep can
+  // recognize it (Codex UikN4); unregistered below once this spawn's own
+  // termination/sweep is settled.
+  if (spawnMark) knownSiblingMarks?.add(spawnMark);
   // Capture approximate starttime for orphan filters:
   // - POSIX: /proc starttime jiffies (exact after spawn when available)
   // - Windows: wall-clock epoch ms for CommandLine CreationDate filtering
@@ -1916,6 +1947,7 @@ const spawnCaptured = async ({
         spawnMark,
         cwd,
         minStarttime,
+        knownSiblingMarks,
       });
   } else {
     timedOut = true;
@@ -1928,6 +1960,7 @@ const spawnCaptured = async ({
       spawnMark,
       cwd,
       minStarttime,
+      knownSiblingMarks,
     });
     outcome = await Promise.race([
       closePromise,
@@ -1954,6 +1987,10 @@ const spawnCaptured = async ({
       child.stderr.destroy();
     }
   }
+  // This spawn's own termination/sweep is settled either way (PASS or
+  // BLOCKED): stop advertising the mark to concurrent siblings' orphan
+  // sweeps now that it no longer identifies an actively-tracked spawn.
+  if (spawnMark) knownSiblingMarks?.delete(spawnMark);
 
   if (outcome?.spawnError) record('stderr', outcome.spawnError.message);
   flush('stdout');
@@ -2506,6 +2543,12 @@ const createCommandExecutor = ({
 } = {}) => {
   let unsafeTermination;
   const attempts = new Map();
+  // Marks this run has generated for still-in-flight checks (added when a
+  // spawn starts, removed once its own termination/sweep is settled). Shared
+  // across every check dispatched through this executor's `execute` so a
+  // parallel sibling's orphan sweep can recognize a genuinely-tracked mark
+  // instead of trusting any self-reported value (Codex UikN4).
+  const activeSpawnMarks = new Set();
   const pathReplacements = buildPathReplacements({ cwd: repo, outputDir, env });
   const childEnv = buildChildEnvironment(env, secretNames);
   const logsDir = path.join(outputDir, 'logs');
@@ -2618,6 +2661,7 @@ const createCommandExecutor = ({
     spawnProcess,
     terminateTree,
     terminationGraceMs,
+    knownSiblingMarks: activeSpawnMarks,
   });
   if (execution.terminationStatus === 'BLOCKED') unsafeTermination = execution.terminationEvidence;
   const classification = classifyExecution(execution);
@@ -2669,6 +2713,7 @@ const createCommandExecutor = ({
       spawnProcess,
       terminateTree,
       terminationGraceMs,
+      knownSiblingMarks: activeSpawnMarks,
     });
     if (proofExecution.terminationStatus === 'BLOCKED') unsafeTermination = proofExecution.terminationEvidence;
     const proofClassification = classifyExecution(proofExecution);

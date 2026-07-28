@@ -1821,20 +1821,33 @@ test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is b
   }
 });
 
-test('environHasAnySpawnMark detects a foreign spawn mark regardless of value', () => {
-  // Codex UfzOf (P1): the exclusion only needs to know SOME check's spawn
-  // mark is present, not which one, so this must match any value and must
-  // not be fooled by a same-prefix-but-different key.
+test('environHasAnySpawnMark only matches a mark registered in knownMarks', () => {
+  // Codex UikN4 (P1): matching ANY self-reported value (the original Codex
+  // UfzOf fix) let a hostile detached process simply set SPAWN_MARK_ENV to
+  // an arbitrary string and be excluded from the mark-free orphan sweep
+  // regardless of whether any real sibling ever generated that value. Only a
+  // mark this run's own registry actually generated for a tracked sibling
+  // may exclude a candidate; an unregistered value -- even one that looks
+  // exactly like a real mark -- must not.
+  const knownMarks = new Set(['some-other-checks-mark']);
   const foreign = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}=some-other-checks-mark\0HOME=/root`, 'utf8');
-  assert.equal(environHasAnySpawnMark(foreign), true);
+  assert.equal(environHasAnySpawnMark(foreign, knownMarks), true);
+
+  // Same environ, no registry entry for it: presence alone is no longer
+  // sufficient (this is exactly the pre-fix behavior being closed).
+  assert.equal(environHasAnySpawnMark(foreign), false);
+  assert.equal(environHasAnySpawnMark(foreign, new Set()), false);
+
+  const forged = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}=attacker-forged-mark\0HOME=/root`, 'utf8');
+  assert.equal(environHasAnySpawnMark(forged, knownMarks), false);
 
   const none = Buffer.from('PATH=/usr/bin\0HOME=/root', 'utf8');
-  assert.equal(environHasAnySpawnMark(none), false);
+  assert.equal(environHasAnySpawnMark(none, knownMarks), false);
 
-  const nearMiss = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}_OTHER=not-a-real-mark`, 'utf8');
-  assert.equal(environHasAnySpawnMark(nearMiss), false);
+  const nearMiss = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}_OTHER=some-other-checks-mark`, 'utf8');
+  assert.equal(environHasAnySpawnMark(nearMiss, knownMarks), false);
 
-  assert.equal(environHasAnySpawnMark(''), false);
+  assert.equal(environHasAnySpawnMark('', knownMarks), false);
 });
 
 test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', { timeout: 15000 }, async () => {
@@ -1875,7 +1888,12 @@ test('cwd/fd probe excludes a live process carrying a different check\'s own spa
     }
     assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
 
-    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid });
+    // Codex UikN4 (P1): exclusion now requires the sibling's mark to be a
+    // member of this run's own registry of marks it actually generated, not
+    // merely present. Register it here to prove the legitimate UfzOf case
+    // still works under the stricter model.
+    const knownSiblingMarks = new Set(['some-other-checks-mark']);
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid, knownSiblingMarks });
     assert.ok(
       !(found || []).includes(siblingPid),
       `foreign-marked sibling ${siblingPid} must be excluded, got: ${JSON.stringify(found)}`,
@@ -1886,8 +1904,70 @@ test('cwd/fd probe excludes a live process carrying a different check\'s own spa
       rootPid,
       kill: () => {},
       selfPid: process.pid,
+      knownSiblingMarks,
     });
     assert.equal(sweep.status, 'PASS', statusDiag(sweep));
+  } finally {
+    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('cwd/fd probe does not exclude a live process carrying an unregistered (forged) spawn mark', { timeout: 15000 }, async () => {
+  // Codex UikN4 (P1): the fix for Codex UfzOf above excluded any candidate
+  // whose environ carried ANY OMO_CLOSEOUT_SPAWN_MARK value, trusting the
+  // value merely because it existed. A hostile detached process could copy
+  // or guess a plausible-looking mark string and escape the orphan sweep
+  // entirely. Reproduce the identical reparented-sibling shape as the test
+  // above, but WITHOUT ever registering its mark as a known sibling -- it
+  // must stay flagged and the sweep must BLOCK, not PASS.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-forged-mark-'));
+  let siblingPid = 0;
+  let rootPid = 0;
+  try {
+    const launcher = [
+      'const {spawn}=require("node:child_process");',
+      `const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true,env:{...process.env,${SPAWN_MARK_ENV}:"attacker-forged-mark"}});`,
+      'process.stdout.write(String(child.pid));',
+      'child.unref();',
+      'setTimeout(()=>process.exit(0),200);',
+    ].join('');
+    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
+    rootPid = root.pid;
+    root.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
+    await new Promise((resolve) => root.once('exit', resolve));
+    for (let i = 0; i < 40 && !siblingPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(siblingPid > 0, 'sibling pid must be reported');
+    let ppid = rootPid;
+    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
+      try {
+        const stat = readFileSync(`/proc/${siblingPid}/stat`, 'utf8');
+        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
+
+    // No knownSiblingMarks passed here -- this run never generated
+    // "attacker-forged-mark" for any tracked sibling, so it must not be
+    // trusted regardless of how legitimate it looks.
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid });
+    assert.ok(
+      (found || []).includes(siblingPid),
+      `forged-mark sibling ${siblingPid} must NOT be excluded, got: ${JSON.stringify(found)}`,
+    );
+    const sweep = await sweepDetachedOrphans({
+      mark: 'probe-this-checks-mark-does-not-match',
+      cwd: repo,
+      rootPid,
+      kill: () => {},
+      selfPid: process.pid,
+    });
+    assert.equal(sweep.status, 'BLOCKED', statusDiag(sweep));
   } finally {
     if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
     await rm(repo, { recursive: true, force: true });
