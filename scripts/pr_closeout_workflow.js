@@ -309,7 +309,7 @@ const readOutputDirLockFile = async (lockPath) => {
   }
 };
 
-const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile } = {}) => {
+const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile, statPath = stat } = {}) => {
   const lockPath = path.join(outputDir, '.closeout.lock');
   const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const payload = `${process.pid}\n${nonce}\n${new Date().toISOString()}\n`;
@@ -330,7 +330,19 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // confirm outputDir still names the directory this lock was acquired
       // against, rather than a same-user swap-in-place replacement (Codex
       // finding: "Bind the evidence lock to the output directory inode").
-      const dirIdentity = await stat(outputDir);
+      const dirIdentity = await statPath(outputDir);
+      // Some filesystems (notably Windows FAT/network mounts) report dev/ino
+      // as 0 for every path, which would make the swap-detection comparisons
+      // below and in assertOutputDirLockIdentity pass vacuously for a
+      // same-path replacement. Fail closed rather than record an identity
+      // that provides no actual guarantee.
+      if (dirIdentity.ino === 0) {
+        await handle.close().catch(() => {});
+        await unlink(lockPath).catch(() => {});
+        throw new Error(
+          `Filesystem does not report a usable directory identity for ${outputDir}; refusing to rely on dev/ino swap detection.`,
+        );
+      }
       let released = false;
       const release = async () => {
         if (released) return;
@@ -483,7 +495,16 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
 const assertOutputDirLockIdentity = async (lock, outputDir, { statPath = stat } = {}) => {
   if (!lock) return;
   const info = await statPath(outputDir);
-  if (info.dev !== lock.dirIdentity.dev || info.ino !== lock.dirIdentity.ino) {
+  // A zero ino (no usable filesystem identity) must never compare equal to
+  // itself here: acquireOutputDirLock already refuses to record such an
+  // identity, but failing closed independently means this check stays safe
+  // even if a lock object ever reached this function some other way.
+  if (
+    lock.dirIdentity.ino === 0
+    || info.ino === 0
+    || info.dev !== lock.dirIdentity.dev
+    || info.ino !== lock.dirIdentity.ino
+  ) {
     throw new Error(`Evidence output directory changed identity after the exclusive lock was acquired: ${outputDir}`);
   }
 };

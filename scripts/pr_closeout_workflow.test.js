@@ -5,6 +5,7 @@ const { MANDATORY_CHECKS } = require('./pr_closeout_core');
 const { digestValidationConfig } = require('./pr_closeout_git');
 const {
   acquireOutputDirLock,
+  assertOutputDirLockIdentity,
   defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,
@@ -588,6 +589,46 @@ test('prepareOutputDirectory rejects when the locked output directory was swappe
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+test('acquireOutputDirLock refuses to record a directory identity the filesystem reports as dev/ino 0', async () => {
+  // Some Windows filesystems report dev/ino as 0 for every path. Recording
+  // that as the lock's dirIdentity would make every later swap-detection
+  // comparison pass vacuously (0 === 0) for a same-path replacement, so
+  // acquisition itself must fail closed instead.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-zero-identity-'));
+  try {
+    await assert.rejects(
+      acquireOutputDirLock(tmp, { statPath: async () => ({ dev: 0, ino: 0 }) }),
+      /usable directory identity/i,
+    );
+    // The lock file created before the identity check must not be left
+    // behind, or every subsequent acquisition attempt would see it as a
+    // pre-existing (and never-reclaimable, since no process holds it) lock.
+    const lockStillExists = await fs.stat(nodePath.join(tmp, '.closeout.lock')).then(() => true, () => false);
+    assert.equal(lockStillExists, false);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('assertOutputDirLockIdentity rejects a zero/zero identity even though dev and ino both compare equal', async () => {
+  // The only way the dev/ino comparison can pass vacuously for a genuine
+  // swap is when both stats report the *same* values despite naming
+  // different underlying directories — which on a filesystem that always
+  // reports ino 0 means dev/ino both read 0/0 on both sides. A mismatched
+  // ino (e.g. 42 vs 0) is already caught by the plain inequality check and
+  // is not the case this guard exists for.
+  const fakeLock = { dirIdentity: { dev: 0, ino: 0 } };
+  await assert.rejects(
+    assertOutputDirLockIdentity(fakeLock, 'C:/evidence', {
+      statPath: async () => ({ dev: 0, ino: 0 }),
+    }),
+    /changed identity/i,
+  );
 });
 
 test('requires a clean initial tree before executing validation commands', async () => {
