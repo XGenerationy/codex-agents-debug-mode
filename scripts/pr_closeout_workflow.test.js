@@ -547,6 +547,39 @@ test('rejects an output-dir traversing a symlink into the repo before creating a
   }
 });
 
+test('prepareOutputDirectory rejects when the locked output directory was swapped for a new one at the same path', async () => {
+  // Codex: "Bind the evidence lock to the output directory inode." Without
+  // verifyLock, a same-user removal + recreation of the locked evidence
+  // directory between two prepareOutputDirectory calls in one closeout run
+  // goes unnoticed — the lock file's own name-based checks are satisfied
+  // again by the replacement directory, but it is not the directory the
+  // exclusive lock was actually acquired against.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-dir-swap-'));
+  const repoRoot = nodePath.join(tmp, 'repo');
+  const outputDir = nodePath.join(tmp, 'evidence');
+  await fs.mkdir(repoRoot, { recursive: true });
+  await fs.mkdir(outputDir, { recursive: true });
+  const lock = await acquireOutputDirLock(outputDir);
+  await lock.release();
+  try {
+    // Not yet swapped: the lock's recorded identity still matches.
+    await prepareOutputDirectory({ repo: repoRoot, outputDir, verifyLock: lock });
+
+    await fs.rm(outputDir, { recursive: true, force: true });
+    await fs.mkdir(outputDir, { recursive: true });
+
+    await assert.rejects(
+      prepareOutputDirectory({ repo: repoRoot, outputDir, verifyLock: lock }),
+      /changed identity/i,
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('requires a clean initial tree before executing validation commands', async () => {
   const fixture = makeDependencies();
   let cleanReads = 0;

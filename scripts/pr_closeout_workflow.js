@@ -202,7 +202,7 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
 /**
- * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, release: () => Promise<void> }} OutputDirLock
+ * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, dirIdentity: {dev: number, ino: number}, release: () => Promise<void> }} OutputDirLock
  */
 
 // Upper bound for a .closeout.lock payload (`pid\nnonce\niso\n` — well under
@@ -326,6 +326,11 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         await handle.close().catch(() => {});
         throw error;
       }
+      // Recorded so later prepareOutputDirectory calls in this same run can
+      // confirm outputDir still names the directory this lock was acquired
+      // against, rather than a same-user swap-in-place replacement (Codex
+      // finding: "Bind the evidence lock to the output directory inode").
+      const dirIdentity = await stat(outputDir);
       let released = false;
       const release = async () => {
         if (released) return;
@@ -360,7 +365,7 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         }
       };
       process.once('exit', onExit);
-      return { handle, path: lockPath, nonce, release };
+      return { handle, path: lockPath, nonce, dirIdentity: { dev: dirIdentity.dev, ino: dirIdentity.ino }, release };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
       let holder = null;
@@ -461,6 +466,28 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
   throw new Error(`Failed to acquire exclusive evidence lock in ${outputDir}`);
 };
 
+/**
+ * Confirm outputDir still identifies the same filesystem object an
+ * already-held exclusive lock was acquired against. Without this, a
+ * same-user swap of the output directory (e.g. removed and recreated, or
+ * replaced with a different mount/junction) between two
+ * prepareOutputDirectory calls in one closeout run would go unnoticed — the
+ * lock file's own name-based checks have nothing to say about the
+ * directory's identity, only the lock file's. A no-op when `lock` is falsy
+ * (the pre-acquisition call, or a non-exclusive run that never took a lock).
+ * @param {OutputDirLock|null|undefined} lock
+ * @param {string} outputDir
+ * @param {{statPath?: (path: string) => Promise<import('node:fs').Stats>}} [deps]
+ * @returns {Promise<void>}
+ */
+const assertOutputDirLockIdentity = async (lock, outputDir, { statPath = stat } = {}) => {
+  if (!lock) return;
+  const info = await statPath(outputDir);
+  if (info.dev !== lock.dirIdentity.dev || info.ino !== lock.dirIdentity.ino) {
+    throw new Error(`Evidence output directory changed identity after the exclusive lock was acquired: ${outputDir}`);
+  }
+};
+
 const prepareOutputDirectory = async ({
   repo,
   outputDir,
@@ -470,6 +497,9 @@ const prepareOutputDirectory = async ({
   // Optional box `{ lock: null }` filled when exclusive so callers can release
   // only their own lock without a process-global drain (Codex #4782132804).
   lockOut = null,
+  // The lock (if any) already held for this invocation's output directory;
+  // re-verified below before every write-preparation call re-uses it.
+  verifyLock = null,
 }) => {
   const resolvedRepo = path.resolve(repo);
   const resolvedOutput = path.resolve(outputDir);
@@ -482,6 +512,7 @@ const prepareOutputDirectory = async ({
   await mkdirPath(resolvedOutput, { recursive: true });
   const physicalOutput = await realpathPath(outputDir);
   assertOutputOutsideRepository(physicalRepo, physicalOutput);
+  await assertOutputDirLockIdentity(verifyLock, resolvedOutput);
   if (exclusive) {
     // Hold the lock for the run; release() unlinks on completion so later
     // runs do not always burn the stale-PID reclaim path (CodeRabbit
@@ -744,6 +775,9 @@ const runCloseoutWorkflow = async ({
     ...args,
     // Only the first exclusive prepare for this invocation owns the lock.
     lockOut: args.exclusive && !lockOut.lock ? lockOut : null,
+    // Every prepare (including the ones after the lock is already held)
+    // re-verifies the output directory still matches the lock's identity.
+    verifyLock: lockOut.lock,
   });
   try {
     return await runCloseoutWorkflowBody({
@@ -1307,6 +1341,7 @@ const runCloseoutWorkflowBody = async ({
 
 module.exports = {
   acquireOutputDirLock,
+  assertOutputDirLockIdentity,
   defaultOutputDir,
   evaluateOverallStatus,
   normalizePersistedPaths,
