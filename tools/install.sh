@@ -401,6 +401,9 @@ for destination in "${destinations[@]}"; do
   # payload one level too deep. Detect that nested layout and treat it the
   # same as a failed move.
   if [[ -d "$destination/$(basename -- "$stage")" ]]; then
+    if ! rm -rf -- "$destination/$(basename -- "$stage")"; then
+      echo "Cleanup warning: could not remove mis-nested stage under $destination" >&2
+    fi
     restore_from_backup "$destination" "$backup"
     rollback
     echo "Failed to install to $destination (destination became a directory during commit)" >&2
