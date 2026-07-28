@@ -568,7 +568,17 @@ test('prepareOutputDirectory rejects when the locked output directory was swappe
     // Not yet swapped: the lock's recorded identity still matches.
     await prepareOutputDirectory({ repo: repoRoot, outputDir, verifyLock: lock });
 
-    await fs.rm(outputDir, { recursive: true, force: true });
+    // Rename the original out of the way (keeping its inode allocated)
+    // instead of removing it, then mkdir a fresh directory at outputDir.
+    // Deleting-then-recreating at the same path is not a reliable way to
+    // force a new inode number: on filesystems like ext4, a freshly freed
+    // inode can be handed straight back to the very next mkdir when nothing
+    // else was allocated in between, which is exactly what happened in a
+    // tight temp directory on Linux CI and made this test flake. Keeping the
+    // original directory alive elsewhere guarantees the replacement gets a
+    // genuinely unused inode, and it doubles as a more realistic model of a
+    // same-user swap (rename/mount the real thing out, put a decoy in).
+    await fs.rename(outputDir, nodePath.join(tmp, 'evidence-displaced'));
     await fs.mkdir(outputDir, { recursive: true });
 
     await assert.rejects(
