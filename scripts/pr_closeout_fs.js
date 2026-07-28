@@ -126,15 +126,26 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
 // root that both looks like a Windows install (final path component
 // "Windows") and is independently verified to contain powershell.exe at that
 // exact location.
+// These three helpers model an inherently Windows-shaped path (a
+// backslash-separated "C:\Windows"/SystemRoot root) regardless of which OS
+// actually runs this code, so they must use path.win32 explicitly rather
+// than the platform-dependent `path` import above: on POSIX (e.g. this
+// suite's Linux CI job), the generic `path` module treats `\` as a literal
+// character rather than a separator, so path.basename/path.normalize/
+// path.join silently mis-parse "C:\Windows" and both looksLikeWindowsRoot
+// checks (hard-coded and env root) would break the same way, always
+// falling through to an un-joined hard-coded root instead of exercising the
+// intended trust logic (CI failure on Node 24/ubuntu-latest: resolved
+// 'C:\Windows' instead of falling back to a verified env root).
 const looksLikeWindowsRoot = (root) => {
-  const normalized = path.normalize(root).replace(/[\\/]+$/u, '');
+  const normalized = path.win32.normalize(root).replace(/[\\/]+$/u, '');
   return /^[A-Za-z]:[\\/]/u.test(normalized)
-    && path.basename(normalized).toLowerCase() === 'windows';
+    && path.win32.basename(normalized).toLowerCase() === 'windows';
 };
 
 const isTrustedSystemRoot = (root, pathExists) => {
   if (!looksLikeWindowsRoot(root)) return false;
-  return pathExists(path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
+  return pathExists(path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
 };
 
 const resolvePowerShellExecutable = ({ env = process.env, pathExists = existsSync } = {}) => {
@@ -144,7 +155,7 @@ const resolvePowerShellExecutable = ({ env = process.env, pathExists = existsSyn
   if (!isTrustedSystemRoot(hardcodedRoot, pathExists) && isTrustedSystemRoot(envRoot, pathExists)) {
     safeRoot = envRoot;
   }
-  return path.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return path.win32.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 };
 
 /**
