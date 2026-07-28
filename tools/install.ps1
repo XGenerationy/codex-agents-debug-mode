@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess)]
+﻿[CmdletBinding(SupportsShouldProcess)]
 param(
     [ValidateSet('Codex', 'Agents', 'Both')]
     [string]$Target = 'Both',
