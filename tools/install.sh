@@ -207,8 +207,24 @@ declare -a committed_backups=()
 # the remaining rollback steps, since the original install error must remain the
 # primary failure. rm/mv return non-zero are caught explicitly so set -e does
 # not exit the script mid-rollback.
+#
+# require_backup (3rd arg, default false): when true and $backup is empty,
+# $dest is left untouched entirely instead of being removed. An empty backup
+# means $destination did not exist at this destination's preflight check, so
+# on this destination's own commit-failure path a concurrent process may have
+# created $destination in the same race window this script already guards
+# against (mv nesting the stage inside it, or the commit mv failing outright)
+# -- with no backup, that content was never ours to begin with, and removing
+# it would destroy data we neither created nor can restore (Codex/qodo
+# finding: "Race cleanup deletes new target"). rollback()'s callers pass the
+# default false: those destinations were committed by this same run, so an
+# empty backup there means WE created that destination fresh, and it is always
+# ours to remove.
 restore_from_backup() {
-  local dest="$1" backup="$2"
+  local dest="$1" backup="$2" require_backup="${3:-false}"
+  if [[ "$require_backup" == "true" && -z "$backup" ]]; then
+    return 0
+  fi
   if ! rm -rf -- "$dest" 2>/dev/null; then
     echo "Rollback warning: could not remove $dest" >&2
   fi
@@ -390,7 +406,7 @@ for destination in "${destinations[@]}"; do
   # restore that in-flight backup before rolling back prior commits — otherwise
   # the target is left missing while a backup still exists on disk.
   if ! mv -- "$stage" "$destination"; then
-    restore_from_backup "$destination" "$backup"
+    restore_from_backup "$destination" "$backup" true
     rollback
     echo "Failed to install to $destination" >&2
     exit 1
@@ -404,7 +420,7 @@ for destination in "${destinations[@]}"; do
     if ! rm -rf -- "$destination/$(basename -- "$stage")"; then
       echo "Cleanup warning: could not remove mis-nested stage under $destination" >&2
     fi
-    restore_from_backup "$destination" "$backup"
+    restore_from_backup "$destination" "$backup" true
     rollback
     echo "Failed to install to $destination (destination became a directory during commit)" >&2
     exit 1
