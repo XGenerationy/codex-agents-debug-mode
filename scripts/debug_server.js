@@ -2,7 +2,7 @@
 
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
 const { execFileSync } = require('node:child_process');
-const { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
+const { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
@@ -61,8 +61,48 @@ const protectWindowsTokenFile = (tokenFile) => {
   );
 };
 
+// Some Windows filesystems (and older Node releases on certain mounts) report
+// dev/ino as 0 for every file. A same-path swap between two stat calls would
+// otherwise pass this identity check vacuously when both sides read 0/0, so a
+// zero ino is rejected outright rather than trusted as a real identity.
+const isSameFileIdentity = (preInfo, postInfo) => (
+  preInfo.ino !== 0
+  && postInfo.dev === preInfo.dev
+  && postInfo.ino === preInfo.ino
+  && postInfo.nlink <= 1
+);
+
 const launchTokenProof = (token, challenge) =>
   createHmac('sha256', token).update(`codex-debug-collector-auth-v1:${challenge}`, 'utf8').digest('base64url');
+
+// Session logs deliberately outlive the collector process (see
+// retireInactiveSessions), so a restarted collector must fold their bytes
+// back into the aggregate cap instead of starting totalBytes from zero.
+// Without this, repeated restarts each grant another full maxTotalBytes
+// allowance while every prior log stays on disk, letting .debug grow without
+// bound. lstatSync (not statSync) so a symlink planted under .debug is
+// skipped rather than followed and counted as/instead of the real file.
+const computeRetainedLogBytes = (logDir) => {
+  let names;
+  try {
+    names = readdirSync(logDir);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 0;
+    throw error;
+  }
+  let bytes = 0;
+  for (const name of names) {
+    if (!/^debug-.*\.log$/.test(name)) continue;
+    let info;
+    try {
+      info = lstatSync(path.join(logDir, name));
+    } catch {
+      continue;
+    }
+    if (info.isFile()) bytes += info.size;
+  }
+  return bytes;
+};
 
 const DEFAULT_PORT = 8787;
 const COLLECTOR_SERVICE = 'codex-debug-collector';
@@ -525,7 +565,7 @@ const createDebugServer = ({
     ? effectiveLimits.sessionIdleTimeoutMs
     : DEFAULT_LIMITS.sessionIdleTimeoutMs;
   const originSet = new Set(allowedOrigins);
-  let totalBytes = 0;
+  let totalBytes = computeRetainedLogBytes(logDir);
   // Token-file persistence finishes after listen(); until then the collector
   // is not ready for already_running relaunch claims.
   let collectorReady = false;
@@ -1286,6 +1326,15 @@ const main = () => {
           if (error?.code !== 'EEXIST') throw error;
           let claimedPort = null;
           let claimText = null;
+          // Captured once, up front, so the stale-reclaim unlink below can
+          // verify it is still deleting this exact record rather than
+          // whatever now occupies the path.
+          let claimInfo = null;
+          try {
+            claimInfo = await lstat(claimFile);
+          } catch {
+            claimInfo = null;
+          }
           try {
             claimText = await readSmallRegularFile(claimFile, MAX_CLAIM_FILE_BYTES);
             if (claimText) {
@@ -1305,21 +1354,14 @@ const main = () => {
             && Boolean(String(claimLines[1] || '').trim())
             && Number.isInteger(Number(String(claimLines[2] || '').trim()))
             && Number(String(claimLines[2] || '').trim()) > 0;
-          if (!completeClaim) {
-            try {
-              const claimInfo = await lstat(claimFile);
-              const freshPrivateRegularClaim = claimInfo.isFile()
-                && !claimInfo.isSymbolicLink()
-                && claimInfo.nlink === 1
-                && claimInfo.size <= MAX_CLAIM_FILE_BYTES
-                && Date.now() - claimInfo.mtimeMs < COLLECTOR_CLAIM_INITIALIZING_GRACE_MS;
-              if (freshPrivateRegularClaim) {
-                throw new Error('collector_claim_initializing');
-              }
-            } catch (claimInfoError) {
-              if (claimInfoError?.message === 'collector_claim_initializing') throw claimInfoError;
-              // A disappeared or uninspectable record can proceed to the
-              // guarded stale-reclaim path below, which still refuses links.
+          if (!completeClaim && claimInfo) {
+            const freshPrivateRegularClaim = claimInfo.isFile()
+              && !claimInfo.isSymbolicLink()
+              && claimInfo.nlink === 1
+              && claimInfo.size <= MAX_CLAIM_FILE_BYTES
+              && Date.now() - claimInfo.mtimeMs < COLLECTOR_CLAIM_INITIALIZING_GRACE_MS;
+            if (freshPrivateRegularClaim) {
+              throw new Error('collector_claim_initializing');
             }
           }
           // Owner PID is authoritative: a starting peer is not ready yet but
@@ -1347,10 +1389,27 @@ const main = () => {
           } catch (portError) {
             if (portError?.message === 'collector_already_running_on_other_port') throw portError;
           }
-          // Stale claim: remove and retry exclusive create.
+          // Stale claim: remove and retry exclusive create. Two concurrent
+          // launches can both inspect this same stale record and both reach
+          // this point; if the first has already unlinked it and created its
+          // own fresh claim by the time the second gets here, an unconditional
+          // unlink would delete that legitimate successor instead of the
+          // stale record actually inspected above, letting both launches
+          // believe they hold the claim. Re-verify the path still identifies
+          // that same record (dev/ino) immediately before deleting it; on a
+          // mismatch, leave the successor alone and let the next attempt
+          // re-evaluate whatever now occupies the path from scratch instead
+          // of hard-failing this launch.
           try {
             await assertNotSymlink(claimFile, 'collector_claim_is_symlink');
-            await unlink(claimFile);
+            let sameRecord = true;
+            if (claimInfo) {
+              const currentClaimInfo = await lstat(claimFile);
+              sameRecord = isSameFileIdentity(claimInfo, currentClaimInfo);
+            }
+            if (sameRecord) {
+              await unlink(claimFile);
+            }
           } catch (unlinkError) {
             if (unlinkError?.code !== 'ENOENT') {
               throw new Error('collector_claim_contention');
@@ -1490,11 +1549,7 @@ const main = () => {
           } catch {
             throw new Error('collector_token_parent_replaced');
           }
-          if (
-            postProtectInfo.dev !== info.dev
-            || postProtectInfo.ino !== info.ino
-            || postProtectInfo.nlink > 1
-          ) {
+          if (!isSameFileIdentity(info, postProtectInfo)) {
             throw new Error('collector_token_parent_replaced');
           }
         } else {
@@ -1574,6 +1629,7 @@ module.exports = {
   RequestError,
   createDebugServer,
   isInsideRoot,
+  isSameFileIdentity,
   openNoFollowSync,
   probeLaunchToken,
   probeReadyCollector,

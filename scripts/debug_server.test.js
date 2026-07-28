@@ -13,6 +13,7 @@ const {
   RequestError,
   createDebugServer,
   isInsideRoot,
+  isSameFileIdentity,
   openNoFollowSync,
   probeLaunchToken,
   probeReadyCollector,
@@ -916,6 +917,55 @@ test('enforces the aggregate log byte cap', async () => {
   }
 });
 
+test('initializes the aggregate byte cap from log files retained across a collector restart', async () => {
+  // scripts/debug_server.js:528 (chatgpt-codex-connector): totalBytes was
+  // always initialized to 0, so a collector restart (or successive relaunches
+  // during a single debugging session) let each new process write another
+  // full maxTotalBytes worth of events on top of whatever session logs the
+  // previous process already left on disk -- the aggregate cap only bounded a
+  // single process's lifetime, not .debug's actual size on disk. Prove a
+  // freshly started collector accounts for bytes a prior process already
+  // wrote: record one event, stop that server (simulating a restart) without
+  // deleting its log, then start a new server with maxTotalBytes set to
+  // exactly the bytes already on disk. If the new process still initializes
+  // totalBytes to 0, a same-sized second event fits under the cap and is
+  // accepted (202); the fix must instead report storage_limit_reached.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-retained-bytes-'));
+
+  const first = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+  const firstUrl = await listen(first);
+  let retainedBytes;
+  try {
+    const session = (await createSession(firstUrl)).body;
+    const recorded = await recordEvent(firstUrl, session);
+    assert.equal(recorded.status, 202);
+    retainedBytes = (await stat(path.join(projectRoot, session.log_file))).size;
+    assert.ok(retainedBytes > 0, 'the first event must have written bytes to disk');
+  } finally {
+    await close(first);
+  }
+
+  const second = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { maxTotalBytes: retainedBytes },
+  });
+  const secondUrl = await listen(second);
+  try {
+    const session = (await createSession(secondUrl)).body;
+    const response = await recordEvent(secondUrl, session);
+    assert.equal(
+      response.status,
+      429,
+      `restart must not reset the aggregate cap: ${JSON.stringify(response.body)}`,
+    );
+    assert.deepEqual(response.body, { error: 'storage_limit_reached' });
+  } finally {
+    await close(second);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('isInsideRoot rejects a path that resolves outside the verified root', async () => {
   // Unit-level regression for the startup token-file post-open
   // re-verification (main()'s TOCTOU-narrowing fix, mirroring
@@ -957,6 +1007,40 @@ test('isInsideRoot rejects a path that resolves outside the verified root', asyn
     await rm(projectRoot, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });
   }
+});
+
+test('isSameFileIdentity rejects a zero/zero identity even though dev and ino both compare equal', () => {
+  // Some Windows filesystems (and older Node versions on certain mounts)
+  // report dev/ino as 0 for every file. Two stat() calls on genuinely
+  // different underlying files could both read {dev: 0, ino: 0}, which would
+  // pass a plain equality check vacuously. The Windows post-protect-ACL
+  // re-verification in main() relies on this predicate to fail closed instead
+  // of trusting an absent identity.
+  assert.equal(
+    isSameFileIdentity({ dev: 0, ino: 0, nlink: 1 }, { dev: 0, ino: 0, nlink: 1 }),
+    false,
+  );
+});
+
+test('isSameFileIdentity accepts a genuine matching non-zero identity', () => {
+  assert.equal(
+    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 1 }),
+    true,
+  );
+});
+
+test('isSameFileIdentity rejects a real dev/ino mismatch', () => {
+  assert.equal(
+    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 43, nlink: 1 }),
+    false,
+  );
+});
+
+test('isSameFileIdentity rejects when nlink indicates a hard link was added', () => {
+  assert.equal(
+    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 2 }),
+    false,
+  );
 });
 
 test('refuses to write the launch token through a hard-linked collector_token', { timeout: 20000 }, async () => {
@@ -1624,6 +1708,99 @@ test('does not reclaim a freshly created incomplete collector_claim', { timeout:
   }
 });
 
+test('does not delete a concurrently reclaimed collector_claim during stale-claim removal', { timeout: 30000 }, async (t) => {
+  // Two launches can both inspect the same stale claim (dead recorded port)
+  // and both conclude it is safe to reclaim. If the first has already
+  // unlinked it and written its own fresh claim by the time the second
+  // reaches its own unconditional unlink, the second would delete that
+  // legitimate successor instead of the stale record it actually inspected,
+  // letting both launches believe they hold the claim. Simulate the
+  // successor landing mid-reclaim with a single, precisely-timed swap of the
+  // seeded stale claim for one pointing at a real, same-project peer: the
+  // launcher captures the stale claim's identity almost immediately (on its
+  // first EEXIST), then spends ~160-260ms probing the dead recorded port
+  // before deciding whether to unlink, so a swap at 100ms reliably lands
+  // inside that window without needing to hammer the file. A swap performed
+  // after the launcher has already finished (checked via `outcomeSettled`)
+  // is skipped so it can never overwrite the launcher's own post-hoc claim
+  // and manufacture a false pass.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-claim-reclaim-race-'));
+    const debugDir = path.join(projectRoot, '.debug');
+    await mkdir(debugDir, { recursive: true });
+    const claimFile = path.join(debugDir, 'collector_claim');
+    const stagedFile = path.join(debugDir, 'collector_claim.staged');
+    const deadPort = await findFreePort();
+    await writeFile(claimFile, `${deadPort}\nstale-instance\n2147483646\n`, 'utf8');
+
+    // The "successor": a real, same-project-hash peer a concurrent launch
+    // would have legitimately created after reclaiming the stale record above.
+    const peer = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const peerUrl = await listen(peer);
+    const peerPort = Number(new URL(peerUrl).port);
+    const peerClaimContent = `${peerPort}\npeer-instance\n${process.pid}\n`;
+
+    const port = await findFreePort();
+    const launched = launchCli(projectRoot, port);
+
+    let outcomeSettled = false;
+    launched.outcome.then(() => { outcomeSettled = true; });
+
+    let swapApplied = false;
+    const swapDone = new Promise((resolve) => {
+      setTimeout(async () => {
+        if (!outcomeSettled) {
+          try {
+            await writeFile(stagedFile, peerClaimContent, 'utf8');
+            try {
+              renameSync(stagedFile, claimFile);
+            } catch (error) {
+              if (error?.code !== 'EPERM') throw error;
+              rmSync(claimFile);
+              renameSync(stagedFile, claimFile);
+            }
+            swapApplied = true;
+          } catch {
+            // The launcher may have deleted/replaced the file at the exact
+            // same instant; leave swapApplied false and let this attempt
+            // be classified as non-decisive below.
+          }
+        }
+        resolve();
+      }, 100);
+    });
+
+    let result;
+    try {
+      result = await launched.outcome;
+      // Ensure the swap (if it fires) is fully settled before any read of
+      // final state, so a still-pending write can never race the assertions.
+      await swapDone;
+    } finally {
+      stopCli(launched.child);
+      await close(peer);
+    }
+
+    try {
+      // Decisive only once the swap actually landed before the launcher
+      // finished; a swap that never applied (outcome settled first) is a
+      // different, non-decisive interleaving this test is not about.
+      if (!swapApplied) continue;
+      assert.equal(result.exitCode, 1, `launcher must back off rather than proceed: ${JSON.stringify(result)}`);
+      assert.match(result.stderr, /collector_already_running_on_other_port|collector_claim_failed|collector_claim_contention/);
+      assert.equal(
+        await readFile(claimFile, 'utf8'),
+        peerClaimContent,
+        'the concurrently reclaimed successor claim must survive, not be deleted',
+      );
+      return;
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+  t.skip('claim reclaim race never landed decisively; nothing asserted');
+});
+
 test('rejects appends after the session log is swapped for a hard link', async () => {
   // The debugged project can mutate .debug after session creation. Swapping
   // the session log for a hard link to an outside file must fail closed
@@ -1960,6 +2137,16 @@ test(
         encoding: 'utf8',
         timeout: 3000,
       });
+      // A timed-out spawnSync also reports status === null (never 0), so
+      // assert.notEqual(res.status, 0) alone would pass even if the installer
+      // hung in its 60s retry loop instead of refusing. Require a real exit
+      // code to distinguish a hang (killed by the test timeout) from a clean
+      // refusal.
+      assert.equal(
+        typeof res.status,
+        'number',
+        `installer must exit on its own, not hang until the test timeout (signal=${res.signal}, error=${res.error?.code})`,
+      );
       assert.notEqual(res.status, 0, 'installer must not steal a fresh reclaim guard');
       assert.equal(existsSync(guard), true, 'a fresh guard must survive a concurrent installer attempt');
       assert.equal(existsSync(target), false, 'install must not proceed while the fresh guard blocks reclamation');
@@ -2128,6 +2315,20 @@ test(
     }
   },
 );
+
+test('install.ps1 is saved as UTF-8 with a BOM', async () => {
+  // Windows PowerShell 5.1 (explicitly supported via the PSVersion.Major -ge
+  // 6 branch near the top of the script) decodes BOM-less files as the
+  // system ANSI code page, mangling the non-ASCII characters the script
+  // contains (e.g. the stage->destination arrow in a comment). PSScriptAnalyzer
+  // flags this as PSUseBOMForUnicodeEncodedFile.
+  const bytes = await readFile(path.join(__dirname, '..', 'tools', 'install.ps1'));
+  assert.deepEqual(
+    [...bytes.subarray(0, 3)],
+    [0xef, 0xbb, 0xbf],
+    'install.ps1 must start with a UTF-8 BOM (EF BB BF)',
+  );
+});
 
 const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], { encoding: 'utf8' });
 const pwshAvailable = !pwshProbe.error && pwshProbe.status === 0;
