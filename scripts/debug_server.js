@@ -26,6 +26,12 @@ const writeFdSync = (fd, text) => {
 // UTF-16 base64, so repository-controlled path characters cannot become code.
 // If PowerShell, the filesystem, or ACL verification fails, startup fails
 // before collector_token receives any token bytes.
+// Resolve powershell.exe by absolute system path rather than PATH lookup: a
+// PATH-relative execFileSync could run an attacker-controlled powershell.exe
+// earlier on PATH instead of the trusted system one.
+const resolvePowerShellExecutable = () =>
+  path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+
 const protectWindowsTokenFile = (tokenFile) => {
   if (process.platform !== 'win32') return;
   const encodedPath = Buffer.from(tokenFile, 'utf16le').toString('base64');
@@ -45,7 +51,7 @@ const protectWindowsTokenFile = (tokenFile) => {
     'if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)) { exit 1 }',
   ].join('; ');
   execFileSync(
-    'powershell.exe',
+    resolvePowerShellExecutable(),
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     // Hosted and freshly provisioned Windows profiles can take more than five
     // seconds to load PowerShell/.NET ACL types. Keep the operation bounded
@@ -756,6 +762,11 @@ const createDebugServer = ({
       }
 
       if (request.method === 'POST' && pathname === '/log') {
+        // Without this, a collector that only ever receives /log calls after
+        // its one /session call (the normal usage pattern) never reclaims
+        // idle sessions, defeating the idle-timeout accounting this function
+        // exists for (see sessionIdleTimeoutMs above).
+        retireInactiveSessions();
         const payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
         // /session returns snake_case keys (session_id, session_token) but
         // older docs and several SDKs use camelCase (sessionId, sessionToken).
@@ -1466,6 +1477,26 @@ const main = () => {
         // token bytes reach disk, or startup fails closed.
         if (process.platform === 'win32') {
           protectWindowsTokenFile(tokenFile);
+          // protectWindowsTokenFile re-resolves tokenFile by path in a
+          // separate PowerShell process. If the path was swapped between the
+          // handle.stat() above and that call returning, the ACL hardening
+          // could land on a different filesystem object than the one
+          // `handle` still refers to, leaving the secret about to be written
+          // below unprotected. Re-verify the path still identifies the same
+          // inode as the open handle before writing.
+          let postProtectInfo;
+          try {
+            postProtectInfo = await lstat(tokenFile);
+          } catch {
+            throw new Error('collector_token_parent_replaced');
+          }
+          if (
+            postProtectInfo.dev !== info.dev
+            || postProtectInfo.ino !== info.ino
+            || postProtectInfo.nlink > 1
+          ) {
+            throw new Error('collector_token_parent_replaced');
+          }
         } else {
           await handle.chmod(0o600);
         }

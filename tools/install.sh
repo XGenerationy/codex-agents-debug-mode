@@ -272,7 +272,19 @@ reclaim_stale_lock() {
   guard="${lock_path}.reclaim"
   # Only one reclaimer may remove a stale lock. It rechecks the exact owner
   # record after taking this guard so it never unlinks a replacement lock.
-  mkdir "$guard" 2>/dev/null || return 1
+  if ! mkdir "$guard" 2>/dev/null; then
+    # A guard left behind by a reclaimer that crashed or was killed before its
+    # own rmdir would otherwise block reclamation forever, even though the
+    # original lock owner is confirmed dead above. Only steal a guard old
+    # enough (5+ minutes) that a live reclaimer could not still be inside the
+    # short critical section below, then retry exactly once.
+    if [[ -n "$(find "$guard" -maxdepth 0 -mmin +5 2>/dev/null)" ]]; then
+      rmdir "$guard" 2>/dev/null
+      mkdir "$guard" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
   current=""
   if [[ -f "$lock_path" && ! -L "$lock_path" ]]; then
     current="$(<"$lock_path")"
@@ -381,6 +393,17 @@ for destination in "${destinations[@]}"; do
     restore_from_backup "$destination" "$backup"
     rollback
     echo "Failed to install to $destination" >&2
+    exit 1
+  fi
+  # If something recreated $destination as a directory between the backup
+  # check above and this mv, POSIX mv nests $stage inside it instead of
+  # replacing it or failing, and the commit would silently "succeed" with the
+  # payload one level too deep. Detect that nested layout and treat it the
+  # same as a failed move.
+  if [[ -d "$destination/$(basename -- "$stage")" ]]; then
+    restore_from_backup "$destination" "$backup"
+    rollback
+    echo "Failed to install to $destination (destination became a directory during commit)" >&2
     exit 1
   fi
   committed_dests+=("$destination")

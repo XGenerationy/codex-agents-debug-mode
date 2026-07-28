@@ -862,6 +862,39 @@ test('retires inactive sessions before enforcing the session cap', async () => {
   }
 });
 
+test('retires an idle session before /log revalidates its credentials', async () => {
+  // CodeRabbit discussion_r3660425592: retireInactiveSessions() was only
+  // invoked from the /session handler, and the /log session lookup has no
+  // inline staleness check of its own -- it just does sessions.get(sessionId)
+  // and, if found, treats the credential as good. So a session that goes
+  // idle past sessionIdleTimeoutMs stayed valid for /log indefinitely unless
+  // some unrelated /session call happened to sweep it first. Prove /log
+  // itself now enforces the idle timeout: with no second session ever
+  // created, an idle-past-timeout /log call for the original session must
+  // fail, matching the documented "subsequent /log gets unknown_session"
+  // contract.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-log-retire-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    limits: { sessionIdleTimeoutMs: 40 },
+  });
+  const baseUrl = await listen(server);
+
+  try {
+    const first = await createSession(baseUrl);
+    assert.equal(first.status, 201);
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    const idleWrite = await recordEvent(baseUrl, first.body);
+    assert.equal(idleWrite.status, 404);
+    assert.deepEqual(idleWrite.body, { error: 'unknown_session' });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('enforces the aggregate log byte cap', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({
@@ -1863,6 +1896,80 @@ test(
 );
 
 test(
+  'install.sh reclaims a lock behind a stale .reclaim guard left by a crashed reclaimer',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: process ownership probe'), timeout: 15000 },
+  async () => {
+    // reclaim_stale_lock's own guard directory (mkdir "$guard") can itself be
+    // left behind if a prior reclaimer crashed between creating it and its
+    // final rmdir. Without staleness recovery, a leftover guard makes every
+    // future installer treat a provably-dead-owner lock as permanently
+    // contended: it would burn through all 120 retries (60s of sleep 0.5)
+    // before failing outright, instead of reclaiming in well under a second.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-stale-guard-home-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    try {
+      const hostname = spawnSync('hostname', [], { encoding: 'utf8' }).stdout.trim();
+      assert.notEqual(hostname, '', 'hostname is required for the stale-lock fixture');
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(
+        `${target}.install-lock`,
+        `pid=999999999\nhost=${hostname}\ntoken=interrupted-fixture\n`,
+      );
+      const guard = `${target}.install-lock.reclaim`;
+      await mkdir(guard);
+      const staleTime = new Date(Date.now() - 10 * 60 * 1000);
+      await utimes(guard, staleTime, staleTime);
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const startedAt = Date.now();
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const elapsedMs = Date.now() - startedAt;
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(existsSync(target), true, 'installer must proceed after reclaiming the lock behind a stale guard');
+      assert.equal(existsSync(guard), false, 'the stale guard must not be left behind after reclamation');
+      assert.equal(existsSync(`${target}.install-lock`), false, 'EXIT cleanup must release the newly acquired lock');
+      assert.ok(elapsedMs < 10000, `reclaiming a stale guard must not fall back to the 60s retry loop (took ${elapsedMs}ms)`);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.sh does not steal a fresh .reclaim guard from a concurrent reclaimer',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: process ownership probe'), timeout: 15000 },
+  async () => {
+    // A guard directory younger than the staleness threshold must still block
+    // reclamation: it may be a live reclaimer mid-critical-section (see
+    // reclaim_stale_lock), and only the guard's own owner may remove it.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-fresh-guard-home-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    try {
+      const hostname = spawnSync('hostname', [], { encoding: 'utf8' }).stdout.trim();
+      assert.notEqual(hostname, '', 'hostname is required for the stale-lock fixture');
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(
+        `${target}.install-lock`,
+        `pid=999999999\nhost=${hostname}\ntoken=interrupted-fixture\n`,
+      );
+      const guard = `${target}.install-lock.reclaim`;
+      await mkdir(guard);
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+        encoding: 'utf8',
+        timeout: 3000,
+      });
+      assert.notEqual(res.status, 0, 'installer must not steal a fresh reclaim guard');
+      assert.equal(existsSync(guard), true, 'a fresh guard must survive a concurrent installer attempt');
+      assert.equal(existsSync(target), false, 'install must not proceed while the fresh guard blocks reclamation');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'install.sh rejects a symlink payload entry before staging',
   { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
@@ -2040,6 +2147,27 @@ test(
       await rm(root, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.ps1 -WhatIf does not throw when every destination is skipped',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: install.ps1 is a Windows installer'), timeout: 30000 },
+  async () => {
+    // When -WhatIf (or a declined ShouldProcess confirmation) skips every
+    // destination, $staged stays empty and $lockTargets becomes @(). Binding
+    // an empty array to Enter-DestinationLocks' mandatory [string[]]
+    // parameter throws "Cannot bind argument ... because it is an empty
+    // array", turning a no-op preview run into a hard failure.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-whatif-home-'));
+    try {
+      const res = runInstallPs1(path.join(__dirname, '..', 'tools', 'install.ps1'), ['-Target', 'Both', '-HomePath', home, '-WhatIf']);
+      assert.equal(res.status, 0, `-WhatIf must not throw when no destination is staged: ${JSON.stringify(res)}`);
+      assert.doesNotMatch(res.stderr || '', /Cannot bind argument/i, `must not hit the empty-array binding error: ${JSON.stringify(res)}`);
+      assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug')), false, '-WhatIf must not actually install anything');
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
   },
 );

@@ -115,6 +115,11 @@ function Get-DestinationMutexName {
     # a one-to-one relationship with the fully-qualified, case-insensitive
     # Windows destination path. Named mutexes are released by the OS if a
     # process crashes, so they cannot permanently wedge a later installer.
+    # Deliberately unprefixed (session-scoped "Local\" namespace, not
+    # "Global\"): this installer only needs to serialize installs for the
+    # invoking user's own destinations within one interactive/service session,
+    # and "Global\" would require the "Create global objects" privilege that
+    # restricted or Terminal-Services accounts may lack.
     $normalized = [System.IO.Path]::GetFullPath($Destination).ToLowerInvariant()
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -210,8 +215,14 @@ try {
         }
     }
 
+    # $staged is empty when every destination was skipped via -WhatIf or a
+    # declined ShouldProcess confirmation; Enter-DestinationLocks' mandatory
+    # [string[]] parameter throws if bound to an empty array, so skip the call
+    # entirely rather than passing $lockTargets in that case.
     $lockTargets = @($staged | ForEach-Object { $_.Destination })
-    Enter-DestinationLocks -Destinations $lockTargets
+    if ($lockTargets.Count -gt 0) {
+        Enter-DestinationLocks -Destinations $lockTargets
+    }
 
     # Buffer success records until every destination commits. Emitting per
     # destination would let a streaming consumer persist an "installed" line
