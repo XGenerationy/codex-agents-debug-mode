@@ -691,6 +691,40 @@ test('normalizes repository and user paths before capture and logging', async ()
   assert.doesNotMatch(log, /PrivatePerson|closeout-private-repo-/i);
 });
 
+test('does not turn a root-only HOME into a needle that mangles every path separator', async () => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-root-home-repo-'));
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-root-home-output-'));
+  try {
+    const execute = createCommandExecutor({
+      repo,
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+      // A container or service account where HOME resolves to the filesystem
+      // root: without the fix, buildPathReplacements would add a bare '/'
+      // (and its '\\' variant) as a <home> needle, and since needles apply
+      // globally across the whole captured string, every path separator in
+      // *unrelated* evidence -- not just an actual home directory -- would
+      // be replaced, destroying the evidentiary value of any other absolute
+      // path the command prints (CodeRabbit review).
+      env: { ...process.env, HOME: '/' },
+    });
+    const unrelatedPath = '/var/log/app/output.txt';
+    const result = await execute({
+      id: 'root-home-probe',
+      command: `process.stdout.write(${JSON.stringify(unrelatedPath)})`,
+    }, 'qualification');
+    assert.equal(
+      result.stdout,
+      unrelatedPath,
+      `an unrelated absolute path must not be mangled by a root-derived HOME needle: ${JSON.stringify(result)}`,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('uses unique logs for repeated baseline setup attempts', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-logs-'));
   const execute = createCommandExecutor({

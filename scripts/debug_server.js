@@ -82,13 +82,18 @@ const launchTokenProof = (token, challenge) =>
 // allowance while every prior log stays on disk, letting .debug grow without
 // bound. lstatSync (not statSync) so a symlink planted under .debug is
 // skipped rather than followed and counted as/instead of the real file.
+// This accounting is explicitly best-effort: it runs synchronously inside
+// createDebugServer's construction path in main(), with no surrounding
+// try/catch, so any readdirSync failure (not just ENOENT/ENOTDIR -- e.g.
+// EACCES/EPERM on an unreadable .debug) must fail open to 0 rather than
+// crash startup with a raw stack trace instead of the structured
+// startup.failed JSON every other failure path emits (CodeRabbit review).
 const computeRetainedLogBytes = (logDir) => {
   let names;
   try {
     names = readdirSync(logDir);
-  } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 0;
-    throw error;
+  } catch {
+    return 0;
   }
   let bytes = 0;
   for (const name of names) {
@@ -1402,7 +1407,16 @@ const main = () => {
           // of hard-failing this launch.
           try {
             await assertNotSymlink(claimFile, 'collector_claim_is_symlink');
-            let sameRecord = true;
+            // A null claimInfo means the earlier lstat (captured up front,
+            // before this catch block ran) already failed -- most likely
+            // because a concurrent launch had already unlinked the stale
+            // record and replaced it with its own successor claim. There is
+            // no captured identity to re-verify against in that case, so
+            // default to NOT deleting rather than unconditionally deleting
+            // whatever now occupies the path: an unverified delete here could
+            // remove a peer's legitimate claim instead of the stale record
+            // this launch actually inspected (CodeRabbit review).
+            let sameRecord = false;
             if (claimInfo) {
               const currentClaimInfo = await lstat(claimFile);
               sameRecord = isSameFileIdentity(claimInfo, currentClaimInfo);

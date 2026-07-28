@@ -81,8 +81,15 @@ const CONFIG_SILENCING = [
   // entire source language from the lint gate without naming a src/test/spec
   // directory, so the token-based pattern above never fires. Flag ignore /
   // exclude values that are bare source-extension globs; build artifacts such
-  // as **/*.d.ts, dist, or node_modules stay unflagged.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'](?:\*\*\/|\.\/)?\*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b/i,
+  // as **/*.d.ts, dist, or node_modules stay unflagged. Brace-expanded globs
+  // (e.g. **/*.{js,ts}) hide the same whole-language exclusion behind a form
+  // the single-extension alternative never matched, since the char right
+  // after the literal dot is `{`, not a recognized extension letter (Codex
+  // UeHJ_). The second alternative below matches that form by requiring a
+  // flagged extension as a comma-delimited item inside the braces --
+  // `(?<=[{,])`/`(?=[,}])` bound each item to its own token so `{d.ts,map}`
+  // still does not match on "ts" the way a bare \b boundary would.
+  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'](?:\*\*\/|\.\/)?\*\.(?:(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b|\{[^{}]{0,200}(?<=[{,])(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)(?=[,}])[^{}]{0,200}\})/i,
   /\|\|\s*true\b/i,
   // Shell zero-exit neutralizers that hide command failure from classifyOutput
   // the same way `|| true` does. `|| :` matches even with redirects/pipes

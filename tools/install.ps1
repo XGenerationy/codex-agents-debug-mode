@@ -109,63 +109,53 @@ function New-UniqueBackupPath {
     return $backup
 }
 
-function Get-DestinationMutexName {
+function Get-DestinationLockPath {
     param([Parameter(Mandatory)][string]$Destination)
-    # A SHA-256 name avoids path separator/name-length limits while preserving
-    # a one-to-one relationship with the fully-qualified, case-insensitive
-    # Windows destination path. Named mutexes are released by the OS if a
-    # process crashes, so they cannot permanently wedge a later installer.
-    # Deliberately unprefixed (session-scoped "Local\" namespace, not
-    # "Global\"): this installer only needs to serialize installs for the
-    # invoking user's own destinations within one interactive/service session,
-    # and "Global\" would require the "Create global objects" privilege that
-    # restricted or Terminal-Services accounts may lack.
-    $normalized = [System.IO.Path]::GetFullPath($Destination).ToLowerInvariant()
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalized))
-        return 'codex-debug-install-' + ([System.BitConverter]::ToString($hash).Replace('-', ''))
-    }
-    finally {
-        $sha256.Dispose()
-    }
+    # A plain filesystem lock adjacent to the destination -- matching
+    # tools/install.sh's own "${dest}.install-lock" convention -- instead of
+    # a named Windows Mutex. A Mutex without the "Global\" prefix lives in
+    # the *invoking session's* private namespace, so two processes started
+    # from separate RDP/service/interactive sessions against the same
+    # -HomePath acquire different mutex objects and can run the
+    # backup/commit/rollback transaction concurrently against the same
+    # destination, defeating the installer's atomicity guarantee (CodeRabbit
+    # review). "Global\" would close that gap but needs the "Create global
+    # objects" privilege that restricted/Terminal-Services accounts may
+    # lack. A filesystem path is not namespaced by session at all, and an
+    # open handle with FileShare::None is released by the OS the instant
+    # this process exits or crashes for any reason, so it cannot permanently
+    # wedge a later installer either.
+    return [System.IO.Path]::GetFullPath($Destination) + '.install-lock'
 }
 
 $destinationLocks = New-Object 'System.Collections.Generic.List[object]'
 function Enter-DestinationLocks {
     param([Parameter(Mandatory)][string[]]$Destinations)
-    # All lock names are acquired in a stable order before any destination is
+    # All lock paths are acquired in a stable order before any destination is
     # moved. This prevents a Both-target transaction from deadlocking a
     # single-target transaction and keeps every backup/commit/rollback action
     # isolated from concurrent installers.
     foreach ($destination in ($Destinations | Sort-Object { [System.IO.Path]::GetFullPath($_).ToLowerInvariant() })) {
-        $mutex = [System.Threading.Mutex]::new($false, (Get-DestinationMutexName -Destination $destination))
-        $acquired = $false
-        try {
+        $lockPath = Get-DestinationLockPath -Destination $destination
+        $deadline = [DateTime]::UtcNow.AddMinutes(1)
+        $stream = $null
+        while ($true) {
             try {
-                $acquired = $mutex.WaitOne([TimeSpan]::FromMinutes(1))
+                $stream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                break
             }
-            catch [System.Threading.AbandonedMutexException] {
-                # The prior owner exited without releasing the mutex. Windows
-                # has already granted this process ownership, so it is safe to
-                # continue and the finally block below will release it.
-                $acquired = $true
+            catch [System.IO.IOException] {
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    throw "Timed out waiting for install lock: $destination"
+                }
+                Start-Sleep -Milliseconds 100
             }
-            if (-not $acquired) {
-                throw "Timed out waiting for install lock: $destination"
-            }
-            $destinationLocks.Add([pscustomobject]@{
-                Destination = $destination
-                Mutex       = $mutex
-            })
         }
-        catch {
-            if ($acquired) {
-                try { $mutex.ReleaseMutex() } catch { Write-Warning "Could not release install lock for ${destination}: $($_.Exception.Message)" }
-            }
-            $mutex.Dispose()
-            throw
-        }
+        $destinationLocks.Add([pscustomobject]@{
+            Destination = $destination
+            Stream      = $stream
+            LockPath    = $lockPath
+        })
     }
 }
 
@@ -173,14 +163,15 @@ function Exit-DestinationLocks {
     for ($i = $destinationLocks.Count - 1; $i -ge 0; $i--) {
         $record = $destinationLocks[$i]
         try {
-            $record.Mutex.ReleaseMutex()
+            $record.Stream.Dispose()
         }
         catch {
             Write-Warning "Could not release install lock for $($record.Destination): $($_.Exception.Message)"
         }
-        finally {
-            $record.Mutex.Dispose()
-        }
+        # Best-effort cleanup only: a leftover lock file does not wedge a
+        # future run because acquisition always reopens it with
+        # FileShare::None, so a failure here is purely cosmetic.
+        try { Remove-Item -LiteralPath $record.LockPath -Force -ErrorAction SilentlyContinue } catch {}
     }
     $destinationLocks.Clear()
 }

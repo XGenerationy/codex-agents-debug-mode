@@ -218,3 +218,51 @@ test('readCloseoutConfig tolerates a missing config path at the lstat pre-check'
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+test('rejects a --config identity check when the filesystem never assigns real inodes (ino === 0)', async () => {
+  // CodeRabbit review (pr_closeout.js:110): a dev/ino comparison where both
+  // sides report ino 0 (some FAT/network mounts never assign real inodes) is
+  // vacuously true and provides zero protection precisely on the platforms
+  // where openNoFollow's own O_NOFOLLOW fallback also degrades.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 0 }),
+    read: async () => { throw new Error('read must not be reached once ino reporting is untrusted'); },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-zero-ino.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 0 }),
+      openFile: async () => fakeHandle,
+    }),
+    /must not be a symlink/,
+  );
+});
+
+test('rejects a --config opened after an ENOENT lstat pre-check finds nothing to compare against', async () => {
+  // Codex review (pr_closeout.js:95): when the pre-open lstat sees ENOENT,
+  // preInfo is null and there is nothing to compare the opened descriptor's
+  // identity against. A symlink created in that exact gap (the config path
+  // did not exist yet, then a racer swapped one in before openFile ran) must
+  // not be silently accepted just because there was no earlier identity to
+  // contradict it.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const targetContent = JSON.stringify({ baseRef: 'HEAD' });
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 1, ino: 1 }),
+    read: async (buffer, offset) => {
+      const chunk = Buffer.from(targetContent, 'utf8');
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+    close: async () => {},
+  };
+  const enoent = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+  await assert.rejects(
+    readCloseoutConfig('closeout-race.json', {
+      lstatFn: async () => { throw enoent; },
+      openFile: async () => fakeHandle,
+    }),
+    /must not be a symlink/,
+  );
+});

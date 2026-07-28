@@ -805,6 +805,35 @@ test('flags extension-only ignore globs as config silencing', () => {
   );
 });
 
+test('flags brace-expanded extension-only ignore globs as config silencing', () => {
+  // A single-extension glob (**/*.ts) is flagged above, but the same
+  // whole-language exclusion can hide behind brace expansion
+  // (**/*.{js,ts}) -- the char right after the literal dot is `{`, not a
+  // recognized extension letter, so the single-extension alternative never
+  // matched this form (Codex UeHJ_).
+  const cases = [
+    ['package.json', '{"eslintConfig":{"ignorePatterns":["**/*.{js,ts}"]}}'],
+    ['.eslintrc.json', '{"ignorePatterns": ["**/*.{jsx,tsx}"]}'],
+    // The flagged extension need not be the first item in the brace list.
+    ['biome.json', '{"linter":{"ignore":["**/*.{py,rb,go}"]}}'],
+  ];
+  for (const [file, text] of cases) {
+    assert.ok(
+      scanSuppressionText(file, text).some((finding) => finding.category === 'config-silencing'),
+      `${file} with a brace-expanded extension-only ignore glob must be flagged`,
+    );
+  }
+  // A brace group whose only source-like item is a declaration/build
+  // artifact extension (*.d.ts) must stay benign, matching the existing
+  // **/*.d.ts exemption for the non-brace form.
+  const benign = scanSuppressionText('tsconfig.json', '{"exclude": ["**/*.{d.ts,map}", "dist", "node_modules"]}');
+  assert.deepEqual(
+    benign.filter((finding) => finding.category === 'config-silencing'),
+    [],
+    'a brace group containing only build-artifact extensions must not be flagged',
+  );
+});
+
 test('detects disabled rules beyond a multi-kilobyte rules object', () => {
   // A realistic .eslintrc can put `"no-console": "off"` many KB after the
   // opening `rules` key. A fixed 4 KB scan window would miss it and accept

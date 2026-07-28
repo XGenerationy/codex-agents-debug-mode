@@ -78,6 +78,11 @@ const CONFIG_MAX_BYTES = 1_048_576;
  * the path is lstat'd up front and rejected outright if it is already a
  * symlink, then the opened descriptor's dev/ino is compared back against
  * that lstat to catch a symlink swapped in during the gap between the two.
+ * A pre-open lstat that fails with ENOENT (a --config path only ever names a
+ * file the caller says already exists) and a dev/ino comparison where either
+ * side reports ino 0 (some FAT/network mounts never assign real inodes) both
+ * carry no verified identity to compare, so both are rejected rather than
+ * silently skipping the comparison and trusting whatever the open returned.
  * @param {string} configPath path passed via --config.
  * @param {{
  *   openFile?: (target: string, flags: number) => Promise<import('node:fs/promises').FileHandle>,
@@ -107,7 +112,18 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
     if (!info.isFile() || info.size > CONFIG_MAX_BYTES) {
       throw new Error(`Closeout config must be a regular file of at most ${CONFIG_MAX_BYTES} bytes: ${target}.`);
     }
-    if (preInfo && (info.dev !== preInfo.dev || info.ino !== preInfo.ino)) {
+    // A null preInfo (ENOENT at the pre-open lstat) means the path had no
+    // verified identity before the open, so a symlink created in the gap
+    // between the failed lstat and the open would otherwise be accepted with
+    // zero verification; a 0 ino on either side means the filesystem gives no
+    // reliable identity to compare at all (some FAT/network mounts always
+    // report ino 0 -- the same platforms where openNoFollow's O_NOFOLLOW
+    // fallback also degrades, per its own contract note above). Both cases
+    // are treated the same as a genuine identity mismatch: a --config path is
+    // only ever passed when the caller says it already exists, so there is no
+    // legitimate case that depends on tolerating either gap here.
+    if (!preInfo || info.ino === 0 || preInfo.ino === 0
+      || info.dev !== preInfo.dev || info.ino !== preInfo.ino) {
       throw new Error(symlinkMessage);
     }
     const buffer = Buffer.alloc(info.size);

@@ -417,6 +417,41 @@ test('exclusive output-dir lock release refuses an unverified successor', async 
   }
 });
 
+test('release() keeps the abrupt-exit safety net registered when it cannot confirm the lock was cleared', async () => {
+  // CodeRabbit review (pr_closeout_workflow.js:365): the release() path used
+  // to mark the lock "released" and unregister the exit-time safety net
+  // unconditionally, even when the read/unlink that verifies this process
+  // still owns the on-disk record failed. If the lock file was in fact still
+  // there naming this process's own live PID, that left the output directory
+  // permanently blocked for the rest of this long-lived process's life, with
+  // no exit-time fallback left to clean it up either. The listener must stay
+  // registered until removal is actually confirmed.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-release-listener-'));
+  const baseline = process.listeners('exit');
+  let added = [];
+  try {
+    const lock = await acquireOutputDirLock(tmp, {
+      readLockFile: async () => {
+        throw new Error('Evidence lock is not a size-bounded regular file.');
+      },
+    });
+    added = process.listeners('exit').filter((fn) => !baseline.includes(fn));
+    assert.equal(added.length, 1);
+    await lock.release();
+    // The unverifiable release above must not have unregistered the safety
+    // net: the lock file (still naming this process) is confirmed retained
+    // by the sibling test above, so the exit listener must still be armed to
+    // clean it up if this process exits abruptly.
+    assert.deepEqual(process.listeners('exit').filter((fn) => !baseline.includes(fn)), added);
+  } finally {
+    added.forEach((fn) => process.removeListener('exit', fn));
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('exclusive output-dir lock treats a special-file lock as corrupt and reclaims it', async () => {
   // Codex #UDDQC: a FIFO/symlinked .closeout.lock must never be followed or
   // block the recovery read; a guard failure takes the corrupt-lock path.
@@ -608,6 +643,31 @@ test('acquireOutputDirLock refuses to record a directory identity the filesystem
     // The lock file created before the identity check must not be left
     // behind, or every subsequent acquisition attempt would see it as a
     // pre-existing (and never-reclaimable, since no process holds it) lock.
+    const lockStillExists = await fs.stat(nodePath.join(tmp, '.closeout.lock')).then(() => true, () => false);
+    assert.equal(lockStillExists, false);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('acquireOutputDirLock cleans up the lock file when statPath rejects outright', async () => {
+  // CodeRabbit review (pr_closeout_workflow.js:333): the ino===0 branch above
+  // closes the handle and unlinks the lock, but a rejecting statPath call
+  // (EACCES/ENOENT/EIO) previously escaped with none of that cleanup: the
+  // lock file stayed on disk naming this process's live PID, with no exit
+  // listener registered, permanently blocking the output directory for every
+  // subsequent run.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-statpath-reject-'));
+  try {
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        statPath: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+      }),
+      /denied/,
+    );
     const lockStillExists = await fs.stat(nodePath.join(tmp, '.closeout.lock')).then(() => true, () => false);
     assert.equal(lockStillExists, false);
   } finally {

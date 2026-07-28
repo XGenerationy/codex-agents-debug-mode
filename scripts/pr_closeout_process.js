@@ -1399,9 +1399,23 @@ const pathVariants = (value) => {
 };
 
 /**
+ * True when `value` is an entire filesystem root (POSIX `/`, a bare `\`, or a
+ * drive spelling like `C:`, `C:\`, `C:/`) rather than a directory under one.
+ * Redacting a root would add it as a needle matching every path separator
+ * (or every path on that drive) in captured evidence instead of scoping to
+ * an actual directory — e.g. a container or service account where
+ * `HOME=/` (CodeRabbit review).
+ * @param {string} value
+ * @returns {boolean}
+ */
+const isFilesystemRoot = (value) => value === '/' || value === '\\' || /^[A-Za-z]:[\\/]?$/.test(value);
+
+/**
  * Expand a path to every spelling that may appear in evidence: the given
  * form, and — when resolvable — its physical realpath. Symlinked worktrees
  * otherwise leave the real directory unredacted when tools print `pwd`.
+ * Filesystem roots are excluded (see isFilesystemRoot) since they would
+ * over-match instead of identifying a specific directory to redact.
  * @param {string} value
  * @returns {string[]}
  */
@@ -1414,7 +1428,7 @@ const pathRootsForRedaction = (value) => {
   } catch {
     // Path may not exist yet (output dir); keep resolve-only spellings.
   }
-  return [...new Set(roots.filter(Boolean))];
+  return [...new Set(roots.filter((root) => root && !isFilesystemRoot(root)))];
 };
 
 /**

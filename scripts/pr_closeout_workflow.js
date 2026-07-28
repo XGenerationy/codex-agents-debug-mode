@@ -330,40 +330,62 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // confirm outputDir still names the directory this lock was acquired
       // against, rather than a same-user swap-in-place replacement (Codex
       // finding: "Bind the evidence lock to the output directory inode").
-      const dirIdentity = await statPath(outputDir);
-      // Some filesystems (notably Windows FAT/network mounts) report dev/ino
-      // as 0 for every path, which would make the swap-detection comparisons
-      // below and in assertOutputDirLockIdentity pass vacuously for a
-      // same-path replacement. Fail closed rather than record an identity
-      // that provides no actual guarantee.
-      if (dirIdentity.ino === 0) {
+      let dirIdentity;
+      try {
+        dirIdentity = await statPath(outputDir);
+        // Some filesystems (notably Windows FAT/network mounts) report
+        // dev/ino as 0 for every path, which would make the swap-detection
+        // comparisons below and in assertOutputDirLockIdentity pass
+        // vacuously for a same-path replacement. Fail closed rather than
+        // record an identity that provides no actual guarantee.
+        if (dirIdentity.ino === 0) {
+          throw new Error(
+            `Filesystem does not report a usable directory identity for ${outputDir}; refusing to rely on dev/ino swap detection.`,
+          );
+        }
+      } catch (error) {
+        // A rejecting statPath (EACCES/ENOENT/EIO) must get the same cleanup
+        // as the ino===0 case above: the lock file is already on disk with
+        // this process's live PID recorded inside it, and no exit listener
+        // is registered yet, so leaving it behind here would permanently
+        // block the output directory for every subsequent run (CodeRabbit
+        // review).
         await handle.close().catch(() => {});
         await unlink(lockPath).catch(() => {});
-        throw new Error(
-          `Filesystem does not report a usable directory identity for ${outputDir}; refusing to rely on dev/ino swap detection.`,
-        );
+        throw error;
       }
       let released = false;
       const release = async () => {
         if (released) return;
-        released = true;
-        // Unregister the abrupt-exit safety net so long-lived processes that
-        // run closeout repeatedly do not accumulate exit listeners
-        // (CodeRabbit discussion_r3652923142 / Codex discussion_r3652957330).
-        process.removeListener('exit', onExit);
+        await handle.close().catch(() => {});
+        // Only mark released and drop the abrupt-exit safety net once the
+        // on-disk lock is confirmed gone or confirmed to belong to someone
+        // else. A read/unlink failure that leaves this unconfirmed (e.g. a
+        // transient EACCES/EIO, or a guarded reader rejecting a swapped-in
+        // special file) must not be treated the same as a verified removal:
+        // the file may still be on disk naming this process's own live PID,
+        // and marking it released here would both drop the exit-time safety
+        // net and stop a later retry of release() from trying again,
+        // permanently wedging the output directory for the rest of this
+        // long-lived process's life (CodeRabbit review).
+        let cleared = false;
         try {
-          await handle.close().catch(() => {});
-        } finally {
-          try {
-            // Only unlink if we still own the nonce (another process must not
-            // have reclaimed and rewritten the lock after a crash).
-            const holder = outputDirLockHolder(await readLockFile(lockPath));
-            if (holder?.nonce === nonce) {
-              await unlink(lockPath).catch(() => {});
-            }
-          } catch {
-            // Best-effort; stale reclaim handles leftovers.
+          // Only unlink if we still own the nonce (another process must not
+          // have reclaimed and rewritten the lock after a crash).
+          const holder = outputDirLockHolder(await readLockFile(lockPath));
+          if (holder?.nonce === nonce) {
+            await unlink(lockPath);
           }
+          cleared = true;
+        } catch (error) {
+          if (error?.code === 'ENOENT') cleared = true;
+        }
+        if (cleared) {
+          released = true;
+          // Unregister the abrupt-exit safety net so long-lived processes
+          // that run closeout repeatedly do not accumulate exit listeners
+          // (CodeRabbit discussion_r3652923142 / Codex discussion_r3652957330).
+          process.removeListener('exit', onExit);
         }
       };
       // Safety net for abrupt exits (CodeRabbit #4781622077).

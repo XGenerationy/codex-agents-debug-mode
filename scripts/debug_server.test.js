@@ -966,6 +966,36 @@ test('initializes the aggregate byte cap from log files retained across a collec
   }
 });
 
+test(
+  'createDebugServer does not crash when .debug is unreadable at startup',
+  {
+    // mode 0000 does not block readdir when the suite runs as UID 0 (common
+    // in containers); skip rather than assert a permission model root can
+    // always bypass.
+    skip: (process.platform === 'win32' && 'POSIX-only: chmod-based permission denial')
+      || (typeof process.getuid === 'function' && process.getuid() === 0 && 'chmod denial is not observable as root'),
+  },
+  async () => {
+    // CodeRabbit review (debug_server.js:91): computeRetainedLogBytes used to
+    // rethrow any non-ENOENT/ENOTDIR readdirSync error. createDebugServer
+    // calls it synchronously during construction with no surrounding
+    // try/catch in main(), so an unreadable .debug directory (EACCES) used to
+    // crash the whole CLI with a raw stack trace instead of the structured
+    // startup.failed JSON every other failure path emits. This accounting is
+    // documented as best-effort, so it must fail open to 0 instead.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-unreadable-'));
+    const logDir = path.join(projectRoot, '.debug');
+    await mkdir(logDir, { recursive: true });
+    await chmod(logDir, 0o000);
+    try {
+      assert.doesNotThrow(() => createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN }));
+    } finally {
+      await chmod(logDir, 0o755);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 test('isInsideRoot rejects a path that resolves outside the verified root', async () => {
   // Unit-level regression for the startup token-file post-open
   // re-verification (main()'s TOCTOU-narrowing fix, mirroring
@@ -1032,6 +1062,17 @@ test('isSameFileIdentity accepts a genuine matching non-zero identity', () => {
 test('isSameFileIdentity rejects a real dev/ino mismatch', () => {
   assert.equal(
     isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 43, nlink: 1 }),
+    false,
+  );
+});
+
+test('isSameFileIdentity rejects a dev mismatch even when ino matches', () => {
+  // CodeRabbit review (debug_server.test.js:1037): every existing mismatch
+  // case above holds dev constant and only varies ino; a matching ino across
+  // two different devices (numerically possible when comparing files from
+  // different volumes/mounts) must still be rejected as a different file.
+  assert.equal(
+    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 2, ino: 42, nlink: 1 }),
     false,
   );
 });
@@ -2196,7 +2237,20 @@ test(
       const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
         encoding: 'utf8',
         env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
+        timeout: 10000,
       });
+      // spawnSync blocks the event loop, so node:test's declared { timeout:
+      // 15000 } on this test cannot fire while spawnSync itself is stuck;
+      // only spawnSync's OWN timeout option can kill a hung installer. A
+      // killed spawnSync also reports status === null (never 0), so
+      // assert.notEqual(res.status, 0) alone would pass even on a hang;
+      // require a real exit code to distinguish a hang from a clean failure
+      // (CodeRabbit review, mirroring the sibling stale-lock-guard test above).
+      assert.equal(
+        typeof res.status,
+        'number',
+        `installer must exit on its own, not hang until spawnSync's own timeout (signal=${res.signal}, error=${res.error?.code})`,
+      );
       assert.notEqual(res.status, 0, `installer must fail when the destination is recreated as a directory mid-commit: ${JSON.stringify(res)}`);
       assert.match(res.stderr || '', /became a directory during commit/);
       assert.equal(existsSync(target), false, 'the failed destination must be rolled back, not left nested one level too deep');
@@ -2419,6 +2473,78 @@ test(
       assert.doesNotMatch(res.stderr || '', /Cannot bind argument/i, `must not hit the empty-array binding error: ${JSON.stringify(res)}`);
       assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug')), false, '-WhatIf must not actually install anything');
     } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.ps1 filesystem lock serializes two concurrent installers against the same destination',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: install.ps1 is a Windows installer'), timeout: 30000 },
+  async () => {
+    // CodeRabbit review (install.ps1:127): the per-destination lock used to
+    // be a named Windows Mutex without the "Global\" prefix, which lives in
+    // the invoking session's own namespace -- untestable here since a single
+    // test process cannot simulate two separate login sessions. The fix
+    // replaces it with a plain filesystem lock adjacent to the destination
+    // (matching tools/install.sh's own ".install-lock" convention), which is
+    // not session-scoped at all. This test proves the new lock still
+    // correctly serializes two *real*, concurrently spawned installer
+    // processes against the same destination: without serialization, the
+    // second process's commit-time Move-Item would race the first's and one
+    // run would fail outright instead of cleanly detecting the
+    // now-occupied destination and backing it up.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-lock-race-home-'));
+    const scriptPath = path.join(__dirname, '..', 'tools', 'install.ps1');
+    const runAsync = () => new Promise((resolve) => {
+      const child = spawn('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Target', 'Codex', '-HomePath', home, '-Force']);
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('close', (status) => resolve({ status, stdout, stderr }));
+    });
+    const lockPath = path.join(home, '.codex', 'skills', 'debug.install-lock');
+    // Same-session concurrency alone cannot distinguish the old Mutex from the
+    // new filesystem lock: both processes here share this one test-process's
+    // login session, so even the pre-fix session-scoped Mutex would still
+    // serialize them and this test would pass either way. What actually pins
+    // the fix is that the mechanism is now a real file on disk -- the old
+    // Mutex-based code never created anything at this path. Poll for it
+    // concurrently with the two installs to prove the new code path runs.
+    let watching = true;
+    let lockObserved = false;
+    const watchLock = (async () => {
+      while (watching && !lockObserved) {
+        if (existsSync(lockPath)) lockObserved = true;
+        else await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    try {
+      const [first, second] = await Promise.all([runAsync(), runAsync()]);
+      watching = false;
+      await watchLock;
+      assert.equal(first.status, 0, `first concurrent install must succeed: ${JSON.stringify(first)}`);
+      assert.equal(second.status, 0, `second concurrent install must succeed: ${JSON.stringify(second)}`);
+      const records = [first, second].map(({ stdout }) => JSON.parse(stdout.trim().split('\n').filter(Boolean).pop()));
+      const backups = records.map((record) => record.backup);
+      assert.ok(
+        backups.some((backup) => backup === null) && backups.some((backup) => backup !== null),
+        `exactly one concurrent run must find the destination unoccupied and the other must back it up: ${JSON.stringify(records)}`,
+      );
+      assert.equal(
+        existsSync(path.join(home, '.codex', 'skills', 'debug', 'SKILL.md')),
+        true,
+        'the final destination must contain a valid installed payload',
+      );
+      assert.equal(
+        lockObserved,
+        true,
+        'a debug.install-lock file must be observed on disk during the run, pinning the filesystem-lock mechanism (not a session-scoped mutex)',
+      );
+      assert.equal(existsSync(lockPath), false, 'the filesystem lock file must not be left behind after both installs complete');
+    } finally {
+      watching = false;
       await rm(home, { recursive: true, force: true });
     }
   },
