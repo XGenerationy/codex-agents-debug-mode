@@ -6,7 +6,7 @@ const path = require('node:path');
 const { promisify, TextDecoder } = require('node:util');
 
 const { scanSuppressionText } = require('./pr_closeout_core');
-const { fingerprintEntries, isGateFile } = require('./pr_closeout_git');
+const { computeFilterSafetyOverrides, fingerprintEntries, isGateFile } = require('./pr_closeout_git');
 const { openNoFollow } = require('./pr_closeout_fs');
 
 const execFileAsync = promisify(execFile);
@@ -83,14 +83,26 @@ const withNoTextconv = (args) => {
  * hook can never run outside spawnCaptured's containment, force
  * `core.fileMode=true` so a validation command cannot flip
  * `core.fileMode=false` to hide a chmod change to a tracked file from the
- * status/diff seal, and apply withNoTextconv.
+ * status/diff seal, neutralize every configured `filter.<driver>.*` driver
+ * (git invokes the `clean` filter to convert worktree content before
+ * comparing it against the index during `diff` — confirmed by manual repro:
+ * `git status` uses a cheaper stat/hash check and does NOT run the filter,
+ * but `git diff`, used below by hashGitOutput/workingTreeFingerprint to seal
+ * the tracked diff, does — so a touched `.gitattributes` selecting a
+ * configured filter, or a validation command writing one to local config,
+ * would otherwise run that driver outside spawnCaptured's sanitized
+ * environment on every internal diff call), and apply withNoTextconv. Filter
+ * drivers are re-enumerated on every call (not cached) because a validation
+ * command can add one to local config between two internal git invocations.
+ * @param {string} repo - Absolute repository path (used only to enumerate filter.* config).
  * @param {string[]} args - git argv.
- * @returns {string[]} args prefixed with the safety `-c` flags.
+ * @returns {Promise<string[]>} args prefixed with the safety `-c` flags.
  */
-const withInternalGitSafety = (args) => ([
+const withInternalGitSafety = async (repo, args) => ([
   '-c', 'core.fsmonitor=',
   '-c', 'core.useBuiltinFSMonitor=false',
   '-c', 'core.fileMode=true',
+  ...(await computeFilterSafetyOverrides(repo, { env: gitChildEnv() })),
   ...withNoTextconv(args),
 ]);
 
@@ -167,7 +179,7 @@ const gitChildEnv = (source = process.env) => {
 };
 
 const gitBuffer = async (repo, args) => {
-  const result = await execFileAsync('git', withInternalGitSafety(args), {
+  const result = await execFileAsync('git', await withInternalGitSafety(repo, args), {
     cwd: repo,
     env: gitChildEnv(),
     encoding: 'buffer',
@@ -721,25 +733,28 @@ const collectExtraEntries = async (repo, requested, entries) => {
  * @returns {Promise<string>} Hex-encoded SHA-256 digest of stdout.
  * @throws {Error} If git exits non-zero, including captured stderr in the message.
  */
-const hashGitOutput = (repo, args) => new Promise((resolve, reject) => {
-  const hash = createHash('sha256');
-  const child = spawn('git', withInternalGitSafety(args), {
-    cwd: repo,
-    env: gitChildEnv(),
-    stdio: ['ignore', 'pipe', 'pipe'],
+const hashGitOutput = async (repo, args) => {
+  const safeArgs = await withInternalGitSafety(repo, args);
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const child = spawn('git', safeArgs, {
+      cwd: repo,
+      env: gitChildEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stdout.on('data', (chunk) => hash.update(chunk));
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`git ${args.join(' ')} exited ${code}: ${stderr.trim()}`));
+        return;
+      }
+      resolve(hash.digest('hex'));
+    });
   });
-  let stderr = '';
-  child.stdout.on('data', (chunk) => hash.update(chunk));
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-  child.on('error', reject);
-  child.on('close', (code) => {
-    if (code !== 0) {
-      reject(new Error(`git ${args.join(' ')} exited ${code}: ${stderr.trim()}`));
-      return;
-    }
-    resolve(hash.digest('hex'));
-  });
-});
+};
 
 /**
  * Compute a single composite fingerprint of everything that can change the

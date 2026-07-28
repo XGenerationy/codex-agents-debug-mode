@@ -224,6 +224,12 @@ test('rejects a --config identity check when the filesystem never assigns real i
   // sides report ino 0 (some FAT/network mounts never assign real inodes) is
   // vacuously true and provides zero protection precisely on the platforms
   // where openNoFollow's own O_NOFOLLOW fallback also degrades.
+  //
+  // CodeRabbit review (pr_closeout.js:128, Codex UfmJr): this must NOT be the
+  // generic "must not be a symlink" message -- an operator on a filesystem
+  // that never assigns real inodes has no symlink to fix, and that message
+  // points them at the wrong problem. The zero-ino case gets its own,
+  // actionable message instead.
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const fakeHandle = {
     stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 0 }),
@@ -235,7 +241,26 @@ test('rejects a --config identity check when the filesystem never assigns real i
       lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 0 }),
       openFile: async () => fakeHandle,
     }),
-    /must not be a symlink/,
+    /does not report a usable file identity/,
+  );
+});
+
+test('rejects a --config identity check when only the pre-open lstat reports ino 0', async () => {
+  // Same zero-ino message must fire when the untrusted side is the pre-open
+  // lstat rather than the opened descriptor's stat -- both sides carry no
+  // verified identity to compare either way.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 9 }),
+    read: async () => { throw new Error('read must not be reached once ino reporting is untrusted'); },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-zero-ino-pre.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 0 }),
+      openFile: async () => fakeHandle,
+    }),
+    /does not report a usable file identity/,
   );
 });
 

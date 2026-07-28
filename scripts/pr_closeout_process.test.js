@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
 const { access, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
@@ -14,6 +14,7 @@ const {
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
+  environHasAnySpawnMark,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeCommandDefault,
@@ -31,6 +32,22 @@ const {
 } = require('./pr_closeout_process');
 
 const { MIN_AUTO_SECRET_LENGTH, buildChildEnvironment } = require('./pr_closeout_stream');
+
+const windowsAclIsCurrentUserOnly = (filePath) => {
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
+  const script = [
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    'if ($acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
+  ].join('; ');
+  return spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { encoding: 'utf8', windowsHide: true },
+  );
+};
 
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
@@ -1235,6 +1252,39 @@ test('refuses to write a command executor log header through a pre-existing syml
   }
 });
 
+test(
+  'protects a written evidence log with a current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    // Codex Ugisp: chmod(0600) at evidence-log open time is a no-op against
+    // Windows' inherited DACL, so a log written into a directory whose
+    // inherited ACL grants other local users access would otherwise stay
+    // readable by them. openLogNoFollow must establish and verify the same
+    // current-user-only ACL invariant already covered for the debug
+    // collector's token/session-log writes (debug_server.test.js).
+    const logDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-acl-'));
+    const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
+    try {
+      const result = await spawnCaptured({
+        command: "process.stdout.write('hello')",
+        cwd: process.cwd(),
+        shell: process.execPath,
+        shellArgs: (command) => ['-e', command],
+        timeoutMs: 5000,
+        env: process.env,
+        logPath,
+      });
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.logWriteError, null);
+      const acl = windowsAclIsCurrentUserOnly(logPath);
+      assert.equal(acl.status, 0, `${acl.stdout}\n${acl.stderr}`);
+      assert.equal(acl.stdout.trim(), 'ok');
+    } finally {
+      await rm(logDir, { recursive: true, force: true });
+    }
+  },
+);
+
 test('treats common database password env vars as sensitive', () => {
   // PGPASSWORD and MYSQL_PWD are standard database credential names that do
   // not contain any of the generic sensitive tokens (PASSWORD/PWD match no
@@ -1636,6 +1686,95 @@ test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is b
     if (orphanPid) { try { process.kill(orphanPid, 'SIGKILL'); } catch {} }
     await rm(repo, { recursive: true, force: true });
   }
+});
+
+test('environHasAnySpawnMark detects a foreign spawn mark regardless of value', () => {
+  // Codex UfzOf (P1): the exclusion only needs to know SOME check's spawn
+  // mark is present, not which one, so this must match any value and must
+  // not be fooled by a same-prefix-but-different key.
+  const foreign = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}=some-other-checks-mark\0HOME=/root`, 'utf8');
+  assert.equal(environHasAnySpawnMark(foreign), true);
+
+  const none = Buffer.from('PATH=/usr/bin\0HOME=/root', 'utf8');
+  assert.equal(environHasAnySpawnMark(none), false);
+
+  const nearMiss = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}_OTHER=not-a-real-mark`, 'utf8');
+  assert.equal(environHasAnySpawnMark(nearMiss), false);
+
+  assert.equal(environHasAnySpawnMark(''), false);
+});
+
+test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', { timeout: 15000 }, async () => {
+  // Codex UfzOf (P1): under the default test-runner parallelism, a sibling
+  // check's own live, mark-tracked descendant can have a PPID chain that
+  // looks broken relative to THIS spawn's rootPid/selfPid purely because it
+  // descends from a different root. Reproduce that exact shape -- a detached,
+  // reparented (broken-chain) grandchild whose environ carries a *different*
+  // check's spawn mark -- and assert it is excluded, not misattributed.
+  if (process.platform === 'win32') return;
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-foreign-mark-'));
+  let siblingPid = 0;
+  let rootPid = 0;
+  try {
+    const launcher = [
+      'const {spawn}=require("node:child_process");',
+      `const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true,env:{...process.env,${SPAWN_MARK_ENV}:"some-other-checks-mark"}});`,
+      'process.stdout.write(String(child.pid));',
+      'child.unref();',
+      'setTimeout(()=>process.exit(0),200);',
+    ].join('');
+    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
+    rootPid = root.pid;
+    root.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
+    await new Promise((resolve) => root.once('exit', resolve));
+    for (let i = 0; i < 40 && !siblingPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(siblingPid > 0, 'sibling pid must be reported');
+    let ppid = rootPid;
+    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
+      try {
+        const stat = readFileSync(`/proc/${siblingPid}/stat`, 'utf8');
+        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
+
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid, rootPid });
+    assert.ok(
+      !(found || []).includes(siblingPid),
+      `foreign-marked sibling ${siblingPid} must be excluded, got: ${JSON.stringify(found)}`,
+    );
+    const sweep = await sweepDetachedOrphans({
+      mark: 'probe-this-checks-mark-does-not-match',
+      cwd: repo,
+      rootPid,
+      kill: () => {},
+      selfPid: process.pid,
+    });
+    assert.equal(sweep.status, 'PASS', statusDiag(sweep));
+  } finally {
+    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host platform', () => {
+  // Codex Ugisk (P1): on macOS and other non-Linux POSIX hosts, /proc never
+  // exists, so listLivePidsWithSpawnMark always returned null there. The old
+  // code treated that as PASS ("process-group containment only") solely
+  // because process.platform !== 'linux', silently accepting weaker evidence
+  // on non-Linux hosts even though a real setsid descendant could still be
+  // alive and mutating the repo after the seal. This host genuinely lacks
+  // /proc (Windows), so it exercises the exact real-world condition the
+  // finding describes without needing to fake the platform.
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') !== null) return; // only meaningful without /proc
+  return sweepDetachedOrphans({ mark: 'probe-ugisk-no-proc', kill: () => {} }).then((result) => {
+    assert.equal(result.status, 'BLOCKED', statusDiag(result));
+    assert.match(result.evidence, /proc.*missing/i);
+  });
 });
 
 test('still runs taskkill /T when the Windows root PID has already exited', async () => {

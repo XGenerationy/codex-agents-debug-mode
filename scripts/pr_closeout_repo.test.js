@@ -647,3 +647,48 @@ test('cleanTreeStatus detects a chmod change even when core.fileMode is disabled
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+test('workingTreeFingerprint does not invoke a configured clean filter driver', async () => {
+  // Codex Ugise: `git diff` (used by hashGitOutput/workingTreeFingerprint to
+  // seal the tracked diff against HEAD) genuinely needs content-level
+  // comparison and so invokes a configured `clean` filter to convert the
+  // worktree copy before diffing -- confirmed by manual repro: a plain `git
+  // status --porcelain` does NOT invoke the filter to detect the same
+  // modification (git's status dirty-check is stat/hash based and never
+  // needed clean-filtered content), but `git diff --binary --no-ext-diff
+  // --no-textconv HEAD` does. A touched .gitattributes selecting a
+  // configured filter (or a validation command writing one to local config)
+  // must not get that driver executed by workingTreeFingerprint's internal
+  // diff call outside spawnCaptured's containment.
+  const repo = await fixtureRepo();
+  const marker = path.join(repo, 'evil-clean-ran');
+  try {
+    await writeFile(path.join(repo, '.gitattributes'), 'tracked.txt filter=evil\n');
+    git(repo, 'add', '.gitattributes');
+    git(repo, 'commit', '--quiet', '-m', 'attributes');
+    // Drive the filter via `node <script>` rather than a `#!/bin/sh` shebang
+    // so the driver runs identically on POSIX and native Windows git (a
+    // shebang script isn't executable through Windows git's shell handling).
+    const evilScript = path.join(repo, 'evil-clean.js');
+    await writeFile(
+      evilScript,
+      `const fs=require('fs');fs.appendFileSync(${JSON.stringify(marker)},'ran\\n');process.stdin.pipe(process.stdout);`,
+    );
+    const filterCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(evilScript)}`;
+    git(repo, 'config', 'filter.evil.clean', filterCommand);
+    git(repo, 'config', 'filter.evil.required', 'true');
+    // Modify the filtered file so the tracked-diff hash has a reason to
+    // compare it against the index (and thus a reason to run the clean
+    // filter absent neutralization).
+    await writeFile(path.join(repo, 'tracked.txt'), 'changed\n');
+    const fingerprint = await workingTreeFingerprint(repo);
+    assert.ok(fingerprint, 'fingerprint must still be computed despite the modification');
+    assert.equal(
+      require('node:fs').existsSync(marker),
+      false,
+      'filter.evil.clean must never have been invoked by an internal diff call',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});

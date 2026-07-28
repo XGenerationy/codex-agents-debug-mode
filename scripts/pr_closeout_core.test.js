@@ -1513,6 +1513,88 @@ test('flags pytest, Go, and Rust native skip forms in touched test files', () =>
   );
 });
 
+test('classifies a root-level test_*.py module as test-like (pytest prefix convention)', () => {
+  // Codex UgisO: pytest's OTHER default discovery glob (python_files =
+  // test_*.py *_test.py) is a prefix form. A root-level test_example.py has
+  // no tests/ directory ancestor and no *_test.py suffix, so it previously
+  // fell through testLike entirely and the native pytest scan never ran.
+  const findings = scanSuppressionText(
+    'test_example.py',
+    '@pytest.mark.skip\ndef test_x(): pass',
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(findings.length, 1, `expected 1 finding: ${JSON.stringify(findings)}`);
+  // A non-test module with an unrelated "test_" substring mid-name, or a
+  // module that merely contains the word test_ but does not start with it,
+  // must not be swept in by the new branch.
+  assert.deepEqual(
+    scanSuppressionText('latest_example.py', '@pytest.mark.skip\ndef test_x(): pass')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('contest_data.py', '@pytest.mark.skip\ndef test_x(): pass')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
+test('flags option-object, this.skip(), and .skipIf() executable test-skip forms', () => {
+  // Codex Ugisa: the weakening patterns only covered a literal .skip/.only/
+  // .todo terminal member, missing three forms that skip at runtime without
+  // ever writing that member: Node's own options-object skip, Mocha's
+  // this.skip() called from inside a running test body, and Vitest's
+  // .skipIf(cond)(...) conditional-skip call chain.
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "test('x', { skip: true }, () => {});")
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "test('x', { skip: 'not ready' }, () => {});")
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "it('x', function () { this.skip(); });")
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', 'describe.skipIf(cond)("x", () => {});')
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', 'it.skipIf(cond)("x", () => {});')
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  // Gating and false-positive controls: outside a test-like file, or inert
+  // inside a comment/string, none of these forms should be flagged; nor
+  // should an unrelated this.<name>() call or a plain object literal that
+  // merely happens to have a `skip` key.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.js', "test('x', { skip: true }, () => {});")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', "// test('x', { skip: true }, () => {});")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'this.skipValidation();')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'const cfg = { skip: true };')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
 test('rules silencing stays within the rules object and ignores sibling zeros', () => {
   // A sibling numeric zero outside the rules object must NOT be flagged as a
   // disabled rule (Codex M6UFnGF): the old unbounded `rules? [\s\S]*?` regex

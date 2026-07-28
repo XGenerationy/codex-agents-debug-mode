@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
-const { execFileSync } = require('node:child_process');
 const { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
-const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared, openNoFollowFlagAttempts } = require('./pr_closeout_fs');
+const {
+  assertNotSymlink: assertNotSymlinkShared,
+  isSameFileIdentity,
+  openNoFollow: openNoFollowShared,
+  openNoFollowFlagAttempts,
+  protectWindowsPrivateFile,
+  resolvePowerShellExecutable,
+} = require('./pr_closeout_fs');
 
 /**
  * Synchronous stdout/stderr writes for CLI terminal paths that call
@@ -19,59 +25,12 @@ const writeFdSync = (fd, text) => {
   writeSync(fd, text);
 };
 
-// Windows does not implement POSIX 0600 semantics: fs.chmod() only affects
-// the writable bit, leaving inherited DACL entries able to read a private
-// file (collector_token, a session log) in a shared checkout. Configure an
-// explicit, protected DACL before any secret or captured evidence is written.
-// The PowerShell program is fixed and the path is embedded only as UTF-16
-// base64, so repository-controlled path characters cannot become code. If
-// PowerShell, the filesystem, or ACL verification fails, the caller must fail
-// closed before the file receives any bytes.
-// Resolve powershell.exe by absolute system path rather than PATH lookup: a
-// PATH-relative execFileSync could run an attacker-controlled powershell.exe
-// earlier on PATH instead of the trusted system one.
-const resolvePowerShellExecutable = () =>
-  path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-
-const protectWindowsPrivateFile = (privateFile) => {
-  if (process.platform !== 'win32') return;
-  const encodedPath = Buffer.from(privateFile, 'utf16le').toString('base64');
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
-    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
-    '$acl = [IO.File]::GetAccessControl($path)',
-    '$acl.SetAccessRuleProtection($true, $false)',
-    'foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }',
-    '$ownerRule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)',
-    '$acl.SetAccessRule($ownerRule)',
-    '[IO.File]::SetAccessControl($path, $acl)',
-    '$verified = [IO.File]::GetAccessControl($path)',
-    'if (-not $verified.AreAccessRulesProtected) { exit 1 }',
-    '$rules = @($verified.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
-    'if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)) { exit 1 }',
-  ].join('; ');
-  execFileSync(
-    resolvePowerShellExecutable(),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    // Hosted and freshly provisioned Windows profiles can take more than five
-    // seconds to load PowerShell/.NET ACL types. Keep the operation bounded
-    // and fail closed, but allow a realistic startup budget before reporting
-    // token_write_failed.
-    { stdio: 'ignore', timeout: 15_000, windowsHide: true },
-  );
-};
-
-// Some Windows filesystems (and older Node releases on certain mounts) report
-// dev/ino as 0 for every file. A same-path swap between two stat calls would
-// otherwise pass this identity check vacuously when both sides read 0/0, so a
-// zero ino is rejected outright rather than trusted as a real identity.
-const isSameFileIdentity = (preInfo, postInfo) => (
-  preInfo.ino !== 0
-  && postInfo.dev === preInfo.dev
-  && postInfo.ino === preInfo.ino
-  && postInfo.nlink <= 1
-);
+// protectWindowsPrivateFile/resolvePowerShellExecutable establish and verify
+// a protected, current-user-only Windows DACL before a secret or captured
+// evidence file receives any bytes; isSameFileIdentity binds a descriptor to
+// a later path-based (l)stat. Shared via pr_closeout_fs.js (imported above)
+// so the collector's token/session-log/port writes and closeout's evidence
+// log writes stay one implementation.
 
 const launchTokenProof = (token, challenge) =>
   createHmac('sha256', token).update(`codex-debug-collector-auth-v1:${challenge}`, 'utf8').digest('base64url');
@@ -1629,6 +1588,27 @@ const main = () => {
         if (!isInsideRoot(resolvedRoot, realPortFile)) {
           throw new Error('collector_port_parent_replaced');
         }
+        // On Windows, or any filesystem where the O_NOFOLLOW ladder falls
+        // back to a plain open, openNoFollow above may have transparently
+        // followed a symlink planted at portFile after the pre-open
+        // assertNotSymlink/assertPrivateRegularFile checks. stat()/realpath()
+        // above both read through that same symlink, so both checks pass for
+        // the symlink's TARGET rather than portFile itself -- if that target
+        // is a regular file inside the project, this handle is about to
+        // truncate and overwrite an unrelated project file. A fresh lstat of
+        // the path (which does not follow a symlink) must still identify the
+        // exact object this descriptor already holds before the destructive
+        // write below reaches disk (mirrors collector_token's
+        // isSameFileIdentity binding).
+        let portPathIdentity;
+        try {
+          portPathIdentity = await lstat(portFile);
+        } catch {
+          throw new Error('collector_port_parent_replaced');
+        }
+        if (!isSameFileIdentity(portWriteInfo, portPathIdentity)) {
+          throw new Error('collector_port_parent_replaced');
+        }
         await portHandle.chmod(0o600);
         await portHandle.truncate(0);
         await portHandle.writeFile(String(port), 'utf8');
@@ -1677,4 +1657,5 @@ module.exports = {
   probeReadyCollector,
   probeServer,
   readJson,
+  resolvePowerShellExecutable,
 };

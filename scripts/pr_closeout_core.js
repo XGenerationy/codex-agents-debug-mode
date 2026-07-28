@@ -790,6 +790,12 @@ const scanSuppressionText = (file, text) => {
     // Playwright/Jest-style suite suffixes that are not named *.test.* but
     // still execute under the project test runner when touched.
     || /\.(?:e2e|integration|unit|accept(?:ance)?|functional|system)\.[a-z0-9]+$/i.test(base)
+    // pytest's OTHER default discovery pattern (python_files = test_*.py
+    // *_test.py) is a prefix, not a suffix: the *_test.py suffix form is
+    // already caught by the first pattern above, but a root-level
+    // test_example.py has no test/ directory ancestor and no *_test.py suffix
+    // to match, so it fell through this predicate entirely (Codex UgisO).
+    || /^test_.*\.py$/i.test(base)
     // Also classify files inside standard test directories (__tests__/ — a
     // standard Jest layout — plus test/, tests/, spec/, and specs/) as test
     // files even when the filename has no test/spec token, so weakening
@@ -908,7 +914,30 @@ const scanSuppressionText = (file, text) => {
   // function from `.each(...)`, and `.only`/`.skip` on THAT member still
   // focuses/skips the suite, so a chain with a call between the receiver and
   // the weakening member must not evade the scan (Codex M6UFnGV).
-  const testWeakening = /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b|\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]|(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/i;
+  // These dot/bracket/bare-function forms are all STATIC receiver.modifier
+  // shapes; they miss three RUNTIME skip forms that never write a literal
+  // `.skip`/`.only`/`.todo` member access (Codex Ugisa):
+  //   - Node's own options-object skip: test('x', { skip: true }, fn) / a
+  //     truthy string reason, per node:test's documented API.
+  //   - Mocha's this.skip() called from inside a running test/suite body --
+  //     invisible to any static describe/it scan since it names no suite.
+  //   - Vitest's describe.skipIf(cond)(...) / it.skipIf(cond)(...) conditional
+  //     skip call-chain, distinct from the unconditional `.skip` already
+  //     covered above.
+  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?:true|['"][^'"]*['"])/;
+  const mochaRuntimeSkip = /\bthis\s*\.\s*skip\s*\(\s*\)/;
+  const vitestSkipIf = /\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\.\s*skipIf\s*\(/;
+  const testWeakening = new RegExp(
+    [
+      /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b/.source,
+      /\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]/.source,
+      /(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/.source,
+      optionObjectSkip.source,
+      mochaRuntimeSkip.source,
+      vitestSkipIf.source,
+    ].join('|'),
+    'i',
+  );
     /**
      * Scan a whole source line and mark every character position that is
      * inert (inside a string, a line/block comment, or a regex literal), so

@@ -112,18 +112,27 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
     if (!info.isFile() || info.size > CONFIG_MAX_BYTES) {
       throw new Error(`Closeout config must be a regular file of at most ${CONFIG_MAX_BYTES} bytes: ${target}.`);
     }
+    // A 0 ino on either side means the filesystem gives no reliable identity
+    // to compare at all (some FAT/network mounts always report ino 0 -- the
+    // same platforms where openNoFollow's O_NOFOLLOW fallback also degrades,
+    // per its own contract note above): fail closed, but with its own
+    // message, since telling the operator "must not be a symlink" points at
+    // the wrong problem on a perfectly legitimate config and hides that the
+    // mount itself is the blocker.
+    if (info.ino === 0 || preInfo?.ino === 0) {
+      throw new Error(
+        `Filesystem does not report a usable file identity for ${target}; refusing to verify the closeout config against a symlink swap.`,
+      );
+    }
     // A null preInfo (ENOENT at the pre-open lstat) means the path had no
     // verified identity before the open, so a symlink created in the gap
     // between the failed lstat and the open would otherwise be accepted with
-    // zero verification; a 0 ino on either side means the filesystem gives no
-    // reliable identity to compare at all (some FAT/network mounts always
-    // report ino 0 -- the same platforms where openNoFollow's O_NOFOLLOW
-    // fallback also degrades, per its own contract note above). Both cases
-    // are treated the same as a genuine identity mismatch: a --config path is
-    // only ever passed when the caller says it already exists, so there is no
-    // legitimate case that depends on tolerating either gap here.
-    if (!preInfo || info.ino === 0 || preInfo.ino === 0
-      || info.dev !== preInfo.dev || info.ino !== preInfo.ino) {
+    // zero verification; a dev/ino mismatch means the open landed on a
+    // different file than the pre-open lstat saw. Both are treated as a
+    // genuine identity mismatch: a --config path is only ever passed when the
+    // caller says it already exists, so there is no legitimate case that
+    // depends on tolerating either gap here.
+    if (!preInfo || info.dev !== preInfo.dev || info.ino !== preInfo.ino) {
       throw new Error(symlinkMessage);
     }
     const buffer = Buffer.alloc(info.size);

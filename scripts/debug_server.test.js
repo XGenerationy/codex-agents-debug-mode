@@ -19,6 +19,7 @@ const {
   probeReadyCollector,
   probeServer,
   readJson,
+  resolvePowerShellExecutable,
 } = require('./debug_server');
 
 const TEST_LAUNCH_TOKEN = 'test-launch-token-with-enough-entropy-for-fixtures';
@@ -1081,6 +1082,57 @@ test('isSameFileIdentity rejects when nlink indicates a hard link was added', ()
   assert.equal(
     isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 2 }),
     false,
+  );
+});
+
+test('resolvePowerShellExecutable prefers the hard-coded system root when it is trusted', () => {
+  // Codex UfzOm: process.env.SystemRoot is untrusted input. Even when it
+  // points at something that looks like a Windows install and has a
+  // powershell.exe planted there, the real C:\Windows must win whenever it
+  // is itself verified to contain powershell.exe.
+  const calls = [];
+  const pathExists = (candidate) => {
+    calls.push(candidate);
+    return true;
+  };
+  const resolved = resolvePowerShellExecutable({
+    env: { SystemRoot: 'C:\\Users\\attacker\\planted' },
+    pathExists,
+  });
+  assert.equal(
+    resolved.replace(/\\/g, '/').toLowerCase(),
+    'c:/windows/system32/windowspowershell/v1.0/powershell.exe',
+  );
+  assert.doesNotMatch(resolved, /planted/i);
+});
+
+test('resolvePowerShellExecutable rejects an env root that does not look like a Windows install', () => {
+  // An attacker-controlled SystemRoot whose final path component is not
+  // "Windows" must never be trusted, even if the hard-coded root is (for
+  // this test's purposes) reported as missing and the planted path reports
+  // a powershell.exe present.
+  const resolved = resolvePowerShellExecutable({
+    env: { SystemRoot: 'C:\\Users\\attacker\\planted' },
+    pathExists: () => false,
+  });
+  assert.equal(
+    resolved.replace(/\\/g, '/').toLowerCase(),
+    'c:/windows/system32/windowspowershell/v1.0/powershell.exe',
+  );
+});
+
+test('resolvePowerShellExecutable falls back to an env root only when it is Windows-shaped and verified', () => {
+  // Hard-coded root reports as untrusted (existsSync fails for it), so the
+  // env-supplied root is consulted; it looks like a Windows install
+  // (basename "Windows") and is independently verified to contain
+  // powershell.exe at the expected relative path, so it is accepted.
+  const resolved = resolvePowerShellExecutable({
+    env: { SystemRoot: 'D:\\Windows' },
+    pathExists: (candidate) => candidate.startsWith('D:\\Windows'),
+  });
+  assert.equal(
+    resolved.replace(/\\/g, '/').toLowerCase(),
+    'd:/windows/system32/windowspowershell/v1.0/powershell.exe',
   );
 });
 
@@ -2542,7 +2594,13 @@ test(
     const watchLock = (async () => {
       while (watching && !lockObserved) {
         if (existsSync(lockPath)) lockObserved = true;
-        else await new Promise((resolve) => setImmediate(resolve));
+        // A setImmediate busy-loop would spin the event loop at maximum rate
+        // for the whole duration of two real installer processes, competing
+        // with the child stdout/close callbacks this test depends on. A short
+        // timed poll is cheaper and equally deterministic for detecting a
+        // lock file that exists for the length of an install (CodeRabbit
+        // review, Codex UfmJj).
+        else await new Promise((resolve) => setTimeout(resolve, 5));
       }
     })();
     try {

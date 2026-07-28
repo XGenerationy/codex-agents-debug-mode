@@ -46,7 +46,11 @@ const {
   createStreamingReplacer,
   createStreamingSignalScanner,
 } = require('./pr_closeout_stream');
-const { assertNotSymlink: assertNotSymlinkShared, openNoFollow: openNoFollowShared } = require('./pr_closeout_fs');
+const {
+  assertNotSymlink: assertNotSymlinkShared,
+  openNoFollow: openNoFollowShared,
+  protectWindowsPrivateFile,
+} = require('./pr_closeout_fs');
 
 const CAPTURE_LIMIT = 2_000_000;
 /** Hard ceiling for artifact hashing so a multi-GB proof path cannot stall closeout. */
@@ -189,6 +193,25 @@ const resolveCheckTimeout = (check, timeoutsMs = {}, timeoutMs) => {
  * @returns {number[]|null} Matching PIDs, or null when /proc is unavailable
  *   (non-Linux), which callers must treat as "unknown", not "none".
  */
+/**
+ * Whether raw `/proc/<pid>/environ` bytes contain ANY `SPAWN_MARK_ENV=...`
+ * entry, regardless of its value. A process carrying some other check's own
+ * spawn mark is not "mark-free" -- it is (or was) tracked by that other
+ * check's own primary mark-based sweep -- so listLivePidsWithCwdUnder's
+ * mark-free fallback must exclude it rather than attribute it to an unrelated
+ * spawn (Codex UfzOf: with the default test-runner parallelism, check B's
+ * still-alive descendant can have a PPID chain broken relative to check A,
+ * causing A's cwd/fd probe to misattribute B's legitimate, actively-tracked
+ * process as A's mark-free orphan and spuriously BLOCK).
+ * @param {Buffer|string} environBuffer - Raw contents of /proc/<pid>/environ.
+ * @returns {boolean}
+ */
+const environHasAnySpawnMark = (environBuffer) => {
+  const prefix = `${SPAWN_MARK_ENV}=`;
+  const vars = environBuffer.toString('utf8').split('\0');
+  return vars.some((entry) => entry.startsWith(prefix));
+};
+
 const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   if (!mark) return [];
   const target = `${SPAWN_MARK_ENV}=${mark}`;
@@ -236,6 +259,16 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
  * detached orphan of this spawn. A genuine orphan's chain is broken by
  * construction (it dead-ends at the exited spawn root or below it), so it
  * stays flagged; unknown/unreadable chains stay flagged too (fail-closed).
+ *
+ * A candidate carrying ANY check's spawn mark (`environHasAnySpawnMark`) is
+ * also excluded, even when its PPID chain to the runner is broken (Codex
+ * UfzOf): under the default test-runner parallelism, a sibling check's own
+ * live, mark-tracked descendant can have a chain that looks detached relative
+ * to THIS spawn's `rootPid`/`selfPid` purely because it descends from a
+ * different root. Without this check that sibling's legitimate process gets
+ * misattributed as this spawn's mark-free orphan and BLOCKs the sweep
+ * spuriously. An unreadable environ is treated as mark-free (fail-closed) and
+ * stays subject to the existing chain/cwd checks.
  * @returns {number[]|null} Matching PIDs, or null when /proc is unavailable
  *   (non-Linux).
  */
@@ -378,7 +411,19 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       // A sibling check still running under the runner (unbroken PPID chain
       // to the runner that never passes through this spawn's root) must not
       // be attributed to this spawn as a mark-free detached descendant.
-      if (underTree && !chainsToRunner(pid)) {
+      // Nor must a live process that carries SOME check's spawn mark (its
+      // own or a different parallel check's) -- this fallback only exists
+      // for genuinely mark-free escapees; an unreadable environ (EACCES,
+      // exited between readdir and read) is treated as mark-free and stays
+      // flagged, matching this function's fail-closed default for every
+      // other uncertain outcome.
+      let carriesSpawnMark = false;
+      try {
+        carriesSpawnMark = environHasAnySpawnMark(readFileSync(`/proc/${pid}/environ`));
+      } catch {
+        carriesSpawnMark = false;
+      }
+      if (underTree && !chainsToRunner(pid) && !carriesSpawnMark) {
         live.push(pid);
       }
     } catch {
@@ -399,7 +444,15 @@ const listLivePidsWithCwdUnder = (rootCwd, {
  * mark-free cwd/fd probe excludes live processes whose unbroken PPID chain
  * reaches the runner without passing through `rootPid` — those are sibling
  * checks spawned by the runner itself (default parallelism 4), not detached
- * descendants of this spawn.
+ * descendants of this spawn. Both the spawn-mark and cwd/fd probes require
+ * `/proc`; its absence is always treated as an incomplete containment proof
+ * and forces BLOCKED regardless of host platform (Codex Ugisk) -- macOS and
+ * other non-Linux POSIX hosts never have `/proc`, so silently downgrading to
+ * PASS there would let a real setsid orphan keep mutating the repository
+ * after the seal, undetected, on every non-Linux run. Windows never reaches
+ * either probe: its spawn mark is always empty (setsid/process-groups are a
+ * POSIX concept), so `list()` short-circuits to `[]` instead of calling into
+ * the `/proc`-based scan.
  * @returns {{status: 'PASS'|'BLOCKED', evidence: string, escalated: boolean}}
  */
 const sweepDetachedOrphans = async ({
@@ -410,7 +463,6 @@ const sweepDetachedOrphans = async ({
   terminationGraceMs = 2000,
   selfPid = process.pid,
   rootPid = 0,
-  platform = process.platform,
 } = {}) => {
   // Only *reap* PIDs that carry this spawn's mark. A cwd/fd-only scan can hit
   // unrelated processes that merely work in the same repository and must not
@@ -424,19 +476,13 @@ const sweepDetachedOrphans = async ({
   let remaining = list();
   if (remaining === null) {
     // /proc is required to re-find setsid escapees after process-group kill.
-    // On Linux its absence is an incomplete containment proof → BLOCKED.
-    // On non-Linux hosts /proc is never present; process-group kill is the
-    // only available containment and the authoritative gate runs on Linux CI.
-    if (platform === 'linux') {
-      return {
-        status: 'BLOCKED',
-        evidence: 'Detached orphan sweep unavailable (/proc missing on Linux); cannot prove setsid descendants exited.',
-        escalated: false,
-      };
-    }
+    // Its absence -- whether Linux with /proc unmounted, or any non-Linux
+    // POSIX host, which never has /proc -- is always an incomplete
+    // containment proof and must BLOCK; the host being non-Linux is not a
+    // reason to accept weaker (process-group-only) evidence as PASS.
     return {
-      status: 'PASS',
-      evidence: 'Detached orphan sweep skipped (/proc unavailable; process-group containment only).',
+      status: 'BLOCKED',
+      evidence: 'Detached orphan sweep unavailable (/proc missing); cannot prove setsid descendants exited.',
       escalated: false,
     };
   }
@@ -449,16 +495,9 @@ const sweepDetachedOrphans = async ({
     if (cwd) {
       const unmarked = listLivePidsWithCwdUnder(cwd, { selfPid, minStarttime, rootPid });
       if (unmarked === null) {
-        if (platform === 'linux') {
-          return {
-            status: 'BLOCKED',
-            evidence: `${evidence} cwd/fd orphan probe is unavailable on Linux; cannot prove mark-free descendants exited.`,
-            escalated,
-          };
-        }
         return {
-          status: 'PASS',
-          evidence: `${evidence} cwd/fd orphan probe unavailable (process-group containment only).`,
+          status: 'BLOCKED',
+          evidence: `${evidence} cwd/fd orphan probe is unavailable (/proc missing); cannot prove mark-free descendants exited.`,
           escalated,
         };
       }
@@ -1185,7 +1224,6 @@ const terminateProcessTree = async ({
         minStarttime,
         kill,
         terminationGraceMs,
-        platform,
         rootPid: child.pid,
       });
       if (sweep.status === 'BLOCKED') {
@@ -1555,6 +1593,47 @@ const openLogNoFollow = async (target, flags) => {
         && process.platform !== 'win32') {
         await handle.close().catch(() => undefined);
         throw error;
+      }
+    }
+    if (process.platform === 'win32') {
+      // chmod(0600) above is a no-op against Windows' inherited DACL, so
+      // another local user with inherited access to a shared checkout could
+      // read this evidence log. Establish a protected, current-user-only ACL
+      // before any evidence bytes are written (mirrors the debug collector's
+      // own token/session-log/port hardening in debug_server.js).
+      const preProtectInfo = await handle.stat();
+      try {
+        protectWindowsPrivateFile(target);
+      } catch {
+        await handle.close().catch(() => undefined);
+        throw new Error(`Failed to protect evidence log with an owner-only ACL: ${target}`);
+      }
+      // protectWindowsPrivateFile re-resolves the path by name in a separate
+      // PowerShell process; if the path was swapped between the open above
+      // and that call returning, the ACL could land on a different
+      // filesystem object than this handle. Only dev/ino identity is checked
+      // here -- nlink is deliberately left to the caller's own regular-file/
+      // hard-link check (writeLogHeaderNoFollow / createLogAppendStreamNoFollow),
+      // which already reports a dedicated "hard links" message; folding that
+      // condition into this generic swap check would shadow it. A zero ino
+      // is rejected outright: some Windows filesystems report dev/ino as 0
+      // for every file, which would otherwise compare equal vacuously.
+      let postProtectInfo;
+      try {
+        postProtectInfo = await lstat(target);
+      } catch {
+        await handle.close().catch(() => undefined);
+        throw new Error(`Refusing to write evidence log with an unverifiable identity: ${target}`);
+      }
+      if (
+        preProtectInfo.ino === 0
+        || postProtectInfo.dev !== preProtectInfo.dev
+        || postProtectInfo.ino !== preProtectInfo.ino
+      ) {
+        await handle.close().catch(() => undefined);
+        throw new Error(
+          `Refusing to write evidence log through a path swapped during ACL protection: ${target}`,
+        );
       }
     }
     return handle;
@@ -3103,6 +3182,7 @@ module.exports = {
   createDecodedRedactor,
   createStreamingRedactor,
   defaultShellArgs,
+  environHasAnySpawnMark,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeCommandDefault,

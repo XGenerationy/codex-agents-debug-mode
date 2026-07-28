@@ -382,6 +382,91 @@ const runGit = async (repo, args, options = {}) => {
 };
 
 /**
+ * Enumerates every effective `filter.<driver>.*` config key (local, global,
+ * system, and worktree scopes — anything `git config --get-regexp` without
+ * `--local` reports) and returns the flat `-c` argv overrides that neutralize
+ * each discovered driver (smudge/clean/process cleared, required forced
+ * false) for one git invocation. A driver assigned via `.gitattributes` can
+ * be defined only in global config, so global-scope drivers must be
+ * neutralized too, not just local ones. Driver names may themselves contain
+ * dots (`filter.a.b.process`), so only the final config-key segment is
+ * treated as the setting name.
+ *
+ * Fails closed (throws) if the local `.git/config` path is missing or not a
+ * regular file, or if enumeration fails for a reason other than a clean "no
+ * matches" (git config --get-regexp exits 1 with no output when nothing
+ * matches) — silently treating any other failure as "no filters configured"
+ * would let a driver escape neutralization.
+ * @param {string} repo - Absolute path to the repository working tree.
+ * @param {{env?: object, timeoutMs?: number}} [options]
+ * @returns {Promise<string[]>} Flat `-c` argv overrides (empty if no `filter.*` keys exist).
+ */
+const computeFilterSafetyOverrides = async (repo, { env, timeoutMs } = {}) => {
+  const gitOptions = {
+    ...(env ? { env } : {}),
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+  };
+  // Fail closed if the local config path is missing or not a regular file
+  // BEFORE trusting enumeration. Without --local, a broken .git/config can
+  // still let get-regexp succeed from global/system scopes and skip this
+  // health check, leaving later git operations to fail opaquely.
+  // Prefer git-path resolution, but fall back to repo/.git/config when
+  // rev-parse itself cannot read the broken config directory.
+  let configPath = path.join(repo, '.git', 'config');
+  try {
+    const gitPath = String(await runGit(repo, ['rev-parse', '--git-path', 'config'], gitOptions)).trim();
+    configPath = path.isAbsolute(gitPath) ? gitPath : path.resolve(repo, gitPath);
+  } catch {
+    // Keep the default path; lstat below decides fail-closed.
+  }
+  try {
+    const info = await lstat(configPath);
+    if (!info.isFile()) {
+      throw new Error(`local config is not a regular file: ${configPath}`);
+    }
+  } catch (verifyError) {
+    throw new Error(
+      `Failed to enumerate filter.* keys for internal git safety: ${verifyError?.message || verifyError}`,
+    );
+  }
+  const filterOverrides = [];
+  try {
+    // Match any filter.<driver>.<setting> key so process/required cannot hide
+    // behind a non-smudge/clean suffix. Omit --local so global/system drivers
+    // selected by in-tree .gitattributes are also neutralized via -c.
+    const listed = await runGit(repo, ['config', '--get-regexp', '^filter\\.'], gitOptions);
+    const drivers = new Set();
+    for (const line of String(listed || '').split(/\r?\n/)) {
+      const key = line.trim().split(/\s+/, 1)[0];
+      if (!key || !key.startsWith('filter.')) continue;
+      // filter.<driver>.<setting>: driver may contain dots (filter.a.b.process).
+      const lastDot = key.lastIndexOf('.');
+      if (lastDot <= 'filter.'.length) continue;
+      const driver = key.slice('filter.'.length, lastDot);
+      if (driver) drivers.add(driver);
+    }
+    for (const driver of drivers) {
+      filterOverrides.push(
+        '-c', `filter.${driver}.smudge=`,
+        '-c', `filter.${driver}.clean=`,
+        '-c', `filter.${driver}.process=`,
+        '-c', `filter.${driver}.required=false`,
+      );
+    }
+  } catch (error) {
+    // git config --get-regexp exits 1 when there are no matches. Local config
+    // was already verified readable above, so exit 1 is a clean empty set.
+    const exitCode = error?.code;
+    if (exitCode !== 1 && exitCode !== '1') {
+      throw new Error(
+        `Failed to enumerate filter.* keys for internal git safety: ${error?.message || error}`,
+      );
+    }
+  }
+  return filterOverrides;
+};
+
+/**
  * Checks out `baseSha` into an isolated disposable clone under a fresh temp
  * directory, runs `callback(worktreePath)`, and guarantees the clone and its
  * temp directory are removed afterward (even if the callback throws), so
@@ -434,72 +519,7 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //    so source-repository info attributes are never inherited or mutated.
   const noHooksDir = path.join(parent, 'no-hooks');
   await mkdir(noHooksDir, { recursive: true });
-  const filterOverrides = [];
-  // Fail closed if the local config path is missing or not a regular file
-  // BEFORE trusting enumeration. Without --local, a broken .git/config can
-  // still let get-regexp succeed from global/system scopes and skip this
-  // health check, leaving later git worktree operations to fail opaquely.
-  // Prefer git-path resolution, but fall back to repo/.git/config when
-  // rev-parse itself cannot read the broken config directory.
-  const assertLocalConfigReadable = async () => {
-    let configPath = path.join(repo, '.git', 'config');
-    try {
-      const gitPath = String(await runGit(repo, ['rev-parse', '--git-path', 'config'], {
-        ...(env ? { env } : {}),
-        ...(timeoutMs ? { timeout: timeoutMs } : {}),
-      })).trim();
-      configPath = path.isAbsolute(gitPath) ? gitPath : path.resolve(repo, gitPath);
-    } catch {
-      // Keep the default path; lstat below decides fail-closed.
-    }
-    try {
-      const info = await lstat(configPath);
-      if (!info.isFile()) {
-        throw new Error(`local config is not a regular file: ${configPath}`);
-      }
-    } catch (verifyError) {
-      throw new Error(
-        `Failed to enumerate filter.* keys for baseline worktree safety: ${verifyError?.message || verifyError}`,
-      );
-    }
-  };
-  await assertLocalConfigReadable();
-  try {
-    // Match any filter.<driver>.<setting> key so process/required cannot hide
-    // behind a non-smudge/clean suffix. Omit --local so global/system drivers
-    // selected by in-tree .gitattributes are also neutralized via -c.
-    const listed = await runGit(repo, ['config', '--get-regexp', '^filter\\.'], {
-      ...(env ? { env } : {}),
-      ...(timeoutMs ? { timeout: timeoutMs } : {}),
-    });
-    const drivers = new Set();
-    for (const line of String(listed || '').split(/\r?\n/)) {
-      const key = line.trim().split(/\s+/, 1)[0];
-      if (!key || !key.startsWith('filter.')) continue;
-      // filter.<driver>.<setting>: driver may contain dots (filter.a.b.process).
-      const lastDot = key.lastIndexOf('.');
-      if (lastDot <= 'filter.'.length) continue;
-      const driver = key.slice('filter.'.length, lastDot);
-      if (driver) drivers.add(driver);
-    }
-    for (const driver of drivers) {
-      filterOverrides.push(
-        '-c', `filter.${driver}.smudge=`,
-        '-c', `filter.${driver}.clean=`,
-        '-c', `filter.${driver}.process=`,
-        '-c', `filter.${driver}.required=false`,
-      );
-    }
-  } catch (error) {
-    // git config --get-regexp exits 1 when there are no matches. Local config
-    // was already verified readable above, so exit 1 is a clean empty set.
-    const exitCode = error?.code;
-    if (exitCode !== 1 && exitCode !== '1') {
-      throw new Error(
-        `Failed to enumerate filter.* keys for baseline worktree safety: ${error?.message || error}`,
-      );
-    }
-  }
+  const filterOverrides = await computeFilterSafetyOverrides(repo, { env, timeoutMs });
   const withInternalSafety = (args) => [
     '-c', `core.hooksPath=${noHooksDir}`,
     '-c', 'core.fsmonitor=',
@@ -662,6 +682,7 @@ const verifyBaseline = async ({
 module.exports = {
   VALIDATION_REMOVAL_PATTERNS,
   classifyGateIntegrity,
+  computeFilterSafetyOverrides,
   digestValidationConfig,
   failureSignature,
   fingerprintEntries,
