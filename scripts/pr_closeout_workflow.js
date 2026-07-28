@@ -8,7 +8,7 @@ const {
   readSync,
 } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require('node:fs/promises');
+const { link, lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -513,12 +513,56 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           // not delete blindly.
           continue;
         }
+        // dev/ino/ctimeMs identity has only filesystem/clock resolution, not
+        // byte-for-byte certainty: on a filesystem with rapid inode reuse, a
+        // peer racing the same guard failure can unlink+recreate the lock
+        // and land on the same inode with a ctimeMs collision inside the
+        // same millisecond, so the identity match above cannot fully rule
+        // out that lockPath now names a live successor lock rather than the
+        // original stale entry (Codex UgisL/UguCX/Uert4/UikNw). Track
+        // whether this reclaim ever had trustworthy content to compare, so
+        // that case gets one more verification after quarantining below.
+        const identityOnlyReclaim = staleSnapshot === null;
         const quarantinePath = `${lockPath}.reclaim-${process.pid}-${randomBytes(8).toString('hex')}`;
         try {
           await rename(lockPath, quarantinePath);
         } catch (renameError) {
           if (renameError?.code === 'ENOENT') continue;
           throw new Error(`Failed to quarantine stale evidence lock in ${outputDir}: ${renameError.message}`);
+        }
+        if (identityOnlyReclaim) {
+          // Now that the entry is isolated under a private quarantine name,
+          // re-run the exact guarded read against it: a genuinely
+          // corrupt/oversized/FIFO/symlinked lock fails the same way again,
+          // but a live successor's real lock now parses cleanly -- proof
+          // this was never the stale entry the identity check matched.
+          // Restore it with a no-clobber link (not rename, which would
+          // silently overwrite a third contender's new lock at lockPath)
+          // and retry rather than deleting a peer's live lock.
+          let requarantinedHolder = null;
+          try {
+            requarantinedHolder = outputDirLockHolder(await readLockFile(quarantinePath));
+          } catch {
+            requarantinedHolder = null;
+          }
+          if (requarantinedHolder) {
+            try {
+              await link(quarantinePath, lockPath);
+              await unlink(quarantinePath);
+            } catch (restoreError) {
+              if (restoreError?.code === 'EEXIST') {
+                // Another contender already created a new lock at lockPath
+                // while this was being verified; the quarantined successor
+                // lock is no longer needed under this pathname.
+                await unlink(quarantinePath).catch(() => {});
+                continue;
+              }
+              throw new Error(
+                `Failed to restore a live successor lock misidentified as stale in ${outputDir}: ${restoreError.message}`,
+              );
+            }
+            continue;
+          }
         }
         try {
           await unlink(quarantinePath);

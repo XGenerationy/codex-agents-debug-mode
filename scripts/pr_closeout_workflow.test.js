@@ -416,6 +416,56 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
   }
 });
 
+test('restores a live successor lock when a guard-failure identity match is later proven wrong', async () => {
+  // Codex UgisL/UguCX/Uert4/UikNw: dev/ino/ctimeMs identity alone has only
+  // filesystem/clock resolution, so it cannot fully rule out a
+  // same-millisecond reused-inode collision between the true stale entry
+  // and a peer's freshly created live successor. Model that gap directly:
+  // the guard read fails against the real, untouched stale file (so the
+  // dev/ino/ctimeMs identity captured before and after the throw
+  // legitimately/correctly match -- nothing has changed on disk), which is
+  // exactly the situation an unavoidable collision would also produce.
+  // The post-quarantine re-read is mocked to report a parseable live
+  // successor record, and the fix must restore the quarantined entry to
+  // its original pathname rather than deleting it.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-guard-collision-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  const staleContent = '2147483646\nstale-nonce\n';
+  const successor = `${process.pid}\nsuccessor-nonce\n`;
+  let reads = 0;
+  try {
+    await fs.writeFile(lockPath, staleContent, 'utf8');
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error('Evidence lock is not a size-bounded regular file.');
+          // Every subsequent read (the post-quarantine re-verification, and
+          // the next attempt's guard read once the entry is restored)
+          // reports the live successor's real content.
+          return successor;
+        },
+      }),
+      /already locked by this closeout process/i,
+    );
+    assert.equal(
+      reads,
+      3,
+      'must re-verify the quarantined entry once, restore it, then re-discover it as the live holder on retry',
+    );
+    assert.equal(
+      await fs.readFile(lockPath, 'utf8'),
+      staleContent,
+      'the quarantined entry must be restored to its original pathname, not deleted',
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('isSameLockIdentity does not treat a reused inode as the same file', () => {
   // Codex Uert4 follow-up: CI on Linux (tmpfs /tmp) showed that unlinking a
   // stale lock and immediately writing a successor can hand the successor
