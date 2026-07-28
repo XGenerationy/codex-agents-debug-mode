@@ -208,22 +208,29 @@ declare -a committed_backups=()
 # primary failure. rm/mv return non-zero are caught explicitly so set -e does
 # not exit the script mid-rollback.
 #
-# require_backup (3rd arg, default false): when true and $backup is empty,
-# $dest is left untouched entirely instead of being removed. An empty backup
-# means $destination did not exist at this destination's preflight check, so
-# on this destination's own commit-failure path a concurrent process may have
-# created $destination in the same race window this script already guards
-# against (mv nesting the stage inside it, or the commit mv failing outright)
-# -- with no backup, that content was never ours to begin with, and removing
-# it would destroy data we neither created nor can restore (Codex/qodo
-# finding: "Race cleanup deletes new target"). rollback()'s callers pass the
-# default false: those destinations were committed by this same run, so an
-# empty backup there means WE created that destination fresh, and it is always
-# ours to remove.
+# require_backup (3rd arg, default false): when true and $backup is empty, an
+# existing non-empty $dest is left untouched instead of being removed. An
+# empty backup means $destination did not exist at this destination's
+# preflight check, so on this destination's own commit-failure path a
+# concurrent process may have created $destination in the same race window
+# this script already guards against (mv nesting the stage inside it, or the
+# commit mv failing outright) -- with no backup, that content was never ours
+# to begin with, and removing it would destroy data we neither created nor
+# can restore (Codex/qodo finding: "Race cleanup deletes new target"). A bare
+# empty directory is still removed even under require_backup: it holds no
+# data (any nested stage this script itself moved into it is always cleared
+# by the caller first), so removing it cannot destroy anything, and the
+# nested-stage recovery path relies on that to fully roll back the
+# concurrently created directory rather than leaving an empty husk behind.
+# rollback()'s callers pass the default false: those destinations were
+# committed by this same run, so an empty backup there means WE created that
+# destination fresh, and it is always ours to remove.
 restore_from_backup() {
   local dest="$1" backup="$2" require_backup="${3:-false}"
-  if [[ "$require_backup" == "true" && -z "$backup" ]]; then
-    return 0
+  if [[ "$require_backup" == "true" && -z "$backup" && -e "$dest" ]]; then
+    if [[ ! -d "$dest" || -n "$(ls -A -- "$dest" 2>/dev/null)" ]]; then
+      return 0
+    fi
   fi
   if ! rm -rf -- "$dest" 2>/dev/null; then
     echo "Rollback warning: could not remove $dest" >&2
