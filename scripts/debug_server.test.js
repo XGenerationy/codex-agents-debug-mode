@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const { constants, existsSync, renameSync, rmSync } = require('node:fs');
-const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
+const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -1242,6 +1242,31 @@ test(
       assert.equal(acl.stdout.trim(), 'ok');
     } finally {
       if (child) stopCli(child);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'writes a session log with a protected current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    // Codex UeruJ: /log writes redaction-free runtime evidence, and the 0600
+    // mode set at session-log creation is a no-op against Windows' inherited
+    // DACL -- another local user with inherited access to a shared checkout
+    // could otherwise read captured diagnostic data. Assert the same
+    // current-user-only ACL invariant already covered for collector_token.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-windows-log-acl-'));
+    const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const baseUrl = await listen(server);
+    try {
+      const session = (await createSession(baseUrl)).body;
+      const logFile = path.join(projectRoot, session.log_file);
+      const acl = windowsAclIsCurrentUserOnly(logFile);
+      assert.equal(acl.status, 0, `${acl.stdout}\n${acl.stderr}`);
+      assert.equal(acl.stdout.trim(), 'ok');
+    } finally {
+      await close(server);
       await rm(projectRoot, { recursive: true, force: true });
     }
   },
@@ -2546,6 +2571,81 @@ test(
     } finally {
       watching = false;
       await rm(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.ps1 rejects a destination recreated as a directory before the stage-commit move',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: install.ps1 is a Windows installer'), timeout: 30000 },
+  async () => {
+    // Codex Uert8: if another process creates $item.Destination in the window
+    // between the occupancy/backup check and the stage-commit Move-Item,
+    // PowerShell's Move-Item nests the staging directory one level too deep
+    // inside the recreated destination instead of replacing it or failing --
+    // the commit would otherwise silently report "installed" with a broken
+    // layout. That window is only a couple of OS calls wide, too small to hit
+    // reliably with a genuinely concurrent second process (confirmed by
+    // probing with a real fs.watch-based recreation attempt, which never won
+    // the race in repeated trials). Force it deterministically by shadowing
+    // Move-Item with a same-named function in a wrapper script that
+    // dot-sources the real installer -- the PowerShell analogue of the
+    // sibling install.sh test's PATH-shimmed mv below -- instead of adding a
+    // test-only hook to install.ps1 itself.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-nest-race-home-'));
+    const shimDir = await mkdtemp(path.join(tmpdir(), 'install-nest-race-shim-'));
+    const scriptPath = path.join(__dirname, '..', 'tools', 'install.ps1');
+    const destination = path.join(home, '.codex', 'skills', 'debug');
+    const wrapperPath = path.join(shimDir, 'wrapper.ps1');
+    try {
+      const escapedTarget = destination.replace(/'/g, "''");
+      const escapedScript = scriptPath.replace(/'/g, "''");
+      await writeFile(
+        wrapperPath,
+        [
+          'param(',
+          '    [string]$Target,',
+          '    [string]$HomePath,',
+          '    [switch]$Force',
+          ')',
+          '',
+          'function Move-Item {',
+          '    [CmdletBinding()]',
+          '    param(',
+          '        [Parameter(Mandatory)][string]$LiteralPath,',
+          '        [Parameter(Mandatory)][string]$Destination',
+          '    )',
+          `    if ($Destination -eq '${escapedTarget}' -and -not (Test-Path -LiteralPath $Destination)) {`,
+          '        New-Item -ItemType Directory -Path $Destination -Force | Out-Null',
+          '    }',
+          '    Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters',
+          '}',
+          '',
+          `. '${escapedScript}' -Target $Target -HomePath $HomePath -Force:$Force`,
+          '',
+        ].join('\n'),
+      );
+      const res = spawnSync(
+        'pwsh',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath, '-Target', 'Codex', '-HomePath', home, '-Force'],
+        { encoding: 'utf8' },
+      );
+      assert.notEqual(res.status, 0, `installer must fail rather than silently nest the payload: ${JSON.stringify(res)}`);
+      assert.match(res.stderr || '', /became a directory during commit/);
+      assert.equal(res.stdout.trim(), '', `a failed commit must never emit a success record: ${JSON.stringify(res)}`);
+      const remaining = existsSync(destination) ? await readdir(destination) : [];
+      assert.ok(
+        !remaining.some((entry) => entry.startsWith('.debug-install-stage')),
+        `destination must never retain a nested stage directory: ${JSON.stringify(remaining)}`,
+      );
+      assert.equal(
+        existsSync(path.join(destination, 'SKILL.md')),
+        false,
+        'a recreated-then-nested destination must not be reported as a valid installed payload',
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(shimDir, { recursive: true, force: true });
     }
   },
 );

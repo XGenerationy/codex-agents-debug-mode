@@ -309,6 +309,25 @@ const readOutputDirLockFile = async (lockPath) => {
   }
 };
 
+/**
+ * True when `postInfo` still identifies the exact same on-disk file as
+ * `preInfo` (same device/inode, and not multiply-linked since the snapshot),
+ * mirroring the debug collector's claim-file identity check. Some filesystems
+ * (notably Windows FAT/network mounts) report ino as 0 for every path, which
+ * would make a zero-ino identity compare equal to any other zero-ino
+ * identity; failing closed on that case avoids treating an unrelated file as
+ * the same record.
+ * @param {import('node:fs').Stats} preInfo
+ * @param {import('node:fs').Stats} postInfo
+ * @returns {boolean}
+ */
+const isSameLockIdentity = (preInfo, postInfo) => (
+  preInfo.ino !== 0
+  && postInfo.dev === preInfo.dev
+  && postInfo.ino === preInfo.ino
+  && postInfo.nlink <= 1
+);
+
 const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile, statPath = stat } = {}) => {
   const lockPath = path.join(outputDir, '.closeout.lock');
   const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -404,6 +423,20 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       if (error?.code !== 'EEXIST') throw error;
       let holder = null;
       let staleSnapshot = null;
+      // Captured independently of readLockFile's own internal lstat so a
+      // guard failure (FIFO/symlink/oversized) still leaves an identity to
+      // re-verify against before reclaim. Without this, two concurrent
+      // reclaimers could both see the same unreadable lock, both treat the
+      // guard failure as "no trustworthy payload to compare" (the prior
+      // staleSnapshot-only check below), and the second would then rename
+      // away a legitimate successor lock the first already created after
+      // quarantining the original (Codex Uert4).
+      let staleIdentity = null;
+      try {
+        staleIdentity = await lstat(lockPath);
+      } catch {
+        staleIdentity = null;
+      }
       try {
         // Guarded bounded read (Codex #UDDQC): a FIFO/symlinked/oversized
         // lock throws here and is treated exactly like a corrupt lock below.
@@ -473,11 +506,30 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         // rename means concurrent reclaimers cannot both unlink/recreate the
         // same pathname: the winner quarantines the old entry, while losers
         // restart at O_EXCL acquisition and observe any successor normally.
-        // A read guard failure has no trustworthy payload to compare, so it
-        // retains the established corrupt-lock recovery path. Parsed and
-        // incomplete records, however, must still match byte-for-byte before
-        // this contender may remove them.
-        if (staleSnapshot !== null && String(await readLockFile(lockPath)) !== staleSnapshot) {
+        // Parsed and incomplete records must match byte-for-byte before this
+        // contender may remove them. A read guard failure has no trustworthy
+        // payload to compare byte-for-byte, but it still leaves the
+        // independently-captured staleIdentity (dev/ino/nlink) to re-verify:
+        // falling through to an unconditional rename here would let this
+        // contender quarantine whatever now occupies the path, including a
+        // legitimate successor lock a peer created after reclaiming the same
+        // guard failure first (Codex Uert4).
+        if (staleSnapshot !== null) {
+          if (String(await readLockFile(lockPath)) !== staleSnapshot) continue;
+        } else if (staleIdentity) {
+          let currentIdentity;
+          try {
+            currentIdentity = await lstat(lockPath);
+          } catch (identityError) {
+            if (identityError?.code === 'ENOENT') continue;
+            throw identityError;
+          }
+          if (!isSameLockIdentity(staleIdentity, currentIdentity)) continue;
+        } else {
+          // Neither a content snapshot nor an identity was ever captured
+          // (the very first lstat above also failed) -- nothing here to
+          // distinguish the current occupant from a fresh successor, so do
+          // not delete blindly.
           continue;
         }
         const quarantinePath = `${lockPath}.reclaim-${process.pid}-${randomBytes(8).toString('hex')}`;
@@ -1067,7 +1119,7 @@ const runCloseoutWorkflowBody = async ({
       // infrastructure throw from verifyBaseline (worktree create, filter
       // enumeration, etc.) must not replace a proven FAIL with BLOCKED.
       try {
-        return await serializeBaseline(() => d.verifyBaseline({
+        const baselineRow = await serializeBaseline(() => d.verifyBaseline({
           repo: initial.repo,
           baseSha: initial.baseSha,
           check,
@@ -1133,6 +1185,19 @@ const runCloseoutWorkflowBody = async ({
             env: childEnv,
           })).toolVersions,
         }));
+        // verifyBaseline can reclassify a generator confirmation row away
+        // from its pre-baseline status (most notably FAIL -> BASELINE when
+        // the failure reproduces exactly at base). The shared
+        // `reproducibility` value assigned above is what evaluateOverallStatus
+        // reads independently of this row, so leaving it at the stale status
+        // here would let a resolved BASELINE/BLOCKED confirmation still
+        // report the overall run as FAIL (FAIL outranks BASELINE/BLOCKED in
+        // evaluateOverallStatus), misattributing a pre-existing generator
+        // failure to this PR.
+        if (check.generator && baselineRow.status !== result.status) {
+          reproducibility = { ...reproducibility, status: baselineRow.status, evidence: baselineRow.evidence };
+        }
+        return baselineRow;
       } catch (error) {
         const note = error?.message || String(error);
         return {

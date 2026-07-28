@@ -20,21 +20,22 @@ const writeFdSync = (fd, text) => {
 };
 
 // Windows does not implement POSIX 0600 semantics: fs.chmod() only affects
-// the writable bit, leaving inherited DACL entries able to read a token in a
-// shared checkout. Configure an explicit, protected DACL before the secret is
-// written. The PowerShell program is fixed and the path is embedded only as
-// UTF-16 base64, so repository-controlled path characters cannot become code.
-// If PowerShell, the filesystem, or ACL verification fails, startup fails
-// before collector_token receives any token bytes.
+// the writable bit, leaving inherited DACL entries able to read a private
+// file (collector_token, a session log) in a shared checkout. Configure an
+// explicit, protected DACL before any secret or captured evidence is written.
+// The PowerShell program is fixed and the path is embedded only as UTF-16
+// base64, so repository-controlled path characters cannot become code. If
+// PowerShell, the filesystem, or ACL verification fails, the caller must fail
+// closed before the file receives any bytes.
 // Resolve powershell.exe by absolute system path rather than PATH lookup: a
 // PATH-relative execFileSync could run an attacker-controlled powershell.exe
 // earlier on PATH instead of the trusted system one.
 const resolvePowerShellExecutable = () =>
   path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 
-const protectWindowsTokenFile = (tokenFile) => {
+const protectWindowsPrivateFile = (privateFile) => {
   if (process.platform !== 'win32') return;
-  const encodedPath = Buffer.from(tokenFile, 'utf16le').toString('base64');
+  const encodedPath = Buffer.from(privateFile, 'utf16le').toString('base64');
   const script = [
     '$ErrorActionPreference = "Stop"',
     `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
@@ -745,6 +746,33 @@ const createDebugServer = ({
           try {
             const info = await handle.stat();
             if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
+            // /log writes redaction-free runtime evidence. The 0600 mode above
+            // is a no-op against Windows' inherited DACL, so another local
+            // user with inherited access to a shared checkout could read this
+            // log; establish a protected, current-user-only ACL before any
+            // event can be appended (mirrors collector_token's own Windows
+            // hardening).
+            if (process.platform === 'win32') {
+              try {
+                protectWindowsPrivateFile(resolvedLogFile);
+              } catch {
+                throw new RequestError('session_log_acl_failed', 500);
+              }
+              // protectWindowsPrivateFile re-resolves the path by name in a
+              // separate PowerShell process; if the path was swapped between
+              // handle.stat() above and that call returning, the ACL could
+              // land on a different filesystem object than this handle. Fail
+              // closed rather than trust an unverified file as protected.
+              let postProtectInfo;
+              try {
+                postProtectInfo = await lstat(resolvedLogFile);
+              } catch {
+                throw new RequestError('session_log_escapes_root', 409);
+              }
+              if (!isSameFileIdentity(info, postProtectInfo)) {
+                throw new RequestError('session_log_escapes_root', 409);
+              }
+            }
             let createdReal;
             try {
               createdReal = await realpath(resolvedLogFile);
@@ -1549,8 +1577,8 @@ const main = () => {
         // permissions there. Either protection is established before fresh
         // token bytes reach disk, or startup fails closed.
         if (process.platform === 'win32') {
-          protectWindowsTokenFile(tokenFile);
-          // protectWindowsTokenFile re-resolves tokenFile by path in a
+          protectWindowsPrivateFile(tokenFile);
+          // protectWindowsPrivateFile re-resolves tokenFile by path in a
           // separate PowerShell process. If the path was swapped between the
           // handle.stat() above and that call returning, the ACL hardening
           // could land on a different filesystem object than the one

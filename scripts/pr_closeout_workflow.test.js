@@ -374,6 +374,47 @@ test('exclusive output-dir lock revalidates a stale holder before reclaiming it'
   }
 });
 
+test('exclusive output-dir lock does not delete a successor lock after a guard-failure read', async () => {
+  // Codex Uert4: when the guarded recovery read itself throws (FIFO/symlink/
+  // oversized lock), staleSnapshot stays null and the byte-for-byte
+  // revalidation used for parsed records is unavailable. An unconditional
+  // rename in that case would quarantine whatever now occupies the path --
+  // including a legitimate successor lock a peer created after reclaiming
+  // the same guard failure first. Simulate that race: the very first guarded
+  // read swaps the lock file out from under this contender (as if a peer had
+  // already quarantined it and created its own fresh lock) before throwing
+  // the guard error, so the independently-captured staleIdentity must be the
+  // thing that stops the rename, not the content comparison.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-guard-failure-race-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  const successor = `${process.pid}\nsuccessor-nonce\n`;
+  let reads = 0;
+  try {
+    await fs.writeFile(lockPath, '2147483646\nstale-nonce\n', 'utf8');
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: async () => {
+          reads += 1;
+          if (reads === 1) {
+            await fs.unlink(lockPath);
+            await fs.writeFile(lockPath, successor, 'utf8');
+            throw new Error('Evidence lock is not a size-bounded regular file.');
+          }
+          return successor;
+        },
+      }),
+      /already locked by this closeout process/i,
+    );
+    assert.equal(reads, 2, 'the guard-failure identity mismatch must retry rather than rename the successor away');
+    assert.equal(await fs.readFile(lockPath, 'utf8'), successor);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('exclusive output-dir lock lets only one concurrent stale reclaimer take over', async () => {
   const fs = require('node:fs/promises');
   const os = require('node:os');
@@ -1121,6 +1162,50 @@ test('preserves failed generator execution details in the row and baseline signa
   assert.equal(row.durationMs, 1);
   assert.equal(baselineHeadResult.exitCode, 17);
   assert.equal(baselineHeadResult.stdout, 'generator exploded');
+});
+
+test('propagates a generator baseline reclassification into the shared reproducibility status', async () => {
+  // Codex UeruN: verifyBaseline can reclassify a generator confirmation row
+  // away from its head FAIL (e.g. to BASELINE, when the failure reproduces
+  // exactly at the base commit). evaluateOverallStatus reads `reproducibility`
+  // as an input separate from the row itself, and FAIL outranks
+  // BASELINE/BLOCKED there, so a stale reproducibility.status would still
+  // report the whole run as FAIL even though the row was resolved to BASELINE.
+  const fixture = makeDependencies();
+  fixture.dependencies.execute = async (check, phase) => {
+    fixture.executions.push(`${phase}:${check.id}`);
+    const result = passingExecution(check, phase);
+    if (check.id === 'prisma-generate' && phase === 'confirmation-generator-1') {
+      return {
+        ...result,
+        status: 'FAIL',
+        exitCode: 17,
+        stdout: 'generator exploded',
+        stderr: 'boom',
+        evidence: 'generator failed',
+      };
+    }
+    return result;
+  };
+  fixture.dependencies.verifyBaseline = async ({ headResult }) => ({
+    ...headResult,
+    status: 'BASELINE',
+    blocking: true,
+    evidence: 'Failure reproduced exactly at base commit; not a regression.',
+  });
+
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+
+  const row = result.report.checks.find(({ id }) => id === 'prisma-generate');
+  assert.equal(row.status, 'BASELINE');
+  assert.equal(result.report.reproducibility.status, 'BASELINE');
+  assert.equal(result.report.overallStatus, 'BLOCKED');
 });
 
 test('seals ignored generated output paths after all checks', async () => {

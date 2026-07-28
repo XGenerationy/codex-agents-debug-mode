@@ -257,6 +257,29 @@ try {
             }
             throw
         }
+        # If another process creates $item.Destination as a directory between the
+        # occupancy/backup check above and this Move-Item, PowerShell nests the
+        # staging directory inside it instead of replacing it or failing, and the
+        # commit above would otherwise silently "succeed" with the payload one
+        # level too deep. Detect that nested layout and treat it the same as a
+        # failed move, mirroring the Bash installer's equivalent POSIX mv check.
+        $nestedStage = Join-Path $item.Destination (Split-Path -Leaf $item.Stage)
+        if (Test-DestinationOccupied -Path $nestedStage) {
+            Remove-Item -LiteralPath $nestedStage -Recurse -Force -ErrorAction SilentlyContinue
+            if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                try {
+                    Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction Stop
+                    $item.Backup = $null
+                }
+                catch {
+                    Write-Warning "Immediate restore of $($item.Destination) from backup failed: $($_.Exception.Message)"
+                }
+            }
+            throw "Failed to install to $($item.Destination) (destination became a directory during commit)"
+        }
         $item.Committed = $true
         $item.Stage = $null
         $pendingResults += [pscustomobject]@{
