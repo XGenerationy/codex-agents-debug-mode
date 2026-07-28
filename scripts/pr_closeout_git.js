@@ -522,16 +522,27 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
     await runGit(repo, withInternalSafety(['clone', '--no-checkout', '--no-local', repo, worktree]), gitOptions);
     try {
       await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
-    } catch {
+    } catch (checkoutError) {
       // baseSha can be unreachable from any ref in `repo` (e.g. a local base
       // branch that has since moved on, leaving baseSha reachable only
       // through the reflog) even though the object itself still exists in
       // repo's object database. The clone above only transfers objects
       // reachable from refs, so checkout fails with "unable to read tree".
       // Fetch the exact commit by SHA directly from repo into a throwaway
-      // ref and retry checkout once before giving up.
-      await runGit(worktree, withInternalSafety(['fetch', repo, `${baseSha}:refs/codex-baseline-fallback`]), gitOptions);
-      await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+      // ref and retry checkout once before giving up. If the fallback also
+      // fails, keep the original checkout error as `cause` instead of
+      // discarding it — otherwise closeout evidence only ever reports the
+      // fallback failure, hiding the real root cause when both fail for
+      // unrelated reasons.
+      try {
+        await runGit(worktree, withInternalSafety(['fetch', repo, `${baseSha}:refs/codex-baseline-fallback`]), gitOptions);
+        await runGit(worktree, withInternalSafety(['checkout', '--detach', baseSha]), gitOptions);
+      } catch (fallbackError) {
+        throw new Error(
+          `Failed to check out baseSha ${baseSha} directly and via fallback fetch: ${fallbackError?.message || fallbackError}`,
+          { cause: checkoutError },
+        );
+      }
     }
     return await callback(worktree);
   } catch (error) {

@@ -447,8 +447,14 @@ test('recovers when baseSha is unreachable from any ref but still present in the
     git(repo, 'branch', '-D', initialBranch);
     git(repo, 'branch', '-m', 'newmain', initialBranch);
 
+    // Passing a string as the 2nd (error-matcher) argument is ambiguous: Node
+    // throws ERR_AMBIGUOUS_ARGUMENT if the thrown error's own .message ever
+    // happens to equal it. Pass undefined for the matcher and the string as
+    // the 3rd (assertion message) argument instead, so this stays
+    // deterministic regardless of what git's stderr says.
     assert.throws(
       () => git(repo, 'merge-base', '--is-ancestor', baseSha, 'HEAD'),
+      undefined,
       'fixture must make baseSha unreachable from the current branch',
     );
 
@@ -459,6 +465,38 @@ test('recovers when baseSha is unreachable from any ref but still present in the
     });
     assert.equal(value, 'verified');
     await assert.rejects(access(worktree), { code: 'ENOENT' });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('preserves the original checkout failure when the unreachable-baseSha fallback also fails', async () => {
+  // If baseSha is unreachable from any ref AND absent from repo's object
+  // database entirely, both the initial checkout and the fallback fetch+retry
+  // fail. The thrown error must still carry the original checkout failure
+  // (as `cause`) instead of only reporting the fallback failure, so closeout
+  // evidence does not hide the real root cause.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-both-fail-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    await writeFile(path.join(repo, 'tracked.txt'), 'base\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    // A well-formed SHA that was never committed anywhere in this repo: both
+    // the initial checkout and the fallback fetch-by-SHA must fail.
+    const missingSha = '0000000000000000000000000000000000000abc'.slice(0, 40);
+    let caught;
+    try {
+      await withDisposableWorktree({ repo, baseSha: missingSha }, async () => 'should-not-run');
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught, 'expected withDisposableWorktree to reject');
+    assert.ok(caught.cause, 'expected the original checkout error to be preserved as .cause');
+    assert.match(String(caught.cause.message || caught.cause), /checkout|tree|object/i);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
