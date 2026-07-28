@@ -1970,6 +1970,57 @@ test(
 );
 
 test(
+  'install.sh rejects a destination recreated as a directory during the commit move',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: PATH-shimmed mv fault injection'), timeout: 15000 },
+  async () => {
+    // CodeRabbit discussion_r3660250087 (install.sh:380): if something
+    // recreates $destination as a directory between the backup check and the
+    // commit `mv`, POSIX mv nests $stage inside it instead of replacing it,
+    // and the commit silently "succeeds" one level too deep. The real bug is
+    // a microsecond TOCTOU window against a second concurrent actor, which a
+    // black-box spawnSync test cannot time reliably. Shadow `mv` on PATH with
+    // a shim that recreates the destination as an empty directory right
+    // before delegating to the real mv -- deterministically forcing the
+    // exact filesystem state the fix must detect, without touching
+    // install.sh itself.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-mv-race-home-'));
+    const shimDir = await mkdtemp(path.join(tmpdir(), 'install-mv-race-shim-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    try {
+      const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim();
+      assert.notEqual(realMv, '', 'a real mv executable is required for the fixture');
+      await writeFile(
+        path.join(shimDir, 'mv'),
+        [
+          '#!/bin/sh',
+          'set -e',
+          'last=""',
+          'for a in "$@"; do last="$a"; done',
+          `if [ "$last" = "${target}" ] && [ ! -e "${target}" ]; then`,
+          `  mkdir -p "${target}"`,
+          'fi',
+          `exec "${realMv}" "$@"`,
+          '',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
+      });
+      assert.notEqual(res.status, 0, `installer must fail when the destination is recreated as a directory mid-commit: ${JSON.stringify(res)}`);
+      assert.match(res.stderr || '', /became a directory during commit/);
+      assert.equal(existsSync(target), false, 'the failed destination must be rolled back, not left nested one level too deep');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(shimDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'install.sh rejects a symlink payload entry before staging',
   { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
