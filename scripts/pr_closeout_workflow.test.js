@@ -8,6 +8,7 @@ const {
   assertOutputDirLockIdentity,
   defaultOutputDir,
   evaluateOverallStatus,
+  isSameLockIdentity,
   normalizePersistedPaths,
   prepareOutputDirectory,
   runCloseoutWorkflow,
@@ -413,6 +414,22 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+test('isSameLockIdentity does not treat a reused inode as the same file', () => {
+  // Codex Uert4 follow-up: CI on Linux (tmpfs /tmp) showed that unlinking a
+  // stale lock and immediately writing a successor can hand the successor
+  // the exact same dev/ino the stale snapshot recorded -- a plain
+  // unlink()+create() is free to reuse a just-freed inode number. A pure
+  // dev/ino/nlink comparison would then wrongly call the successor "the same
+  // file" and let a guard-failure reclaim quarantine it. ctimeMs must also
+  // match: a freshly created file (even on a reused inode) always gets a new
+  // change time the original snapshot cannot share.
+  const stale = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
+  const reusedInodeSuccessor = { ino: 42, dev: 1, nlink: 1, ctimeMs: 2000 };
+  const untouchedSameFile = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
+  assert.equal(isSameLockIdentity(stale, reusedInodeSuccessor), false);
+  assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 });
 
 test('exclusive output-dir lock lets only one concurrent stale reclaimer take over', async () => {

@@ -317,6 +317,16 @@ const readOutputDirLockFile = async (lockPath) => {
  * would make a zero-ino identity compare equal to any other zero-ino
  * identity; failing closed on that case avoids treating an unrelated file as
  * the same record.
+ *
+ * dev/ino alone is not sufficient: on Linux (notably tmpfs, which is a common
+ * CI /tmp mount), an inode number freed by unlink can be reused by the very
+ * next file created in the same directory, so a peer that unlinks a stale
+ * lock and immediately writes its own successor can end up with the exact
+ * same dev/ino the stale snapshot recorded. Requiring ctimeMs to also match
+ * closes that gap: any unlink+recreate (even one that lands on a reused
+ * inode) gives the occupant a fresh change time the original stale file's
+ * snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux after
+ * the dev/ino-only check shipped).
  * @param {import('node:fs').Stats} preInfo
  * @param {import('node:fs').Stats} postInfo
  * @returns {boolean}
@@ -326,6 +336,7 @@ const isSameLockIdentity = (preInfo, postInfo) => (
   && postInfo.dev === preInfo.dev
   && postInfo.ino === preInfo.ino
   && postInfo.nlink <= 1
+  && postInfo.ctimeMs === preInfo.ctimeMs
 );
 
 const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile, statPath = stat } = {}) => {
@@ -1452,6 +1463,7 @@ module.exports = {
   assertOutputDirLockIdentity,
   defaultOutputDir,
   evaluateOverallStatus,
+  isSameLockIdentity,
   normalizePersistedPaths,
   prepareOutputDirectory,
   releaseOutputDirLock,
