@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
-const { access, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { access, chmod, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -1196,6 +1196,11 @@ test('refuses to append a raw evidence log through a pre-existing hard link, wit
   const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-hardlink-outside-'));
   const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
   await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  // Codex UiXEj: the rejected write must not even *touch* permissions on the
+  // shared inode. Pin a distinctive mode before linking so a regression
+  // (chmod(0600) running before the nlink check) is caught even though 0600
+  // happens to be a common default already.
+  if (process.platform !== 'win32') await chmod(outsideTarget, 0o644);
   const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
   await link(outsideTarget, logPath);
   try {
@@ -1214,6 +1219,14 @@ test('refuses to append a raw evidence log through a pre-existing hard link, wit
 
     const untouched = await readFile(outsideTarget, 'utf8');
     assert.equal(untouched, 'do not overwrite this\n', 'the hard-linked outside file must not be modified');
+    if (process.platform !== 'win32') {
+      const outsideMode = (await stat(outsideTarget)).mode & 0o777;
+      assert.equal(
+        outsideMode,
+        0o644,
+        'the hard-linked outside file must keep its own permissions, not the evidence-log chmod(0600)',
+      );
+    }
   } finally {
     await rm(logDir, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });

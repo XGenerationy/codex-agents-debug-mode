@@ -1580,11 +1580,30 @@ const assertLogNotSymlink = async (target) => {
 
 // Open a raw evidence log path without following a symlinked final component.
 // Mode 0600 at create time; fchmod after open so a permissive umask cannot
-// leave evidence world-readable under a shared temp directory.
-const openLogNoFollow = async (target, flags) => {
+// leave evidence world-readable under a shared temp directory. Verifies the
+// descriptor is a regular, single-link file before either permission call
+// below: chmod/protectWindowsPrivateFile mutate the target's underlying
+// identity (POSIX: every name sharing its inode; Windows: the path
+// re-resolved by protectWindowsPrivateFile), so a pre-planted hard link must
+// be rejected before those calls run, not only before content is written --
+// otherwise the outside file's permissions are silently tightened even
+// though the write itself is later refused (Codex UiXEj).
+const openLogNoFollow = async (target, flags, verb = 'write') => {
   await assertLogNotSymlink(target);
   try {
     const handle = await openNoFollowShared(target, flags, 0o600);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw new Error(`Refusing to ${verb} evidence log that is not a regular file: ${target}`);
+      }
+      if (info.nlink !== 1) {
+        throw new Error(`Refusing to ${verb} evidence log with hard links (nlink=${info.nlink}): ${target}`);
+      }
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
     try {
       await handle.chmod(0o600);
     } catch (error) {
@@ -1613,12 +1632,11 @@ const openLogNoFollow = async (target, flags) => {
       // PowerShell process; if the path was swapped between the open above
       // and that call returning, the ACL could land on a different
       // filesystem object than this handle. Only dev/ino identity is checked
-      // here -- nlink is deliberately left to the caller's own regular-file/
-      // hard-link check (writeLogHeaderNoFollow / createLogAppendStreamNoFollow),
-      // which already reports a dedicated "hard links" message; folding that
-      // condition into this generic swap check would shadow it. A zero ino
-      // is rejected outright: some Windows filesystems report dev/ino as 0
-      // for every file, which would otherwise compare equal vacuously.
+      // here -- nlink was already verified to be exactly 1 immediately after
+      // opening, before this call or the chmod above ever ran, so a hard
+      // link cannot reach this point. A zero ino is rejected outright: some
+      // Windows filesystems report dev/ino as 0 for every file, which would
+      // otherwise compare equal vacuously.
       let postProtectInfo;
       try {
         postProtectInfo = await lstat(target);
@@ -1660,17 +1678,8 @@ const openLogNoFollow = async (target, flags) => {
  */
 const writeLogHeaderNoFollow = async (target, contents) => {
   // O_CREAT without O_TRUNC: create if missing, never truncate until fstat.
-  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT);
+  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT, 'write');
   try {
-    const info = await handle.stat();
-    if (!info.isFile()) {
-      throw new Error(`Refusing to write evidence log that is not a regular file: ${target}`);
-    }
-    if (info.nlink !== 1) {
-      throw new Error(
-        `Refusing to write evidence log with hard links (nlink=${info.nlink}): ${target}`,
-      );
-    }
     await handle.truncate(0);
     await handle.writeFile(contents, 'utf8');
   } finally {
@@ -1691,21 +1700,11 @@ const writeLogHeaderNoFollow = async (target, contents) => {
  * @returns {Promise<import('node:fs').WriteStream>}
  */
 const createLogAppendStreamNoFollow = async (target) => {
-  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND);
-  try {
-    const info = await handle.stat();
-    if (!info.isFile()) {
-      throw new Error(`Refusing to append evidence log that is not a regular file: ${target}`);
-    }
-    if (info.nlink !== 1) {
-      throw new Error(
-        `Refusing to append evidence log with hard links (nlink=${info.nlink}): ${target}`,
-      );
-    }
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    throw error;
-  }
+  const handle = await openLogNoFollow(
+    target,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND,
+    'append',
+  );
   return createWriteStream(undefined, { fd: handle, autoClose: true, encoding: 'utf8' });
 };
 
