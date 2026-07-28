@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { constants: fsConstants } = require('node:fs');
+const { lstat } = require('node:fs/promises');
 const path = require('node:path');
 
 const { openNoFollow } = require('./pr_closeout_fs');
@@ -68,23 +69,46 @@ const CONFIG_MAX_BYTES = 1_048_576;
  * without being followed and a FIFO/device can neither block the read nor
  * stream unbounded content into memory before JSON.parse. `openFile` is
  * injectable for tests (Windows CI cannot create symlinks/FIFOs).
+ *
+ * openNoFollow's ELOOP guarantee only holds where the platform actually
+ * enforces O_NOFOLLOW; on Windows, or a filesystem that rejects the flag,
+ * its attempt ladder falls back to a plain open that follows a symlink
+ * instead of failing (see openNoFollow's own contract note: callers must
+ * still lstat first as the primary guard when NOFOLLOW is unavailable). So
+ * the path is lstat'd up front and rejected outright if it is already a
+ * symlink, then the opened descriptor's dev/ino is compared back against
+ * that lstat to catch a symlink swapped in during the gap between the two.
  * @param {string} configPath path passed via --config.
- * @param {{openFile?: (target: string, flags: number) => Promise<import('node:fs/promises').FileHandle>}} [deps]
+ * @param {{
+ *   openFile?: (target: string, flags: number) => Promise<import('node:fs/promises').FileHandle>,
+ *   lstatFn?: (target: string) => Promise<import('node:fs').Stats>,
+ * }} [deps]
  * @returns {Promise<object>} parsed config.
  */
-const readCloseoutConfig = async (configPath, { openFile = openNoFollow } = {}) => {
+const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn = lstat } = {}) => {
   const target = path.resolve(configPath);
+  const symlinkMessage = `Closeout config must not be a symlink: ${target}.`;
+  let preInfo = null;
+  try {
+    preInfo = await lstatFn(target);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (preInfo?.isSymbolicLink()) throw new Error(symlinkMessage);
   let handle;
   try {
     handle = await openFile(target, fsConstants.O_RDONLY);
   } catch (error) {
-    if (error?.code === 'ELOOP') throw new Error(`Closeout config must not be a symlink: ${target}.`);
+    if (error?.code === 'ELOOP') throw new Error(symlinkMessage);
     throw error;
   }
   try {
     const info = await handle.stat();
     if (!info.isFile() || info.size > CONFIG_MAX_BYTES) {
       throw new Error(`Closeout config must be a regular file of at most ${CONFIG_MAX_BYTES} bytes: ${target}.`);
+    }
+    if (preInfo && (info.dev !== preInfo.dev || info.ino !== preInfo.ino)) {
+      throw new Error(symlinkMessage);
     }
     const buffer = Buffer.alloc(info.size);
     let offset = 0;

@@ -139,3 +139,82 @@ test('rejects a symlinked --config without following it', async () => {
     /must not be a symlink/,
   );
 });
+
+test('rejects a symlinked --config even when NOFOLLOW is unavailable and the opener silently follows it', async () => {
+  // Codex review (pr_closeout.js:78): on platforms where O_NOFOLLOW is not
+  // enforced (Windows, some filesystems), openNoFollow's attempt ladder can
+  // fall back to a plain open that follows the symlink instead of throwing
+  // ELOOP. Simulate that fallback with an injected opener that ignores
+  // no-follow semantics entirely, and an injected lstat reporting the target
+  // is a symlink (no real symlink needed, so this runs on Windows CI too).
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const targetContent = JSON.stringify({ baseRef: 'HEAD' });
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 1, ino: 999 }),
+    read: async (buffer, offset) => {
+      const chunk = Buffer.from(targetContent, 'utf8');
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-link.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => true, dev: 1, ino: 42 }),
+      openFile: async () => fakeHandle,
+    }),
+    /must not be a symlink/,
+  );
+});
+
+test('rejects a --config swapped for a symlink between lstat and open (TOCTOU)', async () => {
+  // Codex review (pr_closeout.js:78): even when the pre-open lstat sees a
+  // regular file, a symlink could be swapped in before the open completes.
+  // The opened descriptor's dev/ino must still be compared back against the
+  // pre-open lstat to close that gap.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 999 }),
+    read: async () => { throw new Error('read must not be reached once identity mismatches'); },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-race.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 42 }),
+      openFile: async () => fakeHandle,
+    }),
+    /must not be a symlink/,
+  );
+});
+
+test('accepts a regular --config whose pre-open lstat identity matches the opened descriptor', async () => {
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const targetContent = JSON.stringify({ baseRef: 'HEAD' });
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 7, ino: 55 }),
+    read: async (buffer, offset) => {
+      const chunk = Buffer.from(targetContent, 'utf8');
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+    close: async () => {},
+  };
+  const config = await readCloseoutConfig('closeout-ok.json', {
+    lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+    openFile: async () => fakeHandle,
+  });
+  assert.deepEqual(config, { baseRef: 'HEAD' });
+});
+
+test('readCloseoutConfig tolerates a missing config path at the lstat pre-check', async () => {
+  // ENOENT at lstat must fall through to openFile, which surfaces its own
+  // (existing, well-tested) ENOENT error rather than a symlink rejection.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-missing-'));
+  try {
+    const configPath = path.join(repo, 'does-not-exist.json');
+    await assert.rejects(readCloseoutConfig(configPath), /ENOENT/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
