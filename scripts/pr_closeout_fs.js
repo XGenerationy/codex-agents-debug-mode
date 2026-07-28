@@ -143,9 +143,17 @@ const looksLikeWindowsRoot = (root) => {
     && path.win32.basename(normalized).toLowerCase() === 'windows';
 };
 
-const isTrustedSystemRoot = (root, pathExists) => {
+// extraRelativePaths lets callers that resolve additional root-relative
+// binaries (e.g. pr_closeout_process.js also needs a verified taskkill.exe)
+// fold that requirement into the same trust check instead of forking their
+// own copy of the powershell.exe verification it depends on.
+const isTrustedSystemRoot = (root, pathExists, extraRelativePaths = []) => {
   if (!looksLikeWindowsRoot(root)) return false;
-  return pathExists(path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
+  const requiredRelativePaths = [
+    path.win32.join('System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ...extraRelativePaths,
+  ];
+  return requiredRelativePaths.every((relativePath) => pathExists(path.win32.join(root, relativePath)));
 };
 
 const resolvePowerShellExecutable = ({ env = process.env, pathExists = existsSync } = {}) => {
@@ -208,9 +216,43 @@ const isSameFileIdentity = (preInfo, postInfo) => (
   && postInfo.nlink <= 1
 );
 
+/**
+ * True when `postInfo` still identifies the exact same on-disk file as
+ * `preInfo` (same device/inode, and not multiply-linked since the snapshot).
+ * Stricter than isSameFileIdentity: also requires ctimeMs to match, so it is
+ * only appropriate for reclaim-style checks where no legitimate operation is
+ * expected to change the file's metadata between the two snapshots (a stale
+ * lock or claim record being re-verified immediately before deletion) --
+ * unlike isSameFileIdentity's other callers (write/ACL-protect
+ * verification), where the intervening operation itself legitimately changes
+ * ctimeMs and this check would wrongly reject the very write it is meant to
+ * confirm.
+ *
+ * dev/ino alone is not sufficient: on Linux (notably tmpfs, which is a common
+ * CI /tmp mount), an inode number freed by unlink can be reused by the very
+ * next file created in the same directory, so a peer that unlinks a stale
+ * lock/claim and immediately writes its own successor can end up with the
+ * exact same dev/ino the stale snapshot recorded. Requiring ctimeMs to also
+ * match closes that gap: any unlink+recreate (even one that lands on a
+ * reused inode) gives the occupant a fresh change time the original stale
+ * file's snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux
+ * after the dev/ino-only check shipped).
+ * @param {import('node:fs').Stats} preInfo
+ * @param {import('node:fs').Stats} postInfo
+ * @returns {boolean}
+ */
+const isSameLockIdentity = (preInfo, postInfo) => (
+  preInfo.ino !== 0
+  && postInfo.dev === preInfo.dev
+  && postInfo.ino === preInfo.ino
+  && postInfo.nlink <= 1
+  && postInfo.ctimeMs === preInfo.ctimeMs
+);
+
 module.exports = {
   assertNotSymlink,
   isSameFileIdentity,
+  isSameLockIdentity,
   isTrustedSystemRoot,
   looksLikeWindowsRoot,
   openNoFollow,

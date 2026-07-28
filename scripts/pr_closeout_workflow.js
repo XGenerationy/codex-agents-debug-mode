@@ -12,7 +12,7 @@ const { lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
-const { openNoFollow } = require('./pr_closeout_fs');
+const { isSameLockIdentity, openNoFollow } = require('./pr_closeout_fs');
 const {
   classifyGateIntegrity,
   digestValidationConfig,
@@ -308,36 +308,6 @@ const readOutputDirLockFile = async (lockPath) => {
     await handle.close().catch(() => {});
   }
 };
-
-/**
- * True when `postInfo` still identifies the exact same on-disk file as
- * `preInfo` (same device/inode, and not multiply-linked since the snapshot),
- * mirroring the debug collector's claim-file identity check. Some filesystems
- * (notably Windows FAT/network mounts) report ino as 0 for every path, which
- * would make a zero-ino identity compare equal to any other zero-ino
- * identity; failing closed on that case avoids treating an unrelated file as
- * the same record.
- *
- * dev/ino alone is not sufficient: on Linux (notably tmpfs, which is a common
- * CI /tmp mount), an inode number freed by unlink can be reused by the very
- * next file created in the same directory, so a peer that unlinks a stale
- * lock and immediately writes its own successor can end up with the exact
- * same dev/ino the stale snapshot recorded. Requiring ctimeMs to also match
- * closes that gap: any unlink+recreate (even one that lands on a reused
- * inode) gives the occupant a fresh change time the original stale file's
- * snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux after
- * the dev/ino-only check shipped).
- * @param {import('node:fs').Stats} preInfo
- * @param {import('node:fs').Stats} postInfo
- * @returns {boolean}
- */
-const isSameLockIdentity = (preInfo, postInfo) => (
-  preInfo.ino !== 0
-  && postInfo.dev === preInfo.dev
-  && postInfo.ino === preInfo.ino
-  && postInfo.nlink <= 1
-  && postInfo.ctimeMs === preInfo.ctimeMs
-);
 
 const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLockFile, statPath = stat } = {}) => {
   const lockPath = path.join(outputDir, '.closeout.lock');

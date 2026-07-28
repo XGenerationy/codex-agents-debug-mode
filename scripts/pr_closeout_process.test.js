@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
-const { access, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, symlink, writeFile } = require('node:fs/promises');
+const { access, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
@@ -1249,6 +1249,126 @@ test('refuses to write a command executor log header through a pre-existing syml
   } finally {
     await rm(outputDir, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('revalidates the logs directory before the proof-command log write, not just once', async () => {
+  // CodeRabbit UguCb: the logs-directory containment check ran once per
+  // check(), before the main command's log header was written. A check's
+  // main command can run for its full configured timeout before the proof
+  // command's own log header is written -- if outputDir/logs is swapped for
+  // a symlink in that window (standing in for a concurrently running check,
+  // or the command under test, mutating the shared output directory), the
+  // stale one-time check must not let the later proof-log write silently
+  // follow it outside outputDir.
+  //
+  // The swap-attempt loop below races the whole check() call, so it can
+  // also land in the brief (pre-existing, accepted) gap between the FIRST
+  // ensureLogsDirSecured() call and the main log's own write -- narrowing
+  // that gap rather than eliminating it is a documented tradeoff of this
+  // design (Node's fs/promises has no directory-fd-based open to close it
+  // fully), and it applies equally on both sides of this fix. Landing there
+  // can leak the *main* log into attackerDir even though the fix works
+  // correctly. What UguCb specifically guarantees is narrower and is what
+  // this test asserts: no matter when the swap lands, the *proof*-command
+  // log must never be written through the swapped-in directory, because the
+  // second ensureLogsDirSecured() call revalidates immediately beforehand.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-logsdir-swap-'));
+  const attackerDir = await mkdtemp(path.join(tmpdir(), 'closeout-logsdir-swap-attacker-'));
+  const logsDir = path.join(outputDir, 'logs');
+  try {
+    const execute = createCommandExecutor({
+      repo: process.cwd(),
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+    });
+    const resultPromise = execute({
+      id: 'logsdir-swap',
+      command: "setTimeout(() => process.stdout.write('main-done'), 150)",
+      proof: {
+        type: 'command',
+        command: "process.stdout.write('proof-ran')",
+        expectedPattern: 'literal:proof-ran',
+      },
+    }, 'qualification');
+    // The main command's own log append-stream keeps logsDir's header file
+    // open (and, on Windows, the whole directory un-renameable) for its
+    // entire ~150ms run, so the earliest real opportunity to swap it is
+    // whenever that stream closes. Retry back-to-back with no delay between
+    // attempts -- standing in for a genuinely concurrent check racing to
+    // replace outputDir/logs -- rather than polling on a fixed interval,
+    // which under this environment's variable fs-call latency was
+    // empirically far less reliable at catching the window at all (a 5ms
+    // poll interval let the window close unattempted often enough to stall
+    // the whole swap for the rest of the test run).
+    let swapped = false;
+    let stop = false;
+    let attempt = 0;
+    const attemptSwap = async () => {
+      if (swapped) return;
+      // Unique per attempt: ensureLogsDirSecured's mkdir can recreate a
+      // plain logsDir between this rename and the symlink call below,
+      // making the symlink step fail. A fixed moved-aside destination
+      // would then stay permanently occupied by that orphaned directory,
+      // blocking every later rename attempt (EPERM) for the rest of the
+      // test -- silently stalling the swap forever instead of retrying.
+      const movedAside = `${logsDir}.moved-aside-${attempt}`;
+      attempt += 1;
+      try {
+        // Not atomic (rename away, then symlink in) -- a real attacker
+        // faces the same two-step gap, since POSIX rename cannot replace a
+        // directory with a symlink in one call. The check must come out
+        // safe whichever half of that gap it lands in: either it still
+        // sees the (moved-aside) directory as gone and fails the open, or
+        // it sees the newly created symlink and rejects outright. Neither
+        // may let evidence land inside attackerDir.
+        await rename(logsDir, movedAside);
+        await symlink(attackerDir, logsDir, 'junction');
+        swapped = true;
+      } catch {
+        // logsDir not yet free (still open), already swapped, or the
+        // symlink step lost a race with a fresh mkdir; retry immediately.
+      }
+    };
+    const retryLoop = (async () => {
+      while (!stop && !swapped) {
+        await attemptSwap();
+      }
+    })();
+    let result;
+    let rejection;
+    try {
+      result = await resultPromise;
+    } catch (error) {
+      rejection = error;
+    } finally {
+      stop = true;
+      await retryLoop;
+    }
+    assert.ok(swapped, 'test setup must actually swap logsDir to prove the executor rejects it');
+    // The precise failure mode depends on exactly which half of the
+    // non-atomic swap the check's revalidation lands in -- an outright
+    // rejection (logsDir already a symlink) or a BLOCKED/FAIL result (the
+    // open landed in the brief gap where logsDir did not exist at all).
+    // Either is safe; only a silent PASS built on evidence written through
+    // the swapped directory is not.
+    if (rejection) {
+      assert.match(rejection.message, /symlinked logs directory|outside the output directory|ENOENT/);
+    } else {
+      assert.notEqual(result.status, 'PASS', `must not PASS with evidence redirected through a swapped logs directory: ${JSON.stringify(result)}`);
+    }
+    const attackerContents = await readdir(attackerDir);
+    // Only the proof-log write is asserted against here (not "must be
+    // totally empty"): the main log can legitimately land in the earlier,
+    // pre-existing accepted gap described above, but the proof log must
+    // never appear -- that guarantee is exactly what the second
+    // ensureLogsDirSecured() call (this fix) provides.
+    const leakedProofEvidence = attackerContents.filter((name) => name.includes('.proof.'));
+    assert.deepEqual(leakedProofEvidence, [], `proof-command evidence must never land inside the swapped-in directory: ${JSON.stringify(attackerContents)}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true }).catch(() => {});
+    await rm(attackerDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 

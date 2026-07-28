@@ -48,6 +48,8 @@ const {
 } = require('./pr_closeout_stream');
 const {
   assertNotSymlink: assertNotSymlinkShared,
+  isTrustedSystemRoot,
+  looksLikeWindowsRoot,
   openNoFollow: openNoFollowShared,
   protectWindowsPrivateFile,
 } = require('./pr_closeout_fs');
@@ -914,17 +916,16 @@ const terminateProcessTree = async ({
             return false;
           }
         };
-      const looksLikeWindowsRoot = (root) => {
-        const normalized = path.normalize(root).replace(/[\\/]+$/u, '');
-        return /^[A-Za-z]:[\\/]/u.test(normalized)
-          && path.basename(normalized).toLowerCase() === 'windows';
-      };
-      const isTrustedSystemRoot = (root) => {
-        if (!looksLikeWindowsRoot(root)) return false;
-        const taskkillPath = path.join(root, 'System32', 'taskkill.exe');
-        const powershellPath = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-        return existsCheck(taskkillPath) && existsCheck(powershellPath);
-      };
+      // isTrustedSystemRoot/looksLikeWindowsRoot are imported from
+      // ./pr_closeout_fs (shared with resolvePowerShellExecutable) and always
+      // use path.win32 internally, so they parse a backslash-separated root
+      // correctly even when this file's generic `path` import resolves to
+      // path.posix (test-injected platform: 'win32' on a non-Windows CI
+      // host). This call site also needs taskkill.exe verified (it resolves
+      // a taskkill path from safeRoot below, not just powershell.exe), so it
+      // passes that as an extra required relative path rather than forking
+      // its own copy of the trust check.
+      const taskkillRelativePath = path.win32.join('System32', 'taskkill.exe');
       const envRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim();
       const hardcodedRoot = 'C:\\Windows';
       // Prefer hard-coded C:\\Windows whenever it exists and is trusted.
@@ -934,10 +935,10 @@ const terminateProcessTree = async ({
       // On non-win32 (unit tests with mocked runExecFile), a Windows-shaped
       // envRoot is allowed for path construction only.
       let safeRoot = hardcodedRoot;
-      if (isTrustedSystemRoot(hardcodedRoot)) {
+      if (isTrustedSystemRoot(hardcodedRoot, existsCheck, [taskkillRelativePath])) {
         safeRoot = hardcodedRoot;
       } else if (platform === 'win32') {
-        if (isTrustedSystemRoot(envRoot)) {
+        if (isTrustedSystemRoot(envRoot, existsCheck, [taskkillRelativePath])) {
           safeRoot = envRoot;
         } else {
           safeRoot = hardcodedRoot;
@@ -947,7 +948,7 @@ const terminateProcessTree = async ({
       } else {
         safeRoot = hardcodedRoot;
       }
-      const taskkill = path.join(safeRoot, 'System32', 'taskkill.exe');
+      const taskkill = path.win32.join(safeRoot, 'System32', 'taskkill.exe');
       // taskkill exits non-zero when the root PID is already gone (for
       // example a command that exited cleanly before termination was even
       // considered), which the outer catch would misreport as a termination
@@ -2508,13 +2509,46 @@ const createCommandExecutor = ({
   const attempts = new Map();
   const pathReplacements = buildPathReplacements({ cwd: repo, outputDir, env });
   const childEnv = buildChildEnvironment(env, secretNames);
+  const logsDir = path.join(outputDir, 'logs');
   const nextLogPath = (phase, id, kind = '') => {
     const safePhase = String(phase).replace(/[^a-z0-9_-]/gi, '-');
     const safeId = String(id).replace(/[^a-z0-9_-]/gi, '-');
     const key = `${safePhase}.${safeId}${kind ? `.${kind}` : ''}`;
     const attempt = (attempts.get(key) || 0) + 1;
     attempts.set(key, attempt);
-    return path.join(outputDir, 'logs', `${key}.attempt-${String(attempt).padStart(3, '0')}.log`);
+    return path.join(logsDir, `${key}.attempt-${String(attempt).padStart(3, '0')}.log`);
+  };
+  // Re-run before every path-based log open in a single check, not just
+  // once at the top: a check's main command can run for up to its full
+  // configured timeout between the header write for `logPath` and the one
+  // for `proofLogPath`, and a concurrently running check (or the command
+  // under test, if it has write access to outputDir) could replace
+  // outputDir/logs with a symlink in that window. openLogNoFollow only
+  // guards the final log-file component, not this parent directory, so a
+  // stale one-time check here would let a later open silently follow the
+  // substituted logs directory (CodeRabbit UguCb).
+  const ensureLogsDirSecured = async () => {
+    await mkdir(logsDir, { recursive: true, mode: 0o700 });
+    // mkdir recursive accepts a pre-existing symlink named `logs`. Fail
+    // closed before any evidence open: only a real directory under
+    // outputDir is OK.
+    await assertNotSymlinkShared(
+      logsDir,
+      `Refusing to write evidence logs through a symlinked logs directory: ${logsDir}`,
+    );
+    const realLogs = await realpath(logsDir);
+    const realOut = await realpath(outputDir);
+    const rel = path.relative(realOut, realLogs);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(
+        `Refusing to write evidence logs outside the output directory: ${logsDir}`,
+      );
+    }
+    try {
+      await chmod(logsDir, 0o700);
+    } catch {
+      // Platform may ignore directory modes.
+    }
   };
   const safeEvidencePath = (value) => normalizePaths(
     value,
@@ -2565,33 +2599,7 @@ const createCommandExecutor = ({
   if (artifactBefore?.status === 'FAIL') {
     return finalize({ ...safeCheck, phase, status: 'FAIL', evidence: artifactBefore.evidence, proofResult: artifactBefore });
   }
-  const logsDir = path.join(outputDir, 'logs');
-  await mkdir(logsDir, { recursive: true, mode: 0o700 });
-  // mkdir recursive accepts a pre-existing symlink named `logs`. Fail closed
-  // before any evidence open: only a real directory under outputDir is OK.
-  await assertNotSymlinkShared(
-    logsDir,
-    `Refusing to write evidence logs through a symlinked logs directory: ${logsDir}`,
-  );
-  try {
-    const realLogs = await realpath(logsDir);
-    const realOut = await realpath(outputDir);
-    const rel = path.relative(realOut, realLogs);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
-      throw new Error(
-        `Refusing to write evidence logs outside the output directory: ${logsDir}`,
-      );
-    }
-  } catch (error) {
-    if (error?.message?.startsWith('Refusing to write evidence logs')) throw error;
-    // realpath failure after mkdir is unexpected; surface it.
-    throw error;
-  }
-  try {
-    await chmod(logsDir, 0o700);
-  } catch {
-    // Platform may ignore directory modes.
-  }
+  await ensureLogsDirSecured();
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
   await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`);
@@ -2635,6 +2643,11 @@ const createCommandExecutor = ({
     return finalize({ ...result, status: semantic.status, evidence: semantic.evidence, proofResult });
   }
   if (check.proof.type === 'command') {
+    // The main command above can run for up to its full timeout between
+    // ensureLogsDirSecured()'s first call and this proof-command log open;
+    // revalidate immediately before this second path-based write rather
+    // than trusting the earlier check for the whole check() lifetime.
+    await ensureLogsDirSecured();
     const proofLogPath = nextLogPath(phase, check.id, 'proof');
     const safeProofCommand = normalizePaths(
       redactSecrets(check.proof.command, env, secretNames),

@@ -8,6 +8,7 @@ const path = require('node:path');
 const {
   assertNotSymlink: assertNotSymlinkShared,
   isSameFileIdentity,
+  isSameLockIdentity,
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
@@ -1392,6 +1393,15 @@ const main = () => {
           // mismatch, leave the successor alone and let the next attempt
           // re-evaluate whatever now occupies the path from scratch instead
           // of hard-failing this launch.
+          //
+          // Uses isSameLockIdentity (dev/ino/nlink + ctimeMs), not the plain
+          // isSameFileIdentity used elsewhere in this file: on Linux/tmpfs an
+          // inode freed by unlink can be reused immediately by the very next
+          // file created in the same directory, so a peer that unlinks this
+          // stale claim and writes its own successor can land on the exact
+          // same dev/ino this snapshot recorded. ctimeMs is fresh on any
+          // unlink+recreate (even a reused inode) and cannot match the stale
+          // snapshot, closing that gap (Codex Ua4p7/UiXEg).
           try {
             await assertNotSymlink(claimFile, 'collector_claim_is_symlink');
             // A null claimInfo means the earlier lstat (captured up front,
@@ -1406,7 +1416,7 @@ const main = () => {
             let sameRecord = false;
             if (claimInfo) {
               const currentClaimInfo = await lstat(claimFile);
-              sameRecord = isSameFileIdentity(claimInfo, currentClaimInfo);
+              sameRecord = isSameLockIdentity(claimInfo, currentClaimInfo);
             }
             if (sameRecord) {
               await unlink(claimFile);
