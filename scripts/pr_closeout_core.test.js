@@ -1256,6 +1256,7 @@ test('blocks configured commands that neutralize failures', () => {
   // while the test keeps running (then is terminated by cleanup); `&&`
   // (logical AND) and `&>` / `2>&1` (redirects) are not background operators.
   assert.ok(findCommandFailureNeutralizer('npm test >/dev/null 2>&1 & echo completed'));
+  assert.ok(findCommandFailureNeutralizer('npm test& echo ok'));
   assert.ok(findCommandFailureNeutralizer('npm test &'));
   assert.equal(findCommandFailureNeutralizer('npm test && echo done'), null);
   assert.equal(findCommandFailureNeutralizer('node build &> build.log'), null);

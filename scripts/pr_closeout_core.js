@@ -143,15 +143,17 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // no-evidence class, Codex U1D5F) stay out of this rule.
   /;\s*echo\b[^;|&\n]*$/im,
   /;\s*printf\b[^;|&\n]*$/im,
-  // Background operator (Codex U4u-o): an unquoted single `&` (not `&&`, and
-  // not the `>&`/`<&`/`&>` redirects) backgrounds the preceding command, so
-  // `npm test >/dev/null 2>&1 & echo completed` returns the foreground echo's
-  // exit 0 immediately while the real test keeps running (then is terminated
-  // by process cleanup) -- the check classifies PASS without observing the
-  // test's eventual failure. Matched when `&` follows whitespace and is not
-  // followed by `&` or `>`; a lone trailing `&` (e.g. `cmd &`) backgrounds the
-  // whole validation and is caught too.
-  /\s&(?!&|>)/,
+  // Background operator (Codex U4u-o/U5DBe): an unquoted single `&` (not
+  // `&&`, and not the `>&`/`<&`/`&>` redirects) backgrounds the preceding
+  // command, so `npm test >/dev/null 2>&1 & echo completed` -- or `npm test&
+  // echo ok` with NO space before `&` -- returns the foreground echo's exit 0
+  // immediately while the real test keeps running (then is terminated by
+  // process cleanup), and the check classifies PASS without observing the
+  // test's eventual failure. The `&` must not be adjacent to another `&` (so
+  // `&&` is excluded) nor to `<` or `>` (so `>&`/`<&`/`&>` redirects are
+  // excluded); a lone trailing `&` backgrounds the whole validation and is
+  // caught too.
+  /(?<![&<>])&(?!&|>)/,
   // Direct pipeline tails to always-success commands. Without `pipefail`,
   // `cmd | true` / `cmd | :` / `cmd | exit 0` report the right-hand exit
   // status and mask a failed left-hand command (CodeRabbit #4780344655).
