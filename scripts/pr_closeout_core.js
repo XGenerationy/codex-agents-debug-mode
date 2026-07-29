@@ -1172,7 +1172,12 @@ const scanSuppressionText = (file, text) => {
   // gates, not unconditional weakening. Only a bare always-truthy value (true,
   // a non-empty string, or a bare env/flag reference with no falsy escape) is
   // flagged, preserving the empty-reason and false exemptions (Codex UiTMl).
-  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?!false\b|undefined\b|null\b|''|"")(?![^,}\n]*(?:\?|&&|\|\||===|!==|==|!=))\S/;
+  // The optional pre-`{` prefix is a LAZY `[^(){}]*?` (commas allowed, but it
+  // still refuses to cross parens/braces so nested calls/objects are excluded):
+  // a greedy comma-free prefix would stop at the first comma and miss a test
+  // whose TITLE contains a comma, e.g. test('handles a, b', { skip: true }, fn)
+  // (CodeRabbit U3Q0c).
+  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^(){}]*?,\s*)?\{[^{}]*\bskip\s*:\s*(?!false\b|undefined\b|null\b|''|"")(?![^,}\n]*(?:\?|&&|\|\||===|!==|==|!=))\S/;
   const mochaRuntimeSkip = /\bthis\s*\.\s*skip\s*\(\s*\)/;
   // Accept exactly ONE separator before skipIf — a bare `.` OR the optional-
   // chaining `?.` — via `\??\.`. The prior `(?:\?\.)?\s*\.` consumed an

@@ -1687,6 +1687,21 @@ test('flags option-object, this.skip(), and .skipIf() executable test-skip forms
       .filter(({ category }) => category === 'test-weakening').length,
     1,
   );
+  // A test TITLE that contains a comma must not defeat option-object skip
+  // detection: the lazy comma-tolerant prefix spans the whole title arg before
+  // landing on the options `{` (CodeRabbit U3Q0c). The unconditional `skip:
+  // true` is still flagged, and the `skip: false` falsy exemption still holds
+  // through a comma-bearing title.
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "test('handles a, b, and c', { skip: true }, () => {});")
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', "test('handles a, b, and c', { skip: false }, () => {});")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
   assert.equal(
     scanSuppressionText('src/foo.test.js', "test('x', { skip: 'not ready' }, () => {});")
       .filter(({ category }) => category === 'test-weakening').length,

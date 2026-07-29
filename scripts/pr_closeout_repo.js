@@ -977,8 +977,13 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
         // closed by aborting the structural walk so the fingerprint step
         // surfaces an incomplete seal instead of a reusable-but-incomplete
         // digest (Codex UzZZq) -- the same fail-closed treatment already
-        // applied when the walk exceeds its entry cap above.
-        throw error;
+        // applied when the walk exceeds its entry cap above. Wrap the raw
+        // readdir error with the offending path so the aborted seal is
+        // diagnosable (which directory was unreadable), matching the sibling
+        // "Failed to list ignored untracked files" wrap below (CodeRabbit
+        // U3Q0k); error.message is interpolated so existing EACCES/permission
+        // matchers still hit.
+        throw new Error(`Failed to read directory ${absolute} while sealing the repository: ${error.message}`, { cause: error });
       }
       for (const child of children) {
         const childAbsolute = path.join(absolute, child);

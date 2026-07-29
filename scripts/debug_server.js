@@ -222,8 +222,18 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
       // finishes its 32-byte write, so retry readExisting for a short window; a
       // genuinely untrusted inode (hard-linked / corrupt / unreadable) keeps
       // throwing and falls through to the replace-fallback below.
+      // A zero-delay loop finishes in microseconds and cannot actually wait for
+      // a concurrent winner's 32-byte write to flush, so the loser would
+      // exhaust immediately and fall through to the replace path --
+      // reintroducing the project_hash disagreement this loop exists to prevent
+      // (CodeRabbit U3Q0J). Atomics.wait is the standard synchronous sleep. A
+      // genuinely untrusted inode keeps throwing on every attempt and still
+      // reaches the replace fallback below, just ~160ms later on the true-stale
+      // path only.
+      const adoptWait = new Int32Array(new SharedArrayBuffer(4));
       for (let attempt = 0; attempt < 32; attempt += 1) {
         try { return readExisting(); } catch { /* winner still publishing or untrusted */ }
+        if (attempt < 31) Atomics.wait(adoptWait, 0, 0, 5);
       }
       // Persistently unreadable (e.g. hard-linked): never write through
       // saltFile's existing inode -- a hard link would clobber the linked file
