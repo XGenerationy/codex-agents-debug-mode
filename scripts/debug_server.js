@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
-const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
+const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, unlinkSync, writeSync } = require('node:fs');
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
@@ -92,9 +92,12 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     // attacker-planted link could otherwise redirect the read. Open through
     // the shared no-follow helper (not a plain openSync after lstatSync) so a
     // symlink swapped in during the window between the lstat and the open
-    // cannot still be followed (Codex UzKDl).
+    // cannot still be followed (Codex UzKDl). A hard-linked salt file
+    // (nlink > 1) shares its inode with another, unrelated file; refuse to
+    // trust its content here too, for the same reason the create/repair path
+    // below refuses to ever write through it (Codex Uzynn).
     const info = lstatSync(saltFile);
-    if (!info.isFile()) throw new Error('project_salt_not_regular_file');
+    if (!info.isFile() || info.nlink > 1) throw new Error('project_salt_not_regular_file');
     const fd = openNoFollowSync(saltFile, constants.O_RDONLY);
     try {
       const buffer = Buffer.alloc(32);
@@ -111,47 +114,68 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
   // before the collector even starts would otherwise redirect this earlier,
   // unguarded write/read outside the project root (Codex UzJxy). A missing
   // .debug is fine -- mkdirSync below creates a fresh, safe directory.
-  try {
-    const dirInfo = lstatSync(debugDir);
-    if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) return randomBytes(32);
-    if (!isInsideRoot(realpathSync(resolvedProjectRoot), realpathSync(debugDir))) return randomBytes(32);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') return randomBytes(32);
-  }
+  const debugDirIsSafe = () => {
+    try {
+      const dirInfo = lstatSync(debugDir);
+      if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) return false;
+      return isInsideRoot(realpathSync(resolvedProjectRoot), realpathSync(debugDir));
+    } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+  };
+  if (!debugDirIsSafe()) return randomBytes(32);
   try {
     return readExisting();
   } catch {
-    // Missing, corrupt, or unreadable: fall through to (re)generate below.
+    // Missing, corrupt, unreadable, or hard-linked: fall through to
+    // (re)generate below.
   }
   try { mkdirSync(debugDir, { recursive: true }); } catch {}
+  // Re-check right before writing: mkdirSync above silently no-ops if the
+  // path already resolves to a directory, so an attacker racing a .debug
+  // symlink into place after the first check above (during the window this
+  // ENOENT-tolerant path leaves open) would otherwise go undetected --
+  // O_NOFOLLOW on the final path component below cannot catch a symlinked
+  // PARENT segment (Codex UzZZk). This narrows, but does not fully close,
+  // the window; the same residual gap is already accepted elsewhere in this
+  // file for the same reason (see unlinkOwnedClaimIfUnchanged).
+  if (!debugDirIsSafe()) return randomBytes(32);
+  try {
+    // A concurrent invocation may have already finished writing a valid salt
+    // while this one was creating .debug; prefer agreeing with it over
+    // unconditionally replacing it below.
+    return readExisting();
+  } catch {
+    // Still missing, corrupt, unreadable, or hard-linked: proceed to
+    // (re)generate.
+  }
   const salt = randomBytes(32);
   try {
-    // A pre-existing file already failed readExisting above (short, corrupt,
-    // or otherwise unreadable -- a symlink there was already rejected by the
-    // .debug guard, since project_salt itself cannot be a symlink while its
-    // parent isn't). No invocation could ever have agreed with unreadable
-    // contents, so truncate-and-replace instead of leaving a file that can
-    // never self-heal and permanently disagrees with every future invocation
-    // (Codex UzKEH). O_EXCL still guards the true first-run create race.
-    let replaceUnreadable = false;
-    try { replaceUnreadable = lstatSync(saltFile).isFile(); } catch { replaceUnreadable = false; }
-    const flags = replaceUnreadable
-      ? constants.O_TRUNC | constants.O_WRONLY
-      : constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY;
-    const fd = openNoFollowSync(saltFile, flags, 0o600);
+    // Never write through saltFile's existing inode: if it were hard-linked
+    // to another user-owned file, truncating in place would clobber that
+    // file too (Codex Uzynn/Uz6Aw). Write the salt to a private temp file
+    // instead and atomically rename it over saltFile -- rename() replaces
+    // only the directory entry, so whatever inode saltFile previously named
+    // (hard-linked or not) is left completely untouched.
+    const tempFile = path.join(debugDir, `.project_salt.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+    const fd = openNoFollowSync(tempFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     try {
       writeSync(fd, salt, 0, 32, 0);
     } finally {
       closeSync(fd);
     }
-    return salt;
-  } catch (error) {
-    // Lost the create race to a concurrent invocation: read back its salt so
-    // both agree. Any other failure keeps this invocation's own unpersisted
-    // salt (fail-open per the note above).
-    if (error?.code === 'EEXIST') {
-      try { return readExisting(); } catch { /* fall through */ }
+    try {
+      renameSync(tempFile, saltFile);
+    } catch (error) {
+      try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+      throw error;
     }
+    return salt;
+  } catch {
+    // Any failure keeps this invocation's own unpersisted salt (fail-open
+    // per the note above): worst case is two invocations disagreeing on
+    // project_hash, which only affects the already_running convenience
+    // check, never authentication.
     return salt;
   }
 };

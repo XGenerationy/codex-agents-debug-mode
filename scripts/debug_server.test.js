@@ -345,6 +345,61 @@ test('project_hash is keyed by a persisted per-project salt, not a bare hash of 
   }
 });
 
+test('repairs a hard-linked project_salt via rename instead of clobbering the linked file', async () => {
+  // Codex Uzynn/Uz6Aw: a pre-existing project_salt sharing its inode with an
+  // outside file (nlink > 1) must never be truncated-in-place -- that would
+  // silently corrupt the other file too. readOrCreateProjectSalt must refuse
+  // to trust it on read, then repair it by writing a fresh salt to a private
+  // temp file and renaming that over project_salt, which only replaces the
+  // directory entry and leaves the previously hard-linked inode untouched.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-hardlink-'));
+  try {
+    const debugDir = path.join(projectRoot, '.debug');
+    const outsideFile = path.join(projectRoot, 'outside-salt-target.txt');
+    await mkdir(debugDir, { recursive: true });
+    await writeFile(outsideFile, 'precious-unrelated-content', 'utf8');
+    await link(outsideFile, path.join(debugDir, 'project_salt'));
+
+    createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+
+    assert.equal(await readFile(outsideFile, 'utf8'), 'precious-unrelated-content');
+    const saltFile = path.join(debugDir, 'project_salt');
+    const saltInfo = await stat(saltFile);
+    assert.equal(saltInfo.isFile(), true);
+    assert.equal(saltInfo.size, 32);
+    assert.equal(saltInfo.nlink, 1);
+    const leftoverTemp = (await readdir(debugDir)).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftoverTemp, []);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test(
+  'never persists project_salt through a symlinked .debug directory',
+  { skip: !symlinkCreationAvailable && 'directory symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)' },
+  async () => {
+    // Codex UzZZk: a .debug symlink planted before the collector's own later
+    // per-session guard runs must not redirect this earlier read/write
+    // outside the project root. readOrCreateProjectSalt must fall back to an
+    // unpersisted random salt instead of following the link.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-symlink-'));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-outside-'));
+    try {
+      await symlink(outsideDir, path.join(projectRoot, '.debug'), 'dir');
+
+      const first = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+      const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+
+      assert.notEqual(first.collectorProjectHash, second.collectorProjectHash);
+      assert.equal((await readdir(outsideDir)).includes('project_salt'), false);
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+  },
+);
+
 test('probe accepts the collector identity and rejects an unrelated HTTP 200 server', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const collector = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });

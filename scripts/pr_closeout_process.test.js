@@ -2428,6 +2428,64 @@ test('cwd/fd probe discovers mark-free processes that hold an open repo fd', {
   }
 });
 
+test('cwd/fd probe treats a truncated descriptor scan as unresolved, not a clean negative', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Codex UzZZv: a mark-free process can hide a repo-rooted descriptor past
+  // the scan's 257-entry cap by opening enough throwaway descriptors first
+  // (reproduced upstream with 2,000 descriptors, repo fd at index 1,137).
+  // Reaching the cap must be treated as an INCOMPLETE containment proof, not
+  // as "scanned everything, found nothing" -- so a holder that exceeds the
+  // cap must stay flagged even when the scanned prefix itself has no repo
+  // fd, while a holder well under the cap with no repo fd is still cleared.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-cap-'));
+  let capPid = 0;
+  let belowCapPid = 0;
+  try {
+    const spawnJunkHolder = (count) => {
+      const script = [
+        'const fs=require("node:fs");const os=require("node:os");',
+        `for(let i=0;i<${count};i+=1){fs.openSync(process.execPath,"r");}`,
+        'process.chdir(os.tmpdir());',
+        'process.stdout.write(String(process.pid));',
+        'setInterval(()=>{},10000);',
+      ].join('');
+      const child = spawn(process.execPath, ['-e', script], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        detached: true,
+      });
+      child.unref();
+      return child;
+    };
+
+    const capChild = spawnJunkHolder(300);
+    capChild.stdout.on('data', (chunk) => { capPid = Number(String(chunk).trim()); });
+    const belowCapChild = spawnJunkHolder(5);
+    belowCapChild.stdout.on('data', (chunk) => { belowCapPid = Number(String(chunk).trim()); });
+    for (let i = 0; i < 40 && (!capPid || !belowCapPid); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(capPid > 0, 'over-cap holder must report its pid');
+    assert.ok(belowCapPid > 0, 'below-cap holder must report its pid');
+
+    const found = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(found !== null, '/proc must be available');
+    assert.ok(
+      found.includes(capPid),
+      `holder ${capPid} with an incomplete (over-cap) descriptor scan must stay flagged, got: ${JSON.stringify(found)}`,
+    );
+    assert.ok(
+      !found.includes(belowCapPid),
+      `holder ${belowCapPid} with a complete scan and no repo fd must not be flagged, got: ${JSON.stringify(found)}`,
+    );
+  } finally {
+    if (capPid) { try { process.kill(capPid, 'SIGKILL'); } catch {} }
+    if (belowCapPid) { try { process.kill(belowCapPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('cwd/fd probe excludes a same-repo sibling still running under the runner', {
   timeout: 15000,
   skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
@@ -2618,6 +2676,84 @@ test('cwd/fd probe excludes a pre-existing ancestor of the runner (Codex host)',
     if (hostProc) {
       try { process.kill(hostPid || hostProc.pid, 'SIGKILL'); } catch {}
       hostProc.stdout?.destroy();
+    }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('cwd/fd probe excludes a mark-free sidecar sharing a supervisor with the runner', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Codex UzZZc/Uz6AT: under Codex Code mode, long-lived sidecars such as
+  // codex-code-mode-host and make_pr.py can share the repo cwd while being
+  // SIBLINGS of the runner under a common supervisor, not its ancestor and
+  // not chaining to it directly -- chainsToRunner's PPID walk from such a
+  // sidecar never reaches selfPid, only an ANCESTOR of selfPid (the shared
+  // supervisor). That must still exclude it, via the same hard /proc-topology
+  // evidence as the direct-ancestor and direct-sibling exclusions above, not
+  // the deliberately-rejected "predates the probe" age heuristic (Codex
+  // UrfC6) the bot findings suggested.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-sidecar-sweep-'));
+  let runnerStandInPid = 0;
+  let sidecarPid = 0;
+  let supervisorProc = null;
+  let rootPid = 0;
+  try {
+    // An exited stand-in for this spawn's root pid -- guaranteed to appear
+    // nowhere in the supervisor/runner/sidecar ancestry below.
+    const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise((resolve) => exited.once('exit', resolve));
+    rootPid = exited.pid;
+
+    // "supervisor": own session, cwd inside the repo (inherited by both
+    // children below), no spawn mark -- launches a stand-in for the runner
+    // and a mark-free sidecar as SIBLINGS, then reports both pids.
+    const supervisor = [
+      'const {spawn}=require("node:child_process");',
+      'const runnerStandIn=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore"});',
+      'const sidecar=spawn(process.execPath,["-e","process.stdout.write(String(process.pid));setInterval(()=>{},10000);"],{stdio:["ignore","pipe","ignore"],detached:true});',
+      'runnerStandIn.unref();sidecar.unref();',
+      'sidecar.stdout.on("data",(chunk)=>{process.stdout.write(runnerStandIn.pid+","+String(chunk).trim());});',
+      'setInterval(()=>{},10000);',
+    ].join('');
+    supervisorProc = spawn(process.execPath, ['-e', supervisor], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      cwd: repo,
+      detached: true,
+    });
+    supervisorProc.unref();
+    supervisorProc.stdout.on('data', (chunk) => {
+      const parts = String(chunk).trim().split(',');
+      if (parts.length === 2) { runnerStandInPid = Number(parts[0]); sidecarPid = Number(parts[1]); }
+    });
+    for (let i = 0; i < 40 && !sidecarPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(runnerStandInPid > 0 && sidecarPid > 0, 'runner stand-in and sidecar must both report a pid');
+
+    // Fixture validity: without a selfPid related to the sidecar, the bare
+    // cwd probe matches it like any other mark-free candidate.
+    const attributed = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(
+      (attributed || []).includes(sidecarPid),
+      `sidecar ${sidecarPid} must match the bare cwd probe, got: ${JSON.stringify(attributed)}`,
+    );
+
+    // With selfPid set to the runner stand-in, the sidecar's chain reaches
+    // the shared supervisor -- an ANCESTOR of selfPid, not selfPid itself and
+    // not rootPid -- and must still be excluded.
+    const excluded = listLivePidsWithCwdUnder(repo, { selfPid: runnerStandInPid, rootPid });
+    assert.ok(
+      !(excluded || []).includes(sidecarPid),
+      `sidecar ${sidecarPid} chaining to an ancestor of the runner must be excluded, got: ${JSON.stringify(excluded)}`,
+    );
+  } finally {
+    if (sidecarPid) { try { process.kill(sidecarPid, 'SIGKILL'); } catch {} }
+    if (runnerStandInPid) { try { process.kill(runnerStandInPid, 'SIGKILL'); } catch {} }
+    if (supervisorProc) {
+      try { process.kill(supervisorProc.pid, 'SIGKILL'); } catch {}
+      supervisorProc.stdout?.destroy();
     }
     await rm(repo, { recursive: true, force: true });
   }

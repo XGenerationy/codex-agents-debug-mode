@@ -393,9 +393,9 @@ const listLivePidsWithCwdUnder = (rootCwd, {
     } catch {
       return false;
     }
-    let checked = 0;
-    for (const fd of fds) {
-      if (checked++ > 256) break;
+    const cap = 257;
+    for (let i = 0; i < fds.length && i < cap; i += 1) {
+      const fd = fds[i];
       let target;
       try {
         target = readlinkSync(`/proc/${pid}/fd/${fd}`);
@@ -410,18 +410,38 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       if (!path.isAbsolute(target)) continue;
       if (underRoot(path.resolve(target))) return true;
     }
+    // Reaching the cap without a match is an INCOMPLETE containment proof,
+    // not evidence the process holds no repo-rooted descriptor (Codex
+    // UzZZv): a mark-stripped orphan holding thousands of unrelated
+    // descriptors could place a repository-rooted fd past the scanned
+    // prefix and evade detection entirely. Only a scan that covers every
+    // descriptor (fds.length <= cap) and finds no match proves the process
+    // clean; treat a truncated scan as unproven and keep it flagged,
+    // matching this function's fail-closed default everywhere else.
+    if (fds.length > cap) return true;
     return false;
   };
   // Walk a candidate's PPID chain (bounded, cycle-safe). Only an UNBROKEN
-  // chain that reaches the runner without passing through this spawn's root
-  // proves the candidate is a sibling spawned by the runner's own tree
-  // (e.g. a concurrent qualification check sharing the repo cwd), never a
-  // detached orphan of this spawn — exclude it. Every uncertain outcome
-  // (broken or unreadable link, chain through the spawn root, cycle, hop
-  // bound, chain leaving the runner's tree) keeps the candidate flagged.
-  // This exemption is for a candidate that is mark-free or carries a
-  // registered mark only -- the caller must additionally reject an explicit
-  // unregistered mark before trusting this result (Codex UrfC6).
+  // chain that reaches the runner (or one of the runner's own ancestors,
+  // e.g. a shared supervisor -- see selfAncestors below) without passing
+  // through this spawn's root proves the candidate is a sibling spawned by
+  // the runner's own tree (e.g. a concurrent qualification check sharing the
+  // repo cwd, or a long-lived supervisor-owned sidecar such as
+  // codex-code-mode-host / make_pr.py that shares the repo cwd with this
+  // runner -- Codex UzZZc/Uz6AT), never a detached orphan of this spawn —
+  // exclude it. Every uncertain outcome (broken or unreadable link, chain
+  // through the spawn root, cycle, hop bound, chain leaving the runner's
+  // tree) keeps the candidate flagged. This exemption is for a candidate
+  // that is mark-free or carries a registered mark only -- the caller must
+  // additionally reject an explicit unregistered mark before trusting this
+  // result (Codex UrfC6). Reaching an ancestor of selfPid is, like reaching
+  // selfPid itself, hard unforgeable /proc topology (a genuinely detached
+  // setsid orphan's chain dead-ends at init or the exited spawn root and can
+  // never climb back into the runner's own ancestry) -- unlike the
+  // deliberately-rejected "started before this spawn" age heuristic
+  // (Codex UrfC6) that a forged-mark pre-existing process could exploit
+  // for a free pass, this generalization is not a free pass by age but a
+  // structural-ancestry proof, so it does not reopen that gap.
   const chainsToRunner = (pid) => {
     if (!Number.isInteger(rootPid) || rootPid <= 0) return false;
     const chainVisited = new Set();
@@ -441,7 +461,7 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       const ppid = Number(stat.slice(afterComm + 1).trimStart().split(/\s+/)[1]);
       if (!Number.isInteger(ppid) || ppid <= 0) return false;
       if (ppid === rootPid) return false; // chain through the spawn root — keep flagged.
-      if (ppid === selfPid) return true; // unbroken chain to the runner — sibling.
+      if (ppid === selfPid || selfAncestors.has(ppid)) return true; // unbroken chain to the runner or its own ancestry — sibling.
       current = ppid;
     }
     return false;
