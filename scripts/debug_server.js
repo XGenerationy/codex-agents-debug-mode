@@ -203,7 +203,17 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
       try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
       throw error;
     }
-    return salt;
+    // A concurrent first-launch may rename its own salt over saltFile after
+    // this one's rename; re-read the on-disk winner so both collectors agree
+    // on the same salt (and project_hash) instead of one retaining a stale
+    // in-memory salt that misclassifies a same-project relaunch as
+    // port_in_use_by_other_process (Codex U16Cd). With no concurrency this
+    // reads back exactly the bytes just written.
+    try {
+      return readExisting();
+    } catch {
+      return salt;
+    }
   } catch {
     // Any failure keeps this invocation's own unpersisted salt (fail-open
     // per the note above): worst case is two invocations disagreeing on

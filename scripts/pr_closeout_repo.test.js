@@ -1283,7 +1283,8 @@ test('workingTreeFingerprint fails closed when a node_modules tree exceeds the s
 });
 
 test('workingTreeFingerprint fails closed when a node_modules directory is unreadable (Codex UzZZq)', {
-  skip: process.platform === 'win32' ? 'POSIX-only (chmod permission test)' : false,
+  skip: process.platform === 'win32' ? 'POSIX-only (chmod permission test)'
+    : (typeof process.getuid === 'function' && process.getuid() === 0 ? 'skipped: chmod 0o000 does not restrict root (root bypasses file-mode perms)' : false),
 }, async () => {
   // An unreadable ignored directory cannot be structurally sealed: a stable
   // dir_unreadable marker would be byte-identical at both checkpoints while a
