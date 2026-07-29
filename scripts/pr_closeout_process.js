@@ -22,7 +22,7 @@ const SPAWN_MARK_ENV = 'OMO_CLOSEOUT_SPAWN_MARK';
 // mark is "known", so the fail-closed default is to exclude nothing.
 const EMPTY_MARK_SET = new Set();
 
-const { classifyOutput, findStatusSignals } = require('./pr_closeout_core');
+const { classifyOutput, findStatusSignals, STATUS_TERM } = require('./pr_closeout_core');
 const {
   buildChildEnvironment,
   buildSecretReplacements,
@@ -1442,12 +1442,12 @@ const cappedAppend = (current, chunk) => {
   return `${current}${chunk}`.slice(0, CAPTURE_LIMIT);
 };
 
-// Alternation of status terms mirrored verbatim from pr_closeout_core.js's
-// STATUS_TERM. Used only by the `test files 0` no-work regex below so it does
-// not fire on a bucket count in a richer summary (`Test Files 0 failed | 2
-// passed`). Kept in sync by hand because pr_closeout_core.js does not export
-// the constant.
-const STREAM_STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
+// Status-term alternation shared with pr_closeout_core.js (imported as
+// STATUS_TERM, not re-declared here). Used only by the `test files 0` no-work
+// regex below so it does not fire on a bucket count in a richer summary
+// (`Test Files 0 failed | 2 passed`). Importing the single source of truth
+// keeps this scanner from drifting when a term is added in core (CodeRabbit
+// UmlJV).
 
 // Streaming no-work detection (Codex UikNz).
 //
@@ -1478,7 +1478,7 @@ const STREAM_NO_WORK_UNCONDITIONAL = [
   { label: '0 tests run', re: /\b0\s+tests?\s+(?:run|ran|executed)\b/i },
   { label: '# tests 0', re: /^[ \t]*#\s*tests?\s+0\b/im },
   { label: 'tests 0 passed', re: /\btests?\s+0\s+passed\b/i },
-  { label: 'test files 0', re: new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STREAM_STATUS_TERM}\\b)`, 'i') },
+  { label: 'test files 0', re: new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STATUS_TERM}\\b)`, 'i') },
   { label: '0 passing', re: /(?:^|\n)\s*0\s+passing\b/i },
 ];
 
@@ -1827,6 +1827,9 @@ const assertLogParentIdentity = async (target, expected) => {
  * @param {{dev: number, ino: number}|null} [securedDirIdentity] identity of the
  *   logs directory captured by ensureLogsDirSecured(); when provided, the open
  *   is bound to it and a mismatch is rejected before any truncate/write.
+ * @returns {Promise<{dev: number, ino: number}>} identity of the written
+ *   header file, so the caller can bind a later append reopen of the same path
+ *   to the exact file this header landed on (CodeRabbit UmlJX / Codex UnKZ4).
  */
 const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = null) => {
   // O_CREAT without O_TRUNC: create if missing, never truncate until fstat.
@@ -1837,6 +1840,11 @@ const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = nul
     if (securedDirIdentity) await assertLogParentIdentity(target, securedDirIdentity);
     await handle.truncate(0);
     await handle.writeFile(contents, 'utf8');
+    // Capture the verified file's dev/ino (openLogNoFollow already proved it a
+    // regular, single-link file) so the append reopen can confirm it lands on
+    // this same inode, not a replacement swapped in afterwards.
+    const info = await handle.stat();
+    return { dev: info.dev, ino: info.ino };
   } finally {
     await handle.close();
   }
@@ -1851,15 +1859,49 @@ const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = nul
  * revalidated before use: a pre-existing hard link — or a swap between the
  * header write and this open — must fail softly (the caller's logWriteError
  * path) rather than append command evidence to an outside file.
+ *
+ * openLogNoFollow's O_NOFOLLOW only guards the FINAL path component, so a
+ * `logs` swap or a file swap landing between the header write and this open
+ * could otherwise redirect every captured byte into a substituted directory
+ * or file while the report still names the original evidence path. When the
+ * caller threads the identities captured at header time, the append is bound
+ * to BOTH the validated logs directory (parent dev/ino) and the exact header
+ * file (dev/ino): either mismatch throws before the stream is returned, so
+ * the reopen cannot silently follow a redirect (CodeRabbit UmlJX / Codex
+ * UnKZ4). Both are optional so direct/unit-test callers keep working unbound.
  * @param {string} target
+ * @param {{dev: number, ino: number}|null} [securedDirIdentity] validated logs
+ *   directory identity; when provided, a swapped parent is rejected.
+ * @param {{dev: number, ino: number}|null} [securedFileIdentity] identity of
+ *   the header file; when provided, a swapped leaf is rejected.
  * @returns {Promise<import('node:fs').WriteStream>}
  */
-const createLogAppendStreamNoFollow = async (target) => {
+const createLogAppendStreamNoFollow = async (target, securedDirIdentity = null, securedFileIdentity = null) => {
   const handle = await openLogNoFollow(
     target,
     constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND,
     'append',
   );
+  try {
+    // Bind the reopen to the validated parent directory and the header file's
+    // own identity before any command output is streamed to it.
+    if (securedDirIdentity) await assertLogParentIdentity(target, securedDirIdentity);
+    if (securedFileIdentity) {
+      const info = await handle.stat();
+      if (
+        securedFileIdentity.ino === 0
+        || info.dev !== securedFileIdentity.dev
+        || info.ino !== securedFileIdentity.ino
+      ) {
+        throw new Error(
+          `Refusing to append evidence to a log file swapped after its header write: ${target}`,
+        );
+      }
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
   return createWriteStream(undefined, { fd: handle, autoClose: true, encoding: 'utf8' });
 };
 
@@ -1905,6 +1947,12 @@ const spawnCaptured = async ({
   // createCommandExecutor). Optional so direct/unit-test callers keep
   // working with the safe empty-registry default.
   knownSiblingMarks,
+  // Identities captured when the log header was written, threaded through so
+  // the append reopen below can be bound to the validated logs directory and
+  // the exact header file (CodeRabbit UmlJX / Codex UnKZ4). Optional so
+  // direct/unit-test callers keep working unbound.
+  securedDirIdentity = null,
+  securedFileIdentity = null,
 }) => {
   const startedAt = new Date().toISOString();
   let stdout = '';
@@ -1920,7 +1968,7 @@ const spawnCaptured = async ({
   let log;
   let logError = null;
   try {
-    log = await createLogAppendStreamNoFollow(logPath);
+    log = await createLogAppendStreamNoFollow(logPath, securedDirIdentity, securedFileIdentity);
   } catch (error) {
     logError = error;
     log = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
@@ -1998,98 +2046,112 @@ const spawnCaptured = async ({
   // recognize it (Codex UikN4); unregistered below once this spawn's own
   // termination/sweep is settled.
   if (spawnMark) knownSiblingMarks?.add(spawnMark);
-  // Capture approximate starttime for orphan filters:
-  // - POSIX: /proc starttime jiffies (exact after spawn when available)
-  // - Windows: wall-clock epoch ms for CommandLine CreationDate filtering
-  //   so pre-existing editors/CI agents are not treated as orphans.
-  let minStarttime = platform === 'win32' ? Date.now() : 0;
-  const child = spawnProcess(shell, shellArgs(command, shell), {
-    cwd,
-    env: spawnEnv,
-    // Detached so the child is a process-group leader and kill(-pid) works.
-    detached: platform !== 'win32',
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (platform !== 'win32' && Number.isInteger(child?.pid)) {
-    try {
-      const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
-      const afterComm = stat.lastIndexOf(')');
-      if (afterComm >= 0) {
-        const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
-        const starttime = Number(fields[19]);
-        if (Number.isFinite(starttime)) minStarttime = starttime;
+  try {
+    // Capture approximate starttime for orphan filters:
+    // - POSIX: /proc starttime jiffies (exact after spawn when available)
+    // - Windows: wall-clock epoch ms for CommandLine CreationDate filtering
+    //   so pre-existing editors/CI agents are not treated as orphans.
+    let minStarttime = platform === 'win32' ? Date.now() : 0;
+    const child = spawnProcess(shell, shellArgs(command, shell), {
+      cwd,
+      env: spawnEnv,
+      // Detached so the child is a process-group leader and kill(-pid) works.
+      detached: platform !== 'win32',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (platform !== 'win32' && Number.isInteger(child?.pid)) {
+      try {
+        const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
+        const afterComm = stat.lastIndexOf(')');
+        if (afterComm >= 0) {
+          const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
+          const starttime = Number(fields[19]);
+          if (Number.isFinite(starttime)) minStarttime = starttime;
+        }
+      } catch {
+        minStarttime = 0;
       }
-    } catch {
-      minStarttime = 0;
     }
-  }
-  const emitNormalized = (stream, normalized) => {
-    if (!normalized) return;
-    if (stream === 'stdout') stdout = cappedAppend(stdout, normalized);
-    else stderr = cappedAppend(stderr, normalized);
-    writeLog(`[${stream}] ${normalized}`, child[stream]);
-    states[stream].hash.update(normalized);
-  };
-  const emitSafe = (stream, safe) => {
-    if (!safe) return;
-    emitNormalized(stream, states[stream].normalizer.push(safe));
-  };
-  const record = (stream, chunk) => {
-    const raw = Buffer.isBuffer(chunk)
-      ? states[stream].signalDecoder.write(chunk)
-      : String(chunk ?? '');
-    states[stream].scanner.push(raw);
-    states[stream].noWorkScanner.push(raw);
-    emitSafe(stream, states[stream].redactor.push(chunk));
-  };
-  const flush = (stream) => {
-    // Drain the decoder's trailing bytes once and feed both raw scanners so a
-    // no-work summary that arrives without a trailing newline is still seen.
-    const tail = states[stream].signalDecoder.end();
-    states[stream].scanner.push(tail);
-    states[stream].scanner.flush();
-    states[stream].noWorkScanner.push(tail);
-    states[stream].noWorkScanner.flush();
-    emitSafe(stream, states[stream].redactor.flush());
-    emitNormalized(stream, states[stream].normalizer.flush());
-  };
-  const onStdout = (chunk) => record('stdout', chunk);
-  const onStderr = (chunk) => record('stderr', chunk);
-  child.stdout.on('data', onStdout);
-  child.stderr.on('data', onStderr);
+    const emitNormalized = (stream, normalized) => {
+      if (!normalized) return;
+      if (stream === 'stdout') stdout = cappedAppend(stdout, normalized);
+      else stderr = cappedAppend(stderr, normalized);
+      writeLog(`[${stream}] ${normalized}`, child[stream]);
+      states[stream].hash.update(normalized);
+    };
+    const emitSafe = (stream, safe) => {
+      if (!safe) return;
+      emitNormalized(stream, states[stream].normalizer.push(safe));
+    };
+    const record = (stream, chunk) => {
+      const raw = Buffer.isBuffer(chunk)
+        ? states[stream].signalDecoder.write(chunk)
+        : String(chunk ?? '');
+      states[stream].scanner.push(raw);
+      states[stream].noWorkScanner.push(raw);
+      emitSafe(stream, states[stream].redactor.push(chunk));
+    };
+    const flush = (stream) => {
+      // Drain the decoder's trailing bytes once and feed both raw scanners so a
+      // no-work summary that arrives without a trailing newline is still seen.
+      const tail = states[stream].signalDecoder.end();
+      states[stream].scanner.push(tail);
+      states[stream].scanner.flush();
+      states[stream].noWorkScanner.push(tail);
+      states[stream].noWorkScanner.flush();
+      emitSafe(stream, states[stream].redactor.flush());
+      emitNormalized(stream, states[stream].normalizer.flush());
+    };
+    const onStdout = (chunk) => record('stdout', chunk);
+    const onStderr = (chunk) => record('stderr', chunk);
+    child.stdout.on('data', onStdout);
+    child.stderr.on('data', onStderr);
 
-  let closeResolved = false;
-  let resolveClose;
-  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
-  const close = (outcome) => {
-    if (closeResolved) return;
-    closeResolved = true;
-    resolveClose(outcome);
-  };
-  child.once('error', (error) => close({ exitCode: null, signal: null, spawnError: error }));
-  child.once('close', (exitCode, signal) => close({ exitCode, signal }));
-  let timer;
-  const timeoutPromise = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
-  });
-  const first = await Promise.race([
-    closePromise.then((outcome) => ({ kind: 'close', outcome })),
-    timeoutPromise,
-  ]);
+    let closeResolved = false;
+    let resolveClose;
+    const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+    const close = (outcome) => {
+      if (closeResolved) return;
+      closeResolved = true;
+      resolveClose(outcome);
+    };
+    child.once('error', (error) => close({ exitCode: null, signal: null, spawnError: error }));
+    child.once('close', (exitCode, signal) => close({ exitCode, signal }));
+    let timer;
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+    });
+    const first = await Promise.race([
+      closePromise.then((outcome) => ({ kind: 'close', outcome })),
+      timeoutPromise,
+    ]);
 
-  let outcome = first.outcome;
-  let termination;
-  if (first.kind === 'close') {
-    clearTimeout(timer);
-    // A command can exit 0 while detached background descendants keep running
-    // in its process group, still able to mutate the worktree after the final
-    // seal. Prove the group is gone (terminating any stragglers) before
-    // treating the clean exit as clean. A spawn error means the command never
-    // started, so there is no group to sweep.
-    termination = outcome?.spawnError
-      ? { status: 'PASS', evidence: 'Command did not start; no process group was created.', escalated: false }
-      : await terminateTree({
+    let outcome = first.outcome;
+    let termination;
+    if (first.kind === 'close') {
+      clearTimeout(timer);
+      // A command can exit 0 while detached background descendants keep running
+      // in its process group, still able to mutate the worktree after the final
+      // seal. Prove the group is gone (terminating any stragglers) before
+      // treating the clean exit as clean. A spawn error means the command never
+      // started, so there is no group to sweep.
+      termination = outcome?.spawnError
+        ? { status: 'PASS', evidence: 'Command did not start; no process group was created.', escalated: false }
+        : await terminateTree({
+          child,
+          platform,
+          env,
+          terminationGraceMs,
+          closePromise,
+          spawnMark,
+          cwd,
+          minStarttime,
+          knownSiblingMarks,
+        });
+    } else {
+      timedOut = true;
+      termination = await terminateTree({
         child,
         platform,
         env,
@@ -2100,103 +2162,92 @@ const spawnCaptured = async ({
         minStarttime,
         knownSiblingMarks,
       });
-  } else {
-    timedOut = true;
-    termination = await terminateTree({
-      child,
-      platform,
-      env,
-      terminationGraceMs,
-      closePromise,
-      spawnMark,
-      cwd,
-      minStarttime,
-      knownSiblingMarks,
-    });
-    outcome = await Promise.race([
-      closePromise,
-      delay(terminationGraceMs).then(() => null),
-    ]);
-    if (!outcome) {
-      try {
-        child.kill('SIGKILL');
-      } catch {}
       outcome = await Promise.race([
         closePromise,
         delay(terminationGraceMs).then(() => null),
       ]);
+      if (!outcome) {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+        outcome = await Promise.race([
+          closePromise,
+          delay(terminationGraceMs).then(() => null),
+        ]);
+      }
+      if (!outcome) {
+        termination = {
+          status: 'BLOCKED',
+          evidence: `${termination.evidence} The root process did not close after bounded termination.`,
+          escalated: true,
+        };
+        child.stdout.off('data', onStdout);
+        child.stderr.off('data', onStderr);
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
     }
-    if (!outcome) {
-      termination = {
-        status: 'BLOCKED',
-        evidence: `${termination.evidence} The root process did not close after bounded termination.`,
-        escalated: true,
-      };
-      child.stdout.off('data', onStdout);
-      child.stderr.off('data', onStderr);
-      child.stdout.destroy();
-      child.stderr.destroy();
-    }
-  }
-  // This spawn's own termination/sweep is settled either way (PASS or
-  // BLOCKED): stop advertising the mark to concurrent siblings' orphan
-  // sweeps now that it no longer identifies an actively-tracked spawn.
-  if (spawnMark) knownSiblingMarks?.delete(spawnMark);
 
-  if (outcome?.spawnError) record('stderr', outcome.spawnError.message);
-  flush('stdout');
-  flush('stderr');
-  // Drain the evidence log BEFORE building the result so a write error during
-  // the final flush (ENOSPC on buffered data, perms change, removed logs dir)
-  // is reflected in result.logWriteError instead of being lost: the result
-  // previously captured logError before this flush ran, so a late flush error
-  // could let a command PASS while the durable raw evidence was incomplete.
-  await new Promise((resolve) => {
-    if (logError) return resolve();
-    log.once('error', resolve);
-    log.end(resolve);
-  });
-  const finishedAt = new Date().toISOString();
-  // Resolve the streaming no-work detectors (Codex UikNz). Unconditional
-  // markers were already collected by each noWorkScanner. Conditional markers
-  // (Go/Rust empty packages, empty TAP plan) mirror classifyOutput's mixed-run
-  // guard: emit them only when NO authoritative test evidence (ok\t.., "N
-  // passed", "N passing") appeared in EITHER stream, matching how
-  // classifyOutput computes hasAuthoritativeTestEvidence over the combined
-  // output.
-  const sawAuthoritativeTests = states.stdout.noWork.authoritative || states.stderr.noWork.authoritative;
-  const conditionalNoWork = sawAuthoritativeTests
-    ? []
-    : [...new Set([...states.stdout.noWork.conditional, ...states.stderr.noWork.conditional])]
-      .slice(0, 20)
-      .map((label) => `no-work: ${label}`);
-  const result = {
-    exitCode: outcome?.exitCode ?? null,
-    signal: outcome?.signal ?? null,
-    timedOut,
-    terminationStatus: termination.status,
-    terminationEvidence: termination.evidence,
-    escalated: termination.escalated,
-    stdout,
-    stderr,
-    startedAt,
-    finishedAt,
-    durationMs: new Date(finishedAt) - new Date(startedAt),
-    cwd: '<repo>',
-    outputDigest: {
-      stdout: states.stdout.hash.digest('hex'),
-      stderr: states.stderr.hash.digest('hex'),
-    },
-    detectedSignals: [
-      ...states.stdout.scanner.values(),
-      ...states.stderr.scanner.values(),
-      ...states.stdout.noWorkScanner.values(),
-      ...states.stderr.noWorkScanner.values(),
-      ...conditionalNoWork,
-    ],
-    logWriteError: logError ? logError.message : null,
-  };
-  return result;
+    if (outcome?.spawnError) record('stderr', outcome.spawnError.message);
+    flush('stdout');
+    flush('stderr');
+    // Drain the evidence log BEFORE building the result so a write error during
+    // the final flush (ENOSPC on buffered data, perms change, removed logs dir)
+    // is reflected in result.logWriteError instead of being lost: the result
+    // previously captured logError before this flush ran, so a late flush error
+    // could let a command PASS while the durable raw evidence was incomplete.
+    await new Promise((resolve) => {
+      if (logError) return resolve();
+      log.once('error', resolve);
+      log.end(resolve);
+    });
+    const finishedAt = new Date().toISOString();
+    // Resolve the streaming no-work detectors (Codex UikNz). Unconditional
+    // markers were already collected by each noWorkScanner. Conditional markers
+    // (Go/Rust empty packages, empty TAP plan) mirror classifyOutput's mixed-run
+    // guard: emit them only when NO authoritative test evidence (ok\t.., "N
+    // passed", "N passing") appeared in EITHER stream, matching how
+    // classifyOutput computes hasAuthoritativeTestEvidence over the combined
+    // output.
+    const sawAuthoritativeTests = states.stdout.noWork.authoritative || states.stderr.noWork.authoritative;
+    const conditionalNoWork = sawAuthoritativeTests
+      ? []
+      : [...new Set([...states.stdout.noWork.conditional, ...states.stderr.noWork.conditional])]
+        .slice(0, 20)
+        .map((label) => `no-work: ${label}`);
+    const result = {
+      exitCode: outcome?.exitCode ?? null,
+      signal: outcome?.signal ?? null,
+      timedOut,
+      terminationStatus: termination.status,
+      terminationEvidence: termination.evidence,
+      escalated: termination.escalated,
+      stdout,
+      stderr,
+      startedAt,
+      finishedAt,
+      durationMs: new Date(finishedAt) - new Date(startedAt),
+      cwd: '<repo>',
+      outputDigest: {
+        stdout: states.stdout.hash.digest('hex'),
+        stderr: states.stderr.hash.digest('hex'),
+      },
+      detectedSignals: [
+        ...states.stdout.scanner.values(),
+        ...states.stderr.scanner.values(),
+        ...states.stdout.noWorkScanner.values(),
+        ...states.stderr.noWorkScanner.values(),
+        ...conditionalNoWork,
+      ],
+      logWriteError: logError ? logError.message : null,
+    };
+    return result;
+  } finally {
+    // Settled either way (PASS, BLOCKED, or a throw): stop advertising the
+    // mark to concurrent siblings' orphan sweeps now that it no longer
+    // identifies an actively-tracked spawn (CodeRabbit UmlJY).
+    if (spawnMark) knownSiblingMarks?.delete(spawnMark);
+  }
 };
 
 /**
@@ -2827,7 +2878,7 @@ const createCommandExecutor = ({
   await ensureLogsDirSecured();
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
-  await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
+  const logFileIdentity = await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
   const execution = await spawnCaptured({
     command: check.command,
     cwd,
@@ -2845,6 +2896,10 @@ const createCommandExecutor = ({
     terminateTree,
     terminationGraceMs,
     knownSiblingMarks: activeSpawnMarks,
+    // Bind the append stream to the same directory/file the header write just
+    // validated, so a swap between them cannot redirect captured evidence.
+    securedDirIdentity: securedLogsDirIdentity,
+    securedFileIdentity: logFileIdentity,
   });
   if (execution.terminationStatus === 'BLOCKED') unsafeTermination = execution.terminationEvidence;
   const classification = classifyExecution(execution);
@@ -2880,7 +2935,7 @@ const createCommandExecutor = ({
       effectivePathReplacements,
       platform,
     );
-    await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
+    const proofLogFileIdentity = await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
     const proofExecution = await spawnCaptured({
       command: check.proof.command,
       cwd,
@@ -2897,6 +2952,9 @@ const createCommandExecutor = ({
       terminateTree,
       terminationGraceMs,
       knownSiblingMarks: activeSpawnMarks,
+      // Bind the proof append stream to the just-validated proof log identity.
+      securedDirIdentity: securedLogsDirIdentity,
+      securedFileIdentity: proofLogFileIdentity,
     });
     if (proofExecution.terminationStatus === 'BLOCKED') unsafeTermination = proofExecution.terminationEvidence;
     const proofClassification = classifyExecution(proofExecution);
@@ -3139,8 +3197,28 @@ const probeCommandDefault = async ({
     const next = acc + String(chunk ?? '');
     return next.length > CAPTURE_LIMIT ? next.slice(0, CAPTURE_LIMIT) : next;
   };
-  child.stdout?.on('data', (chunk) => { stdout = cap(stdout, chunk); });
-  child.stderr?.on('data', (chunk) => { stderr = cap(stderr, chunk); });
+  // Full-stream signal scanners (Codex UnKZ9): `cap` above discards everything
+  // past CAPTURE_LIMIT, so a probe that streams more than that before a
+  // warning/failure/skip signal (then exits 0) would push the signal past the
+  // cap where classifyOutput can no longer see it and mark the required tool
+  // probe PASS. Scan every raw chunk here -- bounding only the persisted text --
+  // and thread the matches into detectedSignals, mirroring spawnCaptured's own
+  // raw scanner so classifyOutput still refuses to PASS.
+  const signalScanners = {
+    stdout: createStreamingSignalScanner(findStatusSignals),
+    stderr: createStreamingSignalScanner(findStatusSignals),
+  };
+  const signalDecoders = {
+    stdout: new StringDecoder('utf8'),
+    stderr: new StringDecoder('utf8'),
+  };
+  const scanChunk = (stream, chunk) => {
+    signalScanners[stream].push(
+      Buffer.isBuffer(chunk) ? signalDecoders[stream].write(chunk) : String(chunk ?? ''),
+    );
+  };
+  child.stdout?.on('data', (chunk) => { stdout = cap(stdout, chunk); scanChunk('stdout', chunk); });
+  child.stderr?.on('data', (chunk) => { stderr = cap(stderr, chunk); scanChunk('stderr', chunk); });
 
   let closeResolved = false;
   let resolveClose;
@@ -3216,6 +3294,16 @@ const probeCommandDefault = async ({
     terminationStatus: termination.status === 'BLOCKED' ? 'BLOCKED' : 'PASS',
     terminationEvidence: termination.evidence || '',
   };
+  // Drain each decoder's trailing bytes and flush the scanner so a signal on a
+  // final line without a trailing newline is still recorded, then dedup across
+  // both streams. classifyOutput() honors this list even when the capped
+  // stdout/stderr no longer carry the signal (Codex UnKZ9).
+  const detectedSignals = [];
+  for (const stream of ['stdout', 'stderr']) {
+    signalScanners[stream].push(signalDecoders[stream].end());
+    signalScanners[stream].flush();
+    detectedSignals.push(...signalScanners[stream].values());
+  }
 
   if (outcome?.spawnError) {
     return {
@@ -3223,6 +3311,7 @@ const probeCommandDefault = async ({
       stdout,
       stderr: outcome.spawnError.message || String(outcome.spawnError),
       ...terminationFields,
+      detectedSignals,
     };
   }
   if (!outcome) {
@@ -3231,6 +3320,7 @@ const probeCommandDefault = async ({
       stdout,
       stderr: stderr || 'probe timed out',
       ...terminationFields,
+      detectedSignals,
     };
   }
   return {
@@ -3238,6 +3328,7 @@ const probeCommandDefault = async ({
     stdout,
     stderr,
     ...terminationFields,
+    detectedSignals,
   };
 };
 

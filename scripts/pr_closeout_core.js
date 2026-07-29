@@ -62,34 +62,18 @@ const CONFIG_SILENCING = [
   // closeout. Scope to lint-tool context so legitimate probes such as
   // `git diff --quiet` are not classified as config silencing.
   /\b(?:eslint|biome|stylelint|prettier|ruff|pylint|flake8|rubocop)\b[^\n]*--quiet\b/i,
-  // Consume the optional closing quote on the JSON key (e.g. "enabled":false,
-  // "ignorePatterns":[...], "exclude":[...]) so config-level disabling in
-  // tsconfig/eslint/biome JSON no longer slips past the scan.
-  // Only flag ignore/exclude keys whose value targets source/test/spec paths.
-  // A bare `"exclude":` key fires on routine config (nearly every tsconfig.json
-  // excludes "dist"/"node_modules"; CI matrices use strategy.matrix.exclude),
-  // producing false config-silencing findings on clean PRs. Require the value
-  // to reference src/test/spec globs so only genuine source/test suppression
-  // is flagged. The alternation is anchored with \b so common values that only
-  // contain the token as a substring (windows-latest, attestation, contest)
-  // do not false-positive.
-  // Bound the ignore-array scan window high enough that a long list of
-  // generated-directory globs before `'src/**'` still matches (Codex
-  // #4781366510). The previous 200-char cap missed real eslint ignore arrays.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i,
-  // Extension-only ignore globs (e.g. ignorePatterns: ["**/*.ts"]) suppress an
-  // entire source language from the lint gate without naming a src/test/spec
-  // directory, so the token-based pattern above never fires. Flag ignore /
-  // exclude values that are bare source-extension globs; build artifacts such
-  // as **/*.d.ts, dist, or node_modules stay unflagged. Brace-expanded globs
-  // (e.g. **/*.{js,ts}) hide the same whole-language exclusion behind a form
-  // the single-extension alternative never matched, since the char right
-  // after the literal dot is `{`, not a recognized extension letter (Codex
-  // UeHJ_). The second alternative below matches that form by requiring a
-  // flagged extension as a comma-delimited item inside the braces --
-  // `(?<=[{,])`/`(?=[,}])` bound each item to its own token so `{d.ts,map}`
-  // still does not match on "ts" the way a bare \b boundary would.
-  /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]\s*(?:\[[\s\S]{0,50000}?)?["'](?:\*\*\/|\.\/)?\*\.(?:(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b|\{[^{}]{0,200}(?<=[{,])(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)(?=[,}])[^{}]{0,200}\})/i,
+  // Ignore/exclude keys whose value suppresses source/test/spec paths -- a
+  // src/test/spec-targeting glob (e.g. "src/**", "**/*.test.ts") or a bare
+  // source-extension glob (**/*.ts, **/*.{js,ts}) -- are detected by the
+  // bracket-aware `findIgnoreScopedSilencings` helper (applied in
+  // scanSuppressionText), not a regex here. The previous patterns bridged the
+  // key to its value with a bounded `(?:\[[\s\S]{0,50000}?)?` window, which an
+  // adversary evades by padding >50000 chars of benign entries before the real
+  // `"src/**"` exclusion (Codex UnKZ_). The helper walks the complete ignore
+  // array with a string-aware bracket match, so array length no longer bounds
+  // detection; build artifacts (dist, node_modules, **/*.d.ts) still stay
+  // unflagged and the src/test/spec token stays \b-anchored so substrings like
+  // windows-latest do not false-positive. See its JSDoc for the full rules.
   /\|\|\s*true\b/i,
   // Shell zero-exit neutralizers that hide command failure from classifyOutput
   // the same way `|| true` does. `|| :` matches even with redirects/pipes
@@ -189,6 +173,32 @@ const findCommandFailureNeutralizer = (command) => {
   return null;
 };
 
+/**
+ * Detect a Make recipe body that neutralizes failure so `make <target>` exits 0
+ * even when a command inside it fails (Codex Ummss). Unlike a package script,
+ * a resolved make target is trusted by NAME and its recipe is never covered by
+ * the touched-file suppression scan when the Makefile is unchanged. Two ways a
+ * recipe hides failure are checked per line: Make's own leading `-` ignore-
+ * error prefix (a `-` among the leading `@`/`+`/`-` modifiers makes that
+ * command's nonzero exit non-fatal), and the shared shell neutralizers
+ * (`|| true`, `set +e`, pipeline-to-`:` …) via findCommandFailureNeutralizer.
+ * A leading `-` in a recipe is always Make's prefix, not a shell token: a real
+ * command never begins with `-`.
+ * @param {string} recipe - Recipe body (one or more command lines).
+ * @returns {string|null} matched neutralizer fragment, or null if clean.
+ */
+const findMakeRecipeNeutralizer = (recipe) => {
+  const text = String(recipe ?? '');
+  if (!text.trim()) return null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const ignorePrefix = rawLine.match(/^\s*[@+]*-/);
+    if (ignorePrefix) return ignorePrefix[0].trim();
+    const shellNeutralizer = findCommandFailureNeutralizer(rawLine);
+    if (shellNeutralizer) return shellNeutralizer;
+  }
+  return null;
+};
+
 const define = (id, label, options = {}) => ({ id, label, ...options });
 
 const MANDATORY_CHECKS = [
@@ -268,8 +278,11 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * error, not a silent ignore); otherwise an explicit `config.commands[id]`
  * wins (a placeholder like `<...>` or `REPLACE_...` is rejected as BLOCKED
  * rather than run), then the first matching `package.json` script, then the
- * first matching Makefile target; a check that resolves nothing is BLOCKED
- * as "unresolved". A second pass then attaches `qualificationSafe`,
+ * first matching Makefile target — whose recipe body, when supplied in
+ * `makeRecipes`, is rejected as BLOCKED if it neutralizes failure (Make's
+ * leading `-` ignore-error prefix or a shared shell neutralizer), the same way
+ * an auto-discovered package script is; a check that resolves nothing is
+ * BLOCKED as "unresolved". A second pass then attaches `qualificationSafe`,
  * `resourceGroup`, and `proof` from config, and independently BLOCKs a check
  * that requires a postcondition proof (REQUIRED_PROOFS) without a valid one
  * configured, `redis-integration` without a `services.redis` probe, and
@@ -278,10 +291,10 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * evidence is extended rather than replaced. A config that sets
  * `gateIntegrityReview` (self-attestation) always produces a top-level
  * error, since only a live GitHub PR review attestation is accepted.
- * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], touchedFiles?: string[], mergeBaseSha?: string}} options
+ * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], makeRecipes?: Record<string, string>, touchedFiles?: string[], mergeBaseSha?: string}} options
  * @returns {{checks: object[], errors: string[]}}
  */
-const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], touchedFiles = [], mergeBaseSha } = {}) => {
+const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
   const commands = config.commands || {};
   const qualificationSafe = new Set(config.qualificationSafe || []);
   const resourceGroups = config.resourceGroups || {};
@@ -358,6 +371,21 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], to
     }
     const makeTarget = definition.makeCandidates?.find((candidate) => targets.has(candidate));
     if (makeTarget) {
+      // A resolved make target is trusted by NAME; its recipe body is not
+      // covered by the touched-file scan when the Makefile is unchanged. Reject
+      // a recipe that neutralizes failure (Make's leading `-` ignore-error
+      // prefix, or a shared shell neutralizer) the same way as an
+      // auto-discovered package script (Codex Ummss).
+      const recipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[makeTarget]);
+      if (recipeNeutralizer) {
+        return {
+          ...definition,
+          command: `make ${makeTarget}`,
+          status: 'BLOCKED',
+          resolution: 'make-target',
+          evidence: `Make recipe for ${definition.label} neutralizes failures (${recipeNeutralizer}); closeout cannot admit a failure-hiding recipe.`,
+        };
+      }
       return { ...definition, command: `make ${makeTarget}`, resolution: 'make-target' };
     }
     return {
@@ -752,6 +780,83 @@ const findRulesScopedSilencings = (text) => {
   return findings;
 };
 
+/**
+ * Bracket-aware `ignore`/`exclude` source-suppression detector (Codex UnKZ_).
+ * Replaces two CONFIG_SILENCING regexes that bridged the key to its value with
+ * a bounded `(?:\[[\s\S]{0,50000}?)?` window: padding an ignore array with
+ * >50000 chars of benign globs before the real `"src/**"` entry pushed the
+ * source exclusion outside the window, so the scan missed it. For each
+ * `ignore`/`exclude` key this walks the COMPLETE following value — a
+ * string-aware bracket match for an array literal, or the single quoted string
+ * for a direct value — so array length no longer bounds detection. A value is
+ * flagged when it contains either a src/test/spec-targeting quoted glob
+ * (`srcToken`, \b-anchored so substrings like windows-latest / contest do not
+ * false-positive) or a bare source-extension glob (`extGlob`: a `*.ts` tail and
+ * the brace-expanded `*.{js,ts}` form, each item bounded by `(?<=[{,])`/`(?=[,}])`
+ * so `{d.ts,map}` still matches nothing). Build artifacts (dist, node_modules,
+ * a `*.d.ts` declaration tail) stay unflagged. Non-quoted/non-array values
+ * (YAML block sequences, `const ignore = x.ignore`) yield no region, ignored.
+ * @param {string} text - Full file content to scan.
+ * @returns {{index: number, match: string}[]} source offset + concise fragment
+ *   for each ignore/exclude value that suppresses source/test/spec paths.
+ */
+const findIgnoreScopedSilencings = (text) => {
+  const findings = [];
+  const keyRe = /["']?(?:ignore|exclude)(?:s|d|Files|Patterns)?["']?\s*[:=]/gi;
+  const srcToken = /["'][^"'\r\n]*\b(?:src|test|spec)\b[^"'\r\n]*["']/i;
+  const extGlob = /["'](?:\*\*\/|\.\/)?\*\.(?:(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)\b|\{[^{}]{0,200}(?<=[{,])(?:[cm]?[jt]sx?|py|go|rs|rb|java|php|cs)(?=[,}])[^{}]{0,200}\})/i;
+  let km;
+  while ((km = keyRe.exec(text)) !== null) {
+    let i = km.index + km[0].length;
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    let region = '';
+    let consumedTo = i;
+    if (text[i] === '[') {
+      // String-aware bracket match: quotes and nested `[`/`]` inside string
+      // items (e.g. a char-class glob "*.[jt]sx") do not corrupt the depth.
+      let depth = 0;
+      let inStr = null;
+      const start = i;
+      for (; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inStr) {
+          if (ch === '\\') { i += 1; continue; }
+          if (ch === inStr) inStr = null;
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue; }
+        if (ch === '[') depth += 1;
+        else if (ch === ']') {
+          depth -= 1;
+          if (depth === 0) { i += 1; break; }
+        }
+      }
+      region = text.slice(start, i);
+      consumedTo = i;
+    } else if (text[i] === '"' || text[i] === "'" || text[i] === '`') {
+      // Direct string value: "exclude": "src/**".
+      const q = text[i];
+      const start = i;
+      i += 1;
+      for (; i < text.length; i += 1) {
+        const ch = text[i];
+        if (ch === '\\') { i += 1; continue; }
+        if (ch === q) { i += 1; break; }
+      }
+      region = text.slice(start, i);
+      consumedTo = i;
+    }
+    if (region) {
+      const m = region.match(srcToken) || region.match(extGlob);
+      if (m) findings.push({ index: km.index, match: m[0].trim() });
+    }
+    // Skip past the consumed value so a nested ignore/exclude key is not
+    // re-evaluated against an outer value.
+    if (consumedTo > keyRe.lastIndex) keyRe.lastIndex = consumedTo;
+  }
+  return findings;
+};
+
 const scanSuppressionText = (file, text) => {
   const findings = [];
   const normalized = String(file).replaceAll('\\', '/').toLowerCase();
@@ -863,6 +968,14 @@ const scanSuppressionText = (file, text) => {
     // (e.g. `server.port:0`) no longer false-positives while a disabled rule
     // at any depth/distance is still detected.
     for (const frag of findRulesScopedSilencings(text)) {
+      const line = text.slice(0, frag.index).split(/\r?\n/).length;
+      findings.push({ file, line, category: 'config-silencing', match: frag.match });
+    }
+    // Bracket-aware ignore/exclude source-suppression (Codex UnKZ_): walks the
+    // complete ignore array so a `"src/**"` exclusion padded behind >50000
+    // chars of benign globs is still detected, unlike the bounded-window
+    // regexes this replaced.
+    for (const frag of findIgnoreScopedSilencings(text)) {
       const line = text.slice(0, frag.index).split(/\r?\n/).length;
       findings.push({ file, line, category: 'config-silencing', match: frag.match });
     }
@@ -1315,26 +1428,38 @@ const scanSuppressionText = (file, text) => {
       // removed, so a plain paren/brace depth walk cannot be fooled by braces
       // or parens sitting inside a quoted argument.
       const opensOptionObjectCall = (stripped) => {
+        // Single left-to-right pass so a long/minified line with many receiver
+        // tokens stays linear instead of re-walking to end-of-line for every
+        // `test(`/`describe(`/… match (CodeRabbit UmlJL: the per-match rewalk
+        // was O(matches × length), quadratic on adversarial input up to
+        // MAX_SUPPRESSION_SCAN_BYTES). The original per-match condition — an
+        // unclosed receiver call that still has an options-object `{` open at
+        // end of line — is equivalent to: the innermost still-open `{` was
+        // opened at or after the earliest still-open receiver call's `(`.
+        // (Verified behavior-identical to the previous rewalk against the
+        // multiline option-object fixtures and a 200k-case fuzz.)
         const receiver = /\b(?:describe|it|test|context|suite)\s*\(/g;
-        let m;
-        while ((m = receiver.exec(stripped))) {
-          let parenDepth = 1;
-          let braceDepth = 0;
-          for (let k = m.index + m[0].length; k < stripped.length; k += 1) {
-            const ch = stripped[k];
-            if (ch === '(') parenDepth += 1;
-            else if (ch === ')') {
-              parenDepth -= 1;
-              if (parenDepth === 0) break;
-            } else if (ch === '{') braceDepth += 1;
-            else if (ch === '}' && braceDepth > 0) braceDepth -= 1;
+        const openParens = []; // { isReceiver, start } for each unmatched `(`
+        const openBraces = []; // index of each unmatched `{`
+        let m = receiver.exec(stripped);
+        for (let k = 0; k < stripped.length; k += 1) {
+          let receiverHere = false;
+          // The receiver match ends on its `(`; mark that paren as a receiver
+          // call. Distinct matches end at distinct positions, so the guard
+          // fires at most once per index.
+          while (m && m.index + m[0].length === k + 1) {
+            receiverHere = true;
+            m = receiver.exec(stripped);
           }
-          // Call did not close on this line and an options object is still open
-          // inside its arguments — the `skip:` option (if any) lands on a later
-          // line, so open a window and let windowWeakening rescan the collapse.
-          if (parenDepth > 0 && braceDepth > 0) return true;
+          const ch = stripped[k];
+          if (ch === '(') openParens.push({ isReceiver: receiverHere, start: k + 1 });
+          else if (ch === ')') openParens.pop();
+          else if (ch === '{') openBraces.push(k);
+          else if (ch === '}') { if (openBraces.length) openBraces.pop(); }
         }
-        return false;
+        if (!openBraces.length) return false;
+        const innermostOpenBrace = openBraces[openBraces.length - 1];
+        return openParens.some((p) => p.isReceiver && p.start <= innermostOpenBrace);
       };
       // Lookahead window for bare-receiver splits, counted in CODE-BEARING
       // lines (non-blank after comment/quote stripping) rather than raw lines:
@@ -1393,6 +1518,7 @@ module.exports = {
   MANDATORY_CHECKS,
   MARKERS,
   REQUIRED_PROOFS,
+  STATUS_TERM,
   buildCheckPlan,
   classifyOutput,
   findCommandFailureNeutralizer,

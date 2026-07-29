@@ -394,6 +394,23 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
 // step, a dependency edit, or any other non-metadata removal is never exempted.
 const SAFE_METADATA_KEY = /^["']?(version|description|author|license|homepage|repository|bugs|funding|keywords|contributors|maintainers)["']?\s*[:=]/i;
 
+// The same descriptive key name (e.g. `version`) can carry real validation
+// semantics in a gate-POLICY file -- a `.codereview.yml` `version:` schema
+// field -- even though it is purely cosmetic in an actual package manifest.
+// isSafeMetadataReplacement must therefore know which file a hunk belongs to,
+// not just the key, or a policy-file weakening disguised as a metadata bump
+// slips through (Codex UnKZ7).
+const PACKAGE_MANIFEST_BASENAMES = new Set(['package.json', 'pyproject.toml', 'cargo.toml', 'composer.json']);
+
+/**
+ * True when `filePath`'s basename is a recognized package-manifest file
+ * (case-insensitive) -- one where SAFE_METADATA_KEY's descriptive fields are
+ * known to carry no validation semantics.
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+const isPackageManifestFile = (filePath) => PACKAGE_MANIFEST_BASENAMES.has(path.posix.basename(filePath || '').toLowerCase());
+
 /**
  * Extract the leading allowlisted descriptive-metadata key from a trimmed diff
  * line body (`"version": "1.2.3",` -> `version`), or null when the line is not
@@ -408,17 +425,23 @@ const metadataKey = (body) => {
 
 /**
  * True when a removed gate line and its same-position replacement are a value-
- * only edit of the SAME descriptive-metadata field (a benign modification, not
- * a validation removal). Fails closed: requires both sides to resolve to the
- * same allowlisted key, and reuses VALIDATION_REMOVAL_PATTERNS so a descriptive
- * value that smuggles a validation command (`"description": "run npm test"`),
- * or a replacement that itself reads as a removed validation line, still fails.
- * A pure deletion (no replacement) is never routed here.
+ * only edit of the SAME descriptive-metadata field in an actual package
+ * manifest (a benign modification, not a validation removal). Fails closed:
+ * requires `currentFile` to be a recognized package manifest (Codex UnKZ7 --
+ * without this check, the same key name in a gate-POLICY file such as
+ * `.codereview.yml` would be wrongly treated as cosmetic), requires both
+ * sides to resolve to the same allowlisted key, and reuses
+ * VALIDATION_REMOVAL_PATTERNS so a descriptive value that smuggles a
+ * validation command (`"description": "run npm test"`), or a replacement
+ * that itself reads as a removed validation line, still fails. A pure
+ * deletion (no replacement) is never routed here.
  * @param {string} removedLine unified-diff line starting with `-`
  * @param {string} addedLine unified-diff line starting with `+`
+ * @param {string} currentFile repo-relative path the pair belongs to
  * @returns {boolean}
  */
-const isSafeMetadataReplacement = (removedLine, addedLine) => {
+const isSafeMetadataReplacement = (removedLine, addedLine, currentFile) => {
+  if (!isPackageManifestFile(currentFile)) return false;
   const removedKey = metadataKey(removedLine.slice(1).trim());
   const addedKey = metadataKey(addedLine.slice(1).trim());
   if (!removedKey || removedKey !== addedKey) return false;
@@ -453,6 +476,27 @@ const jsonFieldKey = (body) => {
   return match ? match[1].toLowerCase() : null;
 };
 
+// jsonFieldKey alone matches ANY `"key":` line regardless of nesting depth, so
+// a nested validation-relevant leaf whose key name doesn't hint at validation
+// (Jest's `coverageThreshold.global.lines`, `passWithNoTests`) could bypass
+// VALIDATION_KEY_HINT purely because the key looked harmless. A real
+// dependency/script/override entry is always a complete single-line JSON
+// STRING value; it is never a bare number, boolean, null, or an object/array
+// opener. Requiring the value itself to be a fully-quoted JSON string on one
+// line rejects those nested non-string validation leaves regardless of what
+// their key is named (Codex UnT4H).
+const JSON_STRING_FIELD = /^"[^"]+"\s*:\s*"(?:[^"\\]|\\.)*"\s*,?\s*$/;
+
+/**
+ * True when a trimmed package.json diff line body is a complete single-line
+ * `"key": "value"` field: a quoted key followed by a fully-quoted JSON string
+ * value (optional trailing comma). False for numbers, booleans, null, and
+ * object/array-opening lines.
+ * @param {string} body diff line with the leading +/- stripped and trimmed
+ * @returns {boolean}
+ */
+const isJsonStringField = (body) => JSON_STRING_FIELD.test(body);
+
 /**
  * True when a removed/added pair is a same-key package.json value edit (a
  * dependency version bump, a non-validation script's command, ...) whose key
@@ -463,10 +507,13 @@ const jsonFieldKey = (body) => {
  * That does NOT generalize to e.g. a workflow step, where `run:`/`uses:` are
  * fixed keys shared by every step regardless of what it does -- see
  * isSafeWorkflowStepNameReplacement / isSafeActionPinReplacement below for
- * the (differently-shaped) safe cases there. Fails closed: requires the same
- * key on both sides, that key to clear VALIDATION_KEY_HINT, and reuses
- * VALIDATION_REMOVAL_PATTERNS so a value that smuggles a validation command
- * under a harmless-looking key still fails (Codex UkAe8, UguCZ).
+ * the (differently-shaped) safe cases there. Fails closed: requires both
+ * sides to be a complete single-line JSON STRING field (so a nested
+ * non-string validation leaf can never qualify merely because its key clears
+ * the hint check, Codex UnT4H), requires the same key on both sides, that key
+ * to clear VALIDATION_KEY_HINT, and reuses VALIDATION_REMOVAL_PATTERNS so a
+ * value that smuggles a validation command under a harmless-looking key still
+ * fails (Codex UkAe8, UguCZ).
  * @param {string} removedLine unified-diff line starting with `-`
  * @param {string} addedLine unified-diff line starting with `+`
  * @param {string} currentFile repo-relative path the pair belongs to
@@ -474,8 +521,11 @@ const jsonFieldKey = (body) => {
  */
 const isSafePackageJsonFieldReplacement = (removedLine, addedLine, currentFile) => {
   if (path.posix.basename(currentFile).toLowerCase() !== 'package.json') return false;
-  const removedKey = jsonFieldKey(removedLine.slice(1).trim());
-  const addedKey = jsonFieldKey(addedLine.slice(1).trim());
+  const removedBody = removedLine.slice(1).trim();
+  const addedBody = addedLine.slice(1).trim();
+  if (!isJsonStringField(removedBody) || !isJsonStringField(addedBody)) return false;
+  const removedKey = jsonFieldKey(removedBody);
+  const addedKey = jsonFieldKey(addedBody);
   if (!removedKey || removedKey !== addedKey) return false;
   if (VALIDATION_KEY_HINT.test(removedKey)) return false;
   const addedAsRemoval = `-${addedLine.slice(1)}`;
@@ -511,6 +561,17 @@ const isSafeWorkflowStepNameReplacement = (removedLine, addedLine, currentFile) 
 };
 
 /**
+ * True when `ref` is a full immutable commit SHA (40-hex SHA-1 or 64-hex
+ * SHA-256), the only form GitHub Actions' own pinning guidance treats as
+ * immutable. Deliberately stricter than this module's isUsableSha (which also
+ * accepts abbreviated git object IDs): an abbreviated SHA is still a mutable
+ * lookup as far as this immutability check is concerned.
+ * @param {string} ref
+ * @returns {boolean}
+ */
+const isFullActionSha = (ref) => /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(ref);
+
+/**
  * True when a removed/added `uses:` pair pins the SAME action (identical
  * owner/repo[/path] before the `@`) to a different ref/SHA -- a routine pin
  * bump, not a substitution to a different action. The action path, not the
@@ -518,11 +579,13 @@ const isSafeWorkflowStepNameReplacement = (removedLine, addedLine, currentFile) 
  * isSafePackageJsonFieldReplacement's same-key check: every `uses:` line
  * shares that key regardless of which action it names, so a same-key check
  * alone would admit a swap to an unrelated (possibly malicious) action.
- * Scoped to workflow/action files; still fails closed via
- * VALIDATION_REMOVAL_PATTERNS, so a named security action (codeql-action,
- * trivy-action, ...) is never admitted here either -- it is already caught
- * upstream by detectValidationRemovals before reaching this scan (Codex
- * UkAe8).
+ * Also rejects a full-SHA pin replaced by anything mutable (a tag, a branch,
+ * an abbreviated SHA): that is a supply-chain weakening, not a routine bump,
+ * even though the action path is unchanged (Codex UnT4I, UnS2f). Scoped to
+ * workflow/action files; still fails closed via VALIDATION_REMOVAL_PATTERNS,
+ * so a named security action (codeql-action, trivy-action, ...) is never
+ * admitted here either -- it is already caught upstream by
+ * detectValidationRemovals before reaching this scan (Codex UkAe8).
  * @param {string} removedLine unified-diff line starting with `-`
  * @param {string} addedLine unified-diff line starting with `+`
  * @param {string} currentFile repo-relative path the pair belongs to
@@ -530,10 +593,11 @@ const isSafeWorkflowStepNameReplacement = (removedLine, addedLine, currentFile) 
  */
 const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
   if (!currentFile.startsWith('.github/workflows/') && !currentFile.startsWith('.github/actions/')) return false;
-  const usesPattern = /^[+-]\s*(?:-\s*)?uses:\s*([^@\s'"]+)@\S+\s*$/;
+  const usesPattern = /^[+-]\s*(?:-\s*)?uses:\s*([^@\s'"]+)@(\S+?)\s*$/;
   const removedMatch = usesPattern.exec(removedLine);
   const addedMatch = usesPattern.exec(addedLine);
   if (!removedMatch || !addedMatch || removedMatch[1] !== addedMatch[1]) return false;
+  if (isFullActionSha(removedMatch[2]) && !isFullActionSha(addedMatch[2])) return false;
   const addedAsRemoval = `-${addedLine.slice(1)}`;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
@@ -571,7 +635,7 @@ const collectContentRemovals = (diff) => {
       // A same-position replacement recognized as benign is not a content
       // removal; a pure deletion (undefined) always fails closed.
       if (replacement !== undefined && (
-        isSafeMetadataReplacement(line, replacement)
+        isSafeMetadataReplacement(line, replacement, currentFile)
         || isSafePackageJsonFieldReplacement(line, replacement, currentFile)
         || isSafeWorkflowStepNameReplacement(line, replacement, currentFile)
         || isSafeActionPinReplacement(line, replacement, currentFile)

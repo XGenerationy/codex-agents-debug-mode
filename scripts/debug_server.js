@@ -1200,10 +1200,25 @@ const reclaimStaleCollectorClaim = async (claimFile, {
         await unlinkFn(quarantinePath);
       } catch (error) {
         if (error?.code === 'EEXIST') {
+          // A third contender already created a fresh claim at claimFile while
+          // this successor was quarantined; it is no longer needed here.
           await unlinkFn(quarantinePath).catch(() => {});
           return 'backed-off';
         }
-        throw error;
+        // Hard links are unavailable on some filesystems (FAT/exFAT, some
+        // network mounts, certain Windows shares), where link() fails with
+        // EPERM/ENOSYS/EXDEV rather than ENOENT/EEXIST. Without a fallback the
+        // successor stays orphaned under the quarantine name while claimFile is
+        // left empty for the next launch to wrongly claim, so fall back to a
+        // (non-atomic) rename restore before surfacing contention (CodeRabbit
+        // UmlJJ). A vanished quarantine entry re-throws the original ENOENT and
+        // is funneled to a benign back-off by the outer catch.
+        try {
+          await renameFn(quarantinePath, claimFile);
+          return 'restored';
+        } catch {
+          throw error;
+        }
       }
       return 'restored';
     }
@@ -1214,6 +1229,44 @@ const reclaimStaleCollectorClaim = async (claimFile, {
     if (error?.code === 'ENOENT') return 'backed-off';
     throw new Error('collector_claim_contention');
   }
+};
+
+/**
+ * Path-based release of a collector_claim this process owns, gated on the path
+ * still identifying the exact inode whose descriptor was read and validated.
+ * `releaseOwnedClaim` reads and ownership-checks the claim through an
+ * O_NOFOLLOW descriptor, but that descriptor is closed before the unlink and
+ * `unlinkSync` acts on the PATH: a peer that reclaims this (now stale) claim
+ * and writes its own successor at claimFile between that read and this unlink
+ * would otherwise have its live successor deleted, because the descriptor still
+ * carried this process's own owner fields and the ownership check passed
+ * (Codex Ummsi). Re-lstat the path and unlink only while it still matches the
+ * read descriptor's identity (dev/ino/nlink/ctimeMs via isSameLockIdentity,
+ * which also rejects an inode-reuse collision); a successor now at the path is
+ * left intact. The residual lstat->unlink gap cannot be closed in pure Node
+ * (no unlink-by-descriptor), but this narrows it from the whole read to a
+ * single syscall pair.
+ *
+ * @param {string} claimFile
+ * @param {import('node:fs').Stats|null} openedIdentity fstat of the validated descriptor.
+ * @param {object} [deps]
+ * @returns {boolean} whether the claim was unlinked.
+ */
+const unlinkOwnedClaimIfUnchanged = (claimFile, openedIdentity, {
+  lstatSyncFn = lstatSync,
+  unlinkSyncFn = unlinkSync,
+  sameIdentity = isSameLockIdentity,
+} = {}) => {
+  if (!openedIdentity) return false;
+  let currentInfo;
+  try {
+    currentInfo = lstatSyncFn(claimFile);
+  } catch {
+    return false;
+  }
+  if (!sameIdentity(openedIdentity, currentInfo)) return false;
+  unlinkSyncFn(claimFile);
+  return true;
 };
 
 const parseAllowedOrigins = (value) =>
@@ -1513,8 +1566,11 @@ const main = () => {
           // a live successor that collided on identity within a single
           // millisecond is restored rather than deleted -- the same pattern
           // pr_closeout_workflow.js uses for its output-dir lock
-          // (Codex Ua4p7/UiXEg/UkNET/UkXzk). On any outcome this launch loops
-          // and re-evaluates whatever now occupies the path from scratch.
+          // (Codex Ua4p7/UiXEg/UkNET/UkXzk). Its three resolved outcomes
+          // (reclaimed/restored/backed-off) fall through so this for-loop
+          // re-evaluates whatever now occupies the path from scratch; an
+          // unexpected collector_claim_contention instead propagates out of
+          // the loop to the caller rather than looping (CodeRabbit UmlJJ).
           await reclaimStaleCollectorClaim(claimFile, {
             claimInfo,
             claimText,
@@ -1528,6 +1584,10 @@ const main = () => {
       const releaseOwnedClaim = () => {
         try {
           let text = '';
+          // Identity of the descriptor actually read below, captured so the
+          // path-based unlink can confirm the path still names this same inode
+          // before deleting it (Codex Ummsi).
+          let openedIdentity = null;
           try {
             // Read through an lstat guard + no-follow descriptor, not a
             // path-based readFileSync: .debug is writable by the debugged
@@ -1566,6 +1626,7 @@ const main = () => {
               ) {
                 return;
               }
+              openedIdentity = opened;
               const buf = Buffer.alloc(opened.size);
               let offset = 0;
               while (offset < opened.size) {
@@ -1584,7 +1645,12 @@ const main = () => {
           const claimInstance = String(lines[1] || '').trim();
           const claimPid = Number(String(lines[2] || '').trim());
           if (claimInstance === server.collectorInstanceId || claimPid === process.pid) {
-            unlinkSync(claimFile);
+            // Bind the unlink to the descriptor we validated, not just the
+            // path: a peer that reclaimed this claim and swapped in its own
+            // successor between the read above and here must keep it, since the
+            // ownership check above reflects the descriptor's now-stale bytes,
+            // not whatever occupies the path now (Codex Ummsi).
+            unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
           }
         } catch {
           // Best-effort release; stale reclaim handles crash leftovers.
@@ -1763,4 +1829,5 @@ module.exports = {
   readJson,
   reclaimStaleCollectorClaim,
   resolvePowerShellExecutable,
+  unlinkOwnedClaimIfUnchanged,
 };

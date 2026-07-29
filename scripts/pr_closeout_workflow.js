@@ -539,6 +539,13 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         // third contender's new lock at lockPath) and retry rather than
         // deleting a peer's live lock.
         let requarantinedHolder = null;
+        // Any quarantined content that is not byte-identical to the stale
+        // snapshot this contender was authorized to remove must be restored
+        // rather than deleted -- including an unreadable or a still-writing
+        // successor payload that does not (yet) parse. Parseability is not the
+        // test; byte-difference from the authorized snapshot is (CodeRabbit
+        // UnT4B / qodo UnB_K).
+        let notStale = false;
         if (identityOnlyReclaim) {
           // A genuinely corrupt/oversized/FIFO/symlinked lock fails the
           // same guarded read again, but a live successor's real lock now
@@ -558,18 +565,24 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           // then quarantine that live successor instead of the stale entry
           // (Codex Ukpki). A 500-iteration concurrent-acquisition stress
           // test reproduced two simultaneous successful acquisitions under
-          // the prior unconditional-delete behavior.
+          // the prior unconditional-delete behavior. That successor can also
+          // still be mid-write at the instant of quarantine: created via
+          // O_EXCL, its payload not yet awaited (the window
+          // OUTPUT_DIR_LOCK_INITIALIZING_GRACE_MS guards), so its bytes are
+          // neither identical to staleSnapshot nor yet parseable -- and an
+          // unreadable quarantine re-read throws (null). Restore on any byte
+          // difference from staleSnapshot, never on parseability, so that
+          // initializing successor is preserved rather than destroyed
+          // (CodeRabbit UnT4B / qodo UnB_K).
           let requarantinedSnapshot;
           try {
             requarantinedSnapshot = String(await readLockFile(quarantinePath));
           } catch {
             requarantinedSnapshot = null;
           }
-          requarantinedHolder = requarantinedSnapshot === staleSnapshot
-            ? null
-            : outputDirLockHolder(requarantinedSnapshot ?? '');
+          notStale = requarantinedSnapshot !== staleSnapshot;
         }
-        if (requarantinedHolder) {
+        if (requarantinedHolder || notStale) {
           try {
             await link(quarantinePath, lockPath);
             await unlink(quarantinePath);

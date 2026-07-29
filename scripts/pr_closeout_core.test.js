@@ -1688,3 +1688,102 @@ test('rules silencing stays within the rules object and ignores sibling zeros', 
     .filter((f) => f.category === 'config-silencing');
   assert.ok(farFlags.length > 0, 'a disabled rule far inside the rules object must be flagged');
 });
+
+test('scans an adversarial single-line receiver input in linear time', () => {
+  // CodeRabbit UmlJL: the multiline option-object opener (opensOptionObjectCall)
+  // re-walked to end-of-line for every `test(`/`describe(` match, making it
+  // O(matches x length) — quadratic on one long line up to the 5 MB scan cap.
+  // A minified line of tens of thousands of bare `test(` tokens has no
+  // `.skip`/`.only`, so the per-line pass finds nothing and the multiline
+  // fallback runs the opener on the whole line. The single-pass rewrite is
+  // linear; the old code took several seconds on this input.
+  const adversarial = 'test('.repeat(40000); // ~200 KB, ~40k receiver tokens
+  const started = process.hrtime.bigint();
+  const findings = scanSuppressionText('src/adversarial.test.js', adversarial)
+    .filter(({ category }) => category === 'test-weakening');
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  // Behavior is unchanged — no skip/only/option-object skip is present, so
+  // nothing is flagged; only the cost changed.
+  assert.deepEqual(findings, [], JSON.stringify(findings));
+  assert.ok(
+    elapsedMs < 3000,
+    `adversarial single-line scan must stay linear; took ${elapsedMs.toFixed(0)}ms`,
+  );
+
+  // Equivalence under load: a real option-object skip after heavy receiver
+  // padding is still opened and flagged by the linear rewrite (the opener must
+  // preserve the previous behavior, not just the cost).
+  const paddedSkip = `${'test( , );'.repeat(5000)}\ntest('name', {\n  skip: true,\n}, () => {});`;
+  assert.equal(
+    scanSuppressionText('src/adversarial.test.js', paddedSkip)
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+    'a real option-object skip after heavy padding must still be flagged',
+  );
+});
+
+test('blocks auto-discovered make targets whose recipe neutralizes failures', () => {
+  // Codex Ummss: make-target resolution trusts the target NAME, but the recipe
+  // body is not covered by the touched-file scan when the Makefile is
+  // unchanged. A recipe must be rejected the same way an auto-discovered
+  // package script is (see the package-script test above) — including Make's
+  // leading `-` ignore-error prefix, which makes `make <target>` exit 0 even
+  // when the command fails.
+  const dashPlan = buildCheckPlan({
+    makeTargets: ['grafana-render'],
+    makeRecipes: { 'grafana-render': '\t-node scripts/render-grafana.js' },
+  });
+  const dash = dashPlan.checks.find(({ id }) => id === 'grafana-render');
+  assert.equal(dash.status, 'BLOCKED', JSON.stringify(dash));
+  assert.equal(dash.resolution, 'make-target');
+  assert.equal(dash.command, 'make grafana-render');
+  assert.match(dash.evidence, /neutralizes failures \(-\)/i);
+
+  // A shared shell neutralizer (`|| true`) inside a recipe is rejected too.
+  const orPlan = buildCheckPlan({
+    makeTargets: ['grafana-render'],
+    makeRecipes: { 'grafana-render': 'node scripts/render-grafana.js || true' },
+  });
+  const or = orPlan.checks.find(({ id }) => id === 'grafana-render');
+  assert.equal(or.status, 'BLOCKED', JSON.stringify(or));
+  assert.match(or.evidence, /neutralizes failures/i);
+  assert.match(or.evidence, /\|\|\s*true/i);
+
+  // Negative control: a benign recipe still resolves to the make target and is
+  // not blocked by the recipe check. A valid artifact proof is supplied so the
+  // independent REQUIRED_PROOFS block for grafana-render does not confound the
+  // status assertion.
+  const cleanPlan = buildCheckPlan({
+    makeTargets: ['grafana-render'],
+    makeRecipes: { 'grafana-render': 'node scripts/render-grafana.js' },
+    config: { proofs: { 'grafana-render': { type: 'artifact', path: 'artifacts/grafana.png' } } },
+  });
+  const clean = cleanPlan.checks.find(({ id }) => id === 'grafana-render');
+  assert.equal(clean.command, 'make grafana-render');
+  assert.equal(clean.resolution, 'make-target');
+  assert.notEqual(clean.status, 'BLOCKED', JSON.stringify(clean));
+});
+
+test('flags a source exclusion padded beyond the old ignore-array scan window', () => {
+  // Codex UnKZ_: the previous ignore/exclude patterns bridged the key to its
+  // value with a bounded `(?:\[[\s\S]{0,50000}?)?` window. Padding an ignore
+  // array with >50000 chars of benign globs before the real `"src/**"` entry
+  // pushed the source exclusion outside the window, so the scan missed it. The
+  // bracket-aware helper walks the complete array, so array length no longer
+  // bounds detection.
+  const pad = Array.from({ length: 3000 }, (_, i) => `"generated-directory-number-${i}/**"`).join(', ');
+  const evasive = `{"ignorePatterns": [${pad}, "src/**"]}`;
+  assert.ok(evasive.length > 60000, `fixture must exceed the old 50000 window (got ${evasive.length})`);
+  assert.ok(
+    scanSuppressionText('.eslintrc.json', evasive).some((f) => f.category === 'config-silencing'),
+    'a src/** exclusion padded past 50000 chars must still be flagged',
+  );
+  // The benign padding alone (no source exclusion) stays unflagged, so the
+  // helper is not simply flagging any long ignore array.
+  const benign = `{"ignorePatterns": [${pad}]}`;
+  assert.deepEqual(
+    scanSuppressionText('.eslintrc.json', benign).filter((f) => f.category === 'config-silencing'),
+    [],
+    'a long ignore array of only benign globs must not be flagged',
+  );
+});

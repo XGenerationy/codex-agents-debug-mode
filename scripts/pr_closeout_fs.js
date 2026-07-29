@@ -297,6 +297,25 @@ const isSameFileIdentity = (preInfo, postInfo) => (
  * reused inode) gives the occupant a fresh change time the original stale
  * file's snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux
  * after the dev/ino-only check shipped).
+ *
+ * ctimeMs still has only millisecond resolution, so an unlink+recreate that
+ * both reuses the inode AND lands inside the same millisecond can collide on
+ * ctimeMs too (Codex UkAeu, reproduced on the CI filesystem). birthtimeMs is
+ * required as an independent second time dimension to shrink that window: it
+ * records the file's creation time and -- unlike ctimeMs -- is not advanced by
+ * the ACL-protection and content writes these lock/claim records undergo after
+ * they are created, so a stale record whose ctimeMs was bumped post-creation
+ * cannot match a same-millisecond successor on birthtimeMs unless BOTH the
+ * birth time and the change time collide within the same millisecond. It never
+ * wrongly rejects a genuine same file: birthtime is immutable for an inode's
+ * lifetime, and on filesystems that do not record it (Node falls birthtimeMs
+ * back to ctimeMs or 0) the term is a harmless no-op because ctimeMs is already
+ * required to match. This is defense in depth, not a full guarantee -- the
+ * sub-millisecond residual is deliberately closed at the call sites
+ * (pr_closeout_workflow.js output-dir lock, debug_server.js collector-claim
+ * reclaim) by quarantining the entry and re-verifying its bytes before
+ * deletion; strengthening this predicate narrows the window each independent
+ * layer must otherwise cover.
  * @param {import('node:fs').Stats} preInfo
  * @param {import('node:fs').Stats} postInfo
  * @returns {boolean}
@@ -307,6 +326,7 @@ const isSameLockIdentity = (preInfo, postInfo) => (
   && postInfo.ino === preInfo.ino
   && postInfo.nlink <= 1
   && postInfo.ctimeMs === preInfo.ctimeMs
+  && postInfo.birthtimeMs === preInfo.birthtimeMs
 );
 
 module.exports = {

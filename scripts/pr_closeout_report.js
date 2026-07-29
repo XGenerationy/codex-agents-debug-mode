@@ -1,5 +1,5 @@
 const { constants } = require('node:fs');
-const { chmod, mkdir, rename, unlink } = require('node:fs/promises');
+const { chmod, lstat, mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
 const { assertNotSymlink: assertNotSymlinkShared, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
 
@@ -382,8 +382,41 @@ const writeNoFollow = async (target, contents) => {
     // evidence-log hardening in pr_closeout_process.js.
     try {
       protectWindowsPrivateFile(target);
-    } catch {
-      throw new Error(`Failed to protect evidence report with an owner-only ACL: ${target}`);
+    } catch (error) {
+      throw new Error(
+        `Failed to protect evidence report with an owner-only ACL: ${target}`,
+        { cause: error },
+      );
+    }
+    if (process.platform === 'win32') {
+      // protectWindowsPrivateFile re-resolves `target` by name in a separate
+      // PowerShell process; if the path were renamed/replaced with a different
+      // inode while that ran (possible under the explicitly supported shared/
+      // permissive --output-dir scenario), the ACL would land on the
+      // replacement while the writeFile below still targets the original,
+      // potentially still broadly-readable, inode through this open handle.
+      // Re-check the post-protection path identity against the descriptor
+      // before writing any evidence. nlink was already verified to be exactly
+      // 1 above (before chmod or this call ran), so a hard link cannot reach
+      // here and only dev/ino are compared; a zero ino is rejected outright
+      // because some Windows filesystems report dev/ino as 0 for every file
+      // and would otherwise compare equal vacuously. Mirrors the evidence-log
+      // hardening in pr_closeout_process.js.
+      let postProtectInfo;
+      try {
+        postProtectInfo = await lstat(target);
+      } catch {
+        throw new Error(`Refusing to write evidence report with an unverifiable identity: ${target}`);
+      }
+      if (
+        info.ino === 0
+        || postProtectInfo.dev !== info.dev
+        || postProtectInfo.ino !== info.ino
+      ) {
+        throw new Error(
+          `Refusing to write evidence report through a path swapped during ACL protection: ${target}`,
+        );
+      }
     }
     await handle.writeFile(contents, 'utf8');
   } finally {

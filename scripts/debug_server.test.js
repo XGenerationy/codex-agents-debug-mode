@@ -21,6 +21,7 @@ const {
   readJson,
   reclaimStaleCollectorClaim,
   resolvePowerShellExecutable,
+  unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
 
 const TEST_LAUNCH_TOKEN = 'test-launch-token-with-enough-entropy-for-fixtures';
@@ -217,7 +218,18 @@ const windowsAclIsCurrentUserOnly = (filePath) => {
   );
 };
 
-const bashProbe = spawnSync('bash', ['-c', 'true']);
+// Bare `bash` is resolved through PATH, but on a machine where the WSL
+// launcher stub (C:\Windows\system32\bash.exe) precedes Git for Windows,
+// `bash` silently becomes a *different* bash whose distro mounts drives at
+// /mnt/c/... instead of the MSYS /c/... convention toBashPath produces below
+// -- so an installer path that resolved correctly still hits ENOENT inside
+// that shell. Mirror pr_closeout_process.js's resolveCommandShell so both
+// trust the same explicit Git Bash install (override via OMO_CODEX_GIT_BASH_PATH).
+const GIT_BASH = process.platform === 'win32'
+  ? (process.env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe')
+  : (process.env.OMO_CODEX_SHELL_PATH || 'bash');
+
+const bashProbe = spawnSync(GIT_BASH, ['-c', 'true']);
 const bashAvailable = !bashProbe.error && bashProbe.status === 0;
 
 // Git Bash passes MSYS-style paths (/c/...) to the installer, which forwards
@@ -226,7 +238,15 @@ const bashAvailable = !bashProbe.error && bashProbe.status === 0;
 // POSIX shells and Git Bash.
 const toBashPath = (nativePath) => {
   if (process.platform !== 'win32') return nativePath;
-  const converted = spawnSync('cygpath', ['-u', nativePath], { encoding: 'utf8' });
+  const args = ['-u', nativePath];
+  let converted = spawnSync('cygpath', args, { encoding: 'utf8' });
+  if (converted.error?.code === 'ENOENT') {
+    // Git for Windows only puts `cmd`/`bin` (bash.exe) on PATH by default;
+    // cygpath lives in `usr\bin` alongside the rest of the MSYS toolchain and
+    // is typically not on PATH. Fall back to the well-known install root
+    // pr_closeout_process.js already trusts for bash.exe.
+    converted = spawnSync('C:\\Program Files\\Git\\usr\\bin\\cygpath.exe', args, { encoding: 'utf8' });
+  }
   if (converted.error || converted.status !== 0) {
     throw converted.error || new Error(`cygpath failed: ${converted.stderr}`);
   }
@@ -1269,6 +1289,98 @@ test('reclaimStaleCollectorClaim backs off without touching a claim whose identi
   }
 });
 
+test('reclaimStaleCollectorClaim restores a misidentified successor via rename when link() is unsupported', async () => {
+  // CodeRabbit UmlJJ: the restore branch links the quarantined entry back to
+  // the claim path, then unlinks the quarantine copy. On filesystems where
+  // hard links are unavailable (FAT/exFAT, some network mounts, certain Windows
+  // shares) link() fails with EPERM/ENOSYS/EXDEV -- neither ENOENT nor EEXIST.
+  // Without a fallback that error escapes as collector_claim_contention AFTER
+  // the successor was already renamed to the private quarantine name, so the
+  // live successor is destroyed: claimFile no longer exists and the quarantine
+  // copy is orphaned litter the next launch would step over and wrongly claim.
+  // The reclaim must fall back to a rename restore so the successor survives
+  // even where link() cannot run.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-nolink-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const staleContent = '40000\nstale-instance\n999999\n';
+  const successorContent = `41000\nlive-instance\n${process.pid}\n`;
+  try {
+    await writeFile(claimFile, successorContent, 'utf8');
+    const claimInfo = await lstat(claimFile);
+    const status = await reclaimStaleCollectorClaim(claimFile, {
+      claimInfo,
+      claimText: staleContent,
+      readClaimText: reclaimReadClaimText,
+      // Model a filesystem that cannot create hard links; the default rename
+      // seam stays real so the fallback exercises a genuine on-disk restore.
+      linkFn: async () => {
+        const error = new Error('hard links are not supported on this filesystem');
+        error.code = 'EPERM';
+        throw error;
+      },
+    });
+    assert.equal(status, 'restored', 'a successor must be restored via rename when link() is unsupported');
+    assert.equal(existsSync(claimFile), true, 'the live successor claim must survive a link-unsupported restore');
+    assert.equal(
+      await readFile(claimFile, 'utf8'),
+      successorContent,
+      'the successor claim must be restored to its original path with its content intact',
+    );
+    assert.deepEqual(await readdir(dir), ['collector_claim'], 'no quarantine copy may be left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unlinkOwnedClaimIfUnchanged leaves a successor claim that replaced the read descriptor', async () => {
+  // Codex Ummsi: releaseOwnedClaim reads and ownership-checks collector_claim
+  // through a descriptor, then unlinks by PATH. A peer that reclaims this stale
+  // claim and writes its own successor at collector_claim between that read and
+  // the unlink would otherwise have its live successor deleted, because the
+  // descriptor still carried this process's own owner fields. Model the post-
+  // read swap directly: openedIdentity names the inode the descriptor read, but
+  // a different inode (the successor) now occupies the path, so the identity
+  // re-check must refuse the unlink and leave the successor intact.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-release-swap-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const readInode = path.join(dir, 'read-inode');
+  const successorContent = '41000\nlive-successor\n424242\n';
+  try {
+    // A distinct real file stands in for the now-gone inode the release read,
+    // so its dev/ino differ from the successor now sitting at claimFile.
+    await writeFile(readInode, '40000\nown-instance\n999999\n', 'utf8');
+    const openedIdentity = await lstat(readInode);
+    await writeFile(claimFile, successorContent, 'utf8');
+    const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
+    assert.equal(unlinked, false, 'a successor that replaced the read inode must not be unlinked');
+    assert.equal(existsSync(claimFile), true, 'the live successor claim must survive');
+    assert.equal(
+      await readFile(claimFile, 'utf8'),
+      successorContent,
+      'the successor content must be intact',
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unlinkOwnedClaimIfUnchanged unlinks a claim that still identifies the read descriptor', async () => {
+  // The legitimate release path: nothing swapped the path between the read and
+  // the unlink, so the re-lstat matches the descriptor identity and the owned
+  // claim is removed exactly as the prior unconditional unlink did.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-release-match-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  try {
+    await writeFile(claimFile, `40000\nown-instance\n${process.pid}\n`, 'utf8');
+    const openedIdentity = await lstat(claimFile);
+    const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
+    assert.equal(unlinked, true, 'an unchanged owned claim must be unlinked');
+    assert.equal(existsSync(claimFile), false, 'the owned claim must be removed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('refuses to write the launch token through a hard-linked collector_token', { timeout: 20000 }, async () => {
   // A repo-controlled .debug/collector_token hard link shares its inode with
   // an outside file; a truncating startup write would clobber that file
@@ -2227,7 +2339,7 @@ test(
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
       const expectedTarget = path.join(homeNative, '.codex', 'skills', 'debug');
 
-      const fresh = spawnSync('bash', [installer, '--home', home, '--target', 'codex'], {
+      const fresh = spawnSync(GIT_BASH, [installer, '--home', home, '--target', 'codex'], {
         encoding: 'utf8',
       });
       assert.equal(fresh.status, 0, fresh.stderr);
@@ -2238,7 +2350,7 @@ test(
       assert.equal(freshResult.backup, '');
       assert.equal(existsSync(path.join(expectedTarget, 'SKILL.md')), true);
 
-      const forced = spawnSync('bash', [installer, '--home', home, '--target', 'codex', '--force'], {
+      const forced = spawnSync(GIT_BASH, [installer, '--home', home, '--target', 'codex', '--force'], {
         encoding: 'utf8',
       });
       assert.equal(forced.status, 0, forced.stderr);
@@ -2273,7 +2385,7 @@ test(
       await symlink(missingTarget, target);
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       assert.notEqual(res.status, 0, 'installer must refuse a dangling-symlink target without --force');
       assert.match(res.stderr || '', /target exists/i, `rejection message must mention the existing target: ${JSON.stringify(res)}`);
 
@@ -2281,7 +2393,7 @@ test(
       assert.equal(linkInfo.isSymbolicLink(), true, 'the dangling symlink itself must still be there, not silently replaced');
       await assert.rejects(() => stat(target), { code: 'ENOENT' }, 'the symlink must still be dangling (untouched), not resolved to new content');
 
-      const forced = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex', '--force'], { encoding: 'utf8' });
+      const forced = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex', '--force'], { encoding: 'utf8' });
       assert.equal(forced.status, 0, forced.stderr);
       const forcedResult = JSON.parse(forced.stdout.trim());
       assert.equal(forcedResult.status, 'installed');
@@ -2313,7 +2425,7 @@ test(
       );
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       assert.equal(res.status, 0, res.stderr);
       assert.equal(existsSync(target), true, 'installer must proceed after reclaiming the proven-stale lock');
       assert.equal(existsSync(`${target}.install-lock`), false, 'EXIT cleanup must release the newly acquired lock');
@@ -2350,7 +2462,7 @@ test(
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
       const startedAt = Date.now();
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       const elapsedMs = Date.now() - startedAt;
       assert.equal(res.status, 0, res.stderr);
       assert.equal(existsSync(target), true, 'installer must proceed after reclaiming the lock behind a stale guard');
@@ -2384,7 +2496,7 @@ test(
       await mkdir(guard);
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], {
         encoding: 'utf8',
         timeout: 3000,
       });
@@ -2444,7 +2556,7 @@ test(
       );
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], {
         encoding: 'utf8',
         env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
         timeout: 10000,
@@ -2515,7 +2627,7 @@ test(
       );
 
       const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
-      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+      const res = spawnSync(GIT_BASH, [installer, '--home', toBashPath(home), '--target', 'codex'], {
         encoding: 'utf8',
         env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
         timeout: 10000,
@@ -2564,7 +2676,7 @@ test(
       // 'assets' payload entry is a symlink to an outside directory.
       await symlink(outside, path.join(root, 'assets'));
       await copyFile(path.join(__dirname, '..', 'tools', 'install.sh'), path.join(root, 'tools', 'install.sh'));
-      const res = spawnSync('bash', [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const res = spawnSync(GIT_BASH, [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       assert.notEqual(res.status, 0, 'installer must exit non-zero for a symlink payload entry');
       assert.match((res.stderr || '') + (res.stdout || ''), /symlink|regular file/i, `rejection message must mention symlink/regular file: ${JSON.stringify(res)}`);
     } finally {
@@ -2598,7 +2710,7 @@ test(
       // points outside the tree.
       await symlink(path.join(outside, 'secret'), path.join(root, 'scripts', 'helper.js'));
       await copyFile(path.join(__dirname, '..', 'tools', 'install.sh'), path.join(root, 'tools', 'install.sh'));
-      const res = spawnSync('bash', [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
+      const res = spawnSync(GIT_BASH, [toBashPath(path.join(root, 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'codex'], { encoding: 'utf8' });
       assert.notEqual(res.status, 0, 'installer must exit non-zero for a nested symlink payload entry');
       assert.match((res.stderr || '') + (res.stdout || ''), /symlink|special file/i, `rejection message must mention symlink/special file: ${JSON.stringify(res)}`);
       assert.equal(existsSync(path.join(home, '.codex', 'skills', 'debug', 'scripts', 'helper.js')), false, 'nested symlink must never be staged into an installed skill');
@@ -2634,7 +2746,7 @@ test(
     await chmod(agentsSkillsDir, 0o555);
     try {
       const res = spawnSync(
-        'bash',
+        GIT_BASH,
         [toBashPath(path.join(__dirname, '..', 'tools', 'install.sh')), '--home', toBashPath(home), '--target', 'both'],
         { encoding: 'utf8' },
       );

@@ -279,11 +279,12 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
  * symlink/non-regular/oversized rejections from the nested safeReadFile
  * guard — propagates.
  * @param {string} repo - Absolute repository path.
- * @returns {Promise<{packageScripts: Record<string, string>, makeTargets: string[]}>}
+ * @returns {Promise<{packageScripts: Record<string, string>, makeTargets: string[], makeRecipes: Record<string, string>}>}
  */
 const readProjectMetadata = async (repo) => {
   let packageScripts = {};
   let makeTargets = [];
+  const makeRecipes = {};
   /**
    * Reject symlinked and non-regular metadata before reading it: a reviewed
    * branch can make root `package.json` or a default Makefile a symlink to
@@ -368,16 +369,34 @@ const readProjectMetadata = async (repo) => {
     try {
       const makefile = await safeReadFile(candidate);
       if (makefile === undefined) continue;
-      makeTargets = [...new Set(makefile.split(/\r?\n/)
-        .map((line) => line.match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/))
-        .filter(Boolean)
-        .map((match) => match[1]))];
+      // Recipe lines are the contiguous tab-prefixed lines immediately after a
+      // target line (GNU make's default recipe-line convention). Captured so a
+      // resolved make target's body can be checked for failure-neutralizing
+      // patterns the same way an auto-discovered package script is (Codex
+      // Ummss) — the first definition's recipe wins for a repeated target
+      // name, mirroring the Set dedup already applied to makeTargets below.
+      const lines = makefile.split(/\r?\n/);
+      const targets = [];
+      for (let i = 0; i < lines.length; i += 1) {
+        const match = lines[i].match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/);
+        if (!match) continue;
+        const target = match[1];
+        targets.push(target);
+        if (!Object.hasOwn(makeRecipes, target)) {
+          const recipeLines = [];
+          for (let j = i + 1; j < lines.length && /^\t/.test(lines[j]); j += 1) {
+            recipeLines.push(lines[j]);
+          }
+          if (recipeLines.length) makeRecipes[target] = recipeLines.join('\n');
+        }
+      }
+      makeTargets = [...new Set(targets)];
       break;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
   }
-  return { packageScripts, makeTargets };
+  return { packageScripts, makeTargets, makeRecipes };
 };
 
 // Cap the suppression scanner so a single huge or binary touched file cannot
@@ -747,20 +766,34 @@ const collectExtraEntries = async (repo, requested, entries) => {
 
 // Cap the node_modules structural walk so a pathological or maliciously huge
 // vendor tree cannot make the seal unbounded. Realistic node_modules trees
-// (even large monorepos with a pnpm store) fall well under this; a tree that
-// exceeds the cap is sealed up to the first N entries in the SAME
-// deterministic (sorted, depth-first) order at every checkpoint, so the bound
-// stays symmetric across seal points. Each entry costs one lstat (no content
-// read), so the walk is cheap relative to content-hashing the tree.
+// (even large monorepos with a pnpm store) fall well under this. A tree that
+// exceeds the cap FAILS CLOSED (structuralDigest throws) rather than sealing a
+// truncated prefix: a silently-truncated digest stays identical across
+// checkpoints for an already-oversized tree, so a dependency added, removed, or
+// modified past the deterministic cutoff would be invisible at every seal point
+// while the next validation command still executes it (Codex UnKZ0 / Qodo
+// UmhWL). Each entry costs one lstat (no content read), so the walk is cheap
+// relative to content-hashing the tree.
 const MAX_STRUCTURAL_DIGEST_ENTRIES = 200_000;
+
+// Bound the discovery walk that locates every node_modules root (repo-root and
+// nested workspace roots) so a pathologically deep source tree cannot make the
+// discovery itself unbounded. The walk never descends INTO a node_modules tree
+// (structuralDigest covers that subtree), so this only limits non-vendor depth.
+const MAX_NODE_MODULES_DISCOVERY_DEPTH = 40;
 
 /**
  * Compute a bounded STRUCTURAL digest of a vendor tree (node_modules) without
  * reading any file contents. Recursively walks `requested` in deterministic
  * sorted order and folds each entry's repo-relative path plus its kind and
  * cheap metadata into a single SHA-256: a regular file contributes its
- * size + mtimeMs + permission bits, a symlink its (un-followed) target text,
- * and a directory or any non-regular entry a fixed marker. This catches any
+ * size + mtimeMs + ctimeMs + permission bits, a symlink its (un-followed)
+ * target text, and a directory or any non-regular entry a fixed marker.
+ * ctimeMs (inode change time) is sealed alongside mtime because a same-length
+ * in-place content rewrite that restores the original mtime (touch -r / cp -p)
+ * leaves size + mtime + mode identical, yet both the write and the mtime
+ * restoration bump ctime, which no user-facing API can reset (Codex UnKZx).
+ * This catches any
  * mutation, addition, or removal under the tree — an edited file's size or
  * mtime moves, an added or removed file changes the listing — at the cost of
  * one lstat per entry instead of a full content hash of tens of thousands of
@@ -779,9 +812,11 @@ const MAX_STRUCTURAL_DIGEST_ENTRIES = 200_000;
  * lists it.
  * @param {string} repo - Absolute repository path.
  * @param {string} requested - Repo-relative vendor-tree root (e.g. 'node_modules').
+ * @param {number} [maxEntries=MAX_STRUCTURAL_DIGEST_ENTRIES] - Entry cap; exceeding it fails closed (throws). Injectable so the truncation path is testable without a 200k-entry tree.
  * @returns {Promise<string|null>} Composite structural digest, or null if the root is absent.
+ * @throws {Error} If the walk exceeds `maxEntries` (the tree cannot be fully sealed).
  */
-const structuralDigest = async (repo, requested) => {
+const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIGEST_ENTRIES) => {
   const root = resolveExtraPath(repo, requested);
   let rootInfo;
   try {
@@ -792,13 +827,19 @@ const structuralDigest = async (repo, requested) => {
   }
   const hash = createHash('sha256');
   let count = 0;
-  let truncated = false;
   const record = (line) => hash.update(`${line}\n`);
   const visit = async ({ absolute, relative }, info) => {
-    if (truncated) return;
-    if (count >= MAX_STRUCTURAL_DIGEST_ENTRIES) {
-      truncated = true;
-      return;
+    // Fail closed when the walk would exceed the cap. Silently returning a
+    // truncated-prefix digest lets a dependency added, removed, or modified
+    // past the deterministic cutoff stay invisible at every checkpoint while
+    // producing an identical digest for an already-oversized tree, so the seal
+    // cannot honestly attest the whole tree is unchanged (Codex UnKZ0 / Qodo
+    // UmhWL). A blocking error is the only correct result when the tree is too
+    // large to seal in full.
+    if (count >= maxEntries) {
+      throw new Error(
+        `node_modules structural walk exceeded ${maxEntries} entries at '${root.relative}'; cannot fully seal the dependency tree (fail closed).`,
+      );
     }
     count += 1;
     if (info.isSymbolicLink()) {
@@ -837,14 +878,58 @@ const structuralDigest = async (repo, requested) => {
       return;
     }
     if (info.isFile()) {
-      record(`${relative}\0size=${info.size}\0mtime=${info.mtimeMs}\0mode=${info.mode & 0o777}`);
+      record(`${relative}\0size=${info.size}\0mtime=${info.mtimeMs}\0ctime=${info.ctimeMs}\0mode=${info.mode & 0o777}`);
       return;
     }
     // FIFO/socket/device: record its kind without opening it.
     record(`${relative}\0non-regular`);
   };
   await visit({ absolute: root.absolute, relative: root.relative }, rootInfo);
-  return hashBytes(`structural:count=${count}:truncated=${truncated ? 1 : 0}:${hash.digest('hex')}`);
+  return hashBytes(`structural:count=${count}:${hash.digest('hex')}`);
+};
+
+/**
+ * Discover every node_modules root under the repo — the repo-root tree AND
+ * nested workspace roots such as `packages/api/node_modules` — so
+ * workingTreeFingerprint can structurally seal each one. The ignored-untracked
+ * listing pathspec-excludes every nested node_modules tree and a repo-root-only
+ * structural digest never reaches a package-local dependency, so without
+ * discovering nested roots a mutation under a workspace package is invisible to
+ * the seal (Codex Ummso). The walk skips `.git`, never follows a symlink (a
+ * symlinked directory is not `isDirectory()` in a Dirent, so it is left for the
+ * un-followed symlink handling elsewhere), and does NOT descend into a found
+ * node_modules (structuralDigest already covers that subtree, including any
+ * node_modules nested within it) — bounding cost to the non-vendor source tree.
+ * @param {string} repo - Absolute repository path.
+ * @returns {Promise<string[]>} Sorted repo-relative node_modules root paths (may be empty).
+ */
+const findNodeModulesRoots = async (repo) => {
+  const roots = [];
+  const walk = async (absoluteDir, relativeDir, depth) => {
+    if (depth > MAX_NODE_MODULES_DISCOVERY_DEPTH) return;
+    let dirents;
+    try {
+      dirents = await readdir(absoluteDir, { withFileTypes: true });
+    } catch {
+      // An unreadable directory contributes no roots; a genuinely present
+      // node_modules elsewhere is still discovered independently.
+      return;
+    }
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory()) continue;
+      if (dirent.name === '.git') continue;
+      const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
+      if (dirent.name === 'node_modules') {
+        roots.push(childRelative);
+        // Do not descend: structuralDigest walks the whole subtree, including
+        // any node_modules nested inside this one.
+        continue;
+      }
+      await walk(path.join(absoluteDir, dirent.name), childRelative, depth + 1);
+    }
+  };
+  await walk(repo, '', 0);
+  return roots.sort();
 };
 
 /**
@@ -893,8 +978,9 @@ const hashGitOutput = async (repo, args) => {
  * and the XDG default global gitignore (both of which `--exclude-standard`
  * also consults); every per-directory `.gitignore` in the repo, tracked or
  * untracked, including a self-ignoring one; every untracked file's identity
- * (via hashFsEntry); a bounded STRUCTURAL digest of node_modules (path + size
- * + mtime + mode, not contents, via structuralDigest) so a mutated, added, or
+ * (via hashFsEntry); a bounded STRUCTURAL digest of every node_modules root —
+ * repo-root and nested workspace roots (path + size + mtime + ctime + mode, not
+ * contents, via structuralDigest/findNodeModulesRoots) so a mutated, added, or
  * removed dependency the next validation command would execute cannot escape
  * the seal even though git ignores the vendor tree; and any caller-supplied
  * `extraPaths` (via collectExtraEntries). All entries are handed to
@@ -906,7 +992,11 @@ const hashGitOutput = async (repo, args) => {
  * @param {typeof gitPaths} [overrides.listIgnoredUntracked] - Overrides the ignored-untracked git listing.
  * @returns {Promise<string>} Hex-encoded SHA-256 composite fingerprint.
  */
-const workingTreeFingerprint = async (repo, extraPaths = [], { listIgnoredUntracked = gitPaths } = {}) => {
+const workingTreeFingerprint = async (
+  repo,
+  extraPaths = [],
+  { listIgnoredUntracked = gitPaths, maxStructuralDigestEntries = MAX_STRUCTURAL_DIGEST_ENTRIES } = {},
+) => {
   const [diffHash, untracked] = await Promise.all([
     hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD']),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
@@ -1036,19 +1126,26 @@ const workingTreeFingerprint = async (repo, extraPaths = [], { listIgnoredUntrac
     const absolute = path.join(repo, file);
     entries.push({ path: `__ignored__/${normalized}`, hash: await hashFsEntry(absolute) });
   }
-  // Structurally seal node_modules (a listing of path + size + mtime + mode,
-  // NOT file contents) so a validation command that mutates, adds, or removes
-  // a dependency between seal points moves the fingerprint. git ignores
-  // node_modules and the ignored-untracked listing above pathspec-excludes it,
-  // so without this channel a swapped-in dependency the next validation step
-  // then executes would leave every seal identical (finding UkNEm/UkTG5).
+  // Structurally seal every node_modules root — the repo-root tree AND nested
+  // workspace roots like packages/api/node_modules (a listing of path + size +
+  // mtime + ctime + mode, NOT file contents) so a validation command that
+  // mutates, adds, or removes a dependency between seal points moves the
+  // fingerprint. git ignores node_modules and the ignored-untracked listing
+  // above pathspec-excludes every nested node_modules tree, so without this
+  // channel a swapped-in dependency the next validation step then executes
+  // would leave every seal identical (findings UkNEm/UkTG5). A repo-root-only
+  // digest would miss a package-local dependency mutation under a workspace
+  // package (finding Ummso), so all roots are discovered and hashed.
   // Content-hashing the whole vendor tree would be far too slow; the structural
   // listing catches the same mutations at one lstat per entry. An absent
   // node_modules contributes no entry (structuralDigest returns null); its
   // later creation still moves the seal by making the entry appear.
-  const nodeModulesDigest = await structuralDigest(repo, 'node_modules');
-  if (nodeModulesDigest !== null) {
-    entries.push({ path: '__node_modules_structural__', hash: nodeModulesDigest });
+  const nodeModulesRoots = await findNodeModulesRoots(repo);
+  for (const nodeModulesRoot of nodeModulesRoots) {
+    const digest = await structuralDigest(repo, nodeModulesRoot, maxStructuralDigestEntries);
+    if (digest !== null) {
+      entries.push({ path: `__node_modules_structural__/${nodeModulesRoot}`, hash: digest });
+    }
   }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);
   return fingerprintEntries(entries);
@@ -1180,8 +1277,26 @@ const readGateChanges = async (repo, baseSha) => {
   const proseAddedLines = [];
   if (!trackedDiffError) {
     let inProseGateFile = false;
+    let inHunk = false;
     for (const line of diffLines) {
-      const fileHeader = /^\+\+\+ b\/(.+)$/.exec(line);
+      // A `+++ b/<path>` file header always precedes the first `@@` hunk for
+      // that file. Under --unified=0 an ADDED source line whose content is
+      // literally `++ b/.codereview.yml` is emitted as `+++ b/.codereview.yml`
+      // INSIDE the hunk; treating that as a header would flip inProseGateFile
+      // on and wrongly exempt the rest of an unrelated (non-prose) gate file's
+      // added lines from the weakening scan (CodeRabbit UmlJc). Track hunk
+      // state — reset on each `diff --git`, enter on `@@` — and only accept a
+      // `+++` header when outside a hunk.
+      if (line.startsWith('diff --git ')) {
+        inHunk = false;
+        inProseGateFile = false;
+        continue;
+      }
+      if (line.startsWith('@@')) {
+        inHunk = true;
+        continue;
+      }
+      const fileHeader = inHunk ? null : /^\+\+\+ b\/(.+)$/.exec(line);
       if (fileHeader) {
         inProseGateFile = /^\.codereview\.ya?ml$/i.test(path.posix.basename(fileHeader[1]));
         continue;

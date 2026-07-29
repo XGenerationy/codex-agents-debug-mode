@@ -566,6 +566,63 @@ test('restores a live successor lock created between the byte-for-byte check and
   }
 });
 
+test('restores an initializing successor whose quarantined payload is byte-different from the stale snapshot but does not parse', async () => {
+  // CodeRabbit UnT4B / qodo UnB_K: the post-quarantine content check must
+  // restore on *byte-difference from the authorized stale snapshot*, not on
+  // whether the quarantined payload parses. A peer can create its successor
+  // via O_EXCL and be quarantined before it has awaited its payload write --
+  // an empty/partial record that is neither byte-identical to staleSnapshot
+  // nor yet parseable. Deleting it (the pre-fix behavior, which restored only
+  // when outputDirLockHolder parsed a holder) frees the pathname while the
+  // peer still owns an open descriptor, letting both processes believe they
+  // hold the lock. Model the gap directly: the byte-for-byte verification read
+  // reports the stale content still matched (so the rename proceeds) but, as a
+  // side effect of that same read, a peer's still-initializing (empty)
+  // successor lands on disk at lockPath. Post-quarantine that unparseable,
+  // byte-different payload must be restored, not deleted.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-initializing-successor-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  const staleContent = '2147483646\nstale-nonce\n';
+  // Empty payload: a peer created the lock via O_EXCL but has not yet written
+  // its pid/nonce. It is byte-different from staleContent and does not parse.
+  const initializingSuccessor = '';
+  let reads = 0;
+  try {
+    await fs.writeFile(lockPath, staleContent, 'utf8');
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: async (p) => {
+          reads += 1;
+          if (reads === 1) return staleContent;
+          if (reads === 2) {
+            // Right after this contender's verification read reports the
+            // stale content still matched, a peer's initializing (empty)
+            // successor lands on disk at lockPath.
+            await fs.writeFile(lockPath, initializingSuccessor, 'utf8');
+            return staleContent;
+          }
+          return fs.readFile(p, 'utf8');
+        },
+      }),
+      // Whichever legitimate reason it rejects for, it must not return a lock:
+      // restoring the initializing successor and re-discovering it on retry
+      // yields "still initializing"; it must never delete the successor and
+      // acquire the freed pathname.
+      /still initializing|already locked/i,
+    );
+    assert.equal(
+      await fs.readFile(lockPath, 'utf8'),
+      initializingSuccessor,
+      'the byte-different, unparseable initializing successor must be restored, not deleted',
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('isSameLockIdentity does not treat a reused inode as the same file', () => {
   // Codex Uert4 follow-up: CI on Linux (tmpfs /tmp) showed that unlinking a
   // stale lock and immediately writing a successor can hand the successor

@@ -6,7 +6,12 @@ const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { assertNotSymlink, openNoFollow, openNoFollowFlagAttempts } = require('./pr_closeout_fs');
+const {
+  assertNotSymlink,
+  isSameLockIdentity,
+  openNoFollow,
+  openNoFollowFlagAttempts,
+} = require('./pr_closeout_fs');
 
 test('openNoFollow defaults to O_RDONLY when flags are omitted', async () => {
   // Suppression/gate scanners call openNoFollow(path) with no flags. After the
@@ -93,6 +98,34 @@ test('openNoFollow does not hang when the path is a FIFO', { timeout: 10000 }, a
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs', () => {
+  // Codex UkAeu: ctimeMs has only millisecond resolution, so an unlink+recreate
+  // that reuses the freed inode AND lands in the same millisecond can collide
+  // on dev/ino/nlink/ctimeMs all at once. A ctime-only predicate would then
+  // call two genuinely different files the same lock and let a reclaim
+  // quarantine a peer's live successor. These lock/claim records have their
+  // ctime bumped after creation (ACL protection, content writes) while
+  // birthtime stays pinned to creation, so the stale record's birthtime stays
+  // older than a same-millisecond successor's -- an independent second time
+  // dimension the collision must also clear.
+  const stale = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
+  // Reused inode, ctimeMs collides inside the same ms, but the successor was
+  // actually born later -> birthtimeMs differs -> not the same file. This
+  // assertion fails on the ctime-only predicate (which returns true here).
+  const collidingSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 5000 };
+  assert.equal(isSameLockIdentity(stale, collidingSuccessor), false);
+
+  // Genuine same file: every dimension including the immutable birthtime
+  // matches, so a real stale record stays reclaimable (no false rejection).
+  const untouchedSameFile = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
+  assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
+
+  // The common unlink+recreate case (fresh change time) is still rejected on
+  // ctimeMs alone -- the new birthtime term does not weaken the existing guard.
+  const freshCtimeSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 6000, birthtimeMs: 6000 };
+  assert.equal(isSameLockIdentity(stale, freshCtimeSuccessor), false);
 });
 
 test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () => {

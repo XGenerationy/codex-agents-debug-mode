@@ -15,6 +15,7 @@ const {
   withNoTextconv,
   workingTreeFingerprint,
 } = require('./pr_closeout_repo');
+const { buildCheckPlan } = require('./pr_closeout_core');
 
 const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
 
@@ -111,6 +112,34 @@ test('readProjectMetadata discovers make targets from GNUmakefile and makefile d
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
+  }
+});
+
+test('readProjectMetadata captures make recipe bodies, and buildCheckPlan blocks a neutralizing one end-to-end (Codex Ummss)', async () => {
+  // A resolved make target was trusted by name only; readProjectMetadata never
+  // captured the recipe body, so buildCheckPlan's findMakeRecipeNeutralizer
+  // always saw makeRecipes = {} and could never fire in production. Proves the
+  // full path: a real Makefile's recipe text flows from readProjectMetadata
+  // into buildCheckPlan and blocks a failure-hiding recipe.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-recipe-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(path.join(repo, 'Makefile'), 'grafana-render:\n\t-@echo render ignoring failure\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('-@echo render ignoring failure'),
+      `expected the grafana-render recipe body to be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    const plan = buildCheckPlan({ ...metadata, touchedFiles: [] });
+    const check = plan.checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED');
+    assert.match(check.evidence, /neutralizes failures \(-\)/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
   }
 });
 
@@ -877,6 +906,167 @@ test('workingTreeFingerprint node_modules structural digest stays fast for a few
     // Generous bound: proves the structural walk does not hang or explode,
     // without being flaky on slow or loaded CI.
     assert.ok(elapsed < 10_000, `structural digest should be fast; took ${elapsed}ms`);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readGateChanges does not let a forged +++ header inside a hunk exempt weakening', async () => {
+  // CodeRabbit UmlJc: with --unified=0, an ADDED source line whose content is
+  // literally `++ b/.codereview.yml` is emitted in the diff as
+  // `+++ b/.codereview.yml` INSIDE the hunk. If that were treated as a prose
+  // file header, the rest of a non-prose gate file's added lines would be
+  // exempted from the weakening scan (proseAddedLines), letting real weakening
+  // self-exempt. Header detection must be gated on hunk state.
+  const repo = await fixtureRepo();
+  try {
+    const workflowDir = path.join(repo, '.github', 'workflows');
+    await mkdir(workflowDir, { recursive: true });
+    const workflow = path.join(workflowDir, 'ci.yml');
+    await writeFile(workflow, 'name: ci\non: push\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'add workflow');
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    // Append a forged prose-file header line followed by a real weakening line.
+    await writeFile(workflow, 'name: ci\non: push\n++ b/.codereview.yml\n  run: git commit --no-verify\n');
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.ok(gate.changedFiles.includes('.github/workflows/ci.yml'));
+    // The weakening line must still be scanned as an added line...
+    assert.ok(
+      gate.addedLines.some((line) => line.includes('git commit --no-verify')),
+      `weakening line must be in addedLines, got: ${JSON.stringify(gate.addedLines)}`,
+    );
+    // ...but must NOT be exempted via the prose channel by the forged header.
+    assert.ok(
+      !gate.proseAddedLines.some((line) => line.includes('--no-verify')),
+      `forged header must not exempt weakening, got proseAddedLines: ${JSON.stringify(gate.proseAddedLines)}`,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint moves the seal when node_modules is created from absent', async () => {
+  // UmlJh: structuralDigest returns null when the root is absent, contributing
+  // no entry; its later creation (a validation command installing deps mid-run)
+  // must move the seal by making the entry appear. Every other node_modules
+  // case starts already-populated, so this null->present transition is the one
+  // a mid-run install actually exercises.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    // No node_modules yet.
+    const before = await workingTreeFingerprint(repo);
+    const pkg = path.join(repo, 'node_modules', 'x');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(path.join(pkg, 'index.js'), 'module.exports = 1;\n');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(before, after, 'creating node_modules from absent must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals node_modules content even when size and mtime are preserved', async () => {
+  // Codex UnKZx: a same-length in-place content rewrite that restores the
+  // original mtime (touch -r / cp -p) leaves size + mtime + mode identical. The
+  // structural digest also seals ctimeMs, which no user-facing API can reset, so
+  // the swap still moves the fingerprint.
+  const { statSync } = require('node:fs');
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    const pkg = path.join(repo, 'node_modules', 'dep');
+    await mkdir(pkg, { recursive: true });
+    const target = path.join(pkg, 'index.js');
+    // Pin mtime to a fixed integer-ms instant so restoring it after the rewrite
+    // yields a byte-identical mtimeMs (no sub-ms rounding), isolating ctime as
+    // the only differing metadata.
+    const fixed = new Date('2021-06-01T00:00:00.000Z');
+    await writeFile(target, 'AAAA');
+    await utimes(target, fixed, fixed);
+    const s1 = statSync(target);
+    const before = await workingTreeFingerprint(repo);
+    // Same-length rewrite, then restore the pinned mtime.
+    await writeFile(target, 'BBBB');
+    await utimes(target, fixed, fixed);
+    const s2 = statSync(target);
+    const after = await workingTreeFingerprint(repo);
+    // Preconditions: only ctime differs between the two snapshots.
+    assert.equal(s2.size, s1.size, 'precondition: same length');
+    assert.equal(s2.mtimeMs, s1.mtimeMs, 'precondition: mtime restored to an identical value');
+    assert.notEqual(s2.ctimeMs, s1.ctimeMs, 'precondition: ctime moved (the only differing metadata)');
+    assert.notEqual(before, after, 'a same-length rewrite with restored mtime must still change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint fails closed when a node_modules tree exceeds the structural cap', async () => {
+  // Codex UnKZ0 / Qodo UmhWL: exceeding the entry cap must BLOCK (throw), not
+  // silently seal a truncated prefix that stays identical across checkpoints
+  // while hiding a dependency changed past the cutoff. The cap is injectable so
+  // the truncation path is pinned without building a 200k-entry tree.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    const pkg = path.join(repo, 'node_modules', 'dep');
+    await mkdir(pkg, { recursive: true });
+    for (let i = 0; i < 8; i += 1) {
+      await writeFile(path.join(pkg, `file-${i}.js`), `module.exports = ${i};\n`);
+    }
+    // A generous cap seals the whole tree without error.
+    const ok = await workingTreeFingerprint(repo, [], { maxStructuralDigestEntries: 10_000 });
+    assert.ok(ok, 'a tree under the cap seals normally');
+    // A tiny cap forces truncation, which must fail closed.
+    await assert.rejects(
+      workingTreeFingerprint(repo, [], { maxStructuralDigestEntries: 3 }),
+      /structural walk exceeded 3 entries/,
+      'exceeding the structural cap must throw (fail closed), not seal a truncated prefix',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals nested workspace node_modules roots', async () => {
+  // Codex Ummso: in a monorepo, a package-local node_modules
+  // (packages/api/node_modules) is pathspec-excluded from the ignored-untracked
+  // listing and is NOT under the repo-root node_modules, so a repo-root-only
+  // structural digest would miss a mutation there. All workspace node_modules
+  // roots must be discovered and sealed.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    const nested = path.join(repo, 'packages', 'api', 'node_modules', 'dep');
+    await mkdir(nested, { recursive: true });
+    await writeFile(path.join(nested, 'index.js'), 'AAAA');
+
+    // Sanity: the nested node_modules is genuinely ignored (not an untracked
+    // touched file), so only the structural digest can seal it.
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    assert.ok(
+      !state.touchedFiles.some((file) => file.includes('node_modules/')),
+      `nested node_modules must be ignored, got: ${JSON.stringify(state.touchedFiles)}`,
+    );
+
+    const before = await workingTreeFingerprint(repo);
+    // Mutate the package-local dependency (size change) — must move the seal.
+    await writeFile(path.join(nested, 'index.js'), 'BBBBBB');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(before, after, 'a package-local node_modules mutation must change the fingerprint');
+    // Adding a file under the nested root must also move the seal.
+    await writeFile(path.join(nested, 'extra.js'), 'x\n');
+    const afterAdd = await workingTreeFingerprint(repo);
+    assert.notEqual(after, afterAdd, 'adding a file under a nested node_modules must change the fingerprint');
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

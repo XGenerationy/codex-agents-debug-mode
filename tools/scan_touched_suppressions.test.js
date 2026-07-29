@@ -183,6 +183,38 @@ test('collectContentRemovals exempts a package.json version + description bump (
   assert.deepEqual(collectContentRemovals(diff), []);
 });
 
+test('collectContentRemovals STILL flags a .codereview.yml version field weakening (metadata exemption must not leak, Codex UnKZ7)', async () => {
+  // The SAFE_METADATA_KEY allowlist (version, description, ...) matches by key
+  // name alone; without file scoping it would treat a gate-POLICY file's own
+  // `version:` schema field as a cosmetic package-manifest bump. A
+  // .codereview.yml is not a package manifest, so this same-key replacement
+  // must stay flagged exactly like any other unscoped content removal.
+  const before = 'version: 1\nrules:\n  - id: no-suppressions\n';
+  const after = 'version: 0\nrules:\n  - id: no-suppressions\n';
+  const diff = await singleFileDiff('.codereview.yml', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /version:\s*1/.test(line)),
+    `expected the .codereview.yml version weakening to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals exempts a version bump in other package manifests (pyproject.toml, Cargo.toml)', async () => {
+  // The metadata-replacement allowlist is scoped to recognized package
+  // manifests generically, not just package.json -- SAFE_METADATA_KEY already
+  // matches TOML's unquoted `key = "value"` form. A routine version bump in a
+  // Python/Rust manifest must stay exempt exactly like package.json's.
+  const pyBefore = '[project]\nname = "x"\nversion = "1.2.3"\n';
+  const pyAfter = '[project]\nname = "x"\nversion = "1.2.4"\n';
+  const pyDiff = await singleFileDiff('pyproject.toml', pyBefore, pyAfter);
+  assert.deepEqual(collectContentRemovals(pyDiff), []);
+
+  const cargoBefore = '[package]\nname = "x"\nversion = "1.2.3"\n';
+  const cargoAfter = '[package]\nname = "x"\nversion = "1.2.4"\n';
+  const cargoDiff = await singleFileDiff('Cargo.toml', cargoBefore, cargoAfter);
+  assert.deepEqual(collectContentRemovals(cargoDiff), []);
+});
+
 test('collectContentRemovals STILL flags a weakened test script replacement', async () => {
   // Preserve detection: `"test": "jest --coverage"` -> `"echo skip"`. The key
   // `test` is not an allowlisted descriptive field, so the removal is not a
@@ -331,12 +363,77 @@ test('collectContentRemovals STILL flags a tsconfig.json value change (package.j
   );
 });
 
+test('collectContentRemovals STILL flags a nested coverageThreshold value inside package.json (Codex UnT4H)', async () => {
+  // The package.json same-key allowance is meant for top-level, single-line
+  // JSON *string* fields (dependency versions, script commands) where the key
+  // is the change's true identity. A nested numeric leaf like
+  // `coverageThreshold.global.lines` shares no such guarantee -- `lines` is a
+  // generic key that says nothing about what it gates -- so it must stay
+  // flagged even though it is a same-key, same-line replacement.
+  const before = pkg({
+    version: '1.0.0',
+    jest: { coverageThreshold: { global: { lines: 80 } } },
+  });
+  const after = pkg({
+    version: '1.0.0',
+    jest: { coverageThreshold: { global: { lines: 50 } } },
+  });
+  const diff = await singleFileDiff('package.json', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /"lines":\s*80/.test(line)),
+    `expected the lowered nested coverage threshold to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a nested passWithNoTests boolean inside package.json (Codex UnT4H)', async () => {
+  // Same root cause as the coverageThreshold case: a non-string (boolean)
+  // nested leaf must never qualify as a safe same-key package.json field
+  // replacement, even though `passWithNoTests` itself clears
+  // VALIDATION_KEY_HINT and the surrounding jest block is a same-key edit.
+  const before = pkg({ version: '1.0.0', jest: { passWithNoTests: false } });
+  const after = pkg({ version: '1.0.0', jest: { passWithNoTests: true } });
+  const diff = await singleFileDiff('package.json', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /"passWithNoTests":\s*false/.test(line)),
+    `expected the weakened passWithNoTests flag to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
 test('collectContentRemovals exempts a workflow action pin bump (same action, different ref)', async () => {
   // Reported false positive: bumping actions/checkout's pinned SHA/tag is a
   // routine, benign edit -- the action path (not the fixed `uses` key) is
   // this line's real identity, and it is unchanged here.
   const before = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v3\n';
   const after = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n';
+  const diff = await singleFileDiff('.github/workflows/ci.yml', before, after);
+  assert.deepEqual(collectContentRemovals(diff), []);
+});
+
+test('collectContentRemovals STILL flags a full-SHA action pin downgraded to a mutable ref (Codex UnT4I/UnS2f)', async () => {
+  // A 40-char (or 64-char) hex `uses:` ref is the immutable pin GitHub
+  // Actions' own guidance recommends; replacing it with a mutable tag or
+  // branch name reintroduces the exact supply-chain risk pinning exists to
+  // prevent. This must stay flagged even though the action path is unchanged
+  // and it is otherwise a same-key replacement identical in shape to the
+  // exempt tag-bump case above.
+  const before = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@8f4b7f84864484a7bf31766abe9204da3cbe65b3\n';
+  const after = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@main\n';
+  const diff = await singleFileDiff('.github/workflows/ci.yml', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /actions\/checkout@8f4b7f84864484a7bf31766abe9204da3cbe65b3/.test(line)),
+    `expected the SHA-to-mutable-ref downgrade to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals exempts a full-SHA action pin rotated to a different full-SHA', async () => {
+  // A SHA-to-SHA rotation (e.g. picking up a new upstream release commit)
+  // must remain exempt -- the immutability guarantee is preserved, so the
+  // UnT4I/UnS2f fix must not overreject legitimate same-strength pin updates.
+  const before = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@8f4b7f84864484a7bf31766abe9204da3cbe65b3\n';
+  const after = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744\n';
   const diff = await singleFileDiff('.github/workflows/ci.yml', before, after);
   assert.deepEqual(collectContentRemovals(diff), []);
 });
@@ -387,5 +484,55 @@ test('collectContentRemovals tracks the current file across a multi-file diff', 
   assert.ok(
     removals.some((line) => /verify-artifacts\.sh/.test(line)),
     `workflow validation replacement must still be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals does not pair a removal with an unrelated addition in a distant hunk (Codex UmlJp)', async () => {
+  // Same-key pairing must stay scoped to the hunk it occurs in. Padding lines
+  // force the version removal and the unrelated `overrides.version` addition
+  // into separate hunks under --unified=0; the removal must not be
+  // opportunistically paired with a same-keyed addition from a different hunk.
+  const before = pkg({
+    version: '1.2.3',
+    padding01: 'a', padding02: 'b', padding03: 'c', padding04: 'd',
+    padding05: 'e', padding06: 'f', padding07: 'g', padding08: 'h',
+    scripts: { build: 'webpack' },
+  });
+  const after = pkg({
+    padding01: 'a', padding02: 'b', padding03: 'c', padding04: 'd',
+    padding05: 'e', padding06: 'f', padding07: 'g', padding08: 'h',
+    scripts: { build: 'webpack' },
+    overrides: { version: '9.9.9' },
+  });
+  const diff = await singleFileDiff('package.json', before, after);
+  const hunkCount = (diff.match(/^@@/gm) || []).length;
+  assert.ok(hunkCount >= 2, `fixture must produce multiple hunks to test cross-hunk pairing; got ${hunkCount}`);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /"version":\s*"1\.2\.3"/.test(line)),
+    `expected the unpaired version removal to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals does not pair a removal in one file with an addition in a different file (Codex UmlJp)', async () => {
+  // currentFile tracking must gate pairing exactly like exemption checks do:
+  // a version removed from the root package.json must never be paired with an
+  // unrelated version added to a nested package.json in the same combined diff.
+  const diff = await multiFileDiff([
+    {
+      relPath: 'package.json',
+      before: pkg({ version: '1.2.3', scripts: { build: 'webpack' } }),
+      after: pkg({ scripts: { build: 'webpack' } }),
+    },
+    {
+      relPath: 'packages/nested/package.json',
+      before: pkg({ scripts: { build: 'webpack' } }),
+      after: pkg({ version: '9.9.9', scripts: { build: 'webpack' } }),
+    },
+  ]);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /"version":\s*"1\.2\.3"/.test(line)),
+    `expected the version removal in package.json to be flagged; got ${JSON.stringify(removals)}`,
   );
 });

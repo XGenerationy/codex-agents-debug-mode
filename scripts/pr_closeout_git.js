@@ -43,7 +43,8 @@ const normalizePath = (file) => String(file).replaceAll('\\', '/').replace(/^\.\
 /**
  * True when `file` is one of the paths that define or configure validation
  * strength: CI workflows, package manifests/lockfiles across ecosystems
- * (JS/TS, Python, Rust, Go, Yarn, Bun), linter/formatter configs, Makefiles
+ * (JS/TS, Python, Rust, Go, Ruby, PHP, Elixir, CocoaPods, Dart, Gradle),
+ * linter/formatter configs, Makefiles
  * (including GNU make's alternate default filenames), test-runner configs,
  * the closeout tool's own config file, and this repository's authoritative
  * `.codereview.yml` gate config. This is the classifier classifyGateIntegrity
@@ -67,14 +68,22 @@ const isGateFile = (file) => {
     // actually discovers is treated as a gate change.
     || /^(?:gnu)?makefile(?:\..+)?$/.test(base)
     || /^(?:pnpm-lock\.yaml|pnpm-workspace\.yaml|package-lock\.json|npm-shrinkwrap\.json|lerna\.json|nx\.json|turbo\.json|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
-    // Non-JS validation manifests/lockfiles (Python: pyproject.toml, pytest.ini,
-    // tox.ini; Rust: Cargo.toml; Go: go.mod; Yarn: yarn.lock; Bun: bun.lock) plus
-    // this repo's own authoritative gate config (.codereview.yml, self-declared as
-    // the single source auditors read to understand the gate). Deleting a test
-    // command, coverage threshold, or dependency lock from any of these weakens
-    // validation exactly as editing package.json or a workflow does. Exact
-    // basenames only, so a random foo.toml / notes.ini is not treated as a gate file.
-    || /^(?:pyproject\.toml|pytest\.ini|tox\.ini|cargo\.toml|go\.mod|yarn\.lock|bun\.lock|\.codereview\.ya?ml)$/.test(base)
+    // Non-JS validation manifests (Python: pyproject.toml, pytest.ini, tox.ini;
+    // Rust: Cargo.toml; Go: go.mod) plus this repo's own authoritative gate
+    // config (.codereview.yml/.yaml, self-declared as the single source auditors
+    // read to understand the gate). Deleting a test command or coverage
+    // threshold from any of these weakens validation exactly as editing
+    // package.json or a workflow does. Exact basenames only, so a random
+    // foo.toml / notes.ini is not treated as a gate file.
+    || /^(?:pyproject\.toml|pytest\.ini|tox\.ini|cargo\.toml|go\.mod|\.codereview\.ya?ml)$/.test(base)
+    // Generated ecosystem dependency lockfiles. Deleting or weakening one drops
+    // dependency pinning exactly as deleting package-lock.json does, so it must
+    // reach readGateChanges and the gate-removal checks. Kept a superset of
+    // tools/scan_touched_suppressions.js's isMechanicalLockfile list so the two
+    // files agree on what a lockfile is (npm/pnpm JS lockfiles are already
+    // covered above). Exact basenames only. bun.lockb? matches Bun's text
+    // (bun.lock) and binary (bun.lockb) lockfiles.
+    || /^(?:yarn\.lock|bun\.lockb?|cargo\.lock|go\.sum|poetry\.lock|gemfile\.lock|pipfile\.lock|composer\.lock|mix\.lock|podfile\.lock|pubspec\.lock|gradle\.lockfile)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
     || /(?:^|\/)\.?pr-closeout(?:\.[^/]+)?\.json$/.test(normalized);
 };

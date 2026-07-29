@@ -340,20 +340,73 @@ test('classifies a no-work summary that appears after the report capture cap', a
   // produces different wording -- so matching it proves the post-cap summary
   // was caught by the stream, not by the (now blind) capped string.
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-tail-nowork-'));
-  const execute = createCommandExecutor({
+  try {
+    const execute = createCommandExecutor({
+      repo: process.cwd(),
+      outputDir,
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+    });
+    const result = await execute({
+      id: 'tail-nowork',
+      command: "process.stdout.write('x'.repeat(2100000) + '\\nNo tests found, exiting with code 0\\n')",
+    }, 'qualification');
+    assert.equal(result.stdout.length, 2_000_000);
+    assert.doesNotMatch(result.stdout, /no tests found/i);
+    assert.equal(result.status, 'FAIL', statusDiag(result));
+    assert.match(result.evidence, /no-work/i);
+  } finally {
+    // ~2 MB raw evidence log; every other filesystem test cleans up (UmlJZ).
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('probeCommandDefault records a status signal that streams past the capture cap', async () => {
+  // Codex UnKZ9: `cap` discards everything past CAPTURE_LIMIT, so a preflight
+  // tool probe that streams more than that before a warning/failure/skip signal
+  // (then exits 0) pushes the signal past the cap where classifyOutput can no
+  // longer see it -- and would mark the required tool probe PASS. The full-stream
+  // scanner must record that post-cap signal in detectedSignals so classifyOutput
+  // still refuses PASS, mirroring spawnCaptured's own raw scanner (already covered
+  // for the executor path by the tail-warning/no-work tests above).
+  const { EventEmitter } = require('node:events');
+  const { classifyOutput } = require('./pr_closeout_core');
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  const result = await probeCommandDefault({
+    command: 'streamed-by-fake-child',
     repo: process.cwd(),
-    outputDir,
     shell: process.execPath,
-    shellArgs: (command) => ['-e', command],
+    env: process.env,
+    platform: 'win32', // skip the POSIX /proc starttime read and spawn-mark bookkeeping
+    // Drive the streams the way a real child would -- a >2 MB clean prefix, then
+    // a warning past the cap, then a clean exit -- without depending on any
+    // shell's ability to emit 2 MB cross-platform. spawnProcess/terminateTree
+    // are first-class injection seams on probeCommandDefault for exactly this.
+    spawnProcess: () => {
+      setImmediate(() => {
+        child.stdout.emit('data', Buffer.from('x'.repeat(2_100_000), 'utf8'));
+        child.stdout.emit('data', Buffer.from('\nUserWarning: unsafe tail past the capture cap\n', 'utf8'));
+        child.emit('close', 0, null);
+      });
+      return child;
+    },
+    terminateTree: async () => ({ status: 'PASS', evidence: 'no tree', escalated: false }),
   });
-  const result = await execute({
-    id: 'tail-nowork',
-    command: "process.stdout.write('x'.repeat(2100000) + '\\nNo tests found, exiting with code 0\\n')",
-  }, 'qualification');
+  assert.equal(result.exitCode, 0);
+  // The persisted stdout is capped and no longer carries the signal...
   assert.equal(result.stdout.length, 2_000_000);
-  assert.doesNotMatch(result.stdout, /no tests found/i);
-  assert.equal(result.status, 'FAIL', statusDiag(result));
-  assert.match(result.evidence, /no-work/i);
+  assert.doesNotMatch(result.stdout, /UserWarning/);
+  // ...but the full-stream scanner recorded it, so classifyOutput still sees it.
+  assert.ok(
+    Array.isArray(result.detectedSignals) && result.detectedSignals.length > 0,
+    'the post-cap warning must be recorded in detectedSignals',
+  );
+  assert.match(result.detectedSignals.join('\n'), /UserWarning/);
+  assert.equal(classifyOutput(result).status, 'FAIL');
 });
 
 test('hashes full output beyond the report capture cap', async () => {
@@ -1471,6 +1524,105 @@ test('binds an evidence log header write to the validated logs directory identit
   } finally {
     await rm(logsDir, { recursive: true, force: true });
   }
+});
+
+test('binds the evidence log append stream to the validated logs directory and header file identity', { timeout: 30000 }, async () => {
+  // CodeRabbit UmlJX / Codex UnKZ4: openLogNoFollow's O_NOFOLLOW guards only the
+  // final path component, so a `logs` swap -- or the header file itself being
+  // replaced in place -- between writeLogHeaderNoFollow() and the append reopen
+  // could redirect every captured byte into a substituted directory/file while
+  // the report still names the original path. spawnCaptured must reject the
+  // reopen when the threaded parent-dir OR header-file identity no longer
+  // matches, degrading to logWriteError (never appending), while still appending
+  // when both identities match.
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-append-bind-'));
+  const logPath = path.join(logsDir, 'qualification.typecheck.attempt-001.log');
+  const baseArgs = {
+    command: "process.stdout.write('bound-evidence')",
+    cwd: process.cwd(),
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+    timeoutMs: 5000,
+    env: process.env,
+    logPath,
+  };
+  try {
+    const real = await lstat(logsDir);
+    // Establish the header exactly as createCommandExecutor does, capturing the
+    // header file's own identity to thread into the append reopen.
+    const fileIdentity = await writeLogHeaderNoFollow(
+      logPath,
+      'command: bound\ncwd: <repo>\n',
+      { dev: real.dev, ino: real.ino },
+    );
+
+    // A mismatching PARENT identity stands in for outputDir/logs swapped between
+    // the header write and this append open.
+    const swappedDir = await spawnCaptured({
+      ...baseArgs,
+      securedDirIdentity: { dev: real.dev + 1, ino: real.ino },
+      securedFileIdentity: fileIdentity,
+    });
+    assert.equal(swappedDir.exitCode, 0);
+    assert.equal(typeof swappedDir.logWriteError, 'string');
+    assert.match(swappedDir.logWriteError, /swapped after validation/);
+
+    // A mismatching FILE identity stands in for the header file replaced in
+    // place (same directory) after its header write. Reuse the directory's
+    // own real ino (always distinct from the file's) rather than
+    // `fileIdentity.ino + 1`: real NTFS file IDs are 64-bit and routinely
+    // exceed Number.MAX_SAFE_INTEGER, where float64 rounding can make `+ 1`
+    // silently collide back to the original value.
+    const swappedFile = await spawnCaptured({
+      ...baseArgs,
+      securedDirIdentity: { dev: real.dev, ino: real.ino },
+      securedFileIdentity: { dev: fileIdentity.dev, ino: real.ino },
+    });
+    assert.match(swappedFile.logWriteError, /swapped after its header write/);
+
+    // Neither rejected open may have appended: the file still holds only the header.
+    assert.doesNotMatch(await readFile(logPath, 'utf8'), /bound-evidence/);
+
+    // Matching identities still append the captured evidence (happy path).
+    const bound = await spawnCaptured({
+      ...baseArgs,
+      securedDirIdentity: { dev: real.dev, ino: real.ino },
+      securedFileIdentity: fileIdentity,
+    });
+    assert.equal(bound.exitCode, 0);
+    assert.ok(!bound.logWriteError, statusDiag(bound));
+    assert.match(await readFile(logPath, 'utf8'), /bound-evidence/);
+  } finally {
+    await rm(logsDir, { recursive: true, force: true });
+  }
+});
+
+test('removes the spawn mark from the shared registry even when the spawn throws', async () => {
+  // CodeRabbit UmlJY: knownSiblingMarks.add(mark) and its paired delete must be
+  // wrapped in try/finally. A synchronous throw from spawnProcess between them
+  // would otherwise leak the mark forever; because listLivePidsWithCwdUnder
+  // excludes any live process still carrying a registered sibling mark, a
+  // genuinely detached orphan would then silently escape orphan detection
+  // (failing OPEN) instead of forcing BLOCKED.
+  const activeSpawnMarks = new Set();
+  await assert.rejects(
+    spawnCaptured({
+      command: "process.stdout.write('unreached')",
+      cwd: process.cwd(),
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+      timeoutMs: 5000,
+      env: process.env,
+      // Nonexistent parent dir: the log open fails softly (logWriteError), so
+      // execution still reaches the spawn -- which throws below.
+      logPath: path.join(tmpdir(), `closeout-mark-leak-${Date.now()}-missing`, 'log.txt'),
+      platform: 'linux', // force a non-empty spawnMark (win32 uses '')
+      knownSiblingMarks: activeSpawnMarks,
+      spawnProcess: () => { throw new Error('spawn exploded'); },
+    }),
+    /spawn exploded/,
+  );
+  assert.equal(activeSpawnMarks.size, 0, 'spawn mark must not leak into the registry after a throw');
 });
 
 test(

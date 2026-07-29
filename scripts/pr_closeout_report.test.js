@@ -25,7 +25,7 @@ const windowsAclIsCurrentUserOnly = (filePath) => {
   return spawnSync(
     'powershell.exe',
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { encoding: 'utf8', windowsHide: true },
+    { encoding: 'utf8', windowsHide: true, timeout: 15000 },
   );
 };
 
@@ -35,7 +35,7 @@ const windowsAclIsCurrentUserOnly = (filePath) => {
 const grantInheritedReadToUsers = (dir) => spawnSync(
   'icacls',
   [dir, '/grant', '*S-1-5-32-545:(OI)(CI)(R)'],
-  { encoding: 'utf8', windowsHide: true },
+  { encoding: 'utf8', windowsHide: true, timeout: 15000 },
 );
 
 const hostile = '<script>alert(1)</script>\n# Injected\n[click](javascript:alert(1)) | extra';

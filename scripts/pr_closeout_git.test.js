@@ -821,6 +821,59 @@ test('treats multi-language validation manifests as gate files', () => {
   }
 });
 
+test('treats ecosystem dependency lockfiles as validation-defining gate files', () => {
+  // Deleting or weakening a lockfile drops dependency pinning exactly as
+  // deleting package-lock.json does, so each must be visible to readGateChanges
+  // and the gate-removal checks. These basenames mirror (and stay a superset
+  // of) tools/scan_touched_suppressions.js's isMechanicalLockfile list so the
+  // closeout classifier and the CI suppression scanner agree on what a lockfile
+  // is. bun.lock (text) and bun.lockb (binary) are both Bun lockfiles.
+  for (const file of [
+    'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
+    'Cargo.lock',
+    'go.sum',
+    'poetry.lock',
+    'Gemfile.lock',
+    'Pipfile.lock',
+    'composer.lock',
+    'mix.lock',
+    'Podfile.lock',
+    'pubspec.lock',
+    'gradle.lockfile',
+    // Recognized regardless of directory depth (mirrors package.json handling)
+    // and case (the classifier lowercases the basename).
+    'crates/core/Cargo.lock',
+    'services/api/go.sum',
+    'ios/Podfile.lock',
+  ]) {
+    assert.equal(isGateFile(file), true, file);
+  }
+  // Exact basenames only: a lockfile-shaped name that is not a real lockfile
+  // basename must not be swept in by substring/extension overmatch.
+  for (const file of ['notes.lock', 'foo.sum', 'src/cargo.lock.ts', 'my.gradle.lockfile.bak']) {
+    assert.equal(isGateFile(file), false, file);
+  }
+});
+
+test('a deleted ecosystem lockfile fails closed even with a live attestation', () => {
+  // The security point of classifying these as gate files: deleting one must
+  // reach classifyGateIntegrity's deleted-gate-file check and FAIL closed,
+  // exactly as deleting package-lock.json does, instead of PASSing on trust.
+  const base = { baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
+  for (const lockfile of ['Cargo.lock', 'go.sum', 'poetry.lock', 'Gemfile.lock', 'Pipfile.lock']) {
+    const result = classifyGateIntegrity({
+      ...base,
+      changedFiles: [lockfile],
+      deletedFiles: [lockfile],
+      attestation: liveAttestation(),
+    });
+    assert.equal(result.status, 'FAIL', lockfile);
+    assert.match(result.evidence, /deleted/i);
+  }
+});
+
 test('does not flag .codereview.yml prose naming a flag as gate weakening', () => {
   // Real .codereview.yml text: "FAIL on ... an existing target without
   // --force, or invalid JSON output." Once .codereview.yml is a recognized
