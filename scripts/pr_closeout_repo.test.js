@@ -243,6 +243,36 @@ test('readProjectMetadata captures an inline make recipe after prerequisites, us
   }
 });
 
+test('readProjectMetadata keeps the LAST single-colon recipe for a repeated target (Codex U2TJF)', async () => {
+  // GNU make warns "overriding recipe" / "ignoring old recipe" and runs the
+  // LATER recipe for a single-colon target defined more than once, so a safe
+  // first recipe followed by a failure-neutralizing override must surface the
+  // override (the one `make <target>` actually executes) for inspection --
+  // previously the first definition was kept and the later override was missed.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-single-colon-override-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render:\n\t@echo safe first recipe\ngrafana-render:\n\tnode render.js >/dev/null 2>&1 || true\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    const recipe = metadata.makeRecipes['grafana-render'];
+    assert.ok(recipe?.includes('|| true'), `the LATER (neutralizing) single-colon recipe must be captured, got: ${JSON.stringify(recipe)}`);
+    assert.ok(!recipe?.includes('safe first recipe'), `the overridden first recipe must be replaced, got: ${JSON.stringify(recipe)}`);
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('readProjectMetadata aggregates every double-colon recipe for a target (Codex Uz6Am)', async () => {
   // GNU make executes EVERY defined `target::` (double-colon) recipe
   // independently, so a later `grafana-render::` block hiding a failure-

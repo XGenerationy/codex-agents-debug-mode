@@ -418,11 +418,11 @@ const readProjectMetadata = async (repo) => {
       // (GNU make's default recipe-line convention), captured so a resolved
       // make target's body can be checked for failure-neutralizing patterns
       // the same way an auto-discovered package script is (Codex Ummss) — the
-      // first definition's recipe wins for a repeated SINGLE-COLON target
-      // (later single-colon definitions are Make-level overrides, not
-      // independently-run recipes), while a DOUBLE-COLON target aggregates
-      // every recipe block because GNU make runs each independently (Codex
-      // Uz6Am) -- see doubleColon below. Two gaps let a
+      // a repeated SINGLE-COLON target keeps the LAST definition's recipe
+      // (GNU make warns "overriding/ignoring old recipe" and runs the later
+      // one), while a DOUBLE-COLON target aggregates every recipe block
+      // because GNU make runs each independently (Codex Uz6Am/U2TJF) -- see
+      // doubleColon below. Two gaps let a
       // neutralizing command hide from that check entirely: (1) GNU make also
       // accepts an inline recipe on the target line itself after a `;`
       // (`target: ; recipe` / `target: prereq ; recipe`), which a scan
@@ -449,7 +449,14 @@ const readProjectMetadata = async (repo) => {
         // recipe-wins. match[2] is the matched colon run.
         const doubleColon = match[2] === '::';
         targets.push(target);
-        if (doubleColon || !Object.hasOwn(makeRecipes, target)) {
+        // Capture EVERY definition: a single-colon target redefined with a
+        // recipe REPLACES the earlier body (GNU make warns "overriding/ignoring
+        // old recipe" and runs the LATER recipe, so the last definition is what
+        // `make <target>` executes -- a safe first recipe followed by a
+        // neutralizing override must be the one inspected, Codex U2TJF), while
+        // a double-colon target AGGREGATES every recipe (GNU make runs each
+        // independently, Codex Uz6Am).
+        {
           const recipeLines = [];
           const afterColon = lines[i].slice(match[0].length);
           // GNU make strips a comment (an unescaped `#`) from a target/

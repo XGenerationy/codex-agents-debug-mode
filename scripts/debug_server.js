@@ -109,7 +109,17 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
       const info = fstatSync(fd);
       if (!info.isFile() || info.nlink > 1) throw new Error('project_salt_not_regular_file');
       const buffer = Buffer.alloc(32);
-      const bytesRead = readSync(fd, buffer, 0, 32, 0);
+      // Loop until all 32 bytes are read or a genuine EOF is hit: some
+      // filesystems/mounts return a short read (fewer than the requested
+      // bytes) before EOF, which a single read would misclassify as a corrupt
+      // salt and needlessly rotate, churning project_hash while a live
+      // collector still uses the original (Codex U2TI9).
+      let bytesRead = 0;
+      while (bytesRead < 32) {
+        const n = readSync(fd, buffer, bytesRead, 32 - bytesRead, bytesRead);
+        if (n <= 0) break; // 0 => real EOF before 32 bytes.
+        bytesRead += n;
+      }
       if (bytesRead !== 32) throw new Error('project_salt_short_read');
       return buffer;
     } finally {
@@ -169,7 +179,14 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     const fd = openNoFollowSync(tempFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     try {
       try {
-        writeSync(fd, salt, 0, 32, 0);
+        // Loop until all 32 bytes are written: a short write (possible on some
+        // filesystems/mounts) would otherwise publish a truncated salt, the
+        // symmetric of the short-read fix in readExisting (Codex U2TI9).
+        for (let written = 0; written < 32; ) {
+          const n = writeSync(fd, salt, written, 32 - written, written);
+          if (n <= 0) throw new Error('project_salt_short_write');
+          written += n;
+        }
       } catch (error) {
         // A write failure (ENOSPC, quota, I/O error) must not leak the
         // just-created private temp file in .debug on every failed write --
