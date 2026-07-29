@@ -83,6 +83,17 @@ const CONFIG_MAX_BYTES = 1_048_576;
  * side reports ino 0 (some FAT/network mounts never assign real inodes) both
  * carry no verified identity to compare, so both are rejected rather than
  * silently skipping the comparison and trusting whatever the open returned.
+ *
+ * The read itself is bounded and re-verified, not just the pre-read stat: a
+ * short read (EOF before `offset` reaches the stated size) means the config
+ * was truncated after the stat but before the read finished, and is rejected
+ * rather than silently parsed as whatever shorter document that partial read
+ * produced. The same open descriptor is then re-stat'd after the read and
+ * compared back against the pre-read stat (dev/ino/size/mtimeMs); a mismatch
+ * means the file was rewritten in place while it was being read, so the
+ * bytes just parsed cannot be trusted as the file that was actually
+ * inspected above. Both mirror readBoundArtifactJson's before/after
+ * descriptor comparison (pr_closeout_process.js).
  * @param {string} configPath path passed via --config.
  * @param {{
  *   openFile?: (target: string, flags: number) => Promise<import('node:fs/promises').FileHandle>,
@@ -141,6 +152,30 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
       const { bytesRead } = await handle.read(buffer, offset, info.size - offset, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
+    }
+    // Reaching EOF before `offset` reaches `info.size` means the config was
+    // truncated after the stat above but before this loop finished reading
+    // it. Parsing the shorter bytes anyway would silently accept whatever
+    // partial (even trivially valid, e.g. `{}`) replacement landed in that
+    // gap instead of the file that was actually inspected above.
+    if (offset !== info.size) {
+      throw new Error(`Closeout config was truncated while it was being read: ${target}.`);
+    }
+    // A full read can still have raced an in-place rewrite that completed
+    // entirely between the stat above and here (same byte count, different
+    // content). Re-stat the same open descriptor -- not the path, which
+    // would reopen a fresh TOCTOU window -- and reject if its identity or
+    // size changed, mirroring the before/after descriptor comparison
+    // readBoundArtifactJson uses for evidence artifacts
+    // (pr_closeout_process.js).
+    const after = await handle.stat();
+    if (
+      after.dev !== info.dev
+      || after.ino !== info.ino
+      || after.size !== info.size
+      || after.mtimeMs !== info.mtimeMs
+    ) {
+      throw new Error(`Closeout config changed while it was being read: ${target}.`);
     }
     return JSON.parse(buffer.subarray(0, offset).toString('utf8'));
   } finally {

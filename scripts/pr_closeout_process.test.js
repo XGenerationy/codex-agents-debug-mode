@@ -1543,6 +1543,133 @@ test('binds an evidence log header write to the validated logs directory identit
   }
 });
 
+test('writes an evidence log header successfully whether or not the forced Linux fd-bind path has a working /proc', async () => {
+  // canBindLogParentByFd only checks the injected platform parameter, not the
+  // real host, so this exercises openLogBoundToParent even on non-Linux CI
+  // runners: on a host with a working /proc it takes the true directory-fd
+  // bind (Codex UrfDG); anywhere else (this suite's Windows matrix, or a
+  // Linux host with no /proc mounted) the /proc child open fails ENOENT, gets
+  // tagged procUnavailable, and openLogNoFollow falls back to the pre-fix
+  // path-based open. Either way the header write must succeed identically.
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-fdbind-plumbing-'));
+  const logPath = path.join(logsDir, 'qualification.fdbind-plumbing.attempt-001.log');
+  try {
+    const real = await lstat(logsDir);
+    const identity = await writeLogHeaderNoFollow(
+      logPath,
+      'command: ok\ncwd: <repo>\n',
+      { dev: real.dev, ino: real.ino },
+      'linux',
+    );
+    assert.match(await readFile(logPath, 'utf8'), /^command: ok/);
+    assert.equal(typeof identity.dev, 'number');
+    assert.equal(typeof identity.ino, 'number');
+  } finally {
+    await rm(logsDir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a leaf symlink swapped into the log path between the pre-open check and the forced Linux fd-bind open', { timeout: 30000 }, async (t) => {
+  // Codex #4781366510 follow-up: openLogBoundToParent's /proc/self/fd/<fd>/<base>
+  // child open lacked O_NOFOLLOW. assertLogNotSymlink's pre-open lstat check
+  // (openLogNoFollow's only guard on non-Linux platforms) cannot close this
+  // window by itself -- it runs once, before the fd-bind path is even chosen,
+  // so a leaf symlink swapped into place after that check sees a plain file
+  // but before the /proc child open executes would previously be followed
+  // silently even though the parent-directory identity is bound and verified.
+  // Force platform 'linux' so this exercises the true fd-bind path on any
+  // host with a working /proc. There is no fixed-identity trick that
+  // simulates this the way the directory-swap tests above do (the leaf has
+  // no separately-captured identity to mismatch), so this races many
+  // concurrent header writes against a tight rename+symlink retry loop --
+  // the same no-delay-retry shape as the logsDir swap race -- and, like that
+  // test, reports inconclusive rather than failing if the race is never won.
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-leaf-swap-'));
+  const attackerDir = await mkdtemp(path.join(tmpdir(), 'closeout-leaf-swap-attacker-'));
+  const logPath = path.join(logsDir, 'qualification.typecheck.attempt-001.log');
+  const attackerTarget = path.join(attackerDir, 'clobber-me.txt');
+  await writeFile(attackerTarget, 'do not overwrite this\n', 'utf8');
+  try {
+    const real = await lstat(logsDir);
+    const identity = { dev: real.dev, ino: real.ino };
+    await writeFile(logPath, 'seed\n', 'utf8');
+
+    let swapped = false;
+    let stop = false;
+    const attemptSwap = async () => {
+      if (swapped) return;
+      try {
+        await rm(logPath, { force: true });
+        await symlink(attackerTarget, logPath);
+        swapped = true;
+      } catch {
+        // Not yet free (a concurrent header write recreated it first), or
+        // file symlinks are unavailable here (no privilege on Windows);
+        // either way, retry immediately.
+      }
+    };
+    const retryLoop = (async () => {
+      while (!stop && !swapped) {
+        await attemptSwap();
+      }
+    })();
+
+    const attempts = Array.from({ length: 60 }, (_, i) => (
+      writeLogHeaderNoFollow(logPath, `command: race-${i}\ncwd: <repo>\n`, identity, 'linux').catch((error) => error)
+    ));
+    await Promise.all(attempts);
+    stop = true;
+    await retryLoop;
+
+    if (!swapped) {
+      t.diagnostic('could not win the leaf swap race; setup inconclusive');
+      return;
+    }
+    const attackerContents = await readFile(attackerTarget, 'utf8');
+    assert.equal(
+      attackerContents,
+      'do not overwrite this\n',
+      'evidence must never be written through a leaf symlink swapped in mid-open',
+    );
+  } finally {
+    await rm(logsDir, { recursive: true, force: true }).catch(() => {});
+    await rm(attackerDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('rejects a header write through an already-symlinked logs directory with a directory-specific message', {
+  skip: process.platform === 'win32' ? 'posix-only test' : false,
+}, async (t) => {
+  // openLogBoundToParent's own parent-directory open (O_DIRECTORY|O_NOFOLLOW)
+  // must surface a distinct "symlinked logs directory" message when `logs`
+  // is itself already a symlink, not openLogNoFollow's generic leaf-only
+  // "existing symlink: target" ELOOP rewrap -- callers matching on the
+  // former (the swap-race test above) name the parent, not the child, and no
+  // evidence may leak into the attacker-controlled target either way.
+  const base = await mkdtemp(path.join(tmpdir(), 'closeout-fdbind-parent-symlink-'));
+  const attackerDir = await mkdtemp(path.join(tmpdir(), 'closeout-fdbind-attacker-'));
+  const logsDir = path.join(base, 'logs');
+  const logPath = path.join(logsDir, 'qualification.probe.attempt-001.log');
+  try {
+    await symlink(attackerDir, logsDir, 'junction');
+  } catch (error) {
+    await rm(base, { recursive: true, force: true });
+    await rm(attackerDir, { recursive: true, force: true });
+    t.diagnostic(`directory symlinks unavailable here: ${error?.code || error}`);
+    return;
+  }
+  try {
+    await assert.rejects(
+      writeLogHeaderNoFollow(logPath, 'command: x\ncwd: <repo>\n', { dev: 1, ino: 1 }, 'linux'),
+      /symlinked logs directory/,
+    );
+    assert.deepEqual(await readdir(attackerDir), []);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+    await rm(attackerDir, { recursive: true, force: true });
+  }
+});
+
 test('binds the evidence log append stream to the validated logs directory and header file identity', { timeout: 30000 }, async (t) => {
   // CodeRabbit UmlJX / Codex UnKZ4: openLogNoFollow's O_NOFOLLOW guards only the
   // final path component, so a `logs` swap -- or the header file itself being
@@ -1662,6 +1789,60 @@ test('does not treat an unavailable recorded inode as evidence of an append-time
     assert.equal(result.exitCode, 0);
     assert.ok(!result.logWriteError, statusDiag(result));
     assert.match(await readFile(logPath, 'utf8'), /unavailable-ino-evidence/);
+  } finally {
+    await rm(logsDir, { recursive: true, force: true });
+  }
+});
+
+test('does not inject a stream label mid-line when normalizer output splits across pushes', async () => {
+  // Codex UrfC1 (P1): emitNormalized prefixed every normalizer push()/flush()
+  // output with `[stream] `, treating each call as a fresh line. A logical
+  // line can arrive across two calls with no newline between them -- exactly
+  // what the redactor/normalizer chain does after buffering a possible
+  // partial match -- so unconditional labeling spliced `[stdout] ` into the
+  // middle of persisted bytes (observed as `u[stdout] navailable-ino-evidence`
+  // on Node 24/Linux, breaking the "unavailable-ino-evidence" regression
+  // above there). Reproduce deterministically with a stubbed spawnProcess
+  // that emits the same line in two 'data' events with no newline between
+  // them, and empty pathReplacements/secretNames so the redactor/normalizer
+  // themselves cannot mask the boundary with their own buffering -- isolating
+  // emitNormalized's own labeling logic.
+  const { EventEmitter } = require('node:events');
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-line-split-'));
+  const logPath = path.join(logsDir, 'qualification.typecheck.attempt-001.log');
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  try {
+    const result = await spawnCaptured({
+      command: 'split-by-fake-child',
+      cwd: process.cwd(),
+      shell: process.execPath,
+      shellArgs: (command) => ['-e', command],
+      timeoutMs: 5000,
+      env: {},
+      redactionEnv: {},
+      secretNames: [],
+      pathReplacements: [],
+      logPath,
+      platform: 'win32', // skip the POSIX /proc starttime read -- a pure string-handling bug
+      spawnProcess: () => {
+        setImmediate(() => {
+          child.stdout.emit('data', Buffer.from('u', 'utf8'));
+          child.stdout.emit('data', Buffer.from('navailable-ino-evidence\n', 'utf8'));
+          child.emit('close', 0, null);
+        });
+        return child;
+      },
+      terminateTree: async () => ({ status: 'PASS', evidence: 'no tree', escalated: false }),
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, 'unavailable-ino-evidence\n');
+    const logged = await readFile(logPath, 'utf8');
+    assert.match(logged, /unavailable-ino-evidence/, `label must not split the line: ${JSON.stringify(logged)}`);
+    assert.equal((logged.match(/\[stdout\]/g) || []).length, 1, `line must be labeled exactly once: ${JSON.stringify(logged)}`);
   } finally {
     await rm(logsDir, { recursive: true, force: true });
   }
@@ -1929,15 +2110,13 @@ test('probeCommandDefault still BLOCKs on an unregistered mark-free/foreign desc
   // BLOCKED even though probeCommandDefault now accepts a knownSiblingMarks
   // parameter.
   //
-  // The foreign descendant must be spawned BY the probed command itself, not
-  // by a process that predates the probeCommandDefault call: minStarttime is
-  // captured fresh from THIS call's own spawned child (see listLivePidsWithCwdUnder's
-  // starttime gate), so a descendant that started earlier -- like a
-  // standalone "root" launcher spawned before probeCommandDefault runs -- is
-  // excluded by that gate before the mark check ever runs, regardless of its
-  // mark. Nesting the spawn inside the probed command guarantees the
-  // descendant starts at/after minStarttime, matching how a real foreign
-  // orphan actually arises from a probe's own command.
+  // This test nests the spawn inside the probed command itself -- a foreign
+  // descendant that appears WHILE the probe's own command is still running,
+  // e.g. something the probed command launched and detached from. The
+  // sibling scenario -- a foreign process already running before the probe
+  // even starts -- is covered separately below (Codex UrfC6): the sweep no
+  // longer exempts a candidate purely for predating the probe's own child,
+  // so both arrival orders must BLOCK on an unregistered mark.
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-preflight-foreign-'));
   let siblingPid = 0;
   try {
@@ -1966,6 +2145,112 @@ test('probeCommandDefault still BLOCKs on an unregistered mark-free/foreign desc
     if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
     await rm(repo, { recursive: true, force: true });
   }
+});
+
+test('probeCommandDefault still BLOCKs on an unregistered mark-free process that predates the probe', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Codex UrfC6 (P1): listLivePidsWithCwdUnder used to skip any candidate
+  // whose /proc starttime predated probeCommandDefault's own spawned child,
+  // before ever checking its cwd or spawn mark. A detached process already
+  // running under the repo -- with an unregistered (or forged) mark -- would
+  // therefore never be attributed and probeCommandDefault reported PASS even
+  // though the survivor could still mutate the repo after sealing. Spawn the
+  // untrusted process FIRST, then run the probe, so it is provably older
+  // than the probe's own child; it must still force BLOCKED.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-predates-probe-'));
+  let priorPid = 0;
+  try {
+    const prior = spawn(
+      process.execPath,
+      ['-e', 'process.stdout.write(String(process.pid));setInterval(()=>{},10000);'],
+      {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        cwd: repo,
+        detached: true,
+        env: { ...process.env, [SPAWN_MARK_ENV]: 'never-registered-mark' },
+      },
+    );
+    prior.unref();
+    prior.stdout.on('data', (chunk) => { priorPid = Number(String(chunk).trim()); });
+    for (let i = 0; i < 40 && !priorPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(priorPid > 0, 'prior process must report its pid');
+    // Let /proc settle so the prior process's starttime is unambiguously
+    // committed before the probe below spawns its own child.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const shell = resolveCommandShell({ env: process.env });
+    const result = await probeCommandDefault({
+      command: `'${process.execPath}' -e 'process.exit(0)'`,
+      repo,
+      shell,
+      env: process.env,
+      knownSiblingMarks: new Set(), // the prior process's mark was never registered
+    });
+    assert.equal(
+      result.terminationStatus,
+      'BLOCKED',
+      `a pre-existing untrusted repo process must still block: ${JSON.stringify(result)}`,
+    );
+    assert.match(result.terminationEvidence || '', /mark-free/i);
+  } finally {
+    if (priorPid) { try { process.kill(priorPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('probeCommandDefault gives each omitted-knownSiblingMarks call its own registry, never the shared default', async () => {
+  // Codex UrL5U (P1): knownSiblingMarks used to default to the single
+  // module-scoped EMPTY_MARK_SET and probeCommandDefault mutated it directly
+  // (.add/.delete), so two concurrent probes that both omitted
+  // knownSiblingMarks shared that exact same Set instance -- each probe's
+  // mark was visible to the other while both were in flight. Force the
+  // marks codepath with platform: 'linux' (spawnMark is '' on win32) and
+  // stub spawnProcess/terminateTree so nothing here depends on a real OS
+  // process; capture the Set each concurrent probe's terminateTree receives
+  // before that probe's own finally-block delete runs.
+  const { EventEmitter } = require('node:events');
+  const makeChild = (pid) => {
+    const child = new EventEmitter();
+    child.pid = pid;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    return child;
+  };
+  const seen = [];
+  const runProbe = (pid) => probeCommandDefault({
+    command: 'noop',
+    repo: process.cwd(),
+    shell: process.execPath,
+    env: process.env,
+    platform: 'linux', // force a non-empty spawnMark (win32 uses '')
+    spawnProcess: () => {
+      const child = makeChild(pid);
+      setImmediate(() => child.emit('close', 0, null));
+      return child;
+    },
+    terminateTree: async ({ knownSiblingMarks }) => {
+      // Copy membership now, before this probe's own `finally` deletes its
+      // mark -- the same Set reference goes back to size 0 once every probe
+      // below has settled, so a snapshot (not the live reference) is what
+      // proves what was visible while the other probe was concurrently
+      // in flight.
+      seen.push({ ref: knownSiblingMarks, snapshot: new Set(knownSiblingMarks) });
+      return { status: 'PASS', evidence: 'no tree', escalated: false };
+    },
+    // knownSiblingMarks intentionally omitted -- this is the default path.
+  });
+  const results = await Promise.all([runProbe(4242), runProbe(4243)]);
+  for (const result of results) assert.equal(result.exitCode, 0);
+  assert.equal(seen.length, 2);
+  const [a, b] = seen;
+  assert.notEqual(a.ref, b.ref, 'two concurrent omitted-argument probes must not share one registry');
+  assert.equal(a.snapshot.size, 1, `must see only its own mark, not the other probe's: ${[...a.snapshot]}`);
+  assert.equal(b.snapshot.size, 1, `must see only its own mark, not the other probe's: ${[...b.snapshot]}`);
 });
 
 test('runPreflight BLOCKs when a probe reports process-tree cleanup failure', async () => {

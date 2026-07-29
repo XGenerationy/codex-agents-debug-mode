@@ -263,12 +263,22 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
 /**
  * Secondary containment for setsid orphans that stripped the spawn mark
  * (e.g. `env -u <mark> setsid sh -c '...'`): finds live, non-zombie
- * processes that started at/after `minStarttime`, left the runner's session
- * (a same-session peer is a parallel test worker sharing process.cwd() as
- * the repo and must never be reaped), and either have a cwd under
- * `rootCwd` or — for an orphan that already chdir'd away — hold an open
- * file descriptor that resolves under `rootCwd`, a common precursor to a
- * late absolute-path write.
+ * processes that left the runner's session (a same-session peer is a
+ * parallel test worker sharing process.cwd() as the repo and must never be
+ * reaped), and either have a cwd under `rootCwd` or — for an orphan that
+ * already chdir'd away — hold an open file descriptor that resolves under
+ * `rootCwd`, a common precursor to a late absolute-path write.
+ *
+ * Deliberately NOT exempted: a candidate merely because it started before
+ * this spawn's own child (Codex UrfC6). The Windows CommandLine-based
+ * classifier treats a confidently-older process as proof of innocence
+ * because a path substring match is the only signal it has; this POSIX
+ * sweep already has strictly stronger evidence -- resolved `cwd`, the
+ * spawn-mark registry, and the PPID chain-to-runner check below -- so a
+ * pre-existing process is judged by those, not by its age. An unregistered
+ * or forged-mark process already sitting under the repo before the probe
+ * started is exactly the untrusted case this sweep exists to catch; a free
+ * pass for "older" would reopen that gap.
  *
  * When `rootPid` (the spawn's root pid) is given, a candidate whose UNBROKEN
  * PPID chain reaches the runner (`selfPid`) without passing through `rootPid`
@@ -292,7 +302,6 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
  */
 const listLivePidsWithCwdUnder = (rootCwd, {
   selfPid = process.pid,
-  minStarttime = 0,
   selfSession = null,
   rootPid = 0,
   knownSiblingMarks = EMPTY_MARK_SET,
@@ -407,13 +416,8 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       const fields = stat.slice(afterComm + 1).trimStart().split(/\s+/);
       const state = fields[0];
       if (state === 'Z') continue;
-      // /proc/pid/stat: after (comm) → state ppid pgrp session ... starttime is
-      // field index 19 in the post-comm fields (man proc_pid_stat).
+      // /proc/pid/stat: after (comm) → state ppid pgrp session (man proc_pid_stat).
       const session = Number(fields[3]);
-      const starttime = Number(fields[19]);
-      if (Number.isFinite(minStarttime) && Number.isFinite(starttime) && starttime < minStarttime) {
-        continue;
-      }
       // Only target processes that left the runner session (setsid/detached).
       // Same-session peers (parallel node:test workers) must not be reaped.
       if (Number.isFinite(runnerSession) && Number.isFinite(session) && session === runnerSession) {
@@ -1688,6 +1692,60 @@ const assertLogNotSymlink = async (target) => {
   );
 };
 
+// Linux only: /proc/self/fd/<fd>/<name> is a kernel-maintained magic symlink
+// that always resolves relative to whatever directory the fd currently
+// refers to, so opening a child through it is equivalent to a true
+// openat(dirfd, name) even if the `logs` name itself is renamed or replaced
+// with a symlink afterward. No other platform exposes an equivalent public
+// primitive (Codex UrfDG).
+const canBindLogParentByFd = (platform) => platform === 'linux';
+
+// Open `target` bound to the logs-directory identity ensureLogsDirSecured()
+// validated, closing (not just narrowing) the residual TOCTOU window
+// documented on assertLogParentIdentity below. Opens the parent directory
+// itself no-follow and fstats it against `expected` before ever touching the
+// child, then opens the child through that fd-bound /proc path so a later
+// rename/symlink swap of `logs` cannot redirect where the child lands.
+// Throws assertLogParentIdentity's own "swapped after validation" message on
+// an identity mismatch, and a distinct "symlinked logs directory" message
+// when the parent itself is already a symlink, so both stay recognizable to
+// callers already matching those strings. ENOENT from the /proc child open
+// is tagged `.procUnavailable = true` so openLogNoFollow can fall back to the
+// plain path-based open when /proc is not mounted, rather than failing
+// closed on an unrelated environment gap.
+const openLogBoundToParent = async (target, expected, flags, mode) => {
+  const parent = path.dirname(target);
+  const base = path.basename(target);
+  let dirHandle;
+  try {
+    dirHandle = await open(parent, constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Refusing to write evidence log through a symlinked logs directory: ${parent}`);
+    }
+    throw error;
+  }
+  try {
+    const info = await dirHandle.stat();
+    if (!expected || expected.ino === 0 || info.dev !== expected.dev || info.ino !== expected.ino) {
+      throw new Error(`Refusing to write evidence log through a logs directory swapped after validation: ${parent}`);
+    }
+    try {
+      // Without O_NOFOLLOW here, a leaf symlink swapped in for `base` after
+      // assertLogNotSymlink's check (but before this open) would be silently
+      // followed even though the parent-directory identity is verified --
+      // the fd bind above only protects against a *directory* swap, not a
+      // same-directory leaf-name swap (Codex #4781366510 follow-up).
+      return await open(`/proc/self/fd/${dirHandle.fd}/${base}`, flags | (constants.O_NOFOLLOW || 0), mode);
+    } catch (error) {
+      if (error?.code === 'ENOENT') error.procUnavailable = true;
+      throw error;
+    }
+  } finally {
+    await dirHandle.close().catch(() => undefined);
+  }
+};
+
 // Open a raw evidence log path without following a symlinked final component.
 // Mode 0600 at create time; fchmod after open so a permissive umask cannot
 // leave evidence world-readable under a shared temp directory. Verifies the
@@ -1698,10 +1756,26 @@ const assertLogNotSymlink = async (target) => {
 // be rejected before those calls run, not only before content is written --
 // otherwise the outside file's permissions are silently tightened even
 // though the write itself is later refused (Codex UiXEj).
-const openLogNoFollow = async (target, flags, verb = 'write') => {
+const openLogNoFollow = async (
+  target,
+  flags,
+  verb = 'write',
+  securedDirIdentity = null,
+  platform = process.platform,
+) => {
   await assertLogNotSymlink(target);
   try {
-    const handle = await openNoFollowShared(target, flags, 0o600);
+    let handle;
+    if (securedDirIdentity && canBindLogParentByFd(platform)) {
+      try {
+        handle = await openLogBoundToParent(target, securedDirIdentity, flags, 0o600);
+      } catch (error) {
+        if (!error?.procUnavailable) throw error;
+        handle = await openNoFollowShared(target, flags, 0o600);
+      }
+    } else {
+      handle = await openNoFollowShared(target, flags, 0o600);
+    }
     try {
       const info = await handle.stat();
       if (!info.isFile()) {
@@ -1783,15 +1857,23 @@ const openLogNoFollow = async (target, flags, verb = 'write') => {
  * ensureLogsDirSecured() ran but before this open could still land the
  * descriptor inside an attacker directory (CodeRabbit UguCb).
  *
- * Residual limitation: Node's fs/promises exposes no openat/dir-fd primitive,
- * so the parent cannot be opened and fstat'd atomically with the file. We
- * re-lstat the parent PATH (no-follow, so a symlinked `logs` is caught
- * outright) and compare dev/ino against the captured identity. This narrows
- * the TOCTOU window from "before the open" to "between this lstat and the
- * open" rather than closing it fully; a swap-back to a real directory within
- * that residual window is not detectable without a true dir-fd bind. A zero
- * ino is rejected outright: some Windows filesystems report ino 0 for every
- * file, which would otherwise compare equal vacuously.
+ * On Linux, openLogNoFollow binds the open itself to the validated directory
+ * fd (openLogBoundToParent) whenever a securedDirIdentity is supplied,
+ * closing this window instead of merely narrowing it. This check stays the
+ * sole guard on every other platform, and the Linux path falls back to it
+ * too whenever /proc is unavailable or no securedDirIdentity was supplied, so
+ * it remains unconditional at both call sites below.
+ *
+ * Residual limitation (non-Linux, or whenever the fd bind above falls back):
+ * Node's fs/promises exposes no openat/dir-fd primitive, so the parent cannot
+ * be opened and fstat'd atomically with the file. We re-lstat the parent PATH
+ * (no-follow, so a symlinked `logs` is caught outright) and compare dev/ino
+ * against the captured identity. This narrows the TOCTOU window from "before
+ * the open" to "between this lstat and the open" rather than closing it
+ * fully; a swap-back to a real directory within that residual window is not
+ * detectable without a true dir-fd bind. A zero ino is rejected outright:
+ * some Windows filesystems report ino 0 for every file, which would
+ * otherwise compare equal vacuously.
  * @param {string} target log file path whose parent directory must match.
  * @param {{dev: number, ino: number}} expected captured logsDir identity.
  */
@@ -1827,13 +1909,27 @@ const assertLogParentIdentity = async (target, expected) => {
  * @param {{dev: number, ino: number}|null} [securedDirIdentity] identity of the
  *   logs directory captured by ensureLogsDirSecured(); when provided, the open
  *   is bound to it and a mismatch is rejected before any truncate/write.
+ * @param {string} [platform] injectable for tests; real callers always pass
+ *   process.platform so the Linux fd-bind (see openLogBoundToParent) only
+ *   ever engages on an actual Linux host.
  * @returns {Promise<{dev: number, ino: number}>} identity of the written
  *   header file, so the caller can bind a later append reopen of the same path
  *   to the exact file this header landed on (CodeRabbit UmlJX / Codex UnKZ4).
  */
-const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = null) => {
+const writeLogHeaderNoFollow = async (
+  target,
+  contents,
+  securedDirIdentity = null,
+  platform = process.platform,
+) => {
   // O_CREAT without O_TRUNC: create if missing, never truncate until fstat.
-  const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT, 'write');
+  const handle = await openLogNoFollow(
+    target,
+    constants.O_WRONLY | constants.O_CREAT,
+    'write',
+    securedDirIdentity,
+    platform,
+  );
   try {
     // Bind the open to the directory ensureLogsDirSecured() just validated,
     // before any bytes are written (throw, do not truncate, on mismatch).
@@ -1874,13 +1970,23 @@ const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = nul
  *   directory identity; when provided, a swapped parent is rejected.
  * @param {{dev: number, ino: number}|null} [securedFileIdentity] identity of
  *   the header file; when provided, a swapped leaf is rejected.
+ * @param {string} [platform] injectable for tests; real callers always pass
+ *   process.platform so the Linux fd-bind (see openLogBoundToParent) only
+ *   ever engages on an actual Linux host.
  * @returns {Promise<import('node:fs').WriteStream>}
  */
-const createLogAppendStreamNoFollow = async (target, securedDirIdentity = null, securedFileIdentity = null) => {
+const createLogAppendStreamNoFollow = async (
+  target,
+  securedDirIdentity = null,
+  securedFileIdentity = null,
+  platform = process.platform,
+) => {
   const handle = await openLogNoFollow(
     target,
     constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND,
     'append',
+    securedDirIdentity,
+    platform,
   );
   try {
     // Bind the reopen to the validated parent directory and the header file's
@@ -1975,7 +2081,7 @@ const spawnCaptured = async ({
   let log;
   let logError = null;
   try {
-    log = await createLogAppendStreamNoFollow(logPath, securedDirIdentity, securedFileIdentity);
+    log = await createLogAppendStreamNoFollow(logPath, securedDirIdentity, securedFileIdentity, platform);
   } catch (error) {
     logError = error;
     log = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
@@ -2038,6 +2144,12 @@ const spawnCaptured = async ({
       // string can no longer see it. Fed the same raw chunks as `scanner`.
       noWorkScanner: createStreamingSignalScanner(scanNoWorkSignals(noWork)),
       hash: createHash('sha256'),
+      // Codex UrfC1: whether the next byte emitNormalized() receives for this
+      // stream starts a fresh logical line. A push()/flush() call boundary
+      // does not imply a line boundary -- the normalizer can return a chunk's
+      // first character alone and the rest on the very next call -- so this
+      // must be tracked across calls rather than assumed true every time.
+      atLineStart: true,
     };
   };
   const states = { stdout: makeState(), stderr: makeState() };
@@ -2084,7 +2196,22 @@ const spawnCaptured = async ({
       if (!normalized) return;
       if (stream === 'stdout') stdout = cappedAppend(stdout, normalized);
       else stderr = cappedAppend(stderr, normalized);
-      writeLog(`[${stream}] ${normalized}`, child[stream]);
+      // Codex UrfC1: `normalized` is one streaming-replacer output chunk, and
+      // a push()/flush() call boundary is not necessarily a line boundary --
+      // the replacer can hold back a possible partial match and return the
+      // rest of the same logical line on a later call. Labeling every call
+      // unconditionally spliced `[stream] ` into the middle of persisted
+      // bytes (observed as `u[stdout] navailable-ino-evidence`). Only prefix
+      // the label at a real line start: the first bytes written for this
+      // stream, and immediately after each newline already inside
+      // `normalized` -- except a trailing newline, which starts a line that
+      // has not arrived yet and is deferred to the next call via
+      // `atLineStart`.
+      const label = `[${stream}] `;
+      const withLabel = (states[stream].atLineStart ? label : '')
+        + normalized.replace(/\n(?!$)/g, `\n${label}`);
+      states[stream].atLineStart = normalized.endsWith('\n');
+      writeLog(withLabel, child[stream]);
       states[stream].hash.update(normalized);
     };
     const emitSafe = (stream, safe) => {
@@ -2885,7 +3012,7 @@ const createCommandExecutor = ({
   await ensureLogsDirSecured();
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
-  const logFileIdentity = await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
+  const logFileIdentity = await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, securedLogsDirIdentity, platform);
   const execution = await spawnCaptured({
     command: check.command,
     cwd,
@@ -2942,7 +3069,7 @@ const createCommandExecutor = ({
       effectivePathReplacements,
       platform,
     );
-    const proofLogFileIdentity = await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
+    const proofLogFileIdentity = await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, securedLogsDirIdentity, platform);
     const proofExecution = await spawnCaptured({
       command: check.proof.command,
       cwd,
@@ -3378,10 +3505,16 @@ const probeCommandDefault = async ({
   terminateTree = terminateProcessTree,
   timeoutMs = 120_000,
   terminationGraceMs = 2000,
-  knownSiblingMarks = EMPTY_MARK_SET,
+  knownSiblingMarks,
 }) => {
+  // Never mutate a caller-omitted registry: EMPTY_MARK_SET is a single
+  // module-scoped instance shared by every default-valued caller, so adding
+  // this probe's own mark to it would leak across concurrent probes that
+  // also omitted knownSiblingMarks (Codex UrL5U). Allocate a fresh registry
+  // when none was supplied instead of defaulting the parameter itself.
+  const marks = knownSiblingMarks ?? new Set();
   const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
-  if (spawnMark) knownSiblingMarks?.add(spawnMark);
+  if (spawnMark) marks.add(spawnMark);
   try {
     return await probeCommandDefaultInner({
       command,
@@ -3394,10 +3527,10 @@ const probeCommandDefault = async ({
       timeoutMs,
       terminationGraceMs,
       spawnMark,
-      knownSiblingMarks,
+      knownSiblingMarks: marks,
     });
   } finally {
-    if (spawnMark) knownSiblingMarks?.delete(spawnMark);
+    if (spawnMark) marks.delete(spawnMark);
   }
 };
 

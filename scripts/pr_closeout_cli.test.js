@@ -25,6 +25,15 @@ test('plan mode resolves all 19 checks without executing them', async () => {
     git(repo, 'config', 'user.email', 'closeout@example.invalid');
     git(repo, 'config', 'commit.gpgSign', 'false');
     await writeFile(path.join(repo, 'package.json'), '{}');
+    // The fixed make-smoke/make-sbom/make-audit/make-pr-check checks require
+    // a captured, non-neutralizing recipe before they resolve (Codex UsPVX):
+    // an absent entry fails closed exactly like an unresolved makeCandidates
+    // recipe. Provide a real Makefile with clean recipes so this plan-mode
+    // smoke test exercises the intended "trusted, inspected recipe" path.
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'smoke:\n\tnode scripts/smoke.js\n\nsbom:\n\tnode scripts/sbom.js\n\naudit:\n\tnode scripts/audit.js\n\npr-check:\n\tnpm test\n',
+    );
     git(repo, 'add', '.');
     git(repo, 'commit', '--quiet', '-m', 'base');
     const commands = Object.fromEntries(
@@ -261,6 +270,74 @@ test('rejects a --config identity check when only the pre-open lstat reports ino
       openFile: async () => fakeHandle,
     }),
     /does not report a usable file identity/,
+  );
+});
+
+test('rejects a --config truncated after handle.stat() but before the read finishes', async () => {
+  // Codex review (pr_closeout.js:149, P2): if the config is truncated in
+  // place after handle.stat() captures its size, the read loop hits EOF
+  // early (bytesRead === 0) and used to break out silently, parsing whatever
+  // shorter document remained (even a trivial `{}`) instead of rejecting the
+  // raced read. The stat reports a size the underlying content no longer
+  // has; read returns fewer bytes than that size and then EOF.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const targetContent = JSON.stringify({ baseRef: 'HEAD' });
+  const truncatedContent = '{}';
+  const fakeHandle = {
+    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 7, ino: 55, mtimeMs: 1000 }),
+    read: async (buffer, offset) => {
+      if (offset > 0) return { bytesRead: 0 };
+      const chunk = Buffer.from(truncatedContent, 'utf8');
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-truncated.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+      openFile: async () => fakeHandle,
+    }),
+    /truncated while it was being read/,
+  );
+});
+
+test('rejects a --config rewritten in place between the pre-read and post-read stat (TOCTOU)', async () => {
+  // Codex review (pr_closeout.js:149, P2): a full read (offset === info.size)
+  // can still have raced an in-place rewrite that completed entirely between
+  // the pre-read stat and the read itself -- same byte count, different
+  // content. Re-stating the same open descriptor after the read must catch
+  // the identity/metadata change instead of trusting the bytes just read.
+  const { readCloseoutConfig } = require('./pr_closeout.js');
+  const targetContent = JSON.stringify({ baseRef: 'HEAD' });
+  let statCalls = 0;
+  const fakeHandle = {
+    stat: async () => {
+      statCalls += 1;
+      // First call: the pre-read stat. Second call: the post-read re-stat,
+      // reporting a different mtimeMs as if the file had been rewritten in
+      // place (same dev/ino/size) during the read.
+      return {
+        isFile: () => true,
+        size: targetContent.length,
+        dev: 7,
+        ino: 55,
+        mtimeMs: statCalls === 1 ? 1000 : 2000,
+      };
+    },
+    read: async (buffer, offset) => {
+      const chunk = Buffer.from(targetContent, 'utf8');
+      chunk.copy(buffer, offset);
+      return { bytesRead: chunk.length };
+    },
+    close: async () => {},
+  };
+  await assert.rejects(
+    readCloseoutConfig('closeout-rewritten.json', {
+      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+      openFile: async () => fakeHandle,
+    }),
+    /changed while it was being read/,
   );
 });
 

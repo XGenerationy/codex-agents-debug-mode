@@ -162,6 +162,18 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // stay clean; whitespace is still required before the next token so `!=`
   // (inequality) and a bare word containing `!` are not false positives.
   /(?:^|[;&|\n(){]|\b(?:if|elif|while|until|then|do|else)\b)\s*!\s+\S/,
+  // Conditional-body failure swallow (Codex UrfC9): placing the validation
+  // command directly in an if/while/until CONDITION — no `!` involved — hides
+  // its failure the same way, because Bash's documented `-e` behavior exempts
+  // any command tested by if/while/until from errexit, and a no-op-only
+  // branch (`:` / `true`) with no elif/else to re-raise leaves the whole
+  // compound statement's own exit status at 0 regardless of the condition's
+  // result: `if npm test >/dev/null 2>&1; then :; fi` never surfaces a
+  // failing npm test. Matched conservatively like the OR-list catch-all
+  // below: an inert `if`/`while`/`until` guard ahead of a separately
+  // propagating real check would also match, which is intentional — closeout
+  // BLOCKs rather than risks admitting a genuine failure-hiding conditional.
+  /\b(?:if|elif|while|until)\b[\s\S]*?\b(?:then|do)\b\s*;?\s*(?::|true\b)\s*;?\s*(?:fi\b|done\b)/,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,
@@ -291,7 +303,11 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * Resolve every MANDATORY_CHECKS definition into either a runnable command
  * or a documented BLOCKED reason. Resolution order per check: a `fixed`
  * check always uses its own hardcoded command (a config override is an
- * error, not a silent ignore); otherwise an explicit `config.commands[id]`
+ * error, not a silent ignore) — and when that hardcoded command is a bare
+ * `make <target>` invocation (make-smoke/make-sbom/make-audit/make-pr-check),
+ * its recipe body is validated against `makeRecipes` the exact same way a
+ * makeCandidates-resolved target is, below, rather than being trusted
+ * unexamined; otherwise an explicit `config.commands[id]`
  * wins (a placeholder like `<...>` or `REPLACE_...` is rejected as BLOCKED
  * rather than run), then the first matching `package.json` script, then the
  * first matching Makefile target — whose recipe body, when supplied in
@@ -341,6 +357,37 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
           resolution: 'fixed',
           evidence: 'Live merge-base SHA is required to expand the fixed git-diff-check range.',
         };
+      }
+      // Fixed checks that invoke `make <target>` (make-smoke, make-sbom,
+      // make-audit, make-pr-check) are trusted by NAME exactly like an
+      // auto-discovered makeCandidates target is below: an unchanged base
+      // Makefile's recipe is never covered by the touched-file suppression
+      // scan, so without this validation the fixed branch would return
+      // PASS-eligible for, e.g., a `pr-check` recipe of
+      // `npm test >/dev/null 2>&1 || true` without the recipe ever being
+      // inspected (Codex: "Inspect recipes behind fixed Make checks"). Apply
+      // the identical makeRecipes validation the makeCandidates path performs
+      // below: fail closed when the recipe was never captured, and BLOCK
+      // when it neutralizes failure.
+      const fixedMakeTarget = /^make\s+(\S+)/.exec(definition.command)?.[1];
+      if (fixedMakeTarget) {
+        if (!Object.hasOwn(makeRecipes, fixedMakeTarget)) {
+          return {
+            ...definition,
+            status: 'BLOCKED',
+            resolution: 'fixed',
+            evidence: `No recipe text was captured for make target "${fixedMakeTarget}" (${definition.label}); closeout cannot trust an uninspected recipe.`,
+          };
+        }
+        const recipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[fixedMakeTarget]);
+        if (recipeNeutralizer) {
+          return {
+            ...definition,
+            status: 'BLOCKED',
+            resolution: 'fixed',
+            evidence: `Make recipe for ${definition.label} neutralizes failures (${recipeNeutralizer}); closeout cannot admit a failure-hiding recipe.`,
+          };
+        }
       }
       return { ...definition, command: expand(definition.command), resolution: 'fixed' };
     }
@@ -827,8 +874,13 @@ const findRulesScopedSilencings = (text) => {
  * false-positive) or a bare source-extension glob (`extGlob`: a `*.ts` tail and
  * the brace-expanded `*.{js,ts}` form, each item bounded by `(?<=[{,])`/`(?=[,}])`
  * so `{d.ts,map}` still matches nothing). Build artifacts (dist, node_modules,
- * a `*.d.ts` declaration tail) stay unflagged. Non-quoted/non-array values
- * (YAML block sequences, `const ignore = x.ignore`) yield no region, ignored.
+ * a `*.d.ts` declaration tail) stay unflagged. A YAML block sequence (native
+ * `ignorePatterns:` form: `- "src/**"` items indented under the key, neither
+ * a `[...]` array nor a direct scalar) is walked the same indentation-scoped
+ * way findRulesScopedSilencings already walks a `rules:` block (Codex
+ * UrfDK) — a touched `.eslintrc.yml` using this form was previously invisible
+ * to this scanner. Any other non-quoted/non-array value (`const ignore =
+ * x.ignore`) still yields no region, ignored.
  * @param {string} text - Full file content to scan.
  * @returns {{index: number, match: string}[]} source offset + concise fragment
  *   for each ignore/exclude value that suppresses source/test/spec paths.
@@ -877,6 +929,23 @@ const findIgnoreScopedSilencings = (text) => {
         if (ch === q) { i += 1; break; }
       }
       region = text.slice(start, i);
+      consumedTo = i;
+    } else if (text[i] === '-' && /^-(?:[ \t]|$)/.test(text.slice(i, i + 2))) {
+      // Indentation-scoped YAML block sequence (Codex UrfDK): collect every
+      // following non-blank line more indented than the key's own line, the
+      // same way findRulesScopedSilencings collects a `rules:` block.
+      const lineStart = text.lastIndexOf('\n', km.index - 1) + 1;
+      const keyIndent = text.slice(lineStart, km.index).match(/^[ \t]*/)[0].length;
+      const blockStart = text.lastIndexOf('\n', i - 1) + 1;
+      const restLines = text.slice(blockStart).split(/\r?\n/);
+      const block = [];
+      for (const ln of restLines) {
+        if (ln.trim() === '') continue;
+        const ind = ln.match(/^[ \t]*/)[0].length;
+        if (ind <= keyIndent) break;
+        block.push(ln);
+      }
+      region = block.join('\n');
       consumedTo = i;
     }
     if (region) {

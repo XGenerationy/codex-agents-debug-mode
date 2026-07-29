@@ -1504,9 +1504,16 @@ test('rejects shell keyword-prefixed negation (if!/elif!/while!/until!)', () => 
   assert.ok(findCommandFailureNeutralizer('elif ! pnpm test; then true; fi'));
   assert.ok(findCommandFailureNeutralizer('while ! pnpm test; do sleep 1; done'));
   assert.ok(findCommandFailureNeutralizer('until ! pnpm test; do sleep 1; done'));
+  // The remaining reserved-word anchors (Codex UrL45): `then`/`do`/`else` cover
+  // the negation appearing in a taken branch, not only right after the
+  // introducing keyword itself.
+  assert.ok(findCommandFailureNeutralizer('if x; then ! pnpm test; fi'));
+  assert.ok(findCommandFailureNeutralizer('for f in a; do ! pnpm test; done'));
+  assert.ok(findCommandFailureNeutralizer('if x; then y; else ! pnpm test; fi'));
   // A command argument `!` (not a shell reserved word) must stay clean.
   assert.equal(findCommandFailureNeutralizer('find . ! -name x'), null);
   assert.equal(findCommandFailureNeutralizer('[ ! -f x ]'), null);
+  assert.equal(findCommandFailureNeutralizer('[[ ! -f x ]] && pnpm test'), null);
   // Plan level: an `if !`-guarded configured command is BLOCKED too.
   const negatedIfPlan = buildCheckPlan({
     config: { commands: { typecheck: 'if ! pnpm test; then true; fi' } },
@@ -1514,6 +1521,29 @@ test('rejects shell keyword-prefixed negation (if!/elif!/while!/until!)', () => 
   const negatedIf = negatedIfPlan.checks.find(({ id }) => id === 'typecheck');
   assert.equal(negatedIf.status, 'BLOCKED', JSON.stringify(negatedIf));
   assert.match(negatedIf.evidence, /neutralizes failures/i);
+});
+
+test('rejects conditional bodies that swallow a failing condition (Codex UrfC9)', () => {
+  // Bash exempts any command tested by if/while/until from errexit; a
+  // no-op-only branch (`:` / `true`) with no elif/else to re-raise leaves the
+  // whole compound statement's own exit status at 0 regardless of whether the
+  // condition command itself failed -- no `!` negation involved at all.
+  assert.ok(findCommandFailureNeutralizer('if npm test >/dev/null 2>&1; then :; fi'));
+  assert.ok(findCommandFailureNeutralizer('while pnpm test; do true; done'));
+  assert.ok(findCommandFailureNeutralizer('until make check; do :; done'));
+  // A guard whose taken branch runs the real check (or whose else branch
+  // re-raises the failure) still propagates and must stay clean.
+  assert.equal(findCommandFailureNeutralizer('if [ -f package.json ]; then npm test; fi'), null);
+  assert.equal(findCommandFailureNeutralizer('if npm test; then echo pass; else exit 1; fi'), null);
+  assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
+  // Plan level: a configured check wrapped in a swallowing conditional is
+  // BLOCKED too.
+  const swallowedPlan = buildCheckPlan({
+    config: { commands: { typecheck: 'if pnpm test >/dev/null 2>&1; then :; fi' } },
+  });
+  const swallowed = swallowedPlan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(swallowed.status, 'BLOCKED', JSON.stringify(swallowed));
+  assert.match(swallowed.evidence, /neutralizes failures/i);
 });
 
 test('flags pytest, Go, and Rust native skip forms in touched test files', () => {
@@ -1910,4 +1940,95 @@ test('flags a source exclusion padded beyond the old ignore-array scan window', 
     [],
     'a long ignore array of only benign globs must not be flagged',
   );
+});
+
+test('flags a YAML native block-sequence ignorePatterns list (Codex UrfDK)', () => {
+  // A touched `.eslintrc.yml` using ESLint's native YAML block-sequence form
+  // (`ignorePatterns:` followed by indented `- "..."` items) is neither a
+  // `[...]` array nor a direct quoted scalar, so it previously yielded no
+  // scanned region at all and a `src/**` exclusion went undetected.
+  const yamlSuppressing = ['ignorePatterns:', '  - "src/**"', '  - "generated/**"'].join('\n');
+  assert.ok(
+    scanSuppressionText('.eslintrc.yml', yamlSuppressing).some((f) => f.category === 'config-silencing'),
+    'a YAML block-sequence src/** exclusion must be flagged',
+  );
+  // Benign block-sequence entries (build artifacts only) stay unflagged.
+  const yamlBenign = ['ignorePatterns:', '  - "dist/**"', '  - "coverage/**"'].join('\n');
+  assert.deepEqual(
+    scanSuppressionText('.eslintrc.yml', yamlBenign).filter((f) => f.category === 'config-silencing'),
+    [],
+    'a YAML block-sequence of only benign globs must not be flagged',
+  );
+  // A sibling key at or below the ignorePatterns indentation ends the block,
+  // so its content (even a src/** mention) is not swallowed into the scanned
+  // region as if it were one more ignore entry.
+  const yamlSibling = ['ignorePatterns:', '  - "dist/**"', 'notes: "unrelated src/** mention"'].join('\n');
+  assert.deepEqual(
+    scanSuppressionText('.eslintrc.yml', yamlSibling).filter((f) => f.category === 'config-silencing'),
+    [],
+    'a sibling key at or below the ignorePatterns indentation must end the block',
+  );
+  // A real-world shape -- ignorePatterns followed by a sibling rules: block --
+  // still gets the rules key scanned independently and correctly. (The
+  // findRulesScopedSilencings finding is a fixed "rules: { ... }" template,
+  // never the matched rule id, so this checks category + the rules: prefix
+  // rather than a literal rule-name substring.)
+  const yamlRealistic = ['ignorePatterns:', '  - "dist/**"', 'rules:', '  no-console: "off"'].join('\n');
+  assert.ok(
+    scanSuppressionText('.eslintrc.yml', yamlRealistic)
+      .some((f) => f.category === 'config-silencing' && f.match.startsWith('rules:')),
+    'a rules: key following an ignorePatterns block must still be scanned on its own',
+  );
+});
+
+test('blocks fixed Make checks whose recipe neutralizes failure', () => {
+  // The fixed-check branch (make-smoke/make-sbom/make-audit/make-pr-check)
+  // previously returned before ever consulting makeRecipes, so a fixed
+  // target's recipe was never inspected -- unlike an auto-discovered
+  // makeCandidates target just below it in buildCheckPlan, which already
+  // rejects a failure-hiding recipe. An unchanged base Makefile defining
+  // `pr-check` as `npm test >/dev/null 2>&1 || true` therefore let
+  // `make pr-check` exit 0, unexamined, even with failing tests (Codex:
+  // "Inspect recipes behind fixed Make checks").
+  const swallowedPlan = buildCheckPlan({
+    makeRecipes: { 'pr-check': 'npm test >/dev/null 2>&1 || true' },
+  });
+  const swallowed = swallowedPlan.checks.find(({ id }) => id === 'make-pr-check');
+  assert.equal(swallowed.status, 'BLOCKED', JSON.stringify(swallowed));
+  assert.equal(swallowed.resolution, 'fixed');
+  assert.match(swallowed.evidence, /neutralizes failures/i);
+  assert.match(swallowed.evidence, /\|\|\s*true/i);
+
+  // A fixed Make target whose recipe text was never captured fails closed
+  // too, the same way an unresolved makeCandidates recipe already does.
+  const noRecipe = buildCheckPlan({ makeRecipes: {} })
+    .checks.find(({ id }) => id === 'make-smoke');
+  assert.equal(noRecipe.status, 'BLOCKED', JSON.stringify(noRecipe));
+  assert.equal(noRecipe.resolution, 'fixed');
+  assert.match(noRecipe.evidence, /no recipe text was captured/i);
+  // Omitting makeRecipes entirely (the default {}) is the same case.
+  assert.equal(
+    buildCheckPlan({}).checks.find(({ id }) => id === 'make-audit').status,
+    'BLOCKED',
+  );
+
+  // Negative control: a fixed Make check with a clean, captured recipe still
+  // resolves normally and is not blocked by this check (no false positive).
+  // make-sbom independently requires its own artifact proof (REQUIRED_PROOFS),
+  // so one is supplied to isolate this assertion to the recipe-neutralizer
+  // check, mirroring the equivalent makeCandidates clean-recipe control above.
+  const cleanPlan = buildCheckPlan({
+    makeRecipes: {
+      smoke: 'node scripts/smoke.js',
+      sbom: 'node scripts/sbom.js',
+      audit: 'node scripts/audit.js',
+      'pr-check': 'npm test',
+    },
+    config: { proofs: { 'make-sbom': { type: 'artifact', path: 'artifacts/sbom.json' } } },
+  });
+  for (const id of ['make-smoke', 'make-sbom', 'make-audit', 'make-pr-check']) {
+    const check = cleanPlan.checks.find((c) => c.id === id);
+    assert.notEqual(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.equal(check.resolution, 'fixed');
+  }
 });

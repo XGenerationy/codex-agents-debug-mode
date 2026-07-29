@@ -455,6 +455,53 @@ test('probeReadyCollector bounds all retries against a trickling /health respons
   }
 });
 
+test('probeReadyCollector keeps retrying a promptly-answering not-ready peer past the old attempt cap', { timeout: 10000 }, async () => {
+  // Codex review: with the default attempts=20/delayMs=50, a collector that
+  // answers /health immediately (no trickling) with ready:false exhausted the
+  // old attempt-count loop in ~1s, well short of the 10s deadline. A peer
+  // that flips ready at 2s -- inside the deadline but past the old ~1s cap --
+  // was then reported port_in_use_by_other_process instead of waited for.
+  // This responder answers instantly every time (never trickles a partial
+  // body), so only a deadline-bound loop -- not a lucky slow probe -- can
+  // observe the flip.
+  const expectedProjectHash = 'b'.repeat(64);
+  const startedAt = Date.now();
+  const flipAt = startedAt + 2_000;
+  const responder = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({
+      service: COLLECTOR_SERVICE,
+      version: COLLECTOR_VERSION,
+      instance_id: '1'.repeat(32),
+      project_hash: expectedProjectHash,
+      ready: Date.now() >= flipAt,
+    }));
+  });
+  const responderUrl = await listen(responder);
+
+  try {
+    const result = await probeReadyCollector(
+      Number(new URL(responderUrl).port),
+      expectedProjectHash,
+      { attempts: 20, delayMs: 50, deadlineMs: 5_000 },
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(result, 'expected the peer identity once ready flips true, not null');
+    assert.equal(result.ready, true);
+    assert.equal(result.project_hash, expectedProjectHash);
+    assert.ok(
+      elapsedMs >= 1_000,
+      `must still be retrying past the old ~1s attempt-cap window when ready flips (took ${elapsedMs}ms)`,
+    );
+    assert.ok(
+      elapsedMs < 4_000,
+      `must observe ready shortly after the 2s flip, not fall back to the full deadline (took ${elapsedMs}ms)`,
+    );
+  } finally {
+    await close(responder);
+  }
+});
+
 test('requires the launch token and returns only an opaque relative log path', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });

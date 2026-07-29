@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const { chmod, mkdir, mkdtemp, rm, symlink, utimes, writeFile } = require('node:fs/promises');
 const { mkdtempSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
@@ -35,7 +35,7 @@ const symlinkAvailable = (() => {
     symlinkSync(target, path.join(probeDir, 'link'));
     return true;
   } catch (error) {
-    if (error.code === 'EPERM' || error.code === 'ENOSYS') return false;
+    if (error.code === 'EPERM' || error.code === 'ENOSYS' || error.code === 'EACCES') return false;
     throw error;
   } finally {
     rmSync(probeDir, { recursive: true, force: true });
@@ -1355,6 +1355,233 @@ test('workingTreeFingerprint seals a node_modules tree nested under a generated 
       after,
       'a node_modules mutation nested under a gitignored generated directory must change the fingerprint',
     );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('resolveRepositoryState computes the merge base from resolved SHAs across diverged branches (Qodo UsPVT)', async () => {
+  const repo = await fixtureRepo();
+  try {
+    // Diverge two branches from the same fork point so mergeBaseSha must
+    // resolve to that shared ancestor rather than to headSha, baseSha, or a
+    // merge base computed against a stale ref.
+    const forkPoint = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '--quiet', '-b', 'feature');
+    await writeFile(path.join(repo, 'feature.txt'), 'feature work\n');
+    git(repo, 'add', 'feature.txt');
+    git(repo, 'commit', '--quiet', '-m', 'feature work');
+    const headTip = git(repo, 'rev-parse', 'HEAD');
+
+    // Advance the base branch past the fork point too, so baseSha differs
+    // from both the fork point and headSha.
+    git(repo, 'checkout', '--quiet', '-b', 'base-branch', forkPoint);
+    await writeFile(path.join(repo, 'tracked.txt'), 'base-advanced\n');
+    git(repo, 'add', 'tracked.txt');
+    git(repo, 'commit', '--quiet', '-m', 'advance base');
+    const advancedBaseTip = git(repo, 'rev-parse', 'HEAD');
+
+    git(repo, 'checkout', '--quiet', 'feature');
+    const state = await resolveRepositoryState({ repo, baseRef: 'base-branch' });
+
+    assert.equal(state.headSha, headTip, 'headSha must be the feature branch tip');
+    assert.equal(state.baseSha, advancedBaseTip, 'baseSha must be the resolved base-branch tip');
+    assert.equal(
+      state.mergeBaseSha,
+      forkPoint,
+      'mergeBaseSha must be the true common ancestor, computed from the resolved head/base SHAs',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test(
+  'seals a symlinked node_modules root instead of leaving it invisible (Qodo UrfC_)',
+  { skip: !symlinkAvailable && 'symlink creation not permitted on this platform' },
+  async () => {
+    const repo = await fixtureRepo();
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-node-modules-target-'));
+    try {
+      await writeFile(path.join(repo, '.gitignore'), 'node_modules\n');
+      git(repo, 'add', '.gitignore');
+      git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+
+      // A file target exercises the same discovery + structural-digest code
+      // paths as a directory target without depending on directory-symlink
+      // creation privileges, which the shared symlinkAvailable probe does not
+      // itself validate (it only probes a file-target symlink).
+      const outsideFileA = path.join(outsideDir, 'a.js');
+      const outsideFileB = path.join(outsideDir, 'b.js');
+      await writeFile(outsideFileA, 'A');
+      await writeFile(outsideFileB, 'B');
+      const linkPath = path.join(repo, 'node_modules');
+      await symlink(outsideFileA, linkPath);
+
+      // Sanity: the ignored-untracked listing's pathspec excludes the
+      // node_modules path itself, so only the structural digest below can
+      // possibly seal it.
+      const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+      assert.ok(
+        !state.touchedFiles.includes('node_modules'),
+        `symlinked node_modules must not surface as a touched file, got: ${JSON.stringify(state.touchedFiles)}`,
+      );
+
+      const before = await workingTreeFingerprint(repo);
+      await rm(linkPath);
+      await symlink(outsideFileB, linkPath);
+      const repointed = await workingTreeFingerprint(repo);
+      assert.notEqual(before, repointed, 'repointing a symlinked node_modules root must change the fingerprint');
+
+      await rm(linkPath);
+      const removed = await workingTreeFingerprint(repo);
+      assert.notEqual(repointed, removed, 'removing a symlinked node_modules root must change the fingerprint');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'seals a symlinked generated-directory root instead of leaving it invisible (Qodo UrfC_)',
+  { skip: !symlinkAvailable && 'symlink creation not permitted on this platform' },
+  async () => {
+    const repo = await fixtureRepo();
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-dist-target-'));
+    try {
+      await writeFile(path.join(repo, '.gitignore'), 'dist\n');
+      git(repo, 'add', '.gitignore');
+      git(repo, 'commit', '--quiet', '-m', 'ignore dist');
+
+      const outsideFileA = path.join(outsideDir, 'a.js');
+      const outsideFileB = path.join(outsideDir, 'b.js');
+      await writeFile(outsideFileA, 'A');
+      await writeFile(outsideFileB, 'B');
+      const linkPath = path.join(repo, 'dist');
+      await symlink(outsideFileA, linkPath);
+
+      const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+      assert.ok(
+        !state.touchedFiles.includes('dist'),
+        `symlinked dist must not surface as a touched file, got: ${JSON.stringify(state.touchedFiles)}`,
+      );
+
+      const before = await workingTreeFingerprint(repo);
+      await rm(linkPath);
+      await symlink(outsideFileB, linkPath);
+      const repointed = await workingTreeFingerprint(repo);
+      assert.notEqual(before, repointed, 'repointing a symlinked dist root must change the fingerprint');
+
+      await rm(linkPath);
+      const removed = await workingTreeFingerprint(repo);
+      assert.notEqual(repointed, removed, 'removing a symlinked dist root must change the fingerprint');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('fails closed when bulk-root discovery exceeds its depth cap (Qodo UrfDB/UsPU2)', async () => {
+  // The cap is injectable so this is pinned without building a 41-level-deep
+  // fixture. findNodeModulesRoots runs before findGeneratedDirRoots inside
+  // workingTreeFingerprint and both walk the same tree with the same cap, so
+  // it deterministically throws first; findGeneratedDirRoots' own depth check
+  // is the same `depth > maxDepth` guard, mirrored line for line.
+  const repo = await fixtureRepo();
+  try {
+    await mkdir(path.join(repo, 'level1', 'level2'), { recursive: true });
+    const ok = await workingTreeFingerprint(repo, [], { maxNodeModulesDiscoveryDepth: 10 });
+    assert.ok(ok, 'a shallow tree under the cap seals normally');
+    await assert.rejects(
+      workingTreeFingerprint(repo, [], { maxNodeModulesDiscoveryDepth: 1 }),
+      /node_modules discovery exceeded depth 1/,
+      'exceeding the discovery depth cap must throw (fail closed), not silently report no roots found',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('does not redundantly structurally seal a committed, non-ignored dist/ directory (Qodo UrL5b)', async () => {
+  const repo = await fixtureRepo();
+  try {
+    const dist = path.join(repo, 'dist');
+    await mkdir(dist, { recursive: true });
+    for (let i = 0; i < 3; i += 1) {
+      await writeFile(path.join(dist, `file-${i}.js`), `module.exports = ${i};\n`);
+    }
+    git(repo, 'add', 'dist');
+    git(repo, 'commit', '--quiet', '-m', 'commit tracked dist output');
+
+    // A committed, non-ignored dist/ must not be redirected into the
+    // structural-digest channel: __tracked_diff__ already covers it, so a cap
+    // far too small for its entry count must not throw.
+    const sealed = await workingTreeFingerprint(repo, [], { maxStructuralDigestEntries: 1 });
+    assert.ok(sealed, 'a committed dist/ must not be routed through the structural-digest channel');
+
+    // A tracked-file edit under dist/ must still move the seal via the
+    // ordinary tracked-diff channel.
+    const before = await workingTreeFingerprint(repo);
+    await writeFile(path.join(dist, 'file-0.js'), 'module.exports = "changed";\n');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(before, after, 'editing a tracked file under a committed dist/ must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('rejects a successful diff that still writes to stderr (Qodo UsPVG)', async () => {
+  const repo = await fixtureRepo();
+  try {
+    // An overly long .gitattributes pattern line makes Git print a stable
+    // "ignoring overly long attributes line" warning while still completing
+    // successfully -- hashGitOutput must reject that instead of silently
+    // accepting an unreviewed warning on a zero exit.
+    await writeFile(path.join(repo, '.gitattributes'), `${'x'.repeat(5000)} diff=foo\n`);
+    await writeFile(path.join(repo, 'tracked.txt'), 'changed\n');
+
+    const diffArgs = ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD'];
+    const probe = spawnSync('git', diffArgs, { cwd: repo, encoding: 'utf8' });
+    if (probe.status !== 0 || !probe.stderr) {
+      // This git version/environment does not reproduce the warning; skip
+      // rather than false-fail on an assumption about git's own output.
+      return;
+    }
+
+    await assert.rejects(
+      workingTreeFingerprint(repo),
+      /exited 0 but reported warnings \(fail closed\)/,
+      'a successful diff that writes to stderr must still be rejected',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('surfaces a gate file renamed to an unrecognized path as a deletion (Qodo UsPU6)', async () => {
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, 'vitest.config.js'), 'module.exports = {};\n');
+    git(repo, 'add', 'vitest.config.js');
+    git(repo, 'commit', '--quiet', '-m', 'add vitest config');
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+
+    // Git's default rename detection collapses this into a single R-status
+    // entry (verified: `git diff --name-status` reports R100), which would
+    // vanish from a --diff-filter=D query while --name-only reports only the
+    // unrecognized destination -- evading the deleted-gate-file fail-closed
+    // check entirely.
+    git(repo, 'mv', 'vitest.config.js', 'vitest-settings.js');
+    git(repo, 'commit', '--quiet', '-m', 'rename vitest config to an unrecognized name');
+
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.ok(
+      gate.deletedFiles.includes('vitest.config.js'),
+      `expected the renamed-away gate file on deletedFiles, got: ${JSON.stringify(gate.deletedFiles)}`,
+    );
+    assert.ok(gate.changedFiles.includes('vitest.config.js'));
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

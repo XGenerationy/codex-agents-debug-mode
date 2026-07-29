@@ -989,19 +989,26 @@ const probeServer = (port, { deadlineMs = 2_000 } = {}) =>
 
 /**
  * Probe until the same-project collector reports ready (token persisted), or
- * until the retry budget is exhausted. Avoids already_running while the first
- * process is still mid token-file write after listen().
+ * until the wall-clock deadline elapses. Avoids already_running while the
+ * first process is still mid token-file write after listen().
  * @param {number} port
  * @param {string} expectedProjectHash
- * @param {{attempts?: number, delayMs?: number, deadlineMs?: number}} [options]
+ * @param {{delayMs?: number, deadlineMs?: number}} [options]
  */
 const probeReadyCollector = async (
   port,
   expectedProjectHash,
-  { attempts = 20, delayMs = 50, deadlineMs = 10_000 } = {},
+  { delayMs = 50, deadlineMs = 10_000 } = {},
 ) => {
   const deadlineAt = Date.now() + deadlineMs;
-  for (let i = 0; i < attempts; i += 1) {
+  // Bounded by deadlineAt below, not by a fixed attempt count: a collector
+  // that answers /health promptly with ready:false for longer than a handful
+  // of delayMs sleeps (e.g. mid async claim or token-file work) must keep
+  // being retried for the whole declared deadline. An attempt-count cap here
+  // previously let the loop give up after ~20 * delayMs (~1s), long before a
+  // responsive-but-not-ready peer had reached the 10s deadline, and the final
+  // probe's result (still not ready) was reported as port_in_use_by_other_process.
+  for (;;) {
     const remainingBeforeProbe = deadlineAt - Date.now();
     if (remainingBeforeProbe <= 0) return null;
     const identity = await probeServer(port, { deadlineMs: Math.min(2_000, remainingBeforeProbe) });
@@ -1015,14 +1022,6 @@ const probeReadyCollector = async (
     if (remainingMs <= 0) return null;
     await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remainingMs)));
   }
-  // The final health probe must fit in the same overall startup budget. Each
-  // probe has an inactivity and wall-clock timeout, but without this outer
-  // deadline a continuously trickling listener could multiply those costs by
-  // every retry and outlive the documented startup-capture polling window.
-  const remainingBeforeFinalProbe = deadlineAt - Date.now();
-  return remainingBeforeFinalProbe > 0
-    ? probeServer(port, { deadlineMs: Math.min(2_000, remainingBeforeFinalProbe) })
-    : null;
 };
 
 /**

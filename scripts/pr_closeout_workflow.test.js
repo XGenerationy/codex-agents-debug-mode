@@ -99,7 +99,22 @@ const makeDependencies = ({
           touchedFiles: ['src/a.ts'],
         };
       },
-      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [] }),
+      readProjectMetadata: async () => ({
+        packageScripts: {},
+        makeTargets: ['smoke', 'sbom', 'audit', 'pr-check'],
+        // The fixed make-smoke/make-sbom/make-audit/make-pr-check checks
+        // require a captured, non-neutralizing recipe before they resolve
+        // (Codex UsPVX) -- an absent entry fails closed exactly like an
+        // unresolved makeCandidates recipe. Supply clean stand-ins so this
+        // fixture exercises the intended "trusted, inspected recipe" path
+        // rather than incidentally proving the fail-closed path instead.
+        makeRecipes: {
+          smoke: 'node scripts/smoke.js',
+          sbom: 'node scripts/sbom.js',
+          audit: 'node scripts/audit.js',
+          'pr-check': 'npm test',
+        },
+      }),
       prepareOutputDirectory: async ({ outputDir }) => outputDir,
       readGateChanges: async () => {
         events.push('gate-changes');

@@ -228,9 +228,12 @@ Save the `collector_token` from startup plus the `session_id` and `session_token
 session response. The server writes the collector_token to `$PROJECT/.debug/collector_token`
 (mode 0600) and announces that path in the startup JSON's `token_file` field; capture it via
 `COLLECTOR_TOKEN=$(cat "$PROJECT/.debug/collector_token")` (always under `$PROJECT`, never a
-cwd-relative `.debug/…` path). Never print either token into application logs, reports, commits,
-or PR messages. For browser instrumentation, set `DEBUG_ALLOWED_ORIGIN` to the exact application
-origin before launch; unspecified browser origins are rejected.
+cwd-relative `.debug/…` path). Also save the startup JSON's `port` (default `8787`; override
+with `DEBUG_PORT`) and build every instrumentation URL from `127.0.0.1:<port>`, not
+`localhost:8787` — the collector binds only to `127.0.0.1`, and `localhost` can resolve to an
+IPv6-only `::1` that it never listens on. Never print either token into application logs,
+reports, commits, or PR messages. For browser instrumentation, set `DEBUG_ALLOWED_ORIGIN` to the
+exact application origin before launch; unspecified browser origins are rejected.
 
 **Server endpoints:**
 - GET `/health` → returns collector-specific service, version, and instance identity
@@ -272,7 +275,9 @@ Add logging calls to test all hypotheses.
 // #region debug
 const SESSION_ID = 'REPLACE_WITH_SESSION_ID'; // e.g. 'fix-null-userid-a1b2c3'
 const SESSION_TOKEN = 'REPLACE_WITH_SESSION_TOKEN';
-const DEBUG_LOG_URL = 'http://localhost:8787/log';
+// `port` from the startup JSON (Step 1); DEBUG_PORT overrides the 8787 default.
+const COLLECTOR_PORT = 'REPLACE_WITH_COLLECTOR_PORT';
+const DEBUG_LOG_URL = `http://127.0.0.1:${COLLECTOR_PORT}/log`;
 let debugTransportFailureReported = false;
 
 const reportDebugTransportFailure = (error) => {
@@ -335,6 +340,8 @@ import urllib.error
 import urllib.request
 SESSION_ID = 'REPLACE_WITH_SESSION_ID'  # e.g. 'fix-null-userid-a1b2c3'
 SESSION_TOKEN = 'REPLACE_WITH_SESSION_TOKEN'
+# `port` from the startup JSON (Step 1); DEBUG_PORT overrides the 8787 default.
+COLLECTOR_PORT = 'REPLACE_WITH_COLLECTOR_PORT'
 _debug_transport_failure_reported = False
 
 def debug_log(msg, data=None, hypothesis_id=None):
@@ -346,7 +353,7 @@ def debug_log(msg, data=None, hypothesis_id=None):
             'hypothesisId': hypothesis_id, 'loc': traceback.format_stack()[-2].strip(),
         }).encode('utf-8')
         req = urllib.request.Request(
-            'http://localhost:8787/log',
+            f'http://127.0.0.1:{COLLECTOR_PORT}/log',
             data=payload,
             method='POST',
             headers={'Content-Type': 'application/json'},
@@ -523,13 +530,15 @@ Each line is NDJSON:
 ### CORS / Mixed Content Workarounds
 
 If logs aren't arriving, it’s usually one of:
-- **Mixed content**: HTTPS app → `http://localhost:8787` is blocked. Use a dev-server proxy (same origin) or serve the log endpoint over HTTPS.
+- **Mixed content**: HTTPS app → `http://127.0.0.1:8787` is blocked. Use a dev-server proxy (same origin) or serve the log endpoint over HTTPS.
 - **CSP**: `connect-src` blocks the log URL. Use a dev-server proxy or update CSP.
 - **CORS preflight**: `Content-Type: application/json` triggers `OPTIONS`. Use a “simple” request (`text/plain`) or `sendBeacon`.
 
 **1. Avoid the preflight (acknowledged `text/plain` request; `sendBeacon` only on unload)**:
 ```javascript
-const DEBUG_LOG_URL = 'http://localhost:8787/log';
+// `port` from the startup JSON (Step 1); DEBUG_PORT overrides the 8787 default.
+const COLLECTOR_PORT = 'REPLACE_WITH_COLLECTOR_PORT';
+const DEBUG_LOG_URL = `http://127.0.0.1:${COLLECTOR_PORT}/log`;
 let debugTransportFailureReported = false;
 const reportDebugTransportFailure = (error) => {
   if (debugTransportFailureReported) return;
@@ -576,14 +585,16 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
 ```
 Note: a preflight-free request (fetch or beacon) still can't bypass mixed content + CSP.
 
-**2. Dev server proxy (Vite example)** - same-origin `/__log` → `http://localhost:8787/log`:
+**2. Dev server proxy (Vite example)** - same-origin `/__log` → `http://127.0.0.1:8787/log`:
 ```javascript
 // vite.config.js
 export default {
   server: {
     proxy: {
       '/__log': {
-        target: 'http://localhost:8787',
+        // Host must be 127.0.0.1; port must match the collector's actual
+        // port (see Step 1; DEBUG_PORT overrides the 8787 default).
+        target: 'http://127.0.0.1:8787',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/__log/, '/log'),
       },
@@ -591,7 +602,7 @@ export default {
   },
 };
 
-// Then POST to /__log instead of localhost:8787/log
+// Then POST to /__log instead of 127.0.0.1:8787/log
 ```
 
 Never disable mixed-content or browser security protections. If the preflight-free request
@@ -600,7 +611,7 @@ authenticated HTTPS collector endpoint.
 
 ### Chrome Extension Debugging
 
-Content scripts run in an **isolated world** with strict CSP - they **cannot** directly fetch to `localhost:8787`. The solution is to relay logs through the background script (service worker).
+Content scripts run in an **isolated world** with strict CSP - they **cannot** directly fetch to `127.0.0.1:8787`. The solution is to relay logs through the background script (service worker).
 
 **Content Script (sender):**
 ```javascript
@@ -638,9 +649,13 @@ debugLog('handleMouseMove', { target: target.tagName, rect }, 'H1');
 **Background Script (relay):**
 ```javascript
 // #region debug - relay logs to debug server
+// Host must be 127.0.0.1; port must match the collector's actual port (see
+// Step 1; DEBUG_PORT overrides the 8787 default) and the host_permissions
+// entry below.
+const DEBUG_LOG_URL = 'http://127.0.0.1:8787/log';
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'DEBUG_LOG') {
-    fetch('http://localhost:8787/log', {
+    fetch(DEBUG_LOG_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(message.payload),
@@ -663,20 +678,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 - Keep both debug regions tagged for easy cleanup
 
 **Manifest V3 permission required:** relaxed CSP alone does not authorize a cross-origin
-`fetch`. Without `http://localhost:8787/*` (or `http://localhost/*`) listed in the extension's
+`fetch`. Without `http://127.0.0.1:8787/*` (or `http://127.0.0.1/*`) listed in the extension's
 `manifest.json` `host_permissions`, the background service worker's fetch is blocked and every
 relay call fails with `collector_transport_failed` — with no other symptom to point at the cause.
 Add it temporarily for the debug session and remove it afterward with the rest of the
 instrumentation:
 ```json
 {
-  "host_permissions": ["http://localhost:8787/*"]
+  "host_permissions": ["http://127.0.0.1:8787/*"]
 }
 ```
 
 **Collector origin allowlist required for the relay POST:** `createDebugServer` rejects every
 `Origin` not listed in `DEBUG_ALLOWED_ORIGIN`. A Manifest V3 service-worker `fetch` to
-`http://localhost:8787/log` sends the extension origin (`chrome-extension://<id>`) and triggers a
+`http://127.0.0.1:8787/log` sends the extension origin (`chrome-extension://<id>`) and triggers a
 CORS preflight; without that exact origin allowed, the collector responds `403 origin_not_allowed`
 even when `host_permissions` is correct. Launch the collector with the extension origin before
 using the relay (replace `<id>` with the value from `chrome://extensions`):

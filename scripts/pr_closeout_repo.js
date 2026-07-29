@@ -102,6 +102,15 @@ const withInternalGitSafety = async (repo, args) => ([
   '-c', 'core.fsmonitor=',
   '-c', 'core.useBuiltinFSMonitor=false',
   '-c', 'core.fileMode=true',
+  // Force off regardless of the repo/user/system config: internal diffing
+  // and hashing must see exact on-disk bytes, and letting autocrlf convert
+  // line endings mid-hash would make the seal depend on the checkout's CRLF
+  // config instead of actual content. This also removes the only known
+  // source of git's benign "LF will be replaced by CRLF" notice on stderr,
+  // which would otherwise trip hashGitOutput's fail-closed-on-stderr check
+  // on every ordinary Windows/autocrlf checkout.
+  '-c', 'core.autocrlf=false',
+  '-c', 'core.safecrlf=false',
   ...(await computeFilterSafetyOverrides(repo, { env: gitChildEnv() })),
   ...withNoTextconv(args),
 ]);
@@ -246,11 +255,17 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
     // silently drop the physical-path guarantee used for containment checks.
     if (error?.code !== 'ENOENT') throw error;
   }
-  const [headSha, baseSha, mergeBaseSha] = await Promise.all([
+  // Resolve HEAD and baseRef to immutable SHAs before computing the merge
+  // base. Passing the mutable ref names straight to `merge-base` leaves a
+  // window where a concurrent fetch that advances baseRef between these
+  // calls pairs the NEW baseSha with a merge base computed against the OLD
+  // tip; that stale merge base then seeds the touched-file set while later
+  // checks compare against the already-updated baseSha (Qodo UsPVT).
+  const [headSha, baseSha] = await Promise.all([
     gitText(physicalRepo, ['rev-parse', 'HEAD']),
     gitText(physicalRepo, ['rev-parse', baseRef]),
-    gitText(physicalRepo, ['merge-base', baseRef, 'HEAD']),
   ]);
+  const mergeBaseSha = await gitText(physicalRepo, ['merge-base', baseSha, headSha]);
   const groups = await Promise.all([
     gitPaths(physicalRepo, ['diff', '--name-only', '-z', `${mergeBaseSha}...HEAD`]),
     gitPaths(physicalRepo, ['diff', '--name-only', '-z']),
@@ -841,6 +856,12 @@ const MAX_STRUCTURAL_DIGEST_ENTRIES = 200_000;
 // nested workspace roots) so a pathologically deep source tree cannot make the
 // discovery itself unbounded. The walk never descends INTO a node_modules tree
 // (structuralDigest covers that subtree), so this only limits non-vendor depth.
+// Exceeding the bound FAILS CLOSED (throws) rather than silently returning a
+// knowingly incomplete root list: the ignored-untracked listing separately
+// pathspec-excludes every node_modules/generated-dir tree, so a root that
+// discovery quietly gave up on would never be sealed by any channel, letting a
+// dependency swap or build-output rewrite below the cutoff stay invisible to
+// workingTreeFingerprint (Qodo UrfDB/UsPU2).
 const MAX_NODE_MODULES_DISCOVERY_DEPTH = 40;
 
 /**
@@ -968,13 +989,21 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
  * re-walking bytes findGeneratedDirRoots already seals, rather than leaving
  * them unsealed (CodeRabbit UohnW's original "nothing to gain by descending"
  * rationale no longer holds now that a sibling mechanism seals this content
- * instead). The walk never follows a symlink (a symlinked directory is not
- * `isDirectory()` in a Dirent, so it is left for the un-followed symlink
- * handling elsewhere), and does NOT descend into a found node_modules
- * (structuralDigest already covers that subtree, including any node_modules
- * nested within it) — bounding cost to the non-vendor source tree.
+ * instead). The walk never descends THROUGH a symlink (only a literal
+ * `node_modules`-named symlink is captured as a root itself; any other
+ * symlinked directory is skipped, not traversed), and does NOT descend into a
+ * found node_modules (structuralDigest already covers that subtree, including
+ * any node_modules nested within it) — bounding cost to the non-vendor source
+ * tree. A `node_modules` entry that is itself a symlink is still captured as a
+ * root: the ignored-untracked listing's `ignoredBulkExcludes` pathspec
+ * excludes the link path itself (not just its contents), so a directory-only
+ * filter here would leave a symlinked node_modules invisible to every
+ * fingerprint channel at once, letting a command redirect dependency loading
+ * to an external tree without moving the seal (Qodo UrfC_).
  * @param {string} repo - Absolute repository path.
+ * @param {number} [maxDepth=MAX_NODE_MODULES_DISCOVERY_DEPTH] - Depth cap; exceeding it fails closed (throws). Injectable so the fail-closed path is testable without a 41-level-deep fixture.
  * @returns {Promise<string[]>} Sorted repo-relative node_modules root paths (may be empty).
+ * @throws {Error} If the walk exceeds `maxDepth` (a deeper root cannot be fully discovered).
  */
 // Directories that never contain a workspace's own node_modules root worth
 // discovering here (either VCS internals, or conventional generated build
@@ -984,10 +1013,14 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
 // re-covers bytes the other one already seals.
 const DISCOVERY_SKIP_DIRS = new Set(['.git', 'dist', 'build', 'coverage', '.next', '.cache']);
 
-const findNodeModulesRoots = async (repo) => {
+const findNodeModulesRoots = async (repo, maxDepth = MAX_NODE_MODULES_DISCOVERY_DEPTH) => {
   const roots = [];
   const walk = async (absoluteDir, relativeDir, depth) => {
-    if (depth > MAX_NODE_MODULES_DISCOVERY_DEPTH) return;
+    if (depth > maxDepth) {
+      throw new Error(
+        `node_modules discovery exceeded depth ${maxDepth} at '${relativeDir}'; cannot fully discover node_modules roots (fail closed).`,
+      );
+    }
     let dirents;
     try {
       dirents = await readdir(absoluteDir, { withFileTypes: true });
@@ -997,7 +1030,12 @@ const findNodeModulesRoots = async (repo) => {
       return;
     }
     for (const dirent of dirents) {
-      if (!dirent.isDirectory()) continue;
+      const isDir = dirent.isDirectory();
+      // A symlinked node_modules must still be captured as a root (Qodo
+      // UrfC_ — see docstring above); only a literal node_modules-named
+      // symlink is let through here, since the `isDir` check below still
+      // blocks descending INTO any other symlinked directory.
+      if (!isDir && !dirent.isSymbolicLink()) continue;
       if (DISCOVERY_SKIP_DIRS.has(dirent.name)) continue;
       const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
       if (dirent.name === 'node_modules') {
@@ -1006,6 +1044,7 @@ const findNodeModulesRoots = async (repo) => {
         // any node_modules nested inside this one.
         continue;
       }
+      if (!isDir) continue;
       await walk(path.join(absoluteDir, dirent.name), childRelative, depth + 1);
     }
   };
@@ -1030,6 +1069,32 @@ const findNodeModulesRoots = async (repo) => {
 const SEALED_GENERATED_DIR_NAMES = new Set(['dist', 'build', 'coverage', '.next', '.cache']);
 
 /**
+ * Report whether `relative` is excluded by .gitignore, .git/info/exclude, or
+ * core.excludesFile, via `git check-ignore`. Exit code 0 means ignored, 1
+ * means not ignored — a normal, expected result that `execFileAsync` (which
+ * rejects on any non-zero exit) surfaces as a thrown error, so it must be
+ * unwrapped here rather than left to propagate. Any other outcome (a
+ * different exit code, a spawn failure) fails closed as ignored: an
+ * unclassifiable path is treated as still needing a structural seal rather
+ * than assumed already covered by the plain ignored-untracked listing.
+ * @param {string} repo - Absolute repository path.
+ * @param {string} relative - Repo-relative path to classify.
+ * @returns {Promise<boolean>}
+ */
+const isPathGitIgnored = async (repo, relative) => {
+  try {
+    await execFileAsync('git', await withInternalGitSafety(repo, ['check-ignore', '-q', '--', relative]), {
+      cwd: repo,
+      env: gitChildEnv(),
+    });
+    return true;
+  } catch (error) {
+    if (error && error.code === 1) return false;
+    return true;
+  }
+};
+
+/**
  * Discover every occurrence of a conventional generated/build output
  * directory (SEALED_GENERATED_DIR_NAMES) under the repo, the same way
  * findNodeModulesRoots discovers node_modules roots, so workingTreeFingerprint
@@ -1041,15 +1106,31 @@ const SEALED_GENERATED_DIR_NAMES = new Set(['dist', 'build', 'coverage', '.next'
  * does not descend into an already-discovered generated-dir root
  * (structuralDigest walks that root's whole subtree, including anything
  * nested inside it, so recursing further during discovery would only find
- * redundant nested roots covered twice). Never follows a symlink, for the
- * same reason findNodeModulesRoots does not.
+ * redundant nested roots covered twice). Never descends THROUGH a symlink,
+ * for the same reason findNodeModulesRoots does not. A REAL DIRECTORY match is
+ * only captured as a root when git actually ignores it: a committed
+ * (non-ignored) generated tree is already covered by the tracked-diff hash and
+ * the plain ignored-untracked listing (git recurses those on its own), so
+ * re-walking it here would be redundant and could spuriously fail closed on a
+ * large legitimately-committed tree; only an IGNORED root is invisible to
+ * those channels and needs this structural seal (Qodo UrL5b). A symlinked
+ * match is always captured regardless of ignore status — sealing a symlink
+ * root is a single un-followed lstat, so there is no over-cap risk to guard
+ * against, and the same invisible-root gap findNodeModulesRoots closes for
+ * node_modules applies here too (Qodo UrfC_).
  * @param {string} repo - Absolute repository path.
+ * @param {number} [maxDepth=MAX_NODE_MODULES_DISCOVERY_DEPTH] - Depth cap; exceeding it fails closed (throws). Injectable so the fail-closed path is testable without a 41-level-deep fixture.
  * @returns {Promise<string[]>} Sorted repo-relative generated-dir root paths (may be empty).
+ * @throws {Error} If the walk exceeds `maxDepth` (a deeper root cannot be fully discovered).
  */
-const findGeneratedDirRoots = async (repo) => {
+const findGeneratedDirRoots = async (repo, maxDepth = MAX_NODE_MODULES_DISCOVERY_DEPTH) => {
   const roots = [];
   const walk = async (absoluteDir, relativeDir, depth) => {
-    if (depth > MAX_NODE_MODULES_DISCOVERY_DEPTH) return;
+    if (depth > maxDepth) {
+      throw new Error(
+        `generated-directory discovery exceeded depth ${maxDepth} at '${relativeDir}'; cannot fully discover generated directories (fail closed).`,
+      );
+    }
     let dirents;
     try {
       dirents = await readdir(absoluteDir, { withFileTypes: true });
@@ -1059,15 +1140,23 @@ const findGeneratedDirRoots = async (repo) => {
       return;
     }
     for (const dirent of dirents) {
-      if (!dirent.isDirectory()) continue;
+      const isDir = dirent.isDirectory();
+      const isSymlink = dirent.isSymbolicLink();
+      if (!isDir && !isSymlink) continue;
       if (dirent.name === '.git' || dirent.name === 'node_modules') continue;
       const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
       if (SEALED_GENERATED_DIR_NAMES.has(dirent.name)) {
-        roots.push(childRelative);
+        // A symlink is always sealed (cheap, and otherwise invisible to every
+        // channel); a real directory is sealed only when git actually ignores
+        // it, since a committed one is already covered elsewhere.
+        if (isSymlink || (await isPathGitIgnored(repo, childRelative))) {
+          roots.push(childRelative);
+        }
         // Do not descend: structuralDigest walks the whole subtree, including
         // any node_modules or nested generated directory inside this one.
         continue;
       }
+      if (!isDir) continue;
       await walk(path.join(absoluteDir, dirent.name), childRelative, depth + 1);
     }
   };
@@ -1081,12 +1170,22 @@ const findGeneratedDirRoots = async (repo) => {
  * sufficiently large tracked/staged diff can exceed that buffer and throw,
  * which used to reject the whole closeout workflow before any evidence
  * report was written; streaming keeps memory bounded regardless of diff
- * size.
+ * size. stderr is bounded to MAX_GIT_STDERR_BYTES and, per the gate's
+ * fail-closed warning policy, ANY non-empty stderr rejects the call even on a
+ * zero exit: left unbounded and unchecked, a malformed .gitattributes can make
+ * git emit a warning per invalid pattern on every fingerprint checkpoint,
+ * risking unbounded memory growth while those warnings pass silently despite
+ * a successful exit (Qodo UsPVG).
  * @param {string} repo - Absolute repository path.
  * @param {string[]} args - git argv.
  * @returns {Promise<string>} Hex-encoded SHA-256 digest of stdout.
- * @throws {Error} If git exits non-zero, including captured stderr in the message.
+ * @throws {Error} If git exits non-zero, or exits zero but wrote to stderr, including captured (bounded) stderr in the message.
  */
+// Bound retained stderr text so a git invocation that emits warnings without
+// limit (e.g. one line per invalid .gitattributes pattern) cannot grow this
+// string unboundedly across the process lifetime.
+const MAX_GIT_STDERR_BYTES = 64 * 1024;
+
 const hashGitOutput = async (repo, args) => {
   const safeArgs = await withInternalGitSafety(repo, args);
   return new Promise((resolve, reject) => {
@@ -1097,12 +1196,28 @@ const hashGitOutput = async (repo, args) => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stderr = '';
+    let stderrTruncated = false;
     child.stdout.on('data', (chunk) => hash.update(chunk));
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length >= MAX_GIT_STDERR_BYTES) {
+        stderrTruncated = true;
+        return;
+      }
+      stderr += chunk.toString('utf8');
+      if (stderr.length > MAX_GIT_STDERR_BYTES) {
+        stderr = stderr.slice(0, MAX_GIT_STDERR_BYTES);
+        stderrTruncated = true;
+      }
+    });
     child.on('error', reject);
     child.on('close', (code) => {
+      const stderrText = stderr.trim() + (stderrTruncated ? ' (truncated)' : '');
       if (code !== 0) {
-        reject(new Error(`git ${args.join(' ')} exited ${code}: ${stderr.trim()}`));
+        reject(new Error(`git ${args.join(' ')} exited ${code}: ${stderrText}`));
+        return;
+      }
+      if (stderrText) {
+        reject(new Error(`git ${args.join(' ')} exited 0 but reported warnings (fail closed): ${stderrText}`));
         return;
       }
       resolve(hash.digest('hex'));
@@ -1138,12 +1253,18 @@ const hashGitOutput = async (repo, args) => {
  * @param {string[]} [extraPaths] - Additional repo-relative paths (files or directories) to fold into the seal.
  * @param {object} [overrides] - Test-only seam; defaults to the real `gitPaths` call.
  * @param {typeof gitPaths} [overrides.listIgnoredUntracked] - Overrides the ignored-untracked git listing.
+ * @param {number} [overrides.maxStructuralDigestEntries] - Overrides structuralDigest's entry cap.
+ * @param {number} [overrides.maxNodeModulesDiscoveryDepth] - Overrides findNodeModulesRoots/findGeneratedDirRoots's discovery depth cap.
  * @returns {Promise<string>} Hex-encoded SHA-256 composite fingerprint.
  */
 const workingTreeFingerprint = async (
   repo,
   extraPaths = [],
-  { listIgnoredUntracked = gitPaths, maxStructuralDigestEntries = MAX_STRUCTURAL_DIGEST_ENTRIES } = {},
+  {
+    listIgnoredUntracked = gitPaths,
+    maxStructuralDigestEntries = MAX_STRUCTURAL_DIGEST_ENTRIES,
+    maxNodeModulesDiscoveryDepth = MAX_NODE_MODULES_DISCOVERY_DEPTH,
+  } = {},
 ) => {
   const [diffHash, untracked] = await Promise.all([
     hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD']),
@@ -1288,7 +1409,7 @@ const workingTreeFingerprint = async (
   // listing catches the same mutations at one lstat per entry. An absent
   // node_modules contributes no entry (structuralDigest returns null); its
   // later creation still moves the seal by making the entry appear.
-  const nodeModulesRoots = await findNodeModulesRoots(repo);
+  const nodeModulesRoots = await findNodeModulesRoots(repo, maxNodeModulesDiscoveryDepth);
   for (const nodeModulesRoot of nodeModulesRoots) {
     const digest = await structuralDigest(repo, nodeModulesRoot, maxStructuralDigestEntries);
     if (digest !== null) {
@@ -1307,7 +1428,7 @@ const workingTreeFingerprint = async (
   // above never finds since it does not descend into them either (Qodo
   // UplSv). An absent directory contributes no entry, exactly like an absent
   // node_modules; its later creation still moves the seal.
-  const generatedDirRoots = await findGeneratedDirRoots(repo);
+  const generatedDirRoots = await findGeneratedDirRoots(repo, maxNodeModulesDiscoveryDepth);
   for (const generatedDirRoot of generatedDirRoots) {
     const digest = await structuralDigest(repo, generatedDirRoot, maxStructuralDigestEntries);
     if (digest !== null) {
@@ -1389,10 +1510,17 @@ const readGateChanges = async (repo, baseSha) => {
   // A deleted gate file contributes no added lines, so surface it on a
   // dedicated channel: classifyGateIntegrity must fail closed when a
   // validation-defining file (workflow, package.json, lockfile) is removed
-  // rather than PASS on attestation alone.
+  // rather than PASS on attestation alone. --no-renames is required for both
+  // diffs: Git's default rename detection can collapse a delete+add pair into
+  // a single R-status entry, so a gate file renamed to a path isGateFile()
+  // doesn't recognize would otherwise vanish from the --diff-filter=D query
+  // below (status is R, not D) while --name-only reports only the
+  // unrecognized destination — silently evading the deleted-gate-file
+  // fail-closed check (Qodo UsPU6). Disabling rename detection reports the
+  // old and new paths as a plain delete + add instead.
   const [changed, deleted, untracked] = await Promise.all([
-    gitPaths(repo, ['diff', '--name-only', '-z', baseSha]),
-    gitPaths(repo, ['diff', '--name-only', '--diff-filter=D', '-z', baseSha]),
+    gitPaths(repo, ['diff', '--no-renames', '--name-only', '-z', baseSha]),
+    gitPaths(repo, ['diff', '--no-renames', '--name-only', '--diff-filter=D', '-z', baseSha]),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
   const changedFiles = [...new Set([...changed, ...untracked].filter(isGateFile))].sort();
