@@ -1,7 +1,7 @@
 const { constants } = require('node:fs');
 const { chmod, lstat, mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
-const { assertNotSymlink: assertNotSymlinkShared, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
+const { assertNotSymlink: assertNotSymlinkShared, isSameFileIdentity, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
 
 /**
  * Escape untrusted report text for Markdown: collapse newlines and replace
@@ -334,7 +334,9 @@ const assertNotSymlink = async (target) => {
  * truncated before the nlink check.
  * @param {string} target
  * @param {string} contents
- * @returns {Promise<void>}
+ * @returns {Promise<import('node:fs').Stats>} identity of the written file
+ *   (captured via the open descriptor), so the caller can re-verify it with
+ *   assertStagedIdentity immediately before any later rename.
  */
 const writeNoFollow = async (target, contents) => {
   await assertNotSymlink(target);
@@ -419,8 +421,40 @@ const writeNoFollow = async (target, contents) => {
       }
     }
     await handle.writeFile(contents, 'utf8');
+    return info;
   } finally {
     await handle.close();
+  }
+};
+
+/**
+ * Re-verify a staged temp file's identity immediately before it is renamed
+ * into place as a final report. Staging names are predictable (pid + ms),
+ * and writeNoFollow closes its descriptor well before writeEvidenceReport
+ * renames the file into place, so a concurrent writer with access to
+ * outputDir can replace jsonTmp/markdownTmp with a symlink or a different
+ * regular file in that gap. POSIX rename() does not follow a symlink
+ * source, so it would otherwise commit the replacement itself -- symlink or
+ * outside file and all -- as the final report.json/report.md, even though
+ * only the final destination paths were validated up front (assertNotSymlink
+ * above). Reuses the same isSameFileIdentity predicate the evidence-log and
+ * session-log writers rely on for this class of check, and that the
+ * post-ACL-protection recheck above uses for the equivalent window during
+ * protectWindowsPrivateFile.
+ * @param {string} target
+ * @param {import('node:fs').Stats} info - identity captured when writeNoFollow wrote `target`.
+ * @param {typeof lstat} [lstatFn]
+ * @returns {Promise<void>}
+ */
+const assertStagedIdentity = async (target, info, lstatFn = lstat) => {
+  let current;
+  try {
+    current = await lstatFn(target);
+  } catch {
+    throw new Error(`Refusing to write evidence report with an unverifiable staged identity: ${target}`);
+  }
+  if (!isSameFileIdentity(info, current)) {
+    throw new Error(`Refusing to write evidence report through a staged path swapped before rename: ${target}`);
   }
 };
 
@@ -431,10 +465,13 @@ const writeNoFollow = async (target, contents) => {
  * content is staged to sibling temp files and renamed into place so a
  * failure mid-commit cannot leave a final JSON claiming PASS beside an
  * older provisional Markdown (or vice versa).
- * @param {{outputDir: string, report: object}} options
+ * @param {{outputDir: string, report: object, lstatFn: typeof lstat}} options
+ *   lstatFn defaults to node:fs/promises lstat and exists so tests can
+ *   deterministically simulate a staged file being swapped out from under
+ *   the pre-rename identity check without racing a real concurrent process.
  * @returns {Promise<{json: string, markdown: string}>} the absolute paths written.
  */
-const writeEvidenceReport = async ({ outputDir, report }) => {
+const writeEvidenceReport = async ({ outputDir, report, lstatFn = lstat }) => {
   // Owner-only evidence directory so captured private-repo command output is
   // not world-readable under a shared temp path (umask-independent intent).
   await mkdir(outputDir, { recursive: true, mode: 0o700 });
@@ -462,8 +499,8 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
     ]);
   };
   try {
-    await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
-    await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
+    const jsonInfo = await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
+    const markdownInfo = await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
     // Invalidate any previous final report.json BEFORE committing Markdown.
     // If an explicit --output-dir is reused after a PASS run and we crash
     // between MD rename and JSON rename, consumers must not keep reading the
@@ -478,9 +515,15 @@ const writeEvidenceReport = async ({ outputDir, report }) => {
     }
     // Commit Markdown first, PASS/final JSON last. On a recoverable
     // second-rename failure, remove the committed Markdown so the pair stays
-    // consistent (JSON already removed above).
+    // consistent (JSON already removed above). Re-verify each staged file's
+    // identity immediately before its rename: the predictable staging name,
+    // plus the gap since writeNoFollow closed its descriptor, leaves room for
+    // a concurrent replacement that only a fresh lstat can catch (Codex
+    // UnYbv).
+    await assertStagedIdentity(markdownTmp, markdownInfo, lstatFn);
     await rename(markdownTmp, markdown);
     try {
+      await assertStagedIdentity(jsonTmp, jsonInfo, lstatFn);
       await rename(jsonTmp, json);
     } catch (error) {
       let orphaned = false;

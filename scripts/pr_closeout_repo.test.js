@@ -138,6 +138,78 @@ test('readProjectMetadata captures make recipe bodies, and buildCheckPlan blocks
     const check = plan.checks.find((c) => c.id === 'grafana-render');
     assert.equal(check.status, 'BLOCKED');
     assert.match(check.evidence, /neutralizes failures \(-\)/);
+
+    // CodeRabbit Uohnu: GNU make does not end a recipe at a blank line, so the
+    // ignore-error command below is still part of grafana-render's recipe even
+    // though it sits after a gap. A capture loop that stops at the first
+    // non-tab-prefixed line would miss it and let buildCheckPlan see no
+    // recipe at all for this target.
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render:\n\tnode scripts/render-grafana.js\n\n\t-@echo ignoring failure\n',
+    );
+    const gapped = await readProjectMetadata(repo);
+    assert.ok(
+      gapped.makeRecipes['grafana-render']?.includes('-@echo ignoring failure'),
+      `expected the recipe line after the blank-line gap to be captured, got: ${JSON.stringify(gapped.makeRecipes)}`,
+    );
+    const gappedCheck = buildCheckPlan({ ...gapped, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(gappedCheck.status, 'BLOCKED', JSON.stringify(gappedCheck));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata captures an inline (same-line) make recipe, and buildCheckPlan blocks a neutralizing one end-to-end (Qodo Uod13)', async () => {
+  // GNU make allows a recipe to start on the target line itself after a `;`
+  // (`target: ; recipe` / `target: prereq ; recipe`). A capture loop that only
+  // looks at tab-prefixed lines AFTER the target line never sees this text, so
+  // a neutralizing inline recipe left makeRecipes[target] unset and
+  // buildCheckPlan admitted the check as if it had no recipe to inspect.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-inline-recipe-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(path.join(repo, 'Makefile'), 'grafana-render: ; -@echo inline ignoring failure\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('-@echo inline ignoring failure'),
+      `expected the inline recipe body to be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures \(-\)/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata captures an inline make recipe after prerequisites, using a shell neutralizer (Qodo Uod13)', async () => {
+  // Same gap as above, but with a prerequisite before the `;` and a shell
+  // (not Make `-`) neutralizer, matching the second example from the finding:
+  // `target: prerequisite ; command || true`.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-inline-recipe-prereq-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(path.join(repo, 'Makefile'), 'other:\n\t@echo ok\ngrafana-render: other ; node render.js || true\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('node render.js || true'),
+      `expected the inline recipe body to be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures \(\|\| true\)/);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -447,7 +519,7 @@ test('rejects touched symlinks instead of following them', async (t) => {
       await symlink('target.js', path.join(repo, 'link.js'));
     } catch (error) {
       if (error.code === 'EPERM' || error.code === 'ENOSYS') {
-        t.skip(`symlink creation not permitted on this platform (${error.code})`);
+        t.diagnostic(`symlink creation not permitted on this platform (${error.code})`);
         return;
       }
       throw error;
@@ -502,7 +574,7 @@ test('readProjectMetadata rejects non-regular metadata before reading it', async
 
 test('workingTreeFingerprint records a bounded marker for non-regular reproducibility entries', async (t) => {
   if (process.platform === 'win32') {
-    t.skip('FIFO creation is not available on Windows');
+    t.diagnostic('FIFO creation is not available on Windows');
     return;
   }
   // A generator can leave a FIFO under a configured reproducibility path such
@@ -995,11 +1067,16 @@ test('workingTreeFingerprint seals node_modules content even when size and mtime
     await writeFile(target, 'BBBB');
     await utimes(target, fixed, fixed);
     const s2 = statSync(target);
-    const after = await workingTreeFingerprint(repo);
     // Preconditions: only ctime differs between the two snapshots.
     assert.equal(s2.size, s1.size, 'precondition: same length');
     assert.equal(s2.mtimeMs, s1.mtimeMs, 'precondition: mtime restored to an identical value');
-    assert.notEqual(s2.ctimeMs, s1.ctimeMs, 'precondition: ctime moved (the only differing metadata)');
+    // Some filesystems (FAT/exFAT, certain network mounts, some Windows
+    // configurations) do not track a usable change time; the ctime channel
+    // this test isolates simply does not exist there, so skip rather than
+    // fail the suite on a platform precondition this code does not control
+    // (CodeRabbit Uohnq).
+    if (s2.ctimeMs === s1.ctimeMs) return;
+    const after = await workingTreeFingerprint(repo);
     assert.notEqual(before, after, 'a same-length rewrite with restored mtime must still change the fingerprint');
   } finally {
     await rm(repo, { recursive: true, force: true });

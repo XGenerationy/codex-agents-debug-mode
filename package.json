@@ -9,7 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "validate": "node tools/validate_repository.js",
     "scan:suppressions": "node tools/scan_touched_suppressions.js"
   },

@@ -146,6 +146,16 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // forms `set -e` / `set -o pipefail` are not flagged.
   /\bset\s+\+[a-z]*e[a-z]*\b/i,
   /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
+  // Shell negation (Codex UnYb3): a `!` reserved word before a command,
+  // pipeline, or compound command inverts its exit status AND — per Bash's
+  // documented `-e` behavior — exempts the negated command from errexit, so
+  // `! (npm test) >/dev/null 2>&1` exits 0 precisely when the wrapped command
+  // fails, the same failure-hiding effect as the `|| true` family above.
+  // Anchored like the bare `true`/`:` neutralizers above (start of string, or
+  // right after `;`/`&`/`|`/newline/`(`/`{`) and requiring whitespace before
+  // the next token, so `!=` (inequality) and a bare word containing `!` are
+  // not false positives.
+  /(?:^|[;&|\n(){])\s*!\s+\S/,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,
@@ -376,6 +386,23 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
       // a recipe that neutralizes failure (Make's leading `-` ignore-error
       // prefix, or a shared shell neutralizer) the same way as an
       // auto-discovered package script (Codex Ummss).
+      // readProjectMetadata only records a makeRecipes[target] entry when it
+      // captured at least one recipe line, so an absent entry is
+      // indistinguishable from a recipe whose capture was interrupted
+      // (CodeRabbit 26020f13): findMakeRecipeNeutralizer(undefined) returns
+      // null, which previously let the target resolve as clean even though
+      // its recipe was never actually inspected. Fail closed instead of
+      // trusting an uninspected recipe the same way a neutralizing one is
+      // rejected below.
+      if (!Object.hasOwn(makeRecipes, makeTarget)) {
+        return {
+          ...definition,
+          command: `make ${makeTarget}`,
+          status: 'BLOCKED',
+          resolution: 'make-target',
+          evidence: `No recipe text was captured for make target "${makeTarget}" (${definition.label}); closeout cannot trust an uninspected recipe.`,
+        };
+      }
       const recipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[makeTarget]);
       if (recipeNeutralizer) {
         return {
@@ -1015,11 +1042,18 @@ const scanSuppressionText = (file, text) => {
     // native skip forms of the other test stacks this scanner classifies as
     // test-like. They run under the same testLike gating and inertness map, so
     // quoted mentions (e.g. "pytest.mark.skip" in a JS string) stay unflagged.
-    // The native pattern stays case-SENSITIVE in its own regex: node:test's
-    // legitimate conditional `t.skip(...)` platform gate (lowercase) is not a
-    // skip marker, while Go's abort method is exactly `t.Skip(`/t.Skipf(`
-    // (capital S — lowercase would not compile).
-    const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skip(?:Now|f)?\s*\(|#\s*\[\s*ignore\b/;
+    // node:test's own TestContext#skip([message]) (lowercase `t.skip(`) is
+    // ALSO a native runtime skip, not merely a "legitimate conditional
+    // platform gate": `test('x', t => { t.skip(); throw new Error('never
+    // checked'); })` is reported as skipped and `node --test` exits 0
+    // regardless of what unreachable code follows (CodeRabbit UnYb2). Flag it
+    // unconditionally, the same way `this.skip()` and `.skipIf(cond)` above
+    // are flagged regardless of whether their call site happens to be
+    // conditionally guarded — this scanner surfaces every skip mechanism for
+    // human review rather than trying to tell a legitimate platform gate from
+    // an abused one. Go's abort method keeps its own capital-S alternative
+    // (`t.Skip(`/`t.Skipf(`/`t.SkipNow(`) since Go has no lowercase form.
+    const nativeTestWeakening = /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)\b|\bpytest\s*\.\s*skip\s*\(|\bt\s*\.\s*Skip(?:Now|f)?\s*\(|\bt\s*\.\s*skip\s*\(|#\s*\[\s*ignore\b/;
     const isPythonFile = /\.pyi?$/i.test(base);
     // The optional `(?:\s*\([^()]*\))?` after an intermediate chain member lets
   // the parameterized-test factory forms `test.each(cases).only(...)` /

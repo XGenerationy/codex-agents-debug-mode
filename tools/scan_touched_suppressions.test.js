@@ -348,6 +348,42 @@ test('collectContentRemovals STILL flags a script whose key names a validation s
   );
 });
 
+test('collectContentRemovals STILL flags weakened npm lifecycle-prefixed validation scripts (pretest/posttest/prebuild, Codex UnYbr)', async () => {
+  // VALIDATION_KEY_HINT's word-boundary match alone cannot see the internal
+  // "pre"/"post" + keyword seam inside one concatenated word. npm's own
+  // lifecycle-hook naming (`npm test` runs pretest, test, then posttest) means
+  // these prefixed keys must hint just like their bare form, or a real
+  // fixture-guard script silently becomes a no-op without ever being flagged.
+  for (const key of ['pretest', 'posttest', 'prebuild']) {
+    const diff = await singleFileDiff(
+      'package.json',
+      pkg({ version: '1.0.0', scripts: { [key]: 'node scripts/assert-fixtures.js' } }),
+      pkg({ version: '1.0.0', scripts: { [key]: 'echo skipped' } }),
+    );
+    const removals = collectContentRemovals(diff);
+    assert.ok(
+      removals.some((line) => /assert-fixtures\.js/.test(line)),
+      `expected the replaced ${key} script to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
+});
+
+test('collectContentRemovals exempts a quoted workflow action pin bump (CodeRabbit Uohnw)', async () => {
+  // YAML authors quote `uses:` routinely; isSafeActionPinReplacement's action-
+  // path/ref alternatives both exclude quote characters, so a quoted pin bump
+  // (single- or double-quoted) must be recognized as the same benign
+  // same-action rotation as the bare form tested above.
+  const singleQuotedBefore = "name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: 'actions/checkout@v3'\n";
+  const singleQuotedAfter = "name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: 'actions/checkout@v4'\n";
+  const singleDiff = await singleFileDiff('.github/workflows/ci.yml', singleQuotedBefore, singleQuotedAfter);
+  assert.deepEqual(collectContentRemovals(singleDiff), []);
+
+  const doubleQuotedBefore = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: "actions/checkout@v3"\n';
+  const doubleQuotedAfter = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - uses: "actions/checkout@v4"\n';
+  const doubleDiff = await singleFileDiff('.github/workflows/ci.yml', doubleQuotedBefore, doubleQuotedAfter);
+  assert.deepEqual(collectContentRemovals(doubleDiff), []);
+});
+
 test('collectContentRemovals STILL flags a tsconfig.json value change (package.json-only exemption must not leak)', async () => {
   // The package.json same-key allowance is deliberately scoped to
   // package.json specifically (where the key is the change's true identity,
@@ -530,6 +566,16 @@ test('collectContentRemovals does not pair a removal in one file with an additio
       after: pkg({ version: '9.9.9', scripts: { build: 'webpack' } }),
     },
   ]);
+  // Guard against a vacuous pass: without this precondition, a future
+  // regression that made multiFileDiff emit only the first file's diff would
+  // still flag the 1.2.3 removal (it is a pure deletion in that single-file
+  // diff too) and the test would report success without ever exercising
+  // cross-file pairing (CodeRabbit).
+  assert.ok(
+    /^\+\+\+ b\/package\.json$/m.test(diff)
+    && /^\+\+\+ b\/packages\/nested\/package\.json$/m.test(diff),
+    `fixture must produce a combined two-file diff to test cross-file pairing; got ${diff}`,
+  );
   const removals = collectContentRemovals(diff);
   assert.ok(
     removals.some((line) => /"version":\s*"1\.2\.3"/.test(line)),

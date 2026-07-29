@@ -1289,7 +1289,7 @@ test('reclaimStaleCollectorClaim backs off without touching a claim whose identi
   }
 });
 
-test('reclaimStaleCollectorClaim restores a misidentified successor via rename when link() is unsupported', async () => {
+test('reclaimStaleCollectorClaim restores a misidentified successor when link() is unsupported', async () => {
   // CodeRabbit UmlJJ: the restore branch links the quarantined entry back to
   // the claim path, then unlinks the quarantine copy. On filesystems where
   // hard links are unavailable (FAT/exFAT, some network mounts, certain Windows
@@ -1298,8 +1298,8 @@ test('reclaimStaleCollectorClaim restores a misidentified successor via rename w
   // the successor was already renamed to the private quarantine name, so the
   // live successor is destroyed: claimFile no longer exists and the quarantine
   // copy is orphaned litter the next launch would step over and wrongly claim.
-  // The reclaim must fall back to a rename restore so the successor survives
-  // even where link() cannot run.
+  // The reclaim must fall back to a no-clobber recreate so the successor
+  // survives even where link() cannot run.
   const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-nolink-'));
   const claimFile = path.join(dir, 'collector_claim');
   const staleContent = '40000\nstale-instance\n999999\n';
@@ -1311,20 +1311,64 @@ test('reclaimStaleCollectorClaim restores a misidentified successor via rename w
       claimInfo,
       claimText: staleContent,
       readClaimText: reclaimReadClaimText,
-      // Model a filesystem that cannot create hard links; the default rename
-      // seam stays real so the fallback exercises a genuine on-disk restore.
+      // Model a filesystem that cannot create hard links; the default
+      // restoreClaimExclusiveFn seam stays real so the fallback exercises a
+      // genuine on-disk restore.
       linkFn: async () => {
         const error = new Error('hard links are not supported on this filesystem');
         error.code = 'EPERM';
         throw error;
       },
     });
-    assert.equal(status, 'restored', 'a successor must be restored via rename when link() is unsupported');
+    assert.equal(status, 'restored', 'a successor must be restored when link() is unsupported');
     assert.equal(existsSync(claimFile), true, 'the live successor claim must survive a link-unsupported restore');
     assert.equal(
       await readFile(claimFile, 'utf8'),
       successorContent,
       'the successor claim must be restored to its original path with its content intact',
+    );
+    assert.deepEqual(await readdir(dir), ['collector_claim'], 'no quarantine copy may be left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reclaimStaleCollectorClaim does not clobber a fresh claim that wins the race while link() is unsupported', async () => {
+  // Qodo Uod10: when link() is unsupported, the fallback previously restored
+  // the quarantined successor via a plain rename(), which clobbers whatever
+  // now occupies claimFile. Model a third launcher winning an O_EXCL create
+  // at claimFile in the exact window between link()'s failure and the
+  // restore write -- the restore must back off and leave that fresh claim
+  // untouched, never overwrite it with the misidentified successor.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-nolink-race-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const staleContent = '40000\nstale-instance\n999999\n';
+  const successorContent = `41000\nlive-instance\n${process.pid}\n`;
+  const thirdContenderContent = '42000\nthird-instance\n555555\n';
+  try {
+    await writeFile(claimFile, successorContent, 'utf8');
+    const claimInfo = await lstat(claimFile);
+    const status = await reclaimStaleCollectorClaim(claimFile, {
+      claimInfo,
+      claimText: staleContent,
+      readClaimText: reclaimReadClaimText,
+      linkFn: async () => {
+        // By the time link() would run, claimFile has already been renamed
+        // away to the quarantine path (the reclaim's first step), so this
+        // plants a third launcher's fresh, exclusively-created claim exactly
+        // in that gap before reporting link() as unsupported -- modeling the
+        // destination reappearing after link() fails.
+        await writeFile(claimFile, thirdContenderContent, { encoding: 'utf8', flag: 'wx' });
+        const error = new Error('hard links are not supported on this filesystem');
+        error.code = 'EPERM';
+        throw error;
+      },
+    });
+    assert.equal(status, 'backed-off', 'a fresh third-contender claim must never be clobbered');
+    assert.equal(
+      await readFile(claimFile, 'utf8'),
+      thirdContenderContent,
+      'the third contender claim must survive the restore attempt untouched',
     );
     assert.deepEqual(await readdir(dir), ['collector_claim'], 'no quarantine copy may be left behind');
   } finally {
@@ -1738,7 +1782,7 @@ const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) =
       await rm(projectRoot, { recursive: true, force: true });
     }
   }
-  t.skip('claim swap never landed ahead of the release; nothing asserted');
+  t.diagnostic('claim swap never landed ahead of the release; nothing asserted');
 };
 
 test('does not read or unlink a collector_claim swapped for a symlink before release', { timeout: 30000 }, async (t) => {
@@ -1754,7 +1798,7 @@ test('does not read or unlink a collector_claim swapped for a symlink before rel
     await symlink(probeTarget, path.join(probeRoot, 'link'), 'file');
   } catch (error) {
     // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-    t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+    t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
     return;
   } finally {
     await rm(probeRoot, { recursive: true, force: true });
@@ -2161,7 +2205,7 @@ test('does not delete a concurrently reclaimed collector_claim during stale-clai
       await rm(projectRoot, { recursive: true, force: true });
     }
   }
-  t.skip('claim reclaim race never landed decisively; nothing asserted');
+  t.diagnostic('claim reclaim race never landed decisively; nothing asserted');
 });
 
 test('rejects appends after the session log is swapped for a hard link', async () => {

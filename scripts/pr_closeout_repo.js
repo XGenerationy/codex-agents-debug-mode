@@ -369,12 +369,24 @@ const readProjectMetadata = async (repo) => {
     try {
       const makefile = await safeReadFile(candidate);
       if (makefile === undefined) continue;
-      // Recipe lines are the contiguous tab-prefixed lines immediately after a
-      // target line (GNU make's default recipe-line convention). Captured so a
-      // resolved make target's body can be checked for failure-neutralizing
-      // patterns the same way an auto-discovered package script is (Codex
-      // Ummss) — the first definition's recipe wins for a repeated target
-      // name, mirroring the Set dedup already applied to makeTargets below.
+      // Recipe lines are the tab-prefixed lines belonging to a target
+      // (GNU make's default recipe-line convention), captured so a resolved
+      // make target's body can be checked for failure-neutralizing patterns
+      // the same way an auto-discovered package script is (Codex Ummss) — the
+      // first definition's recipe wins for a repeated target name, mirroring
+      // the Set dedup already applied to makeTargets below. Two gaps let a
+      // neutralizing command hide from that check entirely: (1) GNU make also
+      // accepts an inline recipe on the target line itself after a `;`
+      // (`target: ; recipe` / `target: prereq ; recipe`), which a scan
+      // starting on the NEXT line would never see (Qodo Uod13); (2) GNU make
+      // does not end a recipe at a blank line or a make-level comment (a
+      // non-tab-indented line whose first non-whitespace character is `#`) —
+      // only a genuinely new construct does — so a neutralizer placed after
+      // such a gap inside an otherwise-normal recipe was previously dropped by
+      // stopping at the first non-tab-prefixed line (CodeRabbit Uohnu). Both
+      // are closed here: the post-`;` text (if any) is captured as the first
+      // recipe line, and the scan continues across blank/comment-only lines
+      // instead of stopping at the first one.
       const lines = makefile.split(/\r?\n/);
       const targets = [];
       for (let i = 0; i < lines.length; i += 1) {
@@ -384,8 +396,22 @@ const readProjectMetadata = async (repo) => {
         targets.push(target);
         if (!Object.hasOwn(makeRecipes, target)) {
           const recipeLines = [];
-          for (let j = i + 1; j < lines.length && /^\t/.test(lines[j]); j += 1) {
-            recipeLines.push(lines[j]);
+          const afterColon = lines[i].slice(match[0].length);
+          const semicolon = afterColon.indexOf(';');
+          if (semicolon !== -1) recipeLines.push(afterColon.slice(semicolon + 1));
+          let j = i + 1;
+          while (j < lines.length) {
+            const line = lines[j];
+            if (/^\t/.test(line)) {
+              recipeLines.push(line);
+              j += 1;
+              continue;
+            }
+            if (/^\s*$/.test(line) || /^\s*#/.test(line)) {
+              j += 1;
+              continue;
+            }
+            break;
           }
           if (recipeLines.length) makeRecipes[target] = recipeLines.join('\n');
         }
@@ -895,7 +921,11 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
  * listing pathspec-excludes every nested node_modules tree and a repo-root-only
  * structural digest never reaches a package-local dependency, so without
  * discovering nested roots a mutation under a workspace package is invisible to
- * the seal (Codex Ummso). The walk skips `.git`, never follows a symlink (a
+ * the seal (Codex Ummso). The walk skips `.git` and generated build output
+ * (`dist`, `build`, `coverage`, `.next`, `.cache` — the same directories the
+ * ignored-untracked pathspec query already excludes, so this walk cannot
+ * discover a node_modules root there anyway; descending into them only cost
+ * time in a large repo, CodeRabbit UohnW), never follows a symlink (a
  * symlinked directory is not `isDirectory()` in a Dirent, so it is left for the
  * un-followed symlink handling elsewhere), and does NOT descend into a found
  * node_modules (structuralDigest already covers that subtree, including any
@@ -903,6 +933,12 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
  * @param {string} repo - Absolute repository path.
  * @returns {Promise<string[]>} Sorted repo-relative node_modules root paths (may be empty).
  */
+// Directories that never contain a workspace's own node_modules root worth
+// discovering (either VCS internals or generated build output already
+// excluded from the ignored-untracked seal) — skip descending into them so
+// discovery cost stays proportional to the actual source tree.
+const DISCOVERY_SKIP_DIRS = new Set(['.git', 'dist', 'build', 'coverage', '.next', '.cache']);
+
 const findNodeModulesRoots = async (repo) => {
   const roots = [];
   const walk = async (absoluteDir, relativeDir, depth) => {
@@ -917,7 +953,7 @@ const findNodeModulesRoots = async (repo) => {
     }
     for (const dirent of dirents) {
       if (!dirent.isDirectory()) continue;
-      if (dirent.name === '.git') continue;
+      if (DISCOVERY_SKIP_DIRS.has(dirent.name)) continue;
       const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
       if (dirent.name === 'node_modules') {
         roots.push(childRelative);

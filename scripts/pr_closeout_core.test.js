@@ -1473,6 +1473,28 @@ test('blocks shell options that disable failure propagation', () => {
   assert.match(typecheck.evidence, /neutralizes failures/i);
 });
 
+test('rejects shell negation (!) that inverts a validation failure', () => {
+  // Codex UnYb3: bash exempts a `!`-negated command from errexit and inverts
+  // its exit status, so `! (npm test) >/dev/null 2>&1` exits 0 precisely when
+  // the wrapped command fails — the same failure-hiding effect as `|| true`.
+  assert.ok(findCommandFailureNeutralizer('! (npm test) >/dev/null 2>&1'));
+  assert.ok(findCommandFailureNeutralizer('!  npm test'));
+  assert.ok(findCommandFailureNeutralizer('pnpm build && ! pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('pnpm build; ! pnpm test'));
+  assert.ok(findCommandFailureNeutralizer('! { pnpm test; }'));
+  // `!=` (inequality) and a word merely containing `!` are not neutralizers.
+  assert.equal(findCommandFailureNeutralizer('[ "$x" != "y" ] && pnpm test'), null);
+  assert.equal(findCommandFailureNeutralizer('echo "important!" && pnpm test'), null);
+  assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
+  // Plan level: a configured check negating its own command is BLOCKED.
+  const negatedPlan = buildCheckPlan({
+    config: { commands: { typecheck: '! (tsc --noEmit) >/dev/null 2>&1' } },
+  });
+  const negated = negatedPlan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(negated.status, 'BLOCKED', JSON.stringify(negated));
+  assert.match(negated.evidence, /neutralizes failures/i);
+});
+
 test('flags pytest, Go, and Rust native skip forms in touched test files', () => {
   // Codex UDDQN: the weakening scan only knew JavaScript/Jest forms; the
   // native skip forms of the other test ecosystems the scanner treats as
@@ -1509,6 +1531,41 @@ test('flags pytest, Go, and Rust native skip forms in touched test files', () =>
   assert.deepEqual(
     scanSuppressionText('src/foo.test.js', 'const s = "pytest.mark.skip";')
       .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
+test('flags node:test context skip (lowercase t.skip) as test-weakening', () => {
+  // CodeRabbit UnYb2: node:test's TestContext#skip() is a real runtime skip,
+  // not merely a "legitimate conditional platform gate" — an unconditional
+  // `t.skip()` reports the test as skipped and `node --test` exits 0
+  // regardless of what unreachable code follows, so a PR can replace a real
+  // assertion with a bare skip call and keep the suppression scan silent.
+  const hidden = scanSuppressionText(
+    'src/foo.test.js',
+    "test('hidden', t => { t.skip(); throw new Error('never checked'); });",
+  ).filter(({ category }) => category === 'test-weakening');
+  assert.equal(hidden.length, 1, `expected 1 finding: ${JSON.stringify(hidden)}`);
+  // A message argument is also caught.
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', "test('x', (t) => { t.skip('reason'); });")
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
+  // Gating is unchanged: outside a test-like file, or inert inside a comment
+  // or string, the same text produces no finding; an unrelated receiver whose
+  // name merely ends in "t" (e.g. "test.skip", "context.skip") is a distinct,
+  // already-covered dot-member form and must not double-count here.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.js', 't.skip();').filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', '// t.skip();').filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'const s = "t.skip();";').filter(({ category }) => category === 'test-weakening'),
     [],
   );
 });
@@ -1697,17 +1754,31 @@ test('scans an adversarial single-line receiver input in linear time', () => {
   // `.skip`/`.only`, so the per-line pass finds nothing and the multiline
   // fallback runs the opener on the whole line. The single-pass rewrite is
   // linear; the old code took several seconds on this input.
-  const adversarial = 'test('.repeat(40000); // ~200 KB, ~40k receiver tokens
-  const started = process.hrtime.bigint();
-  const findings = scanSuppressionText('src/adversarial.test.js', adversarial)
-    .filter(({ category }) => category === 'test-weakening');
-  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  //
+  // CodeRabbit (3dfe49fa): a raw `elapsedMs < 3000` wall-clock threshold
+  // measures the CI machine, not the algorithm, and is a flake source on a
+  // loaded shared runner. Compare two input sizes instead: doubling the input
+  // roughly doubles a linear scan's cost but roughly quadruples a quadratic
+  // one, so the ratio — not the absolute time — is what proves linearity.
+  const timeScan = (tokens) => {
+    const input = 'test('.repeat(tokens);
+    const started = process.hrtime.bigint();
+    const found = scanSuppressionText('src/adversarial.test.js', input)
+      .filter(({ category }) => category === 'test-weakening');
+    return { found, ms: Number(process.hrtime.bigint() - started) / 1e6 };
+  };
+  const small = timeScan(20000); // ~100 KB, ~20k receiver tokens
+  const large = timeScan(40000); // ~200 KB, ~40k receiver tokens
   // Behavior is unchanged — no skip/only/option-object skip is present, so
   // nothing is flagged; only the cost changed.
-  assert.deepEqual(findings, [], JSON.stringify(findings));
+  assert.deepEqual(small.found, [], JSON.stringify(small.found));
+  assert.deepEqual(large.found, [], JSON.stringify(large.found));
+  // A quadratic regression costs ~4x for a 2x input, not ~2x; allow generous
+  // slack (3x plus a flat floor) so a slow/loaded runner cannot flake a
+  // genuinely linear implementation.
   assert.ok(
-    elapsedMs < 3000,
-    `adversarial single-line scan must stay linear; took ${elapsedMs.toFixed(0)}ms`,
+    large.ms < Math.max(small.ms * 3 + 50, 250),
+    `adversarial single-line scan must stay near-linear, not quadratic: ${small.ms.toFixed(1)}ms (20k) -> ${large.ms.toFixed(1)}ms (40k)`,
   );
 
   // Equivalence under load: a real option-object skip after heavy receiver
@@ -1762,6 +1833,38 @@ test('blocks auto-discovered make targets whose recipe neutralizes failures', ()
   assert.equal(clean.command, 'make grafana-render');
   assert.equal(clean.resolution, 'make-target');
   assert.notEqual(clean.status, 'BLOCKED', JSON.stringify(clean));
+});
+
+test('blocks a resolved make target whose recipe text was never captured', () => {
+  // CodeRabbit 26020f13: findMakeRecipeNeutralizer(undefined) returns null,
+  // so a make target resolved by name but missing a makeRecipes[target]
+  // entry (empty body, or a recipe whose capture was interrupted) previously
+  // resolved as clean without its recipe ever being inspected — fail-open for
+  // the exact class of failure-hiding recipe this check exists to catch.
+  const noRecipePlan = buildCheckPlan({
+    makeTargets: ['grafana-render'],
+    makeRecipes: {},
+  });
+  const noRecipe = noRecipePlan.checks.find(({ id }) => id === 'grafana-render');
+  assert.equal(noRecipe.status, 'BLOCKED', JSON.stringify(noRecipe));
+  assert.equal(noRecipe.resolution, 'make-target');
+  assert.equal(noRecipe.command, 'make grafana-render');
+  assert.match(noRecipe.evidence, /no recipe text was captured/i);
+  // Omitting makeRecipes entirely (the default {}) is the same case.
+  const omittedPlan = buildCheckPlan({ makeTargets: ['grafana-render'] });
+  assert.equal(
+    omittedPlan.checks.find(({ id }) => id === 'grafana-render').status,
+    'BLOCKED',
+  );
+  // Negative control: a captured (even trivially short) recipe still resolves
+  // normally — this case is not affected by the fail-closed check above.
+  const capturedPlan = buildCheckPlan({
+    makeTargets: ['grafana-render'],
+    makeRecipes: { 'grafana-render': 'node scripts/render-grafana.js' },
+    config: { proofs: { 'grafana-render': { type: 'artifact', path: 'artifacts/grafana.png' } } },
+  });
+  const captured = capturedPlan.checks.find(({ id }) => id === 'grafana-render');
+  assert.notEqual(captured.status, 'BLOCKED', JSON.stringify(captured));
 });
 
 test('flags a source exclusion padded beyond the old ignore-array scan window', () => {

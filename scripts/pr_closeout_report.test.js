@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { linkSync } = require('node:fs');
-const { mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
+const { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -367,7 +367,7 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
       await symlink(outsideTarget, path.join(outputDir, 'report.json'));
     } catch (error) {
       // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
       return;
     }
 
@@ -396,7 +396,7 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
       await symlink(outsideTarget, path.join(outputDir, 'report.md'));
     } catch (error) {
       // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
       return;
     }
 
@@ -430,7 +430,7 @@ test('writeEvidenceReport never writes report.json when report.md is the rejecte
       await symlink(outsideTarget, path.join(outputDir, 'report.md'));
     } catch (error) {
       // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
       return;
     }
 
@@ -519,3 +519,81 @@ test(
     }
   },
 );
+
+test('writeEvidenceReport refuses to rename a staged report.json whose identity changed before commit', async () => {
+  // Staging names are pid+ms and writeNoFollow closes its descriptor well
+  // before the rename below, so a concurrent writer with access to
+  // outputDir could swap jsonTmp for a symlink or a different regular file
+  // in that gap; only the final report.json/report.md paths were validated
+  // up front (assertNotSymlink), not the staged temp paths themselves. A
+  // fake lstatFn deterministically reproduces the post-swap disk state
+  // (mismatched dev/ino, mirroring the fake lstatFn technique in
+  // pr_closeout_repo.test.js) for the pre-rename identity check instead of
+  // racing a real concurrent process (Codex UnYbv).
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-swap-json-'));
+  try {
+    const lstatFn = async (target) => {
+      const info = await lstat(target);
+      if (path.basename(target).startsWith('.report.json.')) {
+        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+      }
+      return info;
+    };
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport(), lstatFn }),
+      /staged path swapped before rename/i,
+    );
+
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.json must not be committed when its staged identity changed',
+    );
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.md'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.md must be rolled back when report.json fails its pre-rename identity check',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport refuses to rename a staged report.md whose identity changed before commit', async () => {
+  // Same TOCTOU window as above, but on the first rename: markdownTmp is
+  // swapped before its own pre-rename identity check runs, so neither final
+  // report file may ever be written (Codex UnYbv).
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-swap-md-'));
+  try {
+    const lstatFn = async (target) => {
+      const info = await lstat(target);
+      if (path.basename(target).startsWith('.report.md.')) {
+        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+      }
+      return info;
+    };
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport(), lstatFn }),
+      /staged path swapped before rename/i,
+    );
+
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.md'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.md must not be committed when its staged identity changed',
+    );
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.json must never be committed when report.md fails its pre-rename identity check',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});

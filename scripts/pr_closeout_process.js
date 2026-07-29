@@ -1888,10 +1888,17 @@ const createLogAppendStreamNoFollow = async (target, securedDirIdentity = null, 
     if (securedDirIdentity) await assertLogParentIdentity(target, securedDirIdentity);
     if (securedFileIdentity) {
       const info = await handle.stat();
+      // Only compare identity when BOTH the recorded and observed inode are
+      // non-zero: some Windows volumes and network mounts report ino: 0 for
+      // every file, which would otherwise make this comparison reject every
+      // append on those hosts as a "swap" even with no swap at all. When the
+      // platform cannot supply a real inode, skip the bind here and rely on
+      // O_NOFOLLOW plus the parent-directory identity check above instead
+      // (CodeRabbit UohnP).
       if (
-        securedFileIdentity.ino === 0
-        || info.dev !== securedFileIdentity.dev
-        || info.ino !== securedFileIdentity.ino
+        securedFileIdentity.ino !== 0
+        && info.ino !== 0
+        && (info.dev !== securedFileIdentity.dev || info.ino !== securedFileIdentity.ino)
       ) {
         throw new Error(
           `Refusing to append evidence to a log file swapped after its header write: ${target}`,

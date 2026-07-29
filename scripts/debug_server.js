@@ -1126,7 +1126,8 @@ const isCompleteClaimText = (text) => {
  * same stale record we already inspected (byte-for-byte, or -- when the
  * original was unreadable -- one that still fails to parse as a claim) is
  * deleted; anything else is a live successor that is restored to its original
- * path via a no-clobber link+unlink so this launch backs off instead.
+ * path via a no-clobber link+unlink (or, when hard links are unsupported, an
+ * equivalent O_CREAT|O_EXCL recreate) so this launch backs off instead.
  *
  * Errors are funneled to `collector_claim_contention` (ENOENT is a benign
  * "someone else already moved it" back-off), matching the bare-unlink branch
@@ -1150,6 +1151,18 @@ const reclaimStaleCollectorClaim = async (claimFile, {
   unlinkFn = unlink,
   sameIdentity = isSameLockIdentity,
   quarantineSuffix = () => randomBytes(8).toString('hex'),
+  // No-clobber restore used when link() cannot run at all (see below): create
+  // the destination the same way every claim is created, O_CREAT|O_EXCL, so a
+  // fresh claim -- or a symlink -- already at claimFile fails this closed
+  // with EEXIST instead of being silently overwritten the way rename() would.
+  restoreClaimExclusiveFn = async (target, contents) => {
+    const handle = await openNoFollow(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    try {
+      await handle.writeFile(contents, 'utf8');
+    } finally {
+      await handle.close();
+    }
+  },
 } = {}) => {
   try {
     await assertNotSymlinkFn(claimFile, 'collector_claim_is_symlink');
@@ -1209,16 +1222,34 @@ const reclaimStaleCollectorClaim = async (claimFile, {
         // network mounts, certain Windows shares), where link() fails with
         // EPERM/ENOSYS/EXDEV rather than ENOENT/EEXIST. Without a fallback the
         // successor stays orphaned under the quarantine name while claimFile is
-        // left empty for the next launch to wrongly claim, so fall back to a
-        // (non-atomic) rename restore before surfacing contention (CodeRabbit
-        // UmlJJ). A vanished quarantine entry re-throws the original ENOENT and
-        // is funneled to a benign back-off by the outer catch.
-        try {
-          await renameFn(quarantinePath, claimFile);
-          return 'restored';
-        } catch {
+        // left empty for the next launch to wrongly claim (CodeRabbit UmlJJ).
+        // A plain rename() restore would reopen that same hazard from the
+        // other direction: rename() clobbers whatever now occupies claimFile,
+        // so a third contender's fresh claim created while this successor sat
+        // quarantined would be silently destroyed (Qodo Uod10). Recreate the
+        // destination via restoreClaimExclusiveFn instead, which fails closed
+        // with EEXIST against a fresh claim (or a planted symlink) rather than
+        // overwriting it. A vanished quarantine entry re-throws the original
+        // ENOENT and is funneled to a benign back-off by the outer catch.
+        if (requarantinedText === null) {
+          // No verified byte-for-byte content to recreate the destination
+          // with (the quarantined entry became unreadable on re-read);
+          // surface contention rather than fabricate a claim record.
           throw error;
         }
+        try {
+          await restoreClaimExclusiveFn(claimFile, requarantinedText);
+        } catch (restoreError) {
+          if (restoreError?.code === 'EEXIST') {
+            // Same third-contender race as the link() EEXIST branch above,
+            // just hit via the no-hard-link fallback path instead.
+            await unlinkFn(quarantinePath).catch(() => {});
+            return 'backed-off';
+          }
+          throw restoreError;
+        }
+        await unlinkFn(quarantinePath);
+        return 'restored';
       }
       return 'restored';
     }

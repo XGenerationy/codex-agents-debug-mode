@@ -458,8 +458,13 @@ const isSafeMetadataReplacement = (removedLine, addedLine, currentFile) => {
 // a script or dependency whose name itself suggests it validates something
 // stays fail-closed even when its new value doesn't (yet) match
 // VALIDATION_REMOVAL_PATTERNS. Word-boundary matching so e.g. `eslint` (a
-// devDependency name) does not collide with the `lint` keyword.
-const VALIDATION_KEY_HINT = /\b(?:test|lint|audit|validate|typecheck|coverage|verify|check|scan|smoke|health[-_]?check|doctor|build|security|codeql|ci)\b/i;
+// devDependency name) does not collide with the `lint` keyword. The optional
+// leading `pre`/`post` recognizes npm's own lifecycle-hook naming -- `npm
+// test` runs `pretest`, `test`, then `posttest` -- so `pretest`/`prebuild`/
+// `postlint`/etc. hint just like their bare form; a bare word-boundary match
+// cannot see the internal "pre"+"test" seam inside one concatenated word
+// (Codex UnYbr).
+const VALIDATION_KEY_HINT = /\b(?:pre|post)?(?:test|lint|audit|validate|typecheck|coverage|verify|check|scan|smoke|health[-_]?check|doctor|build|security|codeql|ci)\b/i;
 
 /**
  * Extract the quoted JSON key from a trimmed package.json diff line body
@@ -593,11 +598,17 @@ const isFullActionSha = (ref) => /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(ref);
  */
 const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
   if (!currentFile.startsWith('.github/workflows/') && !currentFile.startsWith('.github/actions/')) return false;
-  const usesPattern = /^[+-]\s*(?:-\s*)?uses:\s*([^@\s'"]+)@(\S+?)\s*$/;
+  // Accept the quoted YAML form (`uses: 'owner/repo@<sha>'` or `"..."`) as
+  // well as bare: YAML authors quote `uses:` routinely, but the action-path
+  // and ref alternatives both exclude quote characters, so a quoted pin bump
+  // fell through unmatched to the fail-closed content-removal path even when
+  // it only rotates an already-unchanged pin (CodeRabbit Uohnw). The
+  // backreference requires symmetric quoting (or none) on each matched side.
+  const usesPattern = /^[+-]\s*(?:-\s*)?uses:\s*(['"]?)([^@\s'"]+)@([^\s'"]+)\1\s*$/;
   const removedMatch = usesPattern.exec(removedLine);
   const addedMatch = usesPattern.exec(addedLine);
-  if (!removedMatch || !addedMatch || removedMatch[1] !== addedMatch[1]) return false;
-  if (isFullActionSha(removedMatch[2]) && !isFullActionSha(addedMatch[2])) return false;
+  if (!removedMatch || !addedMatch || removedMatch[2] !== addedMatch[2]) return false;
+  if (isFullActionSha(removedMatch[3]) && !isFullActionSha(addedMatch[3])) return false;
   const addedAsRemoval = `-${addedLine.slice(1)}`;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
