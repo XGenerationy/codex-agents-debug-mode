@@ -3720,7 +3720,23 @@ const runPreflight = async ({
     knownSiblingMarks: activeSpawnMarks,
   }));
   for (const [name, command] of TOOL_PROBES) {
-    const result = await runProbe(command);
+    // A probe that rejects (spawn throws synchronously under resource
+    // exhaustion, or an infrastructure error) must not escape this loop and
+    // abort runCloseoutWorkflow -- that would emit only the top-level error and
+    // skip the structured evidence report. Convert a rejected probe into a
+    // redacted per-tool BLOCKED row so the workflow completes and reports it
+    // like any other failing preflight check (Codex U3w6p).
+    let result;
+    try {
+      result = await runProbe(command);
+    } catch (error) {
+      checks.push({
+        name,
+        status: 'BLOCKED',
+        evidence: redactShellEvidence(`Tool probe failed to run: ${error?.message || error}`),
+      });
+      continue;
+    }
     // Process-tree cleanup failure is admission-blocking even when the probe
     // itself exited 0: a surviving descendant can mutate the worktree after
     // the seal, same as the main command executor.

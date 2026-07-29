@@ -240,9 +240,26 @@ const resolveBaseSha = (repoRoot = root) => {
       comparisonStyle = 'two-dot';
       return beforeSha;
     } catch {
-      // Unfetched/unavailable preimage: fall through to GITHUB_BASE_REF /
-      // origin/main / merge-base / empty-tree resolution instead of
-      // selecting a base the diff cannot resolve.
+      // The preimage names a commit not present locally (actions/checkout
+      // fetch-depth:1, or even 0 after a force-push whose old divergent tip was
+      // pruned). Try to fetch it explicitly; if that also fails, fail closed:
+      // silently falling through to origin/main (which commonly equals HEAD on
+      // a push) or the empty tree would make pure deletions from a gate file --
+      // e.g. removing an audit/test step while keeping this workflow --
+      // invisible and let the scan pass as an additive-only current-tree diff
+      // (Codex U25nk/U3w68).
+      try {
+        gitBuffer(['fetch', '--depth=1', 'origin', beforeSha], { cwd: repoRoot });
+        gitBuffer(['cat-file', '-e', `${beforeSha}^{commit}`], { cwd: repoRoot });
+        comparisonStyle = 'two-dot';
+        return beforeSha;
+      } catch (fetchError) {
+        throw new Error(
+          `Push preimage ${beforeSha} (GITHUB_EVENT_BEFORE) is not present locally and could not be fetched; cannot safely diff force-push removals, so the scan fails closed. Fetch it (fetch-depth:0) or clear GITHUB_EVENT_BEFORE to fall back to branch resolution. Cause: ${
+            fetchError?.message || fetchError
+          }`,
+        );
+      }
     }
   }
 

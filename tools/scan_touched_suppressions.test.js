@@ -47,21 +47,24 @@ const fixtureRepo = async () => {
   return repo;
 };
 
-test('GITHUB_EVENT_BEFORE naming an unfetched commit falls through to another base', async () => {
-  // actions/checkout defaults to fetch-depth: 1, so a format-valid push
-  // preimage can name a commit that was never fetched. resolveBaseSha must not
-  // select it as a two-dot base (the diff would die on an unknown revision
-  // before the gate evaluates) and must fall through to the remaining
-  // resolution chain instead (CodeRabbit discussion_r3652923145).
+test('GITHUB_EVENT_BEFORE naming an unfetched commit fails closed when it cannot be fetched', async () => {
+  // A push preimage (GITHUB_EVENT_BEFORE) that is not present locally must be
+  // fetched or fail the scan: silently falling through to origin/main (often
+  // == HEAD on a push) or the empty tree would make pure deletions from a gate
+  // file invisible and let the scan pass as an additive-only current-tree diff
+  // (Codex U25nk/U3w68). This fixture repo has no `origin` remote, so the
+  // explicit `git fetch origin <sha>` fails and resolveBaseSha must throw
+  // rather than pick a different base. (Supersedes the prior fall-through design
+  // from CodeRabbit discussion_r3652923145, which was reliability-motivated but
+  // left the force-push deletion gap open.)
   const repo = await fixtureRepo();
   const restoreEnv = setScanEnv('0123456789abcdef0123456789abcdef01234567');
   try {
-    const unfetched = process.env.GITHUB_EVENT_BEFORE;
-    const base = resolveBaseSha(repo);
-    assert.notEqual(base, unfetched);
-    assert.notEqual(getComparisonStyle(), 'two-dot');
-    // Fall-through still resolves a usable base (fail-closed chain intact).
-    assert.match(base, /^[0-9a-f]{40}$/i);
+    assert.throws(
+      () => resolveBaseSha(repo),
+      /Push preimage .* could not be fetched/i,
+      'an unfetched GITHUB_EVENT_BEFORE that cannot be fetched must fail closed',
+    );
   } finally {
     restoreEnv();
     await rm(repo, { recursive: true, force: true });

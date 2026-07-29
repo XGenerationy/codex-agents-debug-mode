@@ -2254,6 +2254,22 @@ test('probeCommandDefault gives each omitted-knownSiblingMarks call its own regi
   assert.equal(b.snapshot.size, 1, `must see only its own mark, not the other probe's: ${[...b.snapshot]}`);
 });
 
+test('runPreflight converts a rejecting tool probe into a per-tool BLOCKED check instead of aborting (Codex U3w6p)', async () => {
+  // A probeCommand that rejects (spawn throws synchronously under resource
+  // exhaustion, or an infrastructure error) must not escape runPreflight and
+  // abort runCloseoutWorkflow -- it becomes a redacted per-tool BLOCKED row so
+  // the structured evidence report is still written.
+  const result = await runPreflight({
+    repo: process.cwd(),
+    config: { minFreeDiskGb: 0 },
+    env: {},
+    probeCommand: async () => { throw new Error('spawn EAGAIN'); },
+  });
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
+  const probeChecks = result.checks.filter((c) => c.status === 'BLOCKED' && /Tool probe failed to run/i.test(c.evidence));
+  assert.ok(probeChecks.length > 0, `at least one tool probe must be BLOCKED with a run-failure reason: ${JSON.stringify(result.checks)}`);
+});
+
 test('runPreflight BLOCKs when a probe reports process-tree cleanup failure', async () => {
   // Even if a version probe exits 0, an unreaped descendant must refuse
   // admission — matching the main command executor's terminationStatus latch.

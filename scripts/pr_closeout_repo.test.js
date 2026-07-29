@@ -303,6 +303,63 @@ test('readProjectMetadata aggregates every double-colon recipe for a target (Cod
   }
 });
 
+test('readProjectMetadata captures a backslash-continued recipe line, including a neutralizing continuation (Codex U3w6w)', async () => {
+  // GNU make joins a recipe line ending in an unescaped `\` with the next
+  // physical line (which needs no recipe prefix), so `false \` followed by
+  // `|| true` runs `false || true` and exits 0. The parser must capture the
+  // continuation so findMakeRecipeNeutralizer sees the `|| true` instead of
+  // only the first line.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-continuation-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render:\n\tfalse \\\n|| true\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    const recipe = metadata.makeRecipes['grafana-render'];
+    assert.ok(recipe?.includes('|| true'), `the continuation line (|| true) must be captured, got: ${JSON.stringify(recipe)}`);
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata honors a configured .RECIPEPREFIX instead of requiring a tab (Codex U3w63)', async () => {
+  // Repos that set `.RECIPEPREFIX := >` write recipes prefixed with `>`; GNU
+  // make runs them normally. A tab-only test captured no recipe and marked
+  // every Make check BLOCKED with "No recipe text", so closeout could never
+  // pass for such a project. The parser must recognize the active prefix.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-recipeprefix-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      '.RECIPEPREFIX := >\ngrafana-render:\n>node render.js >/dev/null 2>&1 || true\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    const recipe = metadata.makeRecipes['grafana-render'];
+    assert.ok(recipe?.includes('|| true'), `the >-prefixed recipe must be captured under .RECIPEPREFIX, got: ${JSON.stringify(recipe)}`);
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('readProjectMetadata and buildCheckPlan do not mistake a target-line comment for a real recipe (CodeRabbit UptWQ)', async () => {
   // GNU make strips a comment (an unescaped `#`) from a target/prerequisites
   // line before it looks for the `;` that introduces an inline recipe. A scan

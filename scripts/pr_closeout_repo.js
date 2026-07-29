@@ -457,7 +457,28 @@ const readProjectMetadata = async (repo) => {
         // a double-colon target AGGREGATES every recipe (GNU make runs each
         // independently, Codex Uz6Am).
         {
+          // GNU make's recipe prefix is tab by default but is configurable via
+          // .RECIPEPREFIX (the first char of its value). Use the last
+          // .RECIPEPREFIX assignment seen before this target so a repo that
+          // sets `.RECIPEPREFIX := >` is parsed instead of every Make check
+          // reporting "No recipe text was captured" (Codex U3w63).
+          let recipePrefix = '\t';
+          for (let k = 0; k < i; k += 1) {
+            const rpm = lines[k].match(/^\s*\.RECIPEPREFIX\s*(?::{1,2}|\+)?=\s*(\S)/);
+            if (rpm) recipePrefix = rpm[1];
+          }
+          // A recipe line ending in an unescaped `\` continues onto the next
+          // physical line, which needs no recipe prefix; GNU make joins the
+          // backslash-newline and runs the whole thing, so a neutralizer on the
+          // continuation (`false \<newline>|| true`) must be captured (Codex
+          // U3w6w). An odd trailing-backslash count means the final `\` is
+          // unescaped.
+          const continues = (text) => {
+            const m = text.match(/\\+$/);
+            return m ? m[0].length % 2 === 1 : false;
+          };
           const recipeLines = [];
+          let continuing = false;
           const afterColon = lines[i].slice(match[0].length);
           // GNU make strips a comment (an unescaped `#`) from a target/
           // prerequisites line before it looks for the `;` that introduces an
@@ -469,12 +490,17 @@ const readProjectMetadata = async (repo) => {
           const hashIndex = findUnescapedHashIndex(afterColon);
           const beforeComment = hashIndex === -1 ? afterColon : afterColon.slice(0, hashIndex);
           const semicolon = beforeComment.indexOf(';');
-          if (semicolon !== -1) recipeLines.push(beforeComment.slice(semicolon + 1));
+          if (semicolon !== -1) {
+            const inline = beforeComment.slice(semicolon + 1);
+            recipeLines.push(inline);
+            continuing = continues(inline);
+          }
           let j = i + 1;
           while (j < lines.length) {
             const line = lines[j];
-            if (/^\t/.test(line)) {
+            if (continuing || line.startsWith(recipePrefix)) {
               recipeLines.push(line);
+              continuing = continues(line);
               j += 1;
               continue;
             }
