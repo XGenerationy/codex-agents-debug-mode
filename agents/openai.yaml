@@ -1,0 +1,7 @@
+interface:
+  display_name: "Evidence Debug Mode"
+  short_description: "Debug bugs and clean GitHub PRs with live evidence"
+  default_prompt: "Use $debug to investigate this bug or clean up the current GitHub PR using live evidence."
+
+policy:
+  allow_implicit_invocation: true

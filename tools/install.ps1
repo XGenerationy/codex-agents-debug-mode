@@ -1,0 +1,342 @@
+﻿[CmdletBinding(SupportsShouldProcess)]
+param(
+    [ValidateSet('Codex', 'Agents', 'Both')]
+    [string]$Target = 'Both',
+    [string]$HomePath = $HOME,
+    [switch]$Force
+)
+
+$ErrorActionPreference = 'Stop'
+# Fail closed on missing/empty HomePath instead of computing relative
+# destination paths via Join-Path. Mirrors the explicit HOME validation in
+# tools/install.sh so the Windows installer does not silently install into
+# the current directory or an unexpected rooted target.
+if ([string]::IsNullOrWhiteSpace($HomePath)) {
+    throw 'HomePath is empty; pass -HomePath <path> or set $HOME.'
+}
+$HomePath = "$HomePath".Trim()
+# IsPathRooted accepts rooted-relative paths like \tmp that still depend on the
+# current drive. Require a fully qualified path (drive letter or UNC).
+$isFullyQualified = $false
+# Branch on PS version: IsPathFullyQualified exists on PS 6+ /.NET Core.
+# Do not probe the static member under StrictMode on Windows PowerShell 5.1.
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $isFullyQualified = [System.IO.Path]::IsPathFullyQualified($HomePath)
+} else {
+    $isFullyQualified = $HomePath -match '^[A-Za-z]:[\\/]' -or $HomePath -match '^\\\\[^\\]+\\'
+}
+if (-not $isFullyQualified) {
+    throw "HomePath must be a fully qualified absolute path (drive letter or UNC): $HomePath"
+}
+$source = Split-Path -Parent $PSScriptRoot
+$payload = @('SKILL.md', 'agents', 'assets', 'references', 'scripts')
+$targets = @(switch ($Target) {
+    'Codex' { Join-Path $HomePath '.codex\skills\debug' }
+    'Agents' { Join-Path $HomePath '.agents\skills\debug' }
+    'Both' {
+        Join-Path $HomePath '.codex\skills\debug'
+        Join-Path $HomePath '.agents\skills\debug'
+    }
+})
+
+# Reject a symlink/junction/mount-point payload entry, or any nested entry
+# that is one: Test-Path alone follows a reparse point and would pass, then
+# Copy-Item -Recurse would stage the link (or its target) into the installed
+# skill, letting a reviewed payload point outside the tree. Walk one
+# directory level at a time with Get-ChildItem (no -Recurse) instead of
+# recursing wholesale, because -Recurse itself follows a reparse point while
+# traversing; checking each child's own Attributes before deciding whether to
+# descend means a nested reparse point is rejected before it is ever
+# followed.
+function Assert-PayloadEntrySafe {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force
+    $isReparsePoint = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    $isFile = $item -is [System.IO.FileInfo]
+    $isDirectory = $item -is [System.IO.DirectoryInfo]
+    if ($isReparsePoint -or (-not $isFile -and -not $isDirectory)) {
+        throw "Skill payload entry must be a regular file/directory, not a symlink, junction, or special file: $Label"
+    }
+    if ($isDirectory) {
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force) {
+            Assert-PayloadEntrySafe -Path $child.FullName -Label "$Label/$($child.Name)"
+        }
+    }
+}
+
+foreach ($entry in $payload) {
+    $entryPath = Join-Path $source $entry
+    if (-not (Test-Path -LiteralPath $entryPath)) {
+        throw "Missing skill payload entry: $entry"
+    }
+    Assert-PayloadEntrySafe -Path $entryPath -Label $entry
+}
+
+
+function Test-DestinationOccupied {
+    param([Parameter(Mandatory)][string]$Path)
+    # Test-Path can return $false for a dangling symlink/junction (target missing)
+    # even though the reparse point still occupies the name. Get-Item -Force sees
+    # the directory entry itself.
+    if (Test-Path -LiteralPath $Path) { return $true }
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# Preflight all destinations before mutating any of them so multi-target
+# installs cannot leave one path updated and another absent/partial.
+foreach ($destination in $targets) {
+    if ((Test-DestinationOccupied -Path $destination) -and -not $Force) {
+        throw "Target exists: $destination. Rerun with -Force to preserve it as a backup and replace it."
+    }
+}
+
+function New-UniqueBackupPath {
+    param([Parameter(Mandatory)][string]$Destination)
+    $stamp = [DateTime]::UtcNow.Ticks
+    $backup = "$Destination.backup.$stamp`_$PID"
+    $retry = 0
+    # Test-DestinationOccupied also sees dangling reparse points that Test-Path misses.
+    while (Test-DestinationOccupied -Path $backup) {
+        $retry++
+        $backup = "$Destination.backup.$stamp`_$PID`_$retry"
+    }
+    return $backup
+}
+
+function Get-DestinationLockPath {
+    param([Parameter(Mandatory)][string]$Destination)
+    # A plain filesystem lock adjacent to the destination -- matching
+    # tools/install.sh's own "${dest}.install-lock" convention -- instead of
+    # a named Windows Mutex. A Mutex without the "Global\" prefix lives in
+    # the *invoking session's* private namespace, so two processes started
+    # from separate RDP/service/interactive sessions against the same
+    # -HomePath acquire different mutex objects and can run the
+    # backup/commit/rollback transaction concurrently against the same
+    # destination, defeating the installer's atomicity guarantee (CodeRabbit
+    # review). "Global\" would close that gap but needs the "Create global
+    # objects" privilege that restricted/Terminal-Services accounts may
+    # lack. A filesystem path is not namespaced by session at all, and an
+    # open handle with FileShare::None is released by the OS the instant
+    # this process exits or crashes for any reason, so it cannot permanently
+    # wedge a later installer either.
+    return [System.IO.Path]::GetFullPath($Destination) + '.install-lock'
+}
+
+$destinationLocks = New-Object 'System.Collections.Generic.List[object]'
+function Enter-DestinationLocks {
+    param([Parameter(Mandatory)][string[]]$Destinations)
+    # All lock paths are acquired in a stable order before any destination is
+    # moved. This prevents a Both-target transaction from deadlocking a
+    # single-target transaction and keeps every backup/commit/rollback action
+    # isolated from concurrent installers.
+    foreach ($destination in ($Destinations | Sort-Object { [System.IO.Path]::GetFullPath($_).ToLowerInvariant() })) {
+        $lockPath = Get-DestinationLockPath -Destination $destination
+        $deadline = [DateTime]::UtcNow.AddMinutes(1)
+        $stream = $null
+        while ($true) {
+            try {
+                $stream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                break
+            }
+            catch [System.IO.IOException] {
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    throw "Timed out waiting for install lock: $destination"
+                }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        $destinationLocks.Add([pscustomobject]@{
+            Destination = $destination
+            Stream      = $stream
+            LockPath    = $lockPath
+        })
+    }
+}
+
+function Exit-DestinationLocks {
+    for ($i = $destinationLocks.Count - 1; $i -ge 0; $i--) {
+        $record = $destinationLocks[$i]
+        try {
+            $record.Stream.Dispose()
+        }
+        catch {
+            Write-Warning "Could not release install lock for $($record.Destination): $($_.Exception.Message)"
+        }
+        # Best-effort cleanup only: a leftover lock file does not wedge a
+        # future run because acquisition always reopens it with
+        # FileShare::None, so a failure here is purely cosmetic.
+        try { Remove-Item -LiteralPath $record.LockPath -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    $destinationLocks.Clear()
+}
+
+# Stage every payload under a sibling temp directory first. Only after every
+# staged tree is complete do we commit (backup + replace) destinations.
+$staged = @()
+try {
+    foreach ($destination in $targets) {
+        if (-not $PSCmdlet.ShouldProcess($destination, 'Install evidence debug skill')) {
+            continue
+        }
+        $parent = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        $stage = Join-Path $parent ('.debug-install-stage.' + [DateTime]::UtcNow.Ticks + '_' + $PID + '_' + $staged.Count)
+        if (Test-DestinationOccupied -Path $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        # Register the stage before populating it so a failed Copy-Item still
+        # leaves the partial directory in $staged for finally cleanup.
+        $staged += [pscustomobject]@{
+            Destination = $destination
+            Stage       = $stage
+            Backup      = $null
+            Committed   = $false
+        }
+        foreach ($entry in $payload) {
+            Copy-Item -LiteralPath (Join-Path $source $entry) -Destination $stage -Recurse -Force
+        }
+    }
+
+    # $staged is empty when every destination was skipped via -WhatIf or a
+    # declined ShouldProcess confirmation; Enter-DestinationLocks' mandatory
+    # [string[]] parameter throws if bound to an empty array, so skip the call
+    # entirely rather than passing $lockTargets in that case.
+    $lockTargets = @($staged | ForEach-Object { $_.Destination })
+    if ($lockTargets.Count -gt 0) {
+        Enter-DestinationLocks -Destinations $lockTargets
+    }
+
+    # Buffer success records until every destination commits. Emitting per
+    # destination would let a streaming consumer persist an "installed" line
+    # for a target that is later rolled back when a subsequent destination fails.
+    $pendingResults = @()
+    foreach ($item in $staged) {
+        $backup = $null
+        # Recheck -Force at commit time: two concurrent non-Force installers can
+        # both pass preflight while the target is absent; after the first
+        # commits, the second must refuse rather than back up and replace.
+        if (Test-DestinationOccupied -Path $item.Destination) {
+            if (-not $Force) {
+                throw "Target exists: $($item.Destination). Rerun with -Force to preserve it as a backup and replace it."
+            }
+            $backup = New-UniqueBackupPath -Destination $item.Destination
+            Move-Item -LiteralPath $item.Destination -Destination $backup
+            # Record backup before the stage commit so a failed stage→destination
+            # move still restores this in-flight backup (not only fully committed
+            # prior targets).
+            $item.Backup = $backup
+        }
+        try {
+            Move-Item -LiteralPath $item.Stage -Destination $item.Destination
+        }
+        catch {
+            # Stage move failed: put the original destination back if we backed it up.
+            # Only clear $item.Backup after a confirmed successful restore; if the
+            # restore itself fails (e.g. destination locked), keep the reference so
+            # the outer catch can retry and report rather than stranding the backup.
+            if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                try {
+                    Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction Stop
+                    $item.Backup = $null
+                }
+                catch {
+                    Write-Warning "Immediate restore of $($item.Destination) from backup failed: $($_.Exception.Message)"
+                }
+            }
+            throw
+        }
+        # If another process creates $item.Destination as a directory between the
+        # occupancy/backup check above and this Move-Item, PowerShell nests the
+        # staging directory inside it instead of replacing it or failing, and the
+        # commit above would otherwise silently "succeed" with the payload one
+        # level too deep. Detect that nested layout and treat it the same as a
+        # failed move, mirroring the Bash installer's equivalent POSIX mv check.
+        $nestedStage = Join-Path $item.Destination (Split-Path -Leaf $item.Stage)
+        if (Test-DestinationOccupied -Path $nestedStage) {
+            try {
+                Remove-Item -LiteralPath $nestedStage -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Cleanup warning: could not remove mis-nested stage under $($item.Destination): $($_.Exception.Message)"
+            }
+            if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                try {
+                    Move-Item -LiteralPath $item.Backup -Destination $item.Destination -ErrorAction Stop
+                    $item.Backup = $null
+                }
+                catch {
+                    Write-Warning "Immediate restore of $($item.Destination) from backup failed: $($_.Exception.Message)"
+                }
+            }
+            throw "Failed to install to $($item.Destination) (destination became a directory during commit)"
+        }
+        $item.Committed = $true
+        $item.Stage = $null
+        $pendingResults += [pscustomobject]@{
+            status = 'installed'
+            target = $item.Destination
+            backup = $backup
+        }
+    }
+    foreach ($record in $pendingResults) {
+        Write-Output ($record | ConvertTo-Json -Compress)
+    }
+}
+catch {
+    # Roll back committed destinations and any in-flight backup (destination
+    # renamed to backup, stage move never succeeded / already restored).
+    for ($i = $staged.Count - 1; $i -ge 0; $i--) {
+        $item = $staged[$i]
+        try {
+            if ($item.Committed) {
+                if (Test-DestinationOccupied -Path $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force
+                }
+                if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                    Move-Item -LiteralPath $item.Backup -Destination $item.Destination
+                }
+            }
+            elseif ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
+                # In-flight: destination was renamed to backup but never committed.
+                if (Test-DestinationOccupied -Path $item.Destination) {
+                    Remove-Item -LiteralPath $item.Destination -Recurse -Force
+                }
+                Move-Item -LiteralPath $item.Backup -Destination $item.Destination
+            }
+        }
+        catch {
+            # Best-effort rollback; surface the original install error below.
+            # Record the rollback-step failure so a partially broken state is
+            # not silently hidden behind the primary install error.
+            Write-Warning "Rollback step failed for $($item.Destination): $($_.Exception.Message)"
+        }
+    }
+    throw
+}
+finally {
+    try {
+        foreach ($item in $staged) {
+            if ($item.Stage -and (Test-DestinationOccupied -Path $item.Stage)) {
+                Remove-Item -LiteralPath $item.Stage -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    finally {
+        Exit-DestinationLocks
+    }
+}

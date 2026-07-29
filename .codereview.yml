@@ -1,0 +1,234 @@
+# Declarative review guidance and pre-merge checks for the codex-agents-debug-mode
+# skill repository. The procedural checks in tools/validate_repository.js and
+# .github/workflows/validate.yml implement the semantics declared here; this
+# file is the single authoritative source that auditors and tooling should
+# read to understand the gate.
+version: 1
+
+# Top-level issue assessment for this repository. Required by the compliance
+# schema so tooling can render a stable summary of what the gate enforces.
+issue_assessment:
+  title: Validate the evidence-first debug skill payload
+  description: |
+    Every change to scripts/, tools/, SKILL.md, agents/, assets/, references/,
+    or .github/workflows/ must keep the full Node matrix green, keep the
+    payload validator passing, and avoid introducing suppression markers or
+    config-level rule disabling into the touched-file set.
+  severity: error
+
+# Path-specific review instructions consumed by reviewers and audit tooling.
+# Each entry declares the mode (`error` blocks merge, `warning` is advisory)
+# and clear pass/fail instructions so the gate is auditable.
+path_instructions:
+  # One entry per path glob (no overlapping path_instructions for the same
+  # pattern). mode: error holds CI-enforceable criteria; advisory reviewer
+  # guidance is included in the same entry so modes do not conflict.
+  - paths:
+      - 'scripts/**'
+    mode: error
+    instructions: |
+      All PRs that touch scripts/ must keep `npm test` green on every supported
+      Node LTS line (20, 22, 24) for both ubuntu-latest and windows-latest,
+      and `npm run validate` must report PASS. Suppression markers
+      (`eslint-disable`, `nosec`, `noqa`, `@ts-ignore`, `skipcq`, etc.) and
+      config-level rule disabling are not allowed in the touched-file set
+      (enforced by scanSuppressionText / closeout gate). Prefer a focused
+      regression test that fails without the change and passes with it when
+      behavior changes.
+
+  - paths:
+      - 'tools/**'
+    mode: error
+    instructions: |
+      Tools run during CI (`tools/validate_repository.js`, installers) must
+      pass `node --check` syntax validation and must fail closed on missing
+      files, symlinks, non-regular files, and unbounded recursion (enforced by
+      npm run validate and installer smoke checks). Installers should tolerate
+      an unset HOME and accept --home / -HomePath as a workaround.
+
+  - paths:
+      - '.github/workflows/**'
+    mode: error
+    instructions: |
+      Workflow changes must keep the full Node matrix green and must not
+      introduce continue-on-error, passWithNoTests, coverage/threshold
+      reductions, or skipped required checks on required jobs (detectable via
+      gate integrity / workflow scan and CI conclusions).
+
+  - paths:
+      - 'SKILL.md'
+      - 'README.md'
+      - 'SECURITY.md'
+      - 'CONTRIBUTING.md'
+      - 'NOTICE.md'
+      - 'LICENSE'
+      - 'references/**'
+    mode: warning
+    instructions: |
+      Documentation changes should describe the public install/usage
+      contract accurately and must not introduce suppression markers as
+      literal directives outside the scanner's documented vocabulary.
+      Public-distribution safety patterns also cover these root docs.
+
+# Pre-merge checks: the authoritative gate every PR must pass before merge.
+# Each entry uses mode: error (blocks merge on failure) or mode: warning.
+pre_merge_checks:
+  - name: node-matrix-test
+    title: Node matrix (20/22/24 x ubuntu/windows)
+    description: |
+      Run the complete Node test runner on Node 20, 22, and 24 for both
+      ubuntu-latest and windows-latest.
+    mode: error
+    instructions: |
+      PASS requires zero failing tests. A skipped test is acceptable only when
+      the test explicitly returns for an unsupported platform (e.g. Windows
+      symlink creation without developer mode); a skipped test must not hide a
+      real regression.
+    run: npm test
+    issue_assessment:
+      severity: error
+      docstrings: |
+        `npm test` is the canonical invocation; `node --test` is equivalent
+        because the project has no other test scripts.
+
+  - name: repository-validator
+    title: Repository payload validator
+    description: |
+      tools/validate_repository.js must report status:PASS. The validator
+      walks the payload tree without following symlinks, fails closed on
+      missing entries, scans touched files for public-safety patterns, and
+      runs node --check on every JavaScript file.
+    mode: error
+    run: npm run validate
+    instructions: |
+      PASS requires the validator to exit 0 and print status:PASS with the
+      expected payload/javascript file counts. FAIL when any required file is
+      missing, a payload entry is a symlink, a JSON file does not parse, a
+      payload file exceeds the size bound, a public-safety pattern matches, or
+      any JavaScript file fails node --check.
+    issue_assessment:
+      severity: error
+
+  - name: dependency-audit
+    title: npm high-severity dependency audit
+    description: |
+      npm audit at --audit-level=high must exit 0. Vulnerabilities must be
+      remediated, not suppressed or downgraded.
+    mode: error
+    run: npm audit --audit-level=high
+    instructions: |
+      PASS requires `npm audit --audit-level=high` to exit 0 (no high or
+      critical advisories). Any advisory at the configured level must be
+      remediated by upgrading, patching, or replacing the dependency; it must
+      not be suppressed, downgraded via an .npmrc ignore, or excluded.
+    issue_assessment:
+      severity: error
+
+  - name: touched-file-suppression-scan
+    title: No suppression markers in the touched-file set
+    description: |
+      The complete touched-file set (tracked + untracked + changed package
+      manifests at any depth) must contain no suppression markers and no
+      config-level rule disabling. Enforced by scanSuppressionText and
+      readGateChanges in scripts/pr_closeout_repo.js and
+      scripts/pr_closeout_git.js.
+    mode: error
+    instructions: |
+      PASS requires scanSuppressionText and readGateChanges to return zero
+      findings for the complete touched-file set. FAIL on any marker
+      (`skipcq`, `eslint-disable`, `biome-ignore`, `@ts-ignore`, `noqa`,
+      `nosec`, etc.), any config-level rule disabling, any test-weakening
+      token in a touched test file, or any __decode_error__ in the gate
+      diff. Findings must be fixed at the source, never suppressed.
+    issue_assessment:
+      severity: error
+
+  - name: bash-installer-smoke
+    title: Bash installer smoke (Linux)
+    description: |
+      On Linux runners, `bash ./tools/install.sh --target both --home
+      $RUNNER_TEMP/...` must install both the .codex and .agents skill
+      copies. Enforced by .github/workflows/validate.yml.
+    mode: error
+    instructions: |
+      PASS requires the bash installer to exit 0, install both target
+      directories, and emit a machine-readable JSON result line that parses
+      cleanly. FAIL on a missing payload entry, a relative home path, a
+      non-absolute home path, an existing target without --force, or invalid
+      JSON output. Backup preservation must be collision-proof under repeated
+      forced installs.
+    issue_assessment:
+      severity: error
+
+  - name: powershell-installer-smoke
+    title: PowerShell installer smoke (Windows)
+    description: |
+      On Windows runners, `.\tools\install.ps1 -Target Both -HomePath ...`
+      must install both the .codex and .agents skill copies. Enforced by
+      .github/workflows/validate.yml.
+    mode: error
+    instructions: |
+      PASS requires the PowerShell installer to exit 0, install both target
+      directories, and emit a machine-readable JSON result line that parses
+      cleanly. FAIL on an empty or non-absolute HomePath, a missing payload
+      entry, an existing target without -Force, or invalid JSON output.
+      Backup preservation must be collision-proof under repeated forced
+      installs.
+    issue_assessment:
+      severity: error
+
+  - name: pr-title
+    title: PR title is a concise imperative summary of the change
+    description: |
+      The PR title becomes the first line of the squash-merge commit, so it
+      must summarize the change on its own. This repository uses Conventional
+      Commits style (e.g. feat(debug):, fix(closeout):).
+    mode: error
+    instructions: |
+      PASS requires a non-empty title that summarizes the change in the
+      repository's Conventional Commits style. FAIL when the title is empty, a
+      placeholder (e.g. "update"), or does not state what the change does.
+    issue_assessment:
+      severity: error
+      docstrings: |
+        The title must stand alone without the description because it is the
+        only line preserved verbatim in the squash-merge subject.
+
+  - name: pr-description
+    title: PR description explains why and how with re-runnable validation
+    description: |
+      The PR body is the audit record for the change. It must include a
+      Summary and the validation evidence (commands a reviewer can re-run)
+      needed to accept the change.
+    mode: error
+    instructions: |
+      PASS requires a Summary section and the validation commands a reviewer
+      can re-run (e.g. npm test, npm run validate). FAIL when the body is
+      empty, a placeholder, or omits the validation evidence the closeout
+      gate requires.
+    issue_assessment:
+      severity: error
+      docstrings: |
+        The description is the audit record; it must list the commands that
+        prove the gate passes so a reviewer can reproduce the result.
+
+# Structured custom_checks block: explicit, machine-readable check
+# definitions consumed by audit tooling. Mirrors the pre_merge_checks above
+# in a flattened schema for consumers that prefer the structured form.
+custom_checks:
+  - name: no-generated-attribution-in-markdown
+    title: No 'Generated with Claude Code' attribution lines in touched Markdown
+    description: |
+      Tools/validate_repository.js scans every payload file for the
+      'Generated with [Claude Code]' attribution pattern and fails closed.
+    mode: error
+    instructions: |
+      PASS when no payload file contains the pattern; FAIL otherwise.
+  - name: javascript-syntax
+    title: Every JavaScript file parses cleanly under Node 20/22/24
+    description: |
+      `node --check` is run on every file under scripts/ and tools/ as part
+      of `npm run validate`.
+    mode: error
+    instructions: |
+      PASS when `npm run validate` exits 0.
