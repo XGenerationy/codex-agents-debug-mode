@@ -615,6 +615,25 @@ test('workingTreeFingerprint seals newly created ignored inputs like .env', asyn
   }
 });
 
+test('workingTreeFingerprint fails closed when the ignored-untracked listing fails', async () => {
+  // Codex Ukpkr: a constant placeholder hash on listing failure contributes the
+  // same value to every fingerprint, so a listing that keeps failing the same
+  // way before and after a validation command would hide a real change to an
+  // ignored file. The whole fingerprint must reject instead.
+  const repo = await fixtureRepo();
+  try {
+    const failingLister = async () => {
+      throw new Error('simulated git ls-files failure');
+    };
+    await assert.rejects(
+      workingTreeFingerprint(repo, [], { listIgnoredUntracked: failingLister }),
+      /Failed to list ignored untracked files.*simulated git ls-files failure/,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('workingTreeFingerprint seals an untracked self-ignoring .gitignore that hides files', async () => {
   // A validation command can write an untracked .gitignore that ignores itself
   // and an artifact directory. --exclude-standard then omits both the ignore

@@ -530,39 +530,62 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           if (renameError?.code === 'ENOENT') continue;
           throw new Error(`Failed to quarantine stale evidence lock in ${outputDir}: ${renameError.message}`);
         }
+        // Now that the entry is isolated under a private quarantine name,
+        // re-verify that what actually landed there is still the stale
+        // entry this contender was authorized to remove, not a live
+        // successor that a peer created between this contender's check
+        // above and the rename. Restore a misidentified successor with a
+        // no-clobber link (not rename, which would silently overwrite a
+        // third contender's new lock at lockPath) and retry rather than
+        // deleting a peer's live lock.
+        let requarantinedHolder = null;
         if (identityOnlyReclaim) {
-          // Now that the entry is isolated under a private quarantine name,
-          // re-run the exact guarded read against it: a genuinely
-          // corrupt/oversized/FIFO/symlinked lock fails the same way again,
-          // but a live successor's real lock now parses cleanly -- proof
-          // this was never the stale entry the identity check matched.
-          // Restore it with a no-clobber link (not rename, which would
-          // silently overwrite a third contender's new lock at lockPath)
-          // and retry rather than deleting a peer's live lock.
-          let requarantinedHolder = null;
+          // A genuinely corrupt/oversized/FIFO/symlinked lock fails the
+          // same guarded read again, but a live successor's real lock now
+          // parses cleanly -- proof this was never the stale entry the
+          // identity check matched.
           try {
             requarantinedHolder = outputDirLockHolder(await readLockFile(quarantinePath));
           } catch {
             requarantinedHolder = null;
           }
-          if (requarantinedHolder) {
-            try {
-              await link(quarantinePath, lockPath);
-              await unlink(quarantinePath);
-            } catch (restoreError) {
-              if (restoreError?.code === 'EEXIST') {
-                // Another contender already created a new lock at lockPath
-                // while this was being verified; the quarantined successor
-                // lock is no longer needed under this pathname.
-                await unlink(quarantinePath).catch(() => {});
-                continue;
-              }
-              throw new Error(
-                `Failed to restore a live successor lock misidentified as stale in ${outputDir}: ${restoreError.message}`,
-              );
-            }
-            continue;
+        } else {
+          // The byte-for-byte match above only proves lockPath held
+          // staleSnapshot at the moment of that read; it is not atomic
+          // with the rename, so a concurrent reclaimer that read the same
+          // stale content can create its own new lock at lockPath in the
+          // gap between that read and this rename -- and this rename would
+          // then quarantine that live successor instead of the stale entry
+          // (Codex Ukpki). A 500-iteration concurrent-acquisition stress
+          // test reproduced two simultaneous successful acquisitions under
+          // the prior unconditional-delete behavior.
+          let requarantinedSnapshot;
+          try {
+            requarantinedSnapshot = String(await readLockFile(quarantinePath));
+          } catch {
+            requarantinedSnapshot = null;
           }
+          requarantinedHolder = requarantinedSnapshot === staleSnapshot
+            ? null
+            : outputDirLockHolder(requarantinedSnapshot ?? '');
+        }
+        if (requarantinedHolder) {
+          try {
+            await link(quarantinePath, lockPath);
+            await unlink(quarantinePath);
+          } catch (restoreError) {
+            if (restoreError?.code === 'EEXIST') {
+              // Another contender already created a new lock at lockPath
+              // while this was being verified; the quarantined successor
+              // lock is no longer needed under this pathname.
+              await unlink(quarantinePath).catch(() => {});
+              continue;
+            }
+            throw new Error(
+              `Failed to restore a live successor lock misidentified as stale in ${outputDir}: ${restoreError.message}`,
+            );
+          }
+          continue;
         }
         try {
           await unlink(quarantinePath);

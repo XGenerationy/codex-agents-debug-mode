@@ -222,6 +222,47 @@ test('runs no executable preflight or repository validation command when attesta
   assert.equal(fixture.events.includes('clean-tree'), false);
 });
 
+test('production DEFAULTS wires a real prepareOutputDirectory for non-plan runs (no dependency override)', async () => {
+  // Every other full-workflow test above stubs prepareOutputDirectory in the
+  // shared fixture, so none of them would notice if DEFAULTS.prepareOutputDirectory
+  // were ever removed or misassigned (Qodo #4790675668's "d.prepareOutputDirectory
+  // is not a function" concern). Omit the override here so runCloseoutWorkflow
+  // falls back to the real DEFAULTS implementation and prove it actually runs by
+  // observing its real filesystem side effect: the output directory getting created.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-real-prepare-'));
+  const repoRoot = nodePath.join(tmp, 'repo');
+  const outputDir = nodePath.join(tmp, 'evidence');
+  await fs.mkdir(repoRoot, { recursive: true });
+  try {
+    const fixture = makeDependencies();
+    // resolveRepositoryState (not the repo argument below) is what actually
+    // feeds prepareOutputDirectory's realpath check; point it at the real
+    // temp repo so the real implementation has something to resolve.
+    const resolveState = fixture.dependencies.resolveRepositoryState;
+    fixture.dependencies.resolveRepositoryState = async (...args) => ({
+      ...(await resolveState(...args)),
+      repo: repoRoot,
+    });
+    delete fixture.dependencies.prepareOutputDirectory;
+    const result = await runCloseoutWorkflow({
+      repo: repoRoot,
+      baseRef: 'origin/main',
+      config: reviewedConfig(),
+      outputDir,
+      dependencies: fixture.dependencies,
+    });
+    assert.equal(result.report.overallStatus, 'PASS');
+    // A stubbed prepareOutputDirectory never touches the filesystem, so this
+    // only succeeds if the real DEFAULTS implementation actually ran.
+    assert.ok((await fs.stat(outputDir)).isDirectory());
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('passes only essential and explicitly configured environment variables to child commands', async () => {
   const requiredName = 'PR_CLOSEOUT_REQUIRED_TEST';
   const safeName = 'PR_CLOSEOUT_SAFE_TEST';
@@ -466,6 +507,59 @@ test('restores a live successor lock when a guard-failure identity match is late
       await fs.readFile(lockPath, 'utf8'),
       staleContent,
       'the quarantined entry must be restored to its original pathname, not deleted',
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('restores a live successor lock created between the byte-for-byte check and quarantine rename', async () => {
+  // Codex Ukpki: the byte-for-byte verification read (just before the
+  // quarantine rename) is not atomic with that rename, so a concurrent
+  // reclaimer that read the same stale content can create its own live lock
+  // at lockPath in the gap between the two -- and an unconditional rename
+  // would then quarantine that live successor instead of the stale entry.
+  // Model the gap directly: the verification read reports the stale content
+  // still matched (so the rename proceeds) but, as a side effect of that
+  // same read, a peer's live lock actually lands on disk at lockPath first.
+  // The post-quarantine re-verification must catch the mismatch and restore
+  // the successor rather than deleting it.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-byte-for-byte-race-'));
+  const lockPath = nodePath.join(tmp, '.closeout.lock');
+  const staleContent = '2147483646\nstale-nonce\n';
+  const successor = `${process.pid}\nsuccessor-nonce\n`;
+  let reads = 0;
+  try {
+    await fs.writeFile(lockPath, staleContent, 'utf8');
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: async (p) => {
+          reads += 1;
+          if (reads === 1) return staleContent;
+          if (reads === 2) {
+            // A peer's live lock lands on disk here, right after this
+            // contender's verification read reported the stale content
+            // still matched.
+            await fs.writeFile(lockPath, successor, 'utf8');
+            return staleContent;
+          }
+          return fs.readFile(p, 'utf8');
+        },
+      }),
+      /already locked by this closeout process/i,
+    );
+    assert.equal(
+      reads,
+      4,
+      'must verify byte-for-byte, quarantine, re-verify post-quarantine, then re-discover the restored successor on retry',
+    );
+    assert.equal(
+      await fs.readFile(lockPath, 'utf8'),
+      successor,
+      'the live successor must be restored, not deleted as if it were the stale entry',
     );
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });

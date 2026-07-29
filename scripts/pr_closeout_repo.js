@@ -902,9 +902,11 @@ const hashGitOutput = async (repo, args) => {
  * order never affects the result.
  * @param {string} repo - Absolute repository path.
  * @param {string[]} [extraPaths] - Additional repo-relative paths (files or directories) to fold into the seal.
+ * @param {object} [overrides] - Test-only seam; defaults to the real `gitPaths` call.
+ * @param {typeof gitPaths} [overrides.listIgnoredUntracked] - Overrides the ignored-untracked git listing.
  * @returns {Promise<string>} Hex-encoded SHA-256 composite fingerprint.
  */
-const workingTreeFingerprint = async (repo, extraPaths = []) => {
+const workingTreeFingerprint = async (repo, extraPaths = [], { listIgnoredUntracked = gitPaths } = {}) => {
   const [diffHash, untracked] = await Promise.all([
     hashGitOutput(repo, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', 'HEAD']),
     gitPaths(repo, ['ls-files', '--others', '--exclude-standard', '-z']),
@@ -1001,9 +1003,9 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     ':(exclude)**/.pnpm/**',
     ':(exclude)**/.cache/**',
   ];
-  let ignoredUntracked = [];
+  let ignoredUntracked;
   try {
-    ignoredUntracked = await gitPaths(repo, [
+    ignoredUntracked = await listIgnoredUntracked(repo, [
       'ls-files',
       '--others',
       '--ignored',
@@ -1013,10 +1015,14 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
       '.',
       ...ignoredBulkExcludes,
     ]);
-  } catch {
-    // Fail closed with a marker so a broken ignored listing cannot silently
-    // drop mid-run inputs from the seal.
-    entries.push({ path: '__ignored_untracked_error__', hash: hashBytes('list_failed') });
+  } catch (error) {
+    // A constant placeholder hash here would contribute the same value to
+    // every fingerprint regardless of what actually changed, so a listing
+    // that keeps failing the same way before and after a validation command
+    // would hide a mid-run change to an ignored file completely -- the
+    // opposite of failing closed (Codex Ukpkr). Fail the whole fingerprint
+    // instead of masking the gap with a marker that never varies.
+    throw new Error(`Failed to list ignored untracked files in ${repo}: ${error.message}`, { cause: error });
   }
   // Hoist once: spreading a Set per ignored file was O(n*m) allocations
   // (CodeRabbit #4781622077).
