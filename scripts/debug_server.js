@@ -168,16 +168,21 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     // (re)generate.
   }
   const salt = randomBytes(32);
+  // Create-once / first-writer-wins: only the first concurrent first-launch
+  // actually creates saltFile (O_CREAT|O_EXCL). O_EXCL on a non-existent path
+  // makes a brand-new inode this process owns (nlink 1), so unlike truncating
+  // an existing file there is no hard-linked inode to clobber (Codex
+  // Uzynn/Uz6Aw). Every concurrent loser takes the EEXIST branch and adopts the
+  // winner's salt (retrying briefly while the winner finishes its 32-byte
+  // write) instead of overwriting it, so all collectors agree on project_hash
+  // rather than one retaining a stale salt that misclassifies a same-project
+  // relaunch as port_in_use_by_other_process (Codex U2TI8/U25na). With no
+  // concurrency this writes the salt once and reads it straight back.
+  let wroteWinner = false;
   try {
-    // Never write through saltFile's existing inode: if it were hard-linked
-    // to another user-owned file, truncating in place would clobber that
-    // file too (Codex Uzynn/Uz6Aw). Write the salt to a private temp file
-    // instead and atomically rename it over saltFile -- rename() replaces
-    // only the directory entry, so whatever inode saltFile previously named
-    // (hard-linked or not) is left completely untouched.
-    const tempFile = path.join(debugDir, `.project_salt.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
-    const fd = openNoFollowSync(tempFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     try {
+      const fd = openNoFollowSync(saltFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      wroteWinner = true;
       try {
         // Loop until all 32 bytes are written: a short write (possible on some
         // filesystems/mounts) would otherwise publish a truncated salt, the
@@ -188,54 +193,82 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
           written += n;
         }
       } catch (error) {
-        // A write failure (ENOSPC, quota, I/O error) must not leak the
-        // just-created private temp file in .debug on every failed write --
-        // the rename-failure branch below already unlinks on error; this
-        // write-failure branch needs the same cleanup (CodeRabbit U03YF).
-        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        // A failed first-write must not leave an empty/partial saltFile that a
+        // concurrent loser would then adopt as the winner. Close before
+        // unlinking: on Windows unlinkSync of an open fd is a sharing
+        // violation.
+        try { closeSync(fd); } catch { /* fd cleanup */ }
+        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
         throw error;
       }
-    } finally {
       closeSync(fd);
-    }
-    // Apply the same owner-only Windows ACL the collector_token and session
-    // logs get: mode 0o600 above does not strip inherited NTFS read perms on
-    // Windows, so without this a project_salt in a shared/permissive checkout
-    // stays readable by other local users, who could combine it with the
-    // unauthenticated /health project_hash to test candidate canonical paths
-    // and defeat the path-privacy the keyed hash was introduced to provide
-    // (Codex U1D5A). POSIX is a no-op. Applied to the temp file before the
-    // atomic rename so the inode that becomes saltFile is already protected;
-    // a protection failure unlinks the temp file (like the rename failure
-    // below) rather than leaking it.
-    try {
-      protectWindowsPrivateFile(tempFile);
+      // Apply the same owner-only Windows ACL the collector_token and session
+      // logs get: mode 0o600 above does not strip inherited NTFS read perms on
+      // Windows, so without this a project_salt in a shared/permissive
+      // checkout stays readable by other local users, who could combine it
+      // with the unauthenticated /health project_hash to test candidate
+      // canonical paths and defeat the path-privacy the keyed hash was
+      // introduced to provide (Codex U1D5A). POSIX is a no-op.
+      try {
+        protectWindowsPrivateFile(saltFile);
+      } catch (error) {
+        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
+        throw error;
+      }
     } catch (error) {
-      try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
-      throw error;
+      if (error?.code !== 'EEXIST' || wroteWinner) throw error;
+      // saltFile already exists (a concurrent winner or a prior run): adopt it
+      // rather than overwriting. It may briefly be empty while the winner
+      // finishes its 32-byte write, so retry readExisting for a short window; a
+      // genuinely untrusted inode (hard-linked / corrupt / unreadable) keeps
+      // throwing and falls through to the replace-fallback below.
+      for (let attempt = 0; attempt < 32; attempt += 1) {
+        try { return readExisting(); } catch { /* winner still publishing or untrusted */ }
+      }
+      // Persistently unreadable (e.g. hard-linked): never write through
+      // saltFile's existing inode -- a hard link would clobber the linked file
+      // (Codex Uzynn/Uz6Aw). Replace only the directory entry via a private temp
+      // file + atomic rename; rename swaps the directory entry, leaving the
+      // previously hard-linked inode untouched.
+      const tempFile = path.join(debugDir, `.project_salt.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+      const tfd = openNoFollowSync(tempFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      try {
+        for (let written = 0; written < 32; ) {
+          const n = writeSync(tfd, salt, written, 32 - written, written);
+          if (n <= 0) throw new Error('project_salt_short_write');
+          written += n;
+        }
+      } catch (error2) {
+        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        throw error2;
+      } finally {
+        try { closeSync(tfd); } catch { /* best effort cleanup */ }
+      }
+      try {
+        protectWindowsPrivateFile(tempFile);
+      } catch (error2) {
+        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        throw error2;
+      }
+      try {
+        renameSync(tempFile, saltFile);
+      } catch (error2) {
+        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        throw error2;
+      }
     }
-    try {
-      renameSync(tempFile, saltFile);
-    } catch (error) {
-      try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
-      throw error;
-    }
-    // A concurrent first-launch may rename its own salt over saltFile after
-    // this one's rename; re-read the on-disk winner so both collectors agree
-    // on the same salt (and project_hash) instead of one retaining a stale
-    // in-memory salt that misclassifies a same-project relaunch as
-    // port_in_use_by_other_process (Codex U16Cd). With no concurrency this
-    // reads back exactly the bytes just written.
+    // Read back the on-disk winner so every publisher returns the same bytes
+    // (Codex U16Cd); with no concurrency this is exactly the salt just written.
     try {
       return readExisting();
     } catch {
       return salt;
     }
   } catch {
-    // Any failure keeps this invocation's own unpersisted salt (fail-open
-    // per the note above): worst case is two invocations disagreeing on
-    // project_hash, which only affects the already_running convenience
-    // check, never authentication.
+    // Any failure keeps this invocation's own unpersisted salt (fail-open per
+    // the note above): worst case is two invocations disagreeing on
+    // project_hash, which only affects the already_running convenience check,
+    // never authentication.
     return salt;
   }
 };

@@ -345,6 +345,27 @@ test('project_hash is keyed by a persisted per-project salt, not a bare hash of 
   }
 });
 
+test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
+  // First-writer-wins: the second construction takes the O_CREAT|O_EXCL EEXIST
+  // branch and reads the winner rather than renaming a fresh random salt over
+  // it (the old last-writer-wins path). Because the salt is random, an
+  // unchanged on-disk byte sequence across the second construction proves no
+  // rewrite happened -- a last-writer-wins regression would publish different
+  // bytes and fail this assertion.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-create-once-'));
+  try {
+    const first = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const saltPath = path.join(projectRoot, '.debug', 'project_salt');
+    const before = await readFile(saltPath);
+    const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const after = await readFile(saltPath);
+    assert.equal(second.collectorProjectHash, first.collectorProjectHash);
+    assert.deepEqual(after, before);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('repairs a hard-linked project_salt via rename instead of clobbering the linked file', async () => {
   // Codex Uzynn/Uz6Aw: a pre-existing project_salt sharing its inode with an
   // outside file (nlink > 1) must never be truncated-in-place -- that would
