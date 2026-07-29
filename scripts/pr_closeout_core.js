@@ -133,6 +133,16 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   /(?:^|[;\n])\s*true\b/i,
   /(?:^|[;\n])\s*:/i,
   /(?:^|[;\n])\s*exit\s+0\b/i,
+  // Sequential success tail (Codex U3a2X): a `;`-separated list's exit
+  // status is its LAST command's (Bash manual, Lists), so `cmd; echo done`
+  // or `cmd; printf 'ok'` masks the earlier command's failure even though
+  // `cmd && echo done` (which runs echo only on success) does not. Matched only
+  // when echo/printf is the terminal command after a `;` (no later `;`/`|`/`&`
+  // or newline on that line), so `echo start; npm test` -- where the real
+  // check is the LAST command -- and a lone `echo` body (a separate
+  // no-evidence class, Codex U1D5F) stay out of this rule.
+  /;\s*echo\b[^;|&\n]*$/im,
+  /;\s*printf\b[^;|&\n]*$/im,
   // Direct pipeline tails to always-success commands. Without `pipefail`,
   // `cmd | true` / `cmd | :` / `cmd | exit 0` report the right-hand exit
   // status and mask a failed left-hand command (CodeRabbit #4780344655).

@@ -1242,6 +1242,15 @@ test('blocks configured commands that neutralize failures', () => {
   assert.ok(findCommandFailureNeutralizer('actual-test | exit 0'));
   // `|| echo ok` also forces zero exit after a failed left-hand command.
   assert.ok(findCommandFailureNeutralizer('npm test || echo ok'));
+  // Sequential success tail (Codex U3a2X): a `;`-separated list's exit status
+  // is its LAST command's, so `cmd; echo done` / `cmd; printf ok` masks the
+  // earlier failure; `cmd && echo done` (short-circuits on failure) does not,
+  // and `echo start; npm test` (the real check is the LAST command) is clean.
+  assert.ok(findCommandFailureNeutralizer('npm test; echo done'));
+  assert.ok(findCommandFailureNeutralizer('npm test; printf done'));
+  assert.ok(findCommandFailureNeutralizer('lint; test; echo passed'));
+  assert.equal(findCommandFailureNeutralizer('npm test && echo done'), null);
+  assert.equal(findCommandFailureNeutralizer('echo start; npm test'), null);
   // `&& exit 0` short-circuits on failure — not a neutralizer.
   assert.equal(findCommandFailureNeutralizer('pnpm test && exit 0'), null);
   assert.equal(findCommandFailureNeutralizer('pnpm test'), null);
