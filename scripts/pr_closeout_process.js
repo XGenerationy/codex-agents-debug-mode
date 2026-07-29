@@ -3730,10 +3730,20 @@ const runPreflight = async ({
     try {
       result = await runProbe(command);
     } catch (error) {
+      // Apply the SAME redaction the termination/classification rows below
+      // use: a spawn/infrastructure error can carry the expanded command or
+      // env-derived arguments (including a configured requiredEnv/safeEnv
+      // value), so redactShellEvidence (home-path prefixes) alone is not
+      // enough -- redactSecrets over env/sensitiveEnvNames too (CodeRabbit
+      // U4nCE/U4nCb).
       checks.push({
         name,
         status: 'BLOCKED',
-        evidence: redactShellEvidence(`Tool probe failed to run: ${error?.message || error}`),
+        evidence: redactSecrets(
+          redactShellEvidence(`Tool probe failed to run: ${error?.message || error}`),
+          env,
+          sensitiveEnvNames,
+        ),
       });
       continue;
     }

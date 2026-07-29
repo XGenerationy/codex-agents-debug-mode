@@ -437,7 +437,14 @@ const readProjectMetadata = async (repo) => {
       // instead of stopping at the first one.
       const lines = makefile.split(/\r?\n/);
       const targets = [];
+      // Track the active recipe prefix in a single forward scan (O(n), not
+      // O(n^2) per target): the recipe-line prefix is tab by default but is the
+      // first char of .RECIPEPREFIX's value, and the last assignment seen
+      // before a target applies to it (Codex U3w63/U4nCq).
+      let recipePrefix = '\t';
       for (let i = 0; i < lines.length; i += 1) {
+        const rpm = lines[i].match(/^\s*\.RECIPEPREFIX\s*(?::{1,2}|\+)?=\s*(\S)/);
+        if (rpm) recipePrefix = rpm[1];
         const match = lines[i].match(/^([A-Za-z0-9_.-]+)\s*(:+)(?![=])/);
         if (!match) continue;
         const target = match[1];
@@ -457,16 +464,8 @@ const readProjectMetadata = async (repo) => {
         // a double-colon target AGGREGATES every recipe (GNU make runs each
         // independently, Codex Uz6Am).
         {
-          // GNU make's recipe prefix is tab by default but is configurable via
-          // .RECIPEPREFIX (the first char of its value). Use the last
-          // .RECIPEPREFIX assignment seen before this target so a repo that
-          // sets `.RECIPEPREFIX := >` is parsed instead of every Make check
-          // reporting "No recipe text was captured" (Codex U3w63).
-          let recipePrefix = '\t';
-          for (let k = 0; k < i; k += 1) {
-            const rpm = lines[k].match(/^\s*\.RECIPEPREFIX\s*(?::{1,2}|\+)?=\s*(\S)/);
-            if (rpm) recipePrefix = rpm[1];
-          }
+          // recipePrefix is tracked by the outer single forward scan (Codex
+          // U3w63/U4nCq): the active .RECIPEPREFIX char at this point.
           // A recipe line ending in an unescaped `\` continues onto the next
           // physical line, which needs no recipe prefix; GNU make joins the
           // backslash-newline and runs the whole thing, so a neutralizer on the

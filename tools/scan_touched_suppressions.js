@@ -249,15 +249,28 @@ const resolveBaseSha = (repoRoot = root) => {
       // invisible and let the scan pass as an additive-only current-tree diff
       // (Codex U25nk/U3w68).
       try {
-        gitBuffer(['fetch', '--depth=1', 'origin', beforeSha], { cwd: repoRoot });
+        // Bound the fetch and disable credential prompting: an unbounded
+        // fetch can hang or prompt for secrets when GITHUB_EVENT_BEFORE points
+        // at a private/unauthenticated remote (CodeRabbit U4nCv).
+        gitBuffer(['fetch', '--depth=1', 'origin', beforeSha], {
+          cwd: repoRoot,
+          timeout: 30_000,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' },
+        });
         gitBuffer(['cat-file', '-e', `${beforeSha}^{commit}`], { cwd: repoRoot });
         comparisonStyle = 'two-dot';
         return beforeSha;
       } catch (fetchError) {
+        // Sanitize the cause before embedding it: a git remote URL in the
+        // failure text (e.g. https://<user>:<token>@host, a common CI pattern)
+        // would otherwise echo credentials into the gate output (CodeRabbit
+        // U4nC4).
+        const cause = String(fetchError?.message || fetchError).replace(
+          /(https?:\/\/)[^/@\s]+@/gi,
+          '$1***@',
+        );
         throw new Error(
-          `Push preimage ${beforeSha} (GITHUB_EVENT_BEFORE) is not present locally and could not be fetched; cannot safely diff force-push removals, so the scan fails closed. Fetch it (fetch-depth:0) or clear GITHUB_EVENT_BEFORE to fall back to branch resolution. Cause: ${
-            fetchError?.message || fetchError
-          }`,
+          `Push preimage ${beforeSha} (GITHUB_EVENT_BEFORE) is not present locally and could not be fetched; cannot safely diff force-push removals, so the scan fails closed. Fetch it (fetch-depth:0) or clear GITHUB_EVENT_BEFORE to fall back to branch resolution. Cause: ${cause}`,
         );
       }
     }

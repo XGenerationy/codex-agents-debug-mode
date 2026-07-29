@@ -2254,6 +2254,22 @@ test('probeCommandDefault gives each omitted-knownSiblingMarks call its own regi
   assert.equal(b.snapshot.size, 1, `must see only its own mark, not the other probe's: ${[...b.snapshot]}`);
 });
 
+test('runPreflight redacts secret values from a rejected tool probe evidence (CodeRabbit U4nCE/U4nCb)', async () => {
+  // A spawn/infrastructure error can carry the expanded command or env-
+  // derived arguments, including a configured requiredEnv/safeEnv value; the
+  // rejected-probe BLOCKED row must run redactSecrets over env/sensitiveEnvNames
+  // like the other evidence rows, not just home-path redaction.
+  const result = await runPreflight({
+    repo: 'C:/repo',
+    config: { requiredEnv: ['API_TOKEN'], minFreeDiskGb: 0 },
+    env: { API_TOKEN: 'super-secret-token-xyz' },
+    probeCommand: async () => { throw new Error('spawn failed invoking tool with API_TOKEN=super-secret-token-xyz'); },
+  });
+  assert.equal(result.status, 'BLOCKED', statusDiag(result));
+  assert.match(JSON.stringify(result), /Tool probe failed to run/i);
+  assert.doesNotMatch(JSON.stringify(result), /super-secret-token-xyz/, 'a secret in a rejected-probe error must be redacted from evidence');
+});
+
 test('runPreflight converts a rejecting tool probe into a per-tool BLOCKED check instead of aborting (Codex U3w6p)', async () => {
   // A probeCommand that rejects (spawn throws synchronously under resource
   // exhaustion, or an infrastructure error) must not escape runPreflight and
