@@ -15,6 +15,7 @@ const {
   createDecodedRedactor,
   createStreamingRedactor,
   environHasAnySpawnMark,
+  environHasUnregisteredSpawnMark,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeCommandDefault,
@@ -2578,6 +2579,34 @@ test('environHasAnySpawnMark only matches a mark registered in knownMarks', () =
   assert.equal(environHasAnySpawnMark(nearMiss, knownMarks), false);
 
   assert.equal(environHasAnySpawnMark('', knownMarks), false);
+});
+
+test('environHasUnregisteredSpawnMark flags an explicit mark absent from knownMarks, not mark-freeness', () => {
+  // Codex UrfC6 (P1): listLivePidsWithCwdUnder's chain-to-runner exemption
+  // was topologically indistinguishable between a legitimate mark-free
+  // sibling and a hostile process the runner spawned directly that
+  // self-reports an unregistered mark -- both have a PPID chain that reaches
+  // selfPid at hop zero. This predicate is the additional signal that tells
+  // them apart: true only when an explicit SPAWN_MARK_ENV entry exists and
+  // its value is NOT registered; a genuinely mark-free environ (no entry at
+  // all) must read false so it still relies on the chain check alone.
+  const knownMarks = new Set(['some-other-checks-mark']);
+
+  const registered = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}=some-other-checks-mark\0HOME=/root`, 'utf8');
+  assert.equal(environHasUnregisteredSpawnMark(registered, knownMarks), false);
+
+  const unregistered = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}=never-registered-mark\0HOME=/root`, 'utf8');
+  assert.equal(environHasUnregisteredSpawnMark(unregistered, knownMarks), true);
+  assert.equal(environHasUnregisteredSpawnMark(unregistered), true);
+  assert.equal(environHasUnregisteredSpawnMark(unregistered, new Set()), true);
+
+  const markFree = Buffer.from('PATH=/usr/bin\0HOME=/root', 'utf8');
+  assert.equal(environHasUnregisteredSpawnMark(markFree, knownMarks), false);
+
+  const nearMiss = Buffer.from(`PATH=/usr/bin\0${SPAWN_MARK_ENV}_OTHER=never-registered-mark`, 'utf8');
+  assert.equal(environHasUnregisteredSpawnMark(nearMiss, knownMarks), false);
+
+  assert.equal(environHasUnregisteredSpawnMark('', knownMarks), false);
 });
 
 test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', {

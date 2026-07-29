@@ -230,6 +230,27 @@ const environHasAnySpawnMark = (environBuffer, knownMarks = EMPTY_MARK_SET) => {
   return vars.some((entry) => entry.startsWith(prefix) && knownMarks.has(entry.slice(prefix.length)));
 };
 
+/**
+ * Whether raw `/proc/<pid>/environ` bytes contain a `SPAWN_MARK_ENV=...`
+ * entry whose value is NOT a member of `knownMarks` -- an explicit but
+ * unrecognized mark, as opposed to no mark at all. This is stronger evidence
+ * of tampering or staleness than plain mark-freeness (Codex UrfC6): a
+ * candidate that self-reports a mark absent from the registry must never
+ * ride listLivePidsWithCwdUnder's PPID-chain-to-runner exemption through --
+ * that exemption exists for legitimate siblings that carry no mark at all
+ * (or a registered one, already excluded by `environHasAnySpawnMark`), not
+ * for processes actively claiming an unverifiable identity.
+ * @param {Buffer|string} environBuffer - Raw contents of /proc/<pid>/environ.
+ * @param {Set<string>} [knownMarks] - Marks this run generated for
+ *   currently-in-flight sibling spawns.
+ * @returns {boolean}
+ */
+const environHasUnregisteredSpawnMark = (environBuffer, knownMarks = EMPTY_MARK_SET) => {
+  const prefix = `${SPAWN_MARK_ENV}=`;
+  const vars = environBuffer.toString('utf8').split('\0');
+  return vars.some((entry) => entry.startsWith(prefix) && !knownMarks.has(entry.slice(prefix.length)));
+};
+
 const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
   if (!mark) return [];
   const target = `${SPAWN_MARK_ENV}=${mark}`;
@@ -287,6 +308,13 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
  * detached orphan of this spawn. A genuine orphan's chain is broken by
  * construction (it dead-ends at the exited spawn root or below it), so it
  * stays flagged; unknown/unreadable chains stay flagged too (fail-closed).
+ * This chain exemption is itself overridden when the candidate self-reports
+ * an explicit but UNREGISTERED spawn mark (Codex UrfC6): a process the runner
+ * spawned directly (chain reaches `selfPid` at hop zero, indistinguishable
+ * from a legitimate sibling's own root spawn by topology alone) that also
+ * claims an identity absent from the registry is exactly the untrusted
+ * pre-existing-process case this sweep exists to catch, so it stays flagged
+ * regardless of the chain result.
  *
  * A candidate carrying ANY check's spawn mark (`environHasAnySpawnMark`) is
  * also excluded, even when its PPID chain to the runner is broken (Codex
@@ -381,6 +409,9 @@ const listLivePidsWithCwdUnder = (rootCwd, {
   // detached orphan of this spawn — exclude it. Every uncertain outcome
   // (broken or unreadable link, chain through the spawn root, cycle, hop
   // bound, chain leaving the runner's tree) keeps the candidate flagged.
+  // This exemption is for a candidate that is mark-free or carries a
+  // registered mark only -- the caller must additionally reject an explicit
+  // unregistered mark before trusting this result (Codex UrfC6).
   const chainsToRunner = (pid) => {
     if (!Number.isInteger(rootPid) || rootPid <= 0) return false;
     const chainVisited = new Set();
@@ -441,13 +472,26 @@ const listLivePidsWithCwdUnder = (rootCwd, {
       // escapees; an unreadable environ (EACCES, exited between readdir and
       // read) is treated as mark-free and stays flagged, matching this
       // function's fail-closed default for every other uncertain outcome.
+      //
+      // An explicit but UNREGISTERED mark must never ride the chain-to-runner
+      // exemption through, even when the chain reaches the runner directly
+      // (Codex UrfC6): the chain exemption is meant for a legitimate sibling
+      // that is either mark-free or carries a registered mark, not for a
+      // process actively self-reporting an identity the registry does not
+      // recognize -- that combination (under the repo tree, chains to the
+      // runner, but claims an unverifiable mark) is exactly the untrusted
+      // pre-existing-process case this sweep exists to catch.
       let carriesSpawnMark = false;
+      let hasUnregisteredMark = false;
       try {
-        carriesSpawnMark = environHasAnySpawnMark(readFileSync(`/proc/${pid}/environ`), knownSiblingMarks);
+        const environBuf = readFileSync(`/proc/${pid}/environ`);
+        carriesSpawnMark = environHasAnySpawnMark(environBuf, knownSiblingMarks);
+        hasUnregisteredMark = environHasUnregisteredSpawnMark(environBuf, knownSiblingMarks);
       } catch {
         carriesSpawnMark = false;
+        hasUnregisteredMark = false;
       }
-      if (underTree && !chainsToRunner(pid) && !carriesSpawnMark) {
+      if (underTree && !carriesSpawnMark && (hasUnregisteredMark || !chainsToRunner(pid))) {
         live.push(pid);
       }
     } catch {
@@ -1720,7 +1764,10 @@ const openLogBoundToParent = async (target, expected, flags, mode) => {
   try {
     dirHandle = await open(parent, constants.O_DIRECTORY | constants.O_NOFOLLOW);
   } catch (error) {
-    if (error?.code === 'ELOOP') {
+    // Linux reports ENOTDIR (not ELOOP) here: O_NOFOLLOW stops the kernel
+    // from resolving the symlink, so O_DIRECTORY's "must be a directory"
+    // check applies to the unresolved link itself (S_IFLNK), not its target.
+    if (error?.code === 'ELOOP' || error?.code === 'ENOTDIR') {
       throw new Error(`Refusing to write evidence log through a symlinked logs directory: ${parent}`);
     }
     throw error;
@@ -3723,6 +3770,7 @@ module.exports = {
   createStreamingRedactor,
   defaultShellArgs,
   environHasAnySpawnMark,
+  environHasUnregisteredSpawnMark,
   listLivePidsWithCwdUnder,
   listLivePidsWithSpawnMark,
   probeCommandDefault,
