@@ -1556,7 +1556,11 @@ test('rejects a successful diff that still writes to stderr (Qodo UsPVG)', async
       'a successful diff that writes to stderr must still be rejected',
     );
   } finally {
-    await rm(repo, { recursive: true, force: true });
+    // This fixture spawns two git processes against a repo holding an
+    // oversized .gitattributes line; on Windows runners the just-exited
+    // process can still hold the directory handle briefly, so the plain
+    // rm() races an EBUSY. Retry instead of widening this to every fixture.
+    await rm(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
