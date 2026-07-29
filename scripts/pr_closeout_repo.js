@@ -498,7 +498,13 @@ const readProjectMetadata = async (repo) => {
           while (j < lines.length) {
             const line = lines[j];
             if (continuing || line.startsWith(recipePrefix)) {
-              recipeLines.push(line);
+              // Strip the recipe prefix char before storing so Make's leading
+              // modifiers (-/@/+) sit at the start of the stored text: with a
+              // non-tab .RECIPEPREFIX (e.g. `>`), `>-cmd` would otherwise keep
+              // the `>` and findMakeRecipeNeutralizer's /^\s*[@+]*-/ ignore-
+              // error test would not match it (a tab prefix is whitespace and
+              // is consumed by \s*, but `>` is not) (qodo; Codex U3w63).
+              recipeLines.push(line.startsWith(recipePrefix) ? line.slice(recipePrefix.length) : line);
               continuing = continues(line);
               j += 1;
               continue;

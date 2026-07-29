@@ -1251,6 +1251,15 @@ test('blocks configured commands that neutralize failures', () => {
   assert.ok(findCommandFailureNeutralizer('lint; test; echo passed'));
   assert.equal(findCommandFailureNeutralizer('npm test && echo done'), null);
   assert.equal(findCommandFailureNeutralizer('echo start; npm test'), null);
+  // Background operator (Codex U4u-o): a single `&` backgrounds the preceding
+  // command, so `npm test & echo done` returns the foreground echo's exit 0
+  // while the test keeps running (then is terminated by cleanup); `&&`
+  // (logical AND) and `&>` / `2>&1` (redirects) are not background operators.
+  assert.ok(findCommandFailureNeutralizer('npm test >/dev/null 2>&1 & echo completed'));
+  assert.ok(findCommandFailureNeutralizer('npm test &'));
+  assert.equal(findCommandFailureNeutralizer('npm test && echo done'), null);
+  assert.equal(findCommandFailureNeutralizer('node build &> build.log'), null);
+  assert.equal(findCommandFailureNeutralizer('node build 2>&1 | tee log'), null);
   // `&& exit 0` short-circuits on failure — not a neutralizer.
   assert.equal(findCommandFailureNeutralizer('pnpm test && exit 0'), null);
   assert.equal(findCommandFailureNeutralizer('pnpm test'), null);

@@ -562,8 +562,18 @@ const withDisposableWorktree = async ({ repo, baseSha, env, timeoutMs } = {}, ca
   //  - `.git/info/attributes`: an isolated clone gets a fresh Git directory,
   //    so source-repository info attributes are never inherited or mutated.
   const noHooksDir = path.join(parent, 'no-hooks');
-  await mkdir(noHooksDir, { recursive: true });
-  const filterOverrides = await computeFilterSafetyOverrides(repo, { env, timeoutMs });
+  let filterOverrides;
+  try {
+    await mkdir(noHooksDir, { recursive: true });
+    filterOverrides = await computeFilterSafetyOverrides(repo, { env, timeoutMs });
+  } catch (setupError) {
+    // computeFilterSafetyOverrides can reject (e.g. .git/config unreadable or
+    // non-regular) before the main try/finally below, leaking the just-created
+    // parent codex-pr-baseline-* tree in tmpdir on every failed baseline
+    // comparison; clean it up and re-throw (Codex U4u-g).
+    await rm(parent, { recursive: true, force: true });
+    throw setupError;
+  }
   const withInternalSafety = (args) => [
     '-c', `core.hooksPath=${noHooksDir}`,
     '-c', 'core.fsmonitor=',

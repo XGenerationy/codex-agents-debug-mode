@@ -360,6 +360,35 @@ test('readProjectMetadata honors a configured .RECIPEPREFIX instead of requiring
   }
 });
 
+test('readProjectMetadata strips a non-tab .RECIPEPREFIX so Make ignore-error recipes are still detected (qodo; Codex U3w63)', async () => {
+  // With `.RECIPEPREFIX := >`, a recipe `>-cmd` has Make's `-` ignore-error
+  // modifier AFTER the `>` prefix. The stored line must strip the `>` so
+  // findMakeRecipeNeutralizer's /^\s*[@+]*-/ matches the `-` (a tab prefix is
+  // whitespace and consumed by \s*, but `>` is not) -- otherwise a failure-
+  // neutralizing Make target under a non-tab prefix avoids BLOCKED.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-recipeprefix-ignore-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      '.RECIPEPREFIX := >\ngrafana-render:\n>-node render.js\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    const recipe = metadata.makeRecipes['grafana-render'];
+    assert.ok(!recipe?.includes('>'), `the > prefix must be stripped from the stored recipe, got: ${JSON.stringify(recipe)}`);
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('readProjectMetadata and buildCheckPlan do not mistake a target-line comment for a real recipe (CodeRabbit UptWQ)', async () => {
   // GNU make strips a comment (an unescaped `#`) from a target/prerequisites
   // line before it looks for the `;` that introduces an inline recipe. A scan
