@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const { constants, existsSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
@@ -308,6 +309,38 @@ test('exposes collector-specific health without exposing credentials or paths', 
     assert.equal(readyResponse.body.ready, true);
   } finally {
     await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('project_hash is keyed by a persisted per-project salt, not a bare hash of the path', async () => {
+  // Codex UwnvH: an unsalted sha256(canonicalProjectRoot) is a deterministic,
+  // brute-forceable fingerprint of low-entropy path data -- any other local
+  // process could hash likely canonical roots against the unauthenticated
+  // /health response until one matched. project_hash must differ from that
+  // naive hash, yet two independent createDebugServer constructions against
+  // the SAME project must still agree (the EADDRINUSE already_running check
+  // depends on it), because both read the same persisted on-disk salt.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-'));
+  try {
+    const first = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const naiveHash = createHash('sha256').update(await realpath(projectRoot)).digest('hex');
+    assert.notEqual(first.collectorProjectHash, naiveHash);
+
+    const saltInfo = await stat(path.join(projectRoot, '.debug', 'project_salt'));
+    assert.equal(saltInfo.size, 32);
+
+    const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    assert.equal(second.collectorProjectHash, first.collectorProjectHash);
+
+    const otherRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-other-'));
+    try {
+      const third = createDebugServer({ projectRoot: otherRoot, token: TEST_LAUNCH_TOKEN });
+      assert.notEqual(third.collectorProjectHash, first.collectorProjectHash);
+    } finally {
+      await rm(otherRoot, { recursive: true, force: true });
+    }
+  } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });

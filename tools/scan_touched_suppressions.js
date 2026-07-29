@@ -466,6 +466,18 @@ const isSafeMetadataReplacement = (removedLine, addedLine, currentFile) => {
 // (Codex UnYbr).
 const VALIDATION_KEY_HINT = /\b(?:pre|post)?(?:test|lint|audit|validate|typecheck|coverage|verify|check|scan|smoke|health[-_]?check|doctor|build|security|codeql|ci)\b/i;
 
+// Executable/tool names that make a package.json script's VALUE itself read
+// as a validation invocation, independent of what its key is named. A custom
+// script name (e.g. `"quality": "eslint ."`) never matches VALIDATION_KEY_HINT,
+// so isSafePackageJsonFieldReplacement's key-only check would otherwise wave
+// through swapping that command for a no-op like `echo ok` -- neither value
+// matches VALIDATION_REMOVAL_PATTERNS' fixed `npm run <name>` shapes either,
+// since the script is invoked by its own custom key, not by one of those
+// names. Checked against the OLD value: it is the command actually being
+// replaced whose semantics must be preserved, not the new one (Codex UxMWy).
+// Word-boundary matching mirrors VALIDATION_KEY_HINT above.
+const VALIDATION_TOOL_HINT = /\b(?:eslint|tslint|stylelint|prettier|tsc|flake8|pylint|black|mypy|rubocop|golangci-lint|clippy|shellcheck|markdownlint|jsonlint|depcheck|snyk|semgrep|bandit|trivy|codeql|cargo|pytest|jest|mocha|vitest|phpunit|rspec|ctest|nyc|c8)\b/i;
+
 /**
  * Extract the quoted JSON key from a trimmed package.json diff line body
  * (`"lodash": "^4.17.20",` -> `lodash`), or null when the line is not a
@@ -518,7 +530,11 @@ const isJsonStringField = (body) => JSON_STRING_FIELD.test(body);
  * the hint check, Codex UnT4H), requires the same key on both sides, that key
  * to clear VALIDATION_KEY_HINT, and reuses VALIDATION_REMOVAL_PATTERNS so a
  * value that smuggles a validation command under a harmless-looking key still
- * fails (Codex UkAe8, UguCZ).
+ * fails (Codex UkAe8, UguCZ). The key hint alone is an incomplete signal for a
+ * custom script name (e.g. `"quality": "eslint ."`), so this also fails
+ * closed when the OLD value names a known validation tool (VALIDATION_TOOL_HINT)
+ * but the NEW value names none -- the command's semantics changed even though
+ * its key did not (Codex UxMWy).
  * @param {string} removedLine unified-diff line starting with `-`
  * @param {string} addedLine unified-diff line starting with `+`
  * @param {string} currentFile repo-relative path the pair belongs to
@@ -533,6 +549,7 @@ const isSafePackageJsonFieldReplacement = (removedLine, addedLine, currentFile) 
   const addedKey = jsonFieldKey(addedBody);
   if (!removedKey || removedKey !== addedKey) return false;
   if (VALIDATION_KEY_HINT.test(removedKey)) return false;
+  if (VALIDATION_TOOL_HINT.test(removedBody) && !VALIDATION_TOOL_HINT.test(addedBody)) return false;
   const addedAsRemoval = `-${addedLine.slice(1)}`;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
@@ -628,6 +645,14 @@ const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
  * never pairs across a hunk, and the current file (tracked from each `+++`
  * header) never leaks a package.json/workflow exemption into a different
  * file's lines. Blank/comment-only removals are ignored exactly as before.
+ * `---`/`+++` headers are only recognized outside a hunk (reset on `diff
+ * --git`, entered on `@@`): under --unified=0 an added/removed source line
+ * whose content is literally `++ b/<path>` or `-- a/<path>` is emitted as
+ * `+++ b/<path>` / `--- a/<path>` INSIDE the hunk, and without this guard
+ * that in-hunk content would be mistaken for the next file's header,
+ * corrupting `currentFile` or silently dropping the removed line (Codex
+ * UxMW8) -- the same ambiguity pr_closeout_repo.js's prose-gate diff walk
+ * already guards against for its own header parsing.
  * @param {string} diff unified diff text (produced with unified=0)
  * @returns {string[]} truncated removed lines that are not safe replacements
  */
@@ -636,6 +661,7 @@ const collectContentRemovals = (diff) => {
   let removed = [];
   let added = [];
   let currentFile = '';
+  let inHunk = false;
   const flushHunk = () => {
     for (let i = 0; i < removed.length; i += 1) {
       const line = removed[i];
@@ -657,17 +683,25 @@ const collectContentRemovals = (diff) => {
     added = [];
   };
   for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith('+++ ')) {
+    // `diff --git` starts a new file section; reset hunk state so that
+    // section's own `---`/`+++` lines are recognized as headers rather than
+    // still being suppressed by the previous file's in-hunk state.
+    if (line.startsWith('diff --git ')) {
       flushHunk();
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      flushHunk();
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk && line.startsWith('+++ ')) {
       const filePath = line.slice(4).trim();
       currentFile = filePath === '/dev/null' ? '' : filePath.replace(/^b\//, '');
       continue;
     }
-    // Hunk / file boundaries flush the buffers so pairing never spans blocks.
-    if (line.startsWith('@@') || isUnifiedDiffFileHeader(line)) {
-      flushHunk();
-      continue;
-    }
+    if (!inHunk && isUnifiedDiffFileHeader(line)) continue;
     if (line.startsWith('-')) removed.push(line);
     else if (line.startsWith('+')) added.push(line);
   }

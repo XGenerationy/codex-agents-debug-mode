@@ -490,6 +490,13 @@ Remove instrumentation only after:
 
 Search for `#region debug` and remove all debug code.
 
+Stop the collector process started in Phase 1 so it does not linger and hold port 8787 for a
+later session:
+
+```bash
+kill "$COLLECTOR_PID" 2>/dev/null
+```
+
 ## Log Format
 
 Each line is NDJSON:
@@ -703,16 +710,24 @@ DEBUG_ALLOWED_ORIGIN=chrome-extension://<id> node /absolute/path/to/debug/script
 Comma-separate multiple origins when both a page origin and the extension origin must be allowed.
 
 **Injected scripts (MAIN world):**
-If debugging code injected via `<script>` into the page context, use `window.postMessage` to relay to content script, which then relays to background:
+If debugging code injected via `<script>` into the page context, use `window.postMessage` to relay to content script, which then relays to background. The MAIN-world payload carries **no** session
+credentials — giving the page context `DEBUG_SESSION_ID`/`DEBUG_SESSION_TOKEN` would let any page
+script reuse them, defeating the isolated-world boundary — so the content script merges its own
+(already-declared, isolated-world) credentials in before relaying:
 
 ```javascript
-// In MAIN world (injected script)
-window.postMessage({ type: 'DEBUG_LOG_RELAY', payload: { ... } }, '*');
+// In MAIN world (injected script) — no sessionId/sessionToken here
+window.postMessage({ type: 'DEBUG_LOG_RELAY', payload: { msg, data, hypothesisId } }, '*');
 
-// In content script
+// In content script — merge its own DEBUG_SESSION_ID/DEBUG_SESSION_TOKEN
+// (declared in the Content Script sender above) before relaying; never let
+// MAIN world supply or see them.
 window.addEventListener('message', (e) => {
   if (e.data?.type === 'DEBUG_LOG_RELAY') {
-    chrome.runtime.sendMessage({ type: 'DEBUG_LOG', payload: e.data.payload });
+    chrome.runtime.sendMessage({
+      type: 'DEBUG_LOG',
+      payload: { ...e.data.payload, sessionId: DEBUG_SESSION_ID, sessionToken: DEBUG_SESSION_TOKEN },
+    });
   }
 });
 ```
@@ -723,7 +738,7 @@ window.addEventListener('message', (e) => {
 - [ ] Session created via `POST /session` - save the returned `session_id`
 - [ ] 3-5 hypotheses generated
 - [ ] 3-8 logs added, tagged with hypothesisId
-- [ ] Logs cleared before reproduction
+- [ ] Fresh session created for reproduction (never truncate an active session log)
 - [ ] Reproduction steps provided
 - [ ] Each hypothesis evaluated (CONFIRMED/REJECTED/INCONCLUSIVE)
 - [ ] Fix based on evidence only

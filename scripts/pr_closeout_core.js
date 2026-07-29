@@ -173,7 +173,7 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // below: an inert `if`/`while`/`until` guard ahead of a separately
   // propagating real check would also match, which is intentional — closeout
   // BLOCKs rather than risks admitting a genuine failure-hiding conditional.
-  /\b(?:if|elif|while|until)\b[\s\S]*?\b(?:then|do)\b\s*;?\s*(?::|true\b)\s*;?\s*(?:fi\b|done\b)/,
+  /\b(?:if|elif|while|until)\b[\s\S]{0,4000}?\b(?:then|do)\b\s*;?\s*(?::|true\b)\s*;?\s*(?:fi\b|done\b)/,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,

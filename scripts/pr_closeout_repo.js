@@ -102,14 +102,18 @@ const withInternalGitSafety = async (repo, args) => ([
   '-c', 'core.fsmonitor=',
   '-c', 'core.useBuiltinFSMonitor=false',
   '-c', 'core.fileMode=true',
-  // Force off regardless of the repo/user/system config: internal diffing
-  // and hashing must see exact on-disk bytes, and letting autocrlf convert
-  // line endings mid-hash would make the seal depend on the checkout's CRLF
-  // config instead of actual content. This also removes the only known
-  // source of git's benign "LF will be replaced by CRLF" notice on stderr,
-  // which would otherwise trip hashGitOutput's fail-closed-on-stderr check
-  // on every ordinary Windows/autocrlf checkout.
-  '-c', 'core.autocrlf=false',
+  // Suppress git's benign "LF will be replaced by CRLF" NOTICE universally —
+  // this only silences the warning, it does not change conversion behavior,
+  // so it is safe regardless of the caller's autocrlf setting. Deliberately
+  // NOT forcing `core.autocrlf=false` here (Qodo UwS6Q): repro confirmed that
+  // once a working-tree comparison falls off the stat-cache fast path (e.g.
+  // after any mtime-changing operation), forcing autocrlf off makes git
+  // compare a real Windows/autocrlf=true checkout's on-disk CRLF bytes
+  // straight against the LF-normalized committed blob, so cleanTreeStatus and
+  // the gate/touched-file diffs (readGateChanges, readTouchedFiles) would
+  // report every ordinary CRLF text file as modified. Only hashGitOutput's
+  // own spawn call adds the override, where exact-byte fidelity for the
+  // security fingerprint is the deliberate, narrower intent.
   '-c', 'core.safecrlf=false',
   ...(await computeFilterSafetyOverrides(repo, { env: gitChildEnv() })),
   ...withNoTextconv(args),
@@ -267,7 +271,7 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
   ]);
   const mergeBaseSha = await gitText(physicalRepo, ['merge-base', baseSha, headSha]);
   const groups = await Promise.all([
-    gitPaths(physicalRepo, ['diff', '--name-only', '-z', `${mergeBaseSha}...HEAD`]),
+    gitPaths(physicalRepo, ['diff', '--name-only', '-z', `${mergeBaseSha}...${headSha}`]),
     gitPaths(physicalRepo, ['diff', '--name-only', '-z']),
     gitPaths(physicalRepo, ['diff', '--name-only', '--cached', '-z']),
     gitPaths(physicalRepo, ['ls-files', '--others', '--exclude-standard', '-z']),
@@ -1187,7 +1191,11 @@ const findGeneratedDirRoots = async (repo, maxDepth = MAX_NODE_MODULES_DISCOVERY
 const MAX_GIT_STDERR_BYTES = 64 * 1024;
 
 const hashGitOutput = async (repo, args) => {
-  const safeArgs = await withInternalGitSafety(repo, args);
+  // Force off regardless of the repo/user/system config, unlike every other
+  // internal git call: this hash must see exact on-disk bytes, and letting
+  // autocrlf convert line endings mid-hash would make the seal depend on the
+  // checkout's CRLF config instead of actual content.
+  const safeArgs = ['-c', 'core.autocrlf=false', ...(await withInternalGitSafety(repo, args))];
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256');
     const child = spawn('git', safeArgs, {

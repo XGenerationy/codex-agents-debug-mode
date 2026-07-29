@@ -301,6 +301,16 @@ const listLivePidsWithSpawnMark = (mark, { selfPid = process.pid } = {}) => {
  * started is exactly the untrusted case this sweep exists to catch; a free
  * pass for "older" would reopen that gap.
  *
+ * A candidate that is an ANCESTOR of `selfPid` IS excluded unconditionally
+ * (Codex Uwnuu/UxMWt), e.g. the Codex app server or code-mode host that
+ * launched this runner, possibly in a different session with its own cwd or
+ * an open fd under the worktree. This is not the rejected age heuristic
+ * above: age/CommandLine matching is an unreliable proxy, whereas process
+ * ancestry is a hard structural fact fixed at creation time that no spawned
+ * validation command can retroactively forge -- a candidate already on
+ * `selfPid`'s own PPID chain cannot simultaneously be a descendant this spawn
+ * created, so it is judged by the strongest evidence available, not skipped.
+ *
  * When `rootPid` (the spawn's root pid) is given, a candidate whose UNBROKEN
  * PPID chain reaches the runner (`selfPid`) without passing through `rootPid`
  * is excluded: it belongs to the runner's own tree — e.g. a concurrent
@@ -436,10 +446,42 @@ const listLivePidsWithCwdUnder = (rootCwd, {
     }
     return false;
   };
+  // A candidate that is an ANCESTOR of this runner (e.g. the Codex app
+  // server, code-mode host, or another long-lived process that launched this
+  // spawn, possibly in a different session with its own cwd/fd under the
+  // worktree) can never be this spawn's escaped descendant: process ancestry
+  // is fixed at creation time and cannot be rewritten after the fact, no
+  // matter what a validation command's child does. This is the mirror of
+  // chainsToRunner above (which walks a CANDIDATE's ancestry looking for
+  // selfPid); here we walk selfPid's own ancestry looking for the candidate.
+  // Unlike the deliberately-rejected "started before this spawn" heuristic
+  // (Codex UrfC6 — unreliable signals like process age or CommandLine
+  // substring matching), ancestry-of-self is hard, unforgeable /proc
+  // evidence, so this closes Codex Uwnuu/UxMWt without reopening that gap.
+  const selfAncestors = new Set();
+  {
+    let current = selfPid;
+    for (let hop = 0; hop < 64 && current > 1; hop += 1) {
+      if (selfAncestors.has(current)) break;
+      selfAncestors.add(current);
+      let stat;
+      try {
+        stat = readFileSync(`/proc/${current}/stat`, 'utf8');
+      } catch {
+        break;
+      }
+      const afterComm = stat.lastIndexOf(')');
+      if (afterComm < 0) break;
+      const ppid = Number(stat.slice(afterComm + 1).trimStart().split(/\s+/)[1]);
+      if (!Number.isInteger(ppid) || ppid <= 0) break;
+      current = ppid;
+    }
+  }
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (pid === selfPid || pid === 1) continue;
+    if (selfAncestors.has(pid)) continue; // pre-existing ancestor of the runner — never our orphan.
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
       const afterComm = stat.lastIndexOf(')');

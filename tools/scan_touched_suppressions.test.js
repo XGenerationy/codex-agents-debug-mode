@@ -368,6 +368,85 @@ test('collectContentRemovals STILL flags weakened npm lifecycle-prefixed validat
   }
 });
 
+test('collectContentRemovals STILL flags a custom-keyed script that swaps out a real validation tool (Codex UxMWy)', async () => {
+  // VALIDATION_KEY_HINT only denylists specific known key names (test, lint,
+  // build, etc). A repo-specific script name like `quality` never matches it,
+  // so the same-key package.json allowance used to wave through replacing a
+  // real validation invocation (`eslint .`) with a no-op (`echo ok`) purely
+  // because the key stayed the same. VALIDATION_TOOL_HINT closes this gap by
+  // checking the VALUE for a known validation tool name independent of the key.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.0.0', scripts: { quality: 'eslint .' } }),
+    pkg({ version: '1.0.0', scripts: { quality: 'echo ok' } }),
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /eslint \./.test(line)),
+    `expected the replaced quality script to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals does not let an in-hunk "+++ b/package.json" content line spoof currentFile (Codex UxMW8)', async () => {
+  // With --unified=0, a source line whose literal content is `++ b/<path>` or
+  // `-- a/<path>` becomes textually indistinguishable from a real diff file
+  // header once git prefixes its own +/- marker. A naive `startsWith('+++ ')`
+  // check (with no notion of being inside a hunk) would treat that in-hunk
+  // content as a genuine header and corrupt currentFile to "package.json" for
+  // the rest of the diff -- wrongly granting the package.json-only same-key
+  // exemption to an unrelated edit in this tsconfig.json file. Padding lines
+  // force the spoofing line and the real "sync" edit into separate hunks so
+  // the corruption (if present) survives a hunk boundary, exactly like the
+  // pre-existing cross-hunk pairing guard above.
+  const before = [
+    '{',
+    '  "compilerOptions": {',
+    '    "strict": true',
+    '  },',
+    '  "padding01": "a",',
+    '  "padding02": "b",',
+    '  "padding03": "c",',
+    '  "padding04": "d",',
+    '  "padding05": "e",',
+    '  "padding06": "f",',
+    '  "padding07": "g",',
+    '  "padding08": "h",',
+    '  "sync": "run-integration-check.sh"',
+    '}',
+    '',
+  ].join('\n');
+  const after = [
+    '{',
+    '  "compilerOptions": {',
+    '    "strict": true',
+    '  },',
+    '++ b/package.json',
+    '  "padding01": "a",',
+    '  "padding02": "b",',
+    '  "padding03": "c",',
+    '  "padding04": "d",',
+    '  "padding05": "e",',
+    '  "padding06": "f",',
+    '  "padding07": "g",',
+    '  "padding08": "h",',
+    '  "sync": "true"',
+    '}',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('tsconfig.json', before, after);
+  const hunkCount = (diff.match(/^@@/gm) || []).length;
+  assert.ok(hunkCount >= 2, `fixture must produce multiple hunks to test cross-hunk currentFile spoofing; got ${hunkCount}`);
+  assert.ok(
+    /^\+\+\+ b\/package\.json$/m.test(diff),
+    `fixture must produce an in-hunk line indistinguishable from a package.json header; got ${diff}`,
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /run-integration-check\.sh/.test(line)),
+    `expected the sync script edit to stay flagged (currentFile must remain tsconfig.json); got ${JSON.stringify(removals)}`,
+  );
+});
+
 test('collectContentRemovals exempts a quoted workflow action pin bump (CodeRabbit Uohnw)', async () => {
   // YAML authors quote `uses:` routinely; isSafeActionPinReplacement's action-
   // path/ref alternatives both exclude quote characters, so a quoted pin bump

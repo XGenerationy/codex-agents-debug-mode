@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
-const { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
+const { createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
+const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
@@ -69,6 +69,63 @@ const computeRetainedLogBytes = (logDir) => {
     if (info.isFile()) bytes += info.size;
   }
   return bytes;
+};
+
+// Keys projectHash below so it cannot be brute-forced from the unauthenticated
+// /health response (Codex UwnvH): hashing the raw canonicalProjectRoot alone
+// is a deterministic, unkeyed fingerprint of low-entropy data (a filesystem
+// path), so any other local process could hash likely canonical roots (e.g.
+// /home/<user>/<repo>) until one matched and recover the project path despite
+// /health never printing it directly. A random per-project salt persisted
+// under .debug/ (0600, current-user-only) closes that: two invocations of the
+// SAME project's collector still agree, because both read the same on-disk
+// salt, but an outside guesser would also need to guess the unpublished salt.
+// Runs synchronously during createDebugServer's construction, like
+// computeRetainedLogBytes below; every failure (unreadable/corrupt/racing
+// create) falls open to a private, unpersisted salt rather than crashing
+// startup -- worst case is two invocations disagreeing on project_hash, which
+// only affects the already_running convenience check, never authentication.
+const readOrCreateProjectSalt = (debugDir) => {
+  const saltFile = path.join(debugDir, 'project_salt');
+  const readExisting = () => {
+    // Refuse a symlinked salt file, mirroring collector_token's own guard:
+    // an attacker-planted link could otherwise redirect the read.
+    const info = lstatSync(saltFile);
+    if (!info.isFile()) throw new Error('project_salt_not_regular_file');
+    const fd = openSync(saltFile, 'r');
+    try {
+      const buffer = Buffer.alloc(32);
+      const bytesRead = readSync(fd, buffer, 0, 32, 0);
+      if (bytesRead !== 32) throw new Error('project_salt_short_read');
+      return buffer;
+    } finally {
+      closeSync(fd);
+    }
+  };
+  try {
+    return readExisting();
+  } catch {
+    // Missing, corrupt, or unreadable: fall through to (re)generate below.
+  }
+  try { mkdirSync(debugDir, { recursive: true }); } catch {}
+  const salt = randomBytes(32);
+  try {
+    const fd = openSync(saltFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    try {
+      writeSync(fd, salt, 0, 32, 0);
+    } finally {
+      closeSync(fd);
+    }
+    return salt;
+  } catch (error) {
+    // Lost the create race to a concurrent invocation: read back its salt so
+    // both agree. Any other failure keeps this invocation's own unpersisted
+    // salt (fail-open per the note above).
+    if (error?.code === 'EEXIST') {
+      try { return readExisting(); } catch { /* fall through */ }
+    }
+    return salt;
+  }
 };
 
 const DEFAULT_PORT = 8787;
@@ -519,12 +576,13 @@ const createDebugServer = ({
     canonicalProjectRoot = canonicalProjectRoot.replace(/\\/g, '/').toLowerCase();
   }
   const logDir = path.join(resolvedProjectRoot, '.debug');
-  // A one-way, non-reversible fingerprint of the canonical project root.
-  // /health is deliberately unauthenticated (see isAllowedHost) and must
+  // A one-way fingerprint of the canonical project root, keyed by a random
+  // per-project salt (see readOrCreateProjectSalt above) so it cannot be
+  // brute-forced from the unauthenticated /health response. /health must
   // never leak the raw path, but the EADDRINUSE probe in main() still needs
   // a way for two invocations to agree they mean the SAME project without
   // either being able to recover the other's path from what /health reports.
-  const projectHash = createHash('sha256').update(canonicalProjectRoot).digest('hex');
+  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)

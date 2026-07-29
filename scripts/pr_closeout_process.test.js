@@ -2552,6 +2552,69 @@ test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is b
   }
 });
 
+test('cwd/fd probe excludes a pre-existing ancestor of the runner (Codex host)', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Codex Uwnuu/UxMWt (P1): a long-lived host process (e.g. the Codex app
+  // server or code-mode host) that launched this runner can have its cwd
+  // under the worktree while belonging to another session and carrying no
+  // spawn mark -- topologically identical to a detached orphan by every
+  // other signal. Because it is an ANCESTOR of this runner's own pid, no
+  // spawned validation command could ever have created it, so it must be
+  // excluded regardless of session/cwd/mark/chain results. POSIX + /proc.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-host-ancestor-'));
+  let hostPid = 0;
+  let grandchildPid = 0;
+  try {
+    // "host": own session, cwd inside the repo, no spawn mark -- launches a
+    // further descendant (stand-in for this runner) and reports both pids.
+    const host = [
+      'const {spawn}=require("node:child_process");',
+      'const child=spawn(process.execPath,["-e","process.stdout.write(String(process.pid));setInterval(()=>{},10000);"],{stdio:["ignore","pipe","ignore"],detached:true});',
+      'child.unref();',
+      'child.stdout.on("data",(chunk)=>{process.stdout.write(process.pid+","+String(chunk).trim());});',
+      'setInterval(()=>{},10000);',
+    ].join('');
+    const hostProc = spawn(process.execPath, ['-e', host], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      cwd: repo,
+      detached: true,
+    });
+    hostProc.unref();
+    hostProc.stdout.on('data', (chunk) => {
+      const parts = String(chunk).trim().split(',');
+      if (parts.length === 2) { hostPid = Number(parts[0]); grandchildPid = Number(parts[1]); }
+    });
+    for (let i = 0; i < 40 && !grandchildPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(hostPid > 0 && grandchildPid > 0, 'host and its descendant must both report a pid');
+
+    // Fixture validity: without a selfPid that descends from the host, the
+    // bare cwd probe matches it like any other mark-free candidate.
+    const attributed = listLivePidsWithCwdUnder(repo, { selfPid: process.pid });
+    assert.ok(
+      (attributed || []).includes(hostPid),
+      `host ${hostPid} must match the bare cwd probe, got: ${JSON.stringify(attributed)}`,
+    );
+
+    // With selfPid set to the host's own descendant, the host is an ANCESTOR
+    // of selfPid and must be excluded even though it shares no rootPid and
+    // chainsToRunner(hostPid) -- which walks the opposite direction -- would
+    // report it unchained.
+    const excluded = listLivePidsWithCwdUnder(repo, { selfPid: grandchildPid });
+    assert.ok(
+      !(excluded || []).includes(hostPid),
+      `ancestor host ${hostPid} of selfPid ${grandchildPid} must be excluded, got: ${JSON.stringify(excluded)}`,
+    );
+  } finally {
+    if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL'); } catch {} }
+    if (hostPid) { try { process.kill(hostPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('environHasAnySpawnMark only matches a mark registered in knownMarks', () => {
   // Codex UikN4 (P1): matching ANY self-reported value (the original Codex
   // UfzOf fix) let a hostile detached process simply set SPAWN_MARK_ENV to
