@@ -64,6 +64,19 @@ const closeServer = (server) => new Promise((resolve, reject) => {
 const statusDiag = (result) =>
   `evidence: ${result?.evidence || ''} | terminationEvidence: ${result?.terminationEvidence || ''}`;
 
+// Codex/CodeRabbit UptWM: Node's test runner evaluates a test's `skip` option
+// synchronously at registration time (module load), before any test body
+// runs, so a capability probe used to gate a whole test must itself be
+// synchronous and side-effect-free to be hoisted there safely.
+// listLivePidsWithSpawnMark qualifies -- it only readdirSync/readFileSync
+// under /proc (never mutates anything, never spawns) and returns null
+// exactly when /proc itself is unavailable, the same host-level fact every
+// /proc-gated test below now gates its declarative `skip` on. Computed once
+// here (rather than once per test) so registration doesn't re-walk /proc
+// eight separate times for what is, on any given host, always the same
+// answer.
+const PROC_UNAVAILABLE = listLivePidsWithSpawnMark('probe-no-such-mark') === null;
+
 
 test('uses an explicit absolute Git Bash path on Windows', () => {
   const shell = resolveCommandShell({
@@ -1833,6 +1846,129 @@ test('probeCommandDefault clears timeout timers so a fast probe does not hold th
   }
 });
 
+test('probeCommandDefault recognizes a sibling probe\'s still-registered mark instead of misattributing it', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Codex Uonld (P1): runPreflight calls probeCommandDefault sequentially,
+  // once per TOOL_PROBES entry, against the same repo cwd. Before this fix
+  // probeCommandDefault did not accept a knownSiblingMarks registry at all,
+  // so a probe whose command left behind a live, mark-carrying descendant
+  // (docker/docker-compose/docker-daemon commonly spawn slow-to-exit
+  // helpers) gave the NEXT probe's own sweep no way to recognize it as a
+  // known sibling -- it would be misattributed as a mark-free foreign
+  // descendant and force a spurious BLOCKED on an otherwise-clean probe.
+  // Reproduce the exact shape directly against the public entry point:
+  // a real, reparented (broken-PPID-chain) descendant carrying a mark that
+  // is registered in a caller-shared knownSiblingMarks Set -- exactly what
+  // runPreflight's own activeSpawnMarks now does across TOOL_PROBES -- must
+  // be excluded so the probe still reports PASS.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-preflight-sibling-'));
+  let siblingPid = 0;
+  let rootPid = 0;
+  try {
+    const siblingMark = 'sibling-probe-mark-still-in-flight';
+    const launcher = [
+      'const {spawn}=require("node:child_process");',
+      `const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true,env:{...process.env,${SPAWN_MARK_ENV}:"${siblingMark}"}});`,
+      'process.stdout.write(String(child.pid));',
+      'child.unref();',
+      'setTimeout(()=>process.exit(0),200);',
+    ].join('');
+    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
+    rootPid = root.pid;
+    root.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
+    await new Promise((resolve) => root.once('exit', resolve));
+    for (let i = 0; i < 40 && !siblingPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(siblingPid > 0, 'sibling pid must be reported');
+    let ppid = rootPid;
+    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
+      try {
+        const stat = readFileSync(`/proc/${siblingPid}/stat`, 'utf8');
+        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
+
+    // Simulate runPreflight's shared activeSpawnMarks already knowing about
+    // this still-in-flight sibling probe's mark (e.g. registered by an
+    // earlier TOOL_PROBES entry's still-settling probeCommandDefault call in
+    // the same runPreflight invocation).
+    const activeSpawnMarks = new Set([siblingMark]);
+    const shell = resolveCommandShell({ env: process.env });
+    const result = await probeCommandDefault({
+      command: 'printf %s preflight-clean-ok',
+      repo,
+      shell,
+      env: process.env,
+      knownSiblingMarks: activeSpawnMarks,
+    });
+    assert.equal(result.terminationStatus, 'PASS', result.terminationEvidence);
+  } finally {
+    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('probeCommandDefault still BLOCKs on an unregistered mark-free/foreign descendant', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
+  // Companion to the test above: proves the knownSiblingMarks wiring added
+  // to probeCommandDefault for Codex Uonld does not silently swallow genuine
+  // orphans. An unregistered mark is -- by the same UikN4 design already
+  // proven for listLivePidsWithCwdUnder directly -- indistinguishable from a
+  // hostile forger or an entirely unrelated process, so it must still force
+  // BLOCKED even though probeCommandDefault now accepts a knownSiblingMarks
+  // parameter.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-preflight-foreign-'));
+  let siblingPid = 0;
+  let rootPid = 0;
+  try {
+    const launcher = [
+      'const {spawn}=require("node:child_process");',
+      `const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true,env:{...process.env,${SPAWN_MARK_ENV}:"never-registered-mark"}});`,
+      'process.stdout.write(String(child.pid));',
+      'child.unref();',
+      'setTimeout(()=>process.exit(0),200);',
+    ].join('');
+    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
+    rootPid = root.pid;
+    root.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
+    await new Promise((resolve) => root.once('exit', resolve));
+    for (let i = 0; i < 40 && !siblingPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(siblingPid > 0, 'sibling pid must be reported');
+    let ppid = rootPid;
+    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
+      try {
+        const stat = readFileSync(`/proc/${siblingPid}/stat`, 'utf8');
+        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
+
+    const shell = resolveCommandShell({ env: process.env });
+    const result = await probeCommandDefault({
+      command: 'printf %s preflight-should-block',
+      repo,
+      shell,
+      env: process.env,
+      knownSiblingMarks: new Set(), // nothing registered -- must not be trusted
+    });
+    assert.equal(result.terminationStatus, 'BLOCKED', 'an unregistered mark must not be trusted');
+    assert.match(result.terminationEvidence || '', /mark-free/i);
+  } finally {
+    if (siblingPid) { try { process.kill(siblingPid, 'SIGKILL'); } catch {} }
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('runPreflight BLOCKs when a probe reports process-tree cleanup failure', async () => {
   // Even if a version probe exits 0, an unreaped descendant must refuse
   // admission — matching the main command executor's terminationStatus latch.
@@ -1873,12 +2009,11 @@ test('preflight resolves required env names case-insensitively', async () => {
   assert.equal(credential.evidence, 'present');
 });
 
-test('terminates background descendants left behind by a cleanly exiting command', { timeout: 20000 }, async (t) => {
+test('terminates background descendants left behind by a cleanly exiting command', { timeout: 20000, skip: process.platform === 'win32' ? 'posix-only test' : false }, async () => {
   // POSIX-only: this sweeps the command's process group. Windows has no
   // process groups to probe once the root has exited, so the win32 path can
   // only report the root as already gone (covered by the terminateProcessTree
   // unit tests below).
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-'));
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-logs-'));
   const marker = path.join(repo, 'descendant-survived.txt');
@@ -1898,13 +2033,14 @@ test('terminates background descendants left behind by a cleanly exiting command
   await assert.rejects(access(marker));
 });
 
-test('terminates detached/setsid descendants that leave the process group', { timeout: 20000 }, async (t) => {
+test('terminates detached/setsid descendants that leave the process group', {
+  timeout: 20000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // POSIX + /proc only: a validation script can `detached:true` / setsid a
   // child, exit 0, and leave a descendant outside the original process group.
   // Group kill alone would PASS; the spawn-mark environ sweep must still reap
   // it before the command is considered clean.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-'));
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-logs-'));
   const marker = path.join(repo, 'setsid-survived.txt');
@@ -1934,12 +2070,13 @@ test('terminates detached/setsid descendants that leave the process group', { ti
   await assert.rejects(access(marker), 'detached descendant must not mutate the worktree after termination');
 });
 
-test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { timeout: 15000 }, async (t) => {
+test('cwd/fd probe discovers mark-free processes that hold an open repo fd', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // Discovery helper listLivePidsWithCwdUnder still finds mark-free processes
   // that hold a repo fd (useful diagnostics). Orphan kill path no longer
   // reaps by cwd/fd alone — only spawn-mark PIDs are signaled. POSIX + /proc.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-sweep-'));
   let childPid = 0;
   let pipePid = 0;
@@ -2006,14 +2143,15 @@ test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { t
   }
 });
 
-test('cwd/fd probe excludes a same-repo sibling still running under the runner', { timeout: 15000 }, async (t) => {
+test('cwd/fd probe excludes a same-repo sibling still running under the runner', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // Codex UDDP_: with the runner's default parallelism 4, concurrent checks
   // share the repo as cwd in their own sessions. The mark-free cwd/fd
   // fallback must not attribute such a still-running SIBLING — an unbroken
   // PPID chain to the runner that never passes through this spawn's root —
   // to this spawn as a detached descendant. POSIX + /proc only.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-sibling-sweep-'));
   let siblingPid = 0;
   let siblingHandle = null;
@@ -2068,12 +2206,13 @@ test('cwd/fd probe excludes a same-repo sibling still running under the runner',
   }
 });
 
-test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is broken', { timeout: 15000 }, async (t) => {
+test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is broken', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // Fail-closed guard for the sibling exclusion (Codex UDDP_): a genuine
   // detached orphan's PPID chain dead-ends at the exited spawn root (absent
   // pid), so it must stay attributed and force BLOCKED. POSIX + /proc only.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-broken-chain-'));
   let orphanPid = 0;
   let rootPid = 0;
@@ -2157,15 +2296,16 @@ test('environHasAnySpawnMark only matches a mark registered in knownMarks', () =
   assert.equal(environHasAnySpawnMark('', knownMarks), false);
 });
 
-test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', { timeout: 15000 }, async (t) => {
+test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // Codex UfzOf (P1): under the default test-runner parallelism, a sibling
   // check's own live, mark-tracked descendant can have a PPID chain that
   // looks broken relative to THIS spawn's rootPid/selfPid purely because it
   // descends from a different root. Reproduce that exact shape -- a detached,
   // reparented (broken-chain) grandchild whose environ carries a *different*
   // check's spawn mark -- and assert it is excluded, not misattributed.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-foreign-mark-'));
   let siblingPid = 0;
   let rootPid = 0;
@@ -2220,7 +2360,10 @@ test('cwd/fd probe excludes a live process carrying a different check\'s own spa
   }
 });
 
-test('cwd/fd probe does not exclude a live process carrying an unregistered (forged) spawn mark', { timeout: 15000 }, async (t) => {
+test('cwd/fd probe does not exclude a live process carrying an unregistered (forged) spawn mark', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : (PROC_UNAVAILABLE ? 'requires /proc' : false),
+}, async () => {
   // Codex UikN4 (P1): the fix for Codex UfzOf above excluded any candidate
   // whose environ carried ANY OMO_CLOSEOUT_SPAWN_MARK value, trusting the
   // value merely because it existed. A hostile detached process could copy
@@ -2228,8 +2371,6 @@ test('cwd/fd probe does not exclude a live process carrying an unregistered (for
   // entirely. Reproduce the identical reparented-sibling shape as the test
   // above, but WITHOUT ever registering its mark as a known sibling -- it
   // must stay flagged and the sweep must BLOCK, not PASS.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.diagnostic('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-forged-mark-'));
   let siblingPid = 0;
   let rootPid = 0;
@@ -2281,7 +2422,9 @@ test('cwd/fd probe does not exclude a live process carrying an unregistered (for
   }
 });
 
-test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host platform', (t) => {
+test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host platform', {
+  skip: !PROC_UNAVAILABLE ? 'requires a host without /proc' : false,
+}, () => {
   // Codex Ugisk (P1): on macOS and other non-Linux POSIX hosts, /proc never
   // exists, so listLivePidsWithSpawnMark always returned null there. The old
   // code treated that as PASS ("process-group containment only") solely
@@ -2290,7 +2433,6 @@ test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host pla
   // alive and mutating the repo after the seal. This host genuinely lacks
   // /proc (Windows), so it exercises the exact real-world condition the
   // finding describes without needing to fake the platform.
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') !== null) { t.diagnostic('requires a host without /proc'); return; }
   return sweepDetachedOrphans({ mark: 'probe-ugisk-no-proc', kill: () => {} }).then((result) => {
     assert.equal(result.status, 'BLOCKED', statusDiag(result));
     assert.match(result.evidence, /proc.*missing/i);
@@ -2783,12 +2925,14 @@ test('fails artifact proof when the file exceeds the hash size ceiling', async (
   }
 });
 
-test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async (t) => {
+test('does not hang when the verified artifact is swapped for a FIFO', {
+  timeout: 15000,
+  skip: process.platform === 'win32' ? 'posix-only test' : false,
+}, async () => {
   // POSIX-only: Windows Node cannot see POSIX FIFOs. A proof command's
   // background process can swap the verified artifact for a FIFO between the
   // lstat and the hash open; opening a FIFO read-only without O_NONBLOCK
   // would block waiting for a writer, so the proof must fail closed instead.
-  if (process.platform === 'win32') { t.diagnostic('posix-only test'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fifo-artifact-'));
   const fifoPath = path.join(repo, 'render.json');
   execFileSync('mkfifo', [fifoPath]);

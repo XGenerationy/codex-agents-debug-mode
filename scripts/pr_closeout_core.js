@@ -146,16 +146,22 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // forms `set -e` / `set -o pipefail` are not flagged.
   /\bset\s+\+[a-z]*e[a-z]*\b/i,
   /\bset\s+\+o\s+(?:errexit|pipefail)\b/i,
-  // Shell negation (Codex UnYb3): a `!` reserved word before a command,
-  // pipeline, or compound command inverts its exit status AND — per Bash's
-  // documented `-e` behavior — exempts the negated command from errexit, so
-  // `! (npm test) >/dev/null 2>&1` exits 0 precisely when the wrapped command
-  // fails, the same failure-hiding effect as the `|| true` family above.
-  // Anchored like the bare `true`/`:` neutralizers above (start of string, or
-  // right after `;`/`&`/`|`/newline/`(`/`{`) and requiring whitespace before
-  // the next token, so `!=` (inequality) and a bare word containing `!` are
-  // not false positives.
-  /(?:^|[;&|\n(){])\s*!\s+\S/,
+  // Shell negation (Codex UnYb3; CodeRabbit UptWH): a `!` reserved word before
+  // a command, pipeline, or compound command inverts its exit status AND —
+  // per Bash's documented `-e` behavior — exempts the negated command from
+  // errexit, so `! (npm test) >/dev/null 2>&1` exits 0 precisely when the
+  // wrapped command fails, the same failure-hiding effect as the `|| true`
+  // family above. Anchored like the bare `true`/`:` neutralizers above (start
+  // of string, or right after `;`/`&`/`|`/newline/`(`/`{`) OR after a shell
+  // keyword that itself introduces a command (`if`/`elif`/`while`/`until`/
+  // `then`/`do`/`else`): `if ! npm test; then echo skipped; fi` hides a
+  // failure exactly like a bare `! npm test`, but the punctuation anchors
+  // alone never matched it. The keyword alternative is deliberately narrow
+  // (word-bounded, not "any preceding whitespace") so `find . ! -name x` and
+  // `[ ! -f x ]` — where `!` is a command argument, not a shell reserved word —
+  // stay clean; whitespace is still required before the next token so `!=`
+  // (inequality) and a bare word containing `!` are not false positives.
+  /(?:^|[;&|\n(){]|\b(?:if|elif|while|until|then|do|else)\b)\s*!\s+\S/,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,

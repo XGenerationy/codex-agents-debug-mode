@@ -1495,6 +1495,27 @@ test('rejects shell negation (!) that inverts a validation failure', () => {
   assert.match(negated.evidence, /neutralizes failures/i);
 });
 
+test('rejects shell keyword-prefixed negation (if!/elif!/while!/until!)', () => {
+  // CodeRabbit UptWH: the punctuation-only anchor set (`^`, `;`, `&`, `|`,
+  // newline, `(`, `{`) never matches a `!` immediately after a shell keyword
+  // that itself introduces a command, so `if ! npm test; then echo skipped; fi`
+  // hid a failure exactly like `! npm test` but went undetected.
+  assert.ok(findCommandFailureNeutralizer('if ! npm test; then echo skipped; fi'));
+  assert.ok(findCommandFailureNeutralizer('elif ! pnpm test; then true; fi'));
+  assert.ok(findCommandFailureNeutralizer('while ! pnpm test; do sleep 1; done'));
+  assert.ok(findCommandFailureNeutralizer('until ! pnpm test; do sleep 1; done'));
+  // A command argument `!` (not a shell reserved word) must stay clean.
+  assert.equal(findCommandFailureNeutralizer('find . ! -name x'), null);
+  assert.equal(findCommandFailureNeutralizer('[ ! -f x ]'), null);
+  // Plan level: an `if !`-guarded configured command is BLOCKED too.
+  const negatedIfPlan = buildCheckPlan({
+    config: { commands: { typecheck: 'if ! pnpm test; then true; fi' } },
+  });
+  const negatedIf = negatedIfPlan.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(negatedIf.status, 'BLOCKED', JSON.stringify(negatedIf));
+  assert.match(negatedIf.evidence, /neutralizes failures/i);
+});
+
 test('flags pytest, Go, and Rust native skip forms in touched test files', () => {
   // Codex UDDQN: the weakening scan only knew JavaScript/Jest forms; the
   // native skip forms of the other test ecosystems the scanner treats as

@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const { chmod, mkdir, mkdtemp, rm, symlink, utimes, writeFile } = require('node:fs/promises');
+const { mkdtempSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -18,6 +19,28 @@ const {
 const { buildCheckPlan } = require('./pr_closeout_core');
 
 const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+
+// Detect symlink-creation capability once at module load (mirrors the
+// bashProbe/pwshProbe synchronous capability-probe pattern in
+// debug_server.test.js) so tests that need it can use Node's native
+// declarative `{ skip }` option -- evaluated synchronously at registration
+// time -- instead of an imperative check-and-return inside the test body,
+// which reports as a false PASS with zero assertions rather than a genuine
+// SKIP in Node's own test-runner tally.
+const symlinkAvailable = (() => {
+  const probeDir = mkdtempSync(path.join(tmpdir(), 'closeout-symlink-probe-'));
+  try {
+    const target = path.join(probeDir, 'target');
+    writeFileSync(target, '');
+    symlinkSync(target, path.join(probeDir, 'link'));
+    return true;
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'ENOSYS') return false;
+    throw error;
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
 
 test('gitChildEnv strips GIT_* keys case-insensitively (Windows env bypass)', () => {
   // On Windows env names are case-insensitive; Git still honors git_dir /
@@ -156,6 +179,11 @@ test('readProjectMetadata captures make recipe bodies, and buildCheckPlan blocks
     const gappedCheck = buildCheckPlan({ ...gapped, touchedFiles: [] })
       .checks.find((c) => c.id === 'grafana-render');
     assert.equal(gappedCheck.status, 'BLOCKED', JSON.stringify(gappedCheck));
+    // grafana-render also BLOCKS independently for a missing artifact proof, so
+    // status alone would still pass even if the gap-spanning `-@echo` line were
+    // dropped from the recipe again; pin the neutralizer evidence too so this
+    // test actually proves the across-the-gap capture fired (CodeRabbit UptWR).
+    assert.match(gappedCheck.evidence, /neutralizes failures \(-\)/);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -210,6 +238,50 @@ test('readProjectMetadata captures an inline make recipe after prerequisites, us
       .checks.find((c) => c.id === 'grafana-render');
     assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
     assert.match(check.evidence, /neutralizes failures \(\|\| true\)/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata and buildCheckPlan do not mistake a target-line comment for a real recipe (CodeRabbit UptWQ)', async () => {
+  // GNU make strips a comment (an unescaped `#`) from a target/prerequisites
+  // line before it looks for the `;` that introduces an inline recipe. A scan
+  // that searched the raw remainder for `;` without stripping the comment
+  // first could find a `;` that is really inside commentary and capture the
+  // rest of the comment as if it were a real recipe body -- including
+  // neutralizer-looking text the comment merely mentions, e.g. `|| true` --
+  // falsely blocking closeout on a check whose real recipe is clean.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-comment-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render: deps # note; echo x || true\n\t@echo real recipe\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      !metadata.makeRecipes['grafana-render']?.includes('echo x || true'),
+      `comment text must not be captured as recipe body, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('@echo real recipe'),
+      `the real recipe line must still be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    const plan = buildCheckPlan({
+      ...metadata,
+      touchedFiles: [],
+      config: { proofs: { 'grafana-render': { type: 'artifact', path: 'render-output.png' } } },
+    });
+    const check = plan.checks.find((c) => c.id === 'grafana-render');
+    assert.notEqual(
+      check.status,
+      'BLOCKED',
+      `a comment merely mentioning a neutralizer must not block closeout, got: ${JSON.stringify(check)}`,
+    );
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -510,34 +582,30 @@ test('repository seal includes permission bits for reproducibility entries', asy
   }
 });
 
-test('rejects touched symlinks instead of following them', async (t) => {
-  const repo = await fixtureRepo();
-  try {
-    const marker = ['eslint', '-disable'].join('');
-    await writeFile(path.join(repo, 'target.js'), `// ${marker}\n`);
+test(
+  'rejects touched symlinks instead of following them',
+  { skip: !symlinkAvailable && 'symlink creation not permitted on this platform' },
+  async () => {
+    const repo = await fixtureRepo();
     try {
+      const marker = ['eslint', '-disable'].join('');
+      await writeFile(path.join(repo, 'target.js'), `// ${marker}\n`);
       await symlink('target.js', path.join(repo, 'link.js'));
-    } catch (error) {
-      if (error.code === 'EPERM' || error.code === 'ENOSYS') {
-        t.diagnostic(`symlink creation not permitted on this platform (${error.code})`);
-        return;
-      }
-      throw error;
+      const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+      const findings = await scanTouchedSuppressions(repo, state.touchedFiles);
+      const linkFinding = findings.find(({ file }) => file === 'link.js');
+      assert.ok(linkFinding, 'expected a finding for the touched symlink');
+      assert.equal(linkFinding.category, 'scan-error');
+      assert.match(linkFinding.match, /symlink/i);
+      assert.ok(
+        !findings.some((finding) => finding.file === 'link.js' && finding.category !== 'scan-error'),
+        'symlink must not be followed into suppression findings',
+      );
+    } finally {
+      await rm(repo, { recursive: true, force: true });
     }
-    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
-    const findings = await scanTouchedSuppressions(repo, state.touchedFiles);
-    const linkFinding = findings.find(({ file }) => file === 'link.js');
-    assert.ok(linkFinding, 'expected a finding for the touched symlink');
-    assert.equal(linkFinding.category, 'scan-error');
-    assert.match(linkFinding.match, /symlink/i);
-    assert.ok(
-      !findings.some((finding) => finding.file === 'link.js' && finding.category !== 'scan-error'),
-      'symlink must not be followed into suppression findings',
-    );
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test('handles untracked gate files with more than 100k lines without RangeError', async () => {
   const repo = await fixtureRepo();
@@ -572,29 +640,29 @@ test('readProjectMetadata rejects non-regular metadata before reading it', async
   }
 });
 
-test('workingTreeFingerprint records a bounded marker for non-regular reproducibility entries', async (t) => {
-  if (process.platform === 'win32') {
-    t.diagnostic('FIFO creation is not available on Windows');
-    return;
-  }
-  // A generator can leave a FIFO under a configured reproducibility path such
-  // as node_modules/.prisma. Streaming it blocks forever waiting for a writer
-  // before any structured evidence report is written; the fingerprint must
-  // record a bounded non-regular marker instead.
-  const repo = await fixtureRepo();
-  try {
-    await mkdir(path.join(repo, 'out'));
-    execFileSync('mkfifo', [path.join(repo, 'out', 'fifo')]);
-    const hang = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('workingTreeFingerprint hung on a FIFO')), 5000).unref();
-    });
-    const fingerprint = await Promise.race([workingTreeFingerprint(repo, ['out']), hang]);
-    const repeat = await workingTreeFingerprint(repo, ['out']);
-    assert.equal(fingerprint, repeat, 'non-regular entry fingerprint must be stable across re-reads');
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
-});
+test(
+  'workingTreeFingerprint records a bounded marker for non-regular reproducibility entries',
+  { skip: process.platform === 'win32' && 'FIFO creation is not available on Windows' },
+  async () => {
+    // A generator can leave a FIFO under a configured reproducibility path such
+    // as node_modules/.prisma. Streaming it blocks forever waiting for a writer
+    // before any structured evidence report is written; the fingerprint must
+    // record a bounded non-regular marker instead.
+    const repo = await fixtureRepo();
+    try {
+      await mkdir(path.join(repo, 'out'));
+      execFileSync('mkfifo', [path.join(repo, 'out', 'fifo')]);
+      const hang = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('workingTreeFingerprint hung on a FIFO')), 5000).unref();
+      });
+      const fingerprint = await Promise.race([workingTreeFingerprint(repo, ['out']), hang]);
+      const repeat = await workingTreeFingerprint(repo, ['out']);
+      assert.equal(fingerprint, repeat, 'non-regular entry fingerprint must be stable across re-reads');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  },
+);
 
 test('workingTreeFingerprint seals core.excludesFile path and contents', async () => {
   // --exclude-standard honors core.excludesFile; mutating it can hide untracked
@@ -1144,6 +1212,77 @@ test('workingTreeFingerprint seals nested workspace node_modules roots', async (
     await writeFile(path.join(nested, 'extra.js'), 'x\n');
     const afterAdd = await workingTreeFingerprint(repo);
     assert.notEqual(after, afterAdd, 'adding a file under a nested node_modules must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint structurally seals gitignored dist/ content changes (Codex Uonlg)', async () => {
+  // Gitignoring a conventional build output directory pathspec-excludes its
+  // entire contents from the ignored-untracked per-file seal, with no
+  // alternate digest -- a validation command rewriting e.g. dist/result.js
+  // left every fingerprint identical unless the operator manually listed
+  // dist/ in reproducibilityPaths. The structural digest over every
+  // discovered generated-dir root must move the seal on its own, with no
+  // caller-supplied extraPaths.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'dist/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore dist');
+    const dist = path.join(repo, 'dist');
+    await mkdir(dist, { recursive: true });
+    await writeFile(path.join(dist, 'result.js'), 'first');
+
+    // Sanity: dist/ is genuinely pathspec-excluded, so git never surfaces it
+    // as an untracked touched file -- only the structural digest can seal it.
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    assert.ok(
+      !state.touchedFiles.some((file) => file.startsWith('dist/')),
+      `dist/ must be ignored, got: ${JSON.stringify(state.touchedFiles)}`,
+    );
+
+    const baseline = await workingTreeFingerprint(repo);
+    assert.equal(baseline, await workingTreeFingerprint(repo), 'unchanged tree must be stable');
+
+    await writeFile(path.join(dist, 'result.js'), 'second');
+    const afterEdit = await workingTreeFingerprint(repo);
+    assert.notEqual(baseline, afterEdit, 'editing a file under a gitignored dist/ must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint seals a node_modules tree nested under a generated directory (Qodo UplSv)', async () => {
+  // findNodeModulesRoots does not descend into dist/build/coverage/.next/
+  // .cache, so a node_modules tree a build leaves nested underneath one of
+  // them is never discovered there -- and the ignored-untracked listing
+  // independently pathspec-excludes the same generated directories, so no
+  // other channel sees it either. findGeneratedDirRoots' own structural
+  // digest over the whole dist/ subtree must reach it instead.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'dist/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore dist');
+    const nested = path.join(repo, 'dist', 'bundled-tool', 'node_modules', 'dep');
+    await mkdir(nested, { recursive: true });
+    await writeFile(path.join(nested, 'index.js'), 'AAAA');
+
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    assert.ok(
+      !state.touchedFiles.some((file) => file.includes('node_modules/')),
+      `nested node_modules under dist/ must be ignored, got: ${JSON.stringify(state.touchedFiles)}`,
+    );
+
+    const before = await workingTreeFingerprint(repo);
+    await writeFile(path.join(nested, 'index.js'), 'BBBBBB');
+    const after = await workingTreeFingerprint(repo);
+    assert.notEqual(
+      before,
+      after,
+      'a node_modules mutation nested under a gitignored generated directory must change the fingerprint',
+    );
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

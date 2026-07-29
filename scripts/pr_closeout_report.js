@@ -459,6 +459,41 @@ const assertStagedIdentity = async (target, info, lstatFn = lstat) => {
 };
 
 /**
+ * Re-verify a final report path's identity immediately after rename() has
+ * just committed it there. assertStagedIdentity narrows the TOCTOU window by
+ * validating the staged temp file's identity right before its rename, but it
+ * cannot close the window: node:fs's rename() is path-based, not bound to
+ * the descriptor/identity that was just validated, so a concurrent writer
+ * with outputDir access can still replace jsonTmp/markdownTmp in the gap
+ * between that check and the rename call itself. rename() does not follow or
+ * otherwise validate its source, so it would then commit the replacement --
+ * a symlink or a different regular file, never the validated content -- as
+ * report.json/report.md. There is no fd-relative rename primitive available
+ * here to prevent that swap outright, so instead compare the final
+ * destination's post-rename identity back to the same `info` snapshot
+ * assertStagedIdentity most recently validated: a match proves rename()
+ * moved the exact inode that was written and checked; a mismatch proves it
+ * moved something else. Callers must treat a mismatch as a failed commit and
+ * remove `target` rather than return it as trustworthy evidence (Qodo
+ * UplSr).
+ * @param {string} target - the final destination path (report.json/report.md), already renamed into place.
+ * @param {import('node:fs').Stats} info - identity captured when writeNoFollow wrote the staged temp file.
+ * @param {typeof lstat} [lstatFn]
+ * @returns {Promise<void>}
+ */
+const assertCommittedIdentity = async (target, info, lstatFn = lstat) => {
+  let current;
+  try {
+    current = await lstatFn(target);
+  } catch {
+    throw new Error(`Refusing to trust evidence report with an unverifiable post-rename identity: ${target}`);
+  }
+  if (!isSameFileIdentity(info, current)) {
+    throw new Error(`Refusing to trust evidence report through a path swapped during its rename into place: ${target}`);
+  }
+};
+
+/**
  * Persist the evidence report as `report.json` (normalized, machine-
  * readable) and `report.md` (rendered Markdown) under `outputDir`, creating
  * the directory if needed. Both final paths are validated up front, then
@@ -501,6 +536,15 @@ const writeEvidenceReport = async ({ outputDir, report, lstatFn = lstat }) => {
   try {
     const jsonInfo = await writeNoFollow(jsonTmp, `${JSON.stringify(normalized, null, 2)}\n`);
     const markdownInfo = await writeNoFollow(markdownTmp, `${renderMarkdown(normalized)}\n`);
+    // Commit Markdown first, PASS/final JSON last. Re-verify each staged
+    // file's identity immediately before its rename: the predictable staging
+    // name, plus the gap since writeNoFollow closed its descriptor, leaves
+    // room for a concurrent replacement that only a fresh lstat can catch
+    // (Codex UnYbv). This check must run BEFORE any previous report.json is
+    // invalidated below: unlinking it first would destroy a valid prior
+    // report for a failure that never goes on to touch report.md at all
+    // (CodeRabbit UptWV).
+    await assertStagedIdentity(markdownTmp, markdownInfo, lstatFn);
     // Invalidate any previous final report.json BEFORE committing Markdown.
     // If an explicit --output-dir is reused after a PASS run and we crash
     // between MD rename and JSON rename, consumers must not keep reading the
@@ -513,21 +557,33 @@ const writeEvidenceReport = async ({ outputDir, report, lstatFn = lstat }) => {
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
-    // Commit Markdown first, PASS/final JSON last. On a recoverable
-    // second-rename failure, remove the committed Markdown so the pair stays
-    // consistent (JSON already removed above). Re-verify each staged file's
-    // identity immediately before its rename: the predictable staging name,
-    // plus the gap since writeNoFollow closed its descriptor, leaves room for
-    // a concurrent replacement that only a fresh lstat can catch (Codex
-    // UnYbv).
-    await assertStagedIdentity(markdownTmp, markdownInfo, lstatFn);
     await rename(markdownTmp, markdown);
+    try {
+      // rename() is path-based, not bound to the identity just validated: a
+      // concurrent writer could still swap markdownTmp for a replacement
+      // between the check above and this rename call, in which case
+      // rename() commits the replacement -- never the validated content --
+      // as report.md. Re-verifying the destination's identity right after
+      // commit detects that swap after the fact so the tampered file is
+      // removed instead of trusted (Qodo UplSr).
+      await assertCommittedIdentity(markdown, markdownInfo, lstatFn);
+    } catch (error) {
+      await unlink(markdown).catch(() => {});
+      throw error;
+    }
     try {
       await assertStagedIdentity(jsonTmp, jsonInfo, lstatFn);
       await rename(jsonTmp, json);
+      // Same post-rename re-verification as report.md above, for report.json.
+      await assertCommittedIdentity(json, jsonInfo, lstatFn);
     } catch (error) {
       let orphaned = false;
       await unlink(markdown).catch(() => { orphaned = true; });
+      // A post-rename identity mismatch means an untrusted file was just
+      // committed to `json`; remove it too so tampered content is never left
+      // behind. A no-op whenever the rename never happened at all
+      // (assertStagedIdentity or the rename call itself failed first).
+      await unlink(json).catch(() => {});
       if (orphaned) {
         error.message = `${error.message || error} (report.json commit failed and ${markdown} could not be removed; the report pair is inconsistent)`;
       }

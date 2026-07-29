@@ -397,8 +397,17 @@ const readProjectMetadata = async (repo) => {
         if (!Object.hasOwn(makeRecipes, target)) {
           const recipeLines = [];
           const afterColon = lines[i].slice(match[0].length);
-          const semicolon = afterColon.indexOf(';');
-          if (semicolon !== -1) recipeLines.push(afterColon.slice(semicolon + 1));
+          // GNU make strips a comment (an unescaped `#`) from a target/
+          // prerequisites line before it looks for the `;` that introduces an
+          // inline recipe, so a `#` in the tail can hide or fabricate a `;`
+          // that is really commentary, e.g. `target: deps # note; echo hi`.
+          // Search only the text before the first unescaped `#` so a comment
+          // is never mistaken for (or scanned inside) a captured recipe
+          // (CodeRabbit UptWQ).
+          const commentMatch = afterColon.match(/(?<!\\)#/);
+          const beforeComment = commentMatch ? afterColon.slice(0, commentMatch.index) : afterColon;
+          const semicolon = beforeComment.indexOf(';');
+          if (semicolon !== -1) recipeLines.push(beforeComment.slice(semicolon + 1));
           let j = i + 1;
           while (j < lines.length) {
             const line = lines[j];
@@ -809,10 +818,13 @@ const MAX_STRUCTURAL_DIGEST_ENTRIES = 200_000;
 const MAX_NODE_MODULES_DISCOVERY_DEPTH = 40;
 
 /**
- * Compute a bounded STRUCTURAL digest of a vendor tree (node_modules) without
- * reading any file contents. Recursively walks `requested` in deterministic
- * sorted order and folds each entry's repo-relative path plus its kind and
- * cheap metadata into a single SHA-256: a regular file contributes its
+ * Compute a bounded STRUCTURAL digest of a directory tree (a vendor tree such
+ * as node_modules, or a conventional generated/build output directory such as
+ * dist — both findNodeModulesRoots and findGeneratedDirRoots below feed roots
+ * through the same function) without reading any file contents. Recursively
+ * walks `requested` in deterministic sorted order and folds each entry's
+ * repo-relative path plus its kind and cheap metadata into a single SHA-256:
+ * a regular file contributes its
  * size + mtimeMs + ctimeMs + permission bits, a symlink its (un-followed)
  * target text, and a directory or any non-regular entry a fixed marker.
  * ctimeMs (inode change time) is sealed alongside mtime because a same-length
@@ -837,7 +849,7 @@ const MAX_NODE_MODULES_DISCOVERY_DEPTH = 40;
  * that file's real metadata into the digest and the later walk no longer
  * lists it.
  * @param {string} repo - Absolute repository path.
- * @param {string} requested - Repo-relative vendor-tree root (e.g. 'node_modules').
+ * @param {string} requested - Repo-relative tree root (e.g. 'node_modules' or 'dist').
  * @param {number} [maxEntries=MAX_STRUCTURAL_DIGEST_ENTRIES] - Entry cap; exceeding it fails closed (throws). Injectable so the truncation path is testable without a 200k-entry tree.
  * @returns {Promise<string|null>} Composite structural digest, or null if the root is absent.
  * @throws {Error} If the walk exceeds `maxEntries` (the tree cannot be fully sealed).
@@ -864,7 +876,7 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
     // large to seal in full.
     if (count >= maxEntries) {
       throw new Error(
-        `node_modules structural walk exceeded ${maxEntries} entries at '${root.relative}'; cannot fully seal the dependency tree (fail closed).`,
+        `structural walk exceeded ${maxEntries} entries at '${root.relative}'; cannot fully seal this tree (fail closed).`,
       );
     }
     count += 1;
@@ -921,22 +933,29 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
  * listing pathspec-excludes every nested node_modules tree and a repo-root-only
  * structural digest never reaches a package-local dependency, so without
  * discovering nested roots a mutation under a workspace package is invisible to
- * the seal (Codex Ummso). The walk skips `.git` and generated build output
- * (`dist`, `build`, `coverage`, `.next`, `.cache` — the same directories the
- * ignored-untracked pathspec query already excludes, so this walk cannot
- * discover a node_modules root there anyway; descending into them only cost
- * time in a large repo, CodeRabbit UohnW), never follows a symlink (a
- * symlinked directory is not `isDirectory()` in a Dirent, so it is left for the
- * un-followed symlink handling elsewhere), and does NOT descend into a found
- * node_modules (structuralDigest already covers that subtree, including any
- * node_modules nested within it) — bounding cost to the non-vendor source tree.
+ * the seal (Codex Ummso). The walk skips `.git` and conventional generated
+ * build output (`dist`, `build`, `coverage`, `.next`, `.cache`): those
+ * directories are separately discovered and structurally sealed IN FULL by
+ * findGeneratedDirRoots below — which also covers any node_modules a build
+ * leaves nested underneath one of them, since this walk would otherwise never
+ * reach it either (Qodo UplSv) — so skipping them here avoids redundantly
+ * re-walking bytes findGeneratedDirRoots already seals, rather than leaving
+ * them unsealed (CodeRabbit UohnW's original "nothing to gain by descending"
+ * rationale no longer holds now that a sibling mechanism seals this content
+ * instead). The walk never follows a symlink (a symlinked directory is not
+ * `isDirectory()` in a Dirent, so it is left for the un-followed symlink
+ * handling elsewhere), and does NOT descend into a found node_modules
+ * (structuralDigest already covers that subtree, including any node_modules
+ * nested within it) — bounding cost to the non-vendor source tree.
  * @param {string} repo - Absolute repository path.
  * @returns {Promise<string[]>} Sorted repo-relative node_modules root paths (may be empty).
  */
 // Directories that never contain a workspace's own node_modules root worth
-// discovering (either VCS internals or generated build output already
-// excluded from the ignored-untracked seal) — skip descending into them so
-// discovery cost stays proportional to the actual source tree.
+// discovering here (either VCS internals, or conventional generated build
+// output that findGeneratedDirRoots below discovers and structurally seals
+// separately, in full) — skip descending into them so discovery cost stays
+// proportional to the actual source tree and this walk never redundantly
+// re-covers bytes the other one already seals.
 const DISCOVERY_SKIP_DIRS = new Set(['.git', 'dist', 'build', 'coverage', '.next', '.cache']);
 
 const findNodeModulesRoots = async (repo) => {
@@ -959,6 +978,68 @@ const findNodeModulesRoots = async (repo) => {
         roots.push(childRelative);
         // Do not descend: structuralDigest walks the whole subtree, including
         // any node_modules nested inside this one.
+        continue;
+      }
+      await walk(path.join(absoluteDir, dirent.name), childRelative, depth + 1);
+    }
+  };
+  await walk(repo, '', 0);
+  return roots.sort();
+};
+
+// Conventional generated/build output directory basenames. When one of these
+// is gitignored (a near-universal convention), the ignoredBulkExcludes
+// pathspec below pathspec-excludes its ENTIRE contents from the per-file
+// ignored-untracked seal with no alternate digest, so a validation command can
+// rewrite e.g. dist/result.js and leave every fingerprint identical unless the
+// operator manually lists that directory in reproducibilityPaths (Codex
+// Uonlg). Structurally sealing every occurrence of these directories the same
+// bounded way a node_modules root is sealed also covers any executable
+// node_modules tree a build leaves nested underneath one of them (a
+// standalone bundle's own vendored copy, a coverage fixture's own install,
+// ...), which findNodeModulesRoots above never finds since it does not
+// descend into these directories either (Qodo UplSv). One digest over each
+// root's whole subtree closes both gaps without a second, redundant walk into
+// the same bytes.
+const SEALED_GENERATED_DIR_NAMES = new Set(['dist', 'build', 'coverage', '.next', '.cache']);
+
+/**
+ * Discover every occurrence of a conventional generated/build output
+ * directory (SEALED_GENERATED_DIR_NAMES) under the repo, the same way
+ * findNodeModulesRoots discovers node_modules roots, so workingTreeFingerprint
+ * can structurally seal each one in full (Codex Uonlg / Qodo UplSv). Skips
+ * `.git`; never descends into `node_modules` (already fully, separately
+ * sealed by findNodeModulesRoots/structuralDigest — redescending here would
+ * only relabel the same bytes as an extra root for every "dist"/"build"
+ * folder a vendored package happens to ship in its own published output); and
+ * does not descend into an already-discovered generated-dir root
+ * (structuralDigest walks that root's whole subtree, including anything
+ * nested inside it, so recursing further during discovery would only find
+ * redundant nested roots covered twice). Never follows a symlink, for the
+ * same reason findNodeModulesRoots does not.
+ * @param {string} repo - Absolute repository path.
+ * @returns {Promise<string[]>} Sorted repo-relative generated-dir root paths (may be empty).
+ */
+const findGeneratedDirRoots = async (repo) => {
+  const roots = [];
+  const walk = async (absoluteDir, relativeDir, depth) => {
+    if (depth > MAX_NODE_MODULES_DISCOVERY_DEPTH) return;
+    let dirents;
+    try {
+      dirents = await readdir(absoluteDir, { withFileTypes: true });
+    } catch {
+      // An unreadable directory contributes no roots; a genuinely present
+      // generated directory elsewhere is still discovered independently.
+      return;
+    }
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory()) continue;
+      if (dirent.name === '.git' || dirent.name === 'node_modules') continue;
+      const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
+      if (SEALED_GENERATED_DIR_NAMES.has(dirent.name)) {
+        roots.push(childRelative);
+        // Do not descend: structuralDigest walks the whole subtree, including
+        // any node_modules or nested generated directory inside this one.
         continue;
       }
       await walk(path.join(absoluteDir, dirent.name), childRelative, depth + 1);
@@ -1018,7 +1099,12 @@ const hashGitOutput = async (repo, args) => {
  * repo-root and nested workspace roots (path + size + mtime + ctime + mode, not
  * contents, via structuralDigest/findNodeModulesRoots) so a mutated, added, or
  * removed dependency the next validation command would execute cannot escape
- * the seal even though git ignores the vendor tree; and any caller-supplied
+ * the seal even though git ignores the vendor tree; the same STRUCTURAL digest
+ * over every conventional generated/build directory anywhere in the tree (via
+ * structuralDigest/findGeneratedDirRoots) so gitignoring dist/build/coverage/
+ * .next/.cache — which pathspec-excludes their contents from the
+ * ignored-untracked channel below — cannot hide a rewritten build artifact or
+ * a node_modules nested underneath one of them either; and any caller-supplied
  * `extraPaths` (via collectExtraEntries). All entries are handed to
  * fingerprintEntries, which sorts by path before hashing so entry-collection
  * order never affects the result.
@@ -1181,6 +1267,25 @@ const workingTreeFingerprint = async (
     const digest = await structuralDigest(repo, nodeModulesRoot, maxStructuralDigestEntries);
     if (digest !== null) {
       entries.push({ path: `__node_modules_structural__/${nodeModulesRoot}`, hash: digest });
+    }
+  }
+  // Structurally seal every conventional generated/build directory
+  // (SEALED_GENERATED_DIR_NAMES) discovered anywhere in the tree, the same
+  // bounded, content-free digest a node_modules root gets above. Gitignoring
+  // one of these directories (dist/build/coverage/.next/.cache) pathspec-
+  // excludes its entire contents from the ignored-untracked per-file seal
+  // above with no alternate digest, so a validation command rewriting e.g.
+  // dist/result.js would otherwise leave every fingerprint identical (Codex
+  // Uonlg). This also covers any node_modules a build leaves nested
+  // underneath one of these directories, which the node_modules discovery
+  // above never finds since it does not descend into them either (Qodo
+  // UplSv). An absent directory contributes no entry, exactly like an absent
+  // node_modules; its later creation still moves the seal.
+  const generatedDirRoots = await findGeneratedDirRoots(repo);
+  for (const generatedDirRoot of generatedDirRoots) {
+    const digest = await structuralDigest(repo, generatedDirRoot, maxStructuralDigestEntries);
+    if (digest !== null) {
+      entries.push({ path: `__generated_dir_structural__/${generatedDirRoot}`, hash: digest });
     }
   }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);

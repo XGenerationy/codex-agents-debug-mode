@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { constants, existsSync, renameSync, rmSync } = require('node:fs');
+const { constants, existsSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
@@ -231,6 +231,23 @@ const GIT_BASH = process.platform === 'win32'
 
 const bashProbe = spawnSync(GIT_BASH, ['-c', 'true']);
 const bashAvailable = !bashProbe.error && bashProbe.status === 0;
+
+// Probe file-symlink privilege once, eagerly, so the dependent test below
+// can report itself as SKIP (via the `skip` option) rather than reaching an
+// in-body `t.diagnostic()+return` that node:test counts as a zero-assertion
+// PASS -- mirrors the bashProbe pattern above.
+const symlinkProbeRoot = mkdtempSync(path.join(tmpdir(), 'debug-skill-symlink-cap-'));
+let symlinkCreationAvailable = false;
+try {
+  const symlinkProbeTarget = path.join(symlinkProbeRoot, 'target');
+  writeFileSync(symlinkProbeTarget, 'x', 'utf8');
+  symlinkSync(symlinkProbeTarget, path.join(symlinkProbeRoot, 'link'), 'file');
+  symlinkCreationAvailable = true;
+} catch {
+  // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+} finally {
+  rmSync(symlinkProbeRoot, { recursive: true, force: true });
+}
 
 // Git Bash passes MSYS-style paths (/c/...) to the installer, which forwards
 // them to the native node.exe; the emitted JSON then carries the Windows form
@@ -1785,39 +1802,33 @@ const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) =
   t.diagnostic('claim swap never landed ahead of the release; nothing asserted');
 };
 
-test('does not read or unlink a collector_claim swapped for a symlink before release', { timeout: 30000 }, async (t) => {
-  // A local attacker with .debug write access can replace collector_claim
-  // with a symlink between acquire and the shutdown release. The release must
-  // not follow it: no read of the target's bytes (which would pass the
-  // ownership check here) and no unlink driven by them (CodeRabbit
-  // discussion_r3652923124).
-  const probeRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-symlink-probe-'));
-  try {
-    const probeTarget = path.join(probeRoot, 'target');
-    await writeFile(probeTarget, 'x', 'utf8');
-    await symlink(probeTarget, path.join(probeRoot, 'link'), 'file');
-  } catch (error) {
-    // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-    t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
-    return;
-  } finally {
-    await rm(probeRoot, { recursive: true, force: true });
-  }
-
-  await assertReleaseRefusesSwappedClaim(
-    t,
-    async ({ stagedFile, childPid, projectRoot }) => {
-      const content = `1\nnot-the-child\n${childPid}\n`;
-      await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
-      await symlink(path.join(projectRoot, 'swap-target.txt'), stagedFile, 'file');
-      return content;
-    },
-    async (claimFile) => {
-      const info = await lstat(claimFile);
-      assert.equal(info.isSymbolicLink(), true, 'claim symlink must survive the release unread and unlinked');
-    },
-  );
-});
+test(
+  'does not read or unlink a collector_claim swapped for a symlink before release',
+  {
+    skip: !symlinkCreationAvailable && 'file symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)',
+    timeout: 30000,
+  },
+  async (t) => {
+    // A local attacker with .debug write access can replace collector_claim
+    // with a symlink between acquire and the shutdown release. The release must
+    // not follow it: no read of the target's bytes (which would pass the
+    // ownership check here) and no unlink driven by them (CodeRabbit
+    // discussion_r3652923124).
+    await assertReleaseRefusesSwappedClaim(
+      t,
+      async ({ stagedFile, childPid, projectRoot }) => {
+        const content = `1\nnot-the-child\n${childPid}\n`;
+        await writeFile(path.join(projectRoot, 'swap-target.txt'), content, 'utf8');
+        await symlink(path.join(projectRoot, 'swap-target.txt'), stagedFile, 'file');
+        return content;
+      },
+      async (claimFile) => {
+        const info = await lstat(claimFile);
+        assert.equal(info.isSymbolicLink(), true, 'claim symlink must survive the release unread and unlinked');
+      },
+    );
+  },
+);
 
 test('does not read or unlink a collector_claim swapped for a hard link before release', { timeout: 30000 }, async (t) => {
   // Hard-link variant of the symlink swap: claimFile renamed onto an inode

@@ -3163,18 +3163,36 @@ const TOOL_PROBES = [
  * refuse admission (matching the main command executor).
  * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string, terminationStatus?: 'PASS'|'BLOCKED', terminationEvidence?: string}>}
  */
-const probeCommandDefault = async ({
+// Codex Uonld (P1): runPreflight calls this once per TOOL_PROBES entry,
+// sequentially, against the same repo cwd -- but until this fix the function
+// never accepted a knownSiblingMarks registry at all, unlike the validation
+// executor's activeSpawnMarks (createCommandExecutor, below). A probe whose
+// command spawns a slow-to-exit helper (docker/docker-compose/docker-daemon
+// commonly do) could leave a live, mark-carrying descendant that the NEXT
+// probe's own orphan sweep had no way to recognize as "a known sibling",
+// misattributing it as a mark-free foreign descendant and forcing a spurious
+// BLOCKED on an otherwise-clean tool probe. Separately verified empirically
+// (see the two probeCommandDefault sibling-mark tests below) that
+// `node --test --test-concurrency=1` does not wait for a detached
+// grandchild to die before the next test/file proceeds, so this class of
+// leftover is real, not hypothetical, within a single `npm test` invocation.
+// probeCommandDefaultInner does the actual work; the thin wrapper below owns
+// mark generation/registration in a try/finally so a synchronous throw from
+// an injected spawnProcess mock still cannot leak the mark forever (mirrors
+// the CodeRabbit UmlJY fix already applied to spawnCaptured).
+const probeCommandDefaultInner = async ({
   command,
   repo,
   shell,
   env,
-  platform = process.platform,
-  spawnProcess = spawn,
-  terminateTree = terminateProcessTree,
-  timeoutMs = 120_000,
-  terminationGraceMs = 2000,
+  platform,
+  spawnProcess,
+  terminateTree,
+  timeoutMs,
+  terminationGraceMs,
+  spawnMark,
+  knownSiblingMarks,
 }) => {
-  const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
   const spawnEnv = spawnMark ? { ...env, [SPAWN_MARK_ENV]: spawnMark } : env;
   // Windows: wall-clock ms for CommandLine CreationDate filter; POSIX: jiffies.
   let minStarttime = platform === 'win32' ? Date.now() : 0;
@@ -3264,6 +3282,7 @@ const probeCommandDefault = async ({
         spawnMark,
         cwd: repo,
         minStarttime,
+        knownSiblingMarks,
       });
     }
   } else {
@@ -3276,6 +3295,7 @@ const probeCommandDefault = async ({
       spawnMark,
       cwd: repo,
       minStarttime,
+      knownSiblingMarks,
     });
     outcome = await Promise.race([
       closePromise,
@@ -3337,6 +3357,48 @@ const probeCommandDefault = async ({
     ...terminationFields,
     detectedSignals,
   };
+};
+
+/**
+ * Public entry point wrapping {@link probeCommandDefaultInner}. Generates and
+ * registers this probe's spawn mark (Codex Uonld: into `knownSiblingMarks`
+ * when the caller shares one across sequential probes, e.g. runPreflight's
+ * `activeSpawnMarks`) before doing any work, and always unregisters it in
+ * `finally` -- including when `spawnProcess` throws synchronously -- so the
+ * mark never leaks into the shared registry past this probe's own lifetime.
+ * @returns {Promise<{exitCode: number|null, stdout: string, stderr: string, terminationStatus?: 'PASS'|'BLOCKED', terminationEvidence?: string}>}
+ */
+const probeCommandDefault = async ({
+  command,
+  repo,
+  shell,
+  env,
+  platform = process.platform,
+  spawnProcess = spawn,
+  terminateTree = terminateProcessTree,
+  timeoutMs = 120_000,
+  terminationGraceMs = 2000,
+  knownSiblingMarks = EMPTY_MARK_SET,
+}) => {
+  const spawnMark = platform === 'win32' ? '' : randomBytes(16).toString('hex');
+  if (spawnMark) knownSiblingMarks?.add(spawnMark);
+  try {
+    return await probeCommandDefaultInner({
+      command,
+      repo,
+      shell,
+      env,
+      platform,
+      spawnProcess,
+      terminateTree,
+      timeoutMs,
+      terminationGraceMs,
+      spawnMark,
+      knownSiblingMarks,
+    });
+  } finally {
+    if (spawnMark) knownSiblingMarks?.delete(spawnMark);
+  }
 };
 
 /**
@@ -3402,11 +3464,18 @@ const runPreflight = async ({
   // secretNames).
   const sensitiveEnvNames = [...(config.requiredEnv || []), ...(config.safeEnv || [])];
   const commandEnv = buildChildEnvironment(env, sensitiveEnvNames);
+  // Codex Uonld (P1): shared across every sequential TOOL_PROBES call below so
+  // one probe's still-in-flight spawn mark is recognized by the NEXT probe's
+  // own orphan sweep instead of being misattributed as a mark-free foreign
+  // descendant -- mirrors createCommandExecutor's activeSpawnMarks, which
+  // already closed this same gap for validation checks.
+  const activeSpawnMarks = new Set();
   const runProbe = probeCommand || ((command) => probeCommandDefault({
     command,
     repo,
     shell,
     env: commandEnv,
+    knownSiblingMarks: activeSpawnMarks,
   }));
   for (const [name, command] of TOOL_PROBES) {
     const result = await runProbe(command);

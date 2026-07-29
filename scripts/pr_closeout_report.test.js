@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const { linkSync } = require('node:fs');
+const { linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -353,102 +353,121 @@ test('writeEvidenceReport does not clobber hard-linked outside files via staging
   }
 });
 
-test('writeEvidenceReport refuses to write through a pre-existing symlinked report.json', async (t) => {
-  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
-  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
-  const outsideTarget = path.join(outsideDir, 'clobber-me.json');
-  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+// One-time, synchronous capability probe (same shape as the bashAvailable/
+// pwshAvailable probes in debug_server.test.js): can this process actually
+// create a FILE symlink? Windows requires SeCreateSymbolicLinkPrivilege
+// (Developer Mode, or an elevated process), so process.platform alone cannot
+// answer this. The three tests below used to attempt the real symlink and
+// fall back to `t.diagnostic(...); return;` on failure -- but returning early
+// after a diagnostic still reports as a PASS in node:test's own summary, not
+// a SKIP, silently hiding the fact that nothing was actually verified. Probe
+// once at module load and cache the result so these tests can use the
+// declarative `{ skip }` form instead, which reports honestly either way.
+const canCreateFileSymlinks = (() => {
+  let probeDir;
   try {
-    // A prior run, a reused temp directory, or repo-controlled content could
-    // leave report.json as a symlink pointing outside outputDir. writeFile
-    // would silently follow it and overwrite whatever it points to; the
-    // no-follow open must instead fail closed before any bytes are written.
+    probeDir = mkdtempSync(path.join(tmpdir(), 'pr-closeout-report-symlink-probe-'));
+    const target = path.join(probeDir, 'target');
+    writeFileSync(target, '');
+    symlinkSync(target, path.join(probeDir, 'link'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (probeDir) rmSync(probeDir, { recursive: true, force: true });
+  }
+})();
+
+test(
+  'writeEvidenceReport refuses to write through a pre-existing symlinked report.json',
+  { skip: !canCreateFileSymlinks && 'file symlinks unavailable in this environment' },
+  async () => {
+    const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+    const outsideTarget = path.join(outsideDir, 'clobber-me.json');
+    await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
     try {
+      // A prior run, a reused temp directory, or repo-controlled content could
+      // leave report.json as a symlink pointing outside outputDir. writeFile
+      // would silently follow it and overwrite whatever it points to; the
+      // no-follow open must instead fail closed before any bytes are written.
       await symlink(outsideTarget, path.join(outputDir, 'report.json'));
-    } catch (error) {
-      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
-      return;
+
+      await assert.rejects(
+        () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+        /symlink/i,
+      );
+
+      const untouched = await readFile(outsideTarget, 'utf8');
+      assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+      const linkTarget = await readlink(path.join(outputDir, 'report.json'));
+      assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
     }
+  },
+);
 
-    await assert.rejects(
-      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
-      /symlink/i,
-    );
-
-    const untouched = await readFile(outsideTarget, 'utf8');
-    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
-    const linkTarget = await readlink(path.join(outputDir, 'report.json'));
-    assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
-  } finally {
-    await rm(outputDir, { recursive: true, force: true });
-    await rm(outsideDir, { recursive: true, force: true });
-  }
-});
-
-test('writeEvidenceReport refuses to write through a pre-existing symlinked report.md', async (t) => {
-  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
-  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
-  const outsideTarget = path.join(outsideDir, 'clobber-me.md');
-  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
-  try {
+test(
+  'writeEvidenceReport refuses to write through a pre-existing symlinked report.md',
+  { skip: !canCreateFileSymlinks && 'file symlinks unavailable in this environment' },
+  async () => {
+    const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+    const outsideTarget = path.join(outsideDir, 'clobber-me.md');
+    await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
     try {
       await symlink(outsideTarget, path.join(outputDir, 'report.md'));
-    } catch (error) {
-      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
-      return;
+
+      await assert.rejects(
+        () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+        /symlink/i,
+      );
+
+      const untouched = await readFile(outsideTarget, 'utf8');
+      assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
+      const linkTarget = await readlink(path.join(outputDir, 'report.md'));
+      assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
     }
+  },
+);
 
-    await assert.rejects(
-      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
-      /symlink/i,
-    );
-
-    const untouched = await readFile(outsideTarget, 'utf8');
-    assert.equal(untouched, 'do not overwrite this\n', 'the symlink target must not be modified');
-    const linkTarget = await readlink(path.join(outputDir, 'report.md'));
-    assert.equal(linkTarget, outsideTarget, 'the symlink itself must not be replaced');
-  } finally {
-    await rm(outputDir, { recursive: true, force: true });
-    await rm(outsideDir, { recursive: true, force: true });
-  }
-});
-
-test('writeEvidenceReport never writes report.json when report.md is the rejected symlink', async (t) => {
-  // Both targets are validated up front, before either write happens: a
-  // symlink at report.md must not leave a real report.json sitting next to
-  // an untouched, attacker-controlled report.md symlink (an inconsistent
-  // evidence pair for what is meant to be a trustworthy compliance
-  // artifact).
-  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
-  const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
-  const outsideTarget = path.join(outsideDir, 'clobber-me.md');
-  await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
-  try {
+test(
+  'writeEvidenceReport never writes report.json when report.md is the rejected symlink',
+  { skip: !canCreateFileSymlinks && 'file symlinks unavailable in this environment' },
+  async () => {
+    // Both targets are validated up front, before either write happens: a
+    // symlink at report.md must not leave a real report.json sitting next to
+    // an untouched, attacker-controlled report.md symlink (an inconsistent
+    // evidence pair for what is meant to be a trustworthy compliance
+    // artifact).
+    const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
+    const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
+    const outsideTarget = path.join(outsideDir, 'clobber-me.md');
+    await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
     try {
       await symlink(outsideTarget, path.join(outputDir, 'report.md'));
-    } catch (error) {
-      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
-      t.diagnostic(`file symlinks unavailable here: ${error?.code || error}`);
-      return;
+
+      await assert.rejects(
+        () => writeEvidenceReport({ outputDir, report: minimalReport() }),
+        /symlink/i,
+      );
+
+      await assert.rejects(
+        () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+        { code: 'ENOENT' },
+        'report.json must not be written when report.md fails validation',
+      );
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
     }
-
-    await assert.rejects(
-      () => writeEvidenceReport({ outputDir, report: minimalReport() }),
-      /symlink/i,
-    );
-
-    await assert.rejects(
-      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
-      { code: 'ENOENT' },
-      'report.json must not be written when report.md fails validation',
-    );
-  } finally {
-    await rm(outputDir, { recursive: true, force: true });
-    await rm(outsideDir, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test('writeEvidenceReport commits report.json and report.md as a pair (no leftover temps)', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-pair-'));
@@ -590,6 +609,132 @@ test('writeEvidenceReport refuses to rename a staged report.md whose identity ch
       () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
       { code: 'ENOENT' },
       'report.json must never be committed when report.md fails its pre-rename identity check',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport removes a committed report.md whose identity changed during its rename into place', async () => {
+  // Unlike the staged-identity tests above (which perturb the *.tmp staging
+  // name and are caught by assertStagedIdentity before rename() ever runs),
+  // this perturbs only the bare final "report.md" name: the pre-rename
+  // identity check sees the real, matching identity and lets the rename
+  // proceed, so only the new post-rename re-check on the committed
+  // destination catches the swap (Qodo UplSr). Against the pre-fix code,
+  // which never re-verified after rename(), this scenario would be silently
+  // trusted and committed as the final report.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-postswap-md-'));
+  try {
+    const lstatFn = async (target) => {
+      const info = await lstat(target);
+      if (path.basename(target) === 'report.md') {
+        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+      }
+      return info;
+    };
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport(), lstatFn }),
+      /swapped during its rename into place/i,
+    );
+
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.md'), 'utf8'),
+      { code: 'ENOENT' },
+      'a report.md whose post-rename identity does not match must be removed, not trusted',
+    );
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.json must never be committed when report.md fails its post-rename identity check',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport removes a committed report.json whose identity changed during its rename into place, and rolls back report.md', async () => {
+  // Same class of swap as above, but on the second rename: report.md commits
+  // and passes its own post-rename check normally, then report.json's
+  // post-rename check catches the swap. The already-committed report.md must
+  // be rolled back too so the pair is never left inconsistent (Qodo UplSr).
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-postswap-json-'));
+  try {
+    const lstatFn = async (target) => {
+      const info = await lstat(target);
+      if (path.basename(target) === 'report.json') {
+        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+      }
+      return info;
+    };
+
+    await assert.rejects(
+      () => writeEvidenceReport({ outputDir, report: minimalReport(), lstatFn }),
+      /swapped during its rename into place/i,
+    );
+
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      { code: 'ENOENT' },
+      'a report.json whose post-rename identity does not match must be removed, not trusted',
+    );
+    await assert.rejects(
+      () => readFile(path.join(outputDir, 'report.md'), 'utf8'),
+      { code: 'ENOENT' },
+      'report.md must be rolled back when report.json fails its post-rename identity check',
+    );
+    const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
+    assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('writeEvidenceReport leaves a pre-existing valid report pair untouched when the staged Markdown identity check fails', async () => {
+  // CodeRabbit UptWV: the two staged-identity-swap tests above both start
+  // from a fresh outputDir, so neither can catch an ordering defect where a
+  // valid prior report.json is deleted even though the staged report.md
+  // identity check that runs first is what actually fails. Establish a
+  // genuine prior pair with a real (unperturbed) run first, then fail the
+  // second run's pre-rename assertStagedIdentity(markdownTmp) check, and
+  // confirm neither prior file was touched.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-preexisting-'));
+  try {
+    await writeEvidenceReport({ outputDir, report: minimalReport() });
+    const priorJson = await readFile(path.join(outputDir, 'report.json'), 'utf8');
+    const priorMarkdown = await readFile(path.join(outputDir, 'report.md'), 'utf8');
+
+    const lstatFn = async (target) => {
+      const info = await lstat(target);
+      if (path.basename(target).startsWith('.report.md.')) {
+        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+      }
+      return info;
+    };
+
+    await assert.rejects(
+      () => writeEvidenceReport({
+        outputDir,
+        report: { ...minimalReport(), overallStatus: 'FAIL' },
+        lstatFn,
+      }),
+      /staged path swapped before rename/i,
+    );
+
+    assert.equal(
+      await readFile(path.join(outputDir, 'report.json'), 'utf8'),
+      priorJson,
+      'a failed pre-rename identity check on report.md must not destroy the pre-existing valid report.json',
+    );
+    assert.equal(
+      await readFile(path.join(outputDir, 'report.md'), 'utf8'),
+      priorMarkdown,
+      'a failed pre-rename identity check on report.md must not touch the pre-existing valid report.md',
     );
     const leftovers = require('node:fs').readdirSync(outputDir).filter((name) => name.includes('.tmp'));
     assert.deepEqual(leftovers, [], `no temp report files may remain: ${leftovers.join(',')}`);

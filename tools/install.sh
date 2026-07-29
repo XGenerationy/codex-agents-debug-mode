@@ -139,7 +139,31 @@ lock_host="${HOSTNAME:-}"
 if [[ -z "$lock_host" ]]; then
   lock_host="$(hostname)"
 fi
-lock_owner="pid=$$"$'\n'"host=$lock_host"$'\n'"token=$$.$RANDOM.$RANDOM"
+# Best-effort process-start identity, used below to defeat PID-reuse races: a
+# bare `kill -0 "$pid"` success only proves *some* process with that number
+# exists right now, not that it is the same process that created the lock,
+# since the OS recycles PIDs once a process exits and an unrelated
+# long-running process can later inherit a dead installer's PID. `ps -o
+# lstart=` (the exact start wall-clock time) is one of the few process
+# attributes both Linux (procps) and macOS/BSD ps expose under the same
+# flag -- unlike Linux-only /proc/$pid/stat -- so it covers every platform
+# this installer targets with a single implementation. LC_ALL=C keeps the
+# rendered timestamp format stable regardless of the caller's locale,
+# mirroring the LC_ALL=C sort already used below for lock-acquisition order.
+# Prints nothing (callers must treat that as "unverifiable", never as
+# "different") when ps is missing, the pid is already gone, or the running
+# ps does not support the field.
+process_start_identity() {
+  local pid="$1" start
+  command -v ps >/dev/null 2>&1 || return 0
+  start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 0
+  start="${start#"${start%%[![:space:]]*}"}"
+  start="${start%"${start##*[![:space:]]}"}"
+  [[ -n "$start" ]] && printf '%s\n' "$start"
+  return 0
+}
+lock_owner_start="$(process_start_identity "$$")"
+lock_owner="pid=$$"$'\n'"host=$lock_host"$'\n'"token=$$.$RANDOM.$RANDOM"$'\n'"start=$lock_owner_start"
 cleanup_stages() {
   # Best-effort stage removal on EXIT under `set -e`. Capture rm failures
   # into rm_status rather than OR-listing a forced success so this helper
@@ -260,24 +284,58 @@ rollback() {
 # transaction, including rollback, so a later installer cannot be reverted by
 # an earlier transaction that fails on a different destination.
 lock_owner_is_dead() {
-  local lock_path="$1" contents after_pid owner_pid owner_host owner_token ps_status
+  local lock_path="$1" contents rest owner_pid owner_host owner_token owner_start
+  local ps_status current_start
   [[ -f "$lock_path" && ! -L "$lock_path" ]] || return 1
   contents="$(<"$lock_path")"
   [[ "$contents" == pid=* ]] || return 1
-  after_pid="${contents#pid=}"
-  owner_pid="${after_pid%%$'\n'*}"
-  after_pid="${after_pid#*$'\n'}"
-  [[ "$after_pid" == host=* ]] || return 1
-  owner_host="${after_pid#host=}"
+  rest="${contents#pid=}"
+  owner_pid="${rest%%$'\n'*}"
+  rest="${rest#*$'\n'}"
+  [[ "$rest" == host=* ]] || return 1
+  owner_host="${rest#host=}"
   owner_host="${owner_host%%$'\n'*}"
-  owner_token="${after_pid#*$'\n'}"
-  owner_token="${owner_token#token=}"
-  [[ "$contents" == "pid=$owner_pid"$'\n'"host=$owner_host"$'\n'"token=$owner_token" ]] || return 1
+  rest="${rest#*$'\n'}"
+  [[ "$rest" == token=* ]] || return 1
+  rest="${rest#token=}"
+  # `start=<identity>` is a fourth, optional trailing line (see
+  # process_start_identity above) that defeats PID-reuse. A lock written by a
+  # pre-upgrade installer -- or by this installer when `ps` was unavailable at
+  # creation time -- ends right after the token value with no further line;
+  # that legacy shape must keep parsing successfully, with owner_start simply
+  # treated as unverifiable, rather than being rejected outright.
+  if [[ "$rest" == *$'\n'* ]]; then
+    owner_token="${rest%%$'\n'*}"
+    rest="${rest#*$'\n'}"
+    [[ "$rest" == start=* ]] || return 1
+    owner_start="${rest#start=}"
+    [[ "$contents" == "pid=$owner_pid"$'\n'"host=$owner_host"$'\n'"token=$owner_token"$'\n'"start=$owner_start" ]] || return 1
+  else
+    owner_token="$rest"
+    owner_start=""
+    [[ "$contents" == "pid=$owner_pid"$'\n'"host=$owner_host"$'\n'"token=$owner_token" ]] || return 1
+  fi
   [[ "$owner_pid" =~ ^[1-9][0-9]*$ && -n "$owner_host" && -n "$owner_token" ]] || return 1
   # A lock on another host may be on a shared volume; this installer cannot
   # prove that owner dead, so it leaves the lock intact.
   [[ "$owner_host" == "$lock_host" ]] || return 1
   if kill -0 "$owner_pid" 2>/dev/null; then
+    # A live PID alone is not proof of a live OWNER: the OS recycles PIDs, so
+    # a long-dead installer's PID can be reassigned to an unrelated process
+    # that simply happens to still be running under the same number. Only
+    # treat the lock as genuinely live when that process's start identity
+    # still matches what was recorded when the lock was created. An empty
+    # owner_start (legacy lock, or `ps` was unavailable at creation time) or
+    # an unfetchable current_start (`ps` unavailable now, or the pid exited
+    # in the instant between the two checks) can never be verified either
+    # way, so both fail closed to "still alive", exactly like the
+    # pre-existing kill -0-only check did before this identity was added.
+    if [[ -n "$owner_start" ]]; then
+      current_start="$(process_start_identity "$owner_pid")"
+      if [[ -n "$current_start" && "$current_start" != "$owner_start" ]]; then
+        return 0
+      fi
+    fi
     return 1
   fi
   command -v ps >/dev/null 2>&1 || return 1

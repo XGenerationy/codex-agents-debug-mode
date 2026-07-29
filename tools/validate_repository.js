@@ -201,13 +201,23 @@ for (const file of safetyScanFiles) scanFileForPublicSafety(file);
 const javascriptFiles = safetyScanFiles.filter((name) => name.endsWith('.js'));
 for (const file of javascriptFiles) {
   const abs = path.join(root, file);
+  let info;
   try {
-    if (!lstatSync(abs).isFile()) {
-      failures.push(`JavaScript syntax check skipped non-regular file: ${file}`);
-      continue;
-    }
+    info = lstatSync(abs);
   } catch {
     failures.push(`JavaScript syntax check target missing: ${file}`);
+    continue;
+  }
+  if (!info.isFile()) {
+    failures.push(`JavaScript syntax check skipped non-regular file: ${file}`);
+    continue;
+  }
+  // Codex Uonli: enforce the same MAX_PAYLOAD_FILE_BYTES bound the safety scan
+  // uses above before spawning `node --check` — otherwise an oversized or
+  // parser-pathological file still reaches the subprocess and can consume
+  // unbounded parser memory/CPU despite the validator's stated size cap.
+  if (info.size > MAX_PAYLOAD_FILE_BYTES) {
+    failures.push(`JavaScript syntax check skipped oversize file: ${file}`);
     continue;
   }
   const result = spawnSync(process.execPath, ['--check', abs], {
