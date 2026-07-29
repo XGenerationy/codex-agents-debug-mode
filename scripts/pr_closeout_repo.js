@@ -268,6 +268,32 @@ const resolveRepositoryState = async ({ repo, baseRef }) => {
 };
 
 /**
+ * Find the first `#` in a Makefile target/prerequisites tail that GNU make
+ * would treat as a comment start, per make's backslash-escaping rule: a `#`
+ * is literal only when preceded by an ODD number of consecutive backslashes
+ * (each `\\` pair is one escaped literal backslash; a leftover single `\`
+ * escapes the `#`). A single-backslash lookbehind (`/(?<!\\)#/`) gets this
+ * wrong for an even count — e.g. `deps\\# comment` is one escaped backslash
+ * followed by a real comment, but `(?<!\\)` sees the backslash immediately
+ * before `#` and misclassifies it as escaped (Qodo UrI0h).
+ * @param {string} text - Text to scan (the target line's tail after `:`).
+ * @returns {number} Index of the first unescaped `#`, or -1 if none.
+ */
+const findUnescapedHashIndex = (text) => {
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] !== '#') continue;
+    let backslashes = 0;
+    let j = i - 1;
+    while (j >= 0 && text[j] === '\\') {
+      backslashes += 1;
+      j -= 1;
+    }
+    if (backslashes % 2 === 0) return i;
+  }
+  return -1;
+};
+
+/**
  * Read the project metadata buildCheckPlan resolves checks against:
  * `package.json` scripts, and the target names defined in whichever
  * Makefile variant the repo uses. Makefile discovery follows GNU make's own
@@ -403,9 +429,9 @@ const readProjectMetadata = async (repo) => {
           // that is really commentary, e.g. `target: deps # note; echo hi`.
           // Search only the text before the first unescaped `#` so a comment
           // is never mistaken for (or scanned inside) a captured recipe
-          // (CodeRabbit UptWQ).
-          const commentMatch = afterColon.match(/(?<!\\)#/);
-          const beforeComment = commentMatch ? afterColon.slice(0, commentMatch.index) : afterColon;
+          // (CodeRabbit UptWQ; escape parity per Qodo UrI0h).
+          const hashIndex = findUnescapedHashIndex(afterColon);
+          const beforeComment = hashIndex === -1 ? afterColon : afterColon.slice(0, hashIndex);
           const semicolon = beforeComment.indexOf(';');
           if (semicolon !== -1) recipeLines.push(beforeComment.slice(semicolon + 1));
           let j = i + 1;

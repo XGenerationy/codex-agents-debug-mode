@@ -287,6 +287,78 @@ test('readProjectMetadata and buildCheckPlan do not mistake a target-line commen
   }
 });
 
+test('readProjectMetadata treats an even (2x) backslash run before `#` as a real comment, not an escape (Qodo UrI0h)', async () => {
+  // GNU make's escaping rule is parity-based: each `\\` pair is one escaped
+  // literal backslash, so a `#` preceded by an EVEN number of backslashes is
+  // still an unescaped comment start. A single-backslash lookbehind
+  // (`/(?<!\\)#/`) only inspects the one character immediately before `#` and
+  // misclassifies this case as escaped, because that character happens to be
+  // a backslash even though the full run has even parity. That let a `;`
+  // inside real commentary be mistaken for an inline-recipe introducer,
+  // exactly the CodeRabbit UptWQ failure mode above, but reachable through an
+  // even backslash run instead of a bare `#`.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-comment-parity-even-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render: deps \\\\# note; echo x || true\n\t@echo real recipe\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      !metadata.makeRecipes['grafana-render']?.includes('echo x || true'),
+      `comment text after an even backslash run must not be captured as recipe body, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('@echo real recipe'),
+      `the real recipe line must still be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+    const plan = buildCheckPlan({
+      ...metadata,
+      touchedFiles: [],
+      config: { proofs: { 'grafana-render': { type: 'artifact', path: 'render-output.png' } } },
+    });
+    const check = plan.checks.find((c) => c.id === 'grafana-render');
+    assert.notEqual(
+      check.status,
+      'BLOCKED',
+      `a comment merely mentioning a neutralizer must not block closeout, got: ${JSON.stringify(check)}`,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('readProjectMetadata treats an odd (1x) backslash before `#` as an escaped literal, still capturing the real inline recipe (Qodo UrI0h)', async () => {
+  // Companion to the even-parity test above: a single backslash before `#`
+  // escapes it (make treats the `#` as a literal character, not a comment
+  // start), so the line has no real comment at all and the `;` that follows
+  // is a genuine inline-recipe introducer whose body must still be captured.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-comment-parity-odd-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render: deps\\# ; echo x || true\n\t@echo real recipe\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    assert.ok(
+      metadata.makeRecipes['grafana-render']?.includes('echo x || true'),
+      `an odd backslash run escapes the '#', so the following ';' is a real inline recipe introducer that must be captured, got: ${JSON.stringify(metadata.makeRecipes)}`,
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('workingTreeFingerprint hashes untracked symlinks instead of following them', async () => {
   // A validation command can leave an untracked symlink that points at an
   // outside file or device. Following it could hang (e.g. /dev/zero) or read

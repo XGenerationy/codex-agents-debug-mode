@@ -1487,13 +1487,17 @@ test('revalidates the logs directory before the proof-command log write, not jus
     // moved-aside and not yet re-created) or by assertLogParentIdentity's
     // post-open dev/ino comparison ("unverifiable parent directory" /
     // "swapped after validation") -- or, rarely, as a BLOCKED/FAIL result
-    // instead of a thrown rejection. Every one of these is safe; only a
-    // silent PASS built on evidence written through the swapped directory is
-    // not.
+    // instead of a thrown rejection. On Windows the same residual-gap race can
+    // surface as a raw EBADF from realpath() when the directory entry is
+    // replaced with a junction mid-resolution (observed on windows-latest
+    // Node 22 CI): the unguarded realpath() calls in ensureLogsDirSecured()
+    // abort before any proof-log write, so this is equally safe. Every one of
+    // these is safe; only a silent PASS built on evidence written through the
+    // swapped directory is not.
     if (rejection) {
       assert.match(
         rejection.message,
-        /symlinked logs directory|outside the output directory|unverifiable parent directory|swapped after validation|ENOENT/,
+        /symlinked logs directory|outside the output directory|unverifiable parent directory|swapped after validation|ENOENT|EBADF/,
       );
     } else {
       assert.notEqual(result.status, 'PASS', `must not PASS with evidence redirected through a swapped logs directory: ${JSON.stringify(result)}`);
@@ -1924,43 +1928,38 @@ test('probeCommandDefault still BLOCKs on an unregistered mark-free/foreign desc
   // hostile forger or an entirely unrelated process, so it must still force
   // BLOCKED even though probeCommandDefault now accepts a knownSiblingMarks
   // parameter.
+  //
+  // The foreign descendant must be spawned BY the probed command itself, not
+  // by a process that predates the probeCommandDefault call: minStarttime is
+  // captured fresh from THIS call's own spawned child (see listLivePidsWithCwdUnder's
+  // starttime gate), so a descendant that started earlier -- like a
+  // standalone "root" launcher spawned before probeCommandDefault runs -- is
+  // excluded by that gate before the mark check ever runs, regardless of its
+  // mark. Nesting the spawn inside the probed command guarantees the
+  // descendant starts at/after minStarttime, matching how a real foreign
+  // orphan actually arises from a probe's own command.
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-preflight-foreign-'));
   let siblingPid = 0;
-  let rootPid = 0;
   try {
     const launcher = [
       'const {spawn}=require("node:child_process");',
       `const child=spawn(process.execPath,["-e","setInterval(()=>{},10000);"],{stdio:"ignore",cwd:process.argv[1],detached:true,env:{...process.env,${SPAWN_MARK_ENV}:"never-registered-mark"}});`,
       'process.stdout.write(String(child.pid));',
       'child.unref();',
-      'setTimeout(()=>process.exit(0),200);',
     ].join('');
-    const root = spawn(process.execPath, ['-e', launcher, repo], { stdio: ['ignore', 'pipe', 'ignore'] });
-    rootPid = root.pid;
-    root.stdout.on('data', (chunk) => { siblingPid = Number(String(chunk).trim()); });
-    await new Promise((resolve) => root.once('exit', resolve));
-    for (let i = 0; i < 40 && !siblingPid; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    assert.ok(siblingPid > 0, 'sibling pid must be reported');
-    let ppid = rootPid;
-    for (let i = 0; i < 40 && ppid === rootPid; i += 1) {
-      try {
-        const stat = readFileSync(`/proc/${siblingPid}/stat`, 'utf8');
-        ppid = Number(stat.slice(stat.lastIndexOf(')') + 1).trimStart().split(/\s+/)[1]);
-      } catch { break; }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    assert.notEqual(ppid, rootPid, 'sibling must be reparented after its own root exited');
-
     const shell = resolveCommandShell({ env: process.env });
     const result = await probeCommandDefault({
-      command: 'printf %s preflight-should-block',
+      // Single-quoted: execPath/repo are OS-generated paths and launcher
+      // contains no single quotes, so no shell-escaping is needed beyond
+      // wrapping each argument.
+      command: `'${process.execPath}' -e '${launcher}' '${repo}'`,
       repo,
       shell,
       env: process.env,
       knownSiblingMarks: new Set(), // nothing registered -- must not be trusted
     });
+    siblingPid = Number(String(result.stdout || '').trim());
+    assert.ok(siblingPid > 0, `sibling pid must be reported: ${JSON.stringify(result)}`);
     assert.equal(result.terminationStatus, 'BLOCKED', 'an unregistered mark must not be trusted');
     assert.match(result.terminationEvidence || '', /mark-free/i);
   } finally {
