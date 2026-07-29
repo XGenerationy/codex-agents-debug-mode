@@ -2566,6 +2566,7 @@ test('cwd/fd probe excludes a pre-existing ancestor of the runner (Codex host)',
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-host-ancestor-'));
   let hostPid = 0;
   let grandchildPid = 0;
+  let hostProc = null;
   try {
     // "host": own session, cwd inside the repo, no spawn mark -- launches a
     // further descendant (stand-in for this runner) and reports both pids.
@@ -2576,7 +2577,7 @@ test('cwd/fd probe excludes a pre-existing ancestor of the runner (Codex host)',
       'child.stdout.on("data",(chunk)=>{process.stdout.write(process.pid+","+String(chunk).trim());});',
       'setInterval(()=>{},10000);',
     ].join('');
-    const hostProc = spawn(process.execPath, ['-e', host], {
+    hostProc = spawn(process.execPath, ['-e', host], {
       stdio: ['ignore', 'pipe', 'ignore'],
       cwd: repo,
       detached: true,
@@ -2609,8 +2610,15 @@ test('cwd/fd probe excludes a pre-existing ancestor of the runner (Codex host)',
       `ancestor host ${hostPid} of selfPid ${grandchildPid} must be excluded, got: ${JSON.stringify(excluded)}`,
     );
   } finally {
+    // A failed or split stdout handshake leaves hostPid/grandchildPid at 0;
+    // hostProc.pid is known regardless, so fall back to it and destroy the
+    // stream, or both the host and its detached grandchild leak past the
+    // test (Codex UzKEM).
     if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL'); } catch {} }
-    if (hostPid) { try { process.kill(hostPid, 'SIGKILL'); } catch {} }
+    if (hostProc) {
+      try { process.kill(hostPid || hostProc.pid, 'SIGKILL'); } catch {}
+      hostProc.stdout?.destroy();
+    }
     await rm(repo, { recursive: true, force: true });
   }
 });

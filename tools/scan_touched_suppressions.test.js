@@ -387,6 +387,25 @@ test('collectContentRemovals STILL flags a custom-keyed script that swaps out a 
   );
 });
 
+test('collectContentRemovals STILL flags a validation-tool swap when the key itself names a tool (Codex UzKES)', async () => {
+  // VALIDATION_TOOL_HINT must see only the script's VALUE, not the full
+  // `"key": "value"` body. A custom script key that happens to contain a
+  // tool name (`eslint-quality`) would otherwise satisfy the hint on the
+  // ADDED side purely from its key text, even though the added value
+  // (`echo ok`) carries no tool reference at all -- letting a real
+  // stylelint invocation get swapped for a no-op undetected.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.0.0', scripts: { 'eslint-quality': 'stylelint .' } }),
+    pkg({ version: '1.0.0', scripts: { 'eslint-quality': 'echo ok' } }),
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /stylelint \./.test(line)),
+    `expected the replaced eslint-quality script to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
 test('collectContentRemovals does not let an in-hunk "+++ b/package.json" content line spoof currentFile (Codex UxMW8)', async () => {
   // With --unified=0, a source line whose literal content is `++ b/<path>` or
   // `-- a/<path>` becomes textually indistinguishable from a real diff file

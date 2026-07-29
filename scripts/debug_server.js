@@ -85,14 +85,17 @@ const computeRetainedLogBytes = (logDir) => {
 // create) falls open to a private, unpersisted salt rather than crashing
 // startup -- worst case is two invocations disagreeing on project_hash, which
 // only affects the already_running convenience check, never authentication.
-const readOrCreateProjectSalt = (debugDir) => {
+const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
   const saltFile = path.join(debugDir, 'project_salt');
   const readExisting = () => {
-    // Refuse a symlinked salt file, mirroring collector_token's own guard:
-    // an attacker-planted link could otherwise redirect the read.
+    // Refuse a symlinked salt file, mirroring collector_token's own guard: an
+    // attacker-planted link could otherwise redirect the read. Open through
+    // the shared no-follow helper (not a plain openSync after lstatSync) so a
+    // symlink swapped in during the window between the lstat and the open
+    // cannot still be followed (Codex UzKDl).
     const info = lstatSync(saltFile);
     if (!info.isFile()) throw new Error('project_salt_not_regular_file');
-    const fd = openSync(saltFile, 'r');
+    const fd = openNoFollowSync(saltFile, constants.O_RDONLY);
     try {
       const buffer = Buffer.alloc(32);
       const bytesRead = readSync(fd, buffer, 0, 32, 0);
@@ -102,6 +105,19 @@ const readOrCreateProjectSalt = (debugDir) => {
       closeSync(fd);
     }
   };
+  // Refuse to read or create project_salt through a symlinked or
+  // root-escaping .debug: the later per-session handler's .debug guard only
+  // runs on the first /session request, so a .debug symlink already planted
+  // before the collector even starts would otherwise redirect this earlier,
+  // unguarded write/read outside the project root (Codex UzJxy). A missing
+  // .debug is fine -- mkdirSync below creates a fresh, safe directory.
+  try {
+    const dirInfo = lstatSync(debugDir);
+    if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) return randomBytes(32);
+    if (!isInsideRoot(realpathSync(resolvedProjectRoot), realpathSync(debugDir))) return randomBytes(32);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return randomBytes(32);
+  }
   try {
     return readExisting();
   } catch {
@@ -110,7 +126,19 @@ const readOrCreateProjectSalt = (debugDir) => {
   try { mkdirSync(debugDir, { recursive: true }); } catch {}
   const salt = randomBytes(32);
   try {
-    const fd = openSync(saltFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    // A pre-existing file already failed readExisting above (short, corrupt,
+    // or otherwise unreadable -- a symlink there was already rejected by the
+    // .debug guard, since project_salt itself cannot be a symlink while its
+    // parent isn't). No invocation could ever have agreed with unreadable
+    // contents, so truncate-and-replace instead of leaving a file that can
+    // never self-heal and permanently disagrees with every future invocation
+    // (Codex UzKEH). O_EXCL still guards the true first-run create race.
+    let replaceUnreadable = false;
+    try { replaceUnreadable = lstatSync(saltFile).isFile(); } catch { replaceUnreadable = false; }
+    const flags = replaceUnreadable
+      ? constants.O_TRUNC | constants.O_WRONLY
+      : constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY;
+    const fd = openNoFollowSync(saltFile, flags, 0o600);
     try {
       writeSync(fd, salt, 0, 32, 0);
     } finally {
@@ -409,7 +437,7 @@ const openNoFollow = async (target, flags, mode) => {
 // undefined on Windows, collapsing the ladder to plain flags). Callers must
 // still run an lstat-based guard first as the primary check -- the same
 // contract the async wrapper documents (CodeRabbit discussion_r3652923124).
-const openNoFollowSync = (target, flags) => {
+const openNoFollowSync = (target, flags, mode) => {
   // Same fail-closed flags guard the async openNoFollow enforces: a
   // non-integer would silently coerce through `|` in the attempt ladder and
   // defeat the no-follow intent instead of throwing.
@@ -421,7 +449,7 @@ const openNoFollowSync = (target, flags) => {
   let lastError;
   for (let i = 0; i < attempts.length; i += 1) {
     try {
-      return openSync(target, attempts[i]);
+      return openSync(target, attempts[i], mode);
     } catch (error) {
       lastError = error;
       if (i >= attempts.length - 1 || !unsupported(error?.code)) throw error;
@@ -582,7 +610,7 @@ const createDebugServer = ({
   // never leak the raw path, but the EADDRINUSE probe in main() still needs
   // a way for two invocations to agree they mean the SAME project without
   // either being able to recover the other's path from what /health reports.
-  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir)).update(canonicalProjectRoot).digest('hex');
+  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)

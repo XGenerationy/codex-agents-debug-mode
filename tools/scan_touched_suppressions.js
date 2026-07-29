@@ -514,6 +514,27 @@ const JSON_STRING_FIELD = /^"[^"]+"\s*:\s*"(?:[^"\\]|\\.)*"\s*,?\s*$/;
  */
 const isJsonStringField = (body) => JSON_STRING_FIELD.test(body);
 
+// Same shape as JSON_STRING_FIELD, capturing only the value so callers can
+// test a hint against the command itself rather than the whole `"key":
+// "value"` body. Testing the full body let a KEY that happens to contain a
+// tool name (e.g. `"eslint-quality": "echo ok"`) satisfy VALIDATION_TOOL_HINT
+// on its own, even though the command was replaced with a no-op and the
+// value carries no tool reference at all (Codex UzKES).
+const JSON_STRING_FIELD_VALUE = /^"[^"]+"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,?\s*$/;
+
+/**
+ * Extract just the quoted JSON string VALUE from a trimmed package.json diff
+ * line body (`"quality": "eslint ."` -> `eslint .`). Only ever called after
+ * isJsonStringField has already confirmed the same shape, so a null result
+ * here would indicate a caller invariant violation rather than a normal case.
+ * @param {string} body diff line with the leading +/- stripped and trimmed
+ * @returns {string|null}
+ */
+const jsonFieldValue = (body) => {
+  const match = JSON_STRING_FIELD_VALUE.exec(body);
+  return match ? match[1] : null;
+};
+
 /**
  * True when a removed/added pair is a same-key package.json value edit (a
  * dependency version bump, a non-validation script's command, ...) whose key
@@ -549,7 +570,9 @@ const isSafePackageJsonFieldReplacement = (removedLine, addedLine, currentFile) 
   const addedKey = jsonFieldKey(addedBody);
   if (!removedKey || removedKey !== addedKey) return false;
   if (VALIDATION_KEY_HINT.test(removedKey)) return false;
-  if (VALIDATION_TOOL_HINT.test(removedBody) && !VALIDATION_TOOL_HINT.test(addedBody)) return false;
+  const removedValue = jsonFieldValue(removedBody) ?? removedBody;
+  const addedValue = jsonFieldValue(addedBody) ?? addedBody;
+  if (VALIDATION_TOOL_HINT.test(removedValue) && !VALIDATION_TOOL_HINT.test(addedValue)) return false;
   const addedAsRemoval = `-${addedLine.slice(1)}`;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
   if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
