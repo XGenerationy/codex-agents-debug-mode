@@ -418,8 +418,11 @@ const readProjectMetadata = async (repo) => {
       // (GNU make's default recipe-line convention), captured so a resolved
       // make target's body can be checked for failure-neutralizing patterns
       // the same way an auto-discovered package script is (Codex Ummss) — the
-      // first definition's recipe wins for a repeated target name, mirroring
-      // the Set dedup already applied to makeTargets below. Two gaps let a
+      // first definition's recipe wins for a repeated SINGLE-COLON target
+      // (later single-colon definitions are Make-level overrides, not
+      // independently-run recipes), while a DOUBLE-COLON target aggregates
+      // every recipe block because GNU make runs each independently (Codex
+      // Uz6Am) -- see doubleColon below. Two gaps let a
       // neutralizing command hide from that check entirely: (1) GNU make also
       // accepts an inline recipe on the target line itself after a `;`
       // (`target: ; recipe` / `target: prereq ; recipe`), which a scan
@@ -435,11 +438,18 @@ const readProjectMetadata = async (repo) => {
       const lines = makefile.split(/\r?\n/);
       const targets = [];
       for (let i = 0; i < lines.length; i += 1) {
-        const match = lines[i].match(/^([A-Za-z0-9_.-]+)\s*:(?![=])/);
+        const match = lines[i].match(/^([A-Za-z0-9_.-]+)\s*(:+)(?![=])/);
         if (!match) continue;
         const target = match[1];
+        // A double-colon rule (target::) is executed by GNU make as EVERY
+        // defined recipe independently, so each definition's recipe must be
+        // captured and validated -- a failure-neutralizing command placed in a
+        // later smoke:: block would otherwise be dropped while `make smoke`
+        // still runs it (Codex Uz6Am). A single-colon target keeps first-
+        // recipe-wins. match[2] is the matched colon run.
+        const doubleColon = match[2] === '::';
         targets.push(target);
-        if (!Object.hasOwn(makeRecipes, target)) {
+        if (doubleColon || !Object.hasOwn(makeRecipes, target)) {
           const recipeLines = [];
           const afterColon = lines[i].slice(match[0].length);
           // GNU make strips a comment (an unescaped `#`) from a target/
@@ -467,7 +477,12 @@ const readProjectMetadata = async (repo) => {
             }
             break;
           }
-          if (recipeLines.length) makeRecipes[target] = recipeLines.join('\n');
+          if (recipeLines.length) {
+            const block = recipeLines.join('\n');
+            makeRecipes[target] = (doubleColon && Object.hasOwn(makeRecipes, target) && makeRecipes[target])
+              ? `${makeRecipes[target]}\n${block}`
+              : block;
+          }
         }
       }
       makeTargets = [...new Set(targets)];
@@ -947,10 +962,16 @@ const structuralDigest = async (repo, requested, maxEntries = MAX_STRUCTURAL_DIG
       try {
         children = (await readdir(absolute)).sort();
       } catch (error) {
-        // A directory that becomes unreadable mid-walk is fail-closed as a
-        // marker rather than aborting the whole fingerprint step.
-        record(`${relative}\0dir_unreadable:${error.code || error.message}`);
-        return;
+        // A directory that cannot be read cannot be structurally sealed: a
+        // stable marker here would be byte-identical at both fingerprint
+        // checkpoints while a validation command (running as a user who CAN
+        // read it) mutated files underneath, so the repository seal would
+        // report PASS despite changed executable/generated content. Fail
+        // closed by aborting the structural walk so the fingerprint step
+        // surfaces an incomplete seal instead of a reusable-but-incomplete
+        // digest (Codex UzZZq) -- the same fail-closed treatment already
+        // applied when the walk exceeds its entry cap above.
+        throw error;
       }
       for (const child of children) {
         const childAbsolute = path.join(absolute, child);

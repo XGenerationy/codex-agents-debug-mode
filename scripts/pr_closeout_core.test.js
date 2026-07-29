@@ -551,6 +551,12 @@ test('flags focus/skip after parameterized-test factories (.each(...).only)', ()
     'describe.each(table).skip("skipped parameterized");',
     'it.each([1, 2, 3]).only("row focus");',
     'test.concurrent.each(rows).only("concurrent focus");',
+    // A computed table with a NESTED call (cases.map(makeCase)) puts parens
+    // inside the .each(...) argument; [^()]* used to stop at that inner call
+    // and miss the trailing .only, silently excluding the rest of the suite
+    // (Codex Uz6Ak).
+    'test.each(cases.map(makeCase)).only("nested-call focus");',
+    'describe.each(table.filter(Boolean)).skip("nested-call skip");',
   ];
   for (const line of cases) {
     const matches = scanSuppressionText('src/foo.test.js', line)
@@ -1531,6 +1537,13 @@ test('rejects conditional bodies that swallow a failing condition (Codex UrfC9)'
   assert.ok(findCommandFailureNeutralizer('if npm test >/dev/null 2>&1; then :; fi'));
   assert.ok(findCommandFailureNeutralizer('while pnpm test; do true; done'));
   assert.ok(findCommandFailureNeutralizer('until make check; do :; done'));
+  // A success-yielding body (echo / printf / exit 0), not just ':' or 'true',
+  // also masks a failing condition command tested by if/while/until: the
+  // body's own always-0 exit status becomes the compound statement's exit
+  // status (Codex Uz6AY).
+  assert.ok(findCommandFailureNeutralizer('if npm test >/dev/null 2>&1; then echo ok; fi'));
+  assert.ok(findCommandFailureNeutralizer('if pnpm test; then printf done; fi'));
+  assert.ok(findCommandFailureNeutralizer('while make check; do echo running; done'));
   // A guard whose taken branch runs the real check (or whose else branch
   // re-raises the failure) still propagates and must stay clean.
   assert.equal(findCommandFailureNeutralizer('if [ -f package.json ]; then npm test; fi'), null);
@@ -1544,6 +1557,23 @@ test('rejects conditional bodies that swallow a failing condition (Codex UrfC9)'
   const swallowed = swallowedPlan.checks.find(({ id }) => id === 'typecheck');
   assert.equal(swallowed.status, 'BLOCKED', JSON.stringify(swallowed));
   assert.match(swallowed.evidence, /neutralizes failures/i);
+});
+
+test('flags a no-op evaluation script that provides no test-execution evidence (Codex Uz6A0)', () => {
+  // A command whose entire body is an empty/whitespace-only `node -e ""` /
+  // `node --eval ''` exits 0 with no output: it provides no authoritative
+  // test-execution evidence -- the same do-nothing effect passWithNoTests has
+  // -- so a test row can become clean without running anything. The WHOLE
+  // command must be that no-op (an optional ENV=val prefix is allowed); a real
+  // evaluation body, or a composed command whose failure still short-circuits
+  // and propagates, stays clean.
+  assert.ok(findCommandFailureNeutralizer('node -e ""'));
+  assert.ok(findCommandFailureNeutralizer("node -e ''"));
+  assert.ok(findCommandFailureNeutralizer('node --eval "  "'));
+  assert.ok(findCommandFailureNeutralizer('FOO=bar node -e ""'));
+  assert.equal(findCommandFailureNeutralizer('node -e "console.log(1)"'), null);
+  assert.equal(findCommandFailureNeutralizer('node --eval "process.exit(0)"'), null);
+  assert.equal(findCommandFailureNeutralizer('npm test && node -e ""'), null);
 });
 
 test('flags pytest, Go, and Rust native skip forms in touched test files', () => {
@@ -1710,6 +1740,37 @@ test('flags option-object, this.skip(), and .skipIf() executable test-skip forms
       .filter(({ category }) => category === 'test-weakening'),
     [],
   );
+  // A runtime-truthy BARE reference (Codex Uz6Ag): node:test skips whenever
+  // the skip value is truthy, so a bare always-truthy value with no falsy
+  // escape -- `skip: process.env.CI`, `skip: flags.quiet`, `skip: SHOULD_SKIP`
+  // -- skips the test in CI while the scan reports clean.
+  for (const line of [
+    "test('x', { skip: process.env.CI }, () => {});",
+    'test("y", { skip: flags.quiet }, fn);',
+    "test('z', { skip: SHOULD_SKIP }, fn);",
+  ]) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.equal(matches.length, 1, `${line} must be flagged as a runtime-truthy skip, got: ${JSON.stringify(matches)}`);
+  }
+  // A provably-falsy value (false / null / undefined) does NOT skip under
+  // node:test and must not be flagged; nor must a value that carries a falsy
+  // escape via a ternary / short-circuit / comparison -- this repo's own test
+  // suite gates POSIX/Windows-only tests with exactly those forms, and a
+  // static scanner cannot evaluate them, so they are legitimate platform
+  // gates rather than unconditional weakening.
+  for (const line of [
+    "test('a', { skip: false }, () => {});",
+    'test("b", { skip: null }, fn);',
+    "test('c', { skip: undefined }, fn);",
+    "test('p', { skip: process.platform === 'win32' ? 'posix-only' : false }, fn);",
+    "test('q', { skip: !available && 'feature unavailable' }, fn);",
+    "test('r', { skip: cond ? 'reason' : false }, fn);",
+  ]) {
+    const matches = scanSuppressionText('src/foo.test.js', line)
+      .filter(({ category }) => category === 'test-weakening');
+    assert.deepEqual(matches, [], `${line} must not be flagged (falsy or legitimate platform gate)`,);
+  }
   // An empty-string skip reason is falsy under node:test, so the test still
   // runs — `skip: ''` and `skip: ""` must NOT be flagged (Codex UiTMl false
   // positive), while `skip: true` and a non-empty reason (asserted above) do.

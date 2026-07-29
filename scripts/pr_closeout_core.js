@@ -173,7 +173,7 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   // below: an inert `if`/`while`/`until` guard ahead of a separately
   // propagating real check would also match, which is intentional — closeout
   // BLOCKs rather than risks admitting a genuine failure-hiding conditional.
-  /\b(?:if|elif|while|until)\b[\s\S]{0,4000}?\b(?:then|do)\b\s*;?\s*(?::|true\b)\s*;?\s*(?:fi\b|done\b)/,
+  /\b(?:if|elif|while|until)\b[\s\S]{0,4000}?\b(?:then|do)\b\s*;?\s*(?::|true\b|echo\b[^\n;]*|printf\b[^\n;]*|exit\s+0\b)\s*;?\s*(?:fi\b|done\b)/,
   // Catch-all OR-list rule (Codex discussion_r3652957333): flag every `||`
   // whose right operand does not provably re-fail — see the JSDoc above for
   // the rationale. The negative lookahead admits only `false`,
@@ -185,6 +185,15 @@ const COMMAND_FAILURE_NEUTRALIZERS = [
   /\bpassWithNoTests\b/i,
   /\ballowNoTests\b/i,
   /\b--passWithNoTests\b/i,
+  // No-op evaluation script (Codex Uz6A0): a command whose whole body is an
+  // empty/whitespace-only node -e "" / node --eval '' exits 0 with no output,
+  // providing no authoritative test-execution evidence -- the same do-nothing
+  // effect passWithNoTests has, so a test row can become clean without running
+  // anything. Matched only when the WHOLE command is that no-op (optionally
+  // prefixed by ENV=val assignments), so 'npm test && node -e ""' -- whose
+  // failure still short-circuits and propagates -- is not a false positive,
+  // and a non-empty body (node -e "console.log(1)") stays clean.
+  /^\s*(?:[A-Za-z_]\w*=\S+\s+)*node\s+(?:-e|--eval)\s+(['"])\s*\1\s*$/,
 ];
 
 /**
@@ -1146,12 +1155,24 @@ const scanSuppressionText = (file, text) => {
   //   - Vitest's describe.skipIf(cond)(...) / it.skipIf(cond)(...) conditional
   //     skip call-chain, distinct from the unconditional `.skip` already
   //     covered above.
-  // A `skip:` option only skips under node:test when its value is truthy: the
-  // boolean `true` or a NON-EMPTY string reason. An empty-string reason
-  // (`skip: ''` / `skip: ""`) is falsy and the test still runs, so the string
-  // alternative requires at least one character (`[^'"]+`, not `[^'"]*`) — an
-  // empty reason must not be flagged as a skip (Codex UiTMl false positive).
-  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?:true|['"][^'"]+['"])/;
+  // A `skip:` option skips under node:test whenever its value is TRUTHY, not
+  // only for literal `true` or a non-empty string reason: a runtime-truthy
+  // bare reference such as `skip: process.env.CI` or `skip: flags.quiet` skips
+  // the test in CI while this scan reports clean (Codex Uz6Ag). Flag a skip
+  // value that is not PROVABLY falsy AND has no conditional/comparison
+  // operator: a negative lookahead admits the falsy literals (`false`,
+  // `null`, `undefined`) and the empty-string reasons (`''` / `""`), which
+  // node:test treats as falsy and does not skip on; a second negative
+  // lookahead admits a value that contains a ternary (`?`), short-circuit
+  // (`&&` / `||`), or comparison (`===` / `!==` / `==` / `!=`) operator,
+  // because this repo's own test suite gates POSIX/Windows-only tests with
+  // exactly those forms (e.g. `skip: process.platform === 'win32' ? 'reason'
+  // : false`, `skip: !available && 'reason'`) -- a static scanner cannot
+  // evaluate them, but they carry a falsy escape and are legitimate platform
+  // gates, not unconditional weakening. Only a bare always-truthy value (true,
+  // a non-empty string, or a bare env/flag reference with no falsy escape) is
+  // flagged, preserving the empty-reason and false exemptions (Codex UiTMl).
+  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?!false\b|undefined\b|null\b|''|"")(?![^,}\n]*(?:\?|&&|\|\||===|!==|==|!=))\S/;
   const mochaRuntimeSkip = /\bthis\s*\.\s*skip\s*\(\s*\)/;
   // Accept exactly ONE separator before skipIf — a bare `.` OR the optional-
   // chaining `?.` — via `\??\.`. The prior `(?:\?\.)?\s*\.` consumed an
@@ -1161,7 +1182,7 @@ const scanSuppressionText = (file, text) => {
   const vitestSkipIf = /\b(?:describe|it|test|context|suite)\s*\??\.\s*skipIf\s*\(/;
   const testWeakening = new RegExp(
     [
-      /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b/.source,
+      /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b/.source,
       /\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\[\s*['"`](?:skip|only|todo)['"`]\s*\]/.source,
       /(?<![\w$.])(?:fit|fdescribe|xit|xdescribe)\s*\(/.source,
       optionObjectSkip.source,

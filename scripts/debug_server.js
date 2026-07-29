@@ -96,10 +96,18 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     // (nlink > 1) shares its inode with another, unrelated file; refuse to
     // trust its content here too, for the same reason the create/repair path
     // below refuses to ever write through it (Codex Uzynn).
-    const info = lstatSync(saltFile);
-    if (!info.isFile() || info.nlink > 1) throw new Error('project_salt_not_regular_file');
     const fd = openNoFollowSync(saltFile, constants.O_RDONLY);
     try {
+      // Validate the OPENED descriptor (fstatSync), not the pre-open path: an
+      // lstat(path) identity check can be defeated by swapping the path for a
+      // different (e.g. hard-linked) regular file in the window between the
+      // lstat and the open -- the TOCTOU the collector_token and session-log
+      // paths in this file were hardened to close by checking the descriptor
+      // itself (CodeRabbit U03Xw). fstatSync is already imported alongside
+      // lstatSync. Throws project_salt_not_regular_file on a non-regular or
+      // hard-linked (nlink > 1) descriptor; the finally still closes it.
+      const info = fstatSync(fd);
+      if (!info.isFile() || info.nlink > 1) throw new Error('project_salt_not_regular_file');
       const buffer = Buffer.alloc(32);
       const bytesRead = readSync(fd, buffer, 0, 32, 0);
       if (bytesRead !== 32) throw new Error('project_salt_short_read');
@@ -160,7 +168,16 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     const tempFile = path.join(debugDir, `.project_salt.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
     const fd = openNoFollowSync(tempFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     try {
-      writeSync(fd, salt, 0, 32, 0);
+      try {
+        writeSync(fd, salt, 0, 32, 0);
+      } catch (error) {
+        // A write failure (ENOSPC, quota, I/O error) must not leak the
+        // just-created private temp file in .debug on every failed write --
+        // the rename-failure branch below already unlinks on error; this
+        // write-failure branch needs the same cleanup (CodeRabbit U03YF).
+        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        throw error;
+      }
     } finally {
       closeSync(fd);
     }

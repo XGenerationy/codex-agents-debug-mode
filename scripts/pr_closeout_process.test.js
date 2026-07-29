@@ -2442,6 +2442,11 @@ test('cwd/fd probe treats a truncated descriptor scan as unresolved, not a clean
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-cap-'));
   let capPid = 0;
   let belowCapPid = 0;
+  // Hoisted out of the try so the finally can fall back to child.pid when the
+  // stdout pid handshake never completes (CodeRabbit U03YL), mirroring the
+  // hostProc cleanup below.
+  let capChild = null;
+  let belowCapChild = null;
   try {
     const spawnJunkHolder = (count) => {
       const script = [
@@ -2459,9 +2464,9 @@ test('cwd/fd probe treats a truncated descriptor scan as unresolved, not a clean
       return child;
     };
 
-    const capChild = spawnJunkHolder(300);
+    capChild = spawnJunkHolder(300);
     capChild.stdout.on('data', (chunk) => { capPid = Number(String(chunk).trim()); });
-    const belowCapChild = spawnJunkHolder(5);
+    belowCapChild = spawnJunkHolder(5);
     belowCapChild.stdout.on('data', (chunk) => { belowCapPid = Number(String(chunk).trim()); });
     for (let i = 0; i < 40 && (!capPid || !belowCapPid); i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2480,8 +2485,18 @@ test('cwd/fd probe treats a truncated descriptor scan as unresolved, not a clean
       `holder ${belowCapPid} with a complete scan and no repo fd must not be flagged, got: ${JSON.stringify(found)}`,
     );
   } finally {
-    if (capPid) { try { process.kill(capPid, 'SIGKILL'); } catch {} }
-    if (belowCapPid) { try { process.kill(belowCapPid, 'SIGKILL'); } catch {} }
+    // A split/failed stdout handshake leaves capPid/belowCapPid at 0; the
+    // child handle's pid is known regardless, so fall back to it and destroy
+    // the stream, or both detached holders leak past the test (CodeRabbit
+    // U03YL) -- the same cleanup the hostProc test applies below.
+    if (capChild) {
+      try { process.kill(capPid || capChild.pid, 'SIGKILL'); } catch {}
+      capChild.stdout?.destroy();
+    }
+    if (belowCapChild) {
+      try { process.kill(belowCapPid || belowCapChild.pid, 'SIGKILL'); } catch {}
+      belowCapChild.stdout?.destroy();
+    }
     await rm(repo, { recursive: true, force: true });
   }
 });

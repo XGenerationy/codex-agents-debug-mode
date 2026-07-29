@@ -243,6 +243,36 @@ test('readProjectMetadata captures an inline make recipe after prerequisites, us
   }
 });
 
+test('readProjectMetadata aggregates every double-colon recipe for a target (Codex Uz6Am)', async () => {
+  // GNU make executes EVERY defined `target::` (double-colon) recipe
+  // independently, so a later `grafana-render::` block hiding a failure-
+  // neutralizing command must be captured and validated too -- previously only
+  // the first definition's recipe was kept, letting `make grafana-render` run
+  // an uninspected `|| true` recipe while the scan reported the target clean.
+  const repo = await mkdtemp(path.join(tmpdir(), 'closeout-make-double-colon-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Closeout Test');
+    git(repo, 'config', 'user.email', 'closeout@example.invalid');
+    await writeFile(
+      path.join(repo, 'Makefile'),
+      'grafana-render::\n\t@echo first recipe\ngrafana-render::\n\tnode render.js >/dev/null 2>&1 || true\n',
+    );
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'baseline');
+    const metadata = await readProjectMetadata(repo);
+    const recipe = metadata.makeRecipes['grafana-render'];
+    assert.ok(recipe?.includes('@echo first recipe'), `first recipe must be captured, got: ${JSON.stringify(recipe)}`);
+    assert.ok(recipe?.includes('|| true'), `second (neutralizing) double-colon recipe must also be captured, got: ${JSON.stringify(recipe)}`);
+    const check = buildCheckPlan({ ...metadata, touchedFiles: [] })
+      .checks.find((c) => c.id === 'grafana-render');
+    assert.equal(check.status, 'BLOCKED', JSON.stringify(check));
+    assert.match(check.evidence, /neutralizes failures/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test('readProjectMetadata and buildCheckPlan do not mistake a target-line comment for a real recipe (CodeRabbit UptWQ)', async () => {
   // GNU make strips a comment (an unescaped `#`) from a target/prerequisites
   // line before it looks for the `;` that introduces an inline recipe. A scan
@@ -1248,6 +1278,37 @@ test('workingTreeFingerprint fails closed when a node_modules tree exceeds the s
       'exceeding the structural cap must throw (fail closed), not seal a truncated prefix',
     );
   } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint fails closed when a node_modules directory is unreadable (Codex UzZZq)', {
+  skip: process.platform === 'win32' ? 'POSIX-only (chmod permission test)' : false,
+}, async () => {
+  // An unreadable ignored directory cannot be structurally sealed: a stable
+  // dir_unreadable marker would be byte-identical at both checkpoints while a
+  // validation command (running as a user who can read it) mutated files
+  // underneath, so the seal would report PASS despite changed content. The
+  // walk must abort (throw) so the fingerprint surfaces an incomplete seal,
+  // the same fail-closed treatment applied when the walk exceeds its cap.
+  const { chmod } = require('node:fs/promises');
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    const pkg = path.join(repo, 'node_modules', 'dep');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(path.join(pkg, 'index.js'), 'module.exports = 1;\n');
+    await chmod(pkg, 0o000); // unreadable directory
+    await assert.rejects(
+      workingTreeFingerprint(repo),
+      /EACCES|permission|denied/i,
+      'an unreadable node_modules directory must fail closed (throw), not seal a stable marker',
+    );
+  } finally {
+    // Restore readability so rm can clean up the unreadable subtree.
+    try { await chmod(path.join(repo, 'node_modules', 'dep'), 0o755); } catch {}
     await rm(repo, { recursive: true, force: true });
   }
 });
