@@ -430,16 +430,129 @@ const isSafeMetadataReplacement = (removedLine, addedLine) => {
   return true;
 };
 
+// Keys that name or imply a validation/security surface. A same-key value
+// replacement is only ever admitted below when the key clears this check, so
+// a script or dependency whose name itself suggests it validates something
+// stays fail-closed even when its new value doesn't (yet) match
+// VALIDATION_REMOVAL_PATTERNS. Word-boundary matching so e.g. `eslint` (a
+// devDependency name) does not collide with the `lint` keyword.
+const VALIDATION_KEY_HINT = /\b(?:test|lint|audit|validate|typecheck|coverage|verify|check|scan|smoke|health[-_]?check|doctor|build|security|codeql|ci)\b/i;
+
+/**
+ * Extract the quoted JSON key from a trimmed package.json diff line body
+ * (`"lodash": "^4.17.20",` -> `lodash`), or null when the line is not a
+ * single quoted `"key": value` field. Quotes are required (unlike
+ * `metadataKey` above, which also accepts YAML's unquoted `key:` form)
+ * because this is only ever invoked on package.json content, which is pure
+ * JSON.
+ * @param {string} body diff line with the leading +/- stripped and trimmed
+ * @returns {string|null}
+ */
+const jsonFieldKey = (body) => {
+  const match = /^"([^"]+)"\s*:/.exec(body);
+  return match ? match[1].toLowerCase() : null;
+};
+
+/**
+ * True when a removed/added pair is a same-key package.json value edit (a
+ * dependency version bump, a non-validation script's command, ...) whose key
+ * does not itself name a validation surface. Deliberately scoped to
+ * `package.json` only: there the key IS the change's identity (`npm run
+ * <key>` is what actually executes a script; a dependency's name is unique
+ * per key), so a harmless-sounding key genuinely means a harmless change.
+ * That does NOT generalize to e.g. a workflow step, where `run:`/`uses:` are
+ * fixed keys shared by every step regardless of what it does -- see
+ * isSafeWorkflowStepNameReplacement / isSafeActionPinReplacement below for
+ * the (differently-shaped) safe cases there. Fails closed: requires the same
+ * key on both sides, that key to clear VALIDATION_KEY_HINT, and reuses
+ * VALIDATION_REMOVAL_PATTERNS so a value that smuggles a validation command
+ * under a harmless-looking key still fails (Codex UkAe8, UguCZ).
+ * @param {string} removedLine unified-diff line starting with `-`
+ * @param {string} addedLine unified-diff line starting with `+`
+ * @param {string} currentFile repo-relative path the pair belongs to
+ * @returns {boolean}
+ */
+const isSafePackageJsonFieldReplacement = (removedLine, addedLine, currentFile) => {
+  if (path.posix.basename(currentFile).toLowerCase() !== 'package.json') return false;
+  const removedKey = jsonFieldKey(removedLine.slice(1).trim());
+  const addedKey = jsonFieldKey(addedLine.slice(1).trim());
+  if (!removedKey || removedKey !== addedKey) return false;
+  if (VALIDATION_KEY_HINT.test(removedKey)) return false;
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  return true;
+};
+
+/**
+ * True when a removed/added pair are both a workflow/action step's `name:`
+ * label (`- name: Build` -> `- name: Compile`). A step name is a pure display
+ * label with no execution semantics, so renaming it changes nothing about
+ * what runs -- unlike `run:`/`uses:`, which this function never matches and
+ * which stay subject to the default fail-closed behavior. Scoped to
+ * `.github/workflows/` and `.github/actions/` so this cannot match an
+ * unrelated `name:`-shaped line in some other gate file (e.g. a Makefile
+ * variable). Still reuses VALIDATION_REMOVAL_PATTERNS so a step already named
+ * for a validation purpose (matched upstream by detectValidationRemovals)
+ * cannot reach here via a different code path.
+ * @param {string} removedLine unified-diff line starting with `-`
+ * @param {string} addedLine unified-diff line starting with `+`
+ * @param {string} currentFile repo-relative path the pair belongs to
+ * @returns {boolean}
+ */
+const isSafeWorkflowStepNameReplacement = (removedLine, addedLine, currentFile) => {
+  if (!currentFile.startsWith('.github/workflows/') && !currentFile.startsWith('.github/actions/')) return false;
+  const namePattern = /^[+-]\s*(?:-\s*)?name:\s*.+$/;
+  if (!namePattern.test(removedLine) || !namePattern.test(addedLine)) return false;
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  return true;
+};
+
+/**
+ * True when a removed/added `uses:` pair pins the SAME action (identical
+ * owner/repo[/path] before the `@`) to a different ref/SHA -- a routine pin
+ * bump, not a substitution to a different action. The action path, not the
+ * fixed `uses` key, is this line's real identity, so this cannot reuse
+ * isSafePackageJsonFieldReplacement's same-key check: every `uses:` line
+ * shares that key regardless of which action it names, so a same-key check
+ * alone would admit a swap to an unrelated (possibly malicious) action.
+ * Scoped to workflow/action files; still fails closed via
+ * VALIDATION_REMOVAL_PATTERNS, so a named security action (codeql-action,
+ * trivy-action, ...) is never admitted here either -- it is already caught
+ * upstream by detectValidationRemovals before reaching this scan (Codex
+ * UkAe8).
+ * @param {string} removedLine unified-diff line starting with `-`
+ * @param {string} addedLine unified-diff line starting with `+`
+ * @param {string} currentFile repo-relative path the pair belongs to
+ * @returns {boolean}
+ */
+const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
+  if (!currentFile.startsWith('.github/workflows/') && !currentFile.startsWith('.github/actions/')) return false;
+  const usesPattern = /^[+-]\s*(?:-\s*)?uses:\s*([^@\s'"]+)@\S+\s*$/;
+  const removedMatch = usesPattern.exec(removedLine);
+  const addedMatch = usesPattern.exec(addedLine);
+  if (!removedMatch || !addedMatch || removedMatch[1] !== addedMatch[1]) return false;
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  return true;
+};
+
 /**
  * Collect substantive removed gate lines from a `--unified=0` diff, pairing
  * each removed (`-`) line with the added (`+`) line at the same position within
  * its hunk. A pure DELETION (no positional replacement) is always collected;
- * a same-field descriptive value replacement (isSafeMetadataReplacement) is
- * skipped as a benign modification. With `--unified=0` each contiguous change
- * is its own hunk whose removed lines all precede its added lines, so index
- * pairing aligns old<->new; hunk/file boundaries flush the pairing buffers so a
- * removed line never pairs across a hunk. Blank/comment-only removals are
- * ignored exactly as before.
+ * a recognized safe replacement (a same-field descriptive value edit, a
+ * package.json dependency/script edit, a workflow step rename, or an action
+ * pin bump -- see the isSafe* helpers above) is skipped as a benign
+ * modification. With `--unified=0` each contiguous change is its own hunk
+ * whose removed lines all precede its added lines, so index pairing aligns
+ * old<->new; hunk/file boundaries flush the pairing buffers so a removed line
+ * never pairs across a hunk, and the current file (tracked from each `+++`
+ * header) never leaks a package.json/workflow exemption into a different
+ * file's lines. Blank/comment-only removals are ignored exactly as before.
  * @param {string} diff unified diff text (produced with unified=0)
  * @returns {string[]} truncated removed lines that are not safe replacements
  */
@@ -447,6 +560,7 @@ const collectContentRemovals = (diff) => {
   const findings = [];
   let removed = [];
   let added = [];
+  let currentFile = '';
   const flushHunk = () => {
     for (let i = 0; i < removed.length; i += 1) {
       const line = removed[i];
@@ -454,17 +568,28 @@ const collectContentRemovals = (diff) => {
       // Keep `--coverage` / `--strict` removals: only skip blanks and comments.
       if (!body || body.startsWith('#')) continue;
       const replacement = added[i];
-      // A same-position replacement that is a benign metadata value edit is not
-      // a content removal; a pure deletion (undefined) always fails closed.
-      if (replacement !== undefined && isSafeMetadataReplacement(line, replacement)) continue;
+      // A same-position replacement recognized as benign is not a content
+      // removal; a pure deletion (undefined) always fails closed.
+      if (replacement !== undefined && (
+        isSafeMetadataReplacement(line, replacement)
+        || isSafePackageJsonFieldReplacement(line, replacement, currentFile)
+        || isSafeWorkflowStepNameReplacement(line, replacement, currentFile)
+        || isSafeActionPinReplacement(line, replacement, currentFile)
+      )) continue;
       findings.push(line.slice(0, 200));
     }
     removed = [];
     added = [];
   };
   for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith('+++ ')) {
+      flushHunk();
+      const filePath = line.slice(4).trim();
+      currentFile = filePath === '/dev/null' ? '' : filePath.replace(/^b\//, '');
+      continue;
+    }
     // Hunk / file boundaries flush the buffers so pairing never spans blocks.
-    if (line.startsWith('@@') || isUnifiedDiffFileHeader(line) || line.startsWith('+++ ')) {
+    if (line.startsWith('@@') || isUnifiedDiffFileHeader(line)) {
       flushHunk();
       continue;
     }
@@ -631,5 +756,8 @@ module.exports = {
   detectGateContentRemovals,
   collectContentRemovals,
   isSafeMetadataReplacement,
+  isSafePackageJsonFieldReplacement,
+  isSafeWorkflowStepNameReplacement,
+  isSafeActionPinReplacement,
   isMechanicalLockfile,
 };
