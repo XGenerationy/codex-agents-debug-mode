@@ -1,5 +1,4 @@
-# Codex and Agents Debug Mode
-Idea By Mahmoud Ismail - Created By Codex, Cleanup by Claude via Debug Skill
+# Codex and Agents Debug Mode | Idea By Mahmoud Ismail - Created By Codex, Cleanup by Claude via Debug Skill
 [![Validate](https://github.com/XGenerationy/codex-agents-debug-mode/actions/workflows/validate.yml/badge.svg)](https://github.com/XGenerationy/codex-agents-debug-mode/actions/workflows/validate.yml)
 
 An independent, community-maintained, evidence-first debugging and GitHub pull-request cleanup
