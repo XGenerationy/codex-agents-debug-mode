@@ -181,6 +181,22 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
     } finally {
       closeSync(fd);
     }
+    // Apply the same owner-only Windows ACL the collector_token and session
+    // logs get: mode 0o600 above does not strip inherited NTFS read perms on
+    // Windows, so without this a project_salt in a shared/permissive checkout
+    // stays readable by other local users, who could combine it with the
+    // unauthenticated /health project_hash to test candidate canonical paths
+    // and defeat the path-privacy the keyed hash was introduced to provide
+    // (Codex U1D5A). POSIX is a no-op. Applied to the temp file before the
+    // atomic rename so the inode that becomes saltFile is already protected;
+    // a protection failure unlinks the temp file (like the rename failure
+    // below) rather than leaking it.
+    try {
+      protectWindowsPrivateFile(tempFile);
+    } catch (error) {
+      try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+      throw error;
+    }
     try {
       renameSync(tempFile, saltFile);
     } catch (error) {
