@@ -300,7 +300,19 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
     return;
   }
 
-  if (globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
+  // Prefer the ACKNOWLEDGED fetch path. sendBeacon reports success as soon as
+  // the browser QUEUES the request, not when the collector accepts it, so a
+  // rejected event (expired session, stale token, or a collector limit
+  // returning a non-2xx status) would be silently swallowed if its boolean
+  // return were trusted. Reserve the fire-and-forget beacon for page unload,
+  // where a synchronous fetch may be cancelled before it completes; even then,
+  // surface a failed enqueue instead of assuming success.
+  if (globalThis.document?.visibilityState === 'hidden') {
+    if (!globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) {
+      reportDebugTransportFailure(new Error('DebugCollectorBeaconQueueFailed'));
+    }
+    return;
+  }
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
     .then((response) => {
       if (!response.ok) throw new Error(`DebugCollectorHTTP${response.status}`);
@@ -515,7 +527,7 @@ If logs aren't arriving, it’s usually one of:
 - **CSP**: `connect-src` blocks the log URL. Use a dev-server proxy or update CSP.
 - **CORS preflight**: `Content-Type: application/json` triggers `OPTIONS`. Use a “simple” request (`text/plain`) or `sendBeacon`.
 
-**1. `sendBeacon` (avoids preflight; fire-and-forget)**:
+**1. Avoid the preflight (acknowledged `text/plain` request; `sendBeacon` only on unload)**:
 ```javascript
 const DEBUG_LOG_URL = 'http://localhost:8787/log';
 let debugTransportFailureReported = false;
@@ -540,7 +552,21 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
     reportDebugTransportFailure(error);
     return;
   }
-  if (globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) return;
+  // A text/plain body (no Content-Type header, below) is a CORS "simple"
+  // request, so the ACKNOWLEDGED fetch already avoids the OPTIONS preflight —
+  // that is the same reason sendBeacon was reached for here. Because the fetch
+  // avoids preflight AND returns a checkable status, there is no reason to
+  // trust sendBeacon's boolean, which reports success once the browser QUEUES
+  // the request, not when the collector accepts it, and so hides rejected
+  // events (expired session, stale token, or a non-2xx collector limit). Keep
+  // sendBeacon only for page unload, where a synchronous fetch may be
+  // cancelled; check its return there so a failed enqueue still reports.
+  if (globalThis.document?.visibilityState === 'hidden') {
+    if (!globalThis.navigator?.sendBeacon?.(DEBUG_LOG_URL, payload)) {
+      reportDebugTransportFailure(new Error('DebugCollectorBeaconQueueFailed'));
+    }
+    return;
+  }
   fetch(DEBUG_LOG_URL, { method: 'POST', body: payload })
     .then((response) => {
       if (!response.ok) throw new Error(`DebugCollectorHTTP${response.status}`);
@@ -548,7 +574,7 @@ const debugLog = (msg, data = {}, hypothesisId = null) => {
     .catch(reportDebugTransportFailure);
 };
 ```
-Note: still blocked by mixed content + CSP.
+Note: a preflight-free request (fetch or beacon) still can't bypass mixed content + CSP.
 
 **2. Dev server proxy (Vite example)** - same-origin `/__log` → `http://localhost:8787/log`:
 ```javascript
@@ -568,8 +594,9 @@ export default {
 // Then POST to /__log instead of localhost:8787/log
 ```
 
-Never disable mixed-content or browser security protections. If `sendBeacon` cannot reach the
-collector, use the same-origin proxy or an authenticated HTTPS collector endpoint.
+Never disable mixed-content or browser security protections. If the preflight-free request
+cannot reach the collector (mixed content or CSP), use the same-origin proxy or an
+authenticated HTTPS collector endpoint.
 
 ### Chrome Extension Debugging
 

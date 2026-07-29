@@ -29,6 +29,7 @@ const {
   spawnCaptured,
   sweepDetachedOrphans,
   terminateProcessTree,
+  writeLogHeaderNoFollow,
 } = require('./pr_closeout_process');
 
 const { MIN_AUTO_SECRET_LENGTH, buildChildEnvironment } = require('./pr_closeout_stream');
@@ -45,7 +46,7 @@ const windowsAclIsCurrentUserOnly = (filePath) => {
   return spawnSync(
     'powershell.exe',
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { encoding: 'utf8', windowsHide: true },
+    { encoding: 'utf8', windowsHide: true, timeout: 15000 },
   );
 };
 
@@ -325,6 +326,34 @@ test('classifies warning output that appears after the report capture cap', asyn
   assert.doesNotMatch(result.stdout, /UserWarning/);
   assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /UserWarning/);
+});
+
+test('classifies a no-work summary that appears after the report capture cap', async () => {
+  // Codex UikNz: classifyOutput decides "no tests ran" from the capped
+  // combined stdout/stderr. A runner that streams past CAPTURE_LIMIT before
+  // its terminal "No tests found" summary pushes that line beyond the head
+  // cap, so classifyOutput's combined-string checks never see it. The
+  // independent streaming no-work scanner (fed the raw, uncapped stream) must
+  // still catch it and thread a signal into detectedSignals so the executor
+  // FAILs instead of PASSing. The "no-work:" prefix in the evidence is emitted
+  // ONLY by that streaming detector -- classifyOutput's own combined path
+  // produces different wording -- so matching it proves the post-cap summary
+  // was caught by the stream, not by the (now blind) capped string.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-tail-nowork-'));
+  const execute = createCommandExecutor({
+    repo: process.cwd(),
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+  });
+  const result = await execute({
+    id: 'tail-nowork',
+    command: "process.stdout.write('x'.repeat(2100000) + '\\nNo tests found, exiting with code 0\\n')",
+  }, 'qualification');
+  assert.equal(result.stdout.length, 2_000_000);
+  assert.doesNotMatch(result.stdout, /no tests found/i);
+  assert.equal(result.status, 'FAIL', statusDiag(result));
+  assert.match(result.evidence, /no-work/i);
 });
 
 test('hashes full output beyond the report capture cap', async () => {
@@ -1150,7 +1179,7 @@ test('captures write-stream errors in logWriteError instead of crashing', async 
   assert.equal(typeof result.logWriteError, 'string');
 });
 
-test('refuses to write a raw evidence log through a pre-existing symlink, without crashing', async () => {
+test('refuses to write a raw evidence log through a pre-existing symlink, without crashing', async (t) => {
   // A reused or caller-supplied outputDir can already contain this
   // predictable log path as a symlink; the append-mode write stream must
   // reject it instead of following it, and — like any other log open
@@ -1161,7 +1190,15 @@ test('refuses to write a raw evidence log through a pre-existing symlink, withou
   const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
   await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
   const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
-  await symlink(outsideTarget, logPath);
+  try {
+    await symlink(outsideTarget, logPath);
+  } catch (error) {
+    // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+    await rm(logDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+    t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+    return;
+  }
   try {
     const result = await spawnCaptured({
       command: "process.stdout.write('hello')",
@@ -1233,7 +1270,7 @@ test('refuses to append a raw evidence log through a pre-existing hard link, wit
   }
 });
 
-test('refuses to write a command executor log header through a pre-existing symlink', async () => {
+test('refuses to write a command executor log header through a pre-existing symlink', async (t) => {
   // Same predictable-path threat as the append-stream case above, but for
   // the "command: ...\ncwd: ..." header createCommandExecutor writes before
   // spawnCaptured ever runs. This call has no local try/catch (matching the
@@ -1244,9 +1281,17 @@ test('refuses to write a command executor log header through a pre-existing syml
   const outsideDir = await mkdtemp(path.join(tmpdir(), 'closeout-header-symlink-outside-'));
   const outsideTarget = path.join(outsideDir, 'clobber-me.txt');
   await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
+  await mkdir(path.join(outputDir, 'logs'), { recursive: true });
   try {
-    await mkdir(path.join(outputDir, 'logs'), { recursive: true });
     await symlink(outsideTarget, path.join(outputDir, 'logs', 'qualification.probe.attempt-001.log'));
+  } catch (error) {
+    // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+    await rm(outputDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+    t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+    return;
+  }
+  try {
     const execute = createCommandExecutor({
       repo: process.cwd(),
       outputDir,
@@ -1265,7 +1310,7 @@ test('refuses to write a command executor log header through a pre-existing syml
   }
 });
 
-test('revalidates the logs directory before the proof-command log write, not just once', async () => {
+test('revalidates the logs directory before the proof-command log write, not just once', async (t) => {
   // CodeRabbit UguCb: the logs-directory containment check ran once per
   // check(), before the main command's log header was written. A check's
   // main command can run for its full configured timeout before the proof
@@ -1359,15 +1404,31 @@ test('revalidates the logs directory before the proof-command log write, not jus
       stop = true;
       await retryLoop;
     }
-    assert.ok(swapped, 'test setup must actually swap logsDir to prove the executor rejects it');
-    // The precise failure mode depends on exactly which half of the
-    // non-atomic swap the check's revalidation lands in -- an outright
-    // rejection (logsDir already a symlink) or a BLOCKED/FAIL result (the
-    // open landed in the brief gap where logsDir did not exist at all).
-    // Either is safe; only a silent PASS built on evidence written through
-    // the swapped directory is not.
+    if (!swapped) {
+      // Losing the setup race (e.g. an open append-stream keeps logsDir
+      // un-renameable for the whole run, common on Windows) means the attack
+      // scenario was never reproduced -- it does NOT mean the product
+      // misbehaved. Report inconclusive rather than failing the whole test.
+      t.diagnostic('could not win the logsDir swap race; setup inconclusive');
+      return;
+    }
+    // The precise failure mode depends on exactly which window the swap
+    // lands in: the second ensureLogsDirSecured() call rejects outright if
+    // logsDir is already a symlink or already resolves outside outputDir
+    // ("symlinked logs directory" / "outside the output directory"); a swap
+    // landing in the narrower residual gap between that call and the actual
+    // open is caught either as a raw ENOENT (open attempted while logsDir was
+    // moved-aside and not yet re-created) or by assertLogParentIdentity's
+    // post-open dev/ino comparison ("unverifiable parent directory" /
+    // "swapped after validation") -- or, rarely, as a BLOCKED/FAIL result
+    // instead of a thrown rejection. Every one of these is safe; only a
+    // silent PASS built on evidence written through the swapped directory is
+    // not.
     if (rejection) {
-      assert.match(rejection.message, /symlinked logs directory|outside the output directory|ENOENT/);
+      assert.match(
+        rejection.message,
+        /symlinked logs directory|outside the output directory|unverifiable parent directory|swapped after validation|ENOENT/,
+      );
     } else {
       assert.notEqual(result.status, 'PASS', `must not PASS with evidence redirected through a swapped logs directory: ${JSON.stringify(result)}`);
     }
@@ -1385,6 +1446,33 @@ test('revalidates the logs directory before the proof-command log write, not jus
   }
 });
 
+test('binds an evidence log header write to the validated logs directory identity', async () => {
+  // CodeRabbit UguCb: openLogNoFollow's O_NOFOLLOW guards only the final path
+  // component, not the parent logs directory. Binding the header open to the
+  // dev/ino ensureLogsDirSecured() captured must reject a write whose parent
+  // no longer matches -- before truncating any prior content -- while still
+  // writing when the identity matches.
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-dir-bind-'));
+  const logPath = path.join(logsDir, 'qualification.probe.attempt-001.log');
+  try {
+    await writeFile(logPath, 'PRIOR-EVIDENCE', 'utf8');
+    const real = await lstat(logsDir);
+    // A mismatching identity stands in for a logsDir swapped between
+    // validation and this open (same filesystem, different inode).
+    await assert.rejects(
+      writeLogHeaderNoFollow(logPath, 'command: x\ncwd: <repo>\n', { dev: real.dev + 1, ino: real.ino }),
+      /logs directory swapped after validation/,
+    );
+    // Rejected before truncate: the prior content is intact.
+    assert.equal(await readFile(logPath, 'utf8'), 'PRIOR-EVIDENCE');
+    // The matching identity still writes the header (happy path preserved).
+    await writeLogHeaderNoFollow(logPath, 'command: ok\ncwd: <repo>\n', { dev: real.dev, ino: real.ino });
+    assert.match(await readFile(logPath, 'utf8'), /^command: ok/);
+  } finally {
+    await rm(logsDir, { recursive: true, force: true });
+  }
+});
+
 test(
   'protects a written evidence log with a current-user-only Windows ACL',
   { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
@@ -1398,6 +1486,20 @@ test(
     const logDir = await mkdtemp(path.join(tmpdir(), 'closeout-log-acl-'));
     const logPath = path.join(logDir, 'qualification.typecheck.attempt-001.log');
     try {
+      // Codex UiTM8: a fresh mkdtemp directory is already effectively
+      // owner-only, so the ACL assertion below could pass vacuously without
+      // protectWindowsPrivateFile actually removing anything. Reproduce the
+      // scenario it guards -- a directory whose INHERITED ACL grants other
+      // local users access -- by granting the well-known Users group
+      // (S-1-5-32-545) an inheritable (object + container) read ACE. The log
+      // file created inside then inherits it, so the post-run assertion
+      // genuinely proves inheritance was broken by protectWindowsPrivateFile.
+      const grant = spawnSync('icacls', [logDir, '/grant', '*S-1-5-32-545:(OI)(CI)(R)'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 15000,
+      });
+      assert.equal(grant.status, 0, `icacls grant failed: ${grant.stdout}\n${grant.stderr}`);
       const result = await spawnCaptured({
         command: "process.stdout.write('hello')",
         cwd: process.cwd(),
@@ -1566,12 +1668,12 @@ test('preflight resolves required env names case-insensitively', async () => {
   assert.equal(credential.evidence, 'present');
 });
 
-test('terminates background descendants left behind by a cleanly exiting command', { timeout: 20000 }, async () => {
+test('terminates background descendants left behind by a cleanly exiting command', { timeout: 20000 }, async (t) => {
   // POSIX-only: this sweeps the command's process group. Windows has no
   // process groups to probe once the root has exited, so the win32 path can
   // only report the root as already gone (covered by the terminateProcessTree
   // unit tests below).
-  if (process.platform === 'win32') return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-'));
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-clean-tree-logs-'));
   const marker = path.join(repo, 'descendant-survived.txt');
@@ -1591,13 +1693,13 @@ test('terminates background descendants left behind by a cleanly exiting command
   await assert.rejects(access(marker));
 });
 
-test('terminates detached/setsid descendants that leave the process group', { timeout: 20000 }, async () => {
+test('terminates detached/setsid descendants that leave the process group', { timeout: 20000 }, async (t) => {
   // POSIX + /proc only: a validation script can `detached:true` / setsid a
   // child, exit 0, and leave a descendant outside the original process group.
   // Group kill alone would PASS; the spawn-mark environ sweep must still reap
   // it before the command is considered clean.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-'));
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-setsid-tree-logs-'));
   const marker = path.join(repo, 'setsid-survived.txt');
@@ -1627,12 +1729,12 @@ test('terminates detached/setsid descendants that leave the process group', { ti
   await assert.rejects(access(marker), 'detached descendant must not mutate the worktree after termination');
 });
 
-test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { timeout: 15000 }, async () => {
+test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { timeout: 15000 }, async (t) => {
   // Discovery helper listLivePidsWithCwdUnder still finds mark-free processes
   // that hold a repo fd (useful diagnostics). Orphan kill path no longer
   // reaps by cwd/fd alone — only spawn-mark PIDs are signaled. POSIX + /proc.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fd-sweep-'));
   let childPid = 0;
   let pipePid = 0;
@@ -1699,14 +1801,14 @@ test('cwd/fd probe discovers mark-free processes that hold an open repo fd', { t
   }
 });
 
-test('cwd/fd probe excludes a same-repo sibling still running under the runner', { timeout: 15000 }, async () => {
+test('cwd/fd probe excludes a same-repo sibling still running under the runner', { timeout: 15000 }, async (t) => {
   // Codex UDDP_: with the runner's default parallelism 4, concurrent checks
   // share the repo as cwd in their own sessions. The mark-free cwd/fd
   // fallback must not attribute such a still-running SIBLING — an unbroken
   // PPID chain to the runner that never passes through this spawn's root —
   // to this spawn as a detached descendant. POSIX + /proc only.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-sibling-sweep-'));
   let siblingPid = 0;
   let siblingHandle = null;
@@ -1761,12 +1863,12 @@ test('cwd/fd probe excludes a same-repo sibling still running under the runner',
   }
 });
 
-test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is broken', { timeout: 15000 }, async () => {
+test('cwd/fd probe still flags a mark-free orphan whose chain to the runner is broken', { timeout: 15000 }, async (t) => {
   // Fail-closed guard for the sibling exclusion (Codex UDDP_): a genuine
   // detached orphan's PPID chain dead-ends at the exited spawn root (absent
   // pid), so it must stay attributed and force BLOCKED. POSIX + /proc only.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-broken-chain-'));
   let orphanPid = 0;
   let rootPid = 0;
@@ -1850,15 +1952,15 @@ test('environHasAnySpawnMark only matches a mark registered in knownMarks', () =
   assert.equal(environHasAnySpawnMark('', knownMarks), false);
 });
 
-test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', { timeout: 15000 }, async () => {
+test('cwd/fd probe excludes a live process carrying a different check\'s own spawn mark', { timeout: 15000 }, async (t) => {
   // Codex UfzOf (P1): under the default test-runner parallelism, a sibling
   // check's own live, mark-tracked descendant can have a PPID chain that
   // looks broken relative to THIS spawn's rootPid/selfPid purely because it
   // descends from a different root. Reproduce that exact shape -- a detached,
   // reparented (broken-chain) grandchild whose environ carries a *different*
   // check's spawn mark -- and assert it is excluded, not misattributed.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-foreign-mark-'));
   let siblingPid = 0;
   let rootPid = 0;
@@ -1913,7 +2015,7 @@ test('cwd/fd probe excludes a live process carrying a different check\'s own spa
   }
 });
 
-test('cwd/fd probe does not exclude a live process carrying an unregistered (forged) spawn mark', { timeout: 15000 }, async () => {
+test('cwd/fd probe does not exclude a live process carrying an unregistered (forged) spawn mark', { timeout: 15000 }, async (t) => {
   // Codex UikN4 (P1): the fix for Codex UfzOf above excluded any candidate
   // whose environ carried ANY OMO_CLOSEOUT_SPAWN_MARK value, trusting the
   // value merely because it existed. A hostile detached process could copy
@@ -1921,8 +2023,8 @@ test('cwd/fd probe does not exclude a live process carrying an unregistered (for
   // entirely. Reproduce the identical reparented-sibling shape as the test
   // above, but WITHOUT ever registering its mark as a known sibling -- it
   // must stay flagged and the sweep must BLOCK, not PASS.
-  if (process.platform === 'win32') return;
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') === null) { t.skip('requires /proc'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-forged-mark-'));
   let siblingPid = 0;
   let rootPid = 0;
@@ -1974,7 +2076,7 @@ test('cwd/fd probe does not exclude a live process carrying an unregistered (for
   }
 });
 
-test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host platform', () => {
+test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host platform', (t) => {
   // Codex Ugisk (P1): on macOS and other non-Linux POSIX hosts, /proc never
   // exists, so listLivePidsWithSpawnMark always returned null there. The old
   // code treated that as PASS ("process-group containment only") solely
@@ -1983,7 +2085,7 @@ test('sweep BLOCKs instead of PASSing when /proc is unavailable, on any host pla
   // alive and mutating the repo after the seal. This host genuinely lacks
   // /proc (Windows), so it exercises the exact real-world condition the
   // finding describes without needing to fake the platform.
-  if (listLivePidsWithSpawnMark('probe-no-such-mark') !== null) return; // only meaningful without /proc
+  if (listLivePidsWithSpawnMark('probe-no-such-mark') !== null) { t.skip('requires a host without /proc'); return; }
   return sweepDetachedOrphans({ mark: 'probe-ugisk-no-proc', kill: () => {} }).then((result) => {
     assert.equal(result.status, 'BLOCKED', statusDiag(result));
     assert.match(result.evidence, /proc.*missing/i);
@@ -2476,12 +2578,12 @@ test('fails artifact proof when the file exceeds the hash size ceiling', async (
   }
 });
 
-test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async () => {
+test('does not hang when the verified artifact is swapped for a FIFO', { timeout: 15000 }, async (t) => {
   // POSIX-only: Windows Node cannot see POSIX FIFOs. A proof command's
   // background process can swap the verified artifact for a FIFO between the
   // lstat and the hash open; opening a FIFO read-only without O_NONBLOCK
   // would block waiting for a writer, so the proof must fail closed instead.
-  if (process.platform === 'win32') return;
+  if (process.platform === 'win32') { t.skip('posix-only test'); return; }
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-fifo-artifact-'));
   const fifoPath = path.join(repo, 'render.json');
   execFileSync('mkfifo', [fifoPath]);

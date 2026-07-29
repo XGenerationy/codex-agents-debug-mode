@@ -1,7 +1,10 @@
-const { execFileSync } = require('node:child_process');
+const { execFile, execFileSync } = require('node:child_process');
 const { constants, existsSync } = require('node:fs');
 const { lstat, open } = require('node:fs/promises');
 const path = require('node:path');
+const { promisify } = require('node:util');
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
@@ -137,10 +140,17 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
 // falling through to an un-joined hard-coded root instead of exercising the
 // intended trust logic (CI failure on Node 24/ubuntu-latest: resolved
 // 'C:\Windows' instead of falling back to a verified env root).
+// "Windows" must sit directly at a drive root (X:\Windows), not merely be the
+// final component of a deeper path. A basename-only check (`...\Windows`)
+// accepts an attacker-writable nested directory such as
+// C:\Users\<user>\Windows, which -- with a planted powershell.exe/taskkill.exe
+// at the matching relative path -- would be handed to execFile/execFileSync
+// whenever the hard-coded C:\Windows probe is unavailable (Codex UiTMt).
+// Anchoring to the drive root fails that shape closed while still accepting a
+// genuine Windows install on any volume (C:\Windows, D:\Windows).
 const looksLikeWindowsRoot = (root) => {
   const normalized = path.win32.normalize(root).replace(/[\\/]+$/u, '');
-  return /^[A-Za-z]:[\\/]/u.test(normalized)
-    && path.win32.basename(normalized).toLowerCase() === 'windows';
+  return /^[A-Za-z]:[\\/]Windows$/iu.test(normalized);
 };
 
 // extraRelativePaths lets callers that resolve additional root-relative
@@ -159,6 +169,13 @@ const isTrustedSystemRoot = (root, pathExists, extraRelativePaths = []) => {
 const resolvePowerShellExecutable = ({ env = process.env, pathExists = existsSync } = {}) => {
   const hardcodedRoot = 'C:\\Windows';
   const envRoot = String(env.SystemRoot || '').trim();
+  // Fail closed to the hard-coded root: the env-supplied root is only trusted
+  // when it is a drive-root-anchored Windows install (looksLikeWindowsRoot,
+  // now `X:\Windows` only) AND independently verified to contain the real
+  // powershell.exe. When the hard-coded C:\Windows probe fails, an
+  // attacker-controlled SystemRoot with a planted binary at a nested,
+  // non-anchored path (e.g. C:\Users\<user>\Windows) is rejected by the shape
+  // check and safeRoot stays C:\Windows rather than the planted tree (UiTMt).
   let safeRoot = hardcodedRoot;
   if (!isTrustedSystemRoot(hardcodedRoot, pathExists) && isTrustedSystemRoot(envRoot, pathExists)) {
     safeRoot = envRoot;
@@ -166,16 +183,20 @@ const resolvePowerShellExecutable = ({ env = process.env, pathExists = existsSyn
   return path.win32.join(safeRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 };
 
-/**
- * Establish and verify a protected, current-user-only Windows DACL on
- * `privateFile` (owner FullControl, inheritance broken, every other rule
- * removed). No-op on non-Windows platforms. Shared by the debug collector
- * (token file, session logs) and closeout evidence logs so the guard stays
- * one implementation across security-critical write paths.
- * @param {string} privateFile
- */
-const protectWindowsPrivateFile = (privateFile) => {
-  if (process.platform !== 'win32') return;
+// PowerShell/execFile arguments that establish and verify a protected,
+// current-user-only Windows DACL on `privateFile`. Shared by the synchronous
+// and asynchronous entry points so they stay byte-for-byte identical. The
+// program is fixed and the path is embedded only as UTF-16 base64, so
+// repository-controlled path characters cannot become code.
+//
+// Beyond the DACL (inheritance broken, every rule removed, single owner
+// FullControl rule), the script also calls $acl.SetOwner($sid) before writing
+// and verifies GetOwner() on read-back: a Windows file OWNER retains implicit
+// WRITE_DAC and can rewrite the DACL later, so a file that already existed
+// under a different owner in a shared location must be taken over, not just
+// re-permissioned (Codex UiXEn). Any failed step exits non-zero so the Node
+// wrapper throws and the caller fails closed before any bytes are written.
+const buildProtectWindowsPrivateFileArgs = (privateFile) => {
   const encodedPath = Buffer.from(privateFile, 'utf16le').toString('base64');
   const script = [
     '$ErrorActionPreference = "Stop"',
@@ -186,20 +207,59 @@ const protectWindowsPrivateFile = (privateFile) => {
     'foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }',
     '$ownerRule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)',
     '$acl.SetAccessRule($ownerRule)',
+    '$acl.SetOwner($sid)',
     '[IO.File]::SetAccessControl($path, $acl)',
     '$verified = [IO.File]::GetAccessControl($path)',
     'if (-not $verified.AreAccessRulesProtected) { exit 1 }',
+    'if ($verified.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 1 }',
     '$rules = @($verified.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
     'if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)) { exit 1 }',
   ].join('; ');
+  return ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')];
+};
+
+// Hosted and freshly provisioned Windows profiles can take more than five
+// seconds to load PowerShell/.NET ACL types. Keep the operation bounded and
+// fail closed, but allow a realistic startup budget before reporting failure.
+const PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS = 15_000;
+
+/**
+ * Establish and verify a protected, current-user-only Windows DACL (and owner)
+ * on `privateFile` (owner FullControl, inheritance broken, every other rule
+ * removed, owner set to the current user). No-op on non-Windows platforms.
+ * Shared by the debug collector (token file, session logs) and closeout
+ * evidence logs so the guard stays one implementation across security-critical
+ * write paths. Synchronous: only use on startup/CLI paths where blocking the
+ * event loop is acceptable; request handlers must use
+ * protectWindowsPrivateFileAsync instead.
+ * @param {string} privateFile
+ */
+const protectWindowsPrivateFile = (privateFile) => {
+  if (process.platform !== 'win32') return;
   execFileSync(
     resolvePowerShellExecutable(),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    // Hosted and freshly provisioned Windows profiles can take more than five
-    // seconds to load PowerShell/.NET ACL types. Keep the operation bounded
-    // and fail closed, but allow a realistic startup budget before reporting
-    // failure.
-    { stdio: 'ignore', timeout: 15_000, windowsHide: true },
+    buildProtectWindowsPrivateFileArgs(privateFile),
+    { stdio: 'ignore', timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
+  );
+};
+
+/**
+ * Asynchronous sibling of protectWindowsPrivateFile: runs the identical fixed
+ * PowerShell program (same DACL + owner hardening and verification, same 15s
+ * timeout) via a promisified child_process.execFile instead of execFileSync,
+ * so a request-serving path (the /session handler) does not block the Node
+ * event loop for up to the full timeout on every call. No-op on non-Windows
+ * platforms. Rejects (fails closed) on any non-zero exit exactly as the
+ * synchronous variant throws.
+ * @param {string} privateFile
+ * @returns {Promise<void>}
+ */
+const protectWindowsPrivateFileAsync = async (privateFile) => {
+  if (process.platform !== 'win32') return;
+  await execFileAsync(
+    resolvePowerShellExecutable(),
+    buildProtectWindowsPrivateFileArgs(privateFile),
+    { timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
   );
 };
 
@@ -258,5 +318,6 @@ module.exports = {
   openNoFollow,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
+  protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 };

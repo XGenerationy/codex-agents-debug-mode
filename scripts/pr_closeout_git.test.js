@@ -790,6 +790,135 @@ test('treats workspace manifests as validation-defining gate files', () => {
   }
 });
 
+test('treats multi-language validation manifests as gate files', () => {
+  // Python (pyproject.toml/pytest.ini/tox.ini), Rust (Cargo.toml), Go (go.mod),
+  // Yarn (yarn.lock), and Bun (bun.lock) manifests define test commands, coverage
+  // thresholds, or dependency locks the same way package.json does, and
+  // .codereview.yml is this repo's authoritative gate config. A PR that deletes a
+  // validation surface from any of them must not be invisible to readGateChanges.
+  for (const file of [
+    'pyproject.toml',
+    'pytest.ini',
+    'tox.ini',
+    'Cargo.toml',
+    'go.mod',
+    'yarn.lock',
+    'bun.lock',
+    '.codereview.yml',
+    // Recognized regardless of directory depth (mirrors package.json handling)
+    // and case (the classifier lowercases the basename), and .codereview.yaml is
+    // accepted alongside the .yml spelling.
+    'packages/api/pyproject.toml',
+    'crates/core/Cargo.toml',
+    '.codereview.yaml',
+  ]) {
+    assert.equal(isGateFile(file), true, file);
+  }
+  // Exact basenames only: a random .toml/.ini/.md file is not a validation
+  // manifest, so the classifier must not overmatch by extension.
+  for (const file of ['foo.toml', 'config.ini', 'notes.md', 'src/go.mod.ts']) {
+    assert.equal(isGateFile(file), false, file);
+  }
+});
+
+test('does not flag .codereview.yml prose naming a flag as gate weakening', () => {
+  // Real .codereview.yml text: "FAIL on ... an existing target without
+  // --force, or invalid JSON output." Once .codereview.yml is a recognized
+  // gate file, this line reaching classifyGateIntegrity as an ordinary added
+  // line would trip the same substring pattern package.json's
+  // "passWithNoTests": true correctly fails below — readGateChanges tags it
+  // as proseAddedLines instead so it is exempted from the executable-flag
+  // scan without weakening that scan for any other gate file.
+  const proseLine = '+      non-absolute home path, an existing target without --force, or invalid';
+  const base = { changedFiles: ['.codereview.yml'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
+  assert.equal(
+    classifyGateIntegrity({ ...base, addedLines: [proseLine], proseAddedLines: [proseLine] }).status,
+    'BLOCKED',
+    'prose naming --force must not FAIL once tagged as proseAddedLines',
+  );
+  assert.equal(
+    classifyGateIntegrity({
+      ...base, addedLines: [proseLine], proseAddedLines: [proseLine], attestation: liveAttestation(),
+    }).status,
+    'PASS',
+    'with a live attestation, exempted prose must reach PASS like any other unweakened gate change',
+  );
+  // Without the proseAddedLines tag (e.g. an older caller, or the line
+  // appearing in some other gate file), the exact same text must still FAIL —
+  // proving the exemption is scoped to lines readGateChanges actually
+  // attributed to the prose file, not to the flag pattern generally.
+  assert.equal(
+    classifyGateIntegrity({ ...base, addedLines: [proseLine] }).status,
+    'FAIL',
+    'the same line must still fail closed when not tagged as proseAddedLines',
+  );
+  // A genuine executable-invocation weakening line added to a DIFFERENT gate
+  // file in the same call must still FAIL even though an unrelated prose line
+  // is simultaneously exempted — the subtraction is exact-text and must not
+  // blanket-exempt the whole weakening scan.
+  const realWeakening = '+        run: git commit --no-verify -m "wip"';
+  assert.equal(
+    classifyGateIntegrity({
+      ...base,
+      changedFiles: ['.codereview.yml', '.github/workflows/validate.yml'],
+      addedLines: [proseLine, realWeakening],
+      proseAddedLines: [proseLine],
+    }).status,
+    'FAIL',
+    'a real --no-verify invocation added alongside exempted prose must still FAIL',
+  );
+});
+
+test('does not flag .codereview.yml prose naming the __decode_error__ marker as an unscannable gate', () => {
+  // Real .codereview.yml text: "...any test-weakening / token in a touched
+  // test file, or any __decode_error__ in the gate / diff." This line
+  // contains the literal __decode_error__ substring the decodeErrors check
+  // scans for, so once .codereview.yml is a recognized gate file, this prose
+  // would trip a FAIL claiming the gate diff could not be decoded — even
+  // though nothing failed to decode. decodeErrors now scans weakeningScanLines
+  // (addedLines minus proseAddedLines) rather than raw addedLines, so the
+  // same proseAddedLines tag that exempts WEAKENING_PATTERNS matches also
+  // exempts this.
+  const proseLine = '+      token in a touched test file, or any __decode_error__ in the gate';
+  const base = { changedFiles: ['.codereview.yml'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
+  assert.equal(
+    classifyGateIntegrity({ ...base, addedLines: [proseLine], proseAddedLines: [proseLine] }).status,
+    'BLOCKED',
+    'prose naming __decode_error__ must not FAIL as an unscannable gate once tagged as proseAddedLines',
+  );
+  assert.equal(
+    classifyGateIntegrity({
+      ...base, addedLines: [proseLine], proseAddedLines: [proseLine], attestation: liveAttestation(),
+    }).status,
+    'PASS',
+    'with a live attestation, exempted prose must reach PASS like any other unweakened gate change',
+  );
+  // Without the proseAddedLines tag, the exact same text must still trigger
+  // the decode-error FAIL — proving the exemption is scoped to lines
+  // readGateChanges actually attributed to the prose file, not to the marker
+  // substring generally.
+  assert.equal(
+    classifyGateIntegrity({ ...base, addedLines: [proseLine] }).status,
+    'FAIL',
+    'the same line must still fail closed as an unscannable gate when not tagged as proseAddedLines',
+  );
+  // A genuine decode-error marker on a DIFFERENT gate file in the same call
+  // must still FAIL even though an unrelated prose line naming the same
+  // marker text is simultaneously exempted — the subtraction is exact-text
+  // and must not blanket-exempt the whole decodeErrors scan.
+  const realDecodeError = '+__decode_error__: symlink to /etc/passwd';
+  assert.equal(
+    classifyGateIntegrity({
+      ...base,
+      changedFiles: ['.codereview.yml', '.github/workflows/validate.yml'],
+      addedLines: [proseLine, realDecodeError],
+      proseAddedLines: [proseLine],
+    }).status,
+    'FAIL',
+    'a real decode-error marker added alongside exempted prose must still FAIL',
+  );
+});
+
 test('detects coverage threshold reductions split across added lines', () => {
   const base = { changedFiles: ['vitest.config.ts'], baseSha: 'base123', headSha: 'abc123', configDigest: 'cfg123' };
   const addedLines = ['+  coverageThreshold: {', '+    statements: 0,', '+  },'];

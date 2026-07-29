@@ -7,7 +7,7 @@ const { promisify, TextDecoder } = require('node:util');
 
 const { scanSuppressionText } = require('./pr_closeout_core');
 const { computeFilterSafetyOverrides, fingerprintEntries, isGateFile } = require('./pr_closeout_git');
-const { openNoFollow } = require('./pr_closeout_fs');
+const { isSameFileIdentity, openNoFollow } = require('./pr_closeout_fs');
 
 const execFileAsync = promisify(execFile);
 /**
@@ -411,13 +411,20 @@ const readHeadFromHandle = async (handle, size) => {
  * independently to untracked gate files. The first sampled bytes are
  * checked for a NUL byte to reject binary content as a `scan-error`, except
  * a UTF-16 BOM prefix (which legitimately starts with a NUL-adjacent byte
- * pair); any other unexpected error becomes a `scan-error` finding rather
- * than aborting the whole scan.
+ * pair). The re-stat is additionally bound back to the pre-open lstat's
+ * device/inode identity (via isSameFileIdentity) so a path — or a parent
+ * directory — swapped between the lstat and the open (including through
+ * openNoFollow's following-open fallback where O_NOFOLLOW is unavailable)
+ * cannot redirect the scan to a different, clean file and silently miss a
+ * real suppression; a mismatched or unusable (ino===0) identity is a
+ * `scan-error`. Any other unexpected error becomes a `scan-error` finding
+ * rather than aborting the whole scan.
  * @param {string} repo - Absolute repository path.
  * @param {string[]} files - Repo-relative touched file paths to scan.
+ * @param {{lstatFn?: (target: string) => Promise<import('node:fs').Stats>}} [deps] - Injectable lstat for TOCTOU identity tests.
  * @returns {Promise<Array<{file: string, line: number, category: string, match: string}>>} Combined findings across every file.
  */
-const scanTouchedSuppressions = async (repo, files) => {
+const scanTouchedSuppressions = async (repo, files, { lstatFn = lstat } = {}) => {
   const findings = [];
   for (const file of files) {
     let handle;
@@ -425,7 +432,7 @@ const scanTouchedSuppressions = async (repo, files) => {
       const absolute = path.join(repo, file);
       let stats;
       try {
-        stats = await lstat(absolute);
+        stats = await lstatFn(absolute);
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
         continue;
@@ -463,6 +470,23 @@ const scanTouchedSuppressions = async (repo, files) => {
       // Re-stat the opened descriptor so a TOCTOU grow/replace after lstat
       // cannot push the read past MAX_SUPPRESSION_SCAN_BYTES.
       const opened = await handle.stat();
+      // Bind the bytes we are about to scan to the exact file the pre-open
+      // lstat classified. openNoFollow can fall back to a following open where
+      // O_NOFOLLOW is unavailable (Windows / some filesystems), so a path — or
+      // a parent directory — swapped between the lstat above and this open
+      // could otherwise redirect the read to a different, clean file and
+      // silently miss a real suppression. Reject a device/inode mismatch or an
+      // unusable (ino===0) identity as a scan-error and skip, exactly as
+      // readCloseoutConfig binds its config read (pr_closeout.js).
+      if (!isSameFileIdentity(stats, opened)) {
+        findings.push({
+          file,
+          line: 0,
+          category: 'scan-error',
+          match: 'Touched file identity changed between check and open; refusing to scan a possibly-swapped file.',
+        });
+        continue;
+      }
       if (!opened.isFile()) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is not a regular file; refusing to read.' });
         continue;
@@ -721,6 +745,108 @@ const collectExtraEntries = async (repo, requested, entries) => {
   await visit(root);
 };
 
+// Cap the node_modules structural walk so a pathological or maliciously huge
+// vendor tree cannot make the seal unbounded. Realistic node_modules trees
+// (even large monorepos with a pnpm store) fall well under this; a tree that
+// exceeds the cap is sealed up to the first N entries in the SAME
+// deterministic (sorted, depth-first) order at every checkpoint, so the bound
+// stays symmetric across seal points. Each entry costs one lstat (no content
+// read), so the walk is cheap relative to content-hashing the tree.
+const MAX_STRUCTURAL_DIGEST_ENTRIES = 200_000;
+
+/**
+ * Compute a bounded STRUCTURAL digest of a vendor tree (node_modules) without
+ * reading any file contents. Recursively walks `requested` in deterministic
+ * sorted order and folds each entry's repo-relative path plus its kind and
+ * cheap metadata into a single SHA-256: a regular file contributes its
+ * size + mtimeMs + permission bits, a symlink its (un-followed) target text,
+ * and a directory or any non-regular entry a fixed marker. This catches any
+ * mutation, addition, or removal under the tree — an edited file's size or
+ * mtime moves, an added or removed file changes the listing — at the cost of
+ * one lstat per entry instead of a full content hash of tens of thousands of
+ * vendor files. cleanTreeStatus and the tracked-diff hash are both blind to
+ * node_modules (git ignores it and the ignored-untracked listing pathspec-
+ * excludes it), so this is the only channel that notices a dependency swapped
+ * in for the next validation command to execute (finding UkNEm/UkTG5).
+ *
+ * Returns null when the root does not exist, so an absent node_modules
+ * contributes no fingerprint entry at all; its later creation still moves the
+ * seal by making the entry appear. The walk never follows a symlink and never
+ * opens a file, so it cannot hang on a FIFO or read outside the repository. A
+ * child that vanishes between readdir and lstat is skipped: a genuine
+ * cross-checkpoint deletion is still caught because the earlier walk folded
+ * that file's real metadata into the digest and the later walk no longer
+ * lists it.
+ * @param {string} repo - Absolute repository path.
+ * @param {string} requested - Repo-relative vendor-tree root (e.g. 'node_modules').
+ * @returns {Promise<string|null>} Composite structural digest, or null if the root is absent.
+ */
+const structuralDigest = async (repo, requested) => {
+  const root = resolveExtraPath(repo, requested);
+  let rootInfo;
+  try {
+    rootInfo = await lstat(root.absolute);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const hash = createHash('sha256');
+  let count = 0;
+  let truncated = false;
+  const record = (line) => hash.update(`${line}\n`);
+  const visit = async ({ absolute, relative }, info) => {
+    if (truncated) return;
+    if (count >= MAX_STRUCTURAL_DIGEST_ENTRIES) {
+      truncated = true;
+      return;
+    }
+    count += 1;
+    if (info.isSymbolicLink()) {
+      let target;
+      try {
+        target = await readlink(absolute);
+      } catch {
+        target = '__unreadable_link__';
+      }
+      record(`${relative}\0symlink:${target}`);
+      return;
+    }
+    if (info.isDirectory()) {
+      record(`${relative}\0dir`);
+      let children;
+      try {
+        children = (await readdir(absolute)).sort();
+      } catch (error) {
+        // A directory that becomes unreadable mid-walk is fail-closed as a
+        // marker rather than aborting the whole fingerprint step.
+        record(`${relative}\0dir_unreadable:${error.code || error.message}`);
+        return;
+      }
+      for (const child of children) {
+        const childAbsolute = path.join(absolute, child);
+        const childRelative = normalize(path.join(relative, child));
+        let childInfo;
+        try {
+          childInfo = await lstat(childAbsolute);
+        } catch (error) {
+          if (error.code === 'ENOENT') continue;
+          throw error;
+        }
+        await visit({ absolute: childAbsolute, relative: childRelative }, childInfo);
+      }
+      return;
+    }
+    if (info.isFile()) {
+      record(`${relative}\0size=${info.size}\0mtime=${info.mtimeMs}\0mode=${info.mode & 0o777}`);
+      return;
+    }
+    // FIFO/socket/device: record its kind without opening it.
+    record(`${relative}\0non-regular`);
+  };
+  await visit({ absolute: root.absolute, relative: root.relative }, rootInfo);
+  return hashBytes(`structural:count=${count}:truncated=${truncated ? 1 : 0}:${hash.digest('hex')}`);
+};
+
 /**
  * Run git via `spawn` (not execFile) and stream stdout through a SHA-256
  * hash instead of buffering it against execFile's `maxBuffer` ceiling. A
@@ -767,10 +893,13 @@ const hashGitOutput = async (repo, args) => {
  * and the XDG default global gitignore (both of which `--exclude-standard`
  * also consults); every per-directory `.gitignore` in the repo, tracked or
  * untracked, including a self-ignoring one; every untracked file's identity
- * (via hashFsEntry); and any caller-supplied `extraPaths` (via
- * collectExtraEntries). All entries are handed to fingerprintEntries, which
- * sorts by path before hashing so entry-collection order never affects the
- * result.
+ * (via hashFsEntry); a bounded STRUCTURAL digest of node_modules (path + size
+ * + mtime + mode, not contents, via structuralDigest) so a mutated, added, or
+ * removed dependency the next validation command would execute cannot escape
+ * the seal even though git ignores the vendor tree; and any caller-supplied
+ * `extraPaths` (via collectExtraEntries). All entries are handed to
+ * fingerprintEntries, which sorts by path before hashing so entry-collection
+ * order never affects the result.
  * @param {string} repo - Absolute repository path.
  * @param {string[]} [extraPaths] - Additional repo-relative paths (files or directories) to fold into the seal.
  * @returns {Promise<string>} Hex-encoded SHA-256 composite fingerprint.
@@ -901,6 +1030,20 @@ const workingTreeFingerprint = async (repo, extraPaths = []) => {
     const absolute = path.join(repo, file);
     entries.push({ path: `__ignored__/${normalized}`, hash: await hashFsEntry(absolute) });
   }
+  // Structurally seal node_modules (a listing of path + size + mtime + mode,
+  // NOT file contents) so a validation command that mutates, adds, or removes
+  // a dependency between seal points moves the fingerprint. git ignores
+  // node_modules and the ignored-untracked listing above pathspec-excludes it,
+  // so without this channel a swapped-in dependency the next validation step
+  // then executes would leave every seal identical (finding UkNEm/UkTG5).
+  // Content-hashing the whole vendor tree would be far too slow; the structural
+  // listing catches the same mutations at one lstat per entry. An absent
+  // node_modules contributes no entry (structuralDigest returns null); its
+  // later creation still moves the seal by making the entry appear.
+  const nodeModulesDigest = await structuralDigest(repo, 'node_modules');
+  if (nodeModulesDigest !== null) {
+    entries.push({ path: '__node_modules_structural__', hash: nodeModulesDigest });
+  }
   for (const extra of [...new Set(extraPaths)].sort()) await collectExtraEntries(repo, extra, entries);
   return fingerprintEntries(entries);
 };
@@ -970,7 +1113,7 @@ const cleanTreeStatus = async (repo) => {
  * result to report against.
  * @param {string} repo - Absolute repository path.
  * @param {string} baseSha - Base commit SHA to diff gate files against.
- * @returns {Promise<{changedFiles: string[], addedLines: string[], removedLines: string[], deletedFiles: string[]}>}
+ * @returns {Promise<{changedFiles: string[], addedLines: string[], removedLines: string[], deletedFiles: string[], proseAddedLines: string[]}>}
  */
 const readGateChanges = async (repo, baseSha) => {
   // A deleted gate file contributes no added lines, so surface it on a
@@ -984,8 +1127,16 @@ const readGateChanges = async (repo, baseSha) => {
   ]);
   const changedFiles = [...new Set([...changed, ...untracked].filter(isGateFile))].sort();
   const deletedFiles = [...new Set(deleted.filter(isGateFile))].sort();
-  if (!changedFiles.length) return { changedFiles, addedLines: [], removedLines: [], deletedFiles };
+  if (!changedFiles.length) return { changedFiles, addedLines: [], removedLines: [], deletedFiles, proseAddedLines: [] };
   const tracked = changedFiles.filter((file) => !untracked.includes(file));
+  // .codereview.yml/.codereview.yaml is this repo's declarative, non-executable
+  // gate config: prose describing a check (e.g. "an existing target without
+  // --force") can legitimately name a bypass flag without using it. Added
+  // lines sourced from it are tagged separately so classifyGateIntegrity can
+  // exempt them from the executable-invocation weakening scan while every
+  // other gate file (workflows, package.json, lockfiles, ...) stays fully
+  // scanned; see classifyGateIntegrity for how this is consumed.
+  const isProseGateFile = (file) => /^\.codereview\.ya?ml$/i.test(path.posix.basename(normalize(file)));
   // Contain a very large tracked gate-file diff (e.g. a regenerated
   // pnpm-lock.yaml or workspace manifest churn) that would exceed execFile's
   // maxBuffer and reject out of readGateChanges before the workflow can write a
@@ -1014,6 +1165,26 @@ const readGateChanges = async (repo, baseSha) => {
     // line such as `--coverage` becomes `---coverage` and must still scan
     // (CodeRabbit #4781622077).
     : diffLines.filter((line) => line.startsWith('-') && !/^--- (?:a\/|b\/|\/dev\/null)/.test(line));
+  // Walk the same combined diff already fetched above (no second `git diff`)
+  // to pull out just the added lines that belong to a prose gate file's
+  // hunks. `+++ b/<path>` always precedes that file's content lines in a
+  // multi-file unified diff and git diff paths always use `/`, so no
+  // per-OS normalization is needed here the way `isProseGateFile` needs it
+  // for untracked-file paths below.
+  const proseAddedLines = [];
+  if (!trackedDiffError) {
+    let inProseGateFile = false;
+    for (const line of diffLines) {
+      const fileHeader = /^\+\+\+ b\/(.+)$/.exec(line);
+      if (fileHeader) {
+        inProseGateFile = /^\.codereview\.ya?ml$/i.test(path.posix.basename(fileHeader[1]));
+        continue;
+      }
+      if (inProseGateFile && line.startsWith('+') && !line.startsWith('+++')) {
+        proseAddedLines.push(line);
+      }
+    }
+  }
   for (const file of changedFiles.filter((item) => untracked.includes(item))) {
     let handle;
     try {
@@ -1085,8 +1256,11 @@ const readGateChanges = async (repo, baseSha) => {
         continue;
       }
       const text = decodeTouchedText(bytes);
+      const isProse = isProseGateFile(file);
       for (const line of text.split(/\r?\n/)) {
-        addedLines.push(`+${line}`);
+        const added = `+${line}`;
+        addedLines.push(added);
+        if (isProse) proseAddedLines.push(added);
       }
     } catch (error) {
       addedLines.push(`+__decode_error__:${file}:${error.message}`);
@@ -1094,7 +1268,7 @@ const readGateChanges = async (repo, baseSha) => {
       if (handle) await handle.close().catch(() => {});
     }
   }
-  return { changedFiles, addedLines, removedLines, deletedFiles };
+  return { changedFiles, addedLines, removedLines, deletedFiles, proseAddedLines };
 };
 
 module.exports = {

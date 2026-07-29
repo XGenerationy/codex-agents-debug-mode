@@ -107,8 +107,8 @@ for (const file of requiredFiles) {
 const payloadFiles = payloadEntries.flatMap(walk).sort();
 // Keep this count in lockstep with the skill payload tree under scripts/,
 // agents/, assets/, references/, and SKILL.md (including new test modules).
-if (payloadFiles.length !== 30) {
-  failures.push(`Expected 30 skill payload files, found ${payloadFiles.length}`);
+if (payloadFiles.length !== 31) {
+  failures.push(`Expected 31 skill payload files, found ${payloadFiles.length}`);
 }
 
 try {

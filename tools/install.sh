@@ -227,7 +227,7 @@ declare -a committed_backups=()
 # destination fresh, and it is always ours to remove.
 restore_from_backup() {
   local dest="$1" backup="$2" require_backup="${3:-false}"
-  if [[ "$require_backup" == "true" && -z "$backup" && -e "$dest" ]]; then
+  if [[ "$require_backup" == "true" && -z "$backup" && ( -e "$dest" || -L "$dest" ) ]]; then
     if [[ ! -d "$dest" || -n "$(ls -A -- "$dest" 2>/dev/null)" ]]; then
       return 0
     fi

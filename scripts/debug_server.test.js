@@ -19,6 +19,7 @@ const {
   probeReadyCollector,
   probeServer,
   readJson,
+  reclaimStaleCollectorClaim,
   resolvePowerShellExecutable,
 } = require('./debug_server');
 
@@ -198,12 +199,21 @@ const windowsAclIsCurrentUserOnly = (filePath) => {
     '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
     '$acl = [IO.File]::GetAccessControl($path)',
     '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
-    'if ($acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
+    // Codex UiXEn: assert the file OWNER is the current user too, not just the
+    // DACL. A Windows file owner retains implicit WRITE_DAC and could rewrite
+    // the ACL later, so protectWindowsPrivateFile now takes ownership
+    // ($acl.SetOwner) and verifies it; this helper mirrors that check so the
+    // token/session-log ACL tests fail if ownership is not taken.
+    'if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
   ].join('; ');
   return spawnSync(
     'powershell.exe',
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { encoding: 'utf8', windowsHide: true },
+    // Bound the child: a synchronous spawnSync cannot be interrupted by the
+    // surrounding test's own `{ timeout }`, so a hung powershell.exe would
+    // block this worker indefinitely. Match protectWindowsPrivateFile's own
+    // 15s ACL budget (UiTM3).
+    { encoding: 'utf8', windowsHide: true, timeout: 15_000 },
   );
 };
 
@@ -1108,17 +1118,45 @@ test('resolvePowerShellExecutable prefers the hard-coded system root when it is 
 
 test('resolvePowerShellExecutable rejects an env root that does not look like a Windows install', () => {
   // An attacker-controlled SystemRoot whose final path component is not
-  // "Windows" must never be trusted, even if the hard-coded root is (for
-  // this test's purposes) reported as missing and the planted path reports
-  // a powershell.exe present.
+  // "Windows" must never be trusted, even when the hard-coded C:\Windows probe
+  // is unavailable and the attacker HAS planted a powershell.exe at their own
+  // tree. pathExists returns true only for the planted path, so the hard-coded
+  // root reports as untrusted (its powershell.exe "does not exist") and the
+  // env root's planted binary "does exist" -- the ONLY reason it is still
+  // rejected is the shape check (basename "planted" != "Windows"). The prior
+  // `pathExists: () => false` stub passed vacuously because nothing existed at
+  // all, never exercising the shape-rejection branch (UiTMV).
   const resolved = resolvePowerShellExecutable({
     env: { SystemRoot: 'C:\\Users\\attacker\\planted' },
-    pathExists: () => false,
+    pathExists: (candidate) => candidate.startsWith('C:\\Users\\attacker\\planted'),
   });
   assert.equal(
     resolved.replace(/\\/g, '/').toLowerCase(),
     'c:/windows/system32/windowspowershell/v1.0/powershell.exe',
   );
+  assert.doesNotMatch(resolved, /attacker|planted/i);
+});
+
+test('resolvePowerShellExecutable rejects a Windows-shaped env root that is not anchored to a drive root', () => {
+  // Codex UiTMt: existence + basename "Windows" is not enough. An unprivileged
+  // attacker who controls only the SystemRoot env var can create a directory
+  // they own, e.g. C:\Users\<user>\Windows, plant a powershell.exe at the exact
+  // matching relative path, and -- if the hard-coded C:\Windows probe is
+  // unavailable -- get that arbitrary binary handed to execFile. pathExists
+  // reports the hard-coded root missing and the planted tree present, so only
+  // the drive-root-anchoring shape check (Windows must sit directly at X:\)
+  // stands between the attacker and code execution. The resolved path must be
+  // the hard-coded C:\Windows, never the planted nested tree.
+  const plantedRoot = 'C:\\Users\\attacker\\Windows';
+  const resolved = resolvePowerShellExecutable({
+    env: { SystemRoot: plantedRoot },
+    pathExists: (candidate) => candidate.startsWith(plantedRoot),
+  });
+  assert.equal(
+    resolved.replace(/\\/g, '/').toLowerCase(),
+    'c:/windows/system32/windowspowershell/v1.0/powershell.exe',
+  );
+  assert.doesNotMatch(resolved, /users|attacker/i);
 });
 
 test('resolvePowerShellExecutable falls back to an env root only when it is Windows-shaped and verified', () => {
@@ -1134,6 +1172,101 @@ test('resolvePowerShellExecutable falls back to an env root only when it is Wind
     resolved.replace(/\\/g, '/').toLowerCase(),
     'd:/windows/system32/windowspowershell/v1.0/powershell.exe',
   );
+});
+
+const reclaimReadClaimText = async (target) => {
+  try {
+    return await readFile(target, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+test('reclaimStaleCollectorClaim restores a same-identity successor claim instead of deleting it', async () => {
+  // Codex UkNET/UkXzk: the dev/ino/ctimeMs identity match that gates the stale
+  // reclaim has only filesystem/clock resolution. On a filesystem with rapid
+  // inode reuse, a peer that unlinked this stale claim and wrote its own
+  // successor can land on the exact same inode with a same-millisecond ctimeMs
+  // collision, so isSameLockIdentity(inspected, current) returns true even
+  // though the path now names a LIVE successor. Model that gap directly: what
+  // is on disk IS the successor (so the fresh lstat identity trivially matches
+  // the captured one -- nothing changed), but the content this launch
+  // inspected earlier (claimText) was the stale record. The reclaim must
+  // quarantine, notice the content no longer matches, restore the successor to
+  // its original name, and back off -- never delete the peer's live claim.
+  // Mirrors pr_closeout_workflow.test.js's "restores a live successor lock when
+  // a guard-failure identity match is later proven wrong".
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-collision-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const staleContent = '40000\nstale-instance\n999999\n';
+  const successorContent = `41000\nlive-instance\n${process.pid}\n`;
+  try {
+    await writeFile(claimFile, successorContent, 'utf8');
+    const claimInfo = await lstat(claimFile);
+    const status = await reclaimStaleCollectorClaim(claimFile, {
+      claimInfo,
+      claimText: staleContent,
+      readClaimText: reclaimReadClaimText,
+    });
+    assert.equal(status, 'restored', 'a same-identity successor must be restored, not reclaimed');
+    assert.equal(existsSync(claimFile), true, 'the live successor claim must survive the reclaim');
+    assert.equal(
+      await readFile(claimFile, 'utf8'),
+      successorContent,
+      'the successor claim must be restored to its original path with its content intact',
+    );
+    assert.deepEqual(await readdir(dir), ['collector_claim'], 'no quarantine copy may be left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reclaimStaleCollectorClaim deletes a genuinely stale claim whose content is unchanged', async () => {
+  // The other side of the quarantine gate: when the quarantined entry is
+  // byte-for-byte the same stale record this launch inspected, it is the real
+  // stale claim and is removed so the next exclusive-create attempt can win.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-stale-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const staleContent = '40000\nstale-instance\n999999\n';
+  try {
+    await writeFile(claimFile, staleContent, 'utf8');
+    const claimInfo = await lstat(claimFile);
+    const status = await reclaimStaleCollectorClaim(claimFile, {
+      claimInfo,
+      claimText: staleContent,
+      readClaimText: reclaimReadClaimText,
+    });
+    assert.equal(status, 'reclaimed');
+    assert.equal(existsSync(claimFile), false, 'the stale claim must be removed');
+    assert.deepEqual(await readdir(dir), [], 'no quarantine copy may be left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reclaimStaleCollectorClaim backs off without touching a claim whose identity no longer matches', async () => {
+  // A concurrent launch already replaced the inspected record: the captured
+  // identity no longer matches what is on disk, so this launch must leave the
+  // successor alone rather than quarantine or delete it.
+  const dir = await mkdtemp(path.join(tmpdir(), 'debug-claim-backoff-'));
+  const claimFile = path.join(dir, 'collector_claim');
+  const successorContent = `41000\nlive-instance\n${process.pid}\n`;
+  try {
+    await writeFile(claimFile, successorContent, 'utf8');
+    // A captured identity from a different inode/device than the file now on
+    // disk; isSameLockIdentity rejects it (dev/ino mismatch) with no reliance
+    // on platform-specific inode values.
+    const status = await reclaimStaleCollectorClaim(claimFile, {
+      claimInfo: { dev: 1, ino: 424242, nlink: 1, ctimeMs: 1000 },
+      claimText: '40000\nstale-instance\n999999\n',
+      readClaimText: reclaimReadClaimText,
+    });
+    assert.equal(status, 'backed-off');
+    assert.equal(await readFile(claimFile, 'utf8'), successorContent, 'the successor claim must be untouched');
+    assert.deepEqual(await readdir(dir), ['collector_claim'], 'nothing may be quarantined on a back-off');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('refuses to write the launch token through a hard-linked collector_token', { timeout: 20000 }, async () => {
@@ -2339,6 +2472,78 @@ test(
 );
 
 test(
+  'install.sh preserves a foreign dangling symlink at the destination when the commit move fails',
+  { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: dangling symlink + PATH-shimmed mv fault injection'), timeout: 15000 },
+  async () => {
+    // Codex UkXzr (install.sh:230): restore_from_backup's foreign-content guard
+    // was `-e "$dest"` alone, which follows a symlink and is FALSE for a
+    // dangling one. If a concurrent actor plants a dangling symlink at the
+    // destination after preflight and the commit `mv` then fails, the guard
+    // (require_backup=true, empty backup) was skipped and control fell through
+    // to `rm -rf -- "$dest"`, deleting a destination this run neither created
+    // nor backed up -- violating the rollback contract that genuinely foreign
+    // content is preserved. Shadow `mv` on PATH so the commit move fails after
+    // planting exactly that dangling symlink, deterministically reproducing the
+    // TOCTOU state without touching install.sh; assert the symlink survives.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-dangling-race-home-'));
+    const shimDir = await mkdtemp(path.join(tmpdir(), 'install-dangling-race-shim-'));
+    const target = path.join(home, '.codex', 'skills', 'debug');
+    const missingTarget = path.join(home, 'nowhere', 'does-not-exist');
+    try {
+      const realMv = spawnSync('sh', ['-c', 'command -v mv'], { encoding: 'utf8' }).stdout.trim();
+      assert.notEqual(realMv, '', 'a real mv executable is required for the fixture');
+      // Intercept only the commit move (stage -> destination, destination still
+      // absent): plant a dangling symlink at the destination and fail, so
+      // restore_from_backup then runs with an empty backup over foreign
+      // content. Every other mv (staging, backups) has different args and
+      // delegates to the real executable.
+      await writeFile(
+        path.join(shimDir, 'mv'),
+        [
+          '#!/bin/sh',
+          'last=""',
+          'for a in "$@"; do last="$a"; done',
+          `if [ "$last" = "${target}" ] && [ ! -e "${target}" ] && [ ! -L "${target}" ]; then`,
+          `  mkdir -p "$(dirname "${target}")"`,
+          `  ln -s "${missingTarget}" "${target}"`,
+          '  exit 1',
+          'fi',
+          `exec "${realMv}" "$@"`,
+          '',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+
+      const installer = toBashPath(path.join(__dirname, '..', 'tools', 'install.sh'));
+      const res = spawnSync('bash', [installer, '--home', toBashPath(home), '--target', 'codex'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
+        timeout: 10000,
+      });
+      // A killed spawnSync reports status === null, which assert.notEqual(0)
+      // would pass even on a hang; require a real exit code first (mirroring
+      // the sibling mv-race test above).
+      assert.equal(
+        typeof res.status,
+        'number',
+        `installer must exit on its own, not hang (signal=${res.signal}, error=${res.error?.code})`,
+      );
+      assert.notEqual(res.status, 0, `installer must fail when the commit move fails: ${JSON.stringify(res)}`);
+      assert.match(res.stderr || '', /Failed to install/, `must report the commit failure: ${JSON.stringify(res)}`);
+
+      // The core guarantee: the foreign dangling symlink is preserved, not
+      // deleted by the rollback's rm -rf (which the missing -L half allowed).
+      const linkInfo = await lstat(target);
+      assert.equal(linkInfo.isSymbolicLink(), true, 'the foreign dangling symlink must be preserved, not removed during rollback');
+      await assert.rejects(() => stat(target), { code: 'ENOENT' }, 'the preserved symlink must still be dangling (its target untouched)');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(shimDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'install.sh rejects a symlink payload entry before staging',
   { skip: (!bashAvailable && 'bash is required') || (process.platform === 'win32' && 'POSIX-only: symlink'), timeout: 30000 },
   async () => {
@@ -2700,6 +2905,101 @@ test(
         existsSync(path.join(destination, 'SKILL.md')),
         false,
         'a recreated-then-nested destination must not be reported as a valid installed payload',
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      await rm(shimDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'install.ps1 warns when it cannot remove a mis-nested stage during a failed commit',
+  { skip: (!pwshAvailable && 'pwsh is required') || (process.platform !== 'win32' && 'Windows-only: install.ps1 is a Windows installer'), timeout: 30000 },
+  async () => {
+    // Codex UiTNM (install.ps1:268): when the destination is recreated as a
+    // directory mid-commit AND was absent at the backup check ($item.Backup is
+    // $null), the nested-stage cleanup used a bare
+    // `Remove-Item ... -ErrorAction SilentlyContinue`. A failed removal then
+    // left a stray .debug-install-stage.* directory inside a
+    // concurrently-created foreign destination with ZERO operator signal -- the
+    // $item.Backup-truthy restore branch that DOES warn is skipped in this
+    // null-Backup case. Force both conditions deterministically by shadowing
+    // Move-Item (to nest the stage, as the sibling Uert8 test does) AND
+    // Remove-Item (to throw only for the nested stage directly under the
+    // destination); assert the operator now gets a warning instead of silence.
+    const home = await mkdtemp(path.join(tmpdir(), 'install-nest-warn-home-'));
+    const shimDir = await mkdtemp(path.join(tmpdir(), 'install-nest-warn-shim-'));
+    const scriptPath = path.join(__dirname, '..', 'tools', 'install.ps1');
+    const destination = path.join(home, '.codex', 'skills', 'debug');
+    const wrapperPath = path.join(shimDir, 'wrapper.ps1');
+    try {
+      const escapedTarget = destination.replace(/'/g, "''");
+      const escapedScript = scriptPath.replace(/'/g, "''");
+      await writeFile(
+        wrapperPath,
+        [
+          'param(',
+          '    [string]$Target,',
+          '    [string]$HomePath,',
+          '    [switch]$Force',
+          ')',
+          '',
+          '# Nest the staged payload one level too deep, exactly like the TOCTOU',
+          '# race the installer must detect (mirrors the sibling Uert8 test).',
+          'function Move-Item {',
+          '    [CmdletBinding()]',
+          '    param(',
+          '        [Parameter(Mandatory)][string]$LiteralPath,',
+          '        [Parameter(Mandatory)][string]$Destination',
+          '    )',
+          `    if ($Destination -eq '${escapedTarget}' -and -not (Test-Path -LiteralPath $Destination)) {`,
+          '        New-Item -ItemType Directory -Path $Destination -Force | Out-Null',
+          '    }',
+          '    Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters',
+          '}',
+          '',
+          '# Fail ONLY the mis-nested-stage cleanup (a .debug-install-stage.*',
+          '# path directly under the destination). Every other removal (sibling',
+          '# stage, rollback, locks) delegates to the real cmdlet untouched.',
+          'function Remove-Item {',
+          '    [CmdletBinding()]',
+          '    param(',
+          '        [Parameter(Mandatory)][string]$LiteralPath,',
+          '        [switch]$Recurse,',
+          '        [switch]$Force',
+          '    )',
+          `    if ((Split-Path -Parent $LiteralPath) -eq '${escapedTarget}' -and (Split-Path -Leaf $LiteralPath) -like '.debug-install-stage.*') {`,
+          '        throw "simulated cleanup failure: nested stage is locked"',
+          '    }',
+          '    Microsoft.PowerShell.Management\\Remove-Item @PSBoundParameters',
+          '}',
+          '',
+          `. '${escapedScript}' -Target $Target -HomePath $HomePath -Force:$Force`,
+          '',
+        ].join('\n'),
+      );
+      const res = spawnSync(
+        'pwsh',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath, '-Target', 'Codex', '-HomePath', home, '-Force'],
+        { encoding: 'utf8' },
+      );
+      assert.notEqual(res.status, 0, `installer must still fail the commit: ${JSON.stringify(res)}`);
+      // PowerShell may route Write-Warning to either stdout or stderr under
+      // -File, so assert against both streams (mirroring the reparse-point
+      // tests' combined match above).
+      const combined = (res.stderr || '') + (res.stdout || '');
+      assert.match(combined, /became a directory during commit/, `must still throw the nested-directory error: ${JSON.stringify(res)}`);
+      // The fix: the previously-silent cleanup failure now surfaces a warning.
+      assert.match(
+        combined,
+        /Cleanup warning: could not remove mis-nested stage under/,
+        `a failed nested-stage cleanup must warn the operator, not fail silently: ${JSON.stringify(res)}`,
+      );
+      assert.doesNotMatch(
+        res.stdout || '',
+        /"status":\s*"installed"/,
+        `a failed commit must never emit a JSON success record: ${JSON.stringify(res)}`,
       );
     } finally {
       await rm(home, { recursive: true, force: true });

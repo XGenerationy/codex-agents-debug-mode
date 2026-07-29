@@ -42,11 +42,13 @@ const normalizePath = (file) => String(file).replaceAll('\\', '/').replace(/^\.\
 
 /**
  * True when `file` is one of the paths that define or configure validation
- * strength: CI workflows, package manifests/lockfiles, linter/formatter
- * configs, Makefiles (including GNU make's alternate default filenames),
- * test-runner configs, and the closeout tool's own config file. This is the
- * classifier classifyGateIntegrity uses to decide which changed files
- * require a live review attestation instead of passing on trust.
+ * strength: CI workflows, package manifests/lockfiles across ecosystems
+ * (JS/TS, Python, Rust, Go, Yarn, Bun), linter/formatter configs, Makefiles
+ * (including GNU make's alternate default filenames), test-runner configs,
+ * the closeout tool's own config file, and this repository's authoritative
+ * `.codereview.yml` gate config. This is the classifier classifyGateIntegrity
+ * uses to decide which changed files require a live review attestation instead
+ * of passing on trust.
  * @param {string} file
  * @returns {boolean}
  */
@@ -65,6 +67,14 @@ const isGateFile = (file) => {
     // actually discovers is treated as a gate change.
     || /^(?:gnu)?makefile(?:\..+)?$/.test(base)
     || /^(?:pnpm-lock\.yaml|pnpm-workspace\.yaml|package-lock\.json|npm-shrinkwrap\.json|lerna\.json|nx\.json|turbo\.json|biome(?:\..+)?\.jsonc?|tsconfig(?:\..+)?\.json)$/.test(base)
+    // Non-JS validation manifests/lockfiles (Python: pyproject.toml, pytest.ini,
+    // tox.ini; Rust: Cargo.toml; Go: go.mod; Yarn: yarn.lock; Bun: bun.lock) plus
+    // this repo's own authoritative gate config (.codereview.yml, self-declared as
+    // the single source auditors read to understand the gate). Deleting a test
+    // command, coverage threshold, or dependency lock from any of these weakens
+    // validation exactly as editing package.json or a workflow does. Exact
+    // basenames only, so a random foo.toml / notes.ini is not treated as a gate file.
+    || /^(?:pyproject\.toml|pytest\.ini|tox\.ini|cargo\.toml|go\.mod|yarn\.lock|bun\.lock|\.codereview\.ya?ml)$/.test(base)
     || /^(?:vitest|vite|jest|playwright|cypress|eslint)(?:\.[^.]+)*\.config\.[a-z0-9]+$/.test(base)
     || /(?:^|\/)\.?pr-closeout(?:\.[^/]+)?\.json$/.test(normalized);
 };
@@ -147,12 +157,12 @@ const VALIDATION_REMOVAL_PATTERNS = [
  * a caller-supplied `review` object (self-attestation) is never sufficient.
  * Anything short of that is BLOCKED, pending human review.
  * @param {object} options destructured: changedFiles, addedLines,
- *   deletedFiles, configuredCommands, baseSha, headSha, configDigest,
- *   attestation.
+ *   deletedFiles, proseAddedLines, configuredCommands, baseSha, headSha,
+ *   configDigest, attestation.
  * @returns {{status: 'PASS'|'FAIL'|'BLOCKED', evidence: string}}
  */
 const classifyGateIntegrity = ({
-  changedFiles = [], addedLines = [], removedLines = [], deletedFiles = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
+  changedFiles = [], addedLines = [], removedLines = [], deletedFiles = [], proseAddedLines = [], configuredCommands = [], baseSha, headSha, configDigest, attestation,
 } = {}) => {
   const gateFiles = changedFiles.filter(isGateFile);
   const configured = [...new Set(configuredCommands)].sort();
@@ -183,10 +193,29 @@ const classifyGateIntegrity = ({
       evidence: `Validation steps were removed from gate files: ${validationRemovals.slice(0, 5).join(' | ')}`,
     };
   }
-  const suppressionFindings = scanSuppressionText('__gate__.json', addedLines.join('\n'));
-  const joinedAddedLines = addedLines.join('\n');
+  // proseAddedLines (readGateChanges) marks added lines that came from
+  // .codereview.yml/.codereview.yaml — a declarative, non-executable gate
+  // config whose prose can legitimately name a bypass flag while describing
+  // what a check requires (e.g. "an existing target without --force"). The
+  // patterns below are designed to catch flags in executable invocations, so
+  // they would false-positive on that prose; subtract those lines (by exact
+  // text, multiset-safe for duplicates) before scanning. Every other gate
+  // file's added lines are unaffected, and .codereview.yml's removedLines
+  // stay fully subject to VALIDATION_REMOVAL_PATTERNS above and its
+  // whole-file deletion stays covered by deletedGateFiles — only the
+  // executable-invocation weakening scan is narrowed.
+  const proseRemaining = new Map();
+  for (const line of proseAddedLines) proseRemaining.set(line, (proseRemaining.get(line) || 0) + 1);
+  const weakeningScanLines = addedLines.filter((line) => {
+    const remaining = proseRemaining.get(line) || 0;
+    if (remaining <= 0) return true;
+    proseRemaining.set(line, remaining - 1);
+    return false;
+  });
+  const suppressionFindings = scanSuppressionText('__gate__.json', weakeningScanLines.join('\n'));
+  const joinedAddedLines = weakeningScanLines.join('\n');
   const weakening = [
-    ...addedLines.filter((line) => WEAKENING_PATTERNS.some((pattern) => pattern.test(line))),
+    ...weakeningScanLines.filter((line) => WEAKENING_PATTERNS.some((pattern) => pattern.test(line))),
     ...MULTILINE_WEAKENING_PATTERNS
       .map((pattern) => joinedAddedLines.match(pattern))
       .filter(Boolean)
@@ -205,8 +234,14 @@ const classifyGateIntegrity = ({
   // overflow, an oversized/missing/symlinked untracked gate file) leaves the
   // gate change set unscannable. Refuse to PASS on attestation alone in that
   // case — the closeout gate cannot prove no weakening was introduced when it
-  // could not read the complete diff.
-  const decodeErrors = addedLines.filter((line) => String(line).includes('__decode_error__'));
+  // could not read the complete diff. Scanned on weakeningScanLines rather
+  // than addedLines for the same reason as the pattern scan above:
+  // .codereview.yml documents this exact marker in prose ("...or any
+  // __decode_error__ in the gate diff"). This stays fail-closed because a
+  // genuine decode-error marker is never added to proseAddedLines (readGateChanges
+  // only tags real file content, never its own synthetic error markers), so
+  // it is never subtracted out of weakeningScanLines.
+  const decodeErrors = weakeningScanLines.filter((line) => String(line).includes('__decode_error__'));
   if (decodeErrors.length) {
     return {
       status: 'FAIL',

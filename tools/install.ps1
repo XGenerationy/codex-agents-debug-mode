@@ -265,7 +265,12 @@ try {
         # failed move, mirroring the Bash installer's equivalent POSIX mv check.
         $nestedStage = Join-Path $item.Destination (Split-Path -Leaf $item.Stage)
         if (Test-DestinationOccupied -Path $nestedStage) {
-            Remove-Item -LiteralPath $nestedStage -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Remove-Item -LiteralPath $nestedStage -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Cleanup warning: could not remove mis-nested stage under $($item.Destination): $($_.Exception.Message)"
+            }
             if ($item.Backup -and (Test-DestinationOccupied -Path $item.Backup)) {
                 if (Test-DestinationOccupied -Path $item.Destination) {
                     Remove-Item -LiteralPath $item.Destination -Recurse -Force -ErrorAction SilentlyContinue

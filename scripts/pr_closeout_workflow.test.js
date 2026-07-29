@@ -409,7 +409,13 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
       }),
       /already locked by this closeout process/i,
     );
-    assert.equal(reads, 2, 'the guard-failure identity mismatch must retry rather than rename the successor away');
+    // Do not assert an exact read count here. Two paths are both correct
+    // product behavior: the identity-mismatch-only path (2 reads) and, when a
+    // same-millisecond reused-inode collision defeats the dev/ino/ctimeMs
+    // guard, the collision-recovery path (quarantine -> re-read -> restore,
+    // which spends a 3rd guarded read before restoring the successor). Assert
+    // only the externally-visible invariants that hold for both: the successor
+    // survives (below) and the reclaim is rejected (assert.rejects above).
     assert.equal(await fs.readFile(lockPath, 'utf8'), successor);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
@@ -1229,6 +1235,15 @@ test('preserves failed generator execution details in the row and baseline signa
   assert.equal(row.durationMs, 1);
   assert.equal(baselineHeadResult.exitCode, 17);
   assert.equal(baselineHeadResult.stdout, 'generator exploded');
+  // Fail control for the BASELINE reclassification companion test below: with a
+  // passthrough verifyBaseline the head FAIL is not reclassified, so it must
+  // propagate into the shared reproducibility status (which evaluateOverallStatus
+  // reads independently of the row) and into the overall verdict. Without this,
+  // nothing pins reproducibility.status/overallStatus for the un-reclassified
+  // generator-failure case, so a regression that stopped propagating the
+  // failure could slip through green.
+  assert.equal(result.report.reproducibility.status, 'FAIL');
+  assert.equal(result.report.overallStatus, 'FAIL');
 });
 
 test('propagates a generator baseline reclassification into the shared reproducibility status', async () => {
@@ -1254,12 +1269,20 @@ test('propagates a generator baseline reclassification into the shared reproduci
     }
     return result;
   };
-  fixture.dependencies.verifyBaseline = async ({ headResult }) => ({
-    ...headResult,
-    status: 'BASELINE',
-    blocking: true,
-    evidence: 'Failure reproduced exactly at base commit; not a regression.',
-  });
+  // Only reclassify a row that actually failed at head, matching the real
+  // verifyBaseline contract (mirror FAIL -> BASELINE when it reproduces at
+  // base; pass any non-FAIL row through untouched). This keeps a future change
+  // that started routing passing rows through verifyBaseline from silently
+  // holding the BASELINE/BLOCKED assertions below green.
+  fixture.dependencies.verifyBaseline = async ({ headResult }) =>
+    headResult.status === 'FAIL'
+      ? {
+        ...headResult,
+        status: 'BASELINE',
+        blocking: true,
+        evidence: 'Failure reproduced exactly at base commit; not a regression.',
+      }
+      : headResult;
 
   const result = await runCloseoutWorkflow({
     repo: 'C:/repo',

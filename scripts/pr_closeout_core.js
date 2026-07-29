@@ -924,9 +924,19 @@ const scanSuppressionText = (file, text) => {
   //   - Vitest's describe.skipIf(cond)(...) / it.skipIf(cond)(...) conditional
   //     skip call-chain, distinct from the unconditional `.skip` already
   //     covered above.
-  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?:true|['"][^'"]*['"])/;
+  // A `skip:` option only skips under node:test when its value is truthy: the
+  // boolean `true` or a NON-EMPTY string reason. An empty-string reason
+  // (`skip: ''` / `skip: ""`) is falsy and the test still runs, so the string
+  // alternative requires at least one character (`[^'"]+`, not `[^'"]*`) — an
+  // empty reason must not be flagged as a skip (Codex UiTMl false positive).
+  const optionObjectSkip = /\b(?:describe|it|test|context|suite)\s*\(\s*(?:[^,(){}]*,\s*)?\{[^{}]*\bskip\s*:\s*(?:true|['"][^'"]+['"])/;
   const mochaRuntimeSkip = /\bthis\s*\.\s*skip\s*\(\s*\)/;
-  const vitestSkipIf = /\b(?:describe|it|test|context|suite)\s*(?:\?\.)?\s*\.\s*skipIf\s*\(/;
+  // Accept exactly ONE separator before skipIf — a bare `.` OR the optional-
+  // chaining `?.` — via `\??\.`. The prior `(?:\?\.)?\s*\.` consumed an
+  // optional `?.` and then STILL required a literal `.`, so the only `?.` form
+  // it could match was the syntactically-invalid `it?..skipIf(`; the real
+  // `it?.skipIf(cond)(...)` fell through undetected (Codex UiTMl dead branch).
+  const vitestSkipIf = /\b(?:describe|it|test|context|suite)\s*\??\.\s*skipIf\s*\(/;
   const testWeakening = new RegExp(
     [
       /\b(?:describe|it|test|context|suite)(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*(?:\s*(?:\/\*[\s\S]*?\*\/\s*)*\??\.\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:skip|only|todo))\b/.source,
@@ -1293,6 +1303,39 @@ const scanSuppressionText = (file, text) => {
     if (!findings.some((f) => f.category === 'test-weakening' && f.file === file)) {
       const windowWeakening = new RegExp(testWeakening.source, 'i');
       const bareReceiver = /\b(?:describe|it|test|context|suite)\s*(?:\/\*[\s\S]*?\*\/\s*)*$/;
+      // A node:test-style option-object skip opens the multiline window
+      // differently from the `test\n.only` member-access split: its first line
+      // is `test('name', {` — it ends in an open brace, NOT a bare receiver, so
+      // `bareReceiver` never fires and the collapsed-window rescan (which
+      // includes optionObjectSkip) never runs on the reassembled text (Codex
+      // UiNu2). Detect the other opener too: a receiver call
+      // `(describe|it|test|context|suite)(` whose parentheses are still open at
+      // end of the stripped line AND that already has an options-object `{`
+      // open inside them. strippedLines already have strings/templates/comments
+      // removed, so a plain paren/brace depth walk cannot be fooled by braces
+      // or parens sitting inside a quoted argument.
+      const opensOptionObjectCall = (stripped) => {
+        const receiver = /\b(?:describe|it|test|context|suite)\s*\(/g;
+        let m;
+        while ((m = receiver.exec(stripped))) {
+          let parenDepth = 1;
+          let braceDepth = 0;
+          for (let k = m.index + m[0].length; k < stripped.length; k += 1) {
+            const ch = stripped[k];
+            if (ch === '(') parenDepth += 1;
+            else if (ch === ')') {
+              parenDepth -= 1;
+              if (parenDepth === 0) break;
+            } else if (ch === '{') braceDepth += 1;
+            else if (ch === '}' && braceDepth > 0) braceDepth -= 1;
+          }
+          // Call did not close on this line and an options object is still open
+          // inside its arguments — the `skip:` option (if any) lands on a later
+          // line, so open a window and let windowWeakening rescan the collapse.
+          if (parenDepth > 0 && braceDepth > 0) return true;
+        }
+        return false;
+      };
       // Lookahead window for bare-receiver splits, counted in CODE-BEARING
       // lines (non-blank after comment/quote stripping) rather than raw lines:
       // a raw line-count cap is reachable purely by blank/comment padding, so
@@ -1316,10 +1359,13 @@ const scanSuppressionText = (file, text) => {
       });
       for (let c = 0; c < codeIndices.length; c += 1) {
         const i = codeIndices[c];
-        // Only start a window when the stripped line ends with a bare test
-        // receiver (so quoted fixtures like `'describe.only(...)'` on a
-        // single line are not re-scanned without string inertness).
-        if (!bareReceiver.test(strippedLines[i].trimEnd())) continue;
+        // Start a window when the stripped line ends with a bare test receiver
+        // (the `test\n.only` member-access split — quoted fixtures like
+        // `'describe.only(...)'` on a single line are not re-scanned without
+        // string inertness) OR when it opens an unclosed option-object test
+        // call (the multiline `test('name', {\n skip: true\n}, fn)` form).
+        if (!bareReceiver.test(strippedLines[i].trimEnd())
+          && !opensOptionObjectCall(strippedLines[i])) continue;
         const windowText = codeIndices.slice(c, c + RECEIVER_LOOKAHEAD)
           .map((index) => strippedLines[index])
           .join('\n')

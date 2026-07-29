@@ -384,10 +384,105 @@ const detectValidationRemovals = (baseSha, gateFiles) => {
   return findings;
 };
 
+// Package-manifest descriptive fields carry no validation semantics: a routine
+// value edit (`"version": "1.2.3"` -> `"1.2.4"`, a reworded `"description"`,
+// ...) removes the old line but weakens no gate, yet the fail-closed
+// content-removal catch-all would flag every such removed line and fail CI.
+// Treat a same-field value replacement as a safe modification. This is
+// deliberately an ALLOWLIST (fail closed): any key NOT listed keeps failing
+// exactly as before, so a lowered coverage threshold, a replaced smoke/verify
+// step, a dependency edit, or any other non-metadata removal is never exempted.
+const SAFE_METADATA_KEY = /^["']?(version|description|author|license|homepage|repository|bugs|funding|keywords|contributors|maintainers)["']?\s*[:=]/i;
+
 /**
- * Any substantive deleted content in gate files (not blank/comment-only).
- * Used by CI to fail-closed on replacements that neutralize smoke checks
- * without matching VALIDATION_REMOVAL_PATTERNS (Codex #4781495663).
+ * Extract the leading allowlisted descriptive-metadata key from a trimmed diff
+ * line body (`"version": "1.2.3",` -> `version`), or null when the line is not
+ * a single-field descriptive edit.
+ * @param {string} body diff line with the leading +/- stripped and trimmed
+ * @returns {string|null}
+ */
+const metadataKey = (body) => {
+  const match = SAFE_METADATA_KEY.exec(body);
+  return match ? match[1].toLowerCase() : null;
+};
+
+/**
+ * True when a removed gate line and its same-position replacement are a value-
+ * only edit of the SAME descriptive-metadata field (a benign modification, not
+ * a validation removal). Fails closed: requires both sides to resolve to the
+ * same allowlisted key, and reuses VALIDATION_REMOVAL_PATTERNS so a descriptive
+ * value that smuggles a validation command (`"description": "run npm test"`),
+ * or a replacement that itself reads as a removed validation line, still fails.
+ * A pure deletion (no replacement) is never routed here.
+ * @param {string} removedLine unified-diff line starting with `-`
+ * @param {string} addedLine unified-diff line starting with `+`
+ * @returns {boolean}
+ */
+const isSafeMetadataReplacement = (removedLine, addedLine) => {
+  const removedKey = metadataKey(removedLine.slice(1).trim());
+  const addedKey = metadataKey(addedLine.slice(1).trim());
+  if (!removedKey || removedKey !== addedKey) return false;
+  // Re-anchor the added line as a removal so the `^\-`-anchored validation
+  // patterns can test whether the replacement itself reads as validation.
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  return true;
+};
+
+/**
+ * Collect substantive removed gate lines from a `--unified=0` diff, pairing
+ * each removed (`-`) line with the added (`+`) line at the same position within
+ * its hunk. A pure DELETION (no positional replacement) is always collected;
+ * a same-field descriptive value replacement (isSafeMetadataReplacement) is
+ * skipped as a benign modification. With `--unified=0` each contiguous change
+ * is its own hunk whose removed lines all precede its added lines, so index
+ * pairing aligns old<->new; hunk/file boundaries flush the pairing buffers so a
+ * removed line never pairs across a hunk. Blank/comment-only removals are
+ * ignored exactly as before.
+ * @param {string} diff unified diff text (produced with unified=0)
+ * @returns {string[]} truncated removed lines that are not safe replacements
+ */
+const collectContentRemovals = (diff) => {
+  const findings = [];
+  let removed = [];
+  let added = [];
+  const flushHunk = () => {
+    for (let i = 0; i < removed.length; i += 1) {
+      const line = removed[i];
+      const body = line.slice(1).trim();
+      // Keep `--coverage` / `--strict` removals: only skip blanks and comments.
+      if (!body || body.startsWith('#')) continue;
+      const replacement = added[i];
+      // A same-position replacement that is a benign metadata value edit is not
+      // a content removal; a pure deletion (undefined) always fails closed.
+      if (replacement !== undefined && isSafeMetadataReplacement(line, replacement)) continue;
+      findings.push(line.slice(0, 200));
+    }
+    removed = [];
+    added = [];
+  };
+  for (const line of diff.split(/\r?\n/)) {
+    // Hunk / file boundaries flush the buffers so pairing never spans blocks.
+    if (line.startsWith('@@') || isUnifiedDiffFileHeader(line) || line.startsWith('+++ ')) {
+      flushHunk();
+      continue;
+    }
+    if (line.startsWith('-')) removed.push(line);
+    else if (line.startsWith('+')) added.push(line);
+  }
+  flushHunk();
+  return findings;
+};
+
+/**
+ * Any substantive deleted content in gate files (not blank/comment-only, and
+ * not a benign same-field metadata value edit). Used by CI to fail-closed on
+ * replacements that neutralize smoke checks without matching
+ * VALIDATION_REMOVAL_PATTERNS (Codex #4781495663). A pure line MODIFICATION of
+ * an allowlisted descriptive field (e.g. a `package.json` version/description
+ * bump) is not a removal; a pure DELETION, a lowered threshold, or any other
+ * replacement still fails closed (see collectContentRemovals).
  * @param {string} baseSha
  * @param {string[]} gateFiles
  * @returns {string[]} truncated removed lines
@@ -400,15 +495,7 @@ const detectGateContentRemovals = (baseSha, gateFiles) => {
   } catch (error) {
     throw new Error(`Failed to read gate diff for content-removal scan: ${error.message}`);
   }
-  const findings = [];
-  for (const line of diff.split(/\r?\n/)) {
-    // Keep `--coverage` / `--strict` removals: only skip real file headers.
-    if (!line.startsWith('-') || isUnifiedDiffFileHeader(line)) continue;
-    const body = line.slice(1).trim();
-    if (!body || body.startsWith('#')) continue;
-    findings.push(line.slice(0, 200));
-  }
-  return findings;
+  return collectContentRemovals(diff);
 };
 
 /**
@@ -458,6 +545,11 @@ const main = async () => {
     changedFiles: gate.changedFiles,
     addedLines: gate.addedLines,
     deletedFiles: gate.deletedFiles,
+    // .codereview.yml's added lines are prose (see readGateChanges /
+    // classifyGateIntegrity) and can legitimately name a flag like --force
+    // while describing a check; without this, classifyGateIntegrity cannot
+    // tell that content apart from an executable invocation adding the flag.
+    proseAddedLines: gate.proseAddedLines,
     baseSha: gateBaseSha,
     headSha,
     configDigest: process.env.CLOSEOUT_CONFIG_DIGEST || 'ci-suppression-scan',
@@ -537,5 +629,7 @@ module.exports = {
   getComparisonStyle,
   resolveBaseSha,
   detectGateContentRemovals,
+  collectContentRemovals,
+  isSafeMetadataReplacement,
   isMechanicalLockfile,
 };

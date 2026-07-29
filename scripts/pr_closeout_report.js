@@ -1,7 +1,7 @@
 const { constants } = require('node:fs');
 const { chmod, mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
-const { assertNotSymlink: assertNotSymlinkShared, openNoFollow } = require('./pr_closeout_fs');
+const { assertNotSymlink: assertNotSymlinkShared, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
 
 /**
  * Escape untrusted report text for Markdown: collapse newlines and replace
@@ -372,6 +372,18 @@ const writeNoFollow = async (target, contents) => {
       throw new Error(
         `Refusing to write evidence report through a non-private file (nlink=${info.nlink}): ${target}`,
       );
+    }
+    // chmod(0600) above only clears Windows' read-only bit; it does not remove
+    // inherited NTFS DACL entries, so a shared or broadly-readable --output-dir
+    // would leave report.json/report.md inheriting that directory's ACL and
+    // readable by other local users. Establish and verify a protected,
+    // current-user-only ACL before any evidence bytes are written, and fail
+    // closed if it cannot be set. No-op on non-Windows. Mirrors the
+    // evidence-log hardening in pr_closeout_process.js.
+    try {
+      protectWindowsPrivateFile(target);
+    } catch {
+      throw new Error(`Failed to protect evidence report with an owner-only ACL: ${target}`);
     }
     await handle.writeFile(contents, 'utf8');
   } finally {

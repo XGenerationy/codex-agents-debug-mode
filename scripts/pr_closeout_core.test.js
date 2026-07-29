@@ -1569,6 +1569,15 @@ test('flags option-object, this.skip(), and .skipIf() executable test-skip forms
       .filter(({ category }) => category === 'test-weakening').length,
     1,
   );
+  // Optional-chaining Vitest skip: `it?.skipIf(cond)(...)` still skips at
+  // runtime when `it` is defined and must be detected too (Codex UiTMl: the
+  // prior regex accepted `?.` only when followed by a redundant literal `.`,
+  // so this valid real-world form was a dead branch that never matched).
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', 'it?.skipIf(cond)("x", () => {});')
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+  );
   // Gating and false-positive controls: outside a test-like file, or inert
   // inside a comment/string, none of these forms should be flagged; nor
   // should an unrelated this.<name>() call or a plain object literal that
@@ -1590,6 +1599,50 @@ test('flags option-object, this.skip(), and .skipIf() executable test-skip forms
   );
   assert.deepEqual(
     scanSuppressionText('src/foo.test.js', 'const cfg = { skip: true };')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  // An empty-string skip reason is falsy under node:test, so the test still
+  // runs — `skip: ''` and `skip: ""` must NOT be flagged (Codex UiTMl false
+  // positive), while `skip: true` and a non-empty reason (asserted above) do.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', "test('x', { skip: '' }, () => {});")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', 'test(\'x\', { skip: "" }, () => {});')
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+});
+
+test('flags multiline option-object skip test forms', () => {
+  // Codex UiNu2: a node:test option-object skip split across lines —
+  //   test('name', {
+  //     skip: true,
+  //   }, fn)
+  // begins with a line that ends in `{`, not a bare receiver, so the multiline
+  // fallback never opened a rescan window and the reassembled `skip: true`
+  // evaded detection even though the single-line form is flagged. The window
+  // must now also open on an unclosed option-object test call.
+  const multilineSkip = "test('name', {\n  skip: true,\n}, async () => {});";
+  assert.equal(
+    scanSuppressionText('src/foo.test.js', multilineSkip)
+      .filter(({ category }) => category === 'test-weakening').length,
+    1,
+    `multiline option-object skip must be flagged: ${JSON.stringify(scanSuppressionText('src/foo.test.js', multilineSkip))}`,
+  );
+  // Control: a multiline options object with no skip must NOT be flagged — the
+  // window opening on an unclosed option-object call must not itself trip.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.test.js', "test('name', {\n  timeout: 5000,\n}, () => {});")
+      .filter(({ category }) => category === 'test-weakening'),
+    [],
+  );
+  // Outside a test-like file the same multiline form is not test-weakening.
+  assert.deepEqual(
+    scanSuppressionText('src/foo.js', multilineSkip)
       .filter(({ category }) => category === 'test-weakening'),
     [],
   );

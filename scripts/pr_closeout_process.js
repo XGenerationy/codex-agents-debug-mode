@@ -1442,6 +1442,95 @@ const cappedAppend = (current, chunk) => {
   return `${current}${chunk}`.slice(0, CAPTURE_LIMIT);
 };
 
+// Alternation of status terms mirrored verbatim from pr_closeout_core.js's
+// STATUS_TERM. Used only by the `test files 0` no-work regex below so it does
+// not fire on a bucket count in a richer summary (`Test Files 0 failed | 2
+// passed`). Kept in sync by hand because pr_closeout_core.js does not export
+// the constant.
+const STREAM_STATUS_TERM = '(?:warn(?:ing)?s?|errors?|problems?|fail(?:ed|ures?|ing)?|skips?|skipped|ignored|deselected|todos?|blocks?|blocked|xfails?|xfailed|xpassed|pending)';
+
+// Streaming no-work detection (Codex UikNz).
+//
+// classifyOutput() in pr_closeout_core.js decides "the test runner did no
+// work" (Jest "No tests found", unittest "Ran 0 tests", Node TAP "# tests 0",
+// Mocha "0 passing", empty TAP "1..0"/"# pass 0", Go/Rust empty packages)
+// from the *capped* combined stdout/stderr -- only the first CAPTURE_LIMIT
+// bytes cappedAppend() retained. A runner that streams more than
+// CAPTURE_LIMIT of output before its terminal no-work summary pushes that
+// summary past the head cap, so classifyOutput never sees it and the check is
+// misreported PASS. The scanners below run on the *raw, uncapped* stream (fed
+// the same chunks as the status scanner) so a late no-work summary is still
+// caught, then thread a signal into result.detectedSignals -- which
+// classifyOutput already honors: any non-empty detectedSignals entry that is
+// not a warn/error/block keyword still short-circuits away from PASS via its
+// `if (signals.length) return FAIL` fallthrough, so no pr_closeout_core.js
+// change is required. The combined-string checks in classifyOutput are left
+// intact (they still power the hasAuthoritativeTestEvidence override for
+// mixed Go/Rust runs within the head cap); this is a second, independent
+// detection path, not a replacement.
+
+// Unconditional no-work: classifyOutput FAILs on these regardless of any
+// other evidence in the stream, so they are always safe to latch and emit.
+const STREAM_NO_WORK_UNCONDITIONAL = [
+  { label: 'no tests found/executed', re: /\bno\s+tests?\s+(?:found|executed|ran|were run|to run)\b/i },
+  { label: 'no test files found', re: /\bno\s+test\s+files?\s+found\b/i },
+  { label: 'ran 0 tests', re: /\bran\s+0\s+tests?\b/i },
+  { label: '0 tests run', re: /\b0\s+tests?\s+(?:run|ran|executed)\b/i },
+  { label: '# tests 0', re: /^[ \t]*#\s*tests?\s+0\b/im },
+  { label: 'tests 0 passed', re: /\btests?\s+0\s+passed\b/i },
+  { label: 'test files 0', re: new RegExp(`\\btest\\s+files?\\s+0(?!\\s+${STREAM_STATUS_TERM}\\b)`, 'i') },
+  { label: '0 passing', re: /(?:^|\n)\s*0\s+passing\b/i },
+];
+
+// Conditional no-work: package-level empty markers (Go/Rust workspaces) and an
+// empty TAP plan. classifyOutput only FAILs these when NO authoritative test
+// evidence appears elsewhere, so they are latched but emitted only when the
+// stream carried no authoritative evidence (see STREAM_AUTHORITATIVE and the
+// harvest in spawnCaptured), mirroring its mixed-run guard exactly.
+const STREAM_NO_WORK_CONDITIONAL = [
+  { label: 'no test files (package)', re: /\[no test files\]/i },
+  { label: 'no tests to run', re: /\bno tests to run\b/i },
+  { label: 'running 0 tests', re: /\brunning\s+0\s+tests?\b/i },
+  { label: 'empty TAP plan (1..0)', re: /^[ \t]*1\.\.0\b/m },
+  { label: '# pass 0', re: /^[ \t]*#\s*pass\s+0\b/im },
+];
+
+// Authoritative test evidence, mirrored from classifyOutput's
+// hasAuthoritativeTestEvidence. Seeing any of these anywhere in the stream
+// suppresses the conditional markers above (mixed Go/Rust workspace runs that
+// have real tests alongside empty packages).
+const STREAM_AUTHORITATIVE = [
+  /\bok\t\S+/,
+  /test result:\s*ok\.\s*[1-9]\d*\s+passed/i,
+  /\btests?\s+[1-9]\d*\s+passed\b/i,
+  /^[ \t]*#\s*tests?\s+[1-9]/im,
+  /(?:^|\n)\s*[1-9]\d*\s+passing\b/i,
+];
+
+/**
+ * Per-stream no-work scanner backing (Codex UikNz). Latches authoritative
+ * evidence and conditional markers into `state` as a side effect and yields
+ * the unconditional no-work labels for createStreamingSignalScanner to
+ * collect and dedup. Called with one complete line at a time (or a
+ * force-drained window for a pathologically long line).
+ * @param {{authoritative: boolean, conditional: Set<string>}} state
+ * @returns {(line: string) => string[]}
+ */
+const scanNoWorkSignals = (state) => (line) => {
+  const text = String(line ?? '');
+  for (const re of STREAM_AUTHORITATIVE) {
+    if (re.test(text)) { state.authoritative = true; break; }
+  }
+  for (const { label, re } of STREAM_NO_WORK_CONDITIONAL) {
+    if (re.test(text)) state.conditional.add(label);
+  }
+  const found = [];
+  for (const { label, re } of STREAM_NO_WORK_UNCONDITIONAL) {
+    if (re.test(text)) found.push(`no-work: ${label}`);
+  }
+  return found;
+};
+
 /**
  * Returns `value` plus its forward-slash and back-slash variants, deduped.
  * Captured command output can mix separator styles regardless of host
@@ -1686,6 +1775,45 @@ const openLogNoFollow = async (target, flags, verb = 'write') => {
 };
 
 /**
+ * Confirm the just-opened evidence log still resolves inside the directory
+ * identity that ensureLogsDirSecured() validated. openLogNoFollow's O_NOFOLLOW
+ * only guards the FINAL path component, not the parent `logs` directory, so a
+ * concurrent check (or the command under test, if it has write access to
+ * outputDir) that swaps outputDir/logs for a symlink after
+ * ensureLogsDirSecured() ran but before this open could still land the
+ * descriptor inside an attacker directory (CodeRabbit UguCb).
+ *
+ * Residual limitation: Node's fs/promises exposes no openat/dir-fd primitive,
+ * so the parent cannot be opened and fstat'd atomically with the file. We
+ * re-lstat the parent PATH (no-follow, so a symlinked `logs` is caught
+ * outright) and compare dev/ino against the captured identity. This narrows
+ * the TOCTOU window from "before the open" to "between this lstat and the
+ * open" rather than closing it fully; a swap-back to a real directory within
+ * that residual window is not detectable without a true dir-fd bind. A zero
+ * ino is rejected outright: some Windows filesystems report ino 0 for every
+ * file, which would otherwise compare equal vacuously.
+ * @param {string} target log file path whose parent directory must match.
+ * @param {{dev: number, ino: number}} expected captured logsDir identity.
+ */
+const assertLogParentIdentity = async (target, expected) => {
+  const parent = path.dirname(target);
+  let info;
+  try {
+    info = await lstat(parent);
+  } catch {
+    throw new Error(`Refusing to write evidence log with an unverifiable parent directory: ${parent}`);
+  }
+  if (
+    !expected
+    || expected.ino === 0
+    || info.dev !== expected.dev
+    || info.ino !== expected.ino
+  ) {
+    throw new Error(`Refusing to write evidence log through a logs directory swapped after validation: ${parent}`);
+  }
+};
+
+/**
  * Write a one-shot evidence log header (truncating any prior content),
  * no-follow. Used for the "command: ...\ncwd: ..." header written before a
  * command or command-proof spawn begins.
@@ -1696,11 +1824,17 @@ const openLogNoFollow = async (target, flags, verb = 'write') => {
  * descriptor.
  * @param {string} target
  * @param {string} contents
+ * @param {{dev: number, ino: number}|null} [securedDirIdentity] identity of the
+ *   logs directory captured by ensureLogsDirSecured(); when provided, the open
+ *   is bound to it and a mismatch is rejected before any truncate/write.
  */
-const writeLogHeaderNoFollow = async (target, contents) => {
+const writeLogHeaderNoFollow = async (target, contents, securedDirIdentity = null) => {
   // O_CREAT without O_TRUNC: create if missing, never truncate until fstat.
   const handle = await openLogNoFollow(target, constants.O_WRONLY | constants.O_CREAT, 'write');
   try {
+    // Bind the open to the directory ensureLogsDirSecured() just validated,
+    // before any bytes are written (throw, do not truncate, on mismatch).
+    if (securedDirIdentity) await assertLogParentIdentity(target, securedDirIdentity);
     await handle.truncate(0);
     await handle.writeFile(contents, 'utf8');
   } finally {
@@ -1826,20 +1960,31 @@ const spawnCaptured = async ({
   // the status-signal summarizer and downstream redactors do not rebuild the
   // URL/base64/hex variants on every chunk.
   const secretReplacements = buildSecretReplacements(redactionEnv, secretNames);
-  const makeState = () => ({
-    redactor: createDecodedRedactor(redactionEnv, secretNames),
-    normalizer: createStreamingReplacer(pathReplacements, { caseInsensitive: platform === 'win32' }),
-    signalDecoder: new StringDecoder('utf8'),
-    scanner: createStreamingSignalScanner(findStatusSignals, {
-      summarizeSignal: (signal) => safeStatusSignal({
-        signal,
-        secretReplacements,
-        pathReplacements,
-        platform,
+  const makeState = () => {
+    // Side-channel state for the no-work detector: an authoritative-evidence
+    // latch and the set of conditional markers seen, resolved against each
+    // other across both streams at harvest time (see below).
+    const noWork = { authoritative: false, conditional: new Set() };
+    return {
+      redactor: createDecodedRedactor(redactionEnv, secretNames),
+      normalizer: createStreamingReplacer(pathReplacements, { caseInsensitive: platform === 'win32' }),
+      signalDecoder: new StringDecoder('utf8'),
+      scanner: createStreamingSignalScanner(findStatusSignals, {
+        summarizeSignal: (signal) => safeStatusSignal({
+          signal,
+          secretReplacements,
+          pathReplacements,
+          platform,
+        }),
       }),
-    }),
-    hash: createHash('sha256'),
-  });
+      noWork,
+      // Second streaming scanner (Codex UikNz): catches a no-work summary that
+      // lands beyond CAPTURE_LIMIT, where classifyOutput's capped combined
+      // string can no longer see it. Fed the same raw chunks as `scanner`.
+      noWorkScanner: createStreamingSignalScanner(scanNoWorkSignals(noWork)),
+      hash: createHash('sha256'),
+    };
+  };
   const states = { stdout: makeState(), stderr: makeState() };
   // Unique mark inherited by every descendant of this spawn. terminateProcessTree
   // uses it to re-find processes that leave the process group (setsid /
@@ -1895,11 +2040,17 @@ const spawnCaptured = async ({
       ? states[stream].signalDecoder.write(chunk)
       : String(chunk ?? '');
     states[stream].scanner.push(raw);
+    states[stream].noWorkScanner.push(raw);
     emitSafe(stream, states[stream].redactor.push(chunk));
   };
   const flush = (stream) => {
-    states[stream].scanner.push(states[stream].signalDecoder.end());
+    // Drain the decoder's trailing bytes once and feed both raw scanners so a
+    // no-work summary that arrives without a trailing newline is still seen.
+    const tail = states[stream].signalDecoder.end();
+    states[stream].scanner.push(tail);
     states[stream].scanner.flush();
+    states[stream].noWorkScanner.push(tail);
+    states[stream].noWorkScanner.flush();
     emitSafe(stream, states[stream].redactor.flush());
     emitNormalized(stream, states[stream].normalizer.flush());
   };
@@ -2006,6 +2157,19 @@ const spawnCaptured = async ({
     log.end(resolve);
   });
   const finishedAt = new Date().toISOString();
+  // Resolve the streaming no-work detectors (Codex UikNz). Unconditional
+  // markers were already collected by each noWorkScanner. Conditional markers
+  // (Go/Rust empty packages, empty TAP plan) mirror classifyOutput's mixed-run
+  // guard: emit them only when NO authoritative test evidence (ok\t.., "N
+  // passed", "N passing") appeared in EITHER stream, matching how
+  // classifyOutput computes hasAuthoritativeTestEvidence over the combined
+  // output.
+  const sawAuthoritativeTests = states.stdout.noWork.authoritative || states.stderr.noWork.authoritative;
+  const conditionalNoWork = sawAuthoritativeTests
+    ? []
+    : [...new Set([...states.stdout.noWork.conditional, ...states.stderr.noWork.conditional])]
+      .slice(0, 20)
+      .map((label) => `no-work: ${label}`);
   const result = {
     exitCode: outcome?.exitCode ?? null,
     signal: outcome?.signal ?? null,
@@ -2026,6 +2190,9 @@ const spawnCaptured = async ({
     detectedSignals: [
       ...states.stdout.scanner.values(),
       ...states.stderr.scanner.values(),
+      ...states.stdout.noWorkScanner.values(),
+      ...states.stderr.noWorkScanner.values(),
+      ...conditionalNoWork,
     ],
     logWriteError: logError ? logError.message : null,
   };
@@ -2569,6 +2736,12 @@ const createCommandExecutor = ({
   // guards the final log-file component, not this parent directory, so a
   // stale one-time check here would let a later open silently follow the
   // substituted logs directory (CodeRabbit UguCb).
+  // Identity (dev/ino) of the logs directory captured at the end of the most
+  // recent ensureLogsDirSecured() call, so each path-based log open can be
+  // bound to the directory that was just validated (CodeRabbit UguCb). Null
+  // until the first successful validation, or if the post-validation stat
+  // fails (in which case the open still fails closed on its own guards).
+  let securedLogsDirIdentity = null;
   const ensureLogsDirSecured = async () => {
     await mkdir(logsDir, { recursive: true, mode: 0o700 });
     // mkdir recursive accepts a pre-existing symlink named `logs`. Fail
@@ -2590,6 +2763,16 @@ const createCommandExecutor = ({
       await chmod(logsDir, 0o700);
     } catch {
       // Platform may ignore directory modes.
+    }
+    // Capture the just-validated directory's identity for the bind above.
+    // logsDir is confirmed non-symlink here, so lstat gives the real
+    // directory's dev/ino (the same object path.dirname(logPath) resolves to
+    // at write time).
+    try {
+      const info = await lstat(logsDir);
+      securedLogsDirIdentity = { dev: info.dev, ino: info.ino };
+    } catch {
+      securedLogsDirIdentity = null;
     }
   };
   const safeEvidencePath = (value) => normalizePaths(
@@ -2644,7 +2827,7 @@ const createCommandExecutor = ({
   await ensureLogsDirSecured();
   const logPath = nextLogPath(phase, check.id);
   const safeCommand = normalizePaths(redactSecrets(check.command, env, secretNames), effectivePathReplacements, platform);
-  await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`);
+  await writeLogHeaderNoFollow(logPath, `command: ${safeCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
   const execution = await spawnCaptured({
     command: check.command,
     cwd,
@@ -2697,7 +2880,7 @@ const createCommandExecutor = ({
       effectivePathReplacements,
       platform,
     );
-    await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`);
+    await writeLogHeaderNoFollow(proofLogPath, `command: ${safeProofCommand}\ncwd: <repo>\n`, securedLogsDirIdentity);
     const proofExecution = await spawnCaptured({
       command: check.proof.command,
       cwd,
@@ -3256,4 +3439,5 @@ module.exports = {
   sweepDetachedOrphans,
   terminateProcessTree,
   verifyArtifactProof,
+  writeLogHeaderNoFollow,
 };

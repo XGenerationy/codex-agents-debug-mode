@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { chmod, mkdir, mkdtemp, rm, symlink, writeFile } = require('node:fs/promises');
+const { chmod, mkdir, mkdtemp, rm, symlink, utimes, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -262,6 +262,41 @@ test('extracts gate changes and scans the complete touched-file set', async () =
     assert.equal(findings[0].file, 'source.js');
     assert.deepEqual(gate.changedFiles, ['package.json']);
     assert.ok(gate.addedLines.some((line) => line.includes('vitest')));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('tags .codereview.yml added lines separately from other gate files', async () => {
+  const repo = await fixtureRepo();
+  try {
+    // .codereview.yml is a declarative, non-executable gate config: its prose
+    // can legitimately name a flag (e.g. "without --force") while describing
+    // what a check requires. classifyGateIntegrity uses proseAddedLines to
+    // exempt exactly those lines from its executable-invocation weakening
+    // scan; readGateChanges must attribute added lines to the right file so
+    // a change to a DIFFERENT gate file (package.json here) is never
+    // exempted alongside it.
+    await writeFile(path.join(repo, '.codereview.yml'), 'version: 1\n');
+    git(repo, 'add', '.codereview.yml');
+    git(repo, 'commit', '--quiet', '-m', 'add codereview config');
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    await writeFile(
+      path.join(repo, '.codereview.yml'),
+      'version: 1\ninstructions: |\n  FAIL on an existing target without --force, or invalid output.\n',
+    );
+    await writeFile(path.join(repo, 'package.json'), JSON.stringify({ scripts: { test: 'vitest', passWithNoTests: true } }));
+    const gate = await readGateChanges(repo, state.baseSha);
+    assert.deepEqual(gate.changedFiles, ['.codereview.yml', 'package.json']);
+    const proseLine = gate.proseAddedLines.find((line) => line.includes('--force'));
+    assert.ok(proseLine, `expected a --force line in proseAddedLines, got: ${JSON.stringify(gate.proseAddedLines)}`);
+    // proseAddedLines is a tag, not an extraction: the line must still be
+    // present in the full addedLines pool too.
+    assert.ok(gate.addedLines.includes(proseLine));
+    // package.json's added line must reach addedLines but never proseAddedLines,
+    // even though it is scanned in the same combined diff.
+    assert.ok(gate.addedLines.some((line) => line.includes('passWithNoTests')));
+    assert.ok(!gate.proseAddedLines.some((line) => line.includes('passWithNoTests')));
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
@@ -677,17 +712,152 @@ test('workingTreeFingerprint does not invoke a configured clean filter driver', 
     const filterCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(evilScript)}`;
     git(repo, 'config', 'filter.evil.clean', filterCommand);
     git(repo, 'config', 'filter.evil.required', 'true');
+    // Baseline BEFORE the tracked modification: proves the post-mutation
+    // fingerprint actually incorporated the change under the neutralized
+    // filter, rather than silently degrading to a constant fallback hash on a
+    // filter error (which would also be truthy, but wrong).
+    const before = await workingTreeFingerprint(repo);
     // Modify the filtered file so the tracked-diff hash has a reason to
     // compare it against the index (and thus a reason to run the clean
     // filter absent neutralization).
     await writeFile(path.join(repo, 'tracked.txt'), 'changed\n');
     const fingerprint = await workingTreeFingerprint(repo);
     assert.ok(fingerprint, 'fingerprint must still be computed despite the modification');
+    assert.notEqual(
+      fingerprint,
+      before,
+      'tracked diff must actually incorporate the change under the neutralized filter',
+    );
     assert.equal(
       require('node:fs').existsSync(marker),
       false,
       'filter.evil.clean must never have been invoked by an internal diff call',
     );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('scanTouchedSuppressions fails closed when file identity changes between lstat and open (TOCTOU)', async () => {
+  // The suppression scan lstats the touched path, then opens it. openNoFollow
+  // can fall back to a following open where O_NOFOLLOW is unavailable, so a
+  // path (or a parent directory) swapped in that gap could redirect the read to
+  // a different, clean file and miss a real suppression. The re-stat must be
+  // bound back to the pre-open identity and fail closed on a mismatch instead
+  // of scanning the swapped file.
+  const repo = await fixtureRepo();
+  try {
+    const marker = ['eslint', '-disable'].join('');
+    // A real file that DOES contain a suppression marker: if the identity gate
+    // were bypassed, the scan would read it and emit a `marker` finding.
+    await writeFile(path.join(repo, 'sneaky.js'), `// ${marker}\n`);
+    const { lstat: realLstat } = require('node:fs/promises');
+    // Simulate a pre-open lstat that observed a different on-disk file than the
+    // descriptor openNoFollow ultimately returns. Override the device id (a
+    // small-magnitude volume identifier, so +1 is always exact) as the robust
+    // discriminator: NTFS inode numbers can exceed 2**53, where a naive ino+1
+    // would be lost to float rounding and vacuously match. Kind is preserved so
+    // the scan reaches the identity gate rather than tripping an earlier guard.
+    const lstatFn = async (target) => {
+      const real = await realLstat(target);
+      return {
+        ...real,
+        dev: real.dev + 1,
+        ino: real.ino + 4096,
+        isFile: () => real.isFile(),
+        isSymbolicLink: () => real.isSymbolicLink(),
+        isDirectory: () => real.isDirectory(),
+      };
+    };
+    const findings = await scanTouchedSuppressions(repo, ['sneaky.js'], { lstatFn });
+    const finding = findings.find((f) => f.file === 'sneaky.js');
+    assert.ok(finding, 'expected a finding for the identity-mismatched file');
+    assert.equal(finding.category, 'scan-error', `must fail closed, got: ${JSON.stringify(finding)}`);
+    assert.match(finding.match, /identity/i);
+    assert.ok(
+      !findings.some((f) => f.file === 'sneaky.js' && f.category === 'marker'),
+      'a possibly-swapped file must never be scanned into a suppression finding',
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint structurally seals gitignored node_modules mutations', async () => {
+  // git ignores node_modules and the ignored-untracked listing pathspec-
+  // excludes it, so a dependency mutated/added/removed for the next validation
+  // command to execute would otherwise leave every seal identical. The
+  // structural digest (path + size + mtime + mode, not contents) must move the
+  // fingerprint on any such change.
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    const pkg = path.join(repo, 'node_modules', 'left-pad');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(path.join(pkg, 'index.js'), 'module.exports = () => {};\n');
+    await writeFile(path.join(pkg, 'package.json'), JSON.stringify({ name: 'left-pad', version: '1.0.0' }));
+
+    // Sanity: node_modules is genuinely ignored, so git never surfaces it as an
+    // untracked touched file — only the structural digest can seal it.
+    const state = await resolveRepositoryState({ repo, baseRef: 'HEAD' });
+    assert.ok(
+      !state.touchedFiles.some((file) => file.startsWith('node_modules/')),
+      `node_modules must be ignored, got: ${JSON.stringify(state.touchedFiles)}`,
+    );
+
+    const baseline = await workingTreeFingerprint(repo);
+    // Re-reading an unchanged tree must be stable across runs.
+    assert.equal(baseline, await workingTreeFingerprint(repo), 'unchanged tree must be stable');
+
+    // (1) A file added under node_modules must move the seal.
+    await writeFile(path.join(pkg, 'extra.js'), 'added\n');
+    const afterAdd = await workingTreeFingerprint(repo);
+    assert.notEqual(baseline, afterAdd, 'a file added under node_modules must change the fingerprint');
+
+    // (2) Editing an existing file (size/content change) must move the seal.
+    await writeFile(path.join(pkg, 'index.js'), 'module.exports = (s) => String(s).padStart(10, " ");\n');
+    const afterEdit = await workingTreeFingerprint(repo);
+    assert.notEqual(afterAdd, afterEdit, 'editing a file under node_modules must change the fingerprint');
+
+    // (2b) A pure mtime bump (identical contents/size) must also move the seal,
+    // proving mtime is part of the structural listing.
+    const past = new Date('2020-01-01T00:00:00Z');
+    await utimes(path.join(pkg, 'index.js'), past, past);
+    const afterTouch = await workingTreeFingerprint(repo);
+    assert.notEqual(afterEdit, afterTouch, 'a mtime change under node_modules must change the fingerprint');
+
+    // (3) Removing a file must move the seal.
+    await rm(path.join(pkg, 'extra.js'));
+    const afterRemove = await workingTreeFingerprint(repo);
+    assert.notEqual(afterTouch, afterRemove, 'removing a file under node_modules must change the fingerprint');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('workingTreeFingerprint node_modules structural digest stays fast for a few hundred files', async () => {
+  const repo = await fixtureRepo();
+  try {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '--quiet', '-m', 'ignore node_modules');
+    // ~300 files spread across a handful of nested package directories.
+    for (let p = 0; p < 15; p += 1) {
+      const dir = path.join(repo, 'node_modules', `pkg-${p}`, 'lib');
+      await mkdir(dir, { recursive: true });
+      for (let f = 0; f < 20; f += 1) {
+        await writeFile(path.join(dir, `mod-${f}.js`), `module.exports = ${f};\n`);
+      }
+    }
+    const start = Date.now();
+    const fingerprint = await workingTreeFingerprint(repo);
+    const elapsed = Date.now() - start;
+    assert.ok(fingerprint, 'fingerprint computed over a few-hundred-file node_modules');
+    // Generous bound: proves the structural walk does not hang or explode,
+    // without being flaky on slow or loaded CI.
+    assert.ok(elapsed < 10_000, `structural digest should be fast; took ${elapsed}ms`);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

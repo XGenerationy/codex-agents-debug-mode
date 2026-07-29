@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const { linkSync } = require('node:fs');
 const { mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
@@ -6,6 +7,36 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { normalizeReportPaths, renderMarkdown, writeEvidenceReport } = require('./pr_closeout_report');
+
+// Return "ok" only when `filePath` has a protected (inheritance-broken) DACL
+// consisting of exactly one current-user FullControl allow rule. Kept as a
+// local copy consistent with the same helper in pr_closeout_process.test.js
+// and debug_server.test.js so the ACL invariant is asserted identically across
+// every security-critical write path.
+const windowsAclIsCurrentUserOnly = (filePath) => {
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
+  const script = [
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    'if ($acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
+  ].join('; ');
+  return spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { encoding: 'utf8', windowsHide: true },
+  );
+};
+
+// Grant BUILTIN\Users (SID S-1-5-32-545) inheritable read on `dir` so files
+// created inside it would inherit an ACE readable by other local users unless
+// explicitly stripped. (OI)(CI) = object+container inherit; (R) = read.
+const grantInheritedReadToUsers = (dir) => spawnSync(
+  'icacls',
+  [dir, '/grant', '*S-1-5-32-545:(OI)(CI)(R)'],
+  { encoding: 'utf8', windowsHide: true },
+);
 
 const hostile = '<script>alert(1)</script>\n# Injected\n[click](javascript:alert(1)) | extra';
 
@@ -322,7 +353,7 @@ test('writeEvidenceReport does not clobber hard-linked outside files via staging
   }
 });
 
-test('writeEvidenceReport refuses to write through a pre-existing symlinked report.json', async () => {
+test('writeEvidenceReport refuses to write through a pre-existing symlinked report.json', async (t) => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
   const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
   const outsideTarget = path.join(outsideDir, 'clobber-me.json');
@@ -332,7 +363,13 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
     // leave report.json as a symlink pointing outside outputDir. writeFile
     // would silently follow it and overwrite whatever it points to; the
     // no-follow open must instead fail closed before any bytes are written.
-    await symlink(outsideTarget, path.join(outputDir, 'report.json'));
+    try {
+      await symlink(outsideTarget, path.join(outputDir, 'report.json'));
+    } catch (error) {
+      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      return;
+    }
 
     await assert.rejects(
       () => writeEvidenceReport({ outputDir, report: minimalReport() }),
@@ -349,13 +386,19 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
   }
 });
 
-test('writeEvidenceReport refuses to write through a pre-existing symlinked report.md', async () => {
+test('writeEvidenceReport refuses to write through a pre-existing symlinked report.md', async (t) => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-'));
   const outsideDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-outside-'));
   const outsideTarget = path.join(outsideDir, 'clobber-me.md');
   await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
   try {
-    await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+    try {
+      await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+    } catch (error) {
+      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      return;
+    }
 
     await assert.rejects(
       () => writeEvidenceReport({ outputDir, report: minimalReport() }),
@@ -372,7 +415,7 @@ test('writeEvidenceReport refuses to write through a pre-existing symlinked repo
   }
 });
 
-test('writeEvidenceReport never writes report.json when report.md is the rejected symlink', async () => {
+test('writeEvidenceReport never writes report.json when report.md is the rejected symlink', async (t) => {
   // Both targets are validated up front, before either write happens: a
   // symlink at report.md must not leave a real report.json sitting next to
   // an untouched, attacker-controlled report.md symlink (an inconsistent
@@ -383,7 +426,13 @@ test('writeEvidenceReport never writes report.json when report.md is the rejecte
   const outsideTarget = path.join(outsideDir, 'clobber-me.md');
   await writeFile(outsideTarget, 'do not overwrite this\n', 'utf8');
   try {
-    await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+    try {
+      await symlink(outsideTarget, path.join(outputDir, 'report.md'));
+    } catch (error) {
+      // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+      t.skip(`file symlinks unavailable here: ${error?.code || error}`);
+      return;
+    }
 
     await assert.rejects(
       () => writeEvidenceReport({ outputDir, report: minimalReport() }),
@@ -439,3 +488,34 @@ test('writeEvidenceReport removes report.json when the report.md rename fails', 
     await rm(outputDir, { recursive: true, force: true });
   }
 });
+
+test(
+  'writeEvidenceReport protects report.json and report.md with a current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    // chmod(0600) at report-write time is a no-op against Windows' inherited
+    // DACL, so report.json/report.md written into a directory whose inherited
+    // ACL grants other local users access would otherwise stay readable by
+    // them (Codex UguCe/UkXzo/UiXEu/UkAe3). writeNoFollow must establish and
+    // verify the same current-user-only ACL invariant already covered for the
+    // evidence-log write path (pr_closeout_process.test.js).
+    const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-acl-'));
+    try {
+      // Give outputDir an explicit, inheritable ACE for BUILTIN\Users (read).
+      // Absent the fix, files created here inherit it and stay readable by
+      // other local users; the fix must strip it from both report files.
+      const granted = grantInheritedReadToUsers(outputDir);
+      assert.equal(granted.status, 0, `icacls setup failed: ${granted.stdout}\n${granted.stderr}`);
+
+      const { json, markdown } = await writeEvidenceReport({ outputDir, report: minimalReport() });
+
+      for (const target of [json, markdown]) {
+        const acl = windowsAclIsCurrentUserOnly(target);
+        assert.equal(acl.status, 0, `${target}: ${acl.stdout}\n${acl.stderr}`);
+        assert.equal(acl.stdout.trim(), 'ok', `${target} must be current-user-only`);
+      }
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+    }
+  },
+);

@@ -1,11 +1,15 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { getComparisonStyle, resolveBaseSha } = require('./scan_touched_suppressions');
+const {
+  collectContentRemovals,
+  getComparisonStyle,
+  resolveBaseSha,
+} = require('./scan_touched_suppressions');
 
 const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
 
@@ -92,4 +96,148 @@ test('isMechanicalLockfile recognizes generated dependency lockfiles', () => {
   for (const file of ['package.json', 'tsconfig.json', '.eslintrc.json', 'Makefile']) {
     assert.equal(isMechanicalLockfile(file), false, `${file} must not be treated as a lockfile`);
   }
+});
+
+// Build a real `git diff --unified=0` (the exact form diffUnified feeds the
+// content-removal scanner) for one file edited between two commits, so the
+// pairing/allowance logic is exercised against genuine git output rather than a
+// hand-built diff string.
+const singleFileDiff = async (relPath, before, after) => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'scan-content-removal-'));
+  try {
+    git(repo, 'init', '--quiet');
+    git(repo, 'config', 'user.name', 'Scan Test');
+    git(repo, 'config', 'user.email', 'scan@example.invalid');
+    git(repo, 'config', 'commit.gpgsign', 'false');
+    const abs = path.join(repo, relPath);
+    await mkdir(path.dirname(abs), { recursive: true });
+    await writeFile(abs, before);
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'base');
+    await writeFile(abs, after);
+    git(repo, 'add', '.');
+    git(repo, 'commit', '--quiet', '-m', 'head');
+    return execFileSync(
+      'git',
+      ['diff', '--unified=0', '--no-ext-diff', '--no-textconv', 'HEAD~1', 'HEAD', '--', relPath],
+      { cwd: repo, encoding: 'utf8' },
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+};
+
+const pkg = (fields) => `${JSON.stringify({ name: 'x', ...fields }, null, 2)}\n`;
+
+test('collectContentRemovals exempts a lone package.json version bump (single-line hunk)', async () => {
+  // The exact reported false-positive: a benign version bump (removal +
+  // same-field replacement) must no longer be a content removal / CI failure.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.2.3', scripts: { test: 'node --test' } }),
+    pkg({ version: '1.2.4', scripts: { test: 'node --test' } }),
+  );
+  assert.deepEqual(collectContentRemovals(diff), []);
+});
+
+test('collectContentRemovals exempts a package.json version + description bump (multi-line hunk)', async () => {
+  // Two adjacent same-field value edits share one hunk; index pairing must
+  // align each removed line with its own replacement, not mispair them.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.2.3', description: 'old summary' }),
+    pkg({ version: '1.2.4', description: 'new summary' }),
+  );
+  assert.deepEqual(collectContentRemovals(diff), []);
+});
+
+test('collectContentRemovals STILL flags a weakened test script replacement', async () => {
+  // Preserve detection: `"test": "jest --coverage"` -> `"echo skip"`. The key
+  // `test` is not an allowlisted descriptive field, so the removal is not a
+  // safe replacement and must still fail closed.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.0.0', scripts: { test: 'jest --coverage' } }),
+    pkg({ version: '1.0.0', scripts: { test: 'echo skip' } }),
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /jest --coverage/.test(line)),
+    `expected the removed jest command to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a lowered coverage threshold replacement', async () => {
+  // Preserve detection: lowering a coverage threshold (`lines: 80` -> `50`) is
+  // a same-key numeric edit, but `lines` is not an allowlisted descriptive
+  // field, so it must still be reported (never exempted as a metadata bump).
+  const before = 'module.exports = {\n  coverageThreshold: {\n    global: {\n      lines: 80,\n    },\n  },\n};\n';
+  const after = 'module.exports = {\n  coverageThreshold: {\n    global: {\n      lines: 50,\n    },\n  },\n};\n';
+  const diff = await singleFileDiff('jest.config.js', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /lines:\s*80/.test(line)),
+    `expected the lowered coverage threshold to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a pure deletion of a workflow step (no replacement)', async () => {
+  // Preserve detection: a step removed with no positional replacement is a pure
+  // deletion and always fails closed, even when it matches no named validation
+  // pattern (`./scripts/verify-artifacts.sh`).
+  const before = 'name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n      - run: ./scripts/verify-artifacts.sh\n';
+  const after = 'name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n';
+  const diff = await singleFileDiff('.github/workflows/ci.yml', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /verify-artifacts\.sh/.test(line)),
+    `expected the deleted step to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a non-named validation step replaced with echo (Codex #4781495663)', async () => {
+  // The critical negative case: a real validation step that evades
+  // VALIDATION_REMOVAL_PATTERNS, replaced with `echo passed`. `run` is not an
+  // allowlisted descriptive field, so the modification is NOT exempted — the
+  // fail-closed catch-all this scanner exists for must still fire.
+  const before = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - run: ./scripts/verify-artifacts.sh\n';
+  const after = 'name: ci\non: push\njobs:\n  build:\n    steps:\n      - run: echo passed\n';
+  const diff = await singleFileDiff('.github/workflows/ci.yml', before, after);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /verify-artifacts\.sh/.test(line)),
+    `expected the replaced validation step to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals does NOT exempt a metadata field that smuggles a validation command', async () => {
+  // Defense in depth: even an allowlisted key (`description`) is not blindly
+  // exempted when its removed value reads as a validation command — the
+  // VALIDATION_REMOVAL_PATTERNS guard keeps it failing closed.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.0.0', description: 'run npm test before shipping' }),
+    pkg({ version: '1.0.0', description: 'a safe rewording' }),
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /npm test/.test(line)),
+    `expected the command-bearing description removal to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals handles a mixed diff: exempt metadata, flag weakenings together', async () => {
+  // One realistic diff mixing a benign version+description bump with a lowered
+  // `coverage` value and a weakened `test` script. Only the two weakenings are
+  // reported; the metadata edits are exempt.
+  const diff = await singleFileDiff(
+    'package.json',
+    pkg({ version: '1.2.3', description: 'old', coverage: 90, scripts: { test: 'jest --coverage' } }),
+    pkg({ version: '1.2.4', description: 'new', coverage: 50, scripts: { test: 'echo skip' } }),
+  );
+  const removals = collectContentRemovals(diff);
+  assert.ok(removals.some((line) => /"coverage":\s*90/.test(line)), `coverage lowering must be flagged; got ${JSON.stringify(removals)}`);
+  assert.ok(removals.some((line) => /jest --coverage/.test(line)), `test weakening must be flagged; got ${JSON.stringify(removals)}`);
+  assert.ok(!removals.some((line) => /"version"/.test(line)), `version bump must be exempt; got ${JSON.stringify(removals)}`);
+  assert.ok(!removals.some((line) => /"description"/.test(line)), `description bump must be exempt; got ${JSON.stringify(removals)}`);
 });

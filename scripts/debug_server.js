@@ -2,7 +2,7 @@
 
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
 const { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, unlinkSync, writeSync } = require('node:fs');
-const { lstat, mkdir, realpath, unlink } = require('node:fs/promises');
+const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
 const {
@@ -12,6 +12,7 @@ const {
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
+  protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 } = require('./pr_closeout_fs');
 
@@ -714,7 +715,13 @@ const createDebugServer = ({
             // hardening).
             if (process.platform === 'win32') {
               try {
-                protectWindowsPrivateFile(resolvedLogFile);
+                // Async (execFile) variant, not the synchronous
+                // protectWindowsPrivateFile: this runs inside the /session
+                // HTTP request handler, and execFileSync would block the Node
+                // event loop for up to the full 15s ACL timeout on every
+                // session creation (UiTMS). The startup token path keeps the
+                // sync variant where blocking is harmless.
+                await protectWindowsPrivateFileAsync(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
@@ -1093,6 +1100,122 @@ const probeLaunchToken = (port, token) => new Promise((resolve) => {
   request.end();
 });
 
+// A well-formed completed collector_claim records three newline-separated
+// fields: a positive integer port, a non-empty opaque instance ID, and a
+// positive integer owner PID. Shared by the claim-acquisition grace check and
+// the reclaim re-verification so both agree on what "a real claim" is.
+const isCompleteClaimText = (text) => {
+  if (typeof text !== 'string' || text.length === 0) return false;
+  const lines = text.split(/\r?\n/);
+  const port = Number(String(lines[0] || '').trim());
+  const pid = Number(String(lines[2] || '').trim());
+  return Number.isInteger(port) && port > 0
+    && Boolean(String(lines[1] || '').trim())
+    && Number.isInteger(pid) && pid > 0;
+};
+
+/**
+ * Reclaim (or refuse to reclaim) a stale collector_claim after an O_EXCL
+ * create observed EEXIST. Ports pr_closeout_workflow.js's identity-only lock
+ * reclaim: the dev/ino/ctimeMs identity match that gates deletion has only
+ * filesystem/clock resolution, so on a filesystem with rapid inode reuse a
+ * peer that unlinked this stale claim and wrote its own successor can land on
+ * the exact same inode with a same-millisecond ctimeMs collision. A bare
+ * unlink would then delete that live successor (UkNET/UkXzk). Instead,
+ * quarantine the entry under a private name first, then re-read it: only the
+ * same stale record we already inspected (byte-for-byte, or -- when the
+ * original was unreadable -- one that still fails to parse as a claim) is
+ * deleted; anything else is a live successor that is restored to its original
+ * path via a no-clobber link+unlink so this launch backs off instead.
+ *
+ * Errors are funneled to `collector_claim_contention` (ENOENT is a benign
+ * "someone else already moved it" back-off), matching the bare-unlink branch
+ * this replaces.
+ *
+ * @param {string} claimFile
+ * @param {object} deps
+ * @param {import('node:fs').Stats|null} deps.claimInfo  lstat captured before reclaim.
+ * @param {string|null} deps.claimText  claim bytes captured before reclaim (null if unreadable).
+ * @param {(target: string) => Promise<string|null>} deps.readClaimText  guarded re-reader.
+ * @returns {Promise<'reclaimed'|'restored'|'backed-off'>}
+ */
+const reclaimStaleCollectorClaim = async (claimFile, {
+  claimInfo,
+  claimText,
+  readClaimText,
+  assertNotSymlinkFn = assertNotSymlink,
+  lstatFn = lstat,
+  renameFn = rename,
+  linkFn = link,
+  unlinkFn = unlink,
+  sameIdentity = isSameLockIdentity,
+  quarantineSuffix = () => randomBytes(8).toString('hex'),
+} = {}) => {
+  try {
+    await assertNotSymlinkFn(claimFile, 'collector_claim_is_symlink');
+    // A null claimInfo means the up-front lstat already failed -- most likely
+    // a concurrent launch already replaced the stale record -- so there is no
+    // captured identity to re-verify against; do not delete blindly.
+    if (!claimInfo) return 'backed-off';
+    let currentClaimInfo;
+    try {
+      currentClaimInfo = await lstatFn(claimFile);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 'backed-off';
+      throw error;
+    }
+    if (!sameIdentity(claimInfo, currentClaimInfo)) return 'backed-off';
+
+    // Quarantine before deleting so a same-identity successor is isolated
+    // under a private name rather than removed from the shared claim path.
+    // A concurrent reclaimer that already renamed it away leaves ENOENT here;
+    // this launch simply backs off and re-evaluates on the next attempt.
+    const quarantinePath = `${claimFile}.reclaim-${process.pid}-${quarantineSuffix()}`;
+    try {
+      await renameFn(claimFile, quarantinePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 'backed-off';
+      throw error;
+    }
+
+    // Re-verify the quarantined entry. It is the same stale record only when
+    // its content is byte-for-byte what we inspected (or, when the original
+    // was unreadable, when it still fails to parse as a claim). Anything else
+    // is a live successor that collided on identity.
+    let requarantinedText = null;
+    try {
+      requarantinedText = await readClaimText(quarantinePath);
+    } catch {
+      requarantinedText = null;
+    }
+    const stillSameStaleRecord = claimText !== null
+      ? requarantinedText === claimText
+      : !isCompleteClaimText(requarantinedText);
+
+    if (!stillSameStaleRecord) {
+      // Live successor misidentified as stale: restore it to the original name
+      // without clobbering a third contender's fresh claim, then back off.
+      try {
+        await linkFn(quarantinePath, claimFile);
+        await unlinkFn(quarantinePath);
+      } catch (error) {
+        if (error?.code === 'EEXIST') {
+          await unlinkFn(quarantinePath).catch(() => {});
+          return 'backed-off';
+        }
+        throw error;
+      }
+      return 'restored';
+    }
+
+    await unlinkFn(quarantinePath);
+    return 'reclaimed';
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 'backed-off';
+    throw new Error('collector_claim_contention');
+  }
+};
+
 const parseAllowedOrigins = (value) =>
   (value || '')
     .split(',')
@@ -1342,11 +1465,7 @@ const main = () => {
           // Treat only a fresh, private regular-file record that is incomplete
           // as initializing; malformed old files must still be reclaimable,
           // and links/special files are never trusted for the grace.
-          const claimLines = String(claimText || '').split(/\r?\n/);
-          const completeClaim = Number.isInteger(claimedPort) && claimedPort > 0
-            && Boolean(String(claimLines[1] || '').trim())
-            && Number.isInteger(Number(String(claimLines[2] || '').trim()))
-            && Number(String(claimLines[2] || '').trim()) > 0;
+          const completeClaim = isCompleteClaimText(claimText);
           if (!completeClaim && claimInfo) {
             const freshPrivateRegularClaim = claimInfo.isFile()
               && !claimInfo.isSymbolicLink()
@@ -1382,50 +1501,25 @@ const main = () => {
           } catch (portError) {
             if (portError?.message === 'collector_already_running_on_other_port') throw portError;
           }
-          // Stale claim: remove and retry exclusive create. Two concurrent
-          // launches can both inspect this same stale record and both reach
-          // this point; if the first has already unlinked it and created its
-          // own fresh claim by the time the second gets here, an unconditional
-          // unlink would delete that legitimate successor instead of the
-          // stale record actually inspected above, letting both launches
-          // believe they hold the claim. Re-verify the path still identifies
-          // that same record (dev/ino) immediately before deleting it; on a
-          // mismatch, leave the successor alone and let the next attempt
-          // re-evaluate whatever now occupies the path from scratch instead
-          // of hard-failing this launch.
-          //
-          // Uses isSameLockIdentity (dev/ino/nlink + ctimeMs), not the plain
-          // isSameFileIdentity used elsewhere in this file: on Linux/tmpfs an
-          // inode freed by unlink can be reused immediately by the very next
-          // file created in the same directory, so a peer that unlinks this
-          // stale claim and writes its own successor can land on the exact
-          // same dev/ino this snapshot recorded. ctimeMs is fresh on any
-          // unlink+recreate (even a reused inode) and cannot match the stale
-          // snapshot, closing that gap (Codex Ua4p7/UiXEg).
-          try {
-            await assertNotSymlink(claimFile, 'collector_claim_is_symlink');
-            // A null claimInfo means the earlier lstat (captured up front,
-            // before this catch block ran) already failed -- most likely
-            // because a concurrent launch had already unlinked the stale
-            // record and replaced it with its own successor claim. There is
-            // no captured identity to re-verify against in that case, so
-            // default to NOT deleting rather than unconditionally deleting
-            // whatever now occupies the path: an unverified delete here could
-            // remove a peer's legitimate claim instead of the stale record
-            // this launch actually inspected (CodeRabbit review).
-            let sameRecord = false;
-            if (claimInfo) {
-              const currentClaimInfo = await lstat(claimFile);
-              sameRecord = isSameLockIdentity(claimInfo, currentClaimInfo);
-            }
-            if (sameRecord) {
-              await unlink(claimFile);
-            }
-          } catch (unlinkError) {
-            if (unlinkError?.code !== 'ENOENT') {
-              throw new Error('collector_claim_contention');
-            }
-          }
+          // Stale claim: quarantine-then-verify before deleting, then retry
+          // exclusive create. Two concurrent launches can both inspect this
+          // same stale record; if the first already unlinked it and wrote its
+          // own fresh claim by the time the second gets here, a bare unlink
+          // would delete that legitimate successor. reclaimStaleCollectorClaim
+          // re-verifies the path still identifies that same record using
+          // isSameLockIdentity (dev/ino/nlink + ctimeMs -- ctimeMs is fresh on
+          // any unlink+recreate, even a reused inode on Linux/tmpfs), then
+          // renames the entry to a private quarantine name and re-reads it so
+          // a live successor that collided on identity within a single
+          // millisecond is restored rather than deleted -- the same pattern
+          // pr_closeout_workflow.js uses for its output-dir lock
+          // (Codex Ua4p7/UiXEg/UkNET/UkXzk). On any outcome this launch loops
+          // and re-evaluates whatever now occupies the path from scratch.
+          await reclaimStaleCollectorClaim(claimFile, {
+            claimInfo,
+            claimText,
+            readClaimText: (target) => readSmallRegularFile(target, MAX_CLAIM_FILE_BYTES),
+          });
         }
       }
       if (!claimHeld) throw new Error('collector_claim_failed');
@@ -1667,5 +1761,6 @@ module.exports = {
   probeReadyCollector,
   probeServer,
   readJson,
+  reclaimStaleCollectorClaim,
   resolvePowerShellExecutable,
 };

@@ -370,9 +370,15 @@ const createStreamingSignalScanner = (
       newline = pending.search(/\r?\n/);
     }
     while (pending.length > maxPending) {
-      const boundary = Math.max(1, maxPending - overlap);
+      // Record a full maxPending-sized window, then retain its trailing
+      // `overlap` characters as the start of the next window so a signal
+      // straddling the cut still appears whole in one of the two windows.
+      // Retaining strictly fewer than `boundary` characters guarantees the
+      // loop always makes forward progress, even in a degenerate
+      // `overlap >= boundary` config, so it can never spin.
+      const boundary = Math.max(1, maxPending);
       record(pending.slice(0, boundary));
-      pending = pending.slice(boundary);
+      pending = pending.slice(Math.max(1, boundary - overlap));
     }
   };
   return {
