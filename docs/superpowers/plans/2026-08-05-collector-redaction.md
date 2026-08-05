@@ -244,6 +244,36 @@ Claude-Session: https://claude.ai/code/session_013VQCeNzNXziDk5maCRSSvp"
 - Modify: `scripts/debug_server.js` — `createDebugServer` options (~line 713), context creation after `effectiveLimits` (~line 742), `/log` handler between event assembly and serialization (~lines 1052–1056), factory doc-comment (~lines 705–711)
 - Test: `scripts/debug_server.test.js` (append)
 
+**Review round-2 carry-ins (do these in this task too):**
+
+1. In `createRedactionContext`, enforce the cap against `initialTokens` at construction: after
+   the `initialTokens` validation loop and before `const tokens = [...initialTokens];`, add
+
+```js
+  if (initialTokens.length > maxTokens) throw new Error('redaction_token_registry_full');
+```
+
+   with this unit test appended alongside the others:
+
+```js
+test('createRedactionContext rejects initialTokens exceeding maxTokens', () => {
+  assert.throws(
+    () => createRedactionContext({}, [], ['t-0', 't-1', 't-2'], { maxTokens: 2 }),
+    /redaction_token_registry_full/,
+  );
+});
+```
+
+2. Strengthen the round-1 synthetic-prefix collision test: change its second argument from
+   `['__COLLECTOR_TOKEN_0']` to `[]` so the shadowed env value must redact via
+   auto-discovery (`__COLLECTOR_TOKEN_0` matches `SENSITIVE_ENV_NAME` on its own) — the
+   stronger, realistic property. Keep both assertions unchanged.
+
+3. The cap default stays 512 (decision record: at a full registry a crafted 64KB object-dense
+   event costs ~1.65s of walk CPU — an authenticated, loopback-only, self-inflicted ceiling —
+   while a lower cap risks legitimate mint exhaustion on long-lived collectors; operators tune
+   via the new `redactionMaxTokens` option below).
+
 - [ ] **Step 1: Write the failing integration tests**
 
 Append to `scripts/debug_server.test.js`. Reuse the file's existing helpers (`listen`, `close`, `createSession`, `requestJson`, `TEST_LAUNCH_TOKEN`) and this local fixture helper:
@@ -402,6 +432,7 @@ const createDebugServer = ({
   limits = {},
   redactionEnv = { ...process.env },
   redactionNames = [],
+  redactionMaxTokens = 512,
 } = {}) => {
 ```
 
@@ -410,6 +441,7 @@ const createDebugServer = ({
 ```js
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
+ * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_redaction_failed. Default 512 bounds worst-case per-event redaction cost.
 ```
 
 (c) Directly after the `const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };` line, create the context (a build failure throws out of the factory — startup stays fail-closed):
@@ -418,7 +450,9 @@ const createDebugServer = ({
   // Fail-closed secret redaction for every persisted event. Built here so a
   // broken needle build prevents the collector from starting at all; the
   // launch token is registered from the first build.
-  const redaction = createRedactionContext(redactionEnv, redactionNames, [token]);
+  const redaction = createRedactionContext(redactionEnv, redactionNames, [token], {
+    maxTokens: redactionMaxTokens,
+  });
 ```
 
 (d) In the `/log` handler, replace the two lines
@@ -486,27 +520,40 @@ test('collector launch and session tokens are redacted from event bodies, cross-
   });
 });
 
-test('a failed registry rebuild rejects the session fail-closed with session_redaction_failed', async () => {
+test('a full token registry rejects the session fail-closed with session_redaction_failed', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
-  let poisoned = false;
-  const env = new Proxy({}, {
-    ownKeys(target) {
-      if (poisoned) throw new Error('rebuild poisoned');
-      return Reflect.ownKeys(target);
-    },
+  // redactionMaxTokens: 2 = launch token + exactly one session mint. The
+  // second mint exceeds the cap inside registerToken, which the /session
+  // handler maps to session_redaction_failed. This exercises the fail-closed
+  // path through a supported seam. NOTE: a post-construction poisoned env
+  // Proxy CANNOT trigger this path anymore — createRedactionContext
+  // snapshots env once at construction (review round-1 hardening). If a
+  // Proxy-based variant of this test goes red, the test is wrong, not the
+  // snapshot: do NOT revert the snapshot to live env reads.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 2,
   });
-  const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN, redactionEnv: env });
   const baseUrl = await listen(server);
   try {
-    poisoned = true;
-    const response = await createSession(baseUrl);
-    assert.equal(response.status, 500);
-    assert.equal(response.body.error, 'session_redaction_failed');
-    // The failed session must not exist: its id/token were never returned,
-    // and a fresh healthy session still works once the poison is lifted.
-    poisoned = false;
     const healthy = await createSession(baseUrl);
     assert.equal(healthy.status, 201);
+    const rejected = await createSession(baseUrl);
+    assert.equal(rejected.status, 500);
+    assert.equal(rejected.body.error, 'session_redaction_failed');
+    // The healthy session keeps recording after the failed mint: the
+    // registry and needle list are intact (cap check precedes the push).
+    const logged = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: healthy.body.session_id,
+        sessionToken: healthy.body.session_token,
+        msg: 'still recording',
+      },
+    });
+    assert.equal(logged.status, 202);
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
@@ -517,7 +564,7 @@ test('a failed registry rebuild rejects the session fail-closed with session_red
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `node --test --test-concurrency=1 --test-name-pattern "cross-session|session_redaction_failed" scripts/debug_server.test.js`
-Expected: FAIL — session tokens persist raw (registerToken never called), and the poisoned rebuild test gets `201` instead of `500`.
+Expected: FAIL — session tokens persist raw (registerToken never called), and the full-registry test's second mint gets `201` instead of `500` (the cap is never consulted because nothing registers tokens yet).
 
 - [ ] **Step 3: Wire registerToken into /session**
 
