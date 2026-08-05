@@ -1704,6 +1704,14 @@ const parseAllowedOrigins = (value) =>
     .map((origin) => origin.trim())
     .filter(Boolean);
 
+// DEBUG_REDACT_NAMES: comma-separated env-var names that must always be
+// redacted from persisted events regardless of value length (the CLI-facing
+// mirror of the closeout config's `names` opt-in).
+const parseRedactNames = (value) => String(value ?? '')
+  .split(',')
+  .map((name) => name.trim())
+  .filter(Boolean);
+
 const main = () => {
   const [projectArgument] = process.argv.slice(2);
   if (projectArgument === '--help' || projectArgument === '-h') {
@@ -1726,6 +1734,7 @@ const main = () => {
     projectRoot,
     token,
     allowedOrigins: parseAllowedOrigins(process.env.DEBUG_ALLOWED_ORIGIN),
+    redactionNames: parseRedactNames(process.env.DEBUG_REDACT_NAMES),
   });
   server.once('error', async (error) => {
     if (error.code === 'EADDRINUSE') {
@@ -2253,6 +2262,7 @@ module.exports = {
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
+  parseRedactNames,
   probeLaunchToken,
   probeReadyCollector,
   probeServer,

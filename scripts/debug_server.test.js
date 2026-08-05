@@ -17,6 +17,7 @@ const {
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
+  parseRedactNames,
   probeLaunchToken,
   probeReadyCollector,
   probeServer,
@@ -3767,4 +3768,14 @@ test('a full token registry rejects the session fail-closed with session_registr
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('parseRedactNames splits, trims, and drops empty entries', () => {
+  assert.deepEqual(parseRedactNames('NPM_TOKEN, DOCKER_AUTH_CONFIG ,,EXTRA '), [
+    'NPM_TOKEN',
+    'DOCKER_AUTH_CONFIG',
+    'EXTRA',
+  ]);
+  assert.deepEqual(parseRedactNames(undefined), []);
+  assert.deepEqual(parseRedactNames(''), []);
 });
