@@ -737,7 +737,10 @@ connection-string leaves), before any event byte is persisted. A redaction failu
 write instead of storing raw evidence. Note the deliberate trade-off: if a secret value or one
 of its components equals a common word (a dev-default `postgres` password, for example), that
 word is scrubbed from all evidence — the guarantee is unconditional, so prefer distinct dev
-credential values. PII redaction remains an agent responsibility.
+credential values. `DEBUG_REDACT_NAMES` entries additionally bypass the 8-character
+auto-discovery floor, so list only names whose values are genuinely high-entropy secrets — a
+short or common value would be scrubbed wherever it appears as a substring. PII redaction
+remains an agent responsibility.
 ```
 
 In the "Debug collector trust model" section, append after the paragraph ending `...the timing-safe comparison or the `401` response shape.`:
@@ -746,7 +749,10 @@ In the "Debug collector trust model" section, append after the paragraph ending 
 Every persisted event also passes one fail-closed redaction choke point
 (`createRedactionContext` / `redactEventForAppend`): values of sensitive-named environment
 variables, names listed in `DEBUG_REDACT_NAMES`, and the collector's own tokens can never reach
-a session log in raw or encoded form.
+a session log in raw or encoded form. The token registry is capped per process (512 lifetime
+session mints, failed mints included); at the cap further sessions are refused with
+`session_registry_full`, signaled once on stderr as `redaction.registry_full` — restart the
+collector to reset it.
 ```
 
 - [ ] **Step 4: SKILL.md Critical Rule 5**
@@ -774,6 +780,7 @@ In the SKILL.md Troubleshooting table (under `## Troubleshooting`), add this row
 
 ```markdown
 | Common word shows as `[REDACTED]` | An env secret or one of its extracted components (e.g. a dev-default `postgres` DSN password) equals that word; use distinct dev credential values or unset the variable for the collector process |
+| Sessions fail with `session_registry_full` | The collector's lifetime session-mint cap (512, failed mints included) is exhausted; restart the collector |
 ```
 
 - [ ] **Step 5: Validate and commit**
