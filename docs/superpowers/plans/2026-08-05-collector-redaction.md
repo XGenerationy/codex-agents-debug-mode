@@ -731,9 +731,12 @@ In `README.md` Safety section, after the sentence ending `...block a clean resul
 The collector additionally enforces the secrets half of Critical Rule 5 at ingestion: known
 secrets — sensitive-named environment values, `DEBUG_REDACT_NAMES` opt-ins, and the collector's
 own launch and session tokens — are replaced with `[REDACTED]`, including their URL-encoded,
-JSON-escaped, base64, and hex variants, before any event byte is persisted. A redaction failure
-rejects the write instead of storing raw evidence. PII redaction remains an agent
-responsibility.
+JSON-escaped, base64, and hex variants and extracted components (URL credentials,
+connection-string leaves), before any event byte is persisted. A redaction failure rejects the
+write instead of storing raw evidence. Note the deliberate trade-off: if a secret value or one
+of its components equals a common word (a dev-default `postgres` password, for example), that
+word is scrubbed from all evidence — the guarantee is unconditional, so prefer distinct dev
+credential values. PII redaction remains an agent responsibility.
 ```
 
 In the "Debug collector trust model" section, append after the paragraph ending `...the timing-safe comparison or the `401` response shape.`:
@@ -762,6 +765,14 @@ to
    `/log` ingestion (sensitive-named environment values, `DEBUG_REDACT_NAMES` opt-ins, and its
    own tokens, including encoded variants); PII and secrets the collector cannot know remain
    your responsibility.
+```
+
+- [ ] **Step 4b: SKILL.md Troubleshooting row**
+
+In the SKILL.md Troubleshooting table (under `## Troubleshooting`), add this row after the "Too many logs" row:
+
+```markdown
+| Common word shows as `[REDACTED]` | An env secret or one of its extracted components (e.g. a dev-default `postgres` DSN password) equals that word; use distinct dev credential values or unset the variable for the collector process |
 ```
 
 - [ ] **Step 5: Validate and commit**
