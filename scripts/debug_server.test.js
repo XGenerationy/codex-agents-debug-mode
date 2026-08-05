@@ -3686,3 +3686,61 @@ test('createRedactionContext rejects a non-array initialTokens fail-closed', () 
   assert.throws(() => createRedactionContext({}, [], 'abc'), /invalid_redaction_tokens/);
   assert.throws(() => createRedactionContext({}, [], null), /invalid_redaction_tokens/);
 });
+
+test('collector launch and session tokens are redacted from event bodies, cross-session', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const sessionA = (await createSession(baseUrl, 'session-a')).body;
+    const sessionB = (await createSession(baseUrl, 'session-b')).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: sessionA.session_id,
+        sessionToken: sessionA.session_token,
+        msg: `launch=${TEST_LAUNCH_TOKEN} mine=${sessionA.session_token} other=${sessionB.session_token}`,
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, sessionA);
+    assert.equal(event.msg, 'launch=[REDACTED] mine=[REDACTED] other=[REDACTED]');
+  });
+});
+
+test('a full token registry rejects the session fail-closed with session_redaction_failed', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  // redactionMaxTokens: 2 = launch token + exactly one session mint. The
+  // second mint exceeds the cap inside registerToken, which the /session
+  // handler maps to session_redaction_failed. This exercises the fail-closed
+  // path through a supported seam. NOTE: a post-construction poisoned env
+  // Proxy CANNOT trigger this path anymore — createRedactionContext
+  // snapshots env once at construction (review round-1 hardening). If a
+  // Proxy-based variant of this test goes red, the test is wrong, not the
+  // snapshot: do NOT revert the snapshot to live env reads.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 2,
+  });
+  const baseUrl = await listen(server);
+  try {
+    const healthy = await createSession(baseUrl);
+    assert.equal(healthy.status, 201);
+    const rejected = await createSession(baseUrl);
+    assert.equal(rejected.status, 500);
+    assert.equal(rejected.body.error, 'session_redaction_failed');
+    // The healthy session keeps recording after the failed mint: the
+    // registry and needle list are intact (cap check precedes the push).
+    const logged = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: healthy.body.session_id,
+        sessionToken: healthy.body.session_token,
+        msg: 'still recording',
+      },
+    });
+    assert.equal(logged.status, 202);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});

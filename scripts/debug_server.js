@@ -1016,6 +1016,15 @@ const createDebugServer = ({
           provisional: true,
         });
         try {
+          // Push-then-rebuild BEFORE the session can accept /log: the token
+          // joins the append-only registry first, so concurrent mints
+          // converge (whichever rebuild runs last includes every registered
+          // token) and a rebuild failure rejects this session fail-closed.
+          try {
+            redaction.registerToken(sessionToken);
+          } catch {
+            throw new RequestError('session_redaction_failed', 500);
+          }
           // Reject a symlinked, non-directory, or escaped .debug path before
           // writing session evidence. A regular *file* named .debug would make
           // mkdir throw ENOTDIR and surface as an unstructured 500; a
