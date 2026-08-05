@@ -692,6 +692,47 @@ const appendSessionEvent = (session, serializedEvent) => {
 // --- Collector-side secret redaction (spec:
 // docs/superpowers/specs/2026-08-05-collector-redaction-design.md) ---
 
+// Escape the regex meta-characters in a literal needle so it matches as a
+// verbatim substring inside a combined RegExp alternation. Mirrors the
+// escapeRegex helper used by the closeout signal scanner.
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Compile a needle list into ONE alternation RegExp and cache it by the
+// replacements array reference. The list is rebuilt only on registerToken
+// (once per session mint), but applyReplacements runs once per event string
+// AND once per object key on every authenticated /log append, so a single
+// combined scan (one engine pass over the text) replaces one full rescan per
+// needle variant. At the default 512-token cap (~7k variants) that turns
+// millions of String.replaceAll comparisons per 64 KB event into one match.
+// Needles are sorted longest-first (buildSecretReplacements guarantees this):
+// in a leftmost alternation the first alternative to match at a position wins,
+// so a longer needle must precede a shorter overlapping one (e.g.
+// "supersecret" before "super") or the shorter would consume its span first.
+// Every needle shares the single replacement '[REDACTED]'; if a caller ever
+// supplied mixed replacements, this fast path is bypassed for the per-needle
+// reduce path that honors each pair individually.
+const combinedScannerCache = new WeakMap();
+const getCombinedScanner = (replacements) => {
+  if (replacements.length === 0) return null;
+  // All production needles map to '[REDACTED]'; mixed replacements would make
+  // a single replacement ambiguous, so fall back to the per-needle path.
+  const firstReplacement = replacements[0][1];
+  if (!replacements.every(([, replacement]) => replacement === firstReplacement)) return null;
+  let scanner = combinedScannerCache.get(replacements);
+  if (!scanner) {
+    // Pre-sorted longest-first by buildSecretReplacements; re-sort defensively
+    // so a caller-built list cannot break the longest-match-first guarantee.
+    const pattern = replacements
+      .map(([needle]) => needle)
+      .sort((left, right) => right.length - left.length)
+      .map(escapeRegExp)
+      .join('|');
+    scanner = { replacement: firstReplacement, regex: new RegExp(pattern, 'g') };
+    combinedScannerCache.set(replacements, scanner);
+  }
+  return scanner;
+};
+
 // Apply an already-built [needle, replacement] list to one string. The list
 // must be sorted longest-first (buildSecretReplacements guarantees this):
 // that prevents a shorter needle from consuming a longer needle's span
@@ -701,10 +742,14 @@ const appendSessionEvent = (session, serializedEvent) => {
 // never reveal. Matching is case-sensitive, same as the closeout streaming
 // redactor's default. Longest-first ordering is a hard precondition for
 // callers that build their own list.
-const applyReplacements = (text, replacements) => replacements.reduce(
-  (current, [needle, replacement]) => current.replaceAll(needle, replacement),
-  text,
-);
+const applyReplacements = (text, replacements) => {
+  const scanner = getCombinedScanner(replacements);
+  if (scanner) return text.replace(scanner.regex, scanner.replacement);
+  return replacements.reduce(
+    (current, [needle, replacement]) => current.replaceAll(needle, replacement),
+    text,
+  );
+};
 
 // Deep-walk a parsed /log event and redact every string it contains — leaf
 // values, array items, and object KEYS (a client could use a secret as a
@@ -722,9 +767,18 @@ const applyReplacements = (text, replacements) => replacements.reduce(
 // output and repointing the rebuilt object's prototype. defineProperty
 // always creates/overwrites an own data property regardless of the key's
 // name, so "__proto__" round-trips like any other key.
-const redactEventValue = (value, replacements) => {
+// An explicit depth bound (REDACTION_MAX_DEPTH) makes the fail-closed path
+// for hostile nesting deterministic: instead of relying on whichever native
+// stack (the walk itself or a later JSON.stringify) exhausts first — which
+// varies by platform stack size and Node version — input deeper than the
+// bound throws a defined error that redactEventForAppend maps to a single
+// documented code. 64 is far above any legitimate event shape (real /log
+// events nest a handful of levels) while staying well clear of stack limits.
+const REDACTION_MAX_DEPTH = 64;
+const redactEventValue = (value, replacements, depth = 0) => {
+  if (depth > REDACTION_MAX_DEPTH) throw new Error('redaction_depth_exceeded');
   if (typeof value === 'string') return applyReplacements(value, replacements);
-  if (Array.isArray(value)) return value.map((item) => redactEventValue(item, replacements));
+  if (Array.isArray(value)) return value.map((item) => redactEventValue(item, replacements, depth + 1));
   if (value && typeof value === 'object') {
     const output = {};
     for (const [key, entry] of Object.entries(value)) {
@@ -735,7 +789,7 @@ const redactEventValue = (value, replacements) => {
         redactedKey = `${redactedKey}#${suffix}`;
       }
       Object.defineProperty(output, redactedKey, {
-        value: redactEventValue(entry, replacements),
+        value: redactEventValue(entry, replacements, depth + 1),
         writable: true,
         enumerable: true,
         configurable: true,
@@ -780,9 +834,17 @@ const redactEventForAppend = (event, replacements) => {
 // or via registerToken — is validated as a non-empty string; silently
 // accepting anything else would register a token that can never actually
 // redact, i.e. a fail-open hole. Misconfigured option inputs (names, env
-// snapshot, token list) throw rather than silently weakening redaction.
+// snapshot, token list, maxTokens) throw rather than silently weakening
+// redaction or disabling the registry cap.
 const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { maxTokens = 512 } = {}) => {
   if (!Array.isArray(explicitNames)) throw new Error('invalid_redaction_names');
+  // Validate maxTokens before either token-limit comparison: a non-integer or
+  // sub-1 value (e.g. NaN passed via `redactionMaxTokens: Number(envVar)`)
+  // makes both `length > maxTokens` and `length >= maxTokens` evaluate to
+  // false, growing the registry without bound and disabling the cap that
+  // bounds per-event redaction cost. Reject fail-closed, matching the other
+  // option-input validations.
+  if (!Number.isInteger(maxTokens) || maxTokens < 1) throw new Error('invalid_redaction_max_tokens');
   if (envSnapshot === null || typeof envSnapshot !== 'object' || Array.isArray(envSnapshot)) {
     throw new Error('invalid_redaction_env');
   }
@@ -853,7 +915,7 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
  * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
- * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_redaction_failed. Default 512 bounds worst-case per-event redaction cost.
+ * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1027,23 +1089,18 @@ const createDebugServer = ({
           provisional: true,
         });
         try {
-          // Push-then-rebuild BEFORE the session can accept /log: the token
-          // joins the append-only registry first, so concurrent mints
-          // converge (whichever rebuild runs last includes every registered
-          // token) and a rebuild failure rejects this session fail-closed.
-          try {
-            redaction.registerToken(sessionToken);
-          } catch (error) {
-            // redaction_token_registry_full is a permanent, restart-only
-            // condition (the lifetime mint cap); everything else is a
-            // transient rebuild failure a client may retry. Distinct codes
-            // keep the two diagnosable; neither leaks captured data.
-            if (error?.message === 'redaction_token_registry_full') {
-              signalRegistryFull();
-              throw new RequestError('session_registry_full', 500);
-            }
-            throw new RequestError('session_redaction_failed', 500);
-          }
+          // Session setup runs to completion BEFORE the session token is
+          // registered. registerToken consumes an append-only registry slot;
+          // if it ran first (as it once did), a caller able to force any later
+          // setup failure (debug_dir_not_directory, mkdir EPERM, ...) could
+          // repeat /session and burn registry slots until
+          // redaction_token_registry_full, permanently disabling new sessions
+          // until restart. Registering in the successful path means only
+          // tokens actually handed to a usable client consume slots. /log
+          // refuses a provisional session with session_initializing, so the
+          // token is still registered before the session can accept /log,
+          // preserving the ordering invariant that a rebuild failure rejects
+          // the session fail-closed.
           // Reject a symlinked, non-directory, or escaped .debug path before
           // writing session evidence. A regular *file* named .debug would make
           // mkdir throw ENOTDIR and surface as an unstructured 500; a
@@ -1185,6 +1242,30 @@ const createDebugServer = ({
             throw error;
           }
           await handle.close();
+          // Push-then-rebuild at the END of the successful setup path: the
+          // token joins the append-only registry only once .debug validation,
+          // directory creation, and the session log all succeeded, so only
+          // tokens handed out to clients consume registry slots. Concurrent
+          // mints still converge (whichever rebuild runs last includes every
+          // registered token). A late failure here (registry cap or rebuild)
+          // is caught below: the session is deleted and the mint rejected, but
+          // the already-created session log file remains on disk (it was
+          // written through a no-follow, contained descriptor and holds no
+          // captured evidence yet, so leaving it is safe and consistent with
+          // retireInactiveSessions keeping retired logs on disk).
+          try {
+            redaction.registerToken(sessionToken);
+          } catch (error) {
+            // redaction_token_registry_full is a permanent, restart-only
+            // condition (the lifetime mint cap); everything else is a
+            // transient rebuild failure a client may retry. Distinct codes
+            // keep the two diagnosable; neither leaks captured data.
+            if (error?.message === 'redaction_token_registry_full') {
+              signalRegistryFull();
+              throw new RequestError('session_registry_full', 500);
+            }
+            throw new RequestError('session_redaction_failed', 500);
+          }
           delete sessions.get(sessionId).provisional;
         } catch (error) {
           sessions.delete(sessionId);
@@ -2259,6 +2340,7 @@ if (require.main === module) main();
 module.exports = {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  REDACTION_MAX_DEPTH,
   RequestError,
   createDebugServer,
   createRedactionContext,

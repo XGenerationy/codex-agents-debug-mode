@@ -11,6 +11,7 @@ const test = require('node:test');
 const {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  REDACTION_MAX_DEPTH,
   RequestError,
   createDebugServer,
   createRedactionContext,
@@ -3377,6 +3378,19 @@ test('redactEventValue leaves non-string leaves untouched and returns new object
   assert.notEqual(redacted.data, event.data);
 });
 
+test('redactEventValue does not mutate the input event', () => {
+  // The source invariant is that containers are rebuilt, not mutated, so a
+  // part-way failure can never leave a half-redacted event. The clean-input
+  // test above passes whether or not the walk mutates in place, so pin the
+  // invariant on a secret-bearing event where mutation would actually matter.
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { msg: 'saw supersecretvalue123', data: { supersecretvalue123: 'k' } };
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(redacted.msg, 'saw [REDACTED]');
+  assert.equal(event.msg, 'saw supersecretvalue123');
+  assert.equal(Object.hasOwn(event.data, 'supersecretvalue123'), true);
+});
+
 test('redactEventValue disambiguates colliding keys deterministically', () => {
   const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
   const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2 } };
@@ -3488,6 +3502,26 @@ test('createRedactionContext rejects initialTokens exceeding maxTokens', () => {
     () => createRedactionContext({}, [], ['t-0', 't-1', 't-2'], { maxTokens: 2 }),
     /redaction_token_registry_full/,
   );
+});
+
+test('createRedactionContext rejects non-integer or sub-1 maxTokens fail-closed', () => {
+  // A non-numeric maxTokens (e.g. NaN from `Number(envVar)`) makes both
+  // `length > maxTokens` and `length >= maxTokens` evaluate to false, which
+  // would silently disable the registry cap and grow per-event redaction cost
+  // without bound. The cap must reject fail-closed, not fail open. Note
+  // `undefined` is intentionally excluded: the destructure default
+  // (`maxTokens = 512`) substitutes a valid cap, so omitting the option is
+  // the documented happy path.
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '512', null, true]) {
+    assert.throws(
+      () => createRedactionContext({}, [], [], { maxTokens: bad }),
+      /invalid_redaction_max_tokens/,
+      `maxTokens=${String(bad)} should be rejected`,
+    );
+  }
+  // A valid integer cap is accepted and still enforces the bound.
+  const context = createRedactionContext({}, [], ['t-0'], { maxTokens: 1 });
+  assert.throws(() => context.registerToken('t-1'), /redaction_token_registry_full/);
 });
 
 const withRedactionServer = async (redactionEnv, redactionNames, run) => {
@@ -3645,24 +3679,14 @@ test('hostile deep nesting is rejected fail-closed with nothing persisted', asyn
     });
     const logPath = path.join(projectRoot, session.log_file);
     const before = await readFile(logPath, 'utf8');
-    // Depth 5000 nests within maxBodyBytes (~10KB) and reliably exceeds the
-    // recursion budget of either the redaction walk (log_redaction_failed)
-    // or JSON.stringify (internal_error) — WHICH stage trips first varies
-    // with platform stack size, so both fail-closed codes are accepted; the
-    // invariant under test is: 500, byte-identical log, healthy session
-    // afterward. Both paths sit before capacity reservation.
-    //
-    // The request body is assembled as raw JSON TEXT via string
-    // concatenation, then sent through requestJson's rawBody escape hatch
-    // instead of its default JSON.stringify(body) path: measured on this
-    // machine, a depth-5000 array overflows native JSON.stringify's own
-    // recursion budget (bisected boundary ~1500-2000) well before it
-    // reaches the server, which would fail this test in the test CLIENT
-    // instead of exercising the server's fail-closed path under test.
-    // JSON.parse (used to build `nested` for the JSON.stringify() calls
-    // below, which only ever see the small flat fields) tolerates depth
-    // 5000 fine, confirming the asymmetry is specific to stringify.
-    const depth = 5000;
+    // redactEventValue enforces an explicit REDACTION_MAX_DEPTH bound and
+    // throws once input exceeds it, so the fail-closed outcome is a stated
+    // contract rather than whichever native stack (the walk or a later
+    // JSON.stringify) exhausts first on the running platform. A depth just
+    // past the bound trips the walk deterministically; the event rejects with
+    // the single documented code log_redaction_failed (mapped by
+    // redactEventForAppend), nothing is persisted, and the session recovers.
+    const depth = REDACTION_MAX_DEPTH + 1;
     const rawBody = `{"sessionId":${JSON.stringify(session.session_id)},"sessionToken":${JSON.stringify(session.session_token)},"msg":"hostile nesting","data":${'['.repeat(depth)}0${']'.repeat(depth)}}`;
     const rejected = await requestJson(baseUrl, {
       method: 'POST',
@@ -3670,7 +3694,7 @@ test('hostile deep nesting is rejected fail-closed with nothing persisted', asyn
       rawBody,
     });
     assert.equal(rejected.status, 500);
-    assert.equal(['log_redaction_failed', 'internal_error'].includes(rejected.body.error), true);
+    assert.equal(rejected.body.error, 'log_redaction_failed');
     const after = await readFile(logPath, 'utf8');
     assert.equal(after, before);
     const recovered = await requestJson(baseUrl, {
@@ -3682,6 +3706,24 @@ test('hostile deep nesting is rejected fail-closed with nothing persisted', asyn
     const lines = await readSessionLines(projectRoot, session);
     assert.deepEqual(lines.map((line) => line.msg), ['baseline ok', 'recovered ok']);
   });
+});
+
+test('redactEventValue rejects nesting at exactly the configured depth bound', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  // The walk tracks depth as it recurses into containers. Wrapping in
+  // `{ data: ... }` enters the top object at depth 0 and recurses into the
+  // data value at depth 1, so an N-level array nest reaches its leaf at
+  // depth N + 1. REDACTION_MAX_DEPTH - 1 levels (leaf at the bound) are
+  // accepted; one more level (leaf past the bound) throws the defined error.
+  let within = 0;
+  for (let i = 0; i < REDACTION_MAX_DEPTH - 1; i += 1) within = [within];
+  assert.doesNotThrow(() => redactEventValue({ data: within }, replacements));
+  let beyond = 0;
+  for (let i = 0; i < REDACTION_MAX_DEPTH; i += 1) beyond = [beyond];
+  assert.throws(
+    () => redactEventValue({ data: beyond }, replacements),
+    /redaction_depth_exceeded/,
+  );
 });
 
 test('createRedactionContext rejects a non-array initialTokens fail-closed', () => {
@@ -3769,6 +3811,62 @@ test('a full token registry rejects the session fail-closed with session_registr
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('a failed /session setup does not burn a redaction registry slot', async () => {
+  // registerToken now runs at the END of successful session setup, not the
+  // start. A caller able to force a setup failure (debug_dir_not_directory,
+  // mkdir EPERM, ...) must not consume a registry slot, or it could repeat
+  // /session and exhaust the lifetime cap (redaction_token_registry_full),
+  // permanently disabling new sessions until process restart.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-burn-'));
+  // .debug is a regular file, so every /session fails at debug_dir_not_directory
+  // before reaching registerToken.
+  await writeFile(path.join(projectRoot, '.debug'), 'not-a-directory');
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    // maxTokens: 2 = launch token + exactly one session mint.
+    redactionMaxTokens: 2,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // Repeatedly force a failed setup: none of these consume a slot.
+    for (let i = 0; i < 5; i += 1) {
+      const failed = await createSession(baseUrl);
+      assert.equal(failed.status, 409);
+      assert.equal(failed.body.error, 'debug_dir_not_directory');
+    }
+    // Remove the blocker and confirm a real session still mints: the registry
+    // still has one free slot because the failed setups never registered.
+    await rm(path.join(projectRoot, '.debug'));
+    const healthy = await createSession(baseUrl);
+    assert.equal(healthy.status, 201, JSON.stringify(healthy.body));
+    // The next mint exceeds the cap (launch + one session token).
+    const rejected = await createSession(baseUrl);
+    assert.equal(rejected.status, 500);
+    assert.equal(rejected.body.error, 'session_registry_full');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('redactEventValue redacts secrets containing regex meta-characters', () => {
+  // applyReplacements compiles needles into a single combined RegExp; the
+  // needles are escaped so a secret containing regex syntax (., *, +, [, ],
+  // (, ), |, $, {, }, \) matches as a verbatim substring, not as pattern.
+  const replacements = buildSecretReplacements(
+    { API_TOKEN: 'a.b*c+d[e]f(g)h|i$j{k}l\\m' },
+    [],
+  );
+  const secret = 'a.b*c+d[e]f(g)h|i$j{k}l\\m';
+  const redacted = redactEventValue(
+    { msg: `secret is ${secret} here`, data: { [secret]: 'value' } },
+    replacements,
+  );
+  assert.equal(redacted.msg, 'secret is [REDACTED] here');
+  assert.equal(redacted.data['[REDACTED]'], 'value');
 });
 
 test('parseRedactNames splits, trims, and drops empty entries', () => {
