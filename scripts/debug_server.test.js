@@ -1779,11 +1779,12 @@ test(
   'writes a session log with a protected current-user-only Windows ACL',
   { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
   async () => {
-    // Codex UeruJ: /log writes redaction-free runtime evidence, and the 0600
-    // mode set at session-log creation is a no-op against Windows' inherited
-    // DACL -- another local user with inherited access to a shared checkout
-    // could otherwise read captured diagnostic data. Assert the same
-    // current-user-only ACL invariant already covered for collector_token.
+    // Codex UeruJ: /log events are redacted only for known secrets; treat
+    // log contents as sensitive. The 0600 mode set at session-log creation
+    // is a no-op against Windows' inherited DACL -- another local user
+    // with inherited access to a shared checkout could otherwise read
+    // captured diagnostic data. Assert the same current-user-only ACL
+    // invariant already covered for collector_token.
     const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-windows-log-acl-'));
     const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
     const baseUrl = await listen(server);
