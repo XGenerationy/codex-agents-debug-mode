@@ -889,6 +889,11 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
       rebuild();
     },
     replacements: () => replacements,
+    // Cardinality only (never a token value); used for the /health headroom
+    // fields and the single 80%-threshold warning, so an operator can restart
+    // the collector before the lifetime cap starts refusing mints.
+    tokenCount: () => tokens.length,
+    maxTokens: () => maxTokens,
   };
 };
 
@@ -967,6 +972,25 @@ const createDebugServer = ({
     redactionRegistryFullSignaled = true;
     process.stderr.write('{"level":"error","event":"redaction.registry_full"}\n');
   };
+  // One structured warning the FIRST time the registry crosses 80% of the
+  // lifetime cap, so an operator can restart the collector before mints start
+  // failing (the cap is permanent until process restart; retired sessions keep
+  // their tokens registered by design). Emitted from checkRegistryHeadroom()
+  // right after every successful registerToken. Cardinality only — no token
+  // values — matching the opaque-error policy. 80% bounds headroom for the
+  // remaining 20% of slots at the configured cap (e.g. ~410 of 512).
+  const REDACTION_REGISTRY_HEADROOM_THRESHOLD = 0.8;
+  let redactionRegistryHeadroomSignaled = false;
+  const checkRegistryHeadroom = () => {
+    if (redactionRegistryHeadroomSignaled) return;
+    const count = redaction.tokenCount();
+    const cap = redaction.maxTokens();
+    if (cap > 0 && count >= Math.ceil(cap * REDACTION_REGISTRY_HEADROOM_THRESHOLD)) {
+      redactionRegistryHeadroomSignaled = true;
+      process.stderr.write('{"level":"warn","event":"redaction.registry_headroom","tokens":' +
+        `${count},"max":${cap}}\n`);
+    }
+  };
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
     && effectiveLimits.sessionIdleTimeoutMs >= 1
     ? effectiveLimits.sessionIdleTimeoutMs
@@ -1033,6 +1057,12 @@ const createDebugServer = ({
           instance_id: instanceId,
           project_hash: projectHash,
           ready: collectorReady,
+          // Redaction registry headroom (cardinality only — never a token
+          // value): a supervisor can alert before the lifetime cap starts
+          // refusing mints. Both are 0-based counts of registered tokens vs
+          // the cap; retired sessions keep their tokens registered by design.
+          redaction_tokens: redaction.tokenCount(),
+          redaction_max_tokens: redaction.maxTokens(),
         });
         return;
       }
@@ -1266,6 +1296,10 @@ const createDebugServer = ({
             }
             throw new RequestError('session_redaction_failed', 500);
           }
+          // Warn once when the registry crosses 80% of the lifetime cap, so an
+          // operator can restart before mints start failing. Runs only on a
+          // successful registration (the cap check above threw otherwise).
+          checkRegistryHeadroom();
           delete sessions.get(sessionId).provisional;
         } catch (error) {
           sessions.delete(sessionId);

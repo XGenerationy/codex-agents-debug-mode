@@ -319,6 +319,11 @@ test('exposes collector-specific health without exposing credentials or paths', 
     // Before markCollectorReady(), /health must report ready:false so a
     // concurrent relaunch cannot claim already_running mid token write.
     assert.equal(response.body.ready, false);
+    // /health exposes redaction registry headroom (cardinality only — never a
+    // token value): the launch token occupies exactly one slot at startup.
+    assert.equal(response.body.redaction_tokens, 1);
+    assert.equal(response.body.redaction_max_tokens, 512);
+    assert.equal(JSON.stringify(response.body).includes(TEST_LAUNCH_TOKEN), false);
     server.markCollectorReady();
     const readyResponse = await requestJson(baseUrl, { pathname: '/health' });
     assert.equal(readyResponse.body.ready, true);
@@ -3846,6 +3851,83 @@ test('a failed /session setup does not burn a redaction registry slot', async ()
     const rejected = await createSession(baseUrl);
     assert.equal(rejected.status, 500);
     assert.equal(rejected.body.error, 'session_registry_full');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('registry headroom warns once at 80% and /health exposes token counts', async () => {
+  // The lifetime cap is permanent until restart and retired sessions keep
+  // their tokens registered, so a long-running collector that mints past 80%
+  // is on track to refuse every further mint. Two operational signals cover
+  // it: a single warn-level stderr line the first time the registry crosses
+  // 80%, and the registered/cap counts exposed in GET /health (cardinality
+  // only — never a token value).
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-headroom-'));
+  // maxTokens: 6 = launch token + 5 session mints. 80% of 6 = 4.8 -> ceil = 5,
+  // so the threshold is crossed when the 5th token registers (launch + 4
+  // sessions), i.e. after the 4th successful /session.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 6,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // /health reports the launch token (1 of 6) before any session.
+    const health0 = await requestJson(baseUrl, { pathname: '/health' });
+    assert.equal(health0.body.redaction_tokens, 1);
+    assert.equal(health0.body.redaction_max_tokens, 6);
+
+    const stderrLines = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    let headroomCount;
+    try {
+      // Mint 3 sessions (tokens 2,3,4): still under the 5-token threshold.
+      for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
+      headroomCount = stderrLines.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length;
+      assert.equal(headroomCount, 0);
+      // /health now reports 4 registered tokens.
+      const health4 = await requestJson(baseUrl, { pathname: '/health' });
+      assert.equal(health4.body.redaction_tokens, 4);
+
+      // 4th session registers the 5th token (>= ceil(6*0.8)=5): warning fires.
+      await createSession(baseUrl, 'threshold');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    const headroomAfter = stderrLines.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length;
+    assert.equal(headroomAfter, 1, 'headroom warning must fire exactly once at the threshold');
+    // The single line carries cardinality only — no token value leaks.
+    const headroomLine = stderrLines.find((line) => line.includes('"event":"redaction.registry_headroom"'));
+    assert.match(headroomLine, /"tokens":5,"max":6/);
+    assert.equal(headroomLine.includes(TEST_LAUNCH_TOKEN), false);
+
+    // A 5th session registers the 6th token (still >= threshold): the warning
+    // must NOT fire a second time (one-shot, like signalRegistryFull).
+    const stderrLines2 = [];
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines2.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    try {
+      await createSession(baseUrl, 'past-threshold');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(
+      stderrLines2.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length,
+      0,
+      'headroom warning must not repeat after the threshold',
+    );
+    const health6 = await requestJson(baseUrl, { pathname: '/health' });
+    assert.equal(health6.body.redaction_tokens, 6);
+    assert.equal(health6.body.redaction_max_tokens, 6);
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
