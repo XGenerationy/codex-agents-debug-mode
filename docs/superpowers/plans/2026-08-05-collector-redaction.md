@@ -520,12 +520,13 @@ test('collector launch and session tokens are redacted from event bodies, cross-
   });
 });
 
-test('a full token registry rejects the session fail-closed with session_redaction_failed', async () => {
+test('a full token registry rejects the session fail-closed with session_registry_full', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
   // redactionMaxTokens: 2 = launch token + exactly one session mint. The
   // second mint exceeds the cap inside registerToken, which the /session
-  // handler maps to session_redaction_failed. This exercises the fail-closed
-  // path through a supported seam. NOTE: a post-construction poisoned env
+  // handler maps to session_registry_full (permanent cap state, signaled
+  // once on stderr; distinguished from transient session_redaction_failed).
+  // This exercises the fail-closed path through a supported seam. NOTE: a post-construction poisoned env
   // Proxy CANNOT trigger this path anymore — createRedactionContext
   // snapshots env once at construction (review round-1 hardening). If a
   // Proxy-based variant of this test goes red, the test is wrong, not the
@@ -541,7 +542,7 @@ test('a full token registry rejects the session fail-closed with session_redacti
     assert.equal(healthy.status, 201);
     const rejected = await createSession(baseUrl);
     assert.equal(rejected.status, 500);
-    assert.equal(rejected.body.error, 'session_redaction_failed');
+    assert.equal(rejected.body.error, 'session_registry_full');
     // The healthy session keeps recording after the failed mint: the
     // registry and needle list are intact (cap check precedes the push).
     const logged = await requestJson(baseUrl, {
