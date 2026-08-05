@@ -5,7 +5,6 @@ const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdir
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
-const { buildSecretReplacements } = require('./pr_closeout_stream');
 const {
   assertNotSymlink: assertNotSymlinkShared,
   isSameFileIdentity,
@@ -16,6 +15,7 @@ const {
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 } = require('./pr_closeout_fs');
+const { buildSecretReplacements } = require('./pr_closeout_stream');
 
 /**
  * Synchronous stdout/stderr writes for CLI terminal paths that call
@@ -692,10 +692,15 @@ const appendSessionEvent = (session, serializedEvent) => {
 // --- Collector-side secret redaction (spec:
 // docs/superpowers/specs/2026-08-05-collector-redaction-design.md) ---
 
-// Apply an already-built longest-first [needle, replacement] list to one
-// string. buildSecretReplacements sorts longest-first, so a shorter needle
-// can never re-match inside text a longer needle already replaced; matching
-// is case-sensitive, same as the closeout streaming redactor's default.
+// Apply an already-built [needle, replacement] list to one string. The list
+// must be sorted longest-first (buildSecretReplacements guarantees this):
+// that prevents a shorter needle from consuming a longer needle's span
+// first. It does NOT prevent a needle from matching text inserted by an
+// earlier replacement (e.g. a secret whose value is literally "REDACTED"
+// re-matches inside "[REDACTED]") — that direction can only over-redact,
+// never reveal. Matching is case-sensitive, same as the closeout streaming
+// redactor's default. Longest-first ordering is a hard precondition for
+// callers that build their own list.
 const applyReplacements = (text, replacements) => replacements.reduce(
   (current, [needle, replacement]) => current.replaceAll(needle, replacement),
   text,
@@ -709,7 +714,14 @@ const applyReplacements = (text, replacements) => replacements.reduce(
 // leave a half-redacted event that later gets persisted. When two sibling
 // keys collide after redaction (or a redacted key collides with a literal
 // one), the later entry is suffixed deterministically ([REDACTED]#2, ...)
-// rather than silently overwriting the earlier entry.
+// rather than silently overwriting the earlier entry. Entries are installed
+// with Object.defineProperty rather than plain assignment: JSON.parse
+// produces "__proto__" as an ordinary own enumerable property, but
+// `output[key] = value` would instead invoke the inherited
+// Object.prototype.__proto__ setter — silently dropping the entry from the
+// output and repointing the rebuilt object's prototype. defineProperty
+// always creates/overwrites an own data property regardless of the key's
+// name, so "__proto__" round-trips like any other key.
 const redactEventValue = (value, replacements) => {
   if (typeof value === 'string') return applyReplacements(value, replacements);
   if (Array.isArray(value)) return value.map((item) => redactEventValue(item, replacements));
@@ -722,7 +734,12 @@ const redactEventValue = (value, replacements) => {
         while (Object.hasOwn(output, `${redactedKey}#${suffix}`)) suffix += 1;
         redactedKey = `${redactedKey}#${suffix}`;
       }
-      output[redactedKey] = redactEventValue(entry, replacements);
+      Object.defineProperty(output, redactedKey, {
+        value: redactEventValue(entry, replacements),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
     return output;
   }
@@ -748,26 +765,57 @@ const redactEventForAppend = (event, replacements) => {
 // token. Tokens enter buildSecretReplacements as explicitly-named synthetic
 // env entries, which grants them full encoded-variant expansion with no
 // minimum-length filter and requires no change to the reviewed closeout
-// module.
-const createRedactionContext = (envSnapshot, explicitNames, initialTokens) => {
+// module. `envSnapshot` is copied once at construction (not re-read on each
+// rebuild), so a caller mutating the object it passed in — or live
+// `process.env` — after construction cannot change the needle set out from
+// under an already-built context. The synthetic name prefix is derived to
+// provably avoid colliding with any real env var name already in the
+// snapshot: a literal `__COLLECTOR_TOKEN_0` in the environment must not
+// shadow (and thereby un-redact) either that real value or a token
+// registered under the same index. The registry is capped (default 512
+// tokens per process) so a client looping failed /session calls cannot grow
+// rebuild cost at request rate; exceeding the cap throws and the /session
+// handler must treat that as fail-closed (reject the mint) rather than
+// degrade redaction or rebuild cost. Every token — supplied at construction
+// or via registerToken — is validated as a non-empty string; silently
+// accepting anything else would register a token that can never actually
+// redact, i.e. a fail-open hole.
+const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { maxTokens = 512 } = {}) => {
+  const snapshot = { ...envSnapshot };
+  for (const initial of initialTokens) {
+    if (typeof initial !== 'string' || initial.length === 0) {
+      throw new Error('invalid_redaction_token');
+    }
+  }
   const tokens = [...initialTokens];
+  // Keep prepending underscores until no real env var name in the snapshot
+  // starts with the candidate prefix, so synthetic names can never collide
+  // with (and thereby shadow) an actual environment variable.
+  let syntheticPrefix = '__COLLECTOR_TOKEN_';
+  while (Object.keys(snapshot).some((key) => key.startsWith(syntheticPrefix))) {
+    syntheticPrefix = `_${syntheticPrefix}`;
+  }
   let replacements;
   const rebuild = () => {
     const synthetic = {};
     const syntheticNames = [];
     tokens.forEach((tokenValue, index) => {
-      const name = `__COLLECTOR_TOKEN_${index}`;
+      const name = `${syntheticPrefix}${index}`;
       synthetic[name] = tokenValue;
       syntheticNames.push(name);
     });
     replacements = buildSecretReplacements(
-      { ...envSnapshot, ...synthetic },
+      { ...snapshot, ...synthetic },
       [...explicitNames, ...syntheticNames],
     );
   };
   rebuild();
   return {
     registerToken(tokenValue) {
+      if (typeof tokenValue !== 'string' || tokenValue.length === 0) {
+        throw new Error('invalid_redaction_token');
+      }
+      if (tokens.length >= maxTokens) throw new Error('redaction_token_registry_full');
       tokens.push(tokenValue);
       rebuild();
     },

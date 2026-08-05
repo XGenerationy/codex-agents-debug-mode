@@ -3372,6 +3372,32 @@ test('redactEventValue disambiguates colliding keys deterministically', () => {
   const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2 } };
   const redacted = redactEventValue(event, replacements);
   assert.deepEqual(redacted, { data: { '[REDACTED]': 1, '[REDACTED]#2': 2 } });
+  assert.deepStrictEqual(Object.keys(redacted.data), ['[REDACTED]', '[REDACTED]#2']);
+});
+
+test('redactEventValue disambiguates a third colliding key against the already-suffixed one', () => {
+  // NOTE: the suffix loop disambiguates against the current candidate key,
+  // not a stripped "logical base" name. A literal '[REDACTED]#2' colliding
+  // with the '[REDACTED]#2' produced by the previous entry therefore becomes
+  // '[REDACTED]#2#2', not '[REDACTED]#3' -- verified by running the actual
+  // implementation rather than hand-derived, since the two disambiguation
+  // strategies diverge on this exact input.
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2, '[REDACTED]#2': 3 } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepStrictEqual(redacted, { data: { '[REDACTED]': 1, '[REDACTED]#2': 2, '[REDACTED]#2#2': 3 } });
+  assert.deepStrictEqual(Object.keys(redacted.data), ['[REDACTED]', '[REDACTED]#2', '[REDACTED]#2#2']);
+});
+
+test('redactEventValue preserves a JSON __proto__ key as an own property without touching the prototype', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = JSON.parse('{"msg":"hi","data":{"__proto__":{"inner":"supersecretvalue123"},"keep":"me"}}');
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(
+    JSON.stringify(redacted),
+    '{"msg":"hi","data":{"__proto__":{"inner":"[REDACTED]"},"keep":"me"}}',
+  );
+  assert.equal(Object.getPrototypeOf(redacted.data), Object.prototype);
 });
 
 test('redactEventForAppend maps walk failures to log_redaction_failed 500', () => {
@@ -3408,4 +3434,42 @@ test('createRedactionContext folds env, explicit names, and tokens; registry reb
   context.registerToken('another-token-registered-after');
   assert.equal(apply('bearer launch-token-value-with-entropy'), 'bearer [REDACTED]');
   assert.equal(apply('session-token-added-later-abc'), '[REDACTED]');
+});
+
+test('createRedactionContext caps the token registry and leaves it intact after the cap throws', () => {
+  const context = createRedactionContext({}, [], ['t-0'], { maxTokens: 2 });
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  context.registerToken('t-1');
+  assert.throws(
+    () => context.registerToken('t-2'),
+    /redaction_token_registry_full/,
+  );
+  // The registry (and its derived replacements) must be unchanged by the
+  // rejected registration -- both earlier tokens still redact.
+  assert.equal(apply('has t-0 in it'), 'has [REDACTED] in it');
+  assert.equal(apply('has t-1 in it'), 'has [REDACTED] in it');
+});
+
+test('createRedactionContext rejects invalid tokens at construction and via registerToken', () => {
+  assert.throws(
+    () => createRedactionContext({}, [], ['']),
+    /invalid_redaction_token/,
+  );
+  const context = createRedactionContext({}, [], ['seed-token-value']);
+  assert.throws(() => context.registerToken(''), /invalid_redaction_token/);
+  assert.throws(() => context.registerToken(undefined), /invalid_redaction_token/);
+});
+
+test('createRedactionContext derives a synthetic prefix that cannot shadow a real env var', () => {
+  // A literal __COLLECTOR_TOKEN_0 in the environment must not shadow itself
+  // (via the {...snapshot, ...synthetic} spread) nor the token registered
+  // under the same index -- both must still redact.
+  const context = createRedactionContext(
+    { __COLLECTOR_TOKEN_0: 'realenvsecretvalue' },
+    ['__COLLECTOR_TOKEN_0'],
+    ['thelaunchtokenvalue'],
+  );
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  assert.equal(apply('contains realenvsecretvalue here'), 'contains [REDACTED] here');
+  assert.equal(apply('contains thelaunchtokenvalue here'), 'contains [REDACTED] here');
 });
