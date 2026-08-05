@@ -120,7 +120,7 @@ Rejected alternatives:
 |---|---|---|
 | Startup list build | throw | Server refuses to start (same as other init failures) |
 | Session-mint rebuild | throw | `500 session_redaction_failed`; no session created |
-| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction). At extreme nesting depths the pre-existing `JSON.stringify` recursion limit can trip first and surface as `500 internal_error` — also before reservation, equally fail-closed. |
+| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction). In a narrow band just above the serializer's recursion limit, the pre-existing `JSON.stringify` limit trips first and surfaces as `500 internal_error`; deeper still, the redaction walk trips first as `log_redaction_failed`. Both ceilings are platform-dependent; both sit before capacity reservation and are equally fail-closed. |
 
 ## Testing (`scripts/debug_server.test.js` idiom, no new dependencies)
 

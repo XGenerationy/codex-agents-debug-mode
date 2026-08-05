@@ -87,6 +87,7 @@ const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathn
     // are different code paths with different per-level costs), which would
     // fail the test for a reason unrelated to the server behavior under
     // test. rawBody lets a caller hand over pre-built JSON text instead.
+    assert.equal(body === undefined || rawBody === undefined, true);
     if (rawBody !== undefined) request.write(rawBody);
     else if (body !== undefined) request.write(JSON.stringify(body));
     request.end();
@@ -3679,4 +3680,9 @@ test('hostile deep nesting is rejected fail-closed with nothing persisted', asyn
     const lines = await readSessionLines(projectRoot, session);
     assert.deepEqual(lines.map((line) => line.msg), ['baseline ok', 'recovered ok']);
   });
+});
+
+test('createRedactionContext rejects a non-array initialTokens fail-closed', () => {
+  assert.throws(() => createRedactionContext({}, [], 'abc'), /invalid_redaction_tokens/);
+  assert.throws(() => createRedactionContext({}, [], null), /invalid_redaction_tokens/);
 });
