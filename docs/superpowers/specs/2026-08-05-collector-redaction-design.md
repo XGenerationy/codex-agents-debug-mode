@@ -52,6 +52,12 @@ stands — the configured value IS a known secret, and raising the component flo
 silently leak short real passwords, which the unconditional guarantee forbids. The collateral
 is documented in README/SKILL.md troubleshooting instead.
 
+Sequential replacement over overlapping needles can also leave a fragment: when two distinct
+registered secrets share a substring boundary inside one string (`abcdefgh` + `efghijkl` in
+`abcdefghijkl` → `[REDACTED]ijkl`), neither whole value persists, but a suffix of one may.
+Inherited from the closeout redactor's semantics; requires two secrets overlapping *and*
+appearing adjacently in evidence, so it is accepted rather than special-cased.
+
 ### Non-goals
 
 - No regex/pattern detectors and no plugin API. The single `redactEventValue` function is the
