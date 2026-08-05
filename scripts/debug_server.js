@@ -837,7 +837,8 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
  * (unauthenticated identity probe), `POST /session` (requires the launch
  * `token`, creates a session and its append-only NDJSON log under
  * `<projectRoot>/.debug`), and `POST /log` (requires that session's own
- * token — see authorizeRequest — and appends one redaction-free event line).
+ * token — see authorizeRequest — and appends one event line after
+ * fail-closed known-secret redaction; see createRedactionContext).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
@@ -1101,8 +1102,10 @@ const createDebugServer = ({
           try {
             const info = await handle.stat();
             if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
-            // /log writes redaction-free runtime evidence. The 0600 mode above
-            // is a no-op against Windows' inherited DACL, so another local
+            // /log events are redacted only for KNOWN secrets (see
+            // createRedactionContext); treat log contents as sensitive. The
+            // 0600 mode above is a no-op against Windows' inherited DACL, so
+            // another local
             // user with inherited access to a shared checkout could read this
             // log; establish a protected, current-user-only ACL before any
             // event can be appended (mirrors collector_token's own Windows
