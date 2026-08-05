@@ -894,6 +894,16 @@ const createDebugServer = ({
   const redaction = createRedactionContext(redactionEnv, redactionNames, [token], {
     maxTokens: redactionMaxTokens,
   });
+  // One structured line on FIRST cap exhaustion only: the terminal state is
+  // otherwise invisible on the collector side (RequestError responses skip
+  // the request.failed stderr line). Event name only — no captured data —
+  // matching the file's opaque-error policy.
+  let redactionRegistryFullSignaled = false;
+  const signalRegistryFull = () => {
+    if (redactionRegistryFullSignaled) return;
+    redactionRegistryFullSignaled = true;
+    process.stderr.write('{"level":"error","event":"redaction.registry_full"}\n');
+  };
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
     && effectiveLimits.sessionIdleTimeoutMs >= 1
     ? effectiveLimits.sessionIdleTimeoutMs
@@ -1022,7 +1032,15 @@ const createDebugServer = ({
           // token) and a rebuild failure rejects this session fail-closed.
           try {
             redaction.registerToken(sessionToken);
-          } catch {
+          } catch (error) {
+            // redaction_token_registry_full is a permanent, restart-only
+            // condition (the lifetime mint cap); everything else is a
+            // transient rebuild failure a client may retry. Distinct codes
+            // keep the two diagnosable; neither leaks captured data.
+            if (error?.message === 'redaction_token_registry_full') {
+              signalRegistryFull();
+              throw new RequestError('session_registry_full', 500);
+            }
             throw new RequestError('session_redaction_failed', 500);
           }
           // Reject a symlinked, non-directory, or escaped .debug path before

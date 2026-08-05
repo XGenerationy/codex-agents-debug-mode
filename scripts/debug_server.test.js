@@ -3705,16 +3705,18 @@ test('collector launch and session tokens are redacted from event bodies, cross-
   });
 });
 
-test('a full token registry rejects the session fail-closed with session_redaction_failed', async () => {
+test('a full token registry rejects the session fail-closed with session_registry_full', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
   // redactionMaxTokens: 2 = launch token + exactly one session mint. The
   // second mint exceeds the cap inside registerToken, which the /session
-  // handler maps to session_redaction_failed. This exercises the fail-closed
-  // path through a supported seam. NOTE: a post-construction poisoned env
-  // Proxy CANNOT trigger this path anymore — createRedactionContext
-  // snapshots env once at construction (review round-1 hardening). If a
-  // Proxy-based variant of this test goes red, the test is wrong, not the
-  // snapshot: do NOT revert the snapshot to live env reads.
+  // handler maps to session_registry_full (permanent cap state,
+  // distinguished from transient session_redaction_failed). This exercises
+  // the fail-closed path through a supported seam. NOTE: a post-construction
+  // poisoned env Proxy CANNOT trigger this path anymore —
+  // createRedactionContext snapshots env once at construction (review
+  // round-1 hardening). If a Proxy-based variant of this test goes red, the
+  // test is wrong, not the snapshot: do NOT revert the snapshot to live env
+  // reads.
   const server = createDebugServer({
     projectRoot,
     token: TEST_LAUNCH_TOKEN,
@@ -3724,10 +3726,32 @@ test('a full token registry rejects the session fail-closed with session_redacti
   try {
     const healthy = await createSession(baseUrl);
     assert.equal(healthy.status, 201);
-    const rejected = await createSession(baseUrl);
-    assert.equal(rejected.status, 500);
-    assert.equal(rejected.body.error, 'session_redaction_failed');
-    // The healthy session keeps recording after the failed mint: the
+    // Capture stderr around ONLY the two failing mints: the healthy mint
+    // above and the /log call below must not contribute to the count, so a
+    // stray unrelated stderr write elsewhere can't mask a miscount here.
+    const stderrLines = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    try {
+      const rejected = await createSession(baseUrl);
+      assert.equal(rejected.status, 500);
+      assert.equal(rejected.body.error, 'session_registry_full');
+      // The cap state is permanent (restart-only): a THIRD mint attempt must
+      // fail the same way, not fall back to the transient code or recover.
+      const rejectedAgain = await createSession(baseUrl);
+      assert.equal(rejectedAgain.status, 500);
+      assert.equal(rejectedAgain.body.error, 'session_registry_full');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(
+      stderrLines.filter((line) => line.includes('"event":"redaction.registry_full"')).length,
+      1,
+    );
+    // The healthy session keeps recording after the failed mints: the
     // registry and needle list are intact (cap check precedes the push).
     const logged = await requestJson(baseUrl, {
       method: 'POST',
