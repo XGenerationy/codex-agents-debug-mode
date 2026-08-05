@@ -3852,15 +3852,56 @@ test('a failed /session setup does not burn a redaction registry slot', async ()
   }
 });
 
+test('byte accounting uses post-redaction bytes', async () => {
+  // The aggregate byte cap intentionally counts POST-redaction bytes: a raw
+  // event whose secret-laden message exceeds maxTotalBytes, but whose redacted
+  // form fits, must be accepted (202) and the on-disk size must stay under the
+  // cap. A regression that reserved pre-redaction bytes would reject this event
+  // or leave totalBytes out of step with the file size.
+  const secret = 'supersecretvalue123'.repeat(8); // 152 chars raw, 10 redacted
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-bytes-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: { API_TOKEN: secret },
+    // Above the redacted event size (~60 bytes), below the raw size (~202).
+    limits: { maxTotalBytes: 150 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const accepted = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: `leaked ${secret}`,
+      },
+    });
+    assert.equal(accepted.status, 202);
+    const logPath = path.join(projectRoot, session.log_file);
+    const { size } = await stat(logPath);
+    assert.equal(size < 150, true, `on-disk size ${size} must be under the 150-byte cap`);
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'leaked [REDACTED]');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('redactEventValue redacts secrets containing regex meta-characters', () => {
   // applyReplacements compiles needles into a single combined RegExp; the
-  // needles are escaped so a secret containing regex syntax (., *, +, [, ],
-  // (, ), |, $, {, }, \) matches as a verbatim substring, not as pattern.
+  // needles are escaped so a secret containing regex syntax (., *, +, ?, ^,
+  // [, ], (, ), |, $, {, }, \) matches as a verbatim substring, not as
+  // pattern. A leading ^ is the fail-open case: unescaped it compiles as an
+  // anchor, never matches, and the secret would persist unredacted.
+  const secret = '^a.b*c+d?e[f]g(h)i|j$k{l}m\\n';
   const replacements = buildSecretReplacements(
-    { API_TOKEN: 'a.b*c+d[e]f(g)h|i$j{k}l\\m' },
+    { API_TOKEN: secret },
     [],
   );
-  const secret = 'a.b*c+d[e]f(g)h|i$j{k}l\\m';
   const redacted = redactEventValue(
     { msg: `secret is ${secret} here`, data: { [secret]: 'value' } },
     replacements,
