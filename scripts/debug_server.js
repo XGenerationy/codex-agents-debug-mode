@@ -5,6 +5,7 @@ const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdir
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
+const { buildSecretReplacements } = require('./pr_closeout_stream');
 const {
   assertNotSymlink: assertNotSymlinkShared,
   isSameFileIdentity,
@@ -686,6 +687,92 @@ const appendSessionEvent = (session, serializedEvent) => {
   });
   session.appendChain = run;
   return run;
+};
+
+// --- Collector-side secret redaction (spec:
+// docs/superpowers/specs/2026-08-05-collector-redaction-design.md) ---
+
+// Apply an already-built longest-first [needle, replacement] list to one
+// string. buildSecretReplacements sorts longest-first, so a shorter needle
+// can never re-match inside text a longer needle already replaced; matching
+// is case-sensitive, same as the closeout streaming redactor's default.
+const applyReplacements = (text, replacements) => replacements.reduce(
+  (current, [needle, replacement]) => current.replaceAll(needle, replacement),
+  text,
+);
+
+// Deep-walk a parsed /log event and redact every string it contains — leaf
+// values, array items, and object KEYS (a client could use a secret as a
+// key). Input always comes from JSON.parse, so only plain objects, arrays,
+// strings, numbers, booleans, and null occur, and cycles are impossible.
+// Rebuilds containers instead of mutating, so a failure part-way can never
+// leave a half-redacted event that later gets persisted. When two sibling
+// keys collide after redaction (or a redacted key collides with a literal
+// one), the later entry is suffixed deterministically ([REDACTED]#2, ...)
+// rather than silently overwriting the earlier entry.
+const redactEventValue = (value, replacements) => {
+  if (typeof value === 'string') return applyReplacements(value, replacements);
+  if (Array.isArray(value)) return value.map((item) => redactEventValue(item, replacements));
+  if (value && typeof value === 'object') {
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+      let redactedKey = applyReplacements(key, replacements);
+      if (Object.hasOwn(output, redactedKey)) {
+        let suffix = 2;
+        while (Object.hasOwn(output, `${redactedKey}#${suffix}`)) suffix += 1;
+        redactedKey = `${redactedKey}#${suffix}`;
+      }
+      output[redactedKey] = redactEventValue(entry, replacements);
+    }
+    return output;
+  }
+  return value;
+};
+
+// Fail-closed wrapper used by the /log handler: any walk failure rejects the
+// event (nothing is persisted) instead of falling back to raw evidence.
+const redactEventForAppend = (event, replacements) => {
+  try {
+    return redactEventValue(event, replacements);
+  } catch {
+    throw new RequestError('log_redaction_failed', 500);
+  }
+};
+
+// Owns the needle list for one collector process. `tokens` is an append-only
+// registry (launch token first, then every minted session token — retired
+// sessions' tokens deliberately stay registered so a stale token in a later
+// event body still redacts). Rebuilds derive entirely from the registry
+// (push-then-rebuild in the /session handler), so concurrent rebuilds are
+// idempotent and last-writer-wins can never drop a concurrent session's
+// token. Tokens enter buildSecretReplacements as explicitly-named synthetic
+// env entries, which grants them full encoded-variant expansion with no
+// minimum-length filter and requires no change to the reviewed closeout
+// module.
+const createRedactionContext = (envSnapshot, explicitNames, initialTokens) => {
+  const tokens = [...initialTokens];
+  let replacements;
+  const rebuild = () => {
+    const synthetic = {};
+    const syntheticNames = [];
+    tokens.forEach((tokenValue, index) => {
+      const name = `__COLLECTOR_TOKEN_${index}`;
+      synthetic[name] = tokenValue;
+      syntheticNames.push(name);
+    });
+    replacements = buildSecretReplacements(
+      { ...envSnapshot, ...synthetic },
+      [...explicitNames, ...syntheticNames],
+    );
+  };
+  rebuild();
+  return {
+    registerToken(tokenValue) {
+      tokens.push(tokenValue);
+      rebuild();
+    },
+    replacements: () => replacements,
+  };
 };
 
 /**
@@ -2063,6 +2150,7 @@ module.exports = {
   COLLECTOR_VERSION,
   RequestError,
   createDebugServer,
+  createRedactionContext,
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
@@ -2071,6 +2159,8 @@ module.exports = {
   probeServer,
   readJson,
   reclaimStaleCollectorClaim,
+  redactEventForAppend,
+  redactEventValue,
   resolvePowerShellExecutable,
   unlinkOwnedClaimIfUnchanged,
 };

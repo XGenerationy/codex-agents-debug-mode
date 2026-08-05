@@ -13,6 +13,7 @@ const {
   COLLECTOR_VERSION,
   RequestError,
   createDebugServer,
+  createRedactionContext,
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
@@ -21,9 +22,13 @@ const {
   probeServer,
   readJson,
   reclaimStaleCollectorClaim,
+  redactEventForAppend,
+  redactEventValue,
   resolvePowerShellExecutable,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
+
+const { buildSecretReplacements } = require('./pr_closeout_stream');
 
 const TEST_LAUNCH_TOKEN = 'test-launch-token-with-enough-entropy-for-fixtures';
 
@@ -3330,3 +3335,77 @@ test(
     }
   },
 );
+
+test('redactEventValue redacts string leaves, nested data, and object keys', () => {
+  const replacements = buildSecretReplacements(
+    { API_TOKEN: 'supersecretvalue123' },
+    [],
+  );
+  const event = {
+    ts: '2026-08-05T00:00:00.000Z',
+    msg: 'auth failed for supersecretvalue123',
+    data: {
+      nested: { detail: 'retry with supersecretvalue123 now' },
+      supersecretvalue123: 'used as key',
+      list: ['supersecretvalue123', 42, true, null],
+    },
+  };
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(redacted.msg, 'auth failed for [REDACTED]');
+  assert.equal(redacted.data.nested.detail, 'retry with [REDACTED] now');
+  assert.equal(redacted.data['[REDACTED]'], 'used as key');
+  assert.deepEqual(redacted.data.list, ['[REDACTED]', 42, true, null]);
+  assert.equal(Object.hasOwn(redacted.data, 'supersecretvalue123'), false);
+});
+
+test('redactEventValue leaves non-string leaves untouched and returns new objects', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { msg: 'clean', data: { count: 7, ok: false, none: null } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepEqual(redacted, event);
+  assert.notEqual(redacted, event);
+  assert.notEqual(redacted.data, event.data);
+});
+
+test('redactEventValue disambiguates colliding keys deterministically', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2 } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepEqual(redacted, { data: { '[REDACTED]': 1, '[REDACTED]#2': 2 } });
+});
+
+test('redactEventForAppend maps walk failures to log_redaction_failed 500', () => {
+  // Covers spec test group 5 at unit level: with a well-formed needle list
+  // the walk cannot be made to throw through HTTP without a fake injection
+  // seam, so the RequestError mapping is verified here; the handler calls
+  // this BEFORE capacity reservation and append, so a throw provably
+  // persists nothing (see Task 2 wiring).
+  // A RegExp needle makes String.prototype.replaceAll throw (non-global
+  // regex), standing in for any unexpected walk failure.
+  const poisoned = [[/x/, '[REDACTED]']];
+  assert.throws(
+    () => redactEventForAppend({ msg: 'x' }, poisoned),
+    (error) => error instanceof RequestError
+      && error.code === 'log_redaction_failed'
+      && error.status === 500,
+  );
+});
+
+test('createRedactionContext folds env, explicit names, and tokens; registry rebuild is idempotent', () => {
+  const context = createRedactionContext(
+    { API_TOKEN: 'supersecretvalue123', SHORT_TOKEN: 'tiny' },
+    ['SHORT_TOKEN'],
+    ['launch-token-value-with-entropy'],
+  );
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  assert.equal(apply('a supersecretvalue123 b'), 'a [REDACTED] b');
+  assert.equal(apply('short tiny value'), 'short [REDACTED] value');
+  assert.equal(apply('bearer launch-token-value-with-entropy'), 'bearer [REDACTED]');
+  assert.equal(apply('session-token-added-later-abc'), 'session-token-added-later-abc');
+  context.registerToken('session-token-added-later-abc');
+  assert.equal(apply('session-token-added-later-abc'), '[REDACTED]');
+  // Earlier tokens survive later registrations (append-only registry).
+  context.registerToken('another-token-registered-after');
+  assert.equal(apply('bearer launch-token-value-with-entropy'), 'bearer [REDACTED]');
+  assert.equal(apply('session-token-added-later-abc'), '[REDACTED]');
+});
