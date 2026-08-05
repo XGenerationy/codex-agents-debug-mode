@@ -3466,10 +3466,149 @@ test('createRedactionContext derives a synthetic prefix that cannot shadow a rea
   // under the same index -- both must still redact.
   const context = createRedactionContext(
     { __COLLECTOR_TOKEN_0: 'realenvsecretvalue' },
-    ['__COLLECTOR_TOKEN_0'],
+    [],
     ['thelaunchtokenvalue'],
   );
   const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
   assert.equal(apply('contains realenvsecretvalue here'), 'contains [REDACTED] here');
   assert.equal(apply('contains thelaunchtokenvalue here'), 'contains [REDACTED] here');
+});
+
+test('createRedactionContext rejects initialTokens exceeding maxTokens', () => {
+  assert.throws(
+    () => createRedactionContext({}, [], ['t-0', 't-1', 't-2'], { maxTokens: 2 }),
+    /redaction_token_registry_full/,
+  );
+});
+
+const withRedactionServer = async (redactionEnv, redactionNames, run) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv,
+    redactionNames,
+  });
+  const baseUrl = await listen(server);
+  try {
+    return await run({ baseUrl, projectRoot });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+};
+
+const readSessionLines = async (projectRoot, session) => {
+  const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+  return raw.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+};
+
+test('POST /log persists env secrets as [REDACTED] in msg, nested data, and keys', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'refused supersecretvalue123 upstream',
+        data: {
+          nested: { echo: 'value supersecretvalue123 seen' },
+          supersecretvalue123: 'as key',
+        },
+      },
+    });
+    assert.equal(response.status, 202);
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'refused [REDACTED] upstream');
+    assert.equal(event.data.nested.echo, 'value [REDACTED] seen');
+    assert.equal(event.data['[REDACTED]'], 'as key');
+    assert.equal(JSON.stringify(event).includes('supersecretvalue123'), false);
+  });
+});
+
+test('POST /log redacts encoded variants (base64, URL-encoded, JSON-escaped)', async () => {
+  const secret = 'p@ss word+42!"quoted"';
+  await withRedactionServer({ DB_PASSWORD: secret }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const base64 = Buffer.from(secret, 'utf8').toString('base64');
+    const urlEncoded = encodeURIComponent(secret);
+    const jsonEscaped = JSON.stringify(secret).slice(1, -1);
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'variants observed',
+        data: { base64, urlEncoded, jsonEscaped },
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.data.base64, '[REDACTED]');
+    assert.equal(event.data.urlEncoded, '[REDACTED]');
+    assert.equal(event.data.jsonEscaped, '[REDACTED]');
+  });
+});
+
+test('short auto-discovered values persist; redactionNames opt-in redacts them', async () => {
+  await withRedactionServer({ SHORT_TOKEN: 'tiny' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'value tiny stays' },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'value tiny stays');
+  });
+  await withRedactionServer({ SHORT_TOKEN: 'tiny' }, ['SHORT_TOKEN'], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'value tiny goes' },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'value [REDACTED] goes');
+  });
+});
+
+test('secret-free events keep their exact shape (regression guard)', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'Function entry',
+        data: { userId: null },
+        hypothesisId: 'H1',
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.deepEqual(
+      { msg: event.msg, data: event.data, hypothesisId: event.hypothesisId },
+      { msg: 'Function entry', data: { userId: null }, hypothesisId: 'H1' },
+    );
+  });
+});
+
+test('createDebugServer refuses to start when the initial redaction build fails', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  const poisonedEnv = new Proxy({}, {
+    ownKeys() { throw new Error('poisoned env'); },
+  });
+  try {
+    assert.throws(() => createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      redactionEnv: poisonedEnv,
+    }), /poisoned env/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });

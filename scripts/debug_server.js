@@ -787,6 +787,7 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
       throw new Error('invalid_redaction_token');
     }
   }
+  if (initialTokens.length > maxTokens) throw new Error('redaction_token_registry_full');
   const tokens = [...initialTokens];
   // Keep prepending underscores until no real env var name in the snapshot
   // starts with the candidate prefix, so synthetic names can never collide
@@ -843,6 +844,9 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
  * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
+ * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
+ * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
+ * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_redaction_failed. Default 512 bounds worst-case per-event redaction cost.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -851,6 +855,9 @@ const createDebugServer = ({
   instanceId = randomBytes(16).toString('hex'),
   allowedOrigins = [],
   limits = {},
+  redactionEnv = { ...process.env },
+  redactionNames = [],
+  redactionMaxTokens = 512,
 } = {}) => {
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
@@ -875,6 +882,12 @@ const createDebugServer = ({
   const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
+  // Fail-closed secret redaction for every persisted event. Built here so a
+  // broken needle build prevents the collector from starting at all; the
+  // launch token is registered from the first build.
+  const redaction = createRedactionContext(redactionEnv, redactionNames, [token], {
+    maxTokens: redactionMaxTokens,
+  });
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
     && effectiveLimits.sessionIdleTimeoutMs >= 1
     ? effectiveLimits.sessionIdleTimeoutMs
@@ -1188,7 +1201,12 @@ const createDebugServer = ({
         for (const key of ['data', 'hypothesisId', 'loc', 'runId']) {
           if (payload[key] !== undefined) event[key] = payload[key];
         }
-        const serializedEvent = `${JSON.stringify(event)}\n`;
+        // Redact BEFORE serialization and BEFORE capacity reservation: a
+        // redaction failure rejects the event with nothing persisted and no
+        // reservation to roll back. Byte accounting below intentionally uses
+        // post-redaction bytes ([REDACTED] may shrink or grow an event).
+        const redactedEvent = redactEventForAppend(event, redaction.replacements());
+        const serializedEvent = `${JSON.stringify(redactedEvent)}\n`;
         const eventBytes = Buffer.byteLength(serializedEvent);
         if (totalBytes + eventBytes > effectiveLimits.maxTotalBytes) {
           throw new RequestError('storage_limit_reached', 429);
