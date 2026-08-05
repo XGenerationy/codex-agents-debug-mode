@@ -44,6 +44,14 @@ addresses) remains agent discipline: pattern-based detection was considered and 
 the maintainer to protect evidence fidelity (false-positive redaction corrupts runtime
 evidence). SKILL.md keeps Rule 5 as a defense-in-depth agent rule.
 
+Component extraction can over-redact common words: `buildSecretReplacements` extracts URL
+usernames/passwords and connection-string leaves from secret values, so a dev-default
+`DATABASE_URL` like `postgres://postgres:postgres@localhost/app` makes the literal word
+`postgres` a needle and scrubs it from all evidence. Decision (review round 3): behavior
+stands — the configured value IS a known secret, and raising the component floor would
+silently leak short real passwords, which the unconditional guarantee forbids. The collateral
+is documented in README/SKILL.md troubleshooting instead.
+
 ### Non-goals
 
 - No regex/pattern detectors and no plugin API. The single `redactEventValue` function is the
@@ -112,7 +120,7 @@ Rejected alternatives:
 |---|---|---|
 | Startup list build | throw | Server refuses to start (same as other init failures) |
 | Session-mint rebuild | throw | `500 session_redaction_failed`; no session created |
-| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction) |
+| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction). At extreme nesting depths the pre-existing `JSON.stringify` recursion limit can trip first and surface as `500 internal_error` — also before reservation, equally fail-closed. |
 
 ## Testing (`scripts/debug_server.test.js` idiom, no new dependencies)
 
@@ -123,7 +131,7 @@ Rejected alternatives:
    (including cross-session: session A's log never contains session B's token).
 4. Short (<8 chars) auto-discovered value → **not** redacted; the same value under a
    `DEBUG_REDACT_NAMES` name → redacted.
-5. Forced walk failure → `500 log_redaction_failed`, log file byte-identical to before.
+5. Hostile deep nesting over HTTP → `500` (`log_redaction_failed`, or `internal_error` where the serializer's recursion limit trips first), log file byte-identical, session healthy afterward; plus a unit test pinning the exact `log_redaction_failed` mapping.
 6. Non-string leaves (numbers, booleans, null) pass through unchanged.
 7. Key-collision disambiguation produces `[REDACTED]` / `[REDACTED]#2`.
 8. Full existing suite green: secret-free events are byte-identical to today's output.

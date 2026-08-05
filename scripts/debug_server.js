@@ -779,8 +779,17 @@ const redactEventForAppend = (event, replacements) => {
 // degrade redaction or rebuild cost. Every token — supplied at construction
 // or via registerToken — is validated as a non-empty string; silently
 // accepting anything else would register a token that can never actually
-// redact, i.e. a fail-open hole.
+// redact, i.e. a fail-open hole. The same fail-closed stance applies to the
+// other two inputs: a non-array explicitNames (e.g. a bare string, which
+// `[...explicitNames]` would silently iterate per-character) or a
+// null/non-object envSnapshot (which `{...envSnapshot}` would silently
+// coerce to `{}`) both throw immediately rather than quietly building a
+// weaker-than-configured needle list.
 const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { maxTokens = 512 } = {}) => {
+  if (!Array.isArray(explicitNames)) throw new Error('invalid_redaction_names');
+  if (envSnapshot === null || typeof envSnapshot !== 'object' || Array.isArray(envSnapshot)) {
+    throw new Error('invalid_redaction_env');
+  }
   const snapshot = { ...envSnapshot };
   for (const initial of initialTokens) {
     if (typeof initial !== 'string' || initial.length === 0) {

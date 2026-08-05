@@ -49,7 +49,7 @@ const close = (server) =>
     });
   });
 
-const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathname = '/' } = {}) =>
+const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathname = '/', rawBody } = {}) =>
   new Promise((resolve, reject) => {
     const url = new URL(pathname, baseUrl);
     const request = http.request(
@@ -81,7 +81,14 @@ const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathn
       },
     );
     request.on('error', reject);
-    if (body !== undefined) request.write(JSON.stringify(body));
+    // rawBody bypasses this client's own JSON.stringify: a hostile-nesting
+    // fixture deep enough to blow the SERVER's redaction-walk stack can also
+    // overflow the *test client's* native stringify recursion budget (they
+    // are different code paths with different per-level costs), which would
+    // fail the test for a reason unrelated to the server behavior under
+    // test. rawBody lets a caller hand over pre-built JSON text instead.
+    if (rawBody !== undefined) request.write(rawBody);
+    else if (body !== undefined) request.write(JSON.stringify(body));
     request.end();
   });
 
@@ -3401,11 +3408,10 @@ test('redactEventValue preserves a JSON __proto__ key as an own property without
 });
 
 test('redactEventForAppend maps walk failures to log_redaction_failed 500', () => {
-  // Covers spec test group 5 at unit level: with a well-formed needle list
-  // the walk cannot be made to throw through HTTP without a fake injection
-  // seam, so the RequestError mapping is verified here; the handler calls
-  // this BEFORE capacity reservation and append, so a throw provably
-  // persists nothing (see Task 2 wiring).
+  // The walk IS reachable-and-throwable over HTTP via deep nesting inside
+  // maxBodyBytes (see the 'hostile deep nesting' integration test); this
+  // unit test pins the exact RequestError mapping (code + status)
+  // independent of platform stack depth.
   // A RegExp needle makes String.prototype.replaceAll throw (non-global
   // regex), standing in for any unexpected walk failure.
   const poisoned = [[/x/, '[REDACTED]']];
@@ -3611,4 +3617,66 @@ test('createDebugServer refuses to start when the initial redaction build fails'
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('createRedactionContext rejects a non-array explicitNames fail-closed', () => {
+  assert.throws(
+    () => createRedactionContext({}, 'SHORT_TOKEN', ['t-0']),
+    /invalid_redaction_names/,
+  );
+});
+
+test('createRedactionContext rejects null or non-object env snapshots fail-closed', () => {
+  assert.throws(() => createRedactionContext(null, [], ['t-0']), /invalid_redaction_env/);
+  assert.throws(() => createRedactionContext('env', [], ['t-0']), /invalid_redaction_env/);
+  assert.throws(() => createRedactionContext([], [], ['t-0']), /invalid_redaction_env/);
+});
+
+test('hostile deep nesting is rejected fail-closed with nothing persisted', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'baseline ok' },
+    });
+    const logPath = path.join(projectRoot, session.log_file);
+    const before = await readFile(logPath, 'utf8');
+    // Depth 5000 nests within maxBodyBytes (~10KB) and reliably exceeds the
+    // recursion budget of either the redaction walk (log_redaction_failed)
+    // or JSON.stringify (internal_error) — WHICH stage trips first varies
+    // with platform stack size, so both fail-closed codes are accepted; the
+    // invariant under test is: 500, byte-identical log, healthy session
+    // afterward. Both paths sit before capacity reservation.
+    //
+    // The request body is assembled as raw JSON TEXT via string
+    // concatenation, then sent through requestJson's rawBody escape hatch
+    // instead of its default JSON.stringify(body) path: measured on this
+    // machine, a depth-5000 array overflows native JSON.stringify's own
+    // recursion budget (bisected boundary ~1500-2000) well before it
+    // reaches the server, which would fail this test in the test CLIENT
+    // instead of exercising the server's fail-closed path under test.
+    // JSON.parse (used to build `nested` for the JSON.stringify() calls
+    // below, which only ever see the small flat fields) tolerates depth
+    // 5000 fine, confirming the asymmetry is specific to stringify.
+    const depth = 5000;
+    const rawBody = `{"sessionId":${JSON.stringify(session.session_id)},"sessionToken":${JSON.stringify(session.session_token)},"msg":"hostile nesting","data":${'['.repeat(depth)}0${']'.repeat(depth)}}`;
+    const rejected = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      rawBody,
+    });
+    assert.equal(rejected.status, 500);
+    assert.equal(['log_redaction_failed', 'internal_error'].includes(rejected.body.error), true);
+    const after = await readFile(logPath, 'utf8');
+    assert.equal(after, before);
+    const recovered = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'recovered ok' },
+    });
+    assert.equal(recovered.status, 202);
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.msg), ['baseline ok', 'recovered ok']);
+  });
 });
