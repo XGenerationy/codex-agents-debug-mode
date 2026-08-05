@@ -125,10 +125,10 @@ response shape.
 Every persisted event also passes one fail-closed redaction choke point
 (`createRedactionContext` / `redactEventForAppend`): values of sensitive-named environment
 variables, names listed in `DEBUG_REDACT_NAMES`, and the collector's own tokens can never reach
-a session log in raw or encoded form. The token registry is capped per process (512 lifetime
-session mints, failed mints included); at the cap further sessions are refused with
-`session_registry_full`, signaled once on stderr as `redaction.registry_full` — restart the
-collector to reset it.
+a session log in raw or encoded form. The token registry is capped at 512 entries per process —
+the launch token plus up to 511 session mints, failed mints included; at the cap further
+sessions are refused with `session_registry_full`, signaled once on stderr as
+`redaction.registry_full` — restart the collector to reset it.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 

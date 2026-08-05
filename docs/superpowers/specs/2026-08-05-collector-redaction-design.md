@@ -92,9 +92,9 @@ Rejected alternatives:
    every registered token (plain last-writer-wins over the rebuilt list would race and could
    drop a concurrent session's token). Tokens of retired/expired sessions stay registered for
    the process lifetime — deliberate, so a stale token appearing in a later event body still
-   redacts. The registry is capped (512 tokens per process, the collector's lifetime mint
-   budget); when the cap is reached, further session mints fail closed rather than degrade
-   redaction or rebuild cost.
+   redacts. The registry is capped at 512 registered tokens per process — the launch token
+   plus up to 511 session mints; when the cap is reached, further session mints fail closed
+   rather than degrade redaction or rebuild cost.
 3. **Per event (`/log` handler):** between event construction (the allowlisted
    `{ts, msg, data, hypothesisId, loc, runId}` assembly) and `JSON.stringify`, apply
    `redactEventValue(event)`:
