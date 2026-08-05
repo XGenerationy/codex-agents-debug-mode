@@ -749,10 +749,10 @@ In the "Debug collector trust model" section, append after the paragraph ending 
 Every persisted event also passes one fail-closed redaction choke point
 (`createRedactionContext` / `redactEventForAppend`): values of sensitive-named environment
 variables, names listed in `DEBUG_REDACT_NAMES`, and the collector's own tokens can never reach
-a session log in raw or encoded form. The token registry is capped per process (512 lifetime
-session mints, failed mints included); at the cap further sessions are refused with
-`session_registry_full`, signaled once on stderr as `redaction.registry_full` — restart the
-collector to reset it.
+a session log in raw or encoded form. The token registry is capped at 512 entries per process
+— the launch token plus up to 511 session mints, failed mints included; at the cap further
+sessions are refused with `session_registry_full`, signaled once on stderr as
+`redaction.registry_full` — restart the collector to reset it.
 ```
 
 - [ ] **Step 4: SKILL.md Critical Rule 5**
@@ -780,7 +780,7 @@ In the SKILL.md Troubleshooting table (under `## Troubleshooting`), add this row
 
 ```markdown
 | Common word shows as `[REDACTED]` | An env secret or one of its extracted components (e.g. a dev-default `postgres` DSN password) equals that word; use distinct dev credential values or unset the variable for the collector process |
-| Sessions fail with `session_registry_full` | The collector's lifetime session-mint cap (512, failed mints included) is exhausted; restart the collector |
+| Sessions fail with `session_registry_full` | The collector's 512-entry token registry (launch token + up to 511 session mints, failed mints included) is exhausted; restart the collector |
 ```
 
 - [ ] **Step 5: Validate and commit**
