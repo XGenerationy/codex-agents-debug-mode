@@ -488,6 +488,10 @@ test('readSessionLive matches filterEntries over the same data (GET parity)', as
       { runId: 'r2' },
       { type: 'event', hypothesisId: 'H1' },
       { limit: 2 },
+      // Padded values: the route trims query values before comparing; the
+      // core must too. Clean fixtures alone cannot detect trim divergence.
+      { hypothesisId: '  H1  ' },
+      { runId: '  r2  ' },
     ]) {
       const live = await readSessionLive({ port, token: LAUNCH, sessionId: session.session_id, filters });
       const local = filterEntries(fileEntries, filters);
@@ -622,7 +626,7 @@ Extend `module.exports` with `createSessionTail`, `discoverCollector`, `readSess
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 15/15 pass. `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
+Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 19/19 pass (15 from Task 1 + 4 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
 
 - [ ] **Step 5: Commit**
 
