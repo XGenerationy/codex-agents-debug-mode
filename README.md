@@ -92,6 +92,19 @@ The skill is fail-closed. Missing infrastructure, uncertain process ownership, i
 evidence, skipped checks, warning output, stale artifacts, and unverifiable service health block a
 clean result.
 
+The collector additionally enforces the secrets half of Critical Rule 5 at ingestion: known
+secrets — sensitive-named environment values, `DEBUG_REDACT_NAMES` opt-ins, and the collector's
+own launch and session tokens — are replaced with `[REDACTED]`, including their URL-encoded,
+JSON-escaped, base64, and hex variants and extracted components (URL credentials,
+connection-string leaves), before any event byte is persisted. A redaction failure rejects the
+write instead of storing raw evidence. Note the deliberate trade-off: if a secret value or one
+of its components equals a common word (a dev-default `postgres` password, for example), that
+word is scrubbed from all evidence — the guarantee is unconditional, so prefer distinct dev
+credential values. `DEBUG_REDACT_NAMES` entries additionally bypass the 8-character
+auto-discovery floor, so list only names whose values are genuinely high-entropy secrets — a
+short or common value would be scrubbed wherever it appears as a substring. PII redaction
+remains an agent responsibility.
+
 ### Debug collector trust model
 
 `scripts/debug_server.js` is a single-operator, loopback-only server: it binds to `127.0.0.1`,
@@ -108,6 +121,14 @@ unguessable tokens instead:
 Both checks funnel through the single `authorizeRequest` choke point in `debug_server.js` so a new
 authenticated endpoint cannot add an inline check and skip the timing-safe comparison or the `401`
 response shape.
+
+Every persisted event also passes one fail-closed redaction choke point
+(`createRedactionContext` / `redactEventForAppend`): values of sensitive-named environment
+variables, names listed in `DEBUG_REDACT_NAMES`, and the collector's own tokens can never reach
+a session log in raw or encoded form. The token registry is capped at 512 entries per process —
+the launch token plus up to 511 session mints, failed mints included; at the cap further
+sessions are refused with `session_registry_full`, signaled once on stderr as
+`redaction.registry_full` — restart the collector to reset it.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
