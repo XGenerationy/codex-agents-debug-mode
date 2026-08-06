@@ -571,10 +571,13 @@ Guarantees both tools keep (enforced by tests):
   `disappeared` is an exact-string set difference, capped at 20 per hypothesis with the
   remainder counted in `disappearedTruncated`; untagged events are their own bucket,
   never merged into a hypothesis.
-- `schema: 1` JSON is the agent contract; table and markdown are human surfaces. Rendered
-  `msg`/`note` text is escaped, so report structure always reflects the engine, never log
-  content; malformed (non-string) hypothesis ids are excluded, counted in
-  `summary.ignoredMalformedIds`, and stated in human output.
+- `schema: 1` JSON is the agent contract; the diff's table/markdown and the viewer TUI are
+  the human surfaces. All three escape untrusted log text — `msg`/`note`/`title`, hypothesis
+  ids, and control characters — through a shared core helper, so report/screen structure
+  always reflects the engine, never log content; agent outputs (byte-verbatim NDJSON,
+  `schema: 1` JSON) carry source values unmodified. Malformed (non-string) hypothesis ids are
+  excluded, counted in `summary.ignoredMalformedIds`, with their events excluded from totals
+  and counted in `summary.ignoredMalformedEvents` — the decision-relevant number.
 
 ## Troubleshooting
 

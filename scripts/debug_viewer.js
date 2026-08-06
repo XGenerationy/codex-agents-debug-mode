@@ -8,6 +8,7 @@ const path = require('node:path');
 const {
   createSessionTail,
   discoverCollector,
+  escapeEvidenceText,
   filterEntries,
   foldHypotheses,
   listSessions,
@@ -166,14 +167,18 @@ const reduce = (state, key) => {
 // one stdout call, so tearing can't interleave partial rows. Kept free of
 // cursor-addressing so unit tests can assert on plain text.
 const formatEntryRow = (parsed) => {
-  const time = typeof parsed.ts === 'string' ? parsed.ts.slice(11, 19) : '--:--:--';
+  // Every interpolated field here is untrusted log content — route it
+  // through escapeEvidenceText so it can never forge a row's structure or
+  // (once JSON.parse rehydrates a stored escape sequence into a real
+  // control character) inject terminal control sequences into the TUI.
+  const time = escapeEvidenceText(typeof parsed.ts === 'string' ? parsed.ts.slice(11, 19) : '--:--:--');
   if (parsed.type === 'hypothesis') {
-    const note = parsed.note ? ` "${parsed.note}"` : '';
-    return `${time} ◆ ${parsed.hypothesisId} → ${parsed.status}${note}`;
+    const note = parsed.note ? ` "${escapeEvidenceText(parsed.note)}"` : '';
+    return `${time} ◆ ${escapeEvidenceText(parsed.hypothesisId)} → ${escapeEvidenceText(parsed.status)}${note}`;
   }
-  const tag = parsed.hypothesisId ? `${parsed.hypothesisId} ` : '';
-  const loc = parsed.loc ? `  ${parsed.loc}` : '';
-  return `${time} ${tag}${parsed.msg ?? ''}${loc}`;
+  const tag = parsed.hypothesisId ? `${escapeEvidenceText(parsed.hypothesisId)} ` : '';
+  const loc = parsed.loc ? `  ${escapeEvidenceText(parsed.loc)}` : '';
+  return `${time} ${tag}${escapeEvidenceText(parsed.msg ?? '')}${loc}`;
 };
 
 const renderFrame = (state, entries, { columns, rows, live }) => {
@@ -186,10 +191,12 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
     return points.length > columns ? points.slice(0, Math.max(0, columns)).join('') : text;
   };
   const folded = foldHypotheses(entries);
+  // Folded values are derived from untrusted log content just like raw
+  // entries — same escapeEvidenceText discipline as formatEntryRow above.
   const tableRows = [...folded.values()].map((h) => {
-    const when = typeof h.ts === 'string' ? h.ts.slice(11, 16) : '';
-    const detail = h.title ?? h.note ?? '';
-    return `${h.hypothesisId}  ${h.status}  ${detail}  ${when}`;
+    const when = escapeEvidenceText(typeof h.ts === 'string' ? h.ts.slice(11, 16) : '');
+    const detail = escapeEvidenceText(h.title ?? h.note ?? '');
+    return `${escapeEvidenceText(h.hypothesisId)}  ${escapeEvidenceText(h.status)}  ${detail}  ${when}`;
   });
   const tableHeight = Math.min(Math.max(tableRows.length, 1), Math.max(3, Math.floor(rows / 3)));
   const streamHeight = rows - tableHeight - 3;
@@ -198,7 +205,7 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   const status = state.paused ? 'paused' : (live ? '● live' : 'file');
   const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
   const lines = [];
-  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
+  lines.push(clip(`─ ${escapeEvidenceText(state.sessionId)}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
   lines.push(clip(`─ hypotheses ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));

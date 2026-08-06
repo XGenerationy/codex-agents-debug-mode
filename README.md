@@ -149,8 +149,8 @@ table interactively, versioned `schema: 1` JSON when piped; `--format=md` for PR
 consume session logs through the shared `scripts/debug_evidence.js` core, whose filter
 semantics are test-guaranteed identical to `GET /sessions/:id/logs`. The diff never
 classifies severity or infers failures — recorded verdicts and deterministic deltas only —
-and rendered log text is escaped in the human formats, so report structure reflects the
-engine, never log content.
+and rendered log text is escaped in the human formats (diff table/markdown and the viewer
+TUI), so report structure reflects the engine, never log content.
 
 ## License
 

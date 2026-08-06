@@ -6,6 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  escapeEvidenceText,
   filterEntries,
   foldHypotheses,
   listSessions,
@@ -126,6 +127,25 @@ test('foldHypotheses keeps file order as the tiebreak for same-millisecond lines
     line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN' })
     + line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'REJECTED' });
   assert.equal(foldHypotheses(parseSessionText(sameMs)).get('H1').status, 'REJECTED');
+});
+
+test('escapeEvidenceText turns a real newline into the two-character escape text', () => {
+  assert.equal(escapeEvidenceText('a\nb'), 'a\\nb');
+});
+
+test('escapeEvidenceText leaves no character below 0x20 for a string containing a real ESC byte', () => {
+  const withEsc = `${String.fromCharCode(27)}[2J`;
+  const escaped = escapeEvidenceText(withEsc);
+  for (const ch of escaped) assert.equal(ch.charCodeAt(0) < 0x20, false);
+});
+
+test('escapeEvidenceText escapes quotes and backslashes', () => {
+  assert.equal(escapeEvidenceText('she said "hi" \\ ok'), 'she said \\"hi\\" \\\\ ok');
+});
+
+test('escapeEvidenceText leaves plain ASCII and emoji unchanged', () => {
+  assert.equal(escapeEvidenceText('hello world 123'), 'hello world 123');
+  assert.equal(escapeEvidenceText('emoji: \u{1F600}'), 'emoji: \u{1F600}');
 });
 
 test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {

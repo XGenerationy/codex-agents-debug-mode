@@ -41,6 +41,17 @@ const readSessionFile = async (filePath) => {
   return parseSessionText(lastNewline === -1 ? '' : text.slice(0, lastNewline + 1));
 };
 
+// Structure-neutralizing escape for HUMAN render surfaces (the viewer TUI,
+// the diff's table/markdown). Real newlines and control characters —
+// including a raw ESC byte rehydrated by JSON.parse from a stored `\u001b`
+// escape sequence — become printable escape text (e.g. an actual newline
+// becomes the two characters "\" + "n"), so log content can never forge
+// screen/report structure or inject terminal control sequences. Every
+// interpolated parsed/folded field in a human renderer MUST route through
+// this. Agent outputs (byte-verbatim NDJSON, schema:1 JSON) MUST NEVER use
+// it — they carry source values unmodified by contract.
+const escapeEvidenceText = (value) => JSON.stringify(String(value)).slice(1, -1);
+
 const FILTER_KEYS = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
 const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
 
@@ -323,6 +334,7 @@ const discoverCollector = async (projectRoot) => {
 module.exports = {
   createSessionTail,
   discoverCollector,
+  escapeEvidenceText,
   filterEntries,
   foldHypotheses,
   listSessions,

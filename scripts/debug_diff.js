@@ -6,6 +6,7 @@
 // three renderers; the no-flag default is TTY-aware: table for humans,
 // JSON (schema: 1) for pipes, because agents must never scrape tables.
 const {
+  escapeEvidenceText,
   foldHypotheses,
   readSessionFile,
   resolveSessionRef,
@@ -120,16 +121,18 @@ const statusOr = (status) => status ?? '—';
 // evidence that gets pasted into PRs/chat, so raw interpolation would let
 // log content forge headings, verdicts, or break out of a backtick code
 // span (report structure must reflect the engine, never log content).
-// JSON.stringify turns embedded newlines/quotes/control chars into their
-// escaped literal form (a real newline becomes the two printable
-// characters "\" + "n", never an actual line break); backticks are handled
-// separately since JSON.stringify does not touch them and this text can
-// land inside a backtick code span, and the box-drawing pipe `│` becomes
-// `¦` so a crafted id cannot mimic table cell borders — the docs promise
-// report structure NEVER reflects log content, without qualification.
-// JSON output needs none of this — JSON.stringify(diff, ...) already
-// escapes everything correctly there.
-const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`').replaceAll('│', '¦');
+// escapeEvidenceText (the shared core helper, also used by the viewer TUI)
+// turns embedded newlines/quotes/control chars into their escaped literal
+// form (a real newline becomes the two printable characters "\" + "n",
+// never an actual line break) — this is the single source of truth for
+// that layer. Two markdown/table-specific additions on top: backticks are
+// escaped separately since JSON escaping does not touch them and this text
+// can land inside a backtick code span, and the box-drawing pipe `│`
+// becomes `¦` so a crafted id cannot mimic table cell borders — the docs
+// promise report structure NEVER reflects log content, without
+// qualification. JSON output needs none of this — JSON.stringify(diff, ...)
+// already escapes everything correctly there.
+const escapeText = (value) => escapeEvidenceText(value).replaceAll('`', '\\`').replaceAll('│', '¦');
 
 // Hypothesis ids are short identifiers by convention; 40 chars comfortably
 // fits real-world ids while keeping the bordered table readable if an

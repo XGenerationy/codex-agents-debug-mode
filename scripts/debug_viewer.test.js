@@ -215,6 +215,25 @@ test('renderFrame clips at a code-point boundary, never splitting a surrogate pa
   for (const row of rows) assert.equal(row.isWellFormed(), true);
 });
 
+test('renderFrame escapes embedded newlines so log content cannot forge a header line or break the row-count invariant', () => {
+  const forged = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: 'benign\n─ FORGED SESSION ── ● live ─\nfake' } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [forged], { columns: 80, rows: 10, live: true });
+  const rows = frame.split('\n');
+  assert.equal(rows.length, 10);
+  for (const row of rows) assert.doesNotMatch(row, /^─ FORGED/);
+});
+
+test('renderFrame escapes a real ESC byte in msg so no control characters reach the terminal', () => {
+  const injected = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: `${String.fromCharCode(27)}[2J` } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [injected], { columns: 80, rows: 10, live: false });
+  for (const ch of frame) {
+    if (ch === '\n') continue;
+    assert.equal(ch.charCodeAt(0) < 0x20, false);
+  }
+});
+
 // Live collector fixture for the agent-mode --live e2e (mirrors the
 // withLiveSession fixture in debug_evidence.test.js; duplicated because
 // test files cannot share helpers without executing each other's tests).

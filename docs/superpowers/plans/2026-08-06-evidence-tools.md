@@ -642,6 +642,25 @@ test('discoverCollector rejects collector_port_invalid for a non-decimal-integer
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('escapeEvidenceText turns a real newline into the two-character escape text', () => {
+  assert.equal(escapeEvidenceText('a\nb'), 'a\\nb');
+});
+
+test('escapeEvidenceText leaves no character below 0x20 for a string containing a real ESC byte', () => {
+  const withEsc = `${String.fromCharCode(27)}[2J`;
+  const escaped = escapeEvidenceText(withEsc);
+  for (const ch of escaped) assert.equal(ch.charCodeAt(0) < 0x20, false);
+});
+
+test('escapeEvidenceText escapes quotes and backslashes', () => {
+  assert.equal(escapeEvidenceText('she said "hi" \\ ok'), 'she said \\"hi\\" \\\\ ok');
+});
+
+test('escapeEvidenceText leaves plain ASCII and emoji unchanged', () => {
+  assert.equal(escapeEvidenceText('hello world 123'), 'hello world 123');
+  assert.equal(escapeEvidenceText('emoji: \u{1F600}'), 'emoji: \u{1F600}');
+});
 ```
 
 NOTE: place the `const http = require('node:http');` line with the OTHER requires at the top of the test file (the block above shows it mid-file only to keep the diff excerpt together — hoist it when appending).
@@ -649,7 +668,7 @@ NOTE: place the `const http = require('node:http');` line with the OTHER require
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js`
-Expected: the ten new tests fail (`readSessionLive`/`createSessionTail`/`discoverCollector` are not exported); Task 1's tests still pass.
+Expected: the sixteen new tests fail (`readSessionLive`/`createSessionTail`/`discoverCollector`/`escapeEvidenceText` are not exported); Task 1's tests still pass.
 
 - [ ] **Step 3: Implement (append to `scripts/debug_evidence.js`)**
 
@@ -834,13 +853,24 @@ const discoverCollector = async (projectRoot) => {
   if (token === '') throw new Error('collector_token_invalid');
   return { port, token };
 };
+
+// Structure-neutralizing escape for HUMAN render surfaces (the viewer TUI,
+// the diff's table/markdown). Real newlines and control characters —
+// including a raw ESC byte rehydrated by JSON.parse from a stored `\u001b`
+// escape sequence — become printable escape text (e.g. an actual newline
+// becomes the two characters "\" + "n"), so log content can never forge
+// screen/report structure or inject terminal control sequences. Every
+// interpolated parsed/folded field in a human renderer MUST route through
+// this. Agent outputs (byte-verbatim NDJSON, schema:1 JSON) MUST NEVER use
+// it — they carry source values unmodified by contract.
+const escapeEvidenceText = (value) => JSON.stringify(String(value)).slice(1, -1);
 ```
 
-Extend `module.exports` with `createSessionTail`, `discoverCollector`, `readSessionLive` (alphabetical).
+Extend `module.exports` with `createSessionTail`, `discoverCollector`, `escapeEvidenceText`, `readSessionLive` (alphabetical).
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 27/27 pass (15 from Task 1 + 12 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
+Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 31/31 pass (15 from Task 1 + 16 new: the original 12 plus 4 `escapeEvidenceText` tests added in a later cross-cutting escaping review). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
 
 - [ ] **Step 5: Commit**
 
@@ -1299,6 +1329,25 @@ test('renderFrame clips at a code-point boundary, never splitting a surrogate pa
   for (const row of rows) assert.equal(row.isWellFormed(), true);
 });
 
+test('renderFrame escapes embedded newlines so log content cannot forge a header line or break the row-count invariant', () => {
+  const forged = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: 'benign\n─ FORGED SESSION ── ● live ─\nfake' } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [forged], { columns: 80, rows: 10, live: true });
+  const rows = frame.split('\n');
+  assert.equal(rows.length, 10);
+  for (const row of rows) assert.doesNotMatch(row, /^─ FORGED/);
+});
+
+test('renderFrame escapes a real ESC byte in msg so no control characters reach the terminal', () => {
+  const injected = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: `${String.fromCharCode(27)}[2J` } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [injected], { columns: 80, rows: 10, live: false });
+  for (const ch of frame) {
+    if (ch === '\n') continue;
+    assert.equal(ch.charCodeAt(0) < 0x20, false);
+  }
+});
+
 // Live collector fixture for the agent-mode --live e2e (mirrors the
 // withLiveSession fixture in debug_evidence.test.js; duplicated because
 // test files cannot share helpers without executing each other's tests).
@@ -1374,13 +1423,13 @@ test('agent mode --live without a running collector fails with one clean line, e
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js`
-Expected: the six new tests fail (the four renderer tests with `renderFrame` undefined; both --live e2e tests with the exit-2 "not wired yet" usage error); the remaining 13 prior tests pass.
+Expected: the eight new tests fail (the six renderer tests with `renderFrame` undefined; both --live e2e tests with the exit-2 "not wired yet" usage error); the remaining 13 prior tests pass.
 
 - [ ] **Step 3: Implement**
 
 Three implementation moves in this step, in order:
 
-**(a) Wire agent-mode `--live`** (the spec requires both data sources in BOTH frontends). Extend the top-of-file `./debug_evidence` destructured require with `createSessionTail`, `discoverCollector`, `readSessionLive` (alphabetical). Also extend the `USAGE` constant so the `--live` mention reads `--live (bare session ids only; .log file paths are file-mode)` — live reads enforce the route's id pattern by design (trust-model separation), and the usage text must make that read as intentional. Then in `runAgentMode`, replace the entire `if (parsed.forceLive) { ... }` rejection block (the `viewer_usage:--live is not wired yet (Task 4)` one — keep the missing-`--session` guard above it untouched) with:
+**(a) Wire agent-mode `--live`** (the spec requires both data sources in BOTH frontends). Extend the top-of-file `./debug_evidence` destructured require with `createSessionTail`, `discoverCollector`, `escapeEvidenceText`, `readSessionLive` (alphabetical) — `escapeEvidenceText` is used by `formatEntryRow`/`renderFrame` below, added in a later cross-cutting escaping review. Also extend the `USAGE` constant so the `--live` mention reads `--live (bare session ids only; .log file paths are file-mode)` — live reads enforce the route's id pattern by design (trust-model separation), and the usage text must make that read as intentional. Then in `runAgentMode`, replace the entire `if (parsed.forceLive) { ... }` rejection block (the `viewer_usage:--live is not wired yet (Task 4)` one — keep the missing-`--session` guard above it untouched) with:
 
 ```js
   if (parsed.forceLive) {
@@ -1403,14 +1452,18 @@ Three implementation moves in this step, in order:
 // one stdout call, so tearing can't interleave partial rows. Kept free of
 // cursor-addressing so unit tests can assert on plain text.
 const formatEntryRow = (parsed) => {
-  const time = typeof parsed.ts === 'string' ? parsed.ts.slice(11, 19) : '--:--:--';
+  // Every interpolated field here is untrusted log content — route it
+  // through escapeEvidenceText so it can never forge a row's structure or
+  // (once JSON.parse rehydrates a stored escape sequence into a real
+  // control character) inject terminal control sequences into the TUI.
+  const time = escapeEvidenceText(typeof parsed.ts === 'string' ? parsed.ts.slice(11, 19) : '--:--:--');
   if (parsed.type === 'hypothesis') {
-    const note = parsed.note ? ` "${parsed.note}"` : '';
-    return `${time} ◆ ${parsed.hypothesisId} → ${parsed.status}${note}`;
+    const note = parsed.note ? ` "${escapeEvidenceText(parsed.note)}"` : '';
+    return `${time} ◆ ${escapeEvidenceText(parsed.hypothesisId)} → ${escapeEvidenceText(parsed.status)}${note}`;
   }
-  const tag = parsed.hypothesisId ? `${parsed.hypothesisId} ` : '';
-  const loc = parsed.loc ? `  ${parsed.loc}` : '';
-  return `${time} ${tag}${parsed.msg ?? ''}${loc}`;
+  const tag = parsed.hypothesisId ? `${escapeEvidenceText(parsed.hypothesisId)} ` : '';
+  const loc = parsed.loc ? `  ${escapeEvidenceText(parsed.loc)}` : '';
+  return `${time} ${tag}${escapeEvidenceText(parsed.msg ?? '')}${loc}`;
 };
 
 const renderFrame = (state, entries, { columns, rows, live }) => {
@@ -1423,10 +1476,12 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
     return points.length > columns ? points.slice(0, Math.max(0, columns)).join('') : text;
   };
   const folded = foldHypotheses(entries);
+  // Folded values are derived from untrusted log content just like raw
+  // entries — same escapeEvidenceText discipline as formatEntryRow above.
   const tableRows = [...folded.values()].map((h) => {
-    const when = typeof h.ts === 'string' ? h.ts.slice(11, 16) : '';
-    const detail = h.title ?? h.note ?? '';
-    return `${h.hypothesisId}  ${h.status}  ${detail}  ${when}`;
+    const when = escapeEvidenceText(typeof h.ts === 'string' ? h.ts.slice(11, 16) : '');
+    const detail = escapeEvidenceText(h.title ?? h.note ?? '');
+    return `${escapeEvidenceText(h.hypothesisId)}  ${escapeEvidenceText(h.status)}  ${detail}  ${when}`;
   });
   const tableHeight = Math.min(Math.max(tableRows.length, 1), Math.max(3, Math.floor(rows / 3)));
   const streamHeight = rows - tableHeight - 3;
@@ -1435,7 +1490,7 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   const status = state.paused ? 'paused' : (live ? '● live' : 'file');
   const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
   const lines = [];
-  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
+  lines.push(clip(`─ ${escapeEvidenceText(state.sessionId)}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
   lines.push(clip(`─ hypotheses ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));
@@ -1548,7 +1603,7 @@ Move the `applyActiveFilter` const ABOVE `paint` (it is referenced there). Expor
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 22/22 pass (14 from Task 3 and its fix rounds, minus the retired rejection test, plus 6 from this task's Step 1, plus 3 Ctrl+C reducer tests added to `reduce()` during this task's crash-safety review round). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. NOTE (review round): the poll-catch fallback read is guarded (a second failure keeps last-known entries rather than crashing an un-awaited `setInterval` callback), an unconditional `process.on('exit', ...)` restores the terminal on any uncaught throw or external kill, Ctrl+C quits from every `reduce` mode, the `--live`-unavailable message now fires before the fallback file read can throw ENOENT, and `renderFrame`'s `clip`/`'─'.repeat` are negative-columns- and surrogate-pair-safe. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 24/24 pass (14 from Task 3 and its fix rounds, minus the retired rejection test, plus 8 from this task's Step 1, plus 3 Ctrl+C reducer tests added to `reduce()` during this task's crash-safety review round). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. NOTE (review round): the poll-catch fallback read is guarded (a second failure keeps last-known entries rather than crashing an un-awaited `setInterval` callback), an unconditional `process.on('exit', ...)` restores the terminal on any uncaught throw or external kill, Ctrl+C quits from every `reduce` mode, the `--live`-unavailable message now fires before the fallback file read can throw ENOENT, and `renderFrame`'s `clip`/`'─'.repeat` are negative-columns- and surrogate-pair-safe. NOTE (final-review escaping fix): every interpolated field in `formatEntryRow` and `renderFrame`'s table rows/header (msg, note, title, hypothesisId, status, ts, sessionId) now routes through the core's `escapeEvidenceText`, so log content can never forge screen structure or inject terminal control sequences — agent mode is untouched (stored bytes are already ESC-free, byte-verbatim is the contract). Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
 
 - [ ] **Step 5: Commit**
 
@@ -1911,6 +1966,7 @@ Expected: FAIL — module missing.
 // three renderers; the no-flag default is TTY-aware: table for humans,
 // JSON (schema: 1) for pipes, because agents must never scrape tables.
 const {
+  escapeEvidenceText,
   foldHypotheses,
   readSessionFile,
   resolveSessionRef,
@@ -2025,16 +2081,18 @@ const statusOr = (status) => status ?? '—';
 // evidence that gets pasted into PRs/chat, so raw interpolation would let
 // log content forge headings, verdicts, or break out of a backtick code
 // span (report structure must reflect the engine, never log content).
-// JSON.stringify turns embedded newlines/quotes/control chars into their
-// escaped literal form (a real newline becomes the two printable
-// characters "\" + "n", never an actual line break); backticks are handled
-// separately since JSON.stringify does not touch them and this text can
-// land inside a backtick code span, and the box-drawing pipe `│` becomes
-// `¦` so a crafted id cannot mimic table cell borders — the docs promise
-// report structure NEVER reflects log content, without qualification.
-// JSON output needs none of this — JSON.stringify(diff, ...) already
-// escapes everything correctly there.
-const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`').replaceAll('│', '¦');
+// escapeEvidenceText (the shared core helper, also used by the viewer TUI)
+// turns embedded newlines/quotes/control chars into their escaped literal
+// form (a real newline becomes the two printable characters "\" + "n",
+// never an actual line break) — this is the single source of truth for
+// that layer. Two markdown/table-specific additions on top: backticks are
+// escaped separately since JSON escaping does not touch them and this text
+// can land inside a backtick code span, and the box-drawing pipe `│`
+// becomes `¦` so a crafted id cannot mimic table cell borders — the docs
+// promise report structure NEVER reflects log content, without
+// qualification. JSON output needs none of this — JSON.stringify(diff, ...)
+// already escapes everything correctly there.
+const escapeText = (value) => escapeEvidenceText(value).replaceAll('`', '\\`').replaceAll('│', '¦');
 
 // Hypothesis ids are short identifiers by convention; 40 chars comfortably
 // fits real-world ids while keeping the bordered table readable if an
@@ -2206,6 +2264,15 @@ naming which ref failed; and the table's id column width is sampled across
 every rendered id (capped at 40 chars, ellipsis-truncated) instead of only
 the first row.
 
+Further post-review hardening (final whole-branch escaping review, same Task
+5 scope): `escapeText` is redefined as the shared core's `escapeEvidenceText`
+(imported from `./debug_evidence`, added to the top-of-file destructured
+require alphabetically) plus this file's own markdown/table-specific
+additions — `escapeText = (value) => escapeEvidenceText(value)
+.replaceAll('`', '\\`').replaceAll('│', '¦')` — so the JSON-escape layer has
+a single source of truth shared with the viewer TUI. Behavior is unchanged
+(the existing 16 tests prove it): still 16/16 pass, no new tests needed.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2257,10 +2324,13 @@ Guarantees both tools keep (enforced by tests):
   `disappeared` is an exact-string set difference, capped at 20 per hypothesis with the
   remainder counted in `disappearedTruncated`; untagged events are their own bucket,
   never merged into a hypothesis.
-- `schema: 1` JSON is the agent contract; table and markdown are human surfaces. Rendered
-  `msg`/`note` text is escaped, so report structure always reflects the engine, never log
-  content; malformed (non-string) hypothesis ids are excluded, counted in
-  `summary.ignoredMalformedIds`, and stated in human output.
+- `schema: 1` JSON is the agent contract; the diff's table/markdown and the viewer TUI are
+  the human surfaces. All three escape untrusted log text — `msg`/`note`/`title`, hypothesis
+  ids, and control characters — through a shared core helper, so report/screen structure
+  always reflects the engine, never log content; agent outputs (byte-verbatim NDJSON,
+  `schema: 1` JSON) carry source values unmodified. Malformed (non-string) hypothesis ids are
+  excluded, counted in `summary.ignoredMalformedIds`, with their events excluded from totals
+  and counted in `summary.ignoredMalformedEvents` — the decision-relevant number.
 ```
 
 - [ ] **Step 2: README — tools blurb**
@@ -2276,8 +2346,8 @@ table interactively, versioned `schema: 1` JSON when piped; `--format=md` for PR
 consume session logs through the shared `scripts/debug_evidence.js` core, whose filter
 semantics are test-guaranteed identical to `GET /sessions/:id/logs`. The diff never
 classifies severity or infers failures — recorded verdicts and deterministic deltas only —
-and rendered log text is escaped in the human formats, so report structure reflects the
-engine, never log content.
+and rendered log text is escaped in the human formats (diff table/markdown and the viewer
+TUI), so report structure reflects the engine, never log content.
 ```
 
 - [ ] **Step 3: Validate and commit**
