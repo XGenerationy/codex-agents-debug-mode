@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
+const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -155,6 +156,131 @@ test('listSessions returns an empty array when the project has no .debug directo
   const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
   try {
     assert.deepEqual(await listSessions(root), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const { createDebugServer } = require('./debug_server');
+const {
+  createSessionTail,
+  discoverCollector,
+  readSessionLive,
+} = require('./debug_evidence');
+
+const LAUNCH = 'evidence-test-launch-token-with-entropy';
+
+const listen = (server) => new Promise((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+});
+
+const close = (server) => new Promise((resolve, reject) => {
+  server.close((error) => (error ? reject(error) : resolve()));
+});
+
+const httpJson = (port, pathname, { method = 'GET', headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path: pathname, method, headers }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, text }));
+    });
+    request.on('error', reject);
+    if (body !== undefined) request.write(JSON.stringify(body));
+    request.end();
+  });
+
+const withLiveSession = async (run) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-live-'));
+  const server = createDebugServer({ projectRoot: root, token: LAUNCH, redactionEnv: {} });
+  const port = await listen(server);
+  try {
+    const minted = await httpJson(port, '/session', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { name: 'live' },
+    });
+    const session = JSON.parse(minted.text);
+    const log = (msg, extra = {}) => httpJson(port, '/log', {
+      method: 'POST',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg, ...extra },
+    });
+    return await run({ root, port, session, log });
+  } finally {
+    await close(server);
+    await rm(root, { recursive: true, force: true });
+  }
+};
+
+test('readSessionLive matches filterEntries over the same data (GET parity)', async () => {
+  await withLiveSession(async ({ root, port, session, log }) => {
+    await log('e1', { hypothesisId: 'H1', runId: 'r1' });
+    await log('e2', { hypothesisId: 'H2' });
+    await httpJson(port, '/hypothesis', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+    });
+    await log('e3', { runId: 'r2' });
+    const filePath = path.join(root, session.log_file);
+    const fileEntries = await readSessionFile(filePath);
+    for (const filters of [
+      {},
+      { type: 'hypothesis' },
+      { type: 'event' },
+      { hypothesisId: 'H1' },
+      { runId: 'r2' },
+      { type: 'event', hypothesisId: 'H1' },
+      { limit: 2 },
+      // Padded values: the route trims query values before comparing; the
+      // core must too. Clean fixtures alone cannot detect trim divergence.
+      { hypothesisId: '  H1  ' },
+      { runId: '  r2  ' },
+    ]) {
+      const live = await readSessionLive({ port, token: LAUNCH, sessionId: session.session_id, filters });
+      const local = filterEntries(fileEntries, filters);
+      assert.deepEqual(live.map((e) => e.raw), local.map((e) => e.raw), JSON.stringify(filters));
+    }
+  });
+});
+
+test('readSessionLive surfaces structured errors for 401 and 404', async () => {
+  await withLiveSession(async ({ port, session }) => {
+    await assert.rejects(
+      () => readSessionLive({ port, token: 'wrong-token-entirely', sessionId: session.session_id }),
+      /live_read_unauthorized/,
+    );
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'debug-nope-000000000000' }),
+      /live_read_unknown_session/,
+    );
+  });
+});
+
+test('createSessionTail emits each entry exactly once across polls', async () => {
+  await withLiveSession(async ({ port, session, log }) => {
+    await log('a');
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const first = await tail.poll();
+    assert.deepEqual(first.map((e) => e.parsed.msg), ['a']);
+    await log('b');
+    await log('c');
+    const second = await tail.poll();
+    assert.deepEqual(second.map((e) => e.parsed.msg), ['b', 'c']);
+    const third = await tail.poll();
+    assert.deepEqual(third, []);
+  });
+});
+
+test('discoverCollector reads port and token from .debug', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '8787\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok-value\n', 'utf8');
+    assert.deepEqual(await discoverCollector(root), { port: 8787, token: 'tok-value' });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

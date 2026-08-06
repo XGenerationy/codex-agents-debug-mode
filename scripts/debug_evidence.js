@@ -177,11 +177,84 @@ const resolveSessionRef = (projectRoot, ref) => {
   return path.join(projectRoot, '.debug', `debug-${ref}.log`);
 };
 
+// Fetch a live session's filtered lines from the local collector. Filters
+// are passed through to the GET route as query parameters — the server
+// applies the SAME semantics filterEntries implements locally (parity test
+// enforced). Errors surface as distinct codes, never swallowed: evidence
+// integrity failures (409) and auth/liveness failures are actionable.
+const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promise((resolve, reject) => {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined) query.set(key, String(value));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : '';
+  const request = http.request({
+    hostname: '127.0.0.1',
+    port,
+    path: `/sessions/${sessionId}/logs${suffix}`,
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  }, (response) => {
+    let text = '';
+    response.setEncoding('utf8');
+    response.on('data', (chunk) => { text += chunk; });
+    response.on('end', () => {
+      if (response.statusCode === 200) {
+        try {
+          resolve(parseSessionText(text));
+        } catch (error) {
+          reject(error);
+        }
+        return;
+      }
+      if (response.statusCode === 401) reject(new Error('live_read_unauthorized'));
+      else if (response.statusCode === 404) reject(new Error('live_read_unknown_session'));
+      else if (response.statusCode === 409) reject(new Error('live_read_log_replaced'));
+      else reject(new Error(`live_read_failed:${response.statusCode}`));
+    });
+  });
+  request.on('error', reject);
+  request.end();
+});
+
+// Poll-by-count live tail: every poll re-fetches the full (filter-free)
+// line set and emits only entries beyond the count already seen. Counting
+// is immune to same-millisecond timestamps and needs no cursor state on the
+// server. Filters are applied by the CALLER over the emitted entries so the
+// seen-count always refers to the unfiltered stream.
+const createSessionTail = ({ port, token, sessionId }) => {
+  let seen = 0;
+  return {
+    async poll() {
+      const entries = await readSessionLive({ port, token, sessionId });
+      const fresh = entries.slice(seen);
+      seen = entries.length;
+      return fresh;
+    },
+  };
+};
+
+// Read the local collector's connection material persisted by its CLI:
+// .debug/collector_port and .debug/collector_token.
+const discoverCollector = async (projectRoot) => {
+  const debugDir = path.join(projectRoot, '.debug');
+  const [portText, tokenText] = await Promise.all([
+    readFile(path.join(debugDir, 'collector_port'), 'utf8'),
+    readFile(path.join(debugDir, 'collector_token'), 'utf8'),
+  ]);
+  const port = Number(portText.trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('collector_port_invalid');
+  return { port, token: tokenText.trim() };
+};
+
 module.exports = {
+  createSessionTail,
+  discoverCollector,
   filterEntries,
   foldHypotheses,
   listSessions,
   parseSessionText,
   readSessionFile,
+  readSessionLive,
   resolveSessionRef,
 };
