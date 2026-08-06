@@ -141,6 +141,17 @@ per-session token keeps exactly one capability: writing events via `POST /log`.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
+### Evidence tools
+
+`scripts/debug_viewer.js` (layout-C TUI for humans; verbatim filtered NDJSON for agents when
+piped) and `scripts/debug_diff.js` (per-hypothesis before/after report; TTY-aware default —
+table interactively, versioned `schema: 1` JSON when piped; `--format=md` for PR comments)
+consume session logs through the shared `scripts/debug_evidence.js` core, whose filter
+semantics are test-guaranteed identical to `GET /sessions/:id/logs`. The diff never
+classifies severity or infers failures — recorded verdicts and deterministic deltas only —
+and rendered log text is escaped in the human formats, so report structure reflects the
+engine, never log content.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
