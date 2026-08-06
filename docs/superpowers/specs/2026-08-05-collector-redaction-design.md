@@ -126,7 +126,7 @@ Rejected alternatives:
 |---|---|---|
 | Startup list build | throw | Server refuses to start (same as other init failures) |
 | Session-mint rebuild | throw | `500 session_registry_full` when the lifetime mint cap is reached (permanent until restart; signaled once on stderr as `redaction.registry_full`), `500 session_redaction_failed` for any other rebuild failure; no session created either way |
-| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction). In a narrow band just above the serializer's recursion limit, the pre-existing `JSON.stringify` limit trips first and surfaces as `500 internal_error`; deeper still, the redaction walk trips first as `log_redaction_failed`. Both ceilings are platform-dependent; both sit before capacity reservation and are equally fail-closed. |
+| Event walk/apply | throw | `500 log_redaction_failed`; nothing persisted (sits before capacity reservation, so no rollback interaction). Superseded by the explicit `REDACTION_MAX_DEPTH` (64) bound landed in the merged review pass: nesting beyond the bound throws a defined error mapped to `log_redaction_failed`, making the fail-closed code deterministic across platforms. |
 
 ## Testing (`scripts/debug_server.test.js` idiom, no new dependencies)
 

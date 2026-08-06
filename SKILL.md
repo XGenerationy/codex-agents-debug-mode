@@ -504,6 +504,16 @@ Each line is NDJSON:
 {"ts":"2024-01-03T12:00:00.000Z","msg":"Button clicked","data":{"id":5},"hypothesisId":"H1","loc":"app.js:42"}
 ```
 
+Hypothesis lifecycle lines share the same log (a line without `type` is an event):
+
+```json
+{"ts":"2026-08-06T09:07:11.000Z","type":"hypothesis","hypothesisId":"H1","status":"CONFIRMED","note":"null until session loads"}
+```
+
+Record status transitions (`OPEN`, `CONFIRMED`, `REJECTED`, `INCONCLUSIVE`) via
+`POST /hypothesis` (launch token) as evidence accumulates; the latest line per
+`hypothesisId` is its current status and the full history stays auditable.
+
 ## Critical Rules
 
 1. **Never fix without evidence**: collect runtime evidence for bugs and live GitHub evidence
@@ -537,7 +547,7 @@ Each line is NDJSON:
 | Too many logs | Filter by hypothesisId, use state-change logging |
 | Common word shows as `[REDACTED]` | An env secret or one of its extracted components (e.g. a dev-default `postgres` DSN password) equals that word; use distinct dev credential values or unset the variable for the collector process |
 | Sessions fail with `session_registry_full` | The collector's 512-entry token registry (launch token + up to 511 session mints, failed mints included) is exhausted; restart the collector |
-| `/log` returns `log_redaction_failed` | The event is nested too deeply for the redaction walk (roughly 1,700 levels); flatten the logged `data` payload |
+| `/log` returns `log_redaction_failed` | The event nests deeper than the collector's redaction depth bound (64 levels); flatten the logged `data` payload |
 | Can't reproduce | Ask user for exact steps, check environment |
 
 ### CORS / Mixed Content Workarounds

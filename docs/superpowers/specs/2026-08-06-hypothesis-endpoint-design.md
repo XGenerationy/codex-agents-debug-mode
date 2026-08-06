@@ -115,6 +115,7 @@ appended through the existing `appendSessionEvent` chain:
 | Session unknown/retired | 404 `unknown_session` |
 | Session provisional | 425 `session_initializing` |
 | Bad `hypothesisId` / bad `status` | 400 `invalid_hypothesis_id` / `invalid_hypothesis_status` |
+| Non-string optional field (title/note/runId) | 400 `invalid_hypothesis_field` |
 | Bad/unknown GET query parameter | 400 `invalid_query` |
 | Caps exceeded on hypothesis write | 429 (existing codes) |
 | Redaction walk failure | 500 `log_redaction_failed`, nothing persisted |
@@ -135,6 +136,10 @@ appended through the existing `appendSessionEvent` chain:
    (emitted line equals stored line).
 6. GET fail-closed: no/wrong token 401; unknown and retired session 404; provisional 425;
    bad `type`/timestamps/`limit`/unknown param → 400 `invalid_query`; swapped log file → 409.
+   The provisional-425 case is defensively implemented but not black-box testable: a
+   provisional session's id is never observable outside the /session handler (reservation
+   ids are random and never returned; the real id is returned only after provisional
+   clears).
 7. GET output never contains a raw known secret (seed env secret, log it, read back).
 8. Full-suite regression: all existing tests stay green.
 

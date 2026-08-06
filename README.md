@@ -130,6 +130,14 @@ the launch token plus up to 511 session mints, failed mints included; at the cap
 sessions are refused with `session_registry_full`, signaled once on stderr as
 `redaction.registry_full` — restart the collector to reset it.
 
+Two launch-token capabilities extend the model: `POST /hypothesis` records
+event-sourced hypothesis status lines through the same append and redaction
+path, and `GET /sessions/:id/logs` serves filtered, verbatim, already-redacted
+NDJSON for live sessions with the append path's own file-identity checks. The
+per-session token keeps exactly one capability: writing events via `POST /log`.
+`GET /health` additionally reports redaction registry headroom counts
+(cardinality only, never token values).
+
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## License
