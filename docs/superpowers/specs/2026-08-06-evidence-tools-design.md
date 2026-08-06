@@ -126,16 +126,21 @@ One module owns everything both tools must agree on:
 - **JSON output carries `schema: 1`** — a stable, versioned contract for agents, CI gates,
   and the closeout runner. Table and markdown render the same engine result; markdown uses
   per-hypothesis sections with verdict transitions, suitable for PR comments.
-- **Rendered log content is escaped (review decision):** `msg`/`note` values are untrusted
-  (they originate from the instrumented application), and the markdown report is evidence
-  pasted into PRs — so both human renderers escape newlines/backticks before interpolating.
-  Report structure must reflect the engine, never log content. JSON needs nothing —
-  `JSON.stringify` already escapes.
+- **Rendered log content is escaped (review decision):** `msg`/`note`/`title` values AND
+  hypothesis ids are untrusted (the collector accepts any non-empty trimmed string as an
+  id — no character restrictions — so ids can carry newlines/`**`), and the markdown
+  report is evidence pasted into PRs — so both human renderers escape newlines/backticks
+  before interpolating, ids included (escaped before truncation/padding so column widths
+  measure printed text). Report structure must reflect the engine, never log content.
+  JSON needs nothing — `JSON.stringify` already escapes.
 - **String-id contract (review decision):** the engine's id union keeps only non-empty
   string ids. Pre-validation logs (a realistic before-ref) may carry non-string or missing
   hypothesis ids; those records are excluded from the union, counted in
-  `summary.ignoredMalformedIds` (always present, 0 default — still `schema: 1`), and stated
-  in the human renderers when nonzero. Exclusion is counted and stated, never silent.
+  `summary.ignoredMalformedIds` (distinct malformed keys) AND
+  `summary.ignoredMalformedEvents` (event lines excluded from all totals under those keys)
+  — both always present, 0 default, still `schema: 1` — and stated together in the human
+  renderers when nonzero. The diff's whole point is event deltas, so excluded evidence is
+  quantified, not just keyed. Exclusion is counted and stated, never silent.
 - **Diff CLI is fail-closed like the viewer (review decision):** unknown flags, duplicate
   `--format`, and the space-separated `--format md` form are usage errors (exit 2;
   `--format=<value>` is this tool's canonical form). Read errors name WHICH ref failed
