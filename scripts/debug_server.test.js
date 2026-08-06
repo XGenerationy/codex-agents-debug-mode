@@ -4290,6 +4290,66 @@ test('/log rejects non-string and whitespace-only hypothesisId/runId join keys',
   });
 });
 
+test('an invalid join-key request does not refresh session activity', async () => {
+  // Regression guard: POST /log must refresh session.lastActivityAt only AFTER
+  // all payload validation, so a request rejected with invalid_join_key does
+  // not extend the session's idle lifetime. Otherwise a buggy or abusive
+  // authenticated client could keep a session alive forever with bad payloads,
+  // stalling retireInactiveSessions and contributing to maxSessions exhaustion.
+  //
+  // Discriminator design: anchor lastActivityAt with a VALID log at t0, then
+  // fire an INVALID join-key request at t0+gap. Without the bug, retirement is
+  // anchored to t0 → session is gone shortly after t0+idleMs. With the bug, the
+  // invalid request refreshes to t0+gap → session lives until t0+gap+idleMs.
+  // A read between those two deadlines (t0+idleMs .. t0+gap+idleMs)
+  // discriminates: 404 (correct) vs 200 (bug). Verified by mutation: reverting
+  // the fix flips this read to 200.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-joinkey-idle-'));
+  const idleMs = 1500;
+  const gap = 600;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    // t0: a VALID log anchors lastActivityAt. (The session-mint POST also
+    // refreshes it, but mint latency is variable; this explicit valid log
+    // gives a known-late anchor independent of mint cost.)
+    const valid = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'anchor' },
+    });
+    assert.equal(valid.status, 202);
+    const t0 = Date.now();
+    // t0+gap: an authenticated request that fails join-key validation.
+    await new Promise((resolve) => setTimeout(resolve, gap));
+    const rejected = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'x', hypothesisId: '   ' },
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error, 'invalid_join_key');
+    // Wait until just past the t0-anchored deadline (t0+idleMs) but still
+    // well before the bug's extended deadline (t0+gap+idleMs).
+    const remain = (t0 + idleMs + 300) - Date.now();
+    if (remain > 0) await new Promise((resolve) => setTimeout(resolve, remain));
+    const after = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    // Correct (no refresh on invalid): session retired → 404.
+    // Buggy (refreshed on invalid): session still live → 200.
+    assert.equal(after.status, 404);
+    assert.equal(JSON.parse(after.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('the instrumented app cannot forge hypothesis lines through /log', async () => {
   await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
     const session = (await createSession(baseUrl)).body;

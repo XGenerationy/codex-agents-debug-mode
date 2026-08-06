@@ -1403,10 +1403,6 @@ const createDebugServer = ({
         if (typeof payload.msg !== 'string' || payload.msg.trim() === '') {
           throw new RequestError('invalid_message');
         }
-        // Refresh after authentication and message validation, before the
-        // awaited append, so concurrent allocation cannot retire a session
-        // whose valid event is in flight.
-        session.lastActivityAt = Date.now();
         if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
           throw new RequestError('event_limit_reached', 429);
         }
@@ -1434,6 +1430,12 @@ const createDebugServer = ({
             ? payload[key].trim()
             : payload[key];
         }
+        // Refresh AFTER all payload validation (msg + join keys) but BEFORE
+        // the awaited append, so concurrent allocation cannot retire a session
+        // whose VALID event is in flight — while an invalid request rejected
+        // below this point does NOT extend the session lifetime and cannot be
+        // abused to stall retireInactiveSessions or exhaust maxSessions.
+        session.lastActivityAt = Date.now();
         // Redact BEFORE serialization and BEFORE capacity reservation: a
         // redaction failure rejects the event with nothing persisted and no
         // reservation to roll back. Byte accounting below intentionally uses
