@@ -126,13 +126,18 @@ One module owns everything both tools must agree on:
 - **JSON output carries `schema: 1`** — a stable, versioned contract for agents, CI gates,
   and the closeout runner. Table and markdown render the same engine result; markdown uses
   per-hypothesis sections with verdict transitions, suitable for PR comments.
-- **Rendered log content is escaped (review decision):** `msg`/`note`/`title` values AND
-  hypothesis ids are untrusted (the collector accepts any non-empty trimmed string as an
-  id — no character restrictions — so ids can carry newlines/`**`), and the markdown
-  report is evidence pasted into PRs — so both human renderers escape newlines/backticks
-  before interpolating, ids included (escaped before truncation/padding so column widths
-  measure printed text). Report structure must reflect the engine, never log content.
-  JSON needs nothing — `JSON.stringify` already escapes.
+- **Rendered log content is escaped (review decision, extended at final review):**
+  `msg`/`note`/`title` values AND hypothesis ids are untrusted (the collector accepts any
+  non-empty trimmed string as an id — no character restrictions — and `JSON.parse`
+  rehydrates stored `\uXXXX` escapes into REAL control characters, so parsed values can
+  carry newlines and ANSI/ESC). Every HUMAN render surface — the diff's table and
+  markdown AND the viewer TUI frame — routes interpolated parsed fields through one
+  shared core helper (`escapeEvidenceText` in `debug_evidence.js`; the helper lives in
+  the core precisely so sibling renderers cannot drift), with diff-specific backtick and
+  box-pipe neutralization layered on top. Ids are escaped before truncation/padding so
+  column widths measure printed text. Report/screen structure must reflect the engine,
+  never log content. Agent outputs (byte-verbatim NDJSON, `schema: 1` JSON) never use
+  it — they carry source values unmodified.
 - **String-id contract (review decision):** the engine's id union keeps only non-empty
   string ids. Pre-validation logs (a realistic before-ref) may carry non-string or missing
   hypothesis ids; those records are excluded from the union, counted in
