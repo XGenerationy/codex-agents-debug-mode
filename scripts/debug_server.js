@@ -1528,8 +1528,14 @@ const createDebugServer = ({
         // a typo cannot silently disable a filter and widen what is returned.
         const query = new URL(request.url, 'http://127.0.0.1').searchParams;
         const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        const seenParams = new Set();
         for (const name of query.keys()) {
-          if (!allowedParams.has(name)) throw new RequestError('invalid_query');
+          // Unknown names AND duplicates are rejected: a typo or a stray
+          // repeated parameter must never silently change what is returned.
+          if (!allowedParams.has(name) || seenParams.has(name)) {
+            throw new RequestError('invalid_query');
+          }
+          seenParams.add(name);
         }
         const typeFilter = query.get('type') ?? 'all';
         if (!['all', 'event', 'hypothesis'].includes(typeFilter)) {
@@ -1557,6 +1563,10 @@ const createDebugServer = ({
         // window are consistent and a torn trailing line cannot be observed.
         // The identity discipline mirrors appendSessionEvent exactly.
         const previous = session.appendChain || Promise.resolve();
+        // The chain must resolve to undefined (parity with appendSessionEvent):
+        // resolving to the log text would leave session.appendChain retaining
+        // the whole response body until the next append replaces it.
+        let text;
         const run = previous.catch(() => {}).then(async () => {
           let handle;
           try {
@@ -1602,13 +1612,13 @@ const createDebugServer = ({
               if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
               offset += bytesRead;
             }
-            return buffer.toString('utf8');
+            text = buffer.toString('utf8');
           } finally {
             await handle.close();
           }
         });
         session.appendChain = run;
-        const text = await run;
+        await run;
         const matched = [];
         for (const rawLine of text.split('\n')) {
           if (!rawLine) continue;
@@ -1616,7 +1626,9 @@ const createDebugServer = ({
           // append time); a parse failure here would mean identity-checked
           // bytes changed underneath us and surfaces as internal_error.
           const parsed = JSON.parse(rawLine);
-          const lineType = parsed.type === 'hypothesis' ? 'hypothesis' : 'event';
+          // Lines WITHOUT type are events (spec definition). An unknown future
+          // type must not be swept into ?type=event — it matches only type=all.
+          const lineType = parsed.type === undefined ? 'event' : parsed.type;
           if (typeFilter !== 'all' && lineType !== typeFilter) continue;
           if (hypothesisFilter !== undefined && parsed.hypothesisId !== hypothesisFilter) continue;
           if (runFilter !== undefined && parsed.runId !== runFilter) continue;

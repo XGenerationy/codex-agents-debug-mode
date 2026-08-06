@@ -4347,7 +4347,7 @@ test('GET /sessions/:id/logs filters combine and limit is tail-biased', async ()
 test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail-closed', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const session = await seedReadableSession(baseUrl);
-    for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1']) {
+    for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1', '?type=all&type=all', '?limit=1&limit=2']) {
       const res = await requestRaw(baseUrl, {
         pathname: `/sessions/${session.session_id}/logs${query}`,
         headers: LAUNCH_AUTH,
@@ -4411,5 +4411,72 @@ test('GET /sessions/:id/logs output never contains a raw known secret', async ()
     assert.equal(res.status, 200);
     assert.equal(res.text.includes('supersecretvalue123'), false);
     assert.equal(res.text.includes('[REDACTED]'), true);
+  });
+});
+
+test('concurrent appends never produce torn GET output', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (i) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: `event-${i} ${'x'.repeat(200)}`,
+      },
+    });
+    await log(0);
+    const writes = [];
+    const reads = [];
+    for (let i = 1; i <= 30; i += 1) {
+      writes.push(log(i));
+      if (i % 3 === 0) {
+        reads.push(requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH }));
+      }
+    }
+    await Promise.all(writes);
+    for (const read of await Promise.all(reads)) {
+      assert.equal(read.status, 200);
+      for (const line of read.text.split('\n').filter(Boolean)) JSON.parse(line);
+      if (read.text.length) assert.equal(read.text.endsWith('\n'), true);
+    }
+  });
+});
+
+test('GET does not refresh session activity (reads are observers)', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: 60 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const first = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(first.status, 200);
+    let last = first;
+    // 8 polls x 20ms exceed the 60ms idle budget several times over; if GETs
+    // refreshed lastActivityAt the session could never retire.
+    for (let i = 0; i < 8 && last.status !== 404; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    }
+    assert.equal(last.status, 404);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['content-type'], 'application/x-ndjson');
+    assert.equal(res.text, '');
   });
 });

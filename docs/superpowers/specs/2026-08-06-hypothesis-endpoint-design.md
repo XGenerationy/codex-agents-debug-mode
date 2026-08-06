@@ -86,7 +86,7 @@ appended through the existing `appendSessionEvent` chain:
 - **Query filters** (all optional, combined with AND):
   - `hypothesisId=<string>` — lines whose `hypothesisId` equals the value;
   - `type=event|hypothesis|all` (default `all`); `event` = lines without `type`,
-    `hypothesis` = `type:"hypothesis"` lines;
+    `hypothesis` = `type:"hypothesis"` lines; a line with an unknown future `type` matches only `all`.
   - `sinceTs=<ISO>` / `untilTs=<ISO>` — inclusive bounds compared via `Date.parse` of the
     line's `ts`; a line whose `ts` fails to parse is excluded only when a time filter is
     present;
@@ -95,8 +95,9 @@ appended through the existing `appendSessionEvent` chain:
     interesting end), clamped to 2000 (`maxEventsPerSession` — a session cannot legally
     exceed it under one server).
   - Any unparseable filter value (bad `type`, unparseable timestamps, non-numeric or
-    non-positive `limit`) → `400 invalid_query`. Unknown query parameter names → `400
-    invalid_query` (fail-closed against typos silently disabling a filter).
+    non-positive `limit`), any unknown query parameter name, and any duplicated parameter
+    name → `400 invalid_query` (fail-closed against typos or stray repeats silently
+    changing what is returned).
 - **Response**: `200`, `Content-Type: application/x-ndjson`. Matching lines are emitted as
   the stored bytes, verbatim — parsed only to evaluate predicates, never re-serialized, so
   the response can never mutate evidence and is already redacted at rest.
