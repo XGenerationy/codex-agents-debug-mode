@@ -546,7 +546,7 @@ Record status transitions (`OPEN`, `CONFIRMED`, `REJECTED`, `INCONCLUSIVE`) via
 | Wrong log file | Verify session ID matches |
 | Too many logs | Filter by hypothesisId, use state-change logging |
 | Common word shows as `[REDACTED]` | An env secret or one of its extracted components (e.g. a dev-default `postgres` DSN password) equals that word; use distinct dev credential values or unset the variable for the collector process |
-| Sessions fail with `session_registry_full` | The collector's 512-entry token registry (launch token + up to 511 session mints, failed mints included) is exhausted; restart the collector |
+| Sessions fail with `session_registry_full` | The collector's 512-entry token registry (launch token + up to 511 successful session mints) is exhausted; restart the collector |
 | `/log` returns `log_redaction_failed` | The event nests deeper than the collector's redaction depth bound (64 levels); flatten the logged `data` payload |
 | Can't reproduce | Ask user for exact steps, check environment |
 
