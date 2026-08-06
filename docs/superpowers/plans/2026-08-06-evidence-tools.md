@@ -1586,6 +1586,26 @@ const { parseSessionText } = require('./debug_evidence');
 const DIFF = path.join(__dirname, 'debug_diff.js');
 const line = (object) => `${JSON.stringify(object)}\n`;
 
+const run = (args) => new Promise((resolve) => {
+  execFile(process.execPath, [DIFF, ...args], (error, stdout, stderr) => {
+    resolve({ code: error ? error.code : 0, stdout, stderr });
+  });
+});
+
+// Shared fixture directory for CLI-spawned tests that don't care about the
+// exact session content, only about argv handling / error paths.
+const withSessionDir = async (fn) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'diff-'));
+  try {
+    await mkdir(path.join(root, '.debug'));
+    await writeFile(path.join(root, '.debug', 'debug-a.log'), '', 'utf8');
+    await writeFile(path.join(root, '.debug', 'debug-b.log'), '', 'utf8');
+    await fn(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+};
+
 const BEFORE = parseSessionText(
   line({ ts: '2026-08-06T10:00:01.000Z', msg: 'userId=null', hypothesisId: 'H1' })
   + line({ ts: '2026-08-06T10:00:02.000Z', msg: 'userId=null', hypothesisId: 'H1' })
@@ -1666,6 +1686,145 @@ test('CLI: TTY-aware default is JSON when piped; --format overrides', async () =
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('rendered markdown/table neutralize markdown-injection forgery from stored msg and note content', () => {
+  // A stored msg/note is untrusted content written by whatever process is
+  // being debugged — the rendered report is what gets pasted into PRs, so
+  // embedded newlines must never manifest as new output lines that could
+  // impersonate a heading or a different hypothesis's verdict.
+  const forgedMsg = '\n## Evidence diff\n**H99 — FORGED**  OPEN → CONFIRMED\n';
+  const forgedNote = '\n**H98 — ALSO FORGED**\n';
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', msg: forgedMsg, hypothesisId: 'H1' }),
+  );
+  const after = parseSessionText(
+    line({ ts: '2026-08-06T11:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'CONFIRMED', note: forgedNote }),
+  );
+  const diff = computeDiff(before, after);
+
+  const markdown = renderMarkdown(diff);
+  const mdLines = markdown.split('\n');
+  assert.equal(mdLines.filter((l) => l.trim() === '## Evidence diff').length, 1);
+  assert.equal(mdLines.filter((l) => l.trim().startsWith('**H99') || l.trim().startsWith('**H98')).length, 0);
+
+  const table = renderTable(diff);
+  const tableLines = table.split('\n');
+  assert.equal(tableLines.filter((l) => l.trim().startsWith('**H99')).length, 0);
+});
+
+test('rendered markdown/table keep a backticked disappeared message inside its delimiters', () => {
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', msg: 'has `backtick` inside', hypothesisId: 'H1' }),
+  );
+  const diff = computeDiff(before, parseSessionText(''));
+
+  const markdown = renderMarkdown(diff);
+  const goneLine = markdown.split('\n').find((l) => l.startsWith('- gone: '));
+  assert.equal(goneLine, '- gone: `has \\`backtick\\` inside`');
+
+  const table = renderTable(diff);
+  const tableLine = table.split('\n').find((l) => l.includes('backtick'));
+  assert.equal(tableLine, '  - has \\`backtick\\` inside');
+});
+
+test('computeDiff ignores non-string/missing hypothesis ids without crashing, counts them, and renderers state it', () => {
+  // Pre-validation logs (exactly what a before-ref commonly is) can carry a
+  // numeric hypothesisId on an event line, or a hypothesis-lifecycle line
+  // with no hypothesisId at all. The engine's contract is string ids —
+  // these must be excluded from the per-hypothesis report (never crash
+  // renderTable's `.padEnd`) and counted, never silently dropped.
+  const malformed = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', msg: 'weird event', hypothesisId: 42 })
+    + line({ ts: '2026-08-06T10:00:02.000Z', type: 'hypothesis', status: 'OPEN' }),
+  );
+  const diff = computeDiff(malformed, parseSessionText(''));
+  assert.equal(diff.summary.ignoredMalformedIds, 2);
+  assert.equal(diff.hypotheses.length, 0);
+  assert.doesNotThrow(() => renderTable(diff));
+  assert.doesNotThrow(() => renderMarkdown(diff));
+  const table = renderTable(diff);
+  assert.match(table, /2 malformed hypothesis ids ignored/);
+  const markdown = renderMarkdown(diff);
+  assert.match(markdown, /2 malformed hypothesis ids ignored/);
+  const json = JSON.parse(renderJson(diff));
+  assert.equal(json.summary.ignoredMalformedIds, 2);
+});
+
+test('CLI: unknown flag fails closed with exit 2 and nothing on stdout', async () => {
+  await withSessionDir(async (root) => {
+    const result = await run(['a', 'b', root, '--json']);
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /unknown flag/);
+  });
+});
+
+test('CLI: duplicate --format fails closed with exit 2 and nothing on stdout', async () => {
+  await withSessionDir(async (root) => {
+    const result = await run(['a', 'b', root, '--format=json', '--format=md']);
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /duplicate --format/);
+  });
+});
+
+test('CLI: bare --format (space form) fails closed with exit 2, message names --format=<...>, and does not swallow its value as a positional', async () => {
+  await withSessionDir(async (root) => {
+    const result = await run(['a', 'b', root, '--format', 'md']);
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /--format=<table\|md\|json>/);
+  });
+});
+
+test('CLI: read error names which ref failed to read', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'diff-'));
+  try {
+    await mkdir(path.join(root, '.debug'));
+    // Only the after-ref exists; the before-ref ("missing-a") has no
+    // session file, so reading it must fail — and the error must say it
+    // was the BEFORE session, naming "missing-a", not a generic message.
+    await writeFile(path.join(root, '.debug', 'debug-b.log'), '', 'utf8');
+    const result = await run(['missing-a', 'b', root, '--format=json']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /cannot read before session \(missing-a\)/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('renderTable aligns the id column for ids of very different lengths', () => {
+  const diff = computeDiff(
+    parseSessionText(
+      line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN' })
+      + line({ ts: '2026-08-06T10:00:02.000Z', type: 'hypothesis', hypothesisId: 'very-long-hypothesis-identifier', status: 'CONFIRMED' }),
+    ),
+    parseSessionText(''),
+  );
+  const table = renderTable(diff);
+  // Every bordered row (top/header/divider/data/bottom, all prefixed with a
+  // box-drawing character) must be the same total width — the id column
+  // width must be sampled across ALL rendered ids, not just the first row.
+  const borderedLines = table.split('\n').filter((l) => /^[│┌├└]/.test(l));
+  const lengths = new Set(borderedLines.map((l) => l.length));
+  assert.equal(lengths.size, 1);
+  assert.match(table, /very-long-hypothesis-identifier/);
+});
+
+test('renderTable truncates an id over the 40-char cap with an ellipsis, still aligned', () => {
+  const longId = 'H'.repeat(50);
+  const diff = computeDiff(
+    parseSessionText(line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: longId, status: 'OPEN' })),
+    parseSessionText(''),
+  );
+  const table = renderTable(diff);
+  assert.doesNotMatch(table, new RegExp(longId));
+  assert.match(table, /H{39}…/);
+  const borderedLines = table.split('\n').filter((l) => /^[│┌├└]/.test(l));
+  const lengths = new Set(borderedLines.map((l) => l.length));
+  assert.equal(lengths.size, 1);
+});
 ```
 
 - [ ] **Step 2: Run to verify failures**
@@ -1720,15 +1879,34 @@ const diffBucket = (beforeBucket, afterBucket) => {
   };
 };
 
+// The engine's contract is string hypothesis ids. Older/pre-validation
+// logs can carry a non-string id (hypothesisId: 42 on an event line) or a
+// hypothesis-lifecycle line with no id at all (hypothesisId: undefined) —
+// either would otherwise reach renderTable's `.padEnd` and crash. The
+// empty string is deliberately NOT "malformed": it is messagesByHypothesis'
+// own sentinel for the untagged bucket, handled separately below.
+const isValidHypothesisId = (id) => typeof id === 'string' && id !== '';
+
 const computeDiff = (beforeEntries, afterEntries) => {
   const beforeFolded = foldHypotheses(beforeEntries);
   const afterFolded = foldHypotheses(afterEntries);
   const beforeBuckets = messagesByHypothesis(beforeEntries);
   const afterBuckets = messagesByHypothesis(afterEntries);
-  const ids = [...new Set([
+  const allKeys = new Set([
     ...beforeFolded.keys(), ...afterFolded.keys(),
-    ...[...beforeBuckets.keys()].filter(Boolean), ...[...afterBuckets.keys()].filter(Boolean),
-  ])].sort();
+    ...beforeBuckets.keys(), ...afterBuckets.keys(),
+  ]);
+  const ids = [];
+  // Excluded (never silent): every non-string/empty key found anywhere in
+  // the union is counted once, distinct-value basis, matching how `ids`
+  // itself is deduplicated across the same four sources.
+  let ignoredMalformedIds = 0;
+  for (const key of allKeys) {
+    if (key === '') continue;
+    if (isValidHypothesisId(key)) ids.push(key);
+    else ignoredMalformedIds += 1;
+  }
+  ids.sort();
   let verdictChanges = 0;
   let newHypotheses = 0;
   const hypotheses = ids.map((id) => {
@@ -1757,7 +1935,7 @@ const computeDiff = (beforeEntries, afterEntries) => {
       disappeared: untagged.disappeared,
       disappearedTruncated: untagged.disappearedTruncated,
     },
-    summary: { verdictChanges, newHypotheses },
+    summary: { verdictChanges, newHypotheses, ignoredMalformedIds },
   };
 };
 
@@ -1765,68 +1943,144 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 
 const statusOr = (status) => status ?? '—';
 
+// Stored msg/note/title text is untrusted — it is written by whatever
+// process is being debugged, not by this tool. The rendered report IS the
+// evidence that gets pasted into PRs/chat, so raw interpolation would let
+// log content forge headings, verdicts, or break out of a backtick code
+// span (report structure must reflect the engine, never log content).
+// JSON.stringify turns embedded newlines/quotes/control chars into their
+// escaped literal form (a real newline becomes the two printable
+// characters "\" + "n", never an actual line break); backticks are handled
+// separately since JSON.stringify does not touch them and this text can
+// land inside a backtick code span. JSON output needs none of this —
+// JSON.stringify(diff, ...) already escapes everything correctly there.
+const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`');
+
+// Hypothesis ids are short identifiers by convention; 40 chars comfortably
+// fits real-world ids while keeping the bordered table readable if an
+// oversized id somehow reaches here — truncated with an ellipsis rather
+// than silently overflowing the border or wrapping.
+const ID_COLUMN_MAX = 40;
+const truncateId = (id) => (id.length > ID_COLUMN_MAX ? `${id.slice(0, ID_COLUMN_MAX - 1)}…` : id);
+
 const renderTable = (diff) => {
-  const rows = diff.hypotheses.map((h) => (
-    `│ ${h.id.padEnd(4)} │ ${statusOr(h.before.status).padEnd(12)} │ ${statusOr(h.after.status).padEnd(12)} │ ${`${h.before.events} → ${h.after.events}`.padEnd(9)} │`
+  const displayIds = diff.hypotheses.map((h) => truncateId(h.id));
+  // Width is sampled across every rendered id (not just the first row), so
+  // the id column — and therefore every row's total width — stays aligned
+  // regardless of which row has the longest id.
+  const idWidth = Math.max(2, ...displayIds.map((id) => id.length));
+  const rows = diff.hypotheses.map((h, i) => (
+    `│ ${displayIds[i].padEnd(idWidth)} │ ${statusOr(h.before.status).padEnd(12)} │ ${statusOr(h.after.status).padEnd(12)} │ ${`${h.before.events} → ${h.after.events}`.padEnd(9)} │`
   ));
-  const width = rows[0]?.length ?? 52;
+  const header = `│ ${'id'.padEnd(idWidth)} │ ${'before'.padEnd(12)} │ ${'after'.padEnd(12)} │ ${'events'.padEnd(9)} │`;
+  // header and every row share the same column widths by construction, so
+  // header's length IS the row width — no need to sample rows separately
+  // (and this stays correct even when there are zero hypotheses to show).
+  const width = header.length;
   const bar = '─'.repeat(Math.max(width - 2, 10));
-  const lines = [`┌${bar}┐`, `│ id   │ before       │ after        │ events    │`, `├${bar}┤`, ...rows, `└${bar}┘`];
+  const lines = [`┌${bar}┐`, header, `├${bar}┤`, ...rows, `└${bar}┘`];
   for (const h of diff.hypotheses) {
     if (h.disappeared.length > 0) {
       lines.push(`disappeared after fix (${h.id}${h.disappearedTruncated ? `, +${h.disappearedTruncated} more` : ''}):`);
-      for (const msg of h.disappeared) lines.push(`  - ${msg}`);
+      for (const msg of h.disappeared) lines.push(`  - ${escapeText(msg)}`);
     }
   }
   if (diff.untagged.disappeared.length > 0) {
     lines.push('disappeared (untagged):');
-    for (const msg of diff.untagged.disappeared) lines.push(`  - ${msg}`);
+    for (const msg of diff.untagged.disappeared) lines.push(`  - ${escapeText(msg)}`);
   }
   lines.push(`verdict changes: ${diff.summary.verdictChanges}  new hypotheses: ${diff.summary.newHypotheses}`);
+  if (diff.summary.ignoredMalformedIds > 0) {
+    lines.push(`${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored`);
+  }
   return `${lines.join('\n')}\n`;
 };
 
 const renderMarkdown = (diff) => {
   const lines = ['## Evidence diff', ''];
   for (const h of diff.hypotheses) {
-    const title = h.title ? ` — ${h.title}` : '';
+    const title = h.title ? ` — ${escapeText(h.title)}` : '';
     lines.push(`**${h.id}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
     lines.push('');
     lines.push(`- events ${h.before.events} → ${h.after.events}`);
-    for (const msg of h.disappeared) lines.push(`- gone: \`${msg}\``);
+    for (const msg of h.disappeared) lines.push(`- gone: \`${escapeText(msg)}\``);
     if (h.disappearedTruncated > 0) lines.push(`- …and ${h.disappearedTruncated} more disappeared`);
-    if (h.after.note) lines.push(`- note: "${h.after.note}"`);
+    if (h.after.note) lines.push(`- note: "${escapeText(h.after.note)}"`);
     lines.push('');
   }
   lines.push(`_verdict changes: ${diff.summary.verdictChanges} · new hypotheses: ${diff.summary.newHypotheses}_`);
+  if (diff.summary.ignoredMalformedIds > 0) {
+    lines.push(`_${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored_`);
+  }
   return `${lines.join('\n')}\n`;
+};
+
+// Fail-closed argv parsing, mirroring the viewer's stance: an unrecognized
+// flag, a repeated --format, or the space form (`--format md`, which would
+// otherwise silently swallow `md` as a positional and shift beforeRef/
+// afterRef) all reject the invocation rather than guessing what was meant.
+// `--format=<value>` is this tool's one canonical flag form.
+const parseArgs = (args) => {
+  const positional = [];
+  let format;
+  let formatSeen = false;
+  for (const arg of args) {
+    if (!arg.startsWith('--')) {
+      positional.push(arg);
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      if (formatSeen) return { error: 'duplicate --format flag' };
+      formatSeen = true;
+      format = arg.slice('--format='.length);
+      continue;
+    }
+    if (arg === '--format') {
+      return { error: '--format requires a value: --format=<table|md|json>' };
+    }
+    return { error: `unknown flag: ${arg}` };
+  }
+  return { positional, format };
 };
 
 const main = async () => {
   const args = process.argv.slice(2);
-  const formatFlag = args.find((a) => a.startsWith('--format='));
-  const positional = args.filter((a) => !a.startsWith('--'));
+  const parsed = parseArgs(args);
+  if (parsed.error) {
+    process.stderr.write(`debug_diff: ${parsed.error}\n${USAGE}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  const { positional, format: formatArg } = parsed;
   if (positional.length < 2) {
     process.stderr.write(`${USAGE}\n`);
     process.exitCode = 2;
     return;
   }
   const [beforeRef, afterRef, projectRoot = process.cwd()] = positional;
-  let format = formatFlag ? formatFlag.slice('--format='.length) : (process.stdout.isTTY ? 'table' : 'json');
+  const format = formatArg ?? (process.stdout.isTTY ? 'table' : 'json');
   if (!['table', 'md', 'json'].includes(format)) {
     process.stderr.write(`${USAGE}\n`);
     process.exitCode = 2;
     return;
   }
+  // Read before/after separately (not one shared try/catch) — a diff over
+  // a missing or malformed session must never render a partial report, and
+  // "cannot read session" alone leaves the operator guessing which of the
+  // two refs was the problem.
   let beforeEntries;
-  let afterEntries;
   try {
     beforeEntries = await readSessionFile(resolveSessionRef(projectRoot, beforeRef));
+  } catch (error) {
+    process.stderr.write(`debug_diff: cannot read before session (${beforeRef}): ${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  let afterEntries;
+  try {
     afterEntries = await readSessionFile(resolveSessionRef(projectRoot, afterRef));
   } catch (error) {
-    // Fail closed with the offending ref named — a diff over a missing or
-    // malformed session must never render a partial report.
-    process.stderr.write(`debug_diff: cannot read session (${error.message})\n`);
+    process.stderr.write(`debug_diff: cannot read after session (${afterRef}): ${error.message}\n`);
     process.exitCode = 1;
     return;
   }
@@ -1849,7 +2103,17 @@ module.exports = { computeDiff, renderJson, renderMarkdown, renderTable };
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 4/4 pass. `node --check scripts/debug_diff.js` clean.
+Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 13/13 pass. `node --check scripts/debug_diff.js` clean.
+
+Post-review hardening (same Task 5 scope, folded into the fenced blocks above):
+report-forgery escaping (`escapeText`) for stored msg/note/title in both human
+renderers; non-string/missing hypothesis ids excluded from the report and
+counted in `summary.ignoredMalformedIds` instead of crashing `renderTable`;
+fail-closed CLI argv parsing (unknown flags, duplicate `--format`, and the
+bare `--format` space form all exit 2); before/after read errors reported
+separately, naming which ref failed; and the table's id column width is
+sampled across every rendered id (capped at 40 chars, ellipsis-truncated)
+instead of only the first row.
 
 - [ ] **Step 5: Commit**
 
