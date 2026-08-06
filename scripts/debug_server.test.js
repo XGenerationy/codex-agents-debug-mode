@@ -4200,3 +4200,57 @@ test('POST /hypothesis rejects unknown sessions', async () => {
     assert.equal(unknown.body.error, 'unknown_session');
   });
 });
+
+test('hypothesisId is stored trimmed on both /hypothesis and /log (shared join key)', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', hypothesisId: '  H1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: '  H1  ', status: 'OPEN' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.hypothesisId), ['H1', 'H1']);
+  });
+});
+
+test('the instrumented app cannot forge hypothesis lines through /log', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'sneaky',
+        type: 'hypothesis',
+        status: 'CONFIRMED',
+      },
+    });
+    assert.equal(response.status, 202);
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(Object.hasOwn(line, 'type'), false);
+    assert.equal(Object.hasOwn(line, 'status'), false);
+  });
+});
+
+test('events and hypothesis lines interleave in append order with the type discriminator', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (msg) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+    });
+    await log('before');
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await log('after');
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(
+      lines.map((line) => [line.type === 'hypothesis' ? 'hypothesis' : 'event', line.msg ?? line.status]),
+      [['event', 'before'], ['hypothesis', 'OPEN'], ['event', 'after']],
+    );
+  });
+});

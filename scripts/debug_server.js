@@ -1395,7 +1395,17 @@ const createDebugServer = ({
 
         const event = { ts: new Date().toISOString(), msg: payload.msg };
         for (const key of ['data', 'hypothesisId', 'loc', 'runId']) {
-          if (payload[key] !== undefined) event[key] = payload[key];
+          if (payload[key] === undefined) continue;
+          // hypothesisId is the join key that POST /hypothesis lines and
+          // sub-project B's filters/diff match on byte-exactly; trim string
+          // values here and in /hypothesis so "  H1  " and "H1" cannot
+          // silently become distinct hypotheses. 'type' is deliberately
+          // absent from this allowlist: adding it would let the instrumented
+          // app forge hypothesis lines (see the POST /hypothesis capability
+          // split).
+          event[key] = key === 'hypothesisId' && typeof payload[key] === 'string'
+            ? payload[key].trim()
+            : payload[key];
         }
         // Redact BEFORE serialization and BEFORE capacity reservation: a
         // redaction failure rejects the event with nothing persisted and no
@@ -1448,6 +1458,7 @@ const createDebugServer = ({
         if (typeof payload.hypothesisId !== 'string' || payload.hypothesisId.trim() === '') {
           throw new RequestError('invalid_hypothesis_id');
         }
+        const hypothesisId = payload.hypothesisId.trim();
         if (!HYPOTHESIS_STATUSES.has(payload.status)) {
           throw new RequestError('invalid_hypothesis_status');
         }
@@ -1470,7 +1481,7 @@ const createDebugServer = ({
         const line = {
           ts: new Date().toISOString(),
           type: 'hypothesis',
-          hypothesisId: payload.hypothesisId,
+          hypothesisId,
           status: payload.status,
         };
         for (const key of ['title', 'note', 'runId']) {

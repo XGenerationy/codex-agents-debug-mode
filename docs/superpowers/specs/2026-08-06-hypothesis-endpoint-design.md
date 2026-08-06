@@ -39,7 +39,9 @@ appended through the existing `appendSessionEvent` chain:
 
 - Server sets `ts` (ISO-8601 UTC) and `type: "hypothesis"`. Client fields are allowlisted:
   `hypothesisId`, `status`, `title`, `note`, `runId` — nothing else is copied.
-- `hypothesisId`: required non-empty string (same free-form ids agents already put on events).
+- `hypothesisId`: required string, non-empty after trimming; stored TRIMMED. `/log` applies the
+  same trim to string `hypothesisId` values, so the join key that filters and `debug_diff` match
+  on can never differ by invisible whitespace.
 - `status`: required, validated enum `OPEN | CONFIRMED | REJECTED | INCONCLUSIVE`.
 - `title` and `note` are optional strings; they pass the existing redaction choke point
   (`redactEventForAppend`) like every other string, so secrets in hypothesis text are
@@ -151,6 +153,10 @@ appended through the existing `appendSessionEvent` chain:
 - No SSE/WebSocket streaming (parked backlog item).
 - No report generation or session-close concept (sub-project B / rejected respectively).
 - No pagination beyond `limit`; no multi-value filters.
+- Shared caps stay shared (decision record): hypothesis lines and events consume the same
+  `maxEventsPerSession`/`maxTotalBytes` budgets. A chatty app can exhaust the budget before a
+  verdict is recorded; that failure is fail-closed, diagnosable (429), and preferred over
+  introducing a second overdraft cap semantic.
 
 ## Success criteria
 
