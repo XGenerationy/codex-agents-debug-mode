@@ -36,10 +36,19 @@ One module owns everything both tools must agree on:
 - **`readSessionFile(filePath)`** — read a session log from disk; returns ordered entries
   `{raw, parsed}` (raw stored line preserved for verbatim re-emit; incomplete trailing line
   dropped).
-- **`readSessionLive({port, token, sessionId})`** — fetch `GET /sessions/:id/logs` from the
-  local collector (loopback only) with the launch token; same `{raw, parsed}` shape.
-  Collector discovery reads `.debug/collector_port` and `.debug/collector_token` relative to
-  the project root.
+- **`readSessionLive({port, token, sessionId, filters, timeoutMs})`** — fetch
+  `GET /sessions/:id/logs` from the local collector (loopback only) with the launch token;
+  same `{raw, parsed}` shape. The session id is validated against the route's own id
+  pattern BEFORE any request (`invalid_session_ref`) — a crafted id must never reach URL
+  path construction (a `..`-bearing id can otherwise normalize onto another route and
+  return non-log JSON as "evidence"). Join-key filters go through the same normalization
+  `filterEntries` uses (trim; non-string → `invalid_filter:*`) so live and local paths
+  cannot diverge on error behavior. A response timeout (`live_read_timeout`, default 5s)
+  and a response-error handler make silent hangs impossible — a frozen tail must fail
+  loudly, never freeze quietly. Collector discovery reads `.debug/collector_port` and
+  `.debug/collector_token` relative to the project root, failing closed with structured
+  codes: `collector_not_running` (missing material), `collector_port_invalid`
+  (non-`/^\d+$/` port), `collector_token_invalid` (empty token).
 - **`filterEntries(entries, {hypothesisId, type, sinceTs, untilTs, runId, limit})`** —
   semantics IDENTICAL to the GET route's: `type` `all|event|hypothesis` with "no `type` field
   = event" and unknown future types matching only `all`; inclusive `Date.parse` bounds with
@@ -64,7 +73,11 @@ One module owns everything both tools must agree on:
   `.debug` directory is a normal fresh-repo state: `listSessions` returns `[]` on
   ENOENT and rethrows anything else.
 - **Live tail = poll-by-count**: re-fetch and emit only entries beyond the count already
-  seen. No timestamp cursors, no same-millisecond dedupe hazards. When a watched live
+  seen. No timestamp cursors, no same-millisecond dedupe hazards. Accepted cost model:
+  each poll re-downloads the full unfiltered log — O(n) per poll, bounded by the
+  collector's `maxTotalBytes` cap and the read timeout; poll intervals are chosen with
+  this in mind. The `seen` counter advances only after a successful fetch, so a failed
+  poll can never cause a gap or double-emit. When a watched live
   session retires (GET starts returning 404 `unknown_session`) the caller falls back to the
   file transparently and surfaces that the stream is no longer live.
 - Fail-closed error surfacing: 401 (bad/missing launch token), 404 (unknown/retired), 409
@@ -113,6 +126,8 @@ One module owns everything both tools must agree on:
 | Unknown session ref (file absent, GET 404) | exit 1 with a distinct message naming the ref; viewer TUI shows it inline |
 | Live GET 401 | exit 1: launch token missing/mismatched (`.debug/collector_token`) |
 | Live GET 409 `session_log_replaced` | exit 1, surfaced verbatim — evidence integrity failure is never softened |
+| Live GET stalls (server accepts, never responds / dies mid-body) | `live_read_timeout` (default 5s) — a tail fails loudly, never freezes silently |
+| Collector material missing / port or token file corrupt | `collector_not_running` / `collector_port_invalid` / `collector_token_invalid` |
 | Live session retires mid-watch | automatic file fallback + visible "no longer live" state |
 | Agent mode without `--session` | usage error, exit 2 (agents must be explicit) |
 | Malformed stored line encountered by the core | fail closed: name the line number, exit 1 (never skip silently) |
