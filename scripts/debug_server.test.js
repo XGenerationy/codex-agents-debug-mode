@@ -4260,6 +4260,36 @@ test('hypothesisId is stored trimmed on both /hypothesis and /log (shared join k
   });
 });
 
+test('/log rejects non-string and whitespace-only hypothesisId/runId join keys', async () => {
+  // /hypothesis rejects a whitespace-only hypothesisId (invalid_hypothesis_id);
+  // /log must not let the equivalent through on its join keys either, or an
+  // event with hypothesisId: "" could never join a hypothesis line and would
+  // be silently invisible to GET ?hypothesisId= (empty). Both join keys are
+  // held to the same non-empty-after-trim discipline.
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (body) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e', ...body },
+    });
+    for (const key of ['hypothesisId', 'runId']) {
+      const numeric = await log({ [key]: 42 });
+      assert.equal(numeric.status, 400, `${key} numeric`);
+      assert.equal(numeric.body.error, 'invalid_join_key', `${key} numeric`);
+      const object = await log({ [key]: {} });
+      assert.equal(object.status, 400, `${key} object`);
+      assert.equal(object.body.error, 'invalid_join_key', `${key} object`);
+      const blank = await log({ [key]: '   ' });
+      assert.equal(blank.status, 400, `${key} whitespace`);
+      assert.equal(blank.body.error, 'invalid_join_key', `${key} whitespace`);
+    }
+    // Nothing was persisted by the rejected attempts.
+    const lines = await readSessionLines(projectRoot, session);
+    assert.equal(lines.length, 0);
+  });
+});
+
 test('the instrumented app cannot forge hypothesis lines through /log', async () => {
   await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
     const session = (await createSession(baseUrl)).body;

@@ -1422,9 +1422,13 @@ const createDebugServer = ({
           // hypothesis line and is silently invisible to GET ?hypothesisId=42
           // (the query string is compared with !== against the stored value),
           // so reject it with the same structured code /hypothesis uses —
-          // silently persisting it would be fail-open by another name.
-          if ((key === 'hypothesisId' || key === 'runId') && typeof payload[key] !== 'string') {
-            throw new RequestError('invalid_join_key');
+          // silently persisting it would be fail-open by another name. A
+          // whitespace-only value trims to "", which is just as unjoinable and
+          // which /hypothesis already rejects for hypothesisId, so reject it
+          // here too rather than persisting an empty join key.
+          if (key === 'hypothesisId' || key === 'runId') {
+            if (typeof payload[key] !== 'string') throw new RequestError('invalid_join_key');
+            if (payload[key].trim() === '') throw new RequestError('invalid_join_key');
           }
           event[key] = (key === 'hypothesisId' || key === 'runId')
             ? payload[key].trim()
