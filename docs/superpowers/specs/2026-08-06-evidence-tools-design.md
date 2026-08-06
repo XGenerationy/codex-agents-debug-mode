@@ -97,6 +97,14 @@ One module owns everything both tools must agree on:
 - **Testability by design:** the TUI's state transitions are pure reducers
   (`(state, key) → state`) covered by unit tests; only the thin ANSI painter is exempt from
   CI (documented). Agent mode is covered end-to-end by spawning the real CLI.
+- **Crash safety (review decisions):** any `await` inside an un-awaited `setInterval`/event
+  callback is a process-killer `main().catch` cannot reach — the poll's file-fallback read
+  is therefore guarded (on failure, keep last-known entries: stale evidence beats a
+  corrupted terminal), and a `process.on('exit')` hook unconditionally leaves the alternate
+  screen and restores cooked mode so no failure mode strands the terminal. Ctrl+C quits
+  from every mode (raw stdin swallows ISIG). Frame clipping is code-point-safe (never emits
+  a lone surrogate); display-width handling (CJK/emoji double-width) is explicitly out of
+  scope for a zero-dependency tool.
 - **CLI:** `node debug_viewer.js [projectRoot] --session <id|path> [--hypothesis <id>]
   [--type all|event|hypothesis] [--since <ISO>] [--until <ISO>] [--run <id>] [--limit <n>]
   [--live|--file] [--json|--plain]`. Without `--session` in TUI mode, open the picker;
