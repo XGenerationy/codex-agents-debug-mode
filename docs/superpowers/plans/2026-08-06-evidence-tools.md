@@ -115,6 +115,27 @@ test('filterEntries rejects unknown filter keys fail-closed', () => {
   assert.throws(() => filterEntries(entries, { limit: 0 }), /invalid_filter/);
 });
 
+test('filterEntries trims hypothesisId/runId filter values, mirroring the GET route\'s query.get(name)?.trim()', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.deepEqual(
+    filterEntries(entries, { hypothesisId: '  H1  ' }).map((e) => e.parsed.msg ?? e.parsed.status),
+    ['e1', 'OPEN', 'CONFIRMED'],
+  );
+  assert.deepEqual(filterEntries(entries, { runId: '  r2  ' }).map((e) => e.parsed.msg), ['e3']);
+});
+
+test('filterEntries rejects non-string hypothesisId/runId fail-closed like every other filter', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.throws(() => filterEntries(entries, { hypothesisId: 42 }), /invalid_filter:hypothesisId/);
+  assert.throws(() => filterEntries(entries, { runId: 42 }), /invalid_filter:runId/);
+});
+
+test('filterEntries treats an empty-or-whitespace-only hypothesisId/runId as a real filter matching nothing, mirroring the route (never absent, never an error)', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.equal(filterEntries(entries, { hypothesisId: '   ' }).length, 0);
+  assert.equal(filterEntries(entries, { runId: '' }).length, 0);
+});
+
 test('foldHypotheses derives latest-wins state with first-title retention and history', () => {
   const folded = foldHypotheses(parseSessionText(FIXTURE));
   assert.equal(folded.size, 1);
@@ -145,6 +166,22 @@ test('listSessions and resolveSessionRef enumerate and resolve .debug logs', asy
     assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
     const direct = path.join(root, '.debug', 'debug-beta-2.log');
     assert.equal(resolveSessionRef(root, direct), direct);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resolveSessionRef rejects path-traversal-shaped bare session ids fail-closed', () => {
+  const root = path.join(tmpdir(), 'evidence-fixed-root');
+  assert.throws(() => resolveSessionRef(root, '../../../etc/passwd'), /invalid_session_ref/);
+  assert.throws(() => resolveSessionRef(root, 'x/../y'), /invalid_session_ref/);
+  assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
+});
+
+test('listSessions returns an empty array when the project has no .debug directory yet', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
+  try {
+    assert.deepEqual(await listSessions(root), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -209,9 +246,9 @@ const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
 // the parity test): unknown keys and malformed values fail closed; `type`
 // classifies lines WITHOUT a type field as events and unknown future types
 // match only 'all'; time bounds are inclusive Date.parse comparisons and
-// NaN-ts lines are excluded only while a time filter is active; hypothesisId
-// and runId compare byte-exactly (both trimmed at write time by the
-// collector); `limit` keeps the LAST n matches (tail-biased).
+// NaN-ts lines are excluded only while a time filter is active; `limit`
+// keeps the LAST n matches (tail-biased). hypothesisId/runId semantics are
+// documented at normalizeJoinKeyFilter below.
 const filterEntries = (entries, filters = {}) => {
   for (const key of Object.keys(filters)) {
     if (!FILTER_KEYS.has(key)) throw new Error(`invalid_filter:${key}`);
@@ -231,11 +268,32 @@ const filterEntries = (entries, filters = {}) => {
     if (!Number.isInteger(filters.limit) || filters.limit < 1) throw new Error('invalid_filter:limit');
     limit = filters.limit;
   }
+  // Mirrors the route's `query.get(name)?.trim() ?? undefined` EXACTLY: the
+  // collector also trims these join keys at write time (POST /log), so a
+  // caller-supplied value must be trimmed the same way or padded input would
+  // silently fail to match. Only `undefined` means "no filter" — a value
+  // that is empty or whitespace-only AFTER trimming is still a real filter
+  // (for the empty string) that matches nothing, because the collector
+  // rejects empty join keys at ingestion (invalid_join_key) so no stored
+  // line ever has one; this mirrors the route rather than treating blank
+  // input as absent or raising an error. Unlike the URL route — where
+  // URLSearchParams.get always yields a string — this module's filters are
+  // arbitrary JS values, so a non-string hypothesisId/runId has no route
+  // analog and fails closed like every other malformed filter instead of
+  // silently never matching.
+  const normalizeJoinKeyFilter = (name) => {
+    const value = filters[name];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string') throw new Error(`invalid_filter:${name}`);
+    return value.trim();
+  };
+  const hypothesisIdFilter = normalizeJoinKeyFilter('hypothesisId');
+  const runIdFilter = normalizeJoinKeyFilter('runId');
   const matched = entries.filter(({ parsed }) => {
     const lineType = parsed.type === undefined ? 'event' : parsed.type;
     if (type !== 'all' && lineType !== type) return false;
-    if (filters.hypothesisId !== undefined && parsed.hypothesisId !== filters.hypothesisId) return false;
-    if (filters.runId !== undefined && parsed.runId !== filters.runId) return false;
+    if (hypothesisIdFilter !== undefined && parsed.hypothesisId !== hypothesisIdFilter) return false;
+    if (runIdFilter !== undefined && parsed.runId !== runIdFilter) return false;
     if (sinceTs !== undefined || untilTs !== undefined) {
       const lineTs = Date.parse(parsed.ts);
       if (Number.isNaN(lineTs)) return false;
@@ -278,10 +336,25 @@ const foldHypotheses = (entries) => {
 };
 
 const SESSION_FILE_PATTERN = /^debug-(.+)\.log$/;
+// Mirrors the route's path segment pattern (GET /sessions/:id/logs matches
+// `/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/`) — the same documented security
+// control applies here: a bare id is interpolated into a filesystem path
+// below, so it must be constrained to a safe character set or a value like
+// `../../../etc/passwd` would escape the .debug directory entirely.
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
-// Enumerate session logs under <projectRoot>/.debug.
+// Enumerate session logs under <projectRoot>/.debug. A project that has
+// never run a debug session has no .debug directory yet — that is normal,
+// not an error, so ENOENT yields an empty list; any other readdir failure
+// (permissions, not-a-directory, ...) still propagates.
 const listSessions = async (projectRoot) => {
-  const names = await readdir(path.join(projectRoot, '.debug'));
+  let names;
+  try {
+    names = await readdir(path.join(projectRoot, '.debug'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
   const sessions = [];
   for (const name of names) {
     const match = name.match(SESSION_FILE_PATTERN);
@@ -290,9 +363,15 @@ const listSessions = async (projectRoot) => {
   return sessions;
 };
 
-// A ref is either a direct path to a .log file or a bare session id.
+// A ref is either a direct path to a .log file (passed through as-is — an
+// explicit file path supplied by the caller, e.g. from listSessions) or a
+// bare session id, which MUST match SESSION_ID_PATTERN before being
+// interpolated into a path: unlike the .log passthrough, a bare id is
+// untrusted input (e.g. a CLI argument) and would otherwise reach path.join
+// unvalidated — `debug-../../..` would escape the .debug directory.
 const resolveSessionRef = (projectRoot, ref) => {
   if (ref.endsWith('.log')) return ref;
+  if (!SESSION_ID_PATTERN.test(ref)) throw new Error(`invalid_session_ref:${ref}`);
   return path.join(projectRoot, '.debug', `debug-${ref}.log`);
 };
 
@@ -309,7 +388,7 @@ module.exports = {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js`
-Expected: 11/11 pass. `node --check scripts/debug_evidence.js` clean.
+Expected: 15/15 pass. `node --check scripts/debug_evidence.js` clean.
 
 - [ ] **Step 5: Commit**
 

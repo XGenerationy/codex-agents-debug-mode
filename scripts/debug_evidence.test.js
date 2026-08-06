@@ -88,6 +88,27 @@ test('filterEntries rejects unknown filter keys fail-closed', () => {
   assert.throws(() => filterEntries(entries, { limit: 0 }), /invalid_filter/);
 });
 
+test('filterEntries trims hypothesisId/runId filter values, mirroring the GET route\'s query.get(name)?.trim()', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.deepEqual(
+    filterEntries(entries, { hypothesisId: '  H1  ' }).map((e) => e.parsed.msg ?? e.parsed.status),
+    ['e1', 'OPEN', 'CONFIRMED'],
+  );
+  assert.deepEqual(filterEntries(entries, { runId: '  r2  ' }).map((e) => e.parsed.msg), ['e3']);
+});
+
+test('filterEntries rejects non-string hypothesisId/runId fail-closed like every other filter', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.throws(() => filterEntries(entries, { hypothesisId: 42 }), /invalid_filter:hypothesisId/);
+  assert.throws(() => filterEntries(entries, { runId: 42 }), /invalid_filter:runId/);
+});
+
+test('filterEntries treats an empty-or-whitespace-only hypothesisId/runId as a real filter matching nothing, mirroring the route (never absent, never an error)', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.equal(filterEntries(entries, { hypothesisId: '   ' }).length, 0);
+  assert.equal(filterEntries(entries, { runId: '' }).length, 0);
+});
+
 test('foldHypotheses derives latest-wins state with first-title retention and history', () => {
   const folded = foldHypotheses(parseSessionText(FIXTURE));
   assert.equal(folded.size, 1);
@@ -118,6 +139,22 @@ test('listSessions and resolveSessionRef enumerate and resolve .debug logs', asy
     assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
     const direct = path.join(root, '.debug', 'debug-beta-2.log');
     assert.equal(resolveSessionRef(root, direct), direct);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resolveSessionRef rejects path-traversal-shaped bare session ids fail-closed', () => {
+  const root = path.join(tmpdir(), 'evidence-fixed-root');
+  assert.throws(() => resolveSessionRef(root, '../../../etc/passwd'), /invalid_session_ref/);
+  assert.throws(() => resolveSessionRef(root, 'x/../y'), /invalid_session_ref/);
+  assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
+});
+
+test('listSessions returns an empty array when the project has no .debug directory yet', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
+  try {
+    assert.deepEqual(await listSessions(root), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
