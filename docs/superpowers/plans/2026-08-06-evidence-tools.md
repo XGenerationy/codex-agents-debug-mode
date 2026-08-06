@@ -946,6 +946,52 @@ test('agent mode is auto-selected when stdout is not a TTY', async () => {
   }
 });
 
+test('runtime errors (e.g. a mistyped session id) are reported as one clean line, exit 1', async () => {
+  const { root } = await seedRoot();
+  try {
+    const result = await runViewer([root, '--session', 'doesnotexist', '--json']);
+    assert.equal(result.code, 1);
+    const stderrLines = result.stderr.split('\n').filter(Boolean);
+    assert.equal(stderrLines.length, 1);
+    assert.doesNotMatch(result.stderr, /\bat /);
+    assert.doesNotMatch(result.stderr, /Node\.js v/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('agent mode rejects --live as not wired until Task 4, exit 2', async () => {
+  const { root } = await seedRoot();
+  try {
+    const result = await runViewer([root, '--session', 's1', '--live', '--json']);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /--live is not wired yet/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('parseViewerArgs rejects a flag passed twice (GET-route parity)', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session', 's1', '--session', 's2']),
+    /viewer_usage:duplicate flag --session/,
+  );
+});
+
+test('parseViewerArgs rejects --flag=value syntax with a specific message', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session=s1']),
+    /viewer_usage:--session takes a space-separated value/,
+  );
+});
+
+test('parseViewerArgs rejects a value-taking flag whose next token is another flag', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session', '--json']),
+    /viewer_usage:missing value for --session/,
+  );
+});
+
 test('reducers: filter entry, focus toggle, pause, and quit are pure transitions', () => {
   let state = createInitialState({ sessionId: 's1' });
   assert.equal(state.focus, 'stream');
@@ -961,6 +1007,19 @@ test('reducers: filter entry, focus toggle, pause, and quit are pure transitions
   assert.equal(state.mode, 'normal');
   state = reduce(state, { name: 'q' });
   assert.equal(state.quit, true);
+});
+
+test('reduce ignores nullish or shapeless key input, returning the same state reference', () => {
+  const state = createInitialState({ sessionId: 's1' });
+  assert.equal(reduce(state, undefined), state);
+  assert.equal(reduce(state, null), state);
+});
+
+test('reduce appends a multi-byte (surrogate-pair) sequence to the filter draft as one unit', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
+  assert.equal(state.filterDraft, '\u{1F600}');
 });
 ```
 
@@ -991,9 +1050,17 @@ const USAGE = 'Usage: debug_viewer.js [projectRoot] --session <id|path> '
   + '[--hypothesis <id>] [--type all|event|hypothesis] [--since <ISO>] '
   + '[--until <ISO>] [--run <id>] [--limit <n>] [--live|--file] [--json|--plain]';
 
-// Fail-closed argument parsing: unknown flags and malformed values throw a
-// viewer_usage error rather than being ignored (an ignored typo would
-// silently widen what gets shown — same stance as the GET route).
+// Flags that take a following value — used to reject `--flag=value` syntax
+// (this parser only accepts space-separated values) and to stop a value
+// consuming a following flag token (see takeValue below).
+const VALUE_FLAGS = new Set(['--session', '--hypothesis', '--type', '--since', '--until', '--run', '--limit']);
+const EQUALS_FLAG = /^(--[a-z]+)=/;
+
+// Fail-closed argument parsing: unknown flags, duplicate flags, `--flag=value`
+// syntax, and malformed values all throw a viewer_usage error rather than
+// being ignored or silently accepted (an ignored typo would silently widen
+// what gets shown — same stance as the GET route, which also rejects
+// duplicate query params).
 const parseViewerArgs = (argv) => {
   const parsed = {
     projectRoot: process.cwd(),
@@ -1005,12 +1072,21 @@ const parseViewerArgs = (argv) => {
   };
   const args = [...argv];
   if (args[0] && !args[0].startsWith('--')) parsed.projectRoot = args.shift();
+  const seen = new Set();
   while (args.length > 0) {
     const flag = args.shift();
+    const eqMatch = flag.match(EQUALS_FLAG);
+    if (eqMatch && VALUE_FLAGS.has(eqMatch[1])) {
+      throw new Error(`viewer_usage:${eqMatch[1]} takes a space-separated value`);
+    }
+    if (seen.has(flag)) throw new Error(`viewer_usage:duplicate flag ${flag}`);
+    seen.add(flag);
     const takeValue = () => {
-      const value = args.shift();
-      if (value === undefined) throw new Error(`viewer_usage:${flag} requires a value`);
-      return value;
+      const value = args[0];
+      if (value === undefined || value.startsWith('--')) {
+        throw new Error(`viewer_usage:missing value for ${flag}`);
+      }
+      return args.shift();
     };
     if (flag === '--session') parsed.session = takeValue();
     else if (flag === '--hypothesis') parsed.filters.hypothesisId = takeValue();
@@ -1040,6 +1116,12 @@ const runAgentMode = async (parsed) => {
     process.stderr.write(`${USAGE}\nagent mode requires --session\n`);
     return 2;
   }
+  if (parsed.forceLive) {
+    // Live wiring is Task 4 by design; until then fail honestly instead of
+    // silently serving stale file contents to a caller that asked to tail.
+    process.stderr.write(`${USAGE}\nviewer_usage:--live is not wired yet (Task 4)\n`);
+    return 2;
+  }
   const filePath = resolveSessionRef(parsed.projectRoot, parsed.session);
   const entries = await readSessionFile(filePath);
   const selected = filterEntries(entries, parsed.filters);
@@ -1066,13 +1148,20 @@ const createInitialState = ({ sessionId }) => ({
 // q quit. Unknown keys are no-ops — an unmapped keystroke must never
 // mutate state.
 const reduce = (state, key) => {
+  // Nullish or shapeless key input is a no-op — never throw on a malformed
+  // event, and never mutate state for something that isn't a real key.
+  if (!key || typeof key !== 'object') return state;
   if (state.mode === 'filter-input') {
     if (key.name === 'return') {
       return { ...state, mode: 'normal', activeFilter: state.filterDraft || undefined };
     }
     if (key.name === 'escape') return { ...state, mode: 'normal', filterDraft: '' };
     if (key.name === 'backspace') return { ...state, filterDraft: state.filterDraft.slice(0, -1) };
-    if (typeof key.sequence === 'string' && key.sequence.length === 1) {
+    // Code-point length (not UTF-16 .length) so a single emoji/astral
+    // character — a surrogate pair — still counts as one unit, while
+    // multi-code-point escape sequences (arrow keys, etc.) are still
+    // excluded, same as before.
+    if (typeof key.sequence === 'string' && [...key.sequence].length === 1) {
       return { ...state, filterDraft: state.filterDraft + key.sequence };
     }
     return state;
@@ -1109,7 +1198,14 @@ const main = async () => {
   process.exitCode = 3;
 };
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch((error) => {
+    // Runtime failures (bad session path, ENOENT, etc.) must not crash out
+    // through a raw Node stack dump — one clean line on stderr, exit 1.
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
   createInitialState,
@@ -1123,7 +1219,7 @@ module.exports = {
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 6/6 pass. `node --check scripts/debug_viewer.js` clean.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 13/13 pass. `node --check scripts/debug_viewer.js` clean.
 
 - [ ] **Step 5: Commit**
 

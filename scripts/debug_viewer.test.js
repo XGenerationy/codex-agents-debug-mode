@@ -79,6 +79,52 @@ test('agent mode is auto-selected when stdout is not a TTY', async () => {
   }
 });
 
+test('runtime errors (e.g. a mistyped session id) are reported as one clean line, exit 1', async () => {
+  const { root } = await seedRoot();
+  try {
+    const result = await runViewer([root, '--session', 'doesnotexist', '--json']);
+    assert.equal(result.code, 1);
+    const stderrLines = result.stderr.split('\n').filter(Boolean);
+    assert.equal(stderrLines.length, 1);
+    assert.doesNotMatch(result.stderr, /\bat /);
+    assert.doesNotMatch(result.stderr, /Node\.js v/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('agent mode rejects --live as not wired until Task 4, exit 2', async () => {
+  const { root } = await seedRoot();
+  try {
+    const result = await runViewer([root, '--session', 's1', '--live', '--json']);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /--live is not wired yet/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('parseViewerArgs rejects a flag passed twice (GET-route parity)', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session', 's1', '--session', 's2']),
+    /viewer_usage:duplicate flag --session/,
+  );
+});
+
+test('parseViewerArgs rejects --flag=value syntax with a specific message', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session=s1']),
+    /viewer_usage:--session takes a space-separated value/,
+  );
+});
+
+test('parseViewerArgs rejects a value-taking flag whose next token is another flag', () => {
+  assert.throws(
+    () => parseViewerArgs(['--session', '--json']),
+    /viewer_usage:missing value for --session/,
+  );
+});
+
 test('reducers: filter entry, focus toggle, pause, and quit are pure transitions', () => {
   let state = createInitialState({ sessionId: 's1' });
   assert.equal(state.focus, 'stream');
@@ -94,4 +140,17 @@ test('reducers: filter entry, focus toggle, pause, and quit are pure transitions
   assert.equal(state.mode, 'normal');
   state = reduce(state, { name: 'q' });
   assert.equal(state.quit, true);
+});
+
+test('reduce ignores nullish or shapeless key input, returning the same state reference', () => {
+  const state = createInitialState({ sessionId: 's1' });
+  assert.equal(reduce(state, undefined), state);
+  assert.equal(reduce(state, null), state);
+});
+
+test('reduce appends a multi-byte (surrogate-pair) sequence to the filter draft as one unit', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
+  assert.equal(state.filterDraft, '\u{1F600}');
 });
