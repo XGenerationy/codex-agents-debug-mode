@@ -1241,7 +1241,7 @@ Claude-Session: https://claude.ai/code/session_013VQCeNzNXziDk5maCRSSvp"
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `scripts/debug_viewer.test.js` (add `renderFrame` to the destructured require):
+Append to `scripts/debug_viewer.test.js`. Housekeeping first: add `renderFrame` to the `./debug_viewer` destructured require, add `readFile` to the `node:fs/promises` destructure, add `const http = require('node:http');` to the top requires (alphabetical), and DELETE the now-obsolete test `agent mode rejects --live as not wired until Task 4, exit 2` (this task wires --live; the e2e below supersedes it).
 
 ```js
 test('renderFrame paints layout C: stream, verdict table, key bar', () => {
@@ -1266,16 +1266,92 @@ test('renderFrame marks paused state and truncates to the terminal width', () =>
   assert.match(frame, /paused/);
   for (const row of frame.split('\n')) assert.equal(row.length <= 40, true);
 });
+
+// Live collector fixture for the agent-mode --live e2e (mirrors the
+// withLiveSession fixture in debug_evidence.test.js; duplicated because
+// test files cannot share helpers without executing each other's tests).
+const { createDebugServer } = require('./debug_server');
+
+const LAUNCH = 'viewer-test-launch-token-with-entropy';
+
+const listen = (server) => new Promise((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+});
+
+const closeServer = (server) => new Promise((resolve, reject) => {
+  server.close((error) => (error ? reject(error) : resolve()));
+});
+
+const httpJson = (port, pathname, { method = 'GET', headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path: pathname, method, headers }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, text }));
+    });
+    request.on('error', reject);
+    if (body !== undefined) request.write(JSON.stringify(body));
+    request.end();
+  });
+
+test('agent mode --live emits the live session raw lines byte-verbatim', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'viewer-live-'));
+  const server = createDebugServer({ projectRoot: root, token: LAUNCH, redactionEnv: {} });
+  const port = await listen(server);
+  try {
+    const minted = await httpJson(port, '/session', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { name: 'live' },
+    });
+    const session = JSON.parse(minted.text);
+    const log = (msg, extra = {}) => httpJson(port, '/log', {
+      method: 'POST',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg, ...extra },
+    });
+    await log('live-e1', { hypothesisId: 'H1' });
+    await log('live-e2');
+    await writeFile(path.join(root, '.debug', 'collector_port'), String(port), 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), LAUNCH, 'utf8');
+    const stored = await readFile(path.join(root, session.log_file), 'utf8');
+    const result = await runViewer([root, '--session', session.session_id, '--live']);
+    assert.equal(result.stderr, '');
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, stored);
+  } finally {
+    await closeServer(server);
+    await rm(root, { recursive: true, force: true });
+  }
+});
 ```
 
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js`
-Expected: the two new tests fail (`renderFrame` undefined); prior 6 pass.
+Expected: the three new tests fail (the two renderer tests with `renderFrame` undefined; the --live e2e with the exit-2 "not wired yet" usage error); the remaining 12 prior tests pass.
 
 - [ ] **Step 3: Implement**
 
-Insert `renderFrame` (pure — string in, string out, no ANSI cursor addressing inside rows so tests stay byte-stable) above `main`, and replace the exit-3 stub with the TUI loop:
+Three implementation moves in this step, in order:
+
+**(a) Wire agent-mode `--live`** (the spec requires both data sources in BOTH frontends). Extend the top-of-file `./debug_evidence` destructured require with `createSessionTail`, `discoverCollector`, `readSessionLive` (alphabetical). Then in `runAgentMode`, replace the entire `if (parsed.forceLive) { ... }` rejection block (the `viewer_usage:--live is not wired yet (Task 4)` one — keep the missing-`--session` guard above it untouched) with:
+
+```js
+  if (parsed.forceLive) {
+    // Live agent read: discover the collector, let the server apply the
+    // filters (GET-parity guaranteed by the core's test), emit the raw
+    // stored lines byte-verbatim. Errors (collector_not_running,
+    // live_read_*) propagate to main's catch: one line, exit 1.
+    const collector = await discoverCollector(parsed.projectRoot);
+    const entries = await readSessionLive({ ...collector, sessionId: parsed.session, filters: parsed.filters });
+    for (const entry of entries) process.stdout.write(`${entry.raw}\n`);
+    return 0;
+  }
+```
+
+**(b) Insert `renderFrame`** (pure — string in, string out, no ANSI cursor addressing inside rows so tests stay byte-stable) above `main`, and **(c) replace the exit-3 stub with the TUI loop**:
 
 ```js
 // Pure frame renderer for layout C. Returns a full-screen string of exactly
@@ -1324,7 +1400,6 @@ TUI loop replacing the stub (inside `main`'s TTY branch):
   // alternate screen. The painter is the ONLY untested-by-CI code (spec
   // decision); everything it renders comes from tested functions.
   const readline = require('node:readline');
-  const { discoverCollector, createSessionTail } = require('./debug_evidence');
   let sessionId = parsed.session;
   if (sessionId === undefined) {
     const sessions = await listSessions(parsed.projectRoot);
@@ -1405,7 +1480,7 @@ Move the `applyActiveFilter` const ABOVE `paint` (it is referenced there). Expor
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 8/8 pass. `node --check scripts/debug_viewer.js` clean. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 15/15 pass (13 from Task 3, minus the retired rejection test, plus 3 new). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
 
 - [ ] **Step 5: Commit**
 
@@ -1692,7 +1767,14 @@ const main = async () => {
   process.stdout.write(rendered);
 };
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch((error) => {
+    // Same discipline as debug_viewer: runtime failures surface as one
+    // clean line on stderr, never a raw Node stack dump.
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = { computeDiff, renderJson, renderMarkdown, renderTable };
 ```
