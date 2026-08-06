@@ -1506,6 +1506,134 @@ const createDebugServer = ({
         return;
       }
 
+      const sessionLogsMatch = request.method === 'GET'
+        ? pathname.match(/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/)
+        : null;
+      if (sessionLogsMatch) {
+        // Reads are a launch-token capability (see POST /hypothesis). The id
+        // is used ONLY as a map key — client input never reaches filesystem
+        // path construction, so there is no traversal surface.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const session = sessions.get(sessionLogsMatch[1]);
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        // Fail-closed query parsing: unknown parameter names are rejected so
+        // a typo cannot silently disable a filter and widen what is returned.
+        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
+        const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        for (const name of query.keys()) {
+          if (!allowedParams.has(name)) throw new RequestError('invalid_query');
+        }
+        const typeFilter = query.get('type') ?? 'all';
+        if (!['all', 'event', 'hypothesis'].includes(typeFilter)) {
+          throw new RequestError('invalid_query');
+        }
+        const parseBound = (name) => {
+          const value = query.get(name);
+          if (value === null) return undefined;
+          const parsed = Date.parse(value);
+          if (Number.isNaN(parsed)) throw new RequestError('invalid_query');
+          return parsed;
+        };
+        const sinceTs = parseBound('sinceTs');
+        const untilTs = parseBound('untilTs');
+        let limit = effectiveLimits.maxEventsPerSession;
+        const rawLimit = query.get('limit');
+        if (rawLimit !== null) {
+          if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1) throw new RequestError('invalid_query');
+          limit = Math.min(Number(rawLimit), effectiveLimits.maxEventsPerSession);
+        }
+        const hypothesisFilter = query.get('hypothesisId') ?? undefined;
+        const runFilter = query.get('runId') ?? undefined;
+        // Serialize the read on the same per-session chain as appends: no
+        // append can interleave mid-read, so the identity check and the byte
+        // window are consistent and a torn trailing line cannot be observed.
+        // The identity discipline mirrors appendSessionEvent exactly.
+        const previous = session.appendChain || Promise.resolve();
+        const run = previous.catch(() => {}).then(async () => {
+          let handle;
+          try {
+            handle = await openNoFollow(session.logFile, constants.O_RDONLY);
+          } catch (error) {
+            if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
+              throw new RequestError('session_log_replaced', 409);
+            }
+            throw error;
+          }
+          try {
+            const info = await handle.stat();
+            const identity = session.logFileIdentity;
+            const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
+              || info.birthtimeMs === identity.birthtimeMs;
+            if (
+              !info.isFile() || !identity
+              || info.nlink > 1
+              || info.dev !== identity.dev || info.ino !== identity.ino
+              || !sameBirth
+              || info.size !== identity.bytesWritten
+            ) {
+              throw new RequestError('session_log_replaced', 409);
+            }
+            if (identity.projectRootReal) {
+              let realLog;
+              try {
+                realLog = await realpath(session.logFile);
+              } catch {
+                throw new RequestError('session_log_replaced', 409);
+              }
+              if (!isInsideRoot(identity.projectRootReal, realLog)) {
+                throw new RequestError('session_log_replaced', 409);
+              }
+            }
+            // Read exactly the bytes this server wrote: bytesWritten bounds
+            // the window, so appended-after or truncated content can never
+            // slip in (size was already checked equal above).
+            const buffer = Buffer.alloc(identity.bytesWritten);
+            let offset = 0;
+            while (offset < buffer.length) {
+              const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+              if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
+              offset += bytesRead;
+            }
+            return buffer.toString('utf8');
+          } finally {
+            await handle.close();
+          }
+        });
+        session.appendChain = run;
+        const text = await run;
+        const matched = [];
+        for (const rawLine of text.split('\n')) {
+          if (!rawLine) continue;
+          // Server-written lines always parse (they were JSON.stringify'd at
+          // append time); a parse failure here would mean identity-checked
+          // bytes changed underneath us and surfaces as internal_error.
+          const parsed = JSON.parse(rawLine);
+          const lineType = parsed.type === 'hypothesis' ? 'hypothesis' : 'event';
+          if (typeFilter !== 'all' && lineType !== typeFilter) continue;
+          if (hypothesisFilter !== undefined && parsed.hypothesisId !== hypothesisFilter) continue;
+          if (runFilter !== undefined && parsed.runId !== runFilter) continue;
+          if (sinceTs !== undefined || untilTs !== undefined) {
+            const lineTs = Date.parse(parsed.ts);
+            if (Number.isNaN(lineTs)) continue;
+            if (sinceTs !== undefined && lineTs < sinceTs) continue;
+            if (untilTs !== undefined && lineTs > untilTs) continue;
+          }
+          matched.push(rawLine);
+        }
+        const tail = matched.slice(-limit);
+        response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        response.end(tail.length ? `${tail.join('\n')}\n` : '');
+        return;
+      }
+
       sendJson(response, 404, { error: 'not_found' });
     } catch (error) {
       if (error instanceof RequestError) {

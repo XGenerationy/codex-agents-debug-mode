@@ -4254,3 +4254,152 @@ test('events and hypothesis lines interleave in append order with the type discr
     );
   });
 });
+
+const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/' } = {}) =>
+  new Promise((resolve, reject) => {
+    const url = new URL(pathname, baseUrl);
+    const request = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method,
+        headers,
+      },
+      (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { text += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, text }));
+      },
+    );
+    request.on('error', reject);
+    request.end();
+  });
+
+const LAUNCH_AUTH = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` };
+
+const seedReadableSession = async (baseUrl) => {
+  const session = (await createSession(baseUrl)).body;
+  const log = (body) => requestJson(baseUrl, {
+    method: 'POST',
+    pathname: '/log',
+    body: { sessionId: session.session_id, sessionToken: session.session_token, ...body },
+  });
+  await log({ msg: 'e1', hypothesisId: 'H1', runId: 'r1' });
+  await log({ msg: 'e2', hypothesisId: 'H2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+  await log({ msg: 'e3', runId: 'r2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED' });
+  return session;
+};
+
+test('GET /sessions/:id/logs requires the launch token and serves verbatim NDJSON', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = await seedReadableSession(baseUrl);
+    const noAuth = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs` });
+    assert.equal(noAuth.status, 401);
+    const sessionAuth = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: { Authorization: `Bearer ${session.session_token}` },
+    });
+    assert.equal(sessionAuth.status, 401);
+    const ok = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers['content-type'], 'application/x-ndjson');
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    // Verbatim guarantee: an unfiltered read IS the stored bytes.
+    assert.equal(ok.text, raw);
+    for (const line of ok.text.split('\n').filter(Boolean)) JSON.parse(line);
+  });
+});
+
+test('GET /sessions/:id/logs filters combine and limit is tail-biased', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    const fetchLogs = async (query) => {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 200, query);
+      return res.text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    };
+    assert.deepEqual((await fetchLogs('?type=hypothesis')).map((l) => l.status), ['OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?type=event')).map((l) => l.msg), ['e1', 'e2', 'e3']);
+    assert.deepEqual((await fetchLogs('?hypothesisId=H1')).map((l) => l.msg ?? l.status), ['e1', 'OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?runId=r2')).map((l) => l.msg), ['e3']);
+    assert.deepEqual((await fetchLogs('?type=event&hypothesisId=H1')).map((l) => l.msg), ['e1']);
+    assert.deepEqual((await fetchLogs('?limit=2')).map((l) => l.msg ?? l.status), ['e3', 'CONFIRMED']);
+    const all = await fetchLogs('');
+    const boundary = all[2].ts;
+    const since = await fetchLogs(`?sinceTs=${encodeURIComponent(boundary)}`);
+    assert.equal(since.length >= 3, true);
+    assert.equal(since.every((l) => Date.parse(l.ts) >= Date.parse(boundary)), true);
+    const until = await fetchLogs(`?untilTs=${encodeURIComponent(boundary)}`);
+    assert.equal(until.every((l) => Date.parse(l.ts) <= Date.parse(boundary)), true);
+  });
+});
+
+test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1']) {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 400, query);
+      assert.equal(JSON.parse(res.text).error, 'invalid_query', query);
+    }
+  });
+});
+
+test('GET /sessions/:id/logs is live-only and fail-closed on identity change', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: 5 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: LAUNCH_AUTH });
+    assert.equal(unknown.status, 404);
+    assert.equal(JSON.parse(unknown.text).error, 'unknown_session');
+    const session = (await createSession(baseUrl)).body;
+    // Swap the log file out from under the recorded identity.
+    const logPath = path.join(projectRoot, session.log_file);
+    await rm(logPath);
+    await writeFile(logPath, '{"msg":"forged"}\n');
+    const swapped = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(swapped.status, 409);
+    assert.equal(JSON.parse(swapped.text).error, 'session_log_replaced');
+    // Idle retirement: after the timeout the map entry is gone → 404.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const retired = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(retired.status, 404);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET /sessions/:id/logs output never contains a raw known secret', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'leak supersecretvalue123' },
+    });
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.includes('supersecretvalue123'), false);
+    assert.equal(res.text.includes('[REDACTED]'), true);
+  });
+});
