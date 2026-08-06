@@ -43,8 +43,12 @@ One module owns everything both tools must agree on:
 - **`filterEntries(entries, {hypothesisId, type, sinceTs, untilTs, runId, limit})`** —
   semantics IDENTICAL to the GET route's: `type` `all|event|hypothesis` with "no `type` field
   = event" and unknown future types matching only `all`; inclusive `Date.parse` bounds with
-  NaN-`ts` lines excluded only when a time filter is present; byte-exact `hypothesisId`/
-  `runId` equality (both trimmed at write time by sub-project A); tail-biased `limit`.
+  NaN-`ts` lines excluded only when a time filter is present; `hypothesisId`/`runId`
+  filter values mirror the route's read-side handling — trimmed before comparison (the
+  GET route trims query values; stored values are also trimmed at write time by
+  sub-project A) and fail closed (`invalid_filter:*`) on non-string values; tail-biased
+  `limit` (unclamped — collector-written files cannot exceed the server cap, recorded as
+  a parity-test expectation note).
   A **parity test** runs the same scenario through this function and through a live server's
   GET and asserts identical emitted lines — the single source of truth is enforced, not
   assumed.
@@ -53,7 +57,12 @@ One module owns everything both tools must agree on:
   File order is the tiebreak for same-millisecond lines (guaranteed by the collector's
   append chain).
 - **`listSessions(projectRoot)` / `resolveSessionRef(projectRoot, ref)`** — enumerate
-  `.debug/debug-*.log`; accept a session id or a direct file path.
+  `.debug/debug-*.log`; accept a session id or a direct file path. Bare session ids are
+  validated with the route's own `/^[A-Za-z0-9_-]+$/` pattern before any path
+  construction (`invalid_session_ref` otherwise) — ids may arrive from network
+  responses or config, so traversal is closed here, not in each consumer. A missing
+  `.debug` directory is a normal fresh-repo state: `listSessions` returns `[]` on
+  ENOENT and rethrows anything else.
 - **Live tail = poll-by-count**: re-fetch and emit only entries beyond the count already
   seen. No timestamp cursors, no same-millisecond dedupe hazards. When a watched live
   session retires (GET starts returning 404 `unknown_session`) the caller falls back to the
@@ -107,10 +116,12 @@ One module owns everything both tools must agree on:
 | Live session retires mid-watch | automatic file fallback + visible "no longer live" state |
 | Agent mode without `--session` | usage error, exit 2 (agents must be explicit) |
 | Malformed stored line encountered by the core | fail closed: name the line number, exit 1 (never skip silently) |
+| Bare session id failing `/^[A-Za-z0-9_-]+$/` | `invalid_session_ref` before any path construction (traversal closed in the core) |
 
 ## Testing (no new dependencies; hermetic — explicit `redactionEnv: {}` wherever a server spins)
 
-1. Core filter parity with the live GET route (same seeded scenario → identical lines).
+1. Core filter parity with the live GET route (same seeded scenario → identical lines),
+   including padded filter values — clean fixtures alone cannot detect trim divergence.
 2. Core folding: latest-wins, first-title retention, trimmed join keys, same-ms file-order
    tiebreak, full history preservation.
 3. Poll-by-count tail: no duplicates, no gaps across three poll rounds with interleaved
