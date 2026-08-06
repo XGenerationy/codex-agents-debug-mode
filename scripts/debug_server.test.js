@@ -4358,16 +4358,12 @@ test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail
   });
 });
 
-test('GET /sessions/:id/logs is live-only and fail-closed on identity change', async () => {
-  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
-  const server = createDebugServer({
-    projectRoot,
-    token: TEST_LAUNCH_TOKEN,
-    redactionEnv: {},
-    limits: { sessionIdleTimeoutMs: 5 },
-  });
-  const baseUrl = await listen(server);
-  try {
+// NOTE (plan revision): originally one combined test with sessionIdleTimeoutMs: 5 —
+// that retires the session before the swapped-file GET arrives (404 masks the 409),
+// deterministically on slower environments. Split: swapped-identity runs on a
+// default-idle server; retirement gets its own short-idle server.
+test('GET /sessions/:id/logs rejects unknown sessions and swapped log files fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
     const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: LAUNCH_AUTH });
     assert.equal(unknown.status, 404);
     assert.equal(JSON.parse(unknown.text).error, 'unknown_session');
@@ -4379,10 +4375,24 @@ test('GET /sessions/:id/logs is live-only and fail-closed on identity change', a
     const swapped = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
     assert.equal(swapped.status, 409);
     assert.equal(JSON.parse(swapped.text).error, 'session_log_replaced');
-    // Idle retirement: after the timeout the map entry is gone → 404.
+  });
+});
+
+test('GET /sessions/:id/logs is live-only: retired sessions return 404', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: 5 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
     await new Promise((resolve) => setTimeout(resolve, 25));
     const retired = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
     assert.equal(retired.status, 404);
+    assert.equal(JSON.parse(retired.text).error, 'unknown_session');
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
