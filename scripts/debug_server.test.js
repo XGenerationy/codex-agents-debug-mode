@@ -4189,6 +4189,51 @@ test('hypothesis lines respect the aggregate byte cap', async () => {
   }
 });
 
+test('POST /hypothesis rolls back the event and byte reservation when the append fails', async () => {
+  // Regression guard: a hypothesis reserves eventCount and totalBytes before
+  // the awaited append (debug_server.js). If appendSessionEvent throws AFTER
+  // that reservation, the catch must restore both counters — otherwise the
+  // next hypothesis would be rejected with event_limit_reached even though
+  // nothing was persisted. We force the append to fail by swapping the log
+  // file out from under the recorded identity, then restore a matching log
+  // and prove a subsequent hypothesis succeeds within the same cap.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-rollback-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    // Swap the log so appendSessionEvent fails with session_log_replaced
+    // after the hypothesis reserved eventCount=1 / totalBytes=<lineBytes>.
+    await rm(logPath);
+    await writeFile(logPath, '{"forged":"content"}\n');
+    const failed = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(failed.status, 409);
+    assert.equal(failed.body.error, 'session_log_replaced');
+    // Nothing was persisted by the failed attempt.
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
+    // Restore a log file whose identity the next append will accept: recreate
+    // via a fresh session so the server re-establishes logFileIdentity, then
+    // prove a hypothesis lands within the same single-event cap.
+    const fresh = (await createSession(baseUrl)).body;
+    const ok = await postHypothesis(baseUrl, { sessionId: fresh.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(ok.status, 202);
+    assert.equal(ok.body.status, 'recorded');
+    const lines = await readSessionLines(projectRoot, fresh);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].type, 'hypothesis');
+    assert.equal(lines[0].hypothesisId, 'H1');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('POST /hypothesis rejects unknown sessions', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const unknown = await postHypothesis(baseUrl, {
@@ -4255,9 +4300,10 @@ test('events and hypothesis lines interleave in append order with the type discr
   });
 });
 
-const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/' } = {}) =>
+const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/', timeoutMs = 30000 } = {}) =>
   new Promise((resolve, reject) => {
     const url = new URL(pathname, baseUrl);
+    let settled = false;
     const request = http.request(
       {
         hostname: url.hostname,
@@ -4270,10 +4316,37 @@ const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/' } = 
         let text = '';
         response.setEncoding('utf8');
         response.on('data', (chunk) => { text += chunk; });
-        response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, text }));
+        response.on('end', () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status: response.statusCode, headers: response.headers, text });
+        });
+        // A response stream can error after the headers arrive (e.g. a torn
+        // socket mid-body); without this listener neither resolve nor reject
+        // runs and the test hangs until the runner kills it.
+        response.on('error', (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        });
       },
     );
-    request.on('error', reject);
+    // Wall-clock bound: an unresponsive server or a lost connection must
+    // fail with the timeout error instead of hanging the whole test run.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      request.destroy(new Error(`requestRaw timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    request.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
     request.end();
   });
 
@@ -4436,11 +4509,18 @@ test('concurrent appends never produce torn GET output', async () => {
       }
     }
     await Promise.all(writes);
+    // At least one read must observe an appended entry beyond the single
+    // seeded event-0 line, otherwise the test exercises no interleaving and
+    // passes trivially. Counts the parsed lines on each read body.
+    let observedBeyondSeed = false;
     for (const read of await Promise.all(reads)) {
       assert.equal(read.status, 200);
-      for (const line of read.text.split('\n').filter(Boolean)) JSON.parse(line);
+      const lines = read.text.split('\n').filter(Boolean);
+      for (const line of lines) JSON.parse(line);
       if (read.text.length) assert.equal(read.text.endsWith('\n'), true);
+      if (lines.length > 1) observedBeyondSeed = true;
     }
+    assert.equal(observedBeyondSeed, true);
   });
 });
 

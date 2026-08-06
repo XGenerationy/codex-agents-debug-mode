@@ -629,6 +629,51 @@ const configureOrigin = (request, response, allowedOrigins) => {
 // race each other (a parallel append would otherwise grow the file while a
 // second request still holds a stale identity.bytesWritten and false-positive
 // session_log_replaced).
+
+// Shared log-identity invariant for appendSessionEvent (write path) and the
+// GET /sessions/:id/logs read path. Both open the same session.logFile with
+// no-follow semantics and must reject the SAME replacement shapes with the
+// SAME structured conflict, so a hardening applied to one path can never
+// silently leave the other weaker. The stat is taken on the already-opened
+// handle (the caller is responsible for opening and closing it). Throws
+// RequestError('session_log_replaced', 409) on any mismatch; a null/undefined
+// recorded identity is treated as a replacement (defensive: the field is set
+// at session-mint time, so its absence means the log was never established
+// under our control).
+const verifyLogIdentity = async (session, info) => {
+  const identity = session.logFileIdentity;
+  // dev/ino can survive a delete+recreate through inode reuse, so also
+  // require the recorded birth time (when the filesystem reports one on
+  // both sides) and exactly the byte count this server has appended — a
+  // replacement file starts with different content or an empty size.
+  const sameBirth = !identity?.birthtimeMs || !info.birthtimeMs
+    || info.birthtimeMs === identity.birthtimeMs;
+  // nlink > 1 means the session log was hard-linked to another path after
+  // /session; the token/artifact writers already fail closed on that shape.
+  if (
+    !info.isFile() || !identity
+    || info.nlink > 1
+    || info.dev !== identity.dev || info.ino !== identity.ino
+    || !sameBirth
+    || info.size !== identity.bytesWritten
+  ) {
+    throw new RequestError('session_log_replaced', 409);
+  }
+  // Re-verify the opened log still resolves inside the project even if the
+  // original .debug directory was renamed out and replaced with a symlink
+  // to an outside path (inode can still match the moved tree).
+  if (identity.projectRootReal) {
+    let realLog;
+    try {
+      realLog = await realpath(session.logFile);
+    } catch {
+      throw new RequestError('session_log_replaced', 409);
+    }
+    if (!isInsideRoot(identity.projectRootReal, realLog)) {
+      throw new RequestError('session_log_replaced', 409);
+    }
+  }
+};
 const appendSessionEvent = (session, serializedEvent) => {
   const previous = session.appendChain || Promise.resolve();
   const run = previous.catch(() => {}).then(async () => {
@@ -646,41 +691,9 @@ const appendSessionEvent = (session, serializedEvent) => {
       throw error;
     }
     try {
-      const info = await handle.stat();
-      const identity = session.logFileIdentity;
-      // dev/ino can survive a delete+recreate through inode reuse, so also
-      // require the recorded birth time (when the filesystem reports one on
-      // both sides) and exactly the byte count this server has appended — a
-      // replacement file starts with different content or an empty size.
-      const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
-        || info.birthtimeMs === identity.birthtimeMs;
-      // nlink > 1 means the session log was hard-linked to another path after
-      // /session; the token/artifact writers already fail closed on that shape.
-      if (
-        !info.isFile() || !identity
-        || info.nlink > 1
-        || info.dev !== identity.dev || info.ino !== identity.ino
-        || !sameBirth
-        || info.size !== identity.bytesWritten
-      ) {
-        throw new RequestError('session_log_replaced', 409);
-      }
-      // Re-verify the opened log still resolves inside the project even if the
-      // original .debug directory was renamed out and replaced with a symlink
-      // to an outside path (inode can still match the moved tree).
-      if (identity.projectRootReal) {
-        let realLog;
-        try {
-          realLog = await realpath(session.logFile);
-        } catch {
-          throw new RequestError('session_log_replaced', 409);
-        }
-        if (!isInsideRoot(identity.projectRootReal, realLog)) {
-          throw new RequestError('session_log_replaced', 409);
-        }
-      }
+      await verifyLogIdentity(session, await handle.stat());
       await handle.writeFile(serializedEvent, 'utf8');
-      identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+      session.logFileIdentity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
     } finally {
       await handle.close();
     }
@@ -1404,11 +1417,16 @@ const createDebugServer = ({
           // hypothesisId and runId are the join keys that POST /hypothesis
           // lines and sub-project B's filters/diff match on byte-exactly;
           // trim string values here and in /hypothesis so "  H1  " and "H1"
-          // cannot silently become distinct hypotheses. 'type' is
-          // deliberately absent from this allowlist: adding it would let
-          // the instrumented app forge hypothesis lines (see the POST
-          // /hypothesis capability split).
-          event[key] = (key === 'hypothesisId' || key === 'runId') && typeof payload[key] === 'string'
+          // cannot silently become distinct hypotheses. A non-string value
+          // (e.g. hypothesisId: 42 or runId: {}) can never join with a
+          // hypothesis line and is silently invisible to GET ?hypothesisId=42
+          // (the query string is compared with !== against the stored value),
+          // so reject it with the same structured code /hypothesis uses —
+          // silently persisting it would be fail-open by another name.
+          if ((key === 'hypothesisId' || key === 'runId') && typeof payload[key] !== 'string') {
+            throw new RequestError('invalid_join_key');
+          }
+          event[key] = (key === 'hypothesisId' || key === 'runId')
             ? payload[key].trim()
             : payload[key];
         }
@@ -1565,16 +1583,18 @@ const createDebugServer = ({
         }
         const hypothesisFilter = query.get('hypothesisId') ?? undefined;
         const runFilter = query.get('runId') ?? undefined;
-        // Serialize the read on the same per-session chain as appends: no
-        // append can interleave mid-read, so the identity check and the byte
-        // window are consistent and a torn trailing line cannot be observed.
-        // The identity discipline mirrors appendSessionEvent exactly.
+        // Serialize ONLY the identity check + bounded byte read on the
+        // per-session append chain: no append can interleave mid-read, so the
+        // identity check and the byte window are consistent and a torn
+        // trailing line cannot be observed. The chain is released (and the
+        // file handle closed) BEFORE the response is parsed/filtered, so
+        // concurrent /log and POST /hypothesis appends are not blocked while
+        // we scan the captured text. Parsing/filtering operate on a frozen
+        // snapshot: the bytes were identity-checked and read under the chain,
+        // so a concurrent append can only add a NEW line that this snapshot
+        // predates — it cannot mutate already-captured bytes.
         const previous = session.appendChain || Promise.resolve();
-        // The chain must resolve to undefined (parity with appendSessionEvent):
-        // resolving to the log text would leave session.appendChain retaining
-        // the whole response body until the next append replaces it.
-        let text;
-        const run = previous.catch(() => {}).then(async () => {
+        const readSnapshot = previous.catch(() => {}).then(async () => {
           let handle;
           try {
             handle = await openNoFollow(session.logFile, constants.O_RDONLY);
@@ -1585,49 +1605,37 @@ const createDebugServer = ({
             throw error;
           }
           try {
-            const info = await handle.stat();
-            const identity = session.logFileIdentity;
-            const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
-              || info.birthtimeMs === identity.birthtimeMs;
-            if (
-              !info.isFile() || !identity
-              || info.nlink > 1
-              || info.dev !== identity.dev || info.ino !== identity.ino
-              || !sameBirth
-              || info.size !== identity.bytesWritten
-            ) {
-              throw new RequestError('session_log_replaced', 409);
-            }
-            if (identity.projectRootReal) {
-              let realLog;
-              try {
-                realLog = await realpath(session.logFile);
-              } catch {
-                throw new RequestError('session_log_replaced', 409);
-              }
-              if (!isInsideRoot(identity.projectRootReal, realLog)) {
-                throw new RequestError('session_log_replaced', 409);
-              }
-            }
+            await verifyLogIdentity(session, await handle.stat());
             // Read exactly the bytes this server wrote: bytesWritten bounds
             // the window, so appended-after or truncated content can never
-            // slip in (size was already checked equal above).
-            const buffer = Buffer.alloc(identity.bytesWritten);
+            // slip in (size was already checked equal inside verifyLogIdentity).
+            const buffer = Buffer.alloc(session.logFileIdentity.bytesWritten);
             let offset = 0;
             while (offset < buffer.length) {
               const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
               if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
               offset += bytesRead;
             }
-            text = buffer.toString('utf8');
+            // The chain must resolve to undefined (parity with
+            // appendSessionEvent): returning the buffer here would leave
+            // session.appendChain retaining the whole response body until the
+            // next append replaces it.
+            return buffer.toString('utf8');
           } finally {
             await handle.close();
           }
         });
-        session.appendChain = run;
-        await run;
-        const matched = [];
-        for (const rawLine of text.split('\n')) {
+        session.appendChain = readSnapshot;
+        const text = await readSnapshot;
+        // Scan the snapshot tail-first: only the last `limit` matching lines
+        // are kept, so ?limit=1 parses one line instead of walking the whole
+        // (up to maxTotalBytes) log. The output is reversed back into append
+        // order at the end.
+        const tail = [];
+        for (let end = text.length, start = text.lastIndexOf('\n', end - 1);
+          start >= -1 && tail.length < limit;
+          end = start, start = start === -1 ? -2 : text.lastIndexOf('\n', start - 1)) {
+          const rawLine = start === -1 ? text.slice(0, end) : text.slice(start + 1, end);
           if (!rawLine) continue;
           // Server-written lines always parse (they were JSON.stringify'd at
           // append time); a parse failure here would mean identity-checked
@@ -1645,11 +1653,11 @@ const createDebugServer = ({
             if (sinceTs !== undefined && lineTs < sinceTs) continue;
             if (untilTs !== undefined && lineTs > untilTs) continue;
           }
-          matched.push(rawLine);
+          tail.push(rawLine);
         }
-        const tail = matched.slice(-limit);
+        const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
         response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
-        response.end(tail.length ? `${tail.join('\n')}\n` : '');
+        response.end(body);
         return;
       }
 
