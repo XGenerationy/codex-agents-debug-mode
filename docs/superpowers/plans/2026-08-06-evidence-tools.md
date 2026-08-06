@@ -566,6 +566,39 @@ test('readSessionLive rejects live_read_timeout when the collector never respond
   }
 });
 
+test('readSessionLive rejects live_read_interrupted when the connection dies mid-body', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Length': '4096' });
+    response.write('{"ts":"2026-08-06T10:00:00.000Z","msg":"partial"}\n');
+    // Destroy the socket mid-body: the client must surface a structured
+    // live_read_* code, never a raw 'aborted'/ECONNRESET.
+    setTimeout(() => response.destroy(), 10);
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'interrupt-session-1' }),
+      /live_read_interrupted/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('createSessionTail forwards timeoutMs to each poll', async () => {
+  const server = http.createServer(() => {
+    // Never respond: without forwarding, the tail would use the 5s default
+    // and this test would exceed its own runtime budget.
+  });
+  const port = await listen(server);
+  try {
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: 'hang-session-2', timeoutMs: 50 });
+    await assert.rejects(() => tail.poll(), /live_read_timeout/);
+  } finally {
+    await close(server);
+  }
+});
+
 test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
   await assert.rejects(
     () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
@@ -719,7 +752,10 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
     let text = '';
     response.setEncoding('utf8');
     response.on('data', (chunk) => { text += chunk; });
-    response.on('error', reject);
+    // A connection that dies mid-body must carry a structured code like
+    // every other failure path here — callers match /^live_read_/, and a
+    // raw 'aborted'/ECONNRESET would slip past that discipline.
+    response.on('error', () => reject(new Error('live_read_interrupted')));
     response.on('end', () => {
       if (response.statusCode === 200) {
         try {
@@ -755,11 +791,11 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
 // on session size and now by readSessionLive's timeoutMs on any single
 // poll. Task 3/4 choose their poll interval knowing this cost rather than
 // polling aggressively.
-const createSessionTail = ({ port, token, sessionId }) => {
+const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
   let seen = 0;
   return {
     async poll() {
-      const entries = await readSessionLive({ port, token, sessionId });
+      const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
       const fresh = entries.slice(seen);
       seen = entries.length;
       return fresh;
@@ -804,7 +840,7 @@ Extend `module.exports` with `createSessionTail`, `discoverCollector`, `readSess
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 25/25 pass (15 from Task 1 + 10 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
+Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 27/27 pass (15 from Task 1 + 12 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
 
 - [ ] **Step 5: Commit**
 

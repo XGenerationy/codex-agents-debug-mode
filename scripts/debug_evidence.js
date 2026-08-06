@@ -237,7 +237,10 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
     let text = '';
     response.setEncoding('utf8');
     response.on('data', (chunk) => { text += chunk; });
-    response.on('error', reject);
+    // A connection that dies mid-body must carry a structured code like
+    // every other failure path here — callers match /^live_read_/, and a
+    // raw 'aborted'/ECONNRESET would slip past that discipline.
+    response.on('error', () => reject(new Error('live_read_interrupted')));
     response.on('end', () => {
       if (response.statusCode === 200) {
         try {
@@ -273,11 +276,11 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
 // on session size and now by readSessionLive's timeoutMs on any single
 // poll. Task 3/4 choose their poll interval knowing this cost rather than
 // polling aggressively.
-const createSessionTail = ({ port, token, sessionId }) => {
+const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
   let seen = 0;
   return {
     async poll() {
-      const entries = await readSessionLive({ port, token, sessionId });
+      const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
       const fresh = entries.slice(seen);
       seen = entries.length;
       return fresh;

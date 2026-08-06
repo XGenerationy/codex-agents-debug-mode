@@ -312,6 +312,39 @@ test('readSessionLive rejects live_read_timeout when the collector never respond
   }
 });
 
+test('readSessionLive rejects live_read_interrupted when the connection dies mid-body', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Length': '4096' });
+    response.write('{"ts":"2026-08-06T10:00:00.000Z","msg":"partial"}\n');
+    // Destroy the socket mid-body: the client must surface a structured
+    // live_read_* code, never a raw 'aborted'/ECONNRESET.
+    setTimeout(() => response.destroy(), 10);
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'interrupt-session-1' }),
+      /live_read_interrupted/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('createSessionTail forwards timeoutMs to each poll', async () => {
+  const server = http.createServer(() => {
+    // Never respond: without forwarding, the tail would use the 5s default
+    // and this test would exceed its own runtime budget.
+  });
+  const port = await listen(server);
+  try {
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: 'hang-session-2', timeoutMs: 50 });
+    await assert.rejects(() => tail.poll(), /live_read_timeout/);
+  } finally {
+    await close(server);
+  }
+});
+
 test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
   await assert.rejects(
     () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
