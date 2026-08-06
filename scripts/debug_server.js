@@ -1581,8 +1581,8 @@ const createDebugServer = ({
           if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1) throw new RequestError('invalid_query');
           limit = Math.min(Number(rawLimit), effectiveLimits.maxEventsPerSession);
         }
-        const hypothesisFilter = query.get('hypothesisId') ?? undefined;
-        const runFilter = query.get('runId') ?? undefined;
+        const hypothesisFilter = query.get('hypothesisId')?.trim() ?? undefined;
+        const runFilter = query.get('runId')?.trim() ?? undefined;
         // Serialize ONLY the identity check + bounded byte read on the
         // per-session append chain: no append can interleave mid-read, so the
         // identity check and the byte window are consistent and a torn
@@ -1616,16 +1616,19 @@ const createDebugServer = ({
               if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
               offset += bytesRead;
             }
-            // The chain must resolve to undefined (parity with
-            // appendSessionEvent): returning the buffer here would leave
-            // session.appendChain retaining the whole response body until the
-            // next append replaces it.
             return buffer.toString('utf8');
           } finally {
             await handle.close();
           }
         });
-        session.appendChain = readSnapshot;
+        // The chain stored on session.appendChain MUST resolve to undefined
+        // (parity with appendSessionEvent): assigning readSnapshot directly
+        // would leave session.appendChain holding the whole decoded log text
+        // until the next append replaces it — up to maxTotalBytes retained
+        // for an idle read-then-sleep session. The caller still awaits
+        // readSnapshot for the text; the chain keeps only the serialization
+        // guarantee, not the payload.
+        session.appendChain = readSnapshot.then(() => undefined, () => undefined);
         const text = await readSnapshot;
         // Scan the snapshot tail-first: only the last `limit` matching lines
         // are kept, so ?limit=1 parses one line instead of walking the whole

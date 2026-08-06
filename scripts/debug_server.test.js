@@ -4190,44 +4190,44 @@ test('hypothesis lines respect the aggregate byte cap', async () => {
 });
 
 test('POST /hypothesis rolls back the event and byte reservation when the append fails', async () => {
-  // Regression guard: a hypothesis reserves eventCount and totalBytes before
+  // Regression guard: a hypothesis reserves eventCount and totalBytes BEFORE
   // the awaited append (debug_server.js). If appendSessionEvent throws AFTER
-  // that reservation, the catch must restore both counters — otherwise the
-  // next hypothesis would be rejected with event_limit_reached even though
-  // nothing was persisted. We force the append to fail by swapping the log
-  // file out from under the recorded identity, then restore a matching log
-  // and prove a subsequent hypothesis succeeds within the same cap.
+  // that reservation, the catch must restore both counters. We make this
+  // ASSERTION FAIL if the rollback is deleted: both caps are sized for
+  // exactly one hypothesis line, and we retry on the SAME (failed) session.
+  // If the event rollback is missing, session.eventCount stays at 1 and the
+  // cap check runs BEFORE the next append → 429 event_limit_reached (not the
+  // expected 409). If the byte rollback is missing, totalBytes stays
+  // reserved → 429 storage_limit_reached. Either way a missing rollback
+  // changes the second response away from 409 session_log_replaced.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-rollback-'));
   const server = createDebugServer({
     projectRoot,
     token: TEST_LAUNCH_TOKEN,
     redactionEnv: {},
-    limits: { maxEventsPerSession: 1 },
+    limits: { maxEventsPerSession: 1, maxTotalBytes: 512 },
   });
   const baseUrl = await listen(server);
   try {
     const session = (await createSession(baseUrl)).body;
     const logPath = path.join(projectRoot, session.log_file);
     // Swap the log so appendSessionEvent fails with session_log_replaced
-    // after the hypothesis reserved eventCount=1 / totalBytes=<lineBytes>.
+    // AFTER the hypothesis reserved eventCount=1 / totalBytes=<lineBytes>.
     await rm(logPath);
     await writeFile(logPath, '{"forged":"content"}\n');
     const failed = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
     assert.equal(failed.status, 409);
     assert.equal(failed.body.error, 'session_log_replaced');
-    // Nothing was persisted by the failed attempt.
     assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
-    // Restore a log file whose identity the next append will accept: recreate
-    // via a fresh session so the server re-establishes logFileIdentity, then
-    // prove a hypothesis lands within the same single-event cap.
-    const fresh = (await createSession(baseUrl)).body;
-    const ok = await postHypothesis(baseUrl, { sessionId: fresh.session_id, hypothesisId: 'H1', status: 'OPEN' });
-    assert.equal(ok.status, 202);
-    assert.equal(ok.body.status, 'recorded');
-    const lines = await readSessionLines(projectRoot, fresh);
-    assert.equal(lines.length, 1);
-    assert.equal(lines[0].type, 'hypothesis');
-    assert.equal(lines[0].hypothesisId, 'H1');
+    // Discriminator: against the SAME session, with both caps sized for one
+    // line, a leaked reservation surfaces as 429 here. A correctly rolled-
+    // back reservation passes the caps and hits the same swapped-log failure
+    // → 409 session_log_replaced.
+    const retry = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(retry.status, 409);
+    assert.equal(retry.body.error, 'session_log_replaced');
+    // Nothing was persisted by either failed attempt.
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
@@ -4335,10 +4335,16 @@ const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/', tim
     );
     // Wall-clock bound: an unresponsive server or a lost connection must
     // fail with the timeout error instead of hanging the whole test run.
+    // Reject DIRECTLY from the timer: request.destroy(error) emits 'error'
+    // synchronously, and the error handler below guards on `settled`, so if
+    // we set settled=true before destroying, nobody would reject and the
+    // promise would hang — the exact failure this timer prevents.
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      request.destroy(new Error(`requestRaw timeout after ${timeoutMs}ms`));
+      const error = new Error(`requestRaw timeout after ${timeoutMs}ms`);
+      request.destroy(error);
+      reject(error);
     }, timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
     request.on('error', (error) => {
@@ -4500,9 +4506,18 @@ test('concurrent appends never produce torn GET output', async () => {
       },
     });
     await log(0);
+    // Determinism: await a small batch of appends BEFORE issuing any read so
+    // at least one append is provably ahead of every read. The remaining
+    // appends are then issued concurrently with the reads, which still
+    // exercises real interleaving — but the outcome no longer depends on
+    // microtask-enqueue order (which could otherwise let every read land
+    // before the first append and observe only the seeded line).
+    for (let i = 1; i <= 5; i += 1) {
+      await log(i);
+    }
     const writes = [];
     const reads = [];
-    for (let i = 1; i <= 30; i += 1) {
+    for (let i = 6; i <= 30; i += 1) {
       writes.push(log(i));
       if (i % 3 === 0) {
         reads.push(requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH }));
