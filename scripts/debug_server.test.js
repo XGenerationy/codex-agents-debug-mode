@@ -4050,3 +4050,153 @@ test('parseRedactNames splits, trims, and drops empty entries', () => {
   assert.deepEqual(parseRedactNames(undefined), []);
   assert.deepEqual(parseRedactNames(''), []);
 });
+
+const postHypothesis = (baseUrl, body, headers = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` }) =>
+  requestJson(baseUrl, { method: 'POST', pathname: '/hypothesis', headers, body });
+
+test('POST /hypothesis appends a redacted, allowlisted, server-stamped line', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, {
+      sessionId: session.session_id,
+      hypothesisId: 'H1',
+      status: 'OPEN',
+      title: 'token supersecretvalue123 leaks',
+      note: 'seen in supersecretvalue123 header',
+      runId: 'r1',
+      extraneous: 'dropped',
+      ts: 'client-supplied-ignored',
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(response.body, { status: 'recorded' });
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(line.type, 'hypothesis');
+    assert.equal(line.hypothesisId, 'H1');
+    assert.equal(line.status, 'OPEN');
+    assert.equal(line.title, 'token [REDACTED] leaks');
+    assert.equal(line.note, 'seen in [REDACTED] header');
+    assert.equal(line.runId, 'r1');
+    assert.equal(Object.hasOwn(line, 'extraneous'), false);
+    assert.equal(Number.isNaN(Date.parse(line.ts)), false);
+    assert.notEqual(line.ts, 'client-supplied-ignored');
+  });
+});
+
+test('POST /hypothesis lifecycle appends event-sourced status lines in order', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await postHypothesis(baseUrl, { session_id: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED', note: 'later' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((entry) => [entry.type, entry.hypothesisId, entry.status]), [
+      ['hypothesis', 'H1', 'OPEN'],
+      ['hypothesis', 'H1', 'CONFIRMED'],
+    ]);
+  });
+});
+
+test('POST /hypothesis validates fields fail-closed with nothing persisted', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const cases = [
+      [{ sessionId: session.session_id, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '   ', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 42, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'MAYBE' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'open' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', title: 42 }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', note: {} }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: [] }, 'invalid_hypothesis_field'],
+    ];
+    for (const [body, code] of cases) {
+      const response = await postHypothesis(baseUrl, body);
+      assert.equal(response.status, 400, code);
+      assert.equal(response.body.error, code);
+    }
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('POST /hypothesis enforces the launch-token capability split both ways', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const withSessionToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      { Authorization: `Bearer ${session.session_token}` },
+    );
+    assert.equal(withSessionToken.status, 401);
+    const withNoToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      {},
+    );
+    assert.equal(withNoToken.status, 401);
+    // /log stays session-token-only: the launch token must NOT write events.
+    const launchOnLog = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: TEST_LAUNCH_TOKEN, msg: 'nope' },
+    });
+    assert.equal(launchOnLog.status, 401);
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('hypothesis lines consume the shared event and byte caps', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const first = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(first.status, 202);
+    const second = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H2', status: 'OPEN' });
+    assert.equal(second.status, 429);
+    assert.equal(second.body.error, 'event_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('hypothesis lines respect the aggregate byte cap', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxTotalBytes: 10 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(response.status, 429);
+    assert.equal(response.body.error, 'storage_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /hypothesis rejects unknown sessions', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const unknown = await postHypothesis(baseUrl, {
+      sessionId: 'debug-nope-000000000000',
+      hypothesisId: 'H1',
+      status: 'OPEN',
+    });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error, 'unknown_session');
+  });
+});

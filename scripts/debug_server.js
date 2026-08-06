@@ -909,6 +909,12 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
   };
 };
 
+// Valid hypothesis lifecycle statuses (spec:
+// docs/superpowers/specs/2026-08-06-hypothesis-endpoint-design.md). Any
+// status may follow any status — the append-only log preserves the audit
+// trail; only the vocabulary is fixed.
+const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUSIVE']);
+
 /**
  * Build (but do not start) the loopback-only debug-session HTTP collector.
  * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
@@ -1414,6 +1420,75 @@ const createDebugServer = ({
         } catch (error) {
           session.eventCount -= 1;
           totalBytes -= eventBytes;
+          throw error;
+        }
+        sendJson(response, 202, { status: 'recorded' });
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/hypothesis') {
+        // Hypotheses are agent/operator artifacts: they authenticate with the
+        // LAUNCH token (the capability the operator already holds via
+        // .debug/collector_token), never the per-session token — the
+        // instrumented app keeps exactly one write capability: /log events.
+        // Auth precedes the body read, like /session.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
+        const sessionId = payload.sessionId || payload.session_id;
+        const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        if (typeof payload.hypothesisId !== 'string' || payload.hypothesisId.trim() === '') {
+          throw new RequestError('invalid_hypothesis_id');
+        }
+        if (!HYPOTHESIS_STATUSES.has(payload.status)) {
+          throw new RequestError('invalid_hypothesis_status');
+        }
+        // Optional fields must be strings when present: silently dropping or
+        // coercing a non-string would hide caller bugs (fail-open by another
+        // name), so reject with a structured code instead.
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined && typeof payload[key] !== 'string') {
+            throw new RequestError('invalid_hypothesis_field');
+          }
+        }
+        // Same refresh point as /log: after auth and validation, before the
+        // awaited append, so concurrent retirement cannot race a valid write.
+        session.lastActivityAt = Date.now();
+        if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
+          throw new RequestError('event_limit_reached', 429);
+        }
+        // Server-stamped, allowlisted assembly mirrors /log: ts and type are
+        // never client-controlled, and only known optional fields are copied.
+        const line = {
+          ts: new Date().toISOString(),
+          type: 'hypothesis',
+          hypothesisId: payload.hypothesisId,
+          status: payload.status,
+        };
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined) line[key] = payload[key];
+        }
+        const redactedLine = redactEventForAppend(line, redaction.replacements());
+        const serializedLine = `${JSON.stringify(redactedLine)}\n`;
+        const lineBytes = Buffer.byteLength(serializedLine);
+        if (totalBytes + lineBytes > effectiveLimits.maxTotalBytes) {
+          throw new RequestError('storage_limit_reached', 429);
+        }
+        session.eventCount += 1;
+        totalBytes += lineBytes;
+        try {
+          await appendSessionEvent(session, serializedLine);
+        } catch (error) {
+          session.eventCount -= 1;
+          totalBytes -= lineBytes;
           throw error;
         }
         sendJson(response, 202, { status: 'recorded' });
