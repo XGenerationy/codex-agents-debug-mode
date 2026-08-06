@@ -99,8 +99,9 @@ Rejected alternatives:
    drop a concurrent session's token). Tokens of retired/expired sessions stay registered for
    the process lifetime — deliberate, so a stale token appearing in a later event body still
    redacts. The registry is capped at 512 registered tokens per process — the launch token
-   plus up to 511 session mints; when the cap is reached, further session mints fail closed
-   rather than degrade redaction or rebuild cost.
+   plus up to 511 successful session mints (a mint that fails setup registers nothing); when
+   the cap is reached, further session mints fail closed rather than degrade redaction or
+   rebuild cost.
 3. **Per event (`/log` handler):** between event construction (the allowlisted
    `{ts, msg, data, hypothesisId, loc, runId}` assembly) and `JSON.stringify`, apply
    `redactEventValue(event)`:
@@ -137,7 +138,7 @@ Rejected alternatives:
    (including cross-session: session A's log never contains session B's token).
 4. Short (<8 chars) auto-discovered value → **not** redacted; the same value under a
    `DEBUG_REDACT_NAMES` name → redacted.
-5. Hostile deep nesting over HTTP → `500` (`log_redaction_failed`, or `internal_error` where the serializer's recursion limit trips first), log file byte-identical, session healthy afterward; plus a unit test pinning the exact `log_redaction_failed` mapping.
+5. Hostile deep nesting over HTTP → `500 log_redaction_failed` (deterministic since the `REDACTION_MAX_DEPTH` bound), log file byte-identical, session healthy afterward; plus a unit test pinning the exact mapping and a boundary test at the depth bound.
 6. Non-string leaves (numbers, booleans, null) pass through unchanged.
 7. Key-collision disambiguation produces `[REDACTED]` / `[REDACTED]#2`.
 8. Full existing suite green: secret-free events are byte-identical to today's output.

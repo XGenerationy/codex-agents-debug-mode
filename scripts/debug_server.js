@@ -919,14 +919,16 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * Build (but do not start) the loopback-only debug-session HTTP collector.
  * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
  * header must match) before any route logic runs. Routes: `GET /health`
- * (unauthenticated identity probe), `POST /session` (requires the launch
- * `token`, creates a session and its append-only NDJSON log under
- * `<projectRoot>/.debug`), `POST /log` (requires that session's own token —
- * see authorizeRequest — and appends one event line after fail-closed
- * known-secret redaction; see createRedactionContext), `POST /hypothesis`
- * (launch token; appends one hypothesis lifecycle line through the same
- * redaction and append path), and `GET /sessions/:id/logs` (launch token;
- * filtered verbatim NDJSON read of a live session's log).
+ * (unauthenticated identity probe), `GET /auth` (unauthenticated
+ * challenge–response HMAC proof used internally for relaunch/port-conflict
+ * detection; not part of the client-facing protocol), `POST /session`
+ * (requires the launch `token`, creates a session and its append-only NDJSON
+ * log under `<projectRoot>/.debug`), `POST /log` (requires that session's
+ * own token — see authorizeRequest — and appends one event line after
+ * fail-closed known-secret redaction; see createRedactionContext),
+ * `POST /hypothesis` (launch token; appends one hypothesis lifecycle line
+ * through the same redaction and append path), and `GET /sessions/:id/logs`
+ * (launch token; filtered verbatim NDJSON read of a live session's log).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE

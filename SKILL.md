@@ -240,6 +240,10 @@ exact application origin before launch; unspecified browser origins are rejected
 - POST `/session` with bearer launch token and `{"name": "description"}` → creates session,
   returns an opaque ID, per-session token, and repository-relative log path
 - POST `/log` with `sessionId`, `sessionToken`, and `msg` → writes a bounded event
+- POST `/hypothesis` with bearer launch token, `hypothesisId`, and `status` → appends a
+  status line (`OPEN`/`CONFIRMED`/`REJECTED`/`INCONCLUSIVE`)
+- GET `/sessions/:id/logs` with bearer launch token → filtered NDJSON read of a live
+  session's log (filters: `hypothesisId`/`type`/`sinceTs`/`untilTs`/`runId`/`limit`)
 
 If port 8787 is busy, query `/health` and inspect the owning PID/process. Treat an unrelated
 listener, a collector whose launch token is unavailable, or uncertain ownership as `BLOCKED`.
