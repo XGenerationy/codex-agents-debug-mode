@@ -2156,8 +2156,20 @@ node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT"
 node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT" --format=md
 ```
 
-The diff reports recorded verdict transitions and deterministic deltas (event counts,
-disappeared messages) only — it never classifies severity or infers failures.
+Guarantees both tools keep (enforced by tests):
+
+- Agent-mode viewer output is byte-verbatim stored NDJSON; `--live` reads the running
+  collector (bare session ids only — `.log` paths are file-mode) with filter semantics
+  test-guaranteed identical to `GET /sessions/:id/logs`.
+- The diff reports recorded verdict transitions and deterministic deltas (event counts,
+  disappeared messages) only — it never classifies severity or infers failures.
+  `disappeared` is an exact-string set difference, capped at 20 per hypothesis with the
+  remainder counted in `disappearedTruncated`; untagged events are their own bucket,
+  never merged into a hypothesis.
+- `schema: 1` JSON is the agent contract; table and markdown are human surfaces. Rendered
+  `msg`/`note` text is escaped, so report structure always reflects the engine, never log
+  content; malformed (non-string) hypothesis ids are excluded, counted in
+  `summary.ignoredMalformedIds`, and stated in human output.
 ```
 
 - [ ] **Step 2: README — tools blurb**
@@ -2171,7 +2183,10 @@ In README, after the "Debug collector trust model" section's final paragraph, ad
 piped) and `scripts/debug_diff.js` (per-hypothesis before/after report; TTY-aware default —
 table interactively, versioned `schema: 1` JSON when piped; `--format=md` for PR comments)
 consume session logs through the shared `scripts/debug_evidence.js` core, whose filter
-semantics are test-guaranteed identical to `GET /sessions/:id/logs`.
+semantics are test-guaranteed identical to `GET /sessions/:id/logs`. The diff never
+classifies severity or infers failures — recorded verdicts and deterministic deltas only —
+and rendered log text is escaped in the human formats, so report structure reflects the
+engine, never log content.
 ```
 
 - [ ] **Step 3: Validate and commit**
