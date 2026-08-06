@@ -3953,8 +3953,13 @@ test('a stderr write failure cannot break an otherwise-successful /session mint'
     for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
     // Replace stderr.write with a function that throws, simulating a broken
     // stream, for the 4th mint that registers the 5th token (>= threshold).
+    // Count invocations so the test cannot pass if the headroom signal ever
+    // stops firing on this mint (a threshold/constant change would otherwise
+    // leave the 201 assertion true but exercising nothing).
     const originalWrite = process.stderr.write;
-    process.stderr.write = () => {
+    let writeAttempts = 0;
+    process.stderr.write = (_chunk, _cb) => {
+      writeAttempts += 1;
       throw new Error('simulated broken stderr (EPIPE)');
     };
     let mintStatus;
@@ -3966,6 +3971,9 @@ test('a stderr write failure cannot break an otherwise-successful /session mint'
     }
     // The mint must succeed despite the stderr write throwing.
     assert.equal(mintStatus, 201);
+    // Pin that the throwing write actually ran; otherwise this test passes
+    // even when the headroom signal never fires.
+    assert.equal(writeAttempts >= 1, true, 'the stderr write must have been attempted');
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });

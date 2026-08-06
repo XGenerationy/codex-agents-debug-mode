@@ -983,9 +983,23 @@ const createDebugServer = ({
   // flag is set BEFORE the write and the write is guarded. "Attempted once"
   // semantics (rather than "written once") keep a permanently-broken stderr
   // from retrying on every subsequent mint.
+  // process.stderr.write can fail two ways: a synchronous throw (destroyed
+  // stream) and an asynchronous 'error' event (EPIPE on a piped stderr that
+  // surfaces after the write returns). With no 'error' listener, the async
+  // kind would crash the process as an uncaughtException. Attach a no-op
+  // 'error' listener once so either failure mode is absorbed, and use the
+  // write callback as a second net so a callback-reported error never throws.
+  let stderrErrorListenerAttached = false;
   const writeStderrBestEffort = (line) => {
+    if (!stderrErrorListenerAttached) {
+      stderrErrorListenerAttached = true;
+      // No-op listener: swallows async stream errors (EPIPE, etc.) so they
+      // never become uncaughtException. Re-added only on the first call, so
+      // adding is idempotent across the process lifetime.
+      process.stderr.on('error', () => {});
+    }
     try {
-      process.stderr.write(line);
+      process.stderr.write(line, () => {});
     } catch {
       // Observability only; never propagate a stream failure into /session.
     }
