@@ -712,24 +712,36 @@ const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // supplied mixed replacements, this fast path is bypassed for the per-needle
 // reduce path that honors each pair individually.
 const combinedScannerCache = new WeakMap();
+// Sentinel cached for a replacements list that cannot use a combined scanner
+// (empty, or mixed replacement values): distinguishes "cached as not eligible"
+// from "not yet cached" (undefined), so the uniformity scan never repeats.
+const NO_COMBINED_SCANNER = Symbol('no-combined-scanner');
 const getCombinedScanner = (replacements) => {
   if (replacements.length === 0) return null;
+  // Cache lookup FIRST: applyReplacements runs once per string/key on every
+  // /log event, so the uniformity scan must not repeat O(#needles) work once
+  // the combined regex is built. The cache is keyed by the replacements array
+  // reference (rebuilt only on registerToken), so a hit is a single WeakMap
+  // lookup with no per-needle iteration.
+  const cached = combinedScannerCache.get(replacements);
+  if (cached) return cached === NO_COMBINED_SCANNER ? null : cached;
   // All production needles map to '[REDACTED]'; mixed replacements would make
-  // a single replacement ambiguous, so fall back to the per-needle path.
+  // a single replacement ambiguous, so fall back to the per-needle path. This
+  // uniformity scan runs at most once per replacements list (then cached).
   const firstReplacement = replacements[0][1];
-  if (!replacements.every(([, replacement]) => replacement === firstReplacement)) return null;
-  let scanner = combinedScannerCache.get(replacements);
-  if (!scanner) {
-    // Pre-sorted longest-first by buildSecretReplacements; re-sort defensively
-    // so a caller-built list cannot break the longest-match-first guarantee.
-    const pattern = replacements
-      .map(([needle]) => needle)
-      .sort((left, right) => right.length - left.length)
-      .map(escapeRegExp)
-      .join('|');
-    scanner = { replacement: firstReplacement, regex: new RegExp(pattern, 'g') };
-    combinedScannerCache.set(replacements, scanner);
+  if (!replacements.every(([, replacement]) => replacement === firstReplacement)) {
+    combinedScannerCache.set(replacements, NO_COMBINED_SCANNER);
+    return null;
   }
+  // Pre-sorted longest-first by buildSecretReplacements; re-sort defensively
+  // so a caller-built list cannot break the longest-match-first guarantee.
+  const pattern = replacements
+    .map(([needle]) => needle)
+    .sort((left, right) => right.length - left.length)
+    .map(escapeRegExp)
+    .join('|');
+  const scanner = { replacement: firstReplacement, regex: new RegExp(pattern, 'g') };
+  combinedScannerCache.set(replacements, scanner);
   return scanner;
 };
 
@@ -965,12 +977,24 @@ const createDebugServer = ({
   // One structured line on FIRST cap exhaustion only: the terminal state is
   // otherwise invisible on the collector side (RequestError responses skip
   // the request.failed stderr line). Event name only — no captured data —
-  // matching the file's opaque-error policy.
+  // matching the file's opaque-error policy. The write is best-effort: a
+  // broken/closed stderr (EPIPE, destroyed stream) must never turn an
+  // otherwise-successful /session mint into an error response, so the signal
+  // flag is set BEFORE the write and the write is guarded. "Attempted once"
+  // semantics (rather than "written once") keep a permanently-broken stderr
+  // from retrying on every subsequent mint.
+  const writeStderrBestEffort = (line) => {
+    try {
+      process.stderr.write(line);
+    } catch {
+      // Observability only; never propagate a stream failure into /session.
+    }
+  };
   let redactionRegistryFullSignaled = false;
   const signalRegistryFull = () => {
     if (redactionRegistryFullSignaled) return;
     redactionRegistryFullSignaled = true;
-    process.stderr.write('{"level":"error","event":"redaction.registry_full"}\n');
+    writeStderrBestEffort('{"level":"error","event":"redaction.registry_full"}\n');
   };
   // One structured warning the FIRST time the registry crosses 80% of the
   // lifetime cap, so an operator can restart the collector before mints start
@@ -978,7 +1002,8 @@ const createDebugServer = ({
   // their tokens registered by design). Emitted from checkRegistryHeadroom()
   // right after every successful registerToken. Cardinality only — no token
   // values — matching the opaque-error policy. 80% bounds headroom for the
-  // remaining 20% of slots at the configured cap (e.g. ~410 of 512).
+  // remaining 20% of slots at the configured cap (e.g. ~410 of 512). Like the
+  // registry-full signal, the write is best-effort and the flag is set first.
   const REDACTION_REGISTRY_HEADROOM_THRESHOLD = 0.8;
   let redactionRegistryHeadroomSignaled = false;
   const checkRegistryHeadroom = () => {
@@ -987,7 +1012,7 @@ const createDebugServer = ({
     const cap = redaction.maxTokens();
     if (cap > 0 && count >= Math.ceil(cap * REDACTION_REGISTRY_HEADROOM_THRESHOLD)) {
       redactionRegistryHeadroomSignaled = true;
-      process.stderr.write('{"level":"warn","event":"redaction.registry_headroom","tokens":' +
+      writeStderrBestEffort('{"level":"warn","event":"redaction.registry_headroom","tokens":' +
         `${count},"max":${cap}}\n`);
     }
   };

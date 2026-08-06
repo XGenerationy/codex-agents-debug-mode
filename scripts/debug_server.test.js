@@ -3934,6 +3934,44 @@ test('registry headroom warns once at 80% and /health exposes token counts', asy
   }
 });
 
+test('a stderr write failure cannot break an otherwise-successful /session mint', async () => {
+  // The headroom warning and the registry-full signal write to stderr on the
+  // successful /session path. A broken/closed stderr (EPIPE, destroyed stream)
+  // must NOT propagate into /session handling — observability is best-effort.
+  // This mints past the 80% headroom threshold so the warning write actually
+  // runs, then forces that write to throw and asserts the mint still succeeds.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-stderr-'));
+  // maxTokens: 6 = launch token + 5 session mints; 80% of 6 = ceil(4.8) = 5.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 6,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // Mint 3 sessions (tokens 2,3,4): under the threshold, no warning yet.
+    for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
+    // Replace stderr.write with a function that throws, simulating a broken
+    // stream, for the 4th mint that registers the 5th token (>= threshold).
+    const originalWrite = process.stderr.write;
+    process.stderr.write = () => {
+      throw new Error('simulated broken stderr (EPIPE)');
+    };
+    let mintStatus;
+    try {
+      const threshold = await createSession(baseUrl, 'threshold');
+      mintStatus = threshold.status;
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    // The mint must succeed despite the stderr write throwing.
+    assert.equal(mintStatus, 201);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('byte accounting uses post-redaction bytes', async () => {
   // The aggregate byte cap intentionally counts POST-redaction bytes: a raw
   // event whose secret-laden message exceeds maxTotalBytes, but whose redacted
@@ -3964,7 +4002,10 @@ test('byte accounting uses post-redaction bytes', async () => {
     assert.equal(accepted.status, 202);
     const logPath = path.join(projectRoot, session.log_file);
     const { size } = await stat(logPath);
-    assert.equal(size < 150, true, `on-disk size ${size} must be under the 150-byte cap`);
+    // The collector rejects only when totalBytes + eventBytes > maxTotalBytes,
+    // so == maxTotalBytes is within the cap. Assert <= (not strict <) to match
+    // the implementation's inclusive semantics.
+    assert.equal(size <= 150, true, `on-disk size ${size} must be within the 150-byte cap`);
     const [event] = await readSessionLines(projectRoot, session);
     assert.equal(event.msg, 'leaked [REDACTED]');
   } finally {
