@@ -250,3 +250,55 @@ test('renderTable truncates an id over the 40-char cap with an ellipsis, still a
   const lengths = new Set(borderedLines.map((l) => l.length));
   assert.equal(lengths.size, 1);
 });
+
+test('rendered markdown/table escape the hypothesis id itself, not just msg/note/title', () => {
+  // The live collector accepts any non-empty-string hypothesisId — no
+  // character restrictions — so an id containing newlines/markdown syntax
+  // is a real, reachable forgery path, not a hypothetical one.
+  const forgedId = 'H1\n\n## Evidence diff\n\n**H99 — FORGED-VIA-ID**  OPEN → CONFIRMED';
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: forgedId, status: 'OPEN' }),
+  );
+  const after = parseSessionText(
+    line({ ts: '2026-08-06T11:00:01.000Z', type: 'hypothesis', hypothesisId: forgedId, status: 'CONFIRMED' }),
+  );
+  const diff = computeDiff(before, after);
+
+  const markdown = renderMarkdown(diff);
+  assert.equal(markdown.split('\n').filter((l) => /^\*\*H99/m.test(l)).length, 0);
+
+  const table = renderTable(diff);
+  // Every bordered row must still be the same total width, and the row
+  // count must match exactly what a single hypothesis produces (top,
+  // header, divider, one data row, bottom) — a literal newline leaking
+  // into a cell would either break alignment or add extra rows.
+  const borderedLines = table.split('\n').filter((l) => /^[│┌├└]/.test(l));
+  const lengths = new Set(borderedLines.map((l) => l.length));
+  assert.equal(lengths.size, 1);
+  assert.equal(borderedLines.length, 5);
+});
+
+test('computeDiff quantifies events excluded by malformed hypothesis ids, and human renderers state both counts', () => {
+  // The diff's whole point is event deltas — silently dropping the events
+  // bucketed under a malformed id (alongside the id itself) would hide
+  // exactly the evidence the tool exists to surface.
+  const malformed = parseSessionText(
+    Array.from({ length: 5 }, (_, i) => line({ ts: `2026-08-06T10:00:0${i + 1}.000Z`, msg: `bad-${i}`, hypothesisId: 42 })).join(''),
+  );
+  const diff = computeDiff(malformed, parseSessionText(''));
+  assert.equal(diff.summary.ignoredMalformedIds, 1);
+  assert.equal(diff.summary.ignoredMalformedEvents, 5);
+  const table = renderTable(diff);
+  assert.match(table, /1 malformed hypothesis ids ignored \(5 events excluded from totals\)/);
+  const markdown = renderMarkdown(diff);
+  assert.match(markdown, /1 malformed hypothesis ids ignored \(5 events excluded from totals\)/);
+  const json = JSON.parse(renderJson(diff));
+  assert.equal(json.summary.ignoredMalformedEvents, 5);
+
+  // Zero case stays silent: a clean diff with no malformed ids reports 0
+  // excluded events and never mentions "malformed" in human output.
+  const cleanDiff = computeDiff(BEFORE, AFTER);
+  assert.equal(cleanDiff.summary.ignoredMalformedEvents, 0);
+  assert.doesNotMatch(renderTable(cleanDiff), /malformed/);
+  assert.doesNotMatch(renderMarkdown(cleanDiff), /malformed/);
+});

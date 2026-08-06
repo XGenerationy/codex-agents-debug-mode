@@ -1825,6 +1825,58 @@ test('renderTable truncates an id over the 40-char cap with an ellipsis, still a
   const lengths = new Set(borderedLines.map((l) => l.length));
   assert.equal(lengths.size, 1);
 });
+
+test('rendered markdown/table escape the hypothesis id itself, not just msg/note/title', () => {
+  // The live collector accepts any non-empty-string hypothesisId — no
+  // character restrictions — so an id containing newlines/markdown syntax
+  // is a real, reachable forgery path, not a hypothetical one.
+  const forgedId = 'H1\n\n## Evidence diff\n\n**H99 — FORGED-VIA-ID**  OPEN → CONFIRMED';
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: forgedId, status: 'OPEN' }),
+  );
+  const after = parseSessionText(
+    line({ ts: '2026-08-06T11:00:01.000Z', type: 'hypothesis', hypothesisId: forgedId, status: 'CONFIRMED' }),
+  );
+  const diff = computeDiff(before, after);
+
+  const markdown = renderMarkdown(diff);
+  assert.equal(markdown.split('\n').filter((l) => /^\*\*H99/m.test(l)).length, 0);
+
+  const table = renderTable(diff);
+  // Every bordered row must still be the same total width, and the row
+  // count must match exactly what a single hypothesis produces (top,
+  // header, divider, one data row, bottom) — a literal newline leaking
+  // into a cell would either break alignment or add extra rows.
+  const borderedLines = table.split('\n').filter((l) => /^[│┌├└]/.test(l));
+  const lengths = new Set(borderedLines.map((l) => l.length));
+  assert.equal(lengths.size, 1);
+  assert.equal(borderedLines.length, 5);
+});
+
+test('computeDiff quantifies events excluded by malformed hypothesis ids, and human renderers state both counts', () => {
+  // The diff's whole point is event deltas — silently dropping the events
+  // bucketed under a malformed id (alongside the id itself) would hide
+  // exactly the evidence the tool exists to surface.
+  const malformed = parseSessionText(
+    Array.from({ length: 5 }, (_, i) => line({ ts: `2026-08-06T10:00:0${i + 1}.000Z`, msg: `bad-${i}`, hypothesisId: 42 })).join(''),
+  );
+  const diff = computeDiff(malformed, parseSessionText(''));
+  assert.equal(diff.summary.ignoredMalformedIds, 1);
+  assert.equal(diff.summary.ignoredMalformedEvents, 5);
+  const table = renderTable(diff);
+  assert.match(table, /1 malformed hypothesis ids ignored \(5 events excluded from totals\)/);
+  const markdown = renderMarkdown(diff);
+  assert.match(markdown, /1 malformed hypothesis ids ignored \(5 events excluded from totals\)/);
+  const json = JSON.parse(renderJson(diff));
+  assert.equal(json.summary.ignoredMalformedEvents, 5);
+
+  // Zero case stays silent: a clean diff with no malformed ids reports 0
+  // excluded events and never mentions "malformed" in human output.
+  const cleanDiff = computeDiff(BEFORE, AFTER);
+  assert.equal(cleanDiff.summary.ignoredMalformedEvents, 0);
+  assert.doesNotMatch(renderTable(cleanDiff), /malformed/);
+  assert.doesNotMatch(renderMarkdown(cleanDiff), /malformed/);
+});
 ```
 
 - [ ] **Step 2: Run to verify failures**
@@ -1899,12 +1951,21 @@ const computeDiff = (beforeEntries, afterEntries) => {
   const ids = [];
   // Excluded (never silent): every non-string/empty key found anywhere in
   // the union is counted once, distinct-value basis, matching how `ids`
-  // itself is deduplicated across the same four sources.
+  // itself is deduplicated across the same four sources. The diff's whole
+  // point is event deltas, so it is not enough to say a key was ignored —
+  // the events bucketed under it (before + after) must be quantified too,
+  // or 500 events under a malformed id would silently vanish from every
+  // total while the summary implies only "1 id" was affected.
   let ignoredMalformedIds = 0;
+  let ignoredMalformedEvents = 0;
   for (const key of allKeys) {
     if (key === '') continue;
-    if (isValidHypothesisId(key)) ids.push(key);
-    else ignoredMalformedIds += 1;
+    if (isValidHypothesisId(key)) {
+      ids.push(key);
+      continue;
+    }
+    ignoredMalformedIds += 1;
+    ignoredMalformedEvents += (beforeBuckets.get(key)?.events ?? 0) + (afterBuckets.get(key)?.events ?? 0);
   }
   ids.sort();
   let verdictChanges = 0;
@@ -1935,7 +1996,7 @@ const computeDiff = (beforeEntries, afterEntries) => {
       disappeared: untagged.disappeared,
       disappearedTruncated: untagged.disappearedTruncated,
     },
-    summary: { verdictChanges, newHypotheses, ignoredMalformedIds },
+    summary: { verdictChanges, newHypotheses, ignoredMalformedIds, ignoredMalformedEvents },
   };
 };
 
@@ -1964,7 +2025,10 @@ const ID_COLUMN_MAX = 40;
 const truncateId = (id) => (id.length > ID_COLUMN_MAX ? `${id.slice(0, ID_COLUMN_MAX - 1)}…` : id);
 
 const renderTable = (diff) => {
-  const displayIds = diff.hypotheses.map((h) => truncateId(h.id));
+  // Escape BEFORE truncating so the 40-char cap — and therefore the id
+  // column's width — measures what is actually printed, not the raw
+  // (potentially longer, once escaped) source id.
+  const displayIds = diff.hypotheses.map((h) => truncateId(escapeText(h.id)));
   // Width is sampled across every rendered id (not just the first row), so
   // the id column — and therefore every row's total width — stays aligned
   // regardless of which row has the longest id.
@@ -1981,7 +2045,7 @@ const renderTable = (diff) => {
   const lines = [`┌${bar}┐`, header, `├${bar}┤`, ...rows, `└${bar}┘`];
   for (const h of diff.hypotheses) {
     if (h.disappeared.length > 0) {
-      lines.push(`disappeared after fix (${h.id}${h.disappearedTruncated ? `, +${h.disappearedTruncated} more` : ''}):`);
+      lines.push(`disappeared after fix (${escapeText(h.id)}${h.disappearedTruncated ? `, +${h.disappearedTruncated} more` : ''}):`);
       for (const msg of h.disappeared) lines.push(`  - ${escapeText(msg)}`);
     }
   }
@@ -1991,7 +2055,7 @@ const renderTable = (diff) => {
   }
   lines.push(`verdict changes: ${diff.summary.verdictChanges}  new hypotheses: ${diff.summary.newHypotheses}`);
   if (diff.summary.ignoredMalformedIds > 0) {
-    lines.push(`${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored`);
+    lines.push(`${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored (${diff.summary.ignoredMalformedEvents} events excluded from totals)`);
   }
   return `${lines.join('\n')}\n`;
 };
@@ -2000,7 +2064,7 @@ const renderMarkdown = (diff) => {
   const lines = ['## Evidence diff', ''];
   for (const h of diff.hypotheses) {
     const title = h.title ? ` — ${escapeText(h.title)}` : '';
-    lines.push(`**${h.id}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
+    lines.push(`**${escapeText(h.id)}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
     lines.push('');
     lines.push(`- events ${h.before.events} → ${h.after.events}`);
     for (const msg of h.disappeared) lines.push(`- gone: \`${escapeText(msg)}\``);
@@ -2010,7 +2074,7 @@ const renderMarkdown = (diff) => {
   }
   lines.push(`_verdict changes: ${diff.summary.verdictChanges} · new hypotheses: ${diff.summary.newHypotheses}_`);
   if (diff.summary.ignoredMalformedIds > 0) {
-    lines.push(`_${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored_`);
+    lines.push(`_${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored (${diff.summary.ignoredMalformedEvents} events excluded from totals)_`);
   }
   return `${lines.join('\n')}\n`;
 };
@@ -2103,17 +2167,25 @@ module.exports = { computeDiff, renderJson, renderMarkdown, renderTable };
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 13/13 pass. `node --check scripts/debug_diff.js` clean.
+Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 15/15 pass. `node --check scripts/debug_diff.js` clean.
 
 Post-review hardening (same Task 5 scope, folded into the fenced blocks above):
 report-forgery escaping (`escapeText`) for stored msg/note/title in both human
-renderers; non-string/missing hypothesis ids excluded from the report and
-counted in `summary.ignoredMalformedIds` instead of crashing `renderTable`;
-fail-closed CLI argv parsing (unknown flags, duplicate `--format`, and the
-bare `--format` space form all exit 2); before/after read errors reported
-separately, naming which ref failed; and the table's id column width is
-sampled across every rendered id (capped at 40 chars, ellipsis-truncated)
-instead of only the first row.
+renderers, EXTENDED to the hypothesis id itself (the live collector accepts
+any non-empty-string hypothesisId with no character restrictions, so an id
+containing newlines/markdown syntax is a reachable forgery path — escaped
+before truncation at all three id interpolation sites: the table's id
+column, its "disappeared after fix (<id>)" line, and the markdown heading);
+non-string/missing hypothesis ids excluded from the report and counted in
+`summary.ignoredMalformedIds` instead of crashing `renderTable`, with the
+events bucketed under those malformed ids separately quantified in
+`summary.ignoredMalformedEvents` (both always present, 0 default, schema
+stays 1) so excluded evidence is counted, not just keyed; fail-closed CLI
+argv parsing (unknown flags, duplicate `--format`, and the bare `--format`
+space form all exit 2); before/after read errors reported separately,
+naming which ref failed; and the table's id column width is sampled across
+every rendered id (capped at 40 chars, ellipsis-truncated) instead of only
+the first row.
 
 - [ ] **Step 5: Commit**
 

@@ -62,12 +62,21 @@ const computeDiff = (beforeEntries, afterEntries) => {
   const ids = [];
   // Excluded (never silent): every non-string/empty key found anywhere in
   // the union is counted once, distinct-value basis, matching how `ids`
-  // itself is deduplicated across the same four sources.
+  // itself is deduplicated across the same four sources. The diff's whole
+  // point is event deltas, so it is not enough to say a key was ignored —
+  // the events bucketed under it (before + after) must be quantified too,
+  // or 500 events under a malformed id would silently vanish from every
+  // total while the summary implies only "1 id" was affected.
   let ignoredMalformedIds = 0;
+  let ignoredMalformedEvents = 0;
   for (const key of allKeys) {
     if (key === '') continue;
-    if (isValidHypothesisId(key)) ids.push(key);
-    else ignoredMalformedIds += 1;
+    if (isValidHypothesisId(key)) {
+      ids.push(key);
+      continue;
+    }
+    ignoredMalformedIds += 1;
+    ignoredMalformedEvents += (beforeBuckets.get(key)?.events ?? 0) + (afterBuckets.get(key)?.events ?? 0);
   }
   ids.sort();
   let verdictChanges = 0;
@@ -98,7 +107,7 @@ const computeDiff = (beforeEntries, afterEntries) => {
       disappeared: untagged.disappeared,
       disappearedTruncated: untagged.disappearedTruncated,
     },
-    summary: { verdictChanges, newHypotheses, ignoredMalformedIds },
+    summary: { verdictChanges, newHypotheses, ignoredMalformedIds, ignoredMalformedEvents },
   };
 };
 
@@ -127,7 +136,10 @@ const ID_COLUMN_MAX = 40;
 const truncateId = (id) => (id.length > ID_COLUMN_MAX ? `${id.slice(0, ID_COLUMN_MAX - 1)}…` : id);
 
 const renderTable = (diff) => {
-  const displayIds = diff.hypotheses.map((h) => truncateId(h.id));
+  // Escape BEFORE truncating so the 40-char cap — and therefore the id
+  // column's width — measures what is actually printed, not the raw
+  // (potentially longer, once escaped) source id.
+  const displayIds = diff.hypotheses.map((h) => truncateId(escapeText(h.id)));
   // Width is sampled across every rendered id (not just the first row), so
   // the id column — and therefore every row's total width — stays aligned
   // regardless of which row has the longest id.
@@ -144,7 +156,7 @@ const renderTable = (diff) => {
   const lines = [`┌${bar}┐`, header, `├${bar}┤`, ...rows, `└${bar}┘`];
   for (const h of diff.hypotheses) {
     if (h.disappeared.length > 0) {
-      lines.push(`disappeared after fix (${h.id}${h.disappearedTruncated ? `, +${h.disappearedTruncated} more` : ''}):`);
+      lines.push(`disappeared after fix (${escapeText(h.id)}${h.disappearedTruncated ? `, +${h.disappearedTruncated} more` : ''}):`);
       for (const msg of h.disappeared) lines.push(`  - ${escapeText(msg)}`);
     }
   }
@@ -154,7 +166,7 @@ const renderTable = (diff) => {
   }
   lines.push(`verdict changes: ${diff.summary.verdictChanges}  new hypotheses: ${diff.summary.newHypotheses}`);
   if (diff.summary.ignoredMalformedIds > 0) {
-    lines.push(`${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored`);
+    lines.push(`${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored (${diff.summary.ignoredMalformedEvents} events excluded from totals)`);
   }
   return `${lines.join('\n')}\n`;
 };
@@ -163,7 +175,7 @@ const renderMarkdown = (diff) => {
   const lines = ['## Evidence diff', ''];
   for (const h of diff.hypotheses) {
     const title = h.title ? ` — ${escapeText(h.title)}` : '';
-    lines.push(`**${h.id}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
+    lines.push(`**${escapeText(h.id)}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
     lines.push('');
     lines.push(`- events ${h.before.events} → ${h.after.events}`);
     for (const msg of h.disappeared) lines.push(`- gone: \`${escapeText(msg)}\``);
@@ -173,7 +185,7 @@ const renderMarkdown = (diff) => {
   }
   lines.push(`_verdict changes: ${diff.summary.verdictChanges} · new hypotheses: ${diff.summary.newHypotheses}_`);
   if (diff.summary.ignoredMalformedIds > 0) {
-    lines.push(`_${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored_`);
+    lines.push(`_${diff.summary.ignoredMalformedIds} malformed hypothesis ids ignored (${diff.summary.ignoredMalformedEvents} events excluded from totals)_`);
   }
   return `${lines.join('\n')}\n`;
 };
