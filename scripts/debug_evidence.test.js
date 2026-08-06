@@ -285,3 +285,73 @@ test('discoverCollector reads port and token from .debug', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('readSessionLive rejects a session id that would escape the /sessions/:id/logs path before making any request', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: '../health?' }),
+    /invalid_session_ref/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'a b' }),
+    /invalid_session_ref/,
+  );
+});
+
+test('readSessionLive rejects live_read_timeout when the collector never responds', async () => {
+  const server = http.createServer(() => {
+    // Deliberately never write a response — simulates a hung collector.
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'hang-session-1', timeoutMs: 50 }),
+      /live_read_timeout/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
+    /invalid_filter:hypothesisId/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { runId: null } }),
+    /invalid_filter:runId/,
+  );
+});
+
+test('discoverCollector rejects collector_not_running when .debug connection files are missing', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-missing-'));
+  try {
+    await assert.rejects(() => discoverCollector(root), /collector_not_running/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_token_invalid for an empty or whitespace-only token file', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badtoken-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '8787\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), '   \n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_token_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_port_invalid for a non-decimal-integer port string like scientific notation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badport-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '1e4\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok-value\n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_port_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

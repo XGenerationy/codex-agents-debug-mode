@@ -44,13 +44,36 @@ const readSessionFile = async (filePath) => {
 const FILTER_KEYS = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
 const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
 
+// Mirrors the route's `query.get(name)?.trim() ?? undefined` EXACTLY: the
+// collector also trims these join keys at write time (POST /log), so a
+// caller-supplied value must be trimmed the same way or padded input would
+// silently fail to match. Only `undefined` means "no filter" — a value
+// that is empty or whitespace-only AFTER trimming is still a real filter
+// (for the empty string) that matches nothing, because the collector
+// rejects empty join keys at ingestion (invalid_join_key) so no stored
+// line ever has one; this mirrors the route rather than treating blank
+// input as absent or raising an error. Unlike the URL route — where
+// URLSearchParams.get always yields a string — this module's filters are
+// arbitrary JS values, so a non-string hypothesisId/runId has no route
+// analog and fails closed like every other malformed filter instead of
+// silently never matching. Shared by filterEntries (local reads) and
+// readSessionLive (live reads, applied before serializing into the query
+// string) so the two paths cannot diverge on what counts as a valid
+// join-key filter.
+const normalizeJoinKeyFilter = (filters, name) => {
+  const value = filters[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`invalid_filter:${name}`);
+  return value.trim();
+};
+
 // Filter semantics MUST mirror GET /sessions/:id/logs exactly (enforced by
 // the parity test): unknown keys and malformed values fail closed; `type`
 // classifies lines WITHOUT a type field as events and unknown future types
 // match only 'all'; time bounds are inclusive Date.parse comparisons and
 // NaN-ts lines are excluded only while a time filter is active; `limit`
 // keeps the LAST n matches (tail-biased). hypothesisId/runId semantics are
-// documented at normalizeJoinKeyFilter below.
+// documented at normalizeJoinKeyFilter above.
 const filterEntries = (entries, filters = {}) => {
   for (const key of Object.keys(filters)) {
     if (!FILTER_KEYS.has(key)) throw new Error(`invalid_filter:${key}`);
@@ -70,27 +93,8 @@ const filterEntries = (entries, filters = {}) => {
     if (!Number.isInteger(filters.limit) || filters.limit < 1) throw new Error('invalid_filter:limit');
     limit = filters.limit;
   }
-  // Mirrors the route's `query.get(name)?.trim() ?? undefined` EXACTLY: the
-  // collector also trims these join keys at write time (POST /log), so a
-  // caller-supplied value must be trimmed the same way or padded input would
-  // silently fail to match. Only `undefined` means "no filter" — a value
-  // that is empty or whitespace-only AFTER trimming is still a real filter
-  // (for the empty string) that matches nothing, because the collector
-  // rejects empty join keys at ingestion (invalid_join_key) so no stored
-  // line ever has one; this mirrors the route rather than treating blank
-  // input as absent or raising an error. Unlike the URL route — where
-  // URLSearchParams.get always yields a string — this module's filters are
-  // arbitrary JS values, so a non-string hypothesisId/runId has no route
-  // analog and fails closed like every other malformed filter instead of
-  // silently never matching.
-  const normalizeJoinKeyFilter = (name) => {
-    const value = filters[name];
-    if (value === undefined) return undefined;
-    if (typeof value !== 'string') throw new Error(`invalid_filter:${name}`);
-    return value.trim();
-  };
-  const hypothesisIdFilter = normalizeJoinKeyFilter('hypothesisId');
-  const runIdFilter = normalizeJoinKeyFilter('runId');
+  const hypothesisIdFilter = normalizeJoinKeyFilter(filters, 'hypothesisId');
+  const runIdFilter = normalizeJoinKeyFilter(filters, 'runId');
   const matched = entries.filter(({ parsed }) => {
     const lineType = parsed.type === undefined ? 'event' : parsed.type;
     if (type !== 'all' && lineType !== type) return false;
@@ -182,11 +186,46 @@ const resolveSessionRef = (projectRoot, ref) => {
 // applies the SAME semantics filterEntries implements locally (parity test
 // enforced). Errors surface as distinct codes, never swallowed: evidence
 // integrity failures (409) and auth/liveness failures are actionable.
-const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promise((resolve, reject) => {
+const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 5000 }) => new Promise((resolve, reject) => {
+  // Pre-flight, before any request setup: sessionId is interpolated
+  // directly into the request path below. Mirrors resolveSessionRef's
+  // bare-id guard (SESSION_ID_PATTERN, defined above) — sessionId here is
+  // frequently network-sourced (e.g. from a prior /session response), and
+  // without this check a value like '../health?' would escape the
+  // /sessions/:id/logs route entirely, while one containing a space would
+  // throw an unfiltered Node "unescaped characters" error instead of a
+  // structured, catchable one. (This is a distinct guard from
+  // resolveSessionRef itself — that function's .log-path passthrough branch
+  // must never see a network-sourced id; this function never calls it.)
+  if (!SESSION_ID_PATTERN.test(sessionId)) {
+    reject(new Error(`invalid_session_ref:${sessionId}`));
+    return;
+  }
+  // hypothesisId/runId must be validated and trimmed through the SAME
+  // normalizeJoinKeyFilter helper filterEntries uses, before being
+  // serialized into the query string. Without this, a non-string value
+  // (e.g. 42) would silently become the query string "42" — zero matches,
+  // live — while the local path throws invalid_filter:hypothesisId: a
+  // parity break the parity test itself cannot generate, since it only
+  // ever feeds clean fixtures through both paths. Other filter keys
+  // (type/sinceTs/untilTs/limit) keep the plain String() passthrough below;
+  // the route already validates those server-side.
+  let hypothesisIdFilter;
+  let runIdFilter;
+  try {
+    hypothesisIdFilter = normalizeJoinKeyFilter(filters, 'hypothesisId');
+    runIdFilter = normalizeJoinKeyFilter(filters, 'runId');
+  } catch (error) {
+    reject(error);
+    return;
+  }
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
+    if (key === 'hypothesisId' || key === 'runId') continue;
     if (value !== undefined) query.set(key, String(value));
   }
+  if (hypothesisIdFilter !== undefined) query.set('hypothesisId', hypothesisIdFilter);
+  if (runIdFilter !== undefined) query.set('runId', runIdFilter);
   const suffix = query.size > 0 ? `?${query.toString()}` : '';
   const request = http.request({
     hostname: '127.0.0.1',
@@ -198,6 +237,7 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
     let text = '';
     response.setEncoding('utf8');
     response.on('data', (chunk) => { text += chunk; });
+    response.on('error', reject);
     response.on('end', () => {
       if (response.statusCode === 200) {
         try {
@@ -214,6 +254,11 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
     });
   });
   request.on('error', reject);
+  // A collector that accepts the connection and never responds (or dies
+  // mid-body) would otherwise hang this promise forever — the worst case
+  // for createSessionTail below, a silent freeze with no error surfaced.
+  // destroy(error) routes through the 'error' handler above.
+  request.setTimeout(timeoutMs, () => request.destroy(new Error('live_read_timeout')));
   request.end();
 });
 
@@ -222,6 +267,12 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
 // is immune to same-millisecond timestamps and needs no cursor state on the
 // server. Filters are applied by the CALLER over the emitted entries so the
 // seen-count always refers to the unfiltered stream.
+// Accepted cost model: readSessionLive has no cursor/offset support, so
+// each poll re-downloads the ENTIRE unfiltered log — O(session size), not
+// O(new entries) — bounded in practice by the collector's maxTotalBytes cap
+// on session size and now by readSessionLive's timeoutMs on any single
+// poll. Task 3/4 choose their poll interval knowing this cost rather than
+// polling aggressively.
 const createSessionTail = ({ port, token, sessionId }) => {
   let seen = 0;
   return {
@@ -235,16 +286,35 @@ const createSessionTail = ({ port, token, sessionId }) => {
 };
 
 // Read the local collector's connection material persisted by its CLI:
-// .debug/collector_port and .debug/collector_token.
+// .debug/collector_port and .debug/collector_token. Fails closed with
+// structured errors rather than propagating raw fs/parsing errors: a
+// missing file means the collector plainly isn't running (a normal state,
+// not a bug), while a present-but-garbled file is corruption a caller
+// should be able to distinguish from "not running".
 const discoverCollector = async (projectRoot) => {
   const debugDir = path.join(projectRoot, '.debug');
-  const [portText, tokenText] = await Promise.all([
-    readFile(path.join(debugDir, 'collector_port'), 'utf8'),
-    readFile(path.join(debugDir, 'collector_token'), 'utf8'),
-  ]);
-  const port = Number(portText.trim());
+  let portText;
+  let tokenText;
+  try {
+    [portText, tokenText] = await Promise.all([
+      readFile(path.join(debugDir, 'collector_port'), 'utf8'),
+      readFile(path.join(debugDir, 'collector_token'), 'utf8'),
+    ]);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new Error('collector_not_running');
+    throw error;
+  }
+  const trimmedPort = portText.trim();
+  // Require a plain decimal-integer string: Number() alone also accepts
+  // hex ('0x10'), scientific notation ('1e4'), leading '+', etc. — none of
+  // which collector_port ever legitimately contains, since the collector
+  // writes it with a plain String(port).
+  if (!/^\d+$/.test(trimmedPort)) throw new Error('collector_port_invalid');
+  const port = Number(trimmedPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('collector_port_invalid');
-  return { port, token: tokenText.trim() };
+  const token = tokenText.trim();
+  if (token === '') throw new Error('collector_token_invalid');
+  return { port, token };
 };
 
 module.exports = {

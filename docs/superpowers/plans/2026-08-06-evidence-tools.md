@@ -539,6 +539,76 @@ test('discoverCollector reads port and token from .debug', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('readSessionLive rejects a session id that would escape the /sessions/:id/logs path before making any request', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: '../health?' }),
+    /invalid_session_ref/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'a b' }),
+    /invalid_session_ref/,
+  );
+});
+
+test('readSessionLive rejects live_read_timeout when the collector never responds', async () => {
+  const server = http.createServer(() => {
+    // Deliberately never write a response — simulates a hung collector.
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'hang-session-1', timeoutMs: 50 }),
+      /live_read_timeout/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
+    /invalid_filter:hypothesisId/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { runId: null } }),
+    /invalid_filter:runId/,
+  );
+});
+
+test('discoverCollector rejects collector_not_running when .debug connection files are missing', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-missing-'));
+  try {
+    await assert.rejects(() => discoverCollector(root), /collector_not_running/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_token_invalid for an empty or whitespace-only token file', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badtoken-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '8787\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), '   \n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_token_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_port_invalid for a non-decimal-integer port string like scientific notation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badport-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '1e4\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok-value\n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_port_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 ```
 
 NOTE: place the `const http = require('node:http');` line with the OTHER requires at the top of the test file (the block above shows it mid-file only to keep the diff excerpt together — hoist it when appending).
@@ -546,9 +616,51 @@ NOTE: place the `const http = require('node:http');` line with the OTHER require
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js`
-Expected: the four new tests fail (`readSessionLive`/`createSessionTail`/`discoverCollector` are not exported); Task 1's tests still pass.
+Expected: the ten new tests fail (`readSessionLive`/`createSessionTail`/`discoverCollector` are not exported); Task 1's tests still pass.
 
 - [ ] **Step 3: Implement (append to `scripts/debug_evidence.js`)**
+
+This step also promotes `normalizeJoinKeyFilter` out of `filterEntries`'s
+closure (added in Task 1) to module scope — behavior unchanged, now takes
+`(filters, name)` instead of closing over `filters` — so `readSessionLive`
+below can reuse the exact same validation instead of re-implementing it.
+Insert it immediately above `filterEntries`:
+
+```js
+// Mirrors the route's `query.get(name)?.trim() ?? undefined` EXACTLY: the
+// collector also trims these join keys at write time (POST /log), so a
+// caller-supplied value must be trimmed the same way or padded input would
+// silently fail to match. Only `undefined` means "no filter" — a value
+// that is empty or whitespace-only AFTER trimming is still a real filter
+// (for the empty string) that matches nothing, because the collector
+// rejects empty join keys at ingestion (invalid_join_key) so no stored
+// line ever has one; this mirrors the route rather than treating blank
+// input as absent or raising an error. Unlike the URL route — where
+// URLSearchParams.get always yields a string — this module's filters are
+// arbitrary JS values, so a non-string hypothesisId/runId has no route
+// analog and fails closed like every other malformed filter instead of
+// silently never matching. Shared by filterEntries (local reads) and
+// readSessionLive (live reads, applied before serializing into the query
+// string) so the two paths cannot diverge on what counts as a valid
+// join-key filter.
+const normalizeJoinKeyFilter = (filters, name) => {
+  const value = filters[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`invalid_filter:${name}`);
+  return value.trim();
+};
+```
+
+Inside `filterEntries`, delete the old closure-local `normalizeJoinKeyFilter`
+definition, change its doc comment's closing line to "documented at
+normalizeJoinKeyFilter above", and change the two call sites to:
+
+```js
+  const hypothesisIdFilter = normalizeJoinKeyFilter(filters, 'hypothesisId');
+  const runIdFilter = normalizeJoinKeyFilter(filters, 'runId');
+```
+
+Then append the live-read functions after `resolveSessionRef`:
 
 ```js
 // Fetch a live session's filtered lines from the local collector. Filters
@@ -556,11 +668,46 @@ Expected: the four new tests fail (`readSessionLive`/`createSessionTail`/`discov
 // applies the SAME semantics filterEntries implements locally (parity test
 // enforced). Errors surface as distinct codes, never swallowed: evidence
 // integrity failures (409) and auth/liveness failures are actionable.
-const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promise((resolve, reject) => {
+const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 5000 }) => new Promise((resolve, reject) => {
+  // Pre-flight, before any request setup: sessionId is interpolated
+  // directly into the request path below. Mirrors resolveSessionRef's
+  // bare-id guard (SESSION_ID_PATTERN, defined above) — sessionId here is
+  // frequently network-sourced (e.g. from a prior /session response), and
+  // without this check a value like '../health?' would escape the
+  // /sessions/:id/logs route entirely, while one containing a space would
+  // throw an unfiltered Node "unescaped characters" error instead of a
+  // structured, catchable one. (This is a distinct guard from
+  // resolveSessionRef itself — that function's .log-path passthrough branch
+  // must never see a network-sourced id; this function never calls it.)
+  if (!SESSION_ID_PATTERN.test(sessionId)) {
+    reject(new Error(`invalid_session_ref:${sessionId}`));
+    return;
+  }
+  // hypothesisId/runId must be validated and trimmed through the SAME
+  // normalizeJoinKeyFilter helper filterEntries uses, before being
+  // serialized into the query string. Without this, a non-string value
+  // (e.g. 42) would silently become the query string "42" — zero matches,
+  // live — while the local path throws invalid_filter:hypothesisId: a
+  // parity break the parity test itself cannot generate, since it only
+  // ever feeds clean fixtures through both paths. Other filter keys
+  // (type/sinceTs/untilTs/limit) keep the plain String() passthrough below;
+  // the route already validates those server-side.
+  let hypothesisIdFilter;
+  let runIdFilter;
+  try {
+    hypothesisIdFilter = normalizeJoinKeyFilter(filters, 'hypothesisId');
+    runIdFilter = normalizeJoinKeyFilter(filters, 'runId');
+  } catch (error) {
+    reject(error);
+    return;
+  }
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
+    if (key === 'hypothesisId' || key === 'runId') continue;
     if (value !== undefined) query.set(key, String(value));
   }
+  if (hypothesisIdFilter !== undefined) query.set('hypothesisId', hypothesisIdFilter);
+  if (runIdFilter !== undefined) query.set('runId', runIdFilter);
   const suffix = query.size > 0 ? `?${query.toString()}` : '';
   const request = http.request({
     hostname: '127.0.0.1',
@@ -572,6 +719,7 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
     let text = '';
     response.setEncoding('utf8');
     response.on('data', (chunk) => { text += chunk; });
+    response.on('error', reject);
     response.on('end', () => {
       if (response.statusCode === 200) {
         try {
@@ -588,6 +736,11 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
     });
   });
   request.on('error', reject);
+  // A collector that accepts the connection and never responds (or dies
+  // mid-body) would otherwise hang this promise forever — the worst case
+  // for createSessionTail below, a silent freeze with no error surfaced.
+  // destroy(error) routes through the 'error' handler above.
+  request.setTimeout(timeoutMs, () => request.destroy(new Error('live_read_timeout')));
   request.end();
 });
 
@@ -596,6 +749,12 @@ const readSessionLive = ({ port, token, sessionId, filters = {} }) => new Promis
 // is immune to same-millisecond timestamps and needs no cursor state on the
 // server. Filters are applied by the CALLER over the emitted entries so the
 // seen-count always refers to the unfiltered stream.
+// Accepted cost model: readSessionLive has no cursor/offset support, so
+// each poll re-downloads the ENTIRE unfiltered log — O(session size), not
+// O(new entries) — bounded in practice by the collector's maxTotalBytes cap
+// on session size and now by readSessionLive's timeoutMs on any single
+// poll. Task 3/4 choose their poll interval knowing this cost rather than
+// polling aggressively.
 const createSessionTail = ({ port, token, sessionId }) => {
   let seen = 0;
   return {
@@ -609,16 +768,35 @@ const createSessionTail = ({ port, token, sessionId }) => {
 };
 
 // Read the local collector's connection material persisted by its CLI:
-// .debug/collector_port and .debug/collector_token.
+// .debug/collector_port and .debug/collector_token. Fails closed with
+// structured errors rather than propagating raw fs/parsing errors: a
+// missing file means the collector plainly isn't running (a normal state,
+// not a bug), while a present-but-garbled file is corruption a caller
+// should be able to distinguish from "not running".
 const discoverCollector = async (projectRoot) => {
   const debugDir = path.join(projectRoot, '.debug');
-  const [portText, tokenText] = await Promise.all([
-    readFile(path.join(debugDir, 'collector_port'), 'utf8'),
-    readFile(path.join(debugDir, 'collector_token'), 'utf8'),
-  ]);
-  const port = Number(portText.trim());
+  let portText;
+  let tokenText;
+  try {
+    [portText, tokenText] = await Promise.all([
+      readFile(path.join(debugDir, 'collector_port'), 'utf8'),
+      readFile(path.join(debugDir, 'collector_token'), 'utf8'),
+    ]);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new Error('collector_not_running');
+    throw error;
+  }
+  const trimmedPort = portText.trim();
+  // Require a plain decimal-integer string: Number() alone also accepts
+  // hex ('0x10'), scientific notation ('1e4'), leading '+', etc. — none of
+  // which collector_port ever legitimately contains, since the collector
+  // writes it with a plain String(port).
+  if (!/^\d+$/.test(trimmedPort)) throw new Error('collector_port_invalid');
+  const port = Number(trimmedPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('collector_port_invalid');
-  return { port, token: tokenText.trim() };
+  const token = tokenText.trim();
+  if (token === '') throw new Error('collector_token_invalid');
+  return { port, token };
 };
 ```
 
@@ -626,7 +804,7 @@ Extend `module.exports` with `createSessionTail`, `discoverCollector`, `readSess
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 19/19 pass (15 from Task 1 + 4 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
+Run: `node --test --test-concurrency=1 scripts/debug_evidence.test.js` — 25/25 pass (15 from Task 1 + 10 new). `node --check scripts/debug_evidence.js` clean. Also confirm the collector suite is untouched: `git status` shows only the two evidence files modified.
 
 - [ ] **Step 5: Commit**
 
