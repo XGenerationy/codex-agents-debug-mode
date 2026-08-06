@@ -6,16 +6,20 @@
 // pure reducers so they can be unit-tested without a terminal.
 const path = require('node:path');
 const {
+  createSessionTail,
+  discoverCollector,
   filterEntries,
   foldHypotheses,
   listSessions,
   readSessionFile,
+  readSessionLive,
   resolveSessionRef,
 } = require('./debug_evidence');
 
 const USAGE = 'Usage: debug_viewer.js [projectRoot] --session <id|path> '
   + '[--hypothesis <id>] [--type all|event|hypothesis] [--since <ISO>] '
-  + '[--until <ISO>] [--run <id>] [--limit <n>] [--live|--file] [--json|--plain]';
+  + '[--until <ISO>] [--run <id>] [--limit <n>] '
+  + '[--live (bare session ids only; .log file paths are file-mode)|--file] [--json|--plain]';
 
 // Flags that take a following value — used to reject `--flag=value` syntax
 // (this parser only accepts space-separated values) and to stop a value
@@ -84,10 +88,14 @@ const runAgentMode = async (parsed) => {
     return 2;
   }
   if (parsed.forceLive) {
-    // Live wiring is Task 4 by design; until then fail honestly instead of
-    // silently serving stale file contents to a caller that asked to tail.
-    process.stderr.write(`${USAGE}\nviewer_usage:--live is not wired yet (Task 4)\n`);
-    return 2;
+    // Live agent read: discover the collector, let the server apply the
+    // filters (GET-parity guaranteed by the core's test), emit the raw
+    // stored lines byte-verbatim. Errors (collector_not_running,
+    // live_read_*) propagate to main's catch: one line, exit 1.
+    const collector = await discoverCollector(parsed.projectRoot);
+    const entries = await readSessionLive({ ...collector, sessionId: parsed.session, filters: parsed.filters });
+    for (const entry of entries) process.stdout.write(`${entry.raw}\n`);
+    return 0;
   }
   const filePath = resolveSessionRef(parsed.projectRoot, parsed.session);
   const entries = await readSessionFile(filePath);
@@ -149,6 +157,44 @@ const reduce = (state, key) => {
   return state;
 };
 
+// Pure frame renderer for layout C. Returns a full-screen string of exactly
+// `rows` lines, each hard-truncated to `columns` — the painter writes it in
+// one stdout call, so tearing can't interleave partial rows. Kept free of
+// cursor-addressing so unit tests can assert on plain text.
+const formatEntryRow = (parsed) => {
+  const time = typeof parsed.ts === 'string' ? parsed.ts.slice(11, 19) : '--:--:--';
+  if (parsed.type === 'hypothesis') {
+    const note = parsed.note ? ` "${parsed.note}"` : '';
+    return `${time} ◆ ${parsed.hypothesisId} → ${parsed.status}${note}`;
+  }
+  const tag = parsed.hypothesisId ? `${parsed.hypothesisId} ` : '';
+  const loc = parsed.loc ? `  ${parsed.loc}` : '';
+  return `${time} ${tag}${parsed.msg ?? ''}${loc}`;
+};
+
+const renderFrame = (state, entries, { columns, rows, live }) => {
+  const clip = (text) => (text.length > columns ? text.slice(0, columns) : text);
+  const folded = foldHypotheses(entries);
+  const tableRows = [...folded.values()].map((h) => {
+    const when = typeof h.ts === 'string' ? h.ts.slice(11, 16) : '';
+    const detail = h.title ?? h.note ?? '';
+    return `${h.hypothesisId}  ${h.status}  ${detail}  ${when}`;
+  });
+  const tableHeight = Math.min(Math.max(tableRows.length, 1), Math.max(3, Math.floor(rows / 3)));
+  const streamHeight = rows - tableHeight - 3;
+  const streamRows = entries.map((entry) => formatEntryRow(entry.parsed));
+  const visibleStream = streamRows.slice(-(streamHeight + state.streamScroll), streamRows.length - state.streamScroll || undefined);
+  const status = state.paused ? 'paused' : (live ? '● live' : 'file');
+  const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
+  const lines = [];
+  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(columns)}`));
+  for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
+  lines.push(clip(`─ hypotheses ${'─'.repeat(columns)}`));
+  for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));
+  lines.push(clip('f:filter  s:sessions  tab:focus  space:pause  q:quit'));
+  return lines.slice(0, rows).join('\n');
+};
+
 const main = async () => {
   let parsed;
   try {
@@ -162,10 +208,84 @@ const main = async () => {
     process.exitCode = await runAgentMode(parsed);
     return;
   }
-  // TUI loop lands in the next task; until then a real terminal invocation
-  // reports honestly instead of pretending.
-  process.stderr.write('debug_viewer TUI is not wired yet (agent mode: pipe stdout or pass --json)\n');
-  process.exitCode = 3;
+  // TUI loop: raw-mode stdin -> pure reducers -> full-frame repaint on the
+  // alternate screen. The painter is the ONLY untested-by-CI code (spec
+  // decision); everything it renders comes from tested functions.
+  const readline = require('node:readline');
+  let sessionId = parsed.session;
+  if (sessionId === undefined) {
+    const sessions = await listSessions(parsed.projectRoot);
+    if (sessions.length === 0) {
+      process.stderr.write('no sessions under .debug/\n');
+      process.exitCode = 1;
+      return;
+    }
+    sessionId = sessions[sessions.length - 1].sessionId;
+  }
+  let state = createInitialState({ sessionId });
+  let entries = [];
+  let live = false;
+  let tail = null;
+  if (!parsed.forceFile) {
+    try {
+      const collector = await discoverCollector(parsed.projectRoot);
+      tail = createSessionTail({ ...collector, sessionId });
+      entries = await tail.poll();
+      live = true;
+    } catch {
+      tail = null;
+    }
+  }
+  if (!live) {
+    entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+    if (parsed.forceLive) {
+      process.stderr.write('collector not reachable; --live unavailable\n');
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const applyActiveFilter = (current, all) => (
+    current.activeFilter ? filterEntries(all, { hypothesisId: current.activeFilter }) : all
+  );
+  const paint = () => {
+    const { columns = 80, rows = 24 } = process.stdout;
+    process.stdout.write(`\u001b[2J\u001b[H${renderFrame(state, applyActiveFilter(state, entries), { columns, rows, live })}`);
+  };
+  process.stdout.write('\u001b[?1049h');
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  const pollTimer = setInterval(async () => {
+    if (state.paused || tail === null) return;
+    try {
+      const fresh = await tail.poll();
+      if (fresh.length > 0) {
+        entries = entries.concat(fresh);
+        paint();
+      }
+    } catch {
+      // Session retired mid-watch: fall back to the file, visibly.
+      live = false;
+      tail = null;
+      entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+      paint();
+    }
+  }, 500);
+  const shutdown = () => {
+    clearInterval(pollTimer);
+    process.stdout.write('\u001b[?1049l');
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.stdin.pause();
+  };
+  process.stdin.on('keypress', (_, key) => {
+    state = reduce(state, key ?? {});
+    if (state.quit) {
+      shutdown();
+      return;
+    }
+    paint();
+  });
+  process.stdout.on('resize', paint);
+  paint();
 };
 
 if (require.main === module) {
@@ -181,5 +301,6 @@ module.exports = {
   createInitialState,
   parseViewerArgs,
   reduce,
+  renderFrame,
   runAgentMode,
 };

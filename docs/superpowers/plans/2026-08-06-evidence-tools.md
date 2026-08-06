@@ -1457,13 +1457,13 @@ TUI loop replacing the stub (inside `main`'s TTY branch):
       return;
     }
   }
+  const applyActiveFilter = (current, all) => (
+    current.activeFilter ? filterEntries(all, { hypothesisId: current.activeFilter }) : all
+  );
   const paint = () => {
     const { columns = 80, rows = 24 } = process.stdout;
     process.stdout.write(`\u001b[2J\u001b[H${renderFrame(state, applyActiveFilter(state, entries), { columns, rows, live })}`);
   };
-  const applyActiveFilter = (current, all) => (
-    current.activeFilter ? filterEntries(all, { hypothesisId: current.activeFilter }) : all
-  );
   process.stdout.write('\u001b[?1049h');
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);

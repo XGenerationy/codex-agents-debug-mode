@@ -1,11 +1,12 @@
 const assert = require('node:assert/strict');
 const { execFile } = require('node:child_process');
-const { mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
+const { mkdtemp, mkdir, readFile, rm, writeFile } = require('node:fs/promises');
+const http = require('node:http');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { createInitialState, parseViewerArgs, reduce } = require('./debug_viewer');
+const { createInitialState, parseViewerArgs, reduce, renderFrame } = require('./debug_viewer');
 
 const VIEWER = path.join(__dirname, 'debug_viewer.js');
 
@@ -93,17 +94,6 @@ test('runtime errors (e.g. a mistyped session id) are reported as one clean line
   }
 });
 
-test('agent mode rejects --live as not wired until Task 4, exit 2', async () => {
-  const { root } = await seedRoot();
-  try {
-    const result = await runViewer([root, '--session', 's1', '--live', '--json']);
-    assert.equal(result.code, 2);
-    assert.match(result.stderr, /--live is not wired yet/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test('parseViewerArgs rejects a flag passed twice (GET-route parity)', () => {
   assert.throws(
     () => parseViewerArgs(['--session', 's1', '--session', 's2']),
@@ -163,4 +153,98 @@ test('backspace removes a whole surrogate-pair character, never leaving a lone s
   state = reduce(state, { name: 'backspace' });
   assert.equal(state.filterDraft, 'a');
   assert.equal(state.filterDraft.isWellFormed(), true);
+});
+
+test('renderFrame paints layout C: stream, verdict table, key bar', () => {
+  const entries = [
+    { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: 'clicked', hypothesisId: 'H1' } },
+    { raw: '', parsed: { ts: '2026-08-06T10:00:03.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'CONFIRMED', title: 'null id', note: 'proven' } },
+  ];
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, entries, { columns: 80, rows: 16, live: true });
+  assert.match(frame, /s1/);
+  assert.match(frame, /● live/);
+  assert.match(frame, /clicked/);
+  assert.match(frame, /◆ H1 → CONFIRMED/);
+  assert.match(frame, /H1\s+CONFIRMED\s+null id/);
+  assert.match(frame, /f:filter\s+s:sessions\s+tab:focus\s+space:pause\s+q:quit/);
+});
+
+test('renderFrame marks paused state and truncates to the terminal width', () => {
+  const wide = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: 'x'.repeat(300) } };
+  const state = { ...createInitialState({ sessionId: 's1' }), paused: true };
+  const frame = renderFrame(state, [wide], { columns: 40, rows: 12, live: false });
+  assert.match(frame, /paused/);
+  for (const row of frame.split('\n')) assert.equal(row.length <= 40, true);
+});
+
+// Live collector fixture for the agent-mode --live e2e (mirrors the
+// withLiveSession fixture in debug_evidence.test.js; duplicated because
+// test files cannot share helpers without executing each other's tests).
+const { createDebugServer } = require('./debug_server');
+
+const LAUNCH = 'viewer-test-launch-token-with-entropy';
+
+const listen = (server) => new Promise((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+});
+
+const closeServer = (server) => new Promise((resolve, reject) => {
+  server.close((error) => (error ? reject(error) : resolve()));
+});
+
+const httpJson = (port, pathname, { method = 'GET', headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path: pathname, method, headers }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, text }));
+    });
+    request.on('error', reject);
+    if (body !== undefined) request.write(JSON.stringify(body));
+    request.end();
+  });
+
+test('agent mode --live emits the live session raw lines byte-verbatim', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'viewer-live-'));
+  const server = createDebugServer({ projectRoot: root, token: LAUNCH, redactionEnv: {} });
+  const port = await listen(server);
+  try {
+    const minted = await httpJson(port, '/session', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { name: 'live' },
+    });
+    const session = JSON.parse(minted.text);
+    const log = (msg, extra = {}) => httpJson(port, '/log', {
+      method: 'POST',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg, ...extra },
+    });
+    await log('live-e1', { hypothesisId: 'H1' });
+    await log('live-e2');
+    await writeFile(path.join(root, '.debug', 'collector_port'), String(port), 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), LAUNCH, 'utf8');
+    const stored = await readFile(path.join(root, session.log_file), 'utf8');
+    const result = await runViewer([root, '--session', session.session_id, '--live']);
+    assert.equal(result.stderr, '');
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, stored);
+  } finally {
+    await closeServer(server);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('agent mode --live without a running collector fails with one clean line, exit 1', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'viewer-nolive-'));
+  try {
+    const result = await runViewer([root, '--session', 's1', '--live']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'collector_not_running\n');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
