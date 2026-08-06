@@ -1401,14 +1401,14 @@ const createDebugServer = ({
         const event = { ts: new Date().toISOString(), msg: payload.msg };
         for (const key of ['data', 'hypothesisId', 'loc', 'runId']) {
           if (payload[key] === undefined) continue;
-          // hypothesisId is the join key that POST /hypothesis lines and
-          // sub-project B's filters/diff match on byte-exactly; trim string
-          // values here and in /hypothesis so "  H1  " and "H1" cannot
-          // silently become distinct hypotheses. 'type' is deliberately
-          // absent from this allowlist: adding it would let the instrumented
-          // app forge hypothesis lines (see the POST /hypothesis capability
-          // split).
-          event[key] = key === 'hypothesisId' && typeof payload[key] === 'string'
+          // hypothesisId and runId are the join keys that POST /hypothesis
+          // lines and sub-project B's filters/diff match on byte-exactly;
+          // trim string values here and in /hypothesis so "  H1  " and "H1"
+          // cannot silently become distinct hypotheses. 'type' is
+          // deliberately absent from this allowlist: adding it would let
+          // the instrumented app forge hypothesis lines (see the POST
+          // /hypothesis capability split).
+          event[key] = (key === 'hypothesisId' || key === 'runId') && typeof payload[key] === 'string'
             ? payload[key].trim()
             : payload[key];
         }
@@ -1490,7 +1490,9 @@ const createDebugServer = ({
           status: payload.status,
         };
         for (const key of ['title', 'note', 'runId']) {
-          if (payload[key] !== undefined) line[key] = payload[key];
+          if (payload[key] !== undefined) {
+            line[key] = key === 'runId' ? payload[key].trim() : payload[key];
+          }
         }
         const redactedLine = redactEventForAppend(line, redaction.replacements());
         const serializedLine = `${JSON.stringify(redactedLine)}\n`;

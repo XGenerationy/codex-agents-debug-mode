@@ -41,7 +41,8 @@ appended through the existing `appendSessionEvent` chain:
   `hypothesisId`, `status`, `title`, `note`, `runId` — nothing else is copied.
 - `hypothesisId`: required string, non-empty after trimming; stored TRIMMED. `/log` applies the
   same trim to string `hypothesisId` values, so the join key that filters and `debug_diff` match
-  on can never differ by invisible whitespace.
+  on can never differ by invisible whitespace. The same trim applies to `runId` on both routes —
+  it is the second join key `GET` filters byte-exactly.
 - `status`: required, validated enum `OPEN | CONFIRMED | REJECTED | INCONCLUSIVE`.
 - `title` and `note` are optional strings; they pass the existing redaction choke point
   (`redactEventForAppend`) like every other string, so secrets in hypothesis text are

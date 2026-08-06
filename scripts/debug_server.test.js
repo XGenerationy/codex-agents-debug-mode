@@ -4490,3 +4490,20 @@ test('GET on a fresh session returns 200 with an empty NDJSON body', async () =>
     assert.equal(res.text, '');
   });
 });
+
+test('runId is stored trimmed on both routes and joins GET filters', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', runId: '  r1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: '  r1  ' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.runId), ['r1', 'r1']);
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs?runId=r1`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.split('\n').filter(Boolean).length, 2);
+  });
+});
