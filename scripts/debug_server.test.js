@@ -4446,25 +4446,35 @@ test('concurrent appends never produce torn GET output', async () => {
 
 test('GET does not refresh session activity (reads are observers)', async () => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  // The idle budget must comfortably exceed this environment's measured
+  // POST /session cost (~460-730ms of real disk + ACL work): lastActivityAt
+  // is stamped BEFORE that setup work, so a too-small budget can expire
+  // before the first read even dispatches.
+  const idleMs = 1500;
   const server = createDebugServer({
     projectRoot,
     token: TEST_LAUNCH_TOKEN,
     redactionEnv: {},
-    limits: { sessionIdleTimeoutMs: 60 },
+    limits: { sessionIdleTimeoutMs: idleMs },
   });
   const baseUrl = await listen(server);
   try {
     const session = (await createSession(baseUrl)).body;
+    const createdAt = Date.now();
     const first = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
-    assert.equal(first.status, 200);
+    // Assert the pre-expiry 200 only when we provably raced the budget: on a
+    // pathologically slow environment the property assertion below still holds.
+    if (Date.now() - createdAt < idleMs) assert.equal(first.status, 200);
+    // Keep issuing reads WHILE waiting out the budget: if reads refreshed
+    // lastActivityAt, the session could never retire and the final read
+    // would stay 200 forever.
     let last = first;
-    // 8 polls x 20ms exceed the 60ms idle budget several times over; if GETs
-    // refreshed lastActivityAt the session could never retire.
-    for (let i = 0; i < 8 && last.status !== 404; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
       last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
     }
     assert.equal(last.status, 404);
+    assert.equal(JSON.parse(last.text).error, 'unknown_session');
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
