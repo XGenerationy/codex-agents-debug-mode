@@ -1280,6 +1280,21 @@ test('renderFrame marks paused state and truncates to the terminal width', () =>
   for (const row of frame.split('\n')) assert.equal(row.length <= 40, true);
 });
 
+test('renderFrame does not throw on negative columns and still yields the requested row count', () => {
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [], { columns: -5, rows: 4, live: false });
+  assert.equal(frame.split('\n').length, 4);
+});
+
+test('renderFrame clips at a code-point boundary, never splitting a surrogate pair', () => {
+  const wide = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: '\u{1F600}abc' } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [wide], { columns: 10, rows: 12, live: false });
+  const rows = frame.split('\n');
+  assert.equal(rows.length, 12);
+  for (const row of rows) assert.equal(row.isWellFormed(), true);
+});
+
 // Live collector fixture for the agent-mode --live e2e (mirrors the
 // withLiveSession fixture in debug_evidence.test.js; duplicated because
 // test files cannot share helpers without executing each other's tests).
@@ -1355,7 +1370,7 @@ test('agent mode --live without a running collector fails with one clean line, e
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js`
-Expected: the four new tests fail (the two renderer tests with `renderFrame` undefined; both --live e2e tests with the exit-2 "not wired yet" usage error); the remaining 13 prior tests pass.
+Expected: the six new tests fail (the four renderer tests with `renderFrame` undefined; both --live e2e tests with the exit-2 "not wired yet" usage error); the remaining 13 prior tests pass.
 
 - [ ] **Step 3: Implement**
 
@@ -1395,7 +1410,14 @@ const formatEntryRow = (parsed) => {
 };
 
 const renderFrame = (state, entries, { columns, rows, live }) => {
-  const clip = (text) => (text.length > columns ? text.slice(0, columns) : text);
+  // Code-point-safe clip: slicing UTF-16 units can split a surrogate pair
+  // at the boundary and emit a lone surrogate. Display-width (CJK/emoji
+  // rendering as double-width cells) is explicitly out of scope for a
+  // zero-dependency tool — code-unit well-formedness is the guarantee.
+  const clip = (text) => {
+    const points = [...text];
+    return points.length > columns ? points.slice(0, Math.max(0, columns)).join('') : text;
+  };
   const folded = foldHypotheses(entries);
   const tableRows = [...folded.values()].map((h) => {
     const when = typeof h.ts === 'string' ? h.ts.slice(11, 16) : '';
@@ -1409,9 +1431,9 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   const status = state.paused ? 'paused' : (live ? '● live' : 'file');
   const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
   const lines = [];
-  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(columns)}`));
+  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
-  lines.push(clip(`─ hypotheses ${'─'.repeat(columns)}`));
+  lines.push(clip(`─ hypotheses ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));
   lines.push(clip('f:filter  s:sessions  tab:focus  space:pause  q:quit'));
   return lines.slice(0, rows).join('\n');
@@ -1450,12 +1472,12 @@ TUI loop replacing the stub (inside `main`'s TTY branch):
     }
   }
   if (!live) {
-    entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
     if (parsed.forceLive) {
       process.stderr.write('collector not reachable; --live unavailable\n');
       process.exitCode = 1;
       return;
     }
+    entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
   }
   const applyActiveFilter = (current, all) => (
     current.activeFilter ? filterEntries(all, { hypothesisId: current.activeFilter }) : all
@@ -1465,6 +1487,14 @@ TUI loop replacing the stub (inside `main`'s TTY branch):
     process.stdout.write(`\u001b[2J\u001b[H${renderFrame(state, applyActiveFilter(state, entries), { columns, rows, live })}`);
   };
   process.stdout.write('\u001b[?1049h');
+  // Unconditional restore: covers any uncaught throw (e.g. the poll
+  // fallback below) and external kills so a failure never strands the
+  // terminal on the alternate screen in raw mode; shutdown() below is
+  // the clean path, this is the belt-and-suspenders one.
+  process.on('exit', () => {
+    process.stdout.write('\u001b[?1049l');
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  });
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   const pollTimer = setInterval(async () => {
@@ -1479,12 +1509,21 @@ TUI loop replacing the stub (inside `main`'s TTY branch):
       // Session retired mid-watch: fall back to the file, visibly.
       live = false;
       tail = null;
-      entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+      try {
+        entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+      } catch {
+        // Fallback read failed too (collector stopped AND log removed).
+        // setInterval never awaits this callback, so an unhandled
+        // rejection here would kill the process with the alt-screen
+        // still active and raw mode still on — stale evidence beats a
+        // corrupted terminal, so keep the last-known entries instead.
+      }
       paint();
     }
   }, 500);
   const shutdown = () => {
     clearInterval(pollTimer);
+    process.stdout.off('resize', paint);
     process.stdout.write('\u001b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
@@ -1505,7 +1544,7 @@ Move the `applyActiveFilter` const ABOVE `paint` (it is referenced there). Expor
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 17/17 pass (14 from Task 3 and its fix rounds, minus the retired rejection test, plus 4 new). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 22/22 pass (14 from Task 3 and its fix rounds, minus the retired rejection test, plus 6 from this task's Step 1, plus 3 Ctrl+C reducer tests added to `reduce()` during this task's crash-safety review round). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. NOTE (review round): the poll-catch fallback read is guarded (a second failure keeps last-known entries rather than crashing an un-awaited `setInterval` callback), an unconditional `process.on('exit', ...)` restores the terminal on any uncaught throw or external kill, Ctrl+C quits from every `reduce` mode, the `--live`-unavailable message now fires before the fallback file read can throw ENOENT, and `renderFrame`'s `clip`/`'─'.repeat` are negative-columns- and surrogate-pair-safe. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
 
 - [ ] **Step 5: Commit**
 

@@ -155,6 +155,28 @@ test('backspace removes a whole surrogate-pair character, never leaving a lone s
   assert.equal(state.filterDraft.isWellFormed(), true);
 });
 
+test('ctrl+c quits from normal mode', () => {
+  const state = createInitialState({ sessionId: 's1' });
+  const next = reduce(state, { name: 'c', ctrl: true });
+  assert.equal(next.quit, true);
+});
+
+test('ctrl+c quits from filter-input mode', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  assert.equal(state.mode, 'filter-input');
+  state = reduce(state, { name: 'c', ctrl: true });
+  assert.equal(state.quit, true);
+});
+
+test('plain c without ctrl still types into the filter draft', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  state = reduce(state, { name: 'c', sequence: 'c' });
+  assert.equal(state.filterDraft, 'c');
+  assert.equal(state.quit, false);
+});
+
 test('renderFrame paints layout C: stream, verdict table, key bar', () => {
   const entries = [
     { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: 'clicked', hypothesisId: 'H1' } },
@@ -176,6 +198,21 @@ test('renderFrame marks paused state and truncates to the terminal width', () =>
   const frame = renderFrame(state, [wide], { columns: 40, rows: 12, live: false });
   assert.match(frame, /paused/);
   for (const row of frame.split('\n')) assert.equal(row.length <= 40, true);
+});
+
+test('renderFrame does not throw on negative columns and still yields the requested row count', () => {
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [], { columns: -5, rows: 4, live: false });
+  assert.equal(frame.split('\n').length, 4);
+});
+
+test('renderFrame clips at a code-point boundary, never splitting a surrogate pair', () => {
+  const wide = { raw: '', parsed: { ts: '2026-08-06T10:00:01.000Z', msg: '\u{1F600}abc' } };
+  const state = createInitialState({ sessionId: 's1' });
+  const frame = renderFrame(state, [wide], { columns: 10, rows: 12, live: false });
+  const rows = frame.split('\n');
+  assert.equal(rows.length, 12);
+  for (const row of rows) assert.equal(row.isWellFormed(), true);
 });
 
 // Live collector fixture for the agent-mode --live e2e (mirrors the

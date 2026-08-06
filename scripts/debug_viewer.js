@@ -126,6 +126,10 @@ const reduce = (state, key) => {
   // Nullish or shapeless key input is a no-op — never throw on a malformed
   // event, and never mutate state for something that isn't a real key.
   if (!key || typeof key !== 'object') return state;
+  // Ctrl+C must quit from every mode — raw stdin swallows the terminal's
+  // own SIGINT-on-Ctrl+C, so without this check filter-input mode would
+  // trap the user with no way out (plain 'q' just types into the draft).
+  if (key.ctrl && key.name === 'c') return { ...state, quit: true };
   if (state.mode === 'filter-input') {
     if (key.name === 'return') {
       return { ...state, mode: 'normal', activeFilter: state.filterDraft || undefined };
@@ -173,7 +177,14 @@ const formatEntryRow = (parsed) => {
 };
 
 const renderFrame = (state, entries, { columns, rows, live }) => {
-  const clip = (text) => (text.length > columns ? text.slice(0, columns) : text);
+  // Code-point-safe clip: slicing UTF-16 units can split a surrogate pair
+  // at the boundary and emit a lone surrogate. Display-width (CJK/emoji
+  // rendering as double-width cells) is explicitly out of scope for a
+  // zero-dependency tool — code-unit well-formedness is the guarantee.
+  const clip = (text) => {
+    const points = [...text];
+    return points.length > columns ? points.slice(0, Math.max(0, columns)).join('') : text;
+  };
   const folded = foldHypotheses(entries);
   const tableRows = [...folded.values()].map((h) => {
     const when = typeof h.ts === 'string' ? h.ts.slice(11, 16) : '';
@@ -187,9 +198,9 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   const status = state.paused ? 'paused' : (live ? '● live' : 'file');
   const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
   const lines = [];
-  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(columns)}`));
+  lines.push(clip(`─ ${state.sessionId}${filterBadge} ── ${status} ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
-  lines.push(clip(`─ hypotheses ${'─'.repeat(columns)}`));
+  lines.push(clip(`─ hypotheses ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));
   lines.push(clip('f:filter  s:sessions  tab:focus  space:pause  q:quit'));
   return lines.slice(0, rows).join('\n');
@@ -237,12 +248,12 @@ const main = async () => {
     }
   }
   if (!live) {
-    entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
     if (parsed.forceLive) {
       process.stderr.write('collector not reachable; --live unavailable\n');
       process.exitCode = 1;
       return;
     }
+    entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
   }
   const applyActiveFilter = (current, all) => (
     current.activeFilter ? filterEntries(all, { hypothesisId: current.activeFilter }) : all
@@ -252,6 +263,14 @@ const main = async () => {
     process.stdout.write(`\u001b[2J\u001b[H${renderFrame(state, applyActiveFilter(state, entries), { columns, rows, live })}`);
   };
   process.stdout.write('\u001b[?1049h');
+  // Unconditional restore: covers any uncaught throw (e.g. the poll
+  // fallback below) and external kills so a failure never strands the
+  // terminal on the alternate screen in raw mode; shutdown() below is
+  // the clean path, this is the belt-and-suspenders one.
+  process.on('exit', () => {
+    process.stdout.write('\u001b[?1049l');
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  });
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   const pollTimer = setInterval(async () => {
@@ -266,12 +285,21 @@ const main = async () => {
       // Session retired mid-watch: fall back to the file, visibly.
       live = false;
       tail = null;
-      entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+      try {
+        entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
+      } catch {
+        // Fallback read failed too (collector stopped AND log removed).
+        // setInterval never awaits this callback, so an unhandled
+        // rejection here would kill the process with the alt-screen
+        // still active and raw mode still on — stale evidence beats a
+        // corrupted terminal, so keep the last-known entries instead.
+      }
       paint();
     }
   }, 500);
   const shutdown = () => {
     clearInterval(pollTimer);
+    process.stdout.off('resize', paint);
     process.stdout.write('\u001b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
