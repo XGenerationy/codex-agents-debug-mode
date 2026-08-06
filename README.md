@@ -126,9 +126,18 @@ Every persisted event also passes one fail-closed redaction choke point
 (`createRedactionContext` / `redactEventForAppend`): values of sensitive-named environment
 variables, names listed in `DEBUG_REDACT_NAMES`, and the collector's own tokens can never reach
 a session log in raw or encoded form. The token registry is capped at 512 entries per process —
-the launch token plus up to 511 session mints, failed mints included; at the cap further
-sessions are refused with `session_registry_full`, signaled once on stderr as
-`redaction.registry_full` — restart the collector to reset it.
+the launch token plus up to 511 session mints, only successful mints consume entries (a mint
+that fails setup registers nothing); at the cap further sessions are refused with
+`session_registry_full`, signaled once on stderr as `redaction.registry_full` — restart the
+collector to reset it.
+
+Two launch-token capabilities extend the model: `POST /hypothesis` records
+event-sourced hypothesis status lines through the same append and redaction
+path, and `GET /sessions/:id/logs` serves filtered, verbatim, already-redacted
+NDJSON for live sessions with the append path's own file-identity checks. The
+per-session token keeps exactly one capability: writing events via `POST /log`.
+`GET /health` additionally reports redaction registry headroom counts
+(cardinality only, never token values).
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 

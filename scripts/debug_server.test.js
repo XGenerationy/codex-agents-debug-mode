@@ -4050,3 +4050,645 @@ test('parseRedactNames splits, trims, and drops empty entries', () => {
   assert.deepEqual(parseRedactNames(undefined), []);
   assert.deepEqual(parseRedactNames(''), []);
 });
+
+const postHypothesis = (baseUrl, body, headers = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` }) =>
+  requestJson(baseUrl, { method: 'POST', pathname: '/hypothesis', headers, body });
+
+test('POST /hypothesis appends a redacted, allowlisted, server-stamped line', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, {
+      sessionId: session.session_id,
+      hypothesisId: 'H1',
+      status: 'OPEN',
+      title: 'token supersecretvalue123 leaks',
+      note: 'seen in supersecretvalue123 header',
+      runId: 'r1',
+      extraneous: 'dropped',
+      ts: 'client-supplied-ignored',
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(response.body, { status: 'recorded' });
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(line.type, 'hypothesis');
+    assert.equal(line.hypothesisId, 'H1');
+    assert.equal(line.status, 'OPEN');
+    assert.equal(line.title, 'token [REDACTED] leaks');
+    assert.equal(line.note, 'seen in [REDACTED] header');
+    assert.equal(line.runId, 'r1');
+    assert.equal(Object.hasOwn(line, 'extraneous'), false);
+    assert.equal(Number.isNaN(Date.parse(line.ts)), false);
+    assert.notEqual(line.ts, 'client-supplied-ignored');
+  });
+});
+
+test('POST /hypothesis lifecycle appends event-sourced status lines in order', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await postHypothesis(baseUrl, { session_id: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED', note: 'later' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((entry) => [entry.type, entry.hypothesisId, entry.status]), [
+      ['hypothesis', 'H1', 'OPEN'],
+      ['hypothesis', 'H1', 'CONFIRMED'],
+    ]);
+  });
+});
+
+test('POST /hypothesis validates fields fail-closed with nothing persisted', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const cases = [
+      [{ sessionId: session.session_id, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '   ', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 42, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'MAYBE' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'open' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', title: 42 }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', note: {} }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: [] }, 'invalid_hypothesis_field'],
+    ];
+    for (const [body, code] of cases) {
+      const response = await postHypothesis(baseUrl, body);
+      assert.equal(response.status, 400, code);
+      assert.equal(response.body.error, code);
+    }
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('POST /hypothesis enforces the launch-token capability split both ways', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const withSessionToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      { Authorization: `Bearer ${session.session_token}` },
+    );
+    assert.equal(withSessionToken.status, 401);
+    const withNoToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      {},
+    );
+    assert.equal(withNoToken.status, 401);
+    // /log stays session-token-only: the launch token must NOT write events.
+    const launchOnLog = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: TEST_LAUNCH_TOKEN, msg: 'nope' },
+    });
+    assert.equal(launchOnLog.status, 401);
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('hypothesis lines consume the shared event and byte caps', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const first = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(first.status, 202);
+    const second = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H2', status: 'OPEN' });
+    assert.equal(second.status, 429);
+    assert.equal(second.body.error, 'event_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('hypothesis lines respect the aggregate byte cap', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxTotalBytes: 10 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(response.status, 429);
+    assert.equal(response.body.error, 'storage_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /hypothesis rolls back the event and byte reservation when the append fails', async () => {
+  // Regression guard: a hypothesis reserves eventCount and totalBytes BEFORE
+  // the awaited append (debug_server.js). If appendSessionEvent throws AFTER
+  // that reservation, the catch must restore both counters. We make this
+  // ASSERTION FAIL if the rollback is deleted: both caps are sized for
+  // exactly one hypothesis line, and we retry on the SAME (failed) session.
+  // If the event rollback is missing, session.eventCount stays at 1 and the
+  // cap check runs BEFORE the next append → 429 event_limit_reached (not the
+  // expected 409). If the byte rollback is missing, totalBytes stays
+  // reserved → 429 storage_limit_reached. Either way a missing rollback
+  // changes the second response away from 409 session_log_replaced.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-rollback-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1, maxTotalBytes: 512 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    // Swap the log so appendSessionEvent fails with session_log_replaced
+    // AFTER the hypothesis reserved eventCount=1 / totalBytes=<lineBytes>.
+    await rm(logPath);
+    await writeFile(logPath, '{"forged":"content"}\n');
+    const failed = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(failed.status, 409);
+    assert.equal(failed.body.error, 'session_log_replaced');
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
+    // Discriminator: against the SAME session, with both caps sized for one
+    // line, a leaked reservation surfaces as 429 here. A correctly rolled-
+    // back reservation passes the caps and hits the same swapped-log failure
+    // → 409 session_log_replaced.
+    const retry = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(retry.status, 409);
+    assert.equal(retry.body.error, 'session_log_replaced');
+    // Nothing was persisted by either failed attempt.
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /hypothesis rejects unknown sessions', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const unknown = await postHypothesis(baseUrl, {
+      sessionId: 'debug-nope-000000000000',
+      hypothesisId: 'H1',
+      status: 'OPEN',
+    });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error, 'unknown_session');
+  });
+});
+
+test('hypothesisId is stored trimmed on both /hypothesis and /log (shared join key)', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', hypothesisId: '  H1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: '  H1  ', status: 'OPEN' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.hypothesisId), ['H1', 'H1']);
+  });
+});
+
+test('/log rejects non-string and whitespace-only hypothesisId/runId join keys', async () => {
+  // /hypothesis rejects a whitespace-only hypothesisId (invalid_hypothesis_id);
+  // /log must not let the equivalent through on its join keys either, or an
+  // event with hypothesisId: "" could never join a hypothesis line and would
+  // be silently invisible to GET ?hypothesisId= (empty). Both join keys are
+  // held to the same non-empty-after-trim discipline.
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (body) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e', ...body },
+    });
+    for (const key of ['hypothesisId', 'runId']) {
+      const numeric = await log({ [key]: 42 });
+      assert.equal(numeric.status, 400, `${key} numeric`);
+      assert.equal(numeric.body.error, 'invalid_join_key', `${key} numeric`);
+      const object = await log({ [key]: {} });
+      assert.equal(object.status, 400, `${key} object`);
+      assert.equal(object.body.error, 'invalid_join_key', `${key} object`);
+      const blank = await log({ [key]: '   ' });
+      assert.equal(blank.status, 400, `${key} whitespace`);
+      assert.equal(blank.body.error, 'invalid_join_key', `${key} whitespace`);
+    }
+    // Nothing was persisted by the rejected attempts.
+    const lines = await readSessionLines(projectRoot, session);
+    assert.equal(lines.length, 0);
+  });
+});
+
+test('an invalid join-key request does not refresh session activity', async () => {
+  // Regression guard: POST /log must refresh session.lastActivityAt only AFTER
+  // all payload validation, so a request rejected with invalid_join_key does
+  // not extend the session's idle lifetime. Otherwise a buggy or abusive
+  // authenticated client could keep a session alive forever with bad payloads,
+  // stalling retireInactiveSessions and contributing to maxSessions exhaustion.
+  //
+  // Discriminator design: anchor lastActivityAt with a VALID log at t0, then
+  // fire an INVALID join-key request at t0+gap. Without the bug, retirement is
+  // anchored to t0 → session is gone shortly after t0+idleMs. With the bug, the
+  // invalid request refreshes to t0+gap → session lives until t0+gap+idleMs.
+  // A read between those two deadlines (t0+idleMs .. t0+gap+idleMs)
+  // discriminates: 404 (correct) vs 200 (bug). Verified by mutation: reverting
+  // the fix flips this read to 200.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-joinkey-idle-'));
+  const idleMs = 1500;
+  const gap = 600;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    // t0: a VALID log anchors lastActivityAt. (The session-mint POST also
+    // refreshes it, but mint latency is variable; this explicit valid log
+    // gives a known-late anchor independent of mint cost.)
+    const valid = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'anchor' },
+    });
+    assert.equal(valid.status, 202);
+    const t0 = Date.now();
+    // t0+gap: an authenticated request that fails join-key validation.
+    await new Promise((resolve) => setTimeout(resolve, gap));
+    const rejected = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'x', hypothesisId: '   ' },
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error, 'invalid_join_key');
+    // Wait until just past the t0-anchored deadline (t0+idleMs) but still
+    // well before the bug's extended deadline (t0+gap+idleMs).
+    const remain = (t0 + idleMs + 300) - Date.now();
+    if (remain > 0) await new Promise((resolve) => setTimeout(resolve, remain));
+    const after = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    // Correct (no refresh on invalid): session retired → 404.
+    // Buggy (refreshed on invalid): session still live → 200.
+    assert.equal(after.status, 404);
+    assert.equal(JSON.parse(after.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the instrumented app cannot forge hypothesis lines through /log', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'sneaky',
+        type: 'hypothesis',
+        status: 'CONFIRMED',
+      },
+    });
+    assert.equal(response.status, 202);
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(Object.hasOwn(line, 'type'), false);
+    assert.equal(Object.hasOwn(line, 'status'), false);
+  });
+});
+
+test('events and hypothesis lines interleave in append order with the type discriminator', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (msg) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+    });
+    await log('before');
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await log('after');
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(
+      lines.map((line) => [line.type === 'hypothesis' ? 'hypothesis' : 'event', line.msg ?? line.status]),
+      [['event', 'before'], ['hypothesis', 'OPEN'], ['event', 'after']],
+    );
+  });
+});
+
+const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/', timeoutMs = 30000 } = {}) =>
+  new Promise((resolve, reject) => {
+    const url = new URL(pathname, baseUrl);
+    let settled = false;
+    const request = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method,
+        headers,
+      },
+      (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { text += chunk; });
+        response.on('end', () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status: response.statusCode, headers: response.headers, text });
+        });
+        // A response stream can error after the headers arrive (e.g. a torn
+        // socket mid-body); without this listener neither resolve nor reject
+        // runs and the test hangs until the runner kills it.
+        response.on('error', (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        });
+      },
+    );
+    // Wall-clock bound: an unresponsive server or a lost connection must
+    // fail with the timeout error instead of hanging the whole test run.
+    // Reject DIRECTLY from the timer: request.destroy(error) emits 'error'
+    // synchronously, and the error handler below guards on `settled`, so if
+    // we set settled=true before destroying, nobody would reject and the
+    // promise would hang — the exact failure this timer prevents.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const error = new Error(`requestRaw timeout after ${timeoutMs}ms`);
+      request.destroy(error);
+      reject(error);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    request.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    request.end();
+  });
+
+const LAUNCH_AUTH = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` };
+
+const seedReadableSession = async (baseUrl) => {
+  const session = (await createSession(baseUrl)).body;
+  const log = (body) => requestJson(baseUrl, {
+    method: 'POST',
+    pathname: '/log',
+    body: { sessionId: session.session_id, sessionToken: session.session_token, ...body },
+  });
+  await log({ msg: 'e1', hypothesisId: 'H1', runId: 'r1' });
+  await log({ msg: 'e2', hypothesisId: 'H2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+  await log({ msg: 'e3', runId: 'r2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED' });
+  return session;
+};
+
+test('GET /sessions/:id/logs requires the launch token and serves verbatim NDJSON', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = await seedReadableSession(baseUrl);
+    const noAuth = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs` });
+    assert.equal(noAuth.status, 401);
+    const sessionAuth = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: { Authorization: `Bearer ${session.session_token}` },
+    });
+    assert.equal(sessionAuth.status, 401);
+    const ok = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers['content-type'], 'application/x-ndjson');
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    // Verbatim guarantee: an unfiltered read IS the stored bytes.
+    assert.equal(ok.text, raw);
+    for (const line of ok.text.split('\n').filter(Boolean)) JSON.parse(line);
+  });
+});
+
+test('GET /sessions/:id/logs filters combine and limit is tail-biased', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    const fetchLogs = async (query) => {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 200, query);
+      return res.text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    };
+    assert.deepEqual((await fetchLogs('?type=hypothesis')).map((l) => l.status), ['OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?type=event')).map((l) => l.msg), ['e1', 'e2', 'e3']);
+    assert.deepEqual((await fetchLogs('?hypothesisId=H1')).map((l) => l.msg ?? l.status), ['e1', 'OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?runId=r2')).map((l) => l.msg), ['e3']);
+    assert.deepEqual((await fetchLogs('?type=event&hypothesisId=H1')).map((l) => l.msg), ['e1']);
+    assert.deepEqual((await fetchLogs('?limit=2')).map((l) => l.msg ?? l.status), ['e3', 'CONFIRMED']);
+    const all = await fetchLogs('');
+    const boundary = all[2].ts;
+    const since = await fetchLogs(`?sinceTs=${encodeURIComponent(boundary)}`);
+    assert.equal(since.length >= 3, true);
+    assert.equal(since.every((l) => Date.parse(l.ts) >= Date.parse(boundary)), true);
+    const until = await fetchLogs(`?untilTs=${encodeURIComponent(boundary)}`);
+    assert.equal(until.every((l) => Date.parse(l.ts) <= Date.parse(boundary)), true);
+  });
+});
+
+test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1', '?type=all&type=all', '?limit=1&limit=2']) {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 400, query);
+      assert.equal(JSON.parse(res.text).error, 'invalid_query', query);
+    }
+  });
+});
+
+// NOTE (plan revision): originally one combined test with sessionIdleTimeoutMs: 5 —
+// that retires the session before the swapped-file GET arrives (404 masks the 409),
+// deterministically on slower environments. Split: swapped-identity runs on a
+// default-idle server; retirement gets its own short-idle server.
+test('GET /sessions/:id/logs rejects unknown sessions and swapped log files fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: LAUNCH_AUTH });
+    assert.equal(unknown.status, 404);
+    assert.equal(JSON.parse(unknown.text).error, 'unknown_session');
+    const session = (await createSession(baseUrl)).body;
+    // Swap the log file out from under the recorded identity.
+    const logPath = path.join(projectRoot, session.log_file);
+    await rm(logPath);
+    await writeFile(logPath, '{"msg":"forged"}\n');
+    const swapped = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(swapped.status, 409);
+    assert.equal(JSON.parse(swapped.text).error, 'session_log_replaced');
+  });
+});
+
+test('GET /sessions/:id/logs is live-only: retired sessions return 404', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: 5 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const retired = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(retired.status, 404);
+    assert.equal(JSON.parse(retired.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET /sessions/:id/logs output never contains a raw known secret', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'leak supersecretvalue123' },
+    });
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.includes('supersecretvalue123'), false);
+    assert.equal(res.text.includes('[REDACTED]'), true);
+  });
+});
+
+test('concurrent appends never produce torn GET output', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (i) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: `event-${i} ${'x'.repeat(200)}`,
+      },
+    });
+    await log(0);
+    // Determinism: await a small batch of appends BEFORE issuing any read so
+    // at least one append is provably ahead of every read. The remaining
+    // appends are then issued concurrently with the reads, which still
+    // exercises real interleaving — but the outcome no longer depends on
+    // microtask-enqueue order (which could otherwise let every read land
+    // before the first append and observe only the seeded line).
+    for (let i = 1; i <= 5; i += 1) {
+      await log(i);
+    }
+    const writes = [];
+    const reads = [];
+    for (let i = 6; i <= 30; i += 1) {
+      writes.push(log(i));
+      if (i % 3 === 0) {
+        reads.push(requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH }));
+      }
+    }
+    await Promise.all(writes);
+    // At least one read must observe an appended entry beyond the single
+    // seeded event-0 line, otherwise the test exercises no interleaving and
+    // passes trivially. Counts the parsed lines on each read body.
+    let observedBeyondSeed = false;
+    for (const read of await Promise.all(reads)) {
+      assert.equal(read.status, 200);
+      const lines = read.text.split('\n').filter(Boolean);
+      for (const line of lines) JSON.parse(line);
+      if (read.text.length) assert.equal(read.text.endsWith('\n'), true);
+      if (lines.length > 1) observedBeyondSeed = true;
+    }
+    assert.equal(observedBeyondSeed, true);
+  });
+});
+
+test('GET does not refresh session activity (reads are observers)', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  // The idle budget must comfortably exceed this environment's measured
+  // POST /session cost (~460-730ms of real disk + ACL work): lastActivityAt
+  // is stamped BEFORE that setup work, so a too-small budget can expire
+  // before the first read even dispatches.
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const createdAt = Date.now();
+    const first = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    // Assert the pre-expiry 200 only when we provably raced the budget: on a
+    // pathologically slow environment the property assertion below still holds.
+    if (Date.now() - createdAt < idleMs) assert.equal(first.status, 200);
+    // Keep issuing reads WHILE waiting out the budget: if reads refreshed
+    // lastActivityAt, the session could never retire and the final read
+    // would stay 200 forever.
+    let last = first;
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    }
+    assert.equal(last.status, 404);
+    assert.equal(JSON.parse(last.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['content-type'], 'application/x-ndjson');
+    assert.equal(res.text, '');
+  });
+});
+
+test('runId is stored trimmed on both routes and joins GET filters', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', runId: '  r1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: '  r1  ' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.runId), ['r1', 'r1']);
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs?runId=r1`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.split('\n').filter(Boolean).length, 2);
+  });
+});

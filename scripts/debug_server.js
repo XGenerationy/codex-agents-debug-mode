@@ -629,6 +629,51 @@ const configureOrigin = (request, response, allowedOrigins) => {
 // race each other (a parallel append would otherwise grow the file while a
 // second request still holds a stale identity.bytesWritten and false-positive
 // session_log_replaced).
+
+// Shared log-identity invariant for appendSessionEvent (write path) and the
+// GET /sessions/:id/logs read path. Both open the same session.logFile with
+// no-follow semantics and must reject the SAME replacement shapes with the
+// SAME structured conflict, so a hardening applied to one path can never
+// silently leave the other weaker. The stat is taken on the already-opened
+// handle (the caller is responsible for opening and closing it). Throws
+// RequestError('session_log_replaced', 409) on any mismatch; a null/undefined
+// recorded identity is treated as a replacement (defensive: the field is set
+// at session-mint time, so its absence means the log was never established
+// under our control).
+const verifyLogIdentity = async (session, info) => {
+  const identity = session.logFileIdentity;
+  // dev/ino can survive a delete+recreate through inode reuse, so also
+  // require the recorded birth time (when the filesystem reports one on
+  // both sides) and exactly the byte count this server has appended — a
+  // replacement file starts with different content or an empty size.
+  const sameBirth = !identity?.birthtimeMs || !info.birthtimeMs
+    || info.birthtimeMs === identity.birthtimeMs;
+  // nlink > 1 means the session log was hard-linked to another path after
+  // /session; the token/artifact writers already fail closed on that shape.
+  if (
+    !info.isFile() || !identity
+    || info.nlink > 1
+    || info.dev !== identity.dev || info.ino !== identity.ino
+    || !sameBirth
+    || info.size !== identity.bytesWritten
+  ) {
+    throw new RequestError('session_log_replaced', 409);
+  }
+  // Re-verify the opened log still resolves inside the project even if the
+  // original .debug directory was renamed out and replaced with a symlink
+  // to an outside path (inode can still match the moved tree).
+  if (identity.projectRootReal) {
+    let realLog;
+    try {
+      realLog = await realpath(session.logFile);
+    } catch {
+      throw new RequestError('session_log_replaced', 409);
+    }
+    if (!isInsideRoot(identity.projectRootReal, realLog)) {
+      throw new RequestError('session_log_replaced', 409);
+    }
+  }
+};
 const appendSessionEvent = (session, serializedEvent) => {
   const previous = session.appendChain || Promise.resolve();
   const run = previous.catch(() => {}).then(async () => {
@@ -646,41 +691,9 @@ const appendSessionEvent = (session, serializedEvent) => {
       throw error;
     }
     try {
-      const info = await handle.stat();
-      const identity = session.logFileIdentity;
-      // dev/ino can survive a delete+recreate through inode reuse, so also
-      // require the recorded birth time (when the filesystem reports one on
-      // both sides) and exactly the byte count this server has appended — a
-      // replacement file starts with different content or an empty size.
-      const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
-        || info.birthtimeMs === identity.birthtimeMs;
-      // nlink > 1 means the session log was hard-linked to another path after
-      // /session; the token/artifact writers already fail closed on that shape.
-      if (
-        !info.isFile() || !identity
-        || info.nlink > 1
-        || info.dev !== identity.dev || info.ino !== identity.ino
-        || !sameBirth
-        || info.size !== identity.bytesWritten
-      ) {
-        throw new RequestError('session_log_replaced', 409);
-      }
-      // Re-verify the opened log still resolves inside the project even if the
-      // original .debug directory was renamed out and replaced with a symlink
-      // to an outside path (inode can still match the moved tree).
-      if (identity.projectRootReal) {
-        let realLog;
-        try {
-          realLog = await realpath(session.logFile);
-        } catch {
-          throw new RequestError('session_log_replaced', 409);
-        }
-        if (!isInsideRoot(identity.projectRootReal, realLog)) {
-          throw new RequestError('session_log_replaced', 409);
-        }
-      }
+      await verifyLogIdentity(session, await handle.stat());
       await handle.writeFile(serializedEvent, 'utf8');
-      identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+      session.logFileIdentity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
     } finally {
       await handle.close();
     }
@@ -909,15 +922,26 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
   };
 };
 
+// Valid hypothesis lifecycle statuses (spec:
+// docs/superpowers/specs/2026-08-06-hypothesis-endpoint-design.md). Any
+// status may follow any status — the append-only log preserves the audit
+// trail; only the vocabulary is fixed.
+const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUSIVE']);
+
 /**
  * Build (but do not start) the loopback-only debug-session HTTP collector.
  * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
  * header must match) before any route logic runs. Routes: `GET /health`
- * (unauthenticated identity probe), `POST /session` (requires the launch
- * `token`, creates a session and its append-only NDJSON log under
- * `<projectRoot>/.debug`), and `POST /log` (requires that session's own
- * token — see authorizeRequest — and appends one event line after
- * fail-closed known-secret redaction; see createRedactionContext).
+ * (unauthenticated identity probe), `GET /auth` (unauthenticated
+ * challenge–response HMAC proof used internally for relaunch/port-conflict
+ * detection; not part of the client-facing protocol), `POST /session`
+ * (requires the launch `token`, creates a session and its append-only NDJSON
+ * log under `<projectRoot>/.debug`), `POST /log` (requires that session's
+ * own token — see authorizeRequest — and appends one event line after
+ * fail-closed known-secret redaction; see createRedactionContext),
+ * `POST /hypothesis` (launch token; appends one hypothesis lifecycle line
+ * through the same redaction and append path), and `GET /sessions/:id/logs`
+ * (launch token; filtered verbatim NDJSON read of a live session's log).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
@@ -1379,18 +1403,39 @@ const createDebugServer = ({
         if (typeof payload.msg !== 'string' || payload.msg.trim() === '') {
           throw new RequestError('invalid_message');
         }
-        // Refresh after authentication and message validation, before the
-        // awaited append, so concurrent allocation cannot retire a session
-        // whose valid event is in flight.
-        session.lastActivityAt = Date.now();
         if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
           throw new RequestError('event_limit_reached', 429);
         }
 
         const event = { ts: new Date().toISOString(), msg: payload.msg };
         for (const key of ['data', 'hypothesisId', 'loc', 'runId']) {
-          if (payload[key] !== undefined) event[key] = payload[key];
+          if (payload[key] === undefined) continue;
+          // hypothesisId and runId are the join keys that POST /hypothesis
+          // lines and sub-project B's filters/diff match on byte-exactly;
+          // trim string values here and in /hypothesis so "  H1  " and "H1"
+          // cannot silently become distinct hypotheses. A non-string value
+          // (e.g. hypothesisId: 42 or runId: {}) can never join with a
+          // hypothesis line and is silently invisible to GET ?hypothesisId=42
+          // (the query string is compared with !== against the stored value),
+          // so reject it with the same structured code /hypothesis uses —
+          // silently persisting it would be fail-open by another name. A
+          // whitespace-only value trims to "", which is just as unjoinable and
+          // which /hypothesis already rejects for hypothesisId, so reject it
+          // here too rather than persisting an empty join key.
+          if (key === 'hypothesisId' || key === 'runId') {
+            if (typeof payload[key] !== 'string') throw new RequestError('invalid_join_key');
+            if (payload[key].trim() === '') throw new RequestError('invalid_join_key');
+          }
+          event[key] = (key === 'hypothesisId' || key === 'runId')
+            ? payload[key].trim()
+            : payload[key];
         }
+        // Refresh AFTER all payload validation (msg + join keys) but BEFORE
+        // the awaited append, so concurrent allocation cannot retire a session
+        // whose VALID event is in flight — while an invalid request rejected
+        // below this point does NOT extend the session lifetime and cannot be
+        // abused to stall retireInactiveSessions or exhaust maxSessions.
+        session.lastActivityAt = Date.now();
         // Redact BEFORE serialization and BEFORE capacity reservation: a
         // redaction failure rejects the event with nothing persisted and no
         // reservation to roll back. Byte accounting below intentionally uses
@@ -1417,6 +1462,211 @@ const createDebugServer = ({
           throw error;
         }
         sendJson(response, 202, { status: 'recorded' });
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/hypothesis') {
+        // Hypotheses are agent/operator artifacts: they authenticate with the
+        // LAUNCH token (the capability the operator already holds via
+        // .debug/collector_token), never the per-session token — the
+        // instrumented app keeps exactly one write capability: /log events.
+        // Auth precedes the body read, like /session.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
+        const sessionId = payload.sessionId || payload.session_id;
+        const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        if (typeof payload.hypothesisId !== 'string' || payload.hypothesisId.trim() === '') {
+          throw new RequestError('invalid_hypothesis_id');
+        }
+        const hypothesisId = payload.hypothesisId.trim();
+        if (!HYPOTHESIS_STATUSES.has(payload.status)) {
+          throw new RequestError('invalid_hypothesis_status');
+        }
+        // Optional fields must be strings when present: silently dropping or
+        // coercing a non-string would hide caller bugs (fail-open by another
+        // name), so reject with a structured code instead.
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined && typeof payload[key] !== 'string') {
+            throw new RequestError('invalid_hypothesis_field');
+          }
+        }
+        // Same refresh point as /log: after auth and validation, before the
+        // awaited append, so concurrent retirement cannot race a valid write.
+        session.lastActivityAt = Date.now();
+        if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
+          throw new RequestError('event_limit_reached', 429);
+        }
+        // Server-stamped, allowlisted assembly mirrors /log: ts and type are
+        // never client-controlled, and only known optional fields are copied.
+        const line = {
+          ts: new Date().toISOString(),
+          type: 'hypothesis',
+          hypothesisId,
+          status: payload.status,
+        };
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined) {
+            line[key] = key === 'runId' ? payload[key].trim() : payload[key];
+          }
+        }
+        const redactedLine = redactEventForAppend(line, redaction.replacements());
+        const serializedLine = `${JSON.stringify(redactedLine)}\n`;
+        const lineBytes = Buffer.byteLength(serializedLine);
+        if (totalBytes + lineBytes > effectiveLimits.maxTotalBytes) {
+          throw new RequestError('storage_limit_reached', 429);
+        }
+        session.eventCount += 1;
+        totalBytes += lineBytes;
+        try {
+          await appendSessionEvent(session, serializedLine);
+        } catch (error) {
+          session.eventCount -= 1;
+          totalBytes -= lineBytes;
+          throw error;
+        }
+        sendJson(response, 202, { status: 'recorded' });
+        return;
+      }
+
+      const sessionLogsMatch = request.method === 'GET'
+        ? pathname.match(/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/)
+        : null;
+      if (sessionLogsMatch) {
+        // Reads are a launch-token capability (see POST /hypothesis). The id
+        // is used ONLY as a map key — client input never reaches filesystem
+        // path construction, so there is no traversal surface.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const session = sessions.get(sessionLogsMatch[1]);
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        // Fail-closed query parsing: unknown parameter names are rejected so
+        // a typo cannot silently disable a filter and widen what is returned.
+        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
+        const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        const seenParams = new Set();
+        for (const name of query.keys()) {
+          // Unknown names AND duplicates are rejected: a typo or a stray
+          // repeated parameter must never silently change what is returned.
+          if (!allowedParams.has(name) || seenParams.has(name)) {
+            throw new RequestError('invalid_query');
+          }
+          seenParams.add(name);
+        }
+        const typeFilter = query.get('type') ?? 'all';
+        if (!['all', 'event', 'hypothesis'].includes(typeFilter)) {
+          throw new RequestError('invalid_query');
+        }
+        const parseBound = (name) => {
+          const value = query.get(name);
+          if (value === null) return undefined;
+          const parsed = Date.parse(value);
+          if (Number.isNaN(parsed)) throw new RequestError('invalid_query');
+          return parsed;
+        };
+        const sinceTs = parseBound('sinceTs');
+        const untilTs = parseBound('untilTs');
+        let limit = effectiveLimits.maxEventsPerSession;
+        const rawLimit = query.get('limit');
+        if (rawLimit !== null) {
+          if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1) throw new RequestError('invalid_query');
+          limit = Math.min(Number(rawLimit), effectiveLimits.maxEventsPerSession);
+        }
+        const hypothesisFilter = query.get('hypothesisId')?.trim() ?? undefined;
+        const runFilter = query.get('runId')?.trim() ?? undefined;
+        // Serialize ONLY the identity check + bounded byte read on the
+        // per-session append chain: no append can interleave mid-read, so the
+        // identity check and the byte window are consistent and a torn
+        // trailing line cannot be observed. The chain is released (and the
+        // file handle closed) BEFORE the response is parsed/filtered, so
+        // concurrent /log and POST /hypothesis appends are not blocked while
+        // we scan the captured text. Parsing/filtering operate on a frozen
+        // snapshot: the bytes were identity-checked and read under the chain,
+        // so a concurrent append can only add a NEW line that this snapshot
+        // predates — it cannot mutate already-captured bytes.
+        const previous = session.appendChain || Promise.resolve();
+        const readSnapshot = previous.catch(() => {}).then(async () => {
+          let handle;
+          try {
+            handle = await openNoFollow(session.logFile, constants.O_RDONLY);
+          } catch (error) {
+            if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
+              throw new RequestError('session_log_replaced', 409);
+            }
+            throw error;
+          }
+          try {
+            await verifyLogIdentity(session, await handle.stat());
+            // Read exactly the bytes this server wrote: bytesWritten bounds
+            // the window, so appended-after or truncated content can never
+            // slip in (size was already checked equal inside verifyLogIdentity).
+            const buffer = Buffer.alloc(session.logFileIdentity.bytesWritten);
+            let offset = 0;
+            while (offset < buffer.length) {
+              const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+              if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
+              offset += bytesRead;
+            }
+            return buffer.toString('utf8');
+          } finally {
+            await handle.close();
+          }
+        });
+        // The chain stored on session.appendChain MUST resolve to undefined
+        // (parity with appendSessionEvent): assigning readSnapshot directly
+        // would leave session.appendChain holding the whole decoded log text
+        // until the next append replaces it — up to maxTotalBytes retained
+        // for an idle read-then-sleep session. The caller still awaits
+        // readSnapshot for the text; the chain keeps only the serialization
+        // guarantee, not the payload.
+        session.appendChain = readSnapshot.then(() => undefined, () => undefined);
+        const text = await readSnapshot;
+        // Scan the snapshot tail-first: only the last `limit` matching lines
+        // are kept, so ?limit=1 parses one line instead of walking the whole
+        // (up to maxTotalBytes) log. The output is reversed back into append
+        // order at the end.
+        const tail = [];
+        for (let end = text.length, start = text.lastIndexOf('\n', end - 1);
+          start >= -1 && tail.length < limit;
+          end = start, start = start === -1 ? -2 : text.lastIndexOf('\n', start - 1)) {
+          const rawLine = start === -1 ? text.slice(0, end) : text.slice(start + 1, end);
+          if (!rawLine) continue;
+          // Server-written lines always parse (they were JSON.stringify'd at
+          // append time); a parse failure here would mean identity-checked
+          // bytes changed underneath us and surfaces as internal_error.
+          const parsed = JSON.parse(rawLine);
+          // Lines WITHOUT type are events (spec definition). An unknown future
+          // type must not be swept into ?type=event — it matches only type=all.
+          const lineType = parsed.type === undefined ? 'event' : parsed.type;
+          if (typeFilter !== 'all' && lineType !== typeFilter) continue;
+          if (hypothesisFilter !== undefined && parsed.hypothesisId !== hypothesisFilter) continue;
+          if (runFilter !== undefined && parsed.runId !== runFilter) continue;
+          if (sinceTs !== undefined || untilTs !== undefined) {
+            const lineTs = Date.parse(parsed.ts);
+            if (Number.isNaN(lineTs)) continue;
+            if (sinceTs !== undefined && lineTs < sinceTs) continue;
+            if (untilTs !== undefined && lineTs > untilTs) continue;
+          }
+          tail.push(rawLine);
+        }
+        const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
+        response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        response.end(body);
         return;
       }
 
