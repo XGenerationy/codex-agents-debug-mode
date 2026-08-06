@@ -1161,6 +1161,10 @@ const reduce = (state, key) => {
   // Nullish or shapeless key input is a no-op — never throw on a malformed
   // event, and never mutate state for something that isn't a real key.
   if (!key || typeof key !== 'object') return state;
+  // Ctrl+C must quit from every mode — raw stdin swallows the terminal's
+  // own SIGINT-on-Ctrl+C, so without this check filter-input mode would
+  // trap the user with no way out (plain 'q' just types into the draft).
+  if (key.ctrl && key.name === 'c') return { ...state, quit: true };
   if (state.mode === 'filter-input') {
     if (key.name === 'return') {
       return { ...state, mode: 'normal', activeFilter: state.filterDraft || undefined };
