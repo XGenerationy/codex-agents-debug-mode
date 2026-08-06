@@ -1021,6 +1021,16 @@ test('reduce appends a multi-byte (surrogate-pair) sequence to the filter draft 
   state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
   assert.equal(state.filterDraft, '\u{1F600}');
 });
+
+test('backspace removes a whole surrogate-pair character, never leaving a lone surrogate', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  state = reduce(state, { name: undefined, sequence: 'a' });
+  state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
+  state = reduce(state, { name: 'backspace' });
+  assert.equal(state.filterDraft, 'a');
+  assert.equal(state.filterDraft.isWellFormed(), true);
+});
 ```
 
 - [ ] **Step 2: Run to verify failures**
@@ -1156,7 +1166,10 @@ const reduce = (state, key) => {
       return { ...state, mode: 'normal', activeFilter: state.filterDraft || undefined };
     }
     if (key.name === 'escape') return { ...state, mode: 'normal', filterDraft: '' };
-    if (key.name === 'backspace') return { ...state, filterDraft: state.filterDraft.slice(0, -1) };
+    // Code-point slice, matching the append below — backspacing an astral
+    // character must remove the whole surrogate pair, never split it (a
+    // lone surrogate would poison the committed filter downstream).
+    if (key.name === 'backspace') return { ...state, filterDraft: [...state.filterDraft].slice(0, -1).join('') };
     // Code-point length (not UTF-16 .length) so a single emoji/astral
     // character — a surrogate pair — still counts as one unit, while
     // multi-code-point escape sequences (arrow keys, etc.) are still
@@ -1219,7 +1232,7 @@ module.exports = {
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 13/13 pass. `node --check scripts/debug_viewer.js` clean.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 14/14 pass. `node --check scripts/debug_viewer.js` clean.
 
 - [ ] **Step 5: Commit**
 
@@ -1325,18 +1338,30 @@ test('agent mode --live emits the live session raw lines byte-verbatim', async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('agent mode --live without a running collector fails with one clean line, exit 1', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'viewer-nolive-'));
+  try {
+    const result = await runViewer([root, '--session', 's1', '--live']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'collector_not_running\n');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 ```
 
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js`
-Expected: the three new tests fail (the two renderer tests with `renderFrame` undefined; the --live e2e with the exit-2 "not wired yet" usage error); the remaining 12 prior tests pass.
+Expected: the four new tests fail (the two renderer tests with `renderFrame` undefined; both --live e2e tests with the exit-2 "not wired yet" usage error); the remaining 13 prior tests pass.
 
 - [ ] **Step 3: Implement**
 
 Three implementation moves in this step, in order:
 
-**(a) Wire agent-mode `--live`** (the spec requires both data sources in BOTH frontends). Extend the top-of-file `./debug_evidence` destructured require with `createSessionTail`, `discoverCollector`, `readSessionLive` (alphabetical). Then in `runAgentMode`, replace the entire `if (parsed.forceLive) { ... }` rejection block (the `viewer_usage:--live is not wired yet (Task 4)` one — keep the missing-`--session` guard above it untouched) with:
+**(a) Wire agent-mode `--live`** (the spec requires both data sources in BOTH frontends). Extend the top-of-file `./debug_evidence` destructured require with `createSessionTail`, `discoverCollector`, `readSessionLive` (alphabetical). Also extend the `USAGE` constant so the `--live` mention reads `--live (bare session ids only; .log file paths are file-mode)` — live reads enforce the route's id pattern by design (trust-model separation), and the usage text must make that read as intentional. Then in `runAgentMode`, replace the entire `if (parsed.forceLive) { ... }` rejection block (the `viewer_usage:--live is not wired yet (Task 4)` one — keep the missing-`--session` guard above it untouched) with:
 
 ```js
   if (parsed.forceLive) {
@@ -1480,7 +1505,7 @@ Move the `applyActiveFilter` const ABOVE `paint` (it is referenced there). Expor
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 15/15 pass (13 from Task 3, minus the retired rejection test, plus 3 new). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
+Run: `node --test --test-concurrency=1 scripts/debug_viewer.test.js` — 17/17 pass (14 from Task 3 and its fix rounds, minus the retired rejection test, plus 4 new). `node --check scripts/debug_viewer.js` clean. NOTE: step (a) makes the Task 3 test `agent mode rejects --live as not wired until Task 4, exit 2` obsolete — DELETE that test in Step 1 (the new --live e2e supersedes its coverage; Task 4 is the task it was waiting for) and mention the deletion in the commit body. Manual smoke (optional, report if run): `node scripts/debug_viewer.js <root> --session <id>` in a real terminal.
 
 - [ ] **Step 5: Commit**
 

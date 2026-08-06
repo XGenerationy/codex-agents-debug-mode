@@ -154,3 +154,13 @@ test('reduce appends a multi-byte (surrogate-pair) sequence to the filter draft 
   state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
   assert.equal(state.filterDraft, '\u{1F600}');
 });
+
+test('backspace removes a whole surrogate-pair character, never leaving a lone surrogate', () => {
+  let state = createInitialState({ sessionId: 's1' });
+  state = reduce(state, { name: 'f' });
+  state = reduce(state, { name: undefined, sequence: 'a' });
+  state = reduce(state, { name: undefined, sequence: '\u{1F600}' });
+  state = reduce(state, { name: 'backspace' });
+  assert.equal(state.filterDraft, 'a');
+  assert.equal(state.filterDraft.isWellFormed(), true);
+});

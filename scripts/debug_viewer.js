@@ -123,7 +123,10 @@ const reduce = (state, key) => {
       return { ...state, mode: 'normal', activeFilter: state.filterDraft || undefined };
     }
     if (key.name === 'escape') return { ...state, mode: 'normal', filterDraft: '' };
-    if (key.name === 'backspace') return { ...state, filterDraft: state.filterDraft.slice(0, -1) };
+    // Code-point slice, matching the append below — backspacing an astral
+    // character must remove the whole surrogate pair, never split it (a
+    // lone surrogate would poison the committed filter downstream).
+    if (key.name === 'backspace') return { ...state, filterDraft: [...state.filterDraft].slice(0, -1).join('') };
     // Code-point length (not UTF-16 .length) so a single emoji/astral
     // character — a surrogate pair — still counts as one unit, while
     // multi-code-point escape sequences (arrow keys, etc.) are still
