@@ -909,6 +909,22 @@ const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { max
   };
 };
 
+// process.stderr is process-global, so the no-op 'error' listener that keeps
+// an async stderr failure (EPIPE on a piped stream) from crashing the process
+// must be attached at most once across the whole process lifetime — NOT once
+// per createDebugServer() instance. A per-server guard would let multiple
+// servers (tests, embedders, hot reload) each add another listener to the same
+// global stream, producing MaxListenersExceededWarning noise and retaining
+// memory per dead server. This module-level flag is shared by every server.
+let stderrErrorListenerAttachedGlobal = false;
+const ensureStderrErrorListener = () => {
+  if (stderrErrorListenerAttachedGlobal) return;
+  stderrErrorListenerAttachedGlobal = true;
+  // No-op listener: swallows async stream errors (EPIPE, etc.) so they never
+  // become uncaughtException. Added exactly once for the process lifetime.
+  process.stderr.on('error', () => {});
+};
+
 /**
  * Build (but do not start) the loopback-only debug-session HTTP collector.
  * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
@@ -986,18 +1002,13 @@ const createDebugServer = ({
   // process.stderr.write can fail two ways: a synchronous throw (destroyed
   // stream) and an asynchronous 'error' event (EPIPE on a piped stderr that
   // surfaces after the write returns). With no 'error' listener, the async
-  // kind would crash the process as an uncaughtException. Attach a no-op
-  // 'error' listener once so either failure mode is absorbed, and use the
-  // write callback as a second net so a callback-reported error never throws.
-  let stderrErrorListenerAttached = false;
+  // kind would crash the process as an uncaughtException. ensureStderrError
+  // Listener() attaches a no-op listener exactly once for the whole process
+  // (module-level guard, so multiple servers don't accumulate listeners on
+  // the global stream), and the write callback is a second net so a
+  // callback-reported error never throws.
   const writeStderrBestEffort = (line) => {
-    if (!stderrErrorListenerAttached) {
-      stderrErrorListenerAttached = true;
-      // No-op listener: swallows async stream errors (EPIPE, etc.) so they
-      // never become uncaughtException. Re-added only on the first call, so
-      // adding is idempotent across the process lifetime.
-      process.stderr.on('error', () => {});
-    }
+    ensureStderrErrorListener();
     try {
       process.stderr.write(line, () => {});
     } catch {

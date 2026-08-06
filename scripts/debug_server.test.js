@@ -3951,16 +3951,20 @@ test('a stderr write failure cannot break an otherwise-successful /session mint'
   try {
     // Mint 3 sessions (tokens 2,3,4): under the threshold, no warning yet.
     for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
-    // Replace stderr.write with a function that throws, simulating a broken
-    // stream, for the 4th mint that registers the 5th token (>= threshold).
-    // Count invocations so the test cannot pass if the headroom signal ever
-    // stops firing on this mint (a threshold/constant change would otherwise
-    // leave the 201 assertion true but exercising nothing).
+    // Replace stderr.write with a SELECTIVE stub: only the headroom warning
+    // line ("event":"redaction.registry_headroom") throws and is counted, so
+    // the counter is specific to that emission. Other stderr writes during the
+    // mint delegate to the real stream and don't inflate the count — this is a
+    // regression guard that must fail if the headroom warning stops firing at
+    // the threshold mint, even if some unrelated code starts writing to stderr.
     const originalWrite = process.stderr.write;
-    let writeAttempts = 0;
-    process.stderr.write = (_chunk, _cb) => {
-      writeAttempts += 1;
-      throw new Error('simulated broken stderr (EPIPE)');
+    let headroomAttempts = 0;
+    process.stderr.write = (chunk, ...rest) => {
+      if (typeof chunk === 'string' && chunk.includes('"event":"redaction.registry_headroom"')) {
+        headroomAttempts += 1;
+        throw new Error('simulated broken stderr (EPIPE)');
+      }
+      return originalWrite.call(process.stderr, chunk, ...rest);
     };
     let mintStatus;
     try {
@@ -3969,11 +3973,12 @@ test('a stderr write failure cannot break an otherwise-successful /session mint'
     } finally {
       process.stderr.write = originalWrite;
     }
-    // The mint must succeed despite the stderr write throwing.
+    // The mint must succeed despite the headroom stderr write throwing.
     assert.equal(mintStatus, 201);
-    // Pin that the throwing write actually ran; otherwise this test passes
-    // even when the headroom signal never fires.
-    assert.equal(writeAttempts >= 1, true, 'the stderr write must have been attempted');
+    // Pin that the headroom warning specifically was attempted (exactly once:
+    // one-shot, like the registry-full signal). A broad write counter could
+    // pass on an unrelated stderr write; this cannot.
+    assert.equal(headroomAttempts, 1, 'the headroom warning stderr write must fire exactly once');
   } finally {
     await close(server);
     await rm(projectRoot, { recursive: true, force: true });
