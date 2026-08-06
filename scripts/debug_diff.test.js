@@ -278,6 +278,22 @@ test('rendered markdown/table escape the hypothesis id itself, not just msg/note
   assert.equal(borderedLines.length, 5);
 });
 
+test('a pipe-bearing id cannot mimic table cell borders', () => {
+  const pipeId = 'H1 │ CONFIRMED │ CONFIRMED │ 9';
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: pipeId, status: 'OPEN' }),
+  );
+  const diff = computeDiff(before, []);
+  const table = renderTable(diff);
+  const dataRows = table.split('\n').filter((l) => l.startsWith('│') && !l.includes('id'));
+  // The only │ characters in a data row are the four real column borders —
+  // the id's own pipes render as ¦, so a crafted id cannot fake columns.
+  for (const row of dataRows) {
+    assert.equal([...row].filter((ch) => ch === '│').length, 5);
+    assert.equal(row.includes('¦'), true);
+  }
+});
+
 test('computeDiff quantifies events excluded by malformed hypothesis ids, and human renderers state both counts', () => {
   // The diff's whole point is event deltas — silently dropping the events
   // bucketed under a malformed id (alongside the id itself) would hide

@@ -1853,6 +1853,22 @@ test('rendered markdown/table escape the hypothesis id itself, not just msg/note
   assert.equal(borderedLines.length, 5);
 });
 
+test('a pipe-bearing id cannot mimic table cell borders', () => {
+  const pipeId = 'H1 │ CONFIRMED │ CONFIRMED │ 9';
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: pipeId, status: 'OPEN' }),
+  );
+  const diff = computeDiff(before, []);
+  const table = renderTable(diff);
+  const dataRows = table.split('\n').filter((l) => l.startsWith('│') && !l.includes('id'));
+  // The only │ characters in a data row are the four real column borders —
+  // the id's own pipes render as ¦, so a crafted id cannot fake columns.
+  for (const row of dataRows) {
+    assert.equal([...row].filter((ch) => ch === '│').length, 5);
+    assert.equal(row.includes('¦'), true);
+  }
+});
+
 test('computeDiff quantifies events excluded by malformed hypothesis ids, and human renderers state both counts', () => {
   // The diff's whole point is event deltas — silently dropping the events
   // bucketed under a malformed id (alongside the id itself) would hide
@@ -2013,9 +2029,12 @@ const statusOr = (status) => status ?? '—';
 // escaped literal form (a real newline becomes the two printable
 // characters "\" + "n", never an actual line break); backticks are handled
 // separately since JSON.stringify does not touch them and this text can
-// land inside a backtick code span. JSON output needs none of this —
-// JSON.stringify(diff, ...) already escapes everything correctly there.
-const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`');
+// land inside a backtick code span, and the box-drawing pipe `│` becomes
+// `¦` so a crafted id cannot mimic table cell borders — the docs promise
+// report structure NEVER reflects log content, without qualification.
+// JSON output needs none of this — JSON.stringify(diff, ...) already
+// escapes everything correctly there.
+const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`').replaceAll('│', '¦');
 
 // Hypothesis ids are short identifiers by convention; 40 chars comfortably
 // fits real-world ids while keeping the bordered table readable if an
@@ -2167,7 +2186,7 @@ module.exports = { computeDiff, renderJson, renderMarkdown, renderTable };
 
 - [ ] **Step 4: Verify green**
 
-Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 15/15 pass. `node --check scripts/debug_diff.js` clean.
+Run: `node --test --test-concurrency=1 scripts/debug_diff.test.js` — 16/16 pass. `node --check scripts/debug_diff.js` clean.
 
 Post-review hardening (same Task 5 scope, folded into the fenced blocks above):
 report-forgery escaping (`escapeText`) for stored msg/note/title in both human

@@ -124,9 +124,12 @@ const statusOr = (status) => status ?? '—';
 // escaped literal form (a real newline becomes the two printable
 // characters "\" + "n", never an actual line break); backticks are handled
 // separately since JSON.stringify does not touch them and this text can
-// land inside a backtick code span. JSON output needs none of this —
-// JSON.stringify(diff, ...) already escapes everything correctly there.
-const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`');
+// land inside a backtick code span, and the box-drawing pipe `│` becomes
+// `¦` so a crafted id cannot mimic table cell borders — the docs promise
+// report structure NEVER reflects log content, without qualification.
+// JSON output needs none of this — JSON.stringify(diff, ...) already
+// escapes everything correctly there.
+const escapeText = (value) => JSON.stringify(String(value)).slice(1, -1).replaceAll('`', '\\`').replaceAll('│', '¦');
 
 // Hypothesis ids are short identifiers by convention; 40 chars comfortably
 // fits real-world ids while keeping the bordered table readable if an
