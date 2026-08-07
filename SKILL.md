@@ -541,6 +541,44 @@ Record status transitions (`OPEN`, `CONFIRMED`, `REJECTED`, `INCONCLUSIVE`) via
    passing evidence, an independent live review attestation, a clean post-GitHub repository seal,
    and no known residual risk or active suppression marker.
 
+## Analyze & Verify Tooling
+
+Phase 5 (Analyze) — watch and filter a session:
+
+```bash
+# Human: layout-C TUI (stream over hypothesis verdict table)
+node /path/to/debug/scripts/debug_viewer.js "$PROJECT" --session <id>
+# Agent: same filters, verbatim NDJSON on stdout (auto-selected when piped)
+node /path/to/debug/scripts/debug_viewer.js "$PROJECT" --session <id> --hypothesis H1 --type event --json
+```
+
+Phase 7 (Verify) — compare before-fix and after-fix sessions per hypothesis:
+
+```bash
+# Piped default is stable schema:1 JSON (never scrape the table)
+node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT"
+# PR-ready markdown
+node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT" --format=md
+```
+
+Guarantees both tools keep (enforced by tests):
+
+- Agent-mode viewer output is byte-verbatim stored NDJSON; `--live` reads the running
+  collector (bare session ids only — `.log` paths are file-mode) with filter semantics
+  test-guaranteed identical to `GET /sessions/:id/logs`.
+- The diff reports recorded verdict transitions and deterministic deltas (event counts,
+  disappeared messages) only — it never classifies severity or infers failures.
+  `disappeared` is an exact-string set difference, capped at 20 per hypothesis with the
+  remainder counted in `disappearedTruncated`; untagged events are their own bucket,
+  never merged into a hypothesis.
+- `schema: 1` JSON is the agent contract; the diff's table/markdown and the viewer TUI are
+  the human surfaces. All three escape untrusted log text — `msg`/`note`/`title`, hypothesis
+  ids, and control characters — through a shared core helper, so report/screen structure
+  always reflects the engine, never log content; agent outputs (byte-verbatim NDJSON,
+  `schema: 1` JSON) carry source values unmodified. Malformed (non-string) hypothesis ids are
+  excluded, counted in `summary.ignoredMalformedIds`, with their events excluded from totals
+  and counted in `summary.ignoredMalformedEvents` — the decision-relevant number.
+
 ## Troubleshooting
 
 | Issue | Solution |

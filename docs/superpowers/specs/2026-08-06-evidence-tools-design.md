@@ -1,0 +1,214 @@
+# Evidence Tools — debug_viewer + debug_diff — Design (Sub-project B)
+
+**Date:** 2026-08-06
+**Status:** Approved (design dialogue in session; layout, formats, and build shape chosen by maintainer)
+**Components:** `scripts/debug_evidence.js` (new shared core), `scripts/debug_viewer.js` (new),
+`scripts/debug_diff.js` (new)
+**Roadmap:** cycle 2, sub-project B — consumes sub-project A (hypothesis lifecycle lines +
+`GET /sessions/:id/logs`, merged in PR #3). Branch: `feat/evidence-tools` off
+`codex/publish-debug-skill` (`112a0de`).
+
+## Problem
+
+Session evidence is now first-class (typed NDJSON with recorded hypothesis verdicts) but the
+only consumers are `cat` and hand-rolled greps. Phase 5 (Analyze) needs a filterable live
+view; Phase 7 (Verify) needs a per-hypothesis before/after comparison. Both humans and agents
+consume this — the maintainer works across multiple agent harnesses and requires every
+human-facing interface to keep an agent-consumable mode.
+
+## Decisions already made (maintainer-approved)
+
+- Viewer form factor: terminal TUI + agent mode (one filter engine, two frontends).
+- TUI layout: **C — full-width stream over a full-width hypothesis verdict table** (session
+  switching via key overlay, not a persistent pane).
+- Diff formats: **table, markdown, and JSON all ship** from one engine; the no-flag default is
+  **TTY-aware — table when interactive, JSON when piped** (agents never scrape tables);
+  `--format=table|md|json` overrides.
+- Build shape: **B1 — one shared evidence core + two thin CLIs** (rejected: self-contained
+  duplicating tools — filter drift; one merged binary — conflated interaction models).
+- Data sources: both direct file reads (history) and the live GET endpoint, from day one.
+- Verdicts come only from recorded hypothesis lines — no inference (sub-project A decision).
+
+## Shared core — `scripts/debug_evidence.js` (zero dependencies)
+
+One module owns everything both tools must agree on:
+
+- **`readSessionFile(filePath)`** — read a session log from disk; returns ordered entries
+  `{raw, parsed}` (raw stored line preserved for verbatim re-emit; incomplete trailing line
+  dropped).
+- **`readSessionLive({port, token, sessionId, filters, timeoutMs})`** — fetch
+  `GET /sessions/:id/logs` from the local collector (loopback only) with the launch token;
+  same `{raw, parsed}` shape. The session id is validated against the route's own id
+  pattern BEFORE any request (`invalid_session_ref`) — a crafted id must never reach URL
+  path construction (a `..`-bearing id can otherwise normalize onto another route and
+  return non-log JSON as "evidence"). Join-key filters go through the same normalization
+  `filterEntries` uses (trim; non-string → `invalid_filter:*`) so live and local paths
+  cannot diverge on error behavior. A response timeout (`live_read_timeout`, default 5s)
+  and a response-error handler make silent hangs impossible — a frozen tail must fail
+  loudly, never freeze quietly. Collector discovery reads `.debug/collector_port` and
+  `.debug/collector_token` relative to the project root, failing closed with structured
+  codes: `collector_not_running` (missing material), `collector_port_invalid`
+  (non-`/^\d+$/` port), `collector_token_invalid` (empty token).
+- **`filterEntries(entries, {hypothesisId, type, sinceTs, untilTs, runId, limit})`** —
+  semantics IDENTICAL to the GET route's: `type` `all|event|hypothesis` with "no `type` field
+  = event" and unknown future types matching only `all`; inclusive `Date.parse` bounds with
+  NaN-`ts` lines excluded only when a time filter is present; `hypothesisId`/`runId`
+  filter values mirror the route's read-side handling — trimmed before comparison (the
+  GET route trims query values; stored values are also trimmed at write time by
+  sub-project A) and fail closed (`invalid_filter:*`) on non-string values; tail-biased
+  `limit` (unclamped — collector-written files cannot exceed the server cap, recorded as
+  a parity-test expectation note).
+  A **parity test** runs the same scenario through this function and through a live server's
+  GET and asserts identical emitted lines — the single source of truth is enforced, not
+  assumed.
+- **`foldHypotheses(entries)`** — derive per-hypothesis state from lifecycle lines:
+  latest-wins `status`/`note`/`ts`, first non-empty `title`, plus full ordered history.
+  File order is the tiebreak for same-millisecond lines (guaranteed by the collector's
+  append chain).
+- **`listSessions(projectRoot)` / `resolveSessionRef(projectRoot, ref)`** — enumerate
+  `.debug/debug-*.log`; accept a session id or a direct file path. Bare session ids are
+  validated with the route's own `/^[A-Za-z0-9_-]+$/` pattern before any path
+  construction (`invalid_session_ref` otherwise) — ids may arrive from network
+  responses or config, so traversal is closed here, not in each consumer. A missing
+  `.debug` directory is a normal fresh-repo state: `listSessions` returns `[]` on
+  ENOENT and rethrows anything else.
+- **Live tail = poll-by-count**: re-fetch and emit only entries beyond the count already
+  seen. No timestamp cursors, no same-millisecond dedupe hazards. Accepted cost model:
+  each poll re-downloads the full unfiltered log — O(n) per poll, bounded by the
+  collector's `maxTotalBytes` cap and the read timeout; poll intervals are chosen with
+  this in mind. The `seen` counter advances only after a successful fetch, so a failed
+  poll can never cause a gap or double-emit. When a watched live
+  session retires (GET starts returning 404 `unknown_session`) the caller falls back to the
+  file transparently and surfaces that the stream is no longer live.
+- Fail-closed error surfacing: 401 (bad/missing launch token), 404 (unknown/retired), 409
+  (`session_log_replaced`) are distinct, actionable errors — never swallowed.
+
+## `scripts/debug_viewer.js`
+
+- **Mode selection:** stdout TTY → TUI; non-TTY or `--json`/`--plain` → agent mode.
+- **Agent mode:** apply the same filters, print the RAW stored lines (verbatim contract
+  preserved end to end), exit 0. `--json` and `--plain` are synonyms today (lines are
+  already NDJSON); both exist so intent reads clearly in scripts.
+- **TUI (layout C):** full-width stream (auto-tail, verdict lines highlighted `◆`), then a
+  full-width hypothesis table (id, status, title/note, last-update time), then a key bar.
+  Keys: `f` edit filter, `tab` focus stream/table (scroll focused region), `space`
+  pause/resume tail, `q` quit. ANSI alternate screen + raw-mode stdin, resize-aware. No
+  curses dependency. (A session-picker overlay is a documented future addition; it returns
+  to the key bar once `renderFrame` implements its rendering. It is intentionally absent
+  from the initial implementation so no advertised key is a dead control.)
+- **Testability by design:** the TUI's state transitions are pure reducers
+  (`(state, key) → state`) covered by unit tests; only the thin ANSI painter is exempt from
+  CI (documented). Agent mode is covered end-to-end by spawning the real CLI.
+- **Crash safety and single-flight polling (review decisions):** the live tail is driven by
+  a self-rescheduling `setTimeout` that schedules the next poll only after the prior poll
+  settles, so a slow collector can never overlap polls (createSessionTail additionally
+  deduplicates concurrent `poll()` callers via an in-flight promise). The poll's
+  file-fallback read is guarded (on failure, keep last-known entries: stale evidence beats
+  a corrupted terminal), and a `process.on('exit')` hook unconditionally leaves the
+  alternate screen and restores cooked mode so no failure mode strands the terminal.
+  Ctrl+C quits from every mode (raw stdin swallows ISIG). Frame clipping is code-point-safe
+  (never emits a lone surrogate); display-width handling (CJK/emoji double-width) is
+  explicitly out of scope for a zero-dependency tool. A live-read failure that is not
+  `collector_not_running` is surfaced on stderr before the file fallback rather than
+  silently downgrading, so auth/session/port/token errors are visible.
+- **CLI:** `node debug_viewer.js [projectRoot] --session <id|path> [--hypothesis <id>]
+  [--type all|event|hypothesis] [--since <ISO>] [--until <ISO>] [--run <id>] [--limit <n>]
+  [--live|--file] [--json|--plain]`. `--live` and `--file` are mutually exclusive. Without
+  `--session` in TUI mode, the most recent session under `.debug` is selected; in agent
+  mode, exit with a usage error (agents must be explicit).
+
+## `scripts/debug_diff.js`
+
+- **CLI:** `node debug_diff.js <beforeRef> <afterRef> [projectRoot]
+  [--format=table|md|json]`. Refs are session ids or file paths. Default format: TTY-aware
+  (table interactive, JSON piped).
+- **Engine (deterministic, no inference):** for the union of hypothesis ids across both
+  sessions — `statusBefore → statusAfter` (from recorded lifecycle lines; `—` when absent),
+  per-hypothesis event counts before/after, and **disappeared messages**: distinct event
+  `msg` texts present in the before-session and absent in the after-session, scoped to that
+  hypothesis's events (plus an unscoped bucket for untagged events), capped per hypothesis
+  with the cap stated in the output. **No severity/failure classification** — deciding what
+  counts as a failure would be pattern-guessing; the report presents recorded verdicts and
+  deterministic deltas only.
+- **JSON output carries `schema: 1`** — a stable, versioned contract for agents, CI gates,
+  and the closeout runner. Table and markdown render the same engine result; markdown uses
+  per-hypothesis sections with verdict transitions, suitable for PR comments.
+- **Rendered log content is escaped (review decision, extended at final review):**
+  `msg`/`note`/`title` values AND hypothesis ids are untrusted (the collector accepts any
+  non-empty trimmed string as an id — no character restrictions — and `JSON.parse`
+  rehydrates stored `\uXXXX` escapes into REAL control characters, so parsed values can
+  carry newlines and ANSI/ESC). Every HUMAN render surface — the diff's table and
+  markdown AND the viewer TUI frame — routes interpolated parsed fields through one
+  shared core helper (`escapeEvidenceText` in `debug_evidence.js`; the helper lives in
+  the core precisely so sibling renderers cannot drift), with diff-specific backtick and
+  box-pipe neutralization layered on top. Ids are escaped before truncation/padding so
+  column widths measure printed text. Report/screen structure must reflect the engine,
+  never log content. Agent outputs (byte-verbatim NDJSON, `schema: 1` JSON) never use
+  it — they carry source values unmodified.
+- **String-id contract (review decision):** the engine's id union keeps only non-empty
+  string ids. Pre-validation logs (a realistic before-ref) may carry non-string or missing
+  hypothesis ids; those records are excluded from the union, counted in
+  `summary.ignoredMalformedIds` (distinct malformed keys) AND
+  `summary.ignoredMalformedEvents` (event lines excluded from all totals under those keys)
+  — both always present, 0 default, still `schema: 1` — and stated together in the human
+  renderers when nonzero. The diff's whole point is event deltas, so excluded evidence is
+  quantified, not just keyed. Exclusion is counted and stated, never silent.
+- **Diff CLI is fail-closed like the viewer (review decision):** unknown flags, duplicate
+  `--format`, and the space-separated `--format md` form are usage errors (exit 2;
+  `--format=<value>` is this tool's canonical form). Read errors name WHICH ref failed
+  (before vs after) plus the ref itself, exit 1, nothing on stdout.
+
+## Error handling
+
+| Case | Behavior |
+|---|---|
+| Unknown session ref (file absent, GET 404) | exit 1 with a distinct message naming the ref; viewer TUI shows it inline |
+| Live GET 401 | exit 1: launch token missing/mismatched (`.debug/collector_token`) |
+| Live GET 409 `session_log_replaced` | exit 1, surfaced verbatim — evidence integrity failure is never softened |
+| Live GET stalls (server accepts, never responds / dies mid-body) | `live_read_timeout` (default 5s) — a tail fails loudly, never freezes silently |
+| Collector material missing / port or token file corrupt | `collector_not_running` / `collector_port_invalid` / `collector_token_invalid` |
+| Live session retires mid-watch | automatic file fallback + visible "no longer live" state |
+| Agent mode without `--session` | usage error, exit 2 (agents must be explicit) |
+| Malformed stored line encountered by the core | fail closed: name the line number, exit 1 (never skip silently) |
+| Bare session id failing `/^[A-Za-z0-9_-]+$/` | `invalid_session_ref` before any path construction (traversal closed in the core) |
+
+## Testing (no new dependencies; hermetic — explicit `redactionEnv: {}` wherever a server spins)
+
+1. Core filter parity with the live GET route (same seeded scenario → identical lines),
+   including padded filter values — clean fixtures alone cannot detect trim divergence.
+2. Core folding: latest-wins, first-title retention, trimmed join keys, same-ms file-order
+   tiebreak, full history preservation.
+3. Poll-by-count tail: no duplicates, no gaps across three poll rounds with interleaved
+   appends.
+4. Viewer agent mode e2e: spawn the real CLI piped with filter flags → exact expected NDJSON;
+   non-TTY default selection; usage error without `--session`.
+5. Viewer reducers: key-by-key state transitions (filter entry, focus, pause, picker).
+6. Diff engine fixtures: verdict transitions, absent-before/absent-after hypotheses,
+   disappeared-message scoping and cap.
+7. Renderer exact-string tests for table, markdown, and JSON (including `schema: 1` and the
+   TTY-aware default selection logic).
+8. Error paths: unknown ref, wrong token, retired-session fallback, malformed line.
+9. Full-suite regression: all existing tests stay green; `npm run validate` passes with the
+   three new payload files.
+
+## Documentation
+
+- SKILL.md: an "Analyze & Verify tooling" subsection — viewer usage for Phase 5 (TUI and
+  agent-mode examples) and diff usage for Phase 7, including the TTY-aware defaults.
+- README: tools blurb under the collector section.
+- This spec carries the decision records listed above.
+
+## Non-goals
+
+- No WebSocket/SSE streaming (parked backlog item) — poll-by-count is the mechanism.
+- No web dashboard, no annotations/editing from the viewer, no cross-session search.
+- No severity, failure, or PII heuristics anywhere in the pipeline.
+- No `--format` for the viewer (it emits raw NDJSON in agent mode, period).
+
+## Success criteria
+
+- All nine test groups pass on Windows and Linux CI via `npm test`; validator PASS with the
+  three new files in the payload.
+- The parity test proves core filters and GET filters cannot drift.
+- Agent mode output is byte-identical to the stored lines it selects.
+- The diff JSON schema is stable, versioned, and consumed without scraping.

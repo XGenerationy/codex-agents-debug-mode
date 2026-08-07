@@ -1,0 +1,456 @@
+const assert = require('node:assert/strict');
+const { mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
+const http = require('node:http');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const {
+  escapeEvidenceText,
+  filterEntries,
+  foldHypotheses,
+  listSessions,
+  parseSessionText,
+  readSessionFile,
+  resolveSessionRef,
+} = require('./debug_evidence');
+
+const line = (object) => `${JSON.stringify(object)}\n`;
+
+const FIXTURE =
+  line({ ts: '2026-08-06T10:00:01.000Z', msg: 'e1', hypothesisId: 'H1', runId: 'r1' })
+  + line({ ts: '2026-08-06T10:00:02.000Z', msg: 'e2', hypothesisId: 'H2' })
+  + line({ ts: '2026-08-06T10:00:03.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN', title: 'null id' })
+  + line({ ts: '2026-08-06T10:00:04.000Z', msg: 'e3', runId: 'r2' })
+  + line({ ts: '2026-08-06T10:00:05.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'CONFIRMED', note: 'proven' });
+
+test('parseSessionText yields raw+parsed entries and drops nothing silently', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.equal(entries.length, 5);
+  assert.equal(entries[0].parsed.msg, 'e1');
+  assert.equal(entries[0].raw, JSON.stringify({ ts: '2026-08-06T10:00:01.000Z', msg: 'e1', hypothesisId: 'H1', runId: 'r1' }));
+});
+
+test('parseSessionText fails closed on a malformed line, naming the line number', () => {
+  assert.throws(
+    () => parseSessionText('{"ok":1}\nnot-json\n'),
+    /malformed_session_line:2/,
+  );
+});
+
+test('parseSessionText fails closed on a JSON-valid line that is not an object', () => {
+  // JSON.parse accepts null, numbers, and arrays; each would otherwise reach
+  // filterEntries/foldHypotheses as a non-object they dereference unguarded,
+  // throwing a raw TypeError instead of the structured malformed_session_line
+  // contract.
+  assert.throws(() => parseSessionText('{"ok":1}\nnull\n'), /malformed_session_line:2/);
+  assert.throws(() => parseSessionText('42\n'), /malformed_session_line:1/);
+  assert.throws(() => parseSessionText('[1,2]\n'), /malformed_session_line:1/);
+});
+
+test('readSessionFile ignores an incomplete trailing line (torn tail)', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'evidence-'));
+  try {
+    const file = path.join(dir, 'debug-s1.log');
+    await writeFile(file, `${FIXTURE}{"ts":"2026-08-06T10:00:06.000Z","msg":"torn`, 'utf8');
+    const entries = await readSessionFile(file);
+    assert.equal(entries.length, 5);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('filterEntries mirrors the GET route semantics', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.deepEqual(filterEntries(entries, {}).map((e) => e.parsed.msg ?? e.parsed.status), ['e1', 'e2', 'OPEN', 'e3', 'CONFIRMED']);
+  assert.deepEqual(filterEntries(entries, { type: 'hypothesis' }).map((e) => e.parsed.status), ['OPEN', 'CONFIRMED']);
+  assert.deepEqual(filterEntries(entries, { type: 'event' }).map((e) => e.parsed.msg), ['e1', 'e2', 'e3']);
+  assert.deepEqual(filterEntries(entries, { hypothesisId: 'H1' }).map((e) => e.parsed.msg ?? e.parsed.status), ['e1', 'OPEN', 'CONFIRMED']);
+  assert.deepEqual(filterEntries(entries, { runId: 'r2' }).map((e) => e.parsed.msg), ['e3']);
+  assert.deepEqual(filterEntries(entries, { type: 'event', hypothesisId: 'H1' }).map((e) => e.parsed.msg), ['e1']);
+  assert.deepEqual(filterEntries(entries, { limit: 2 }).map((e) => e.parsed.msg ?? e.parsed.status), ['e3', 'CONFIRMED']);
+  assert.deepEqual(
+    filterEntries(entries, { sinceTs: '2026-08-06T10:00:03.000Z' }).map((e) => e.parsed.msg ?? e.parsed.status),
+    ['OPEN', 'e3', 'CONFIRMED'],
+  );
+  assert.deepEqual(
+    filterEntries(entries, { untilTs: '2026-08-06T10:00:02.000Z' }).map((e) => e.parsed.msg),
+    ['e1', 'e2'],
+  );
+});
+
+test('filterEntries excludes NaN-ts lines only when a time filter is present', () => {
+  const entries = parseSessionText(line({ msg: 'no-ts' }) + line({ ts: '2026-08-06T10:00:01.000Z', msg: 'ok' }));
+  assert.equal(filterEntries(entries, {}).length, 2);
+  assert.deepEqual(filterEntries(entries, { sinceTs: '2026-08-06T09:00:00.000Z' }).map((e) => e.parsed.msg), ['ok']);
+});
+
+test('filterEntries treats unknown future types as matching only all', () => {
+  const entries = parseSessionText(line({ ts: '2026-08-06T10:00:01.000Z', type: 'future-kind', x: 1 }));
+  assert.equal(filterEntries(entries, {}).length, 1);
+  assert.equal(filterEntries(entries, { type: 'event' }).length, 0);
+  assert.equal(filterEntries(entries, { type: 'hypothesis' }).length, 0);
+});
+
+test('filterEntries rejects unknown filter keys fail-closed', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.throws(() => filterEntries(entries, { surprise: 1 }), /invalid_filter/);
+  assert.throws(() => filterEntries(entries, { type: 'bogus' }), /invalid_filter/);
+  assert.throws(() => filterEntries(entries, { sinceTs: 'notadate' }), /invalid_filter/);
+  assert.throws(() => filterEntries(entries, { limit: 0 }), /invalid_filter/);
+});
+
+test('filterEntries trims hypothesisId/runId filter values, mirroring the GET route\'s query.get(name)?.trim()', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.deepEqual(
+    filterEntries(entries, { hypothesisId: '  H1  ' }).map((e) => e.parsed.msg ?? e.parsed.status),
+    ['e1', 'OPEN', 'CONFIRMED'],
+  );
+  assert.deepEqual(filterEntries(entries, { runId: '  r2  ' }).map((e) => e.parsed.msg), ['e3']);
+});
+
+test('filterEntries rejects non-string hypothesisId/runId fail-closed like every other filter', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.throws(() => filterEntries(entries, { hypothesisId: 42 }), /invalid_filter:hypothesisId/);
+  assert.throws(() => filterEntries(entries, { runId: 42 }), /invalid_filter:runId/);
+});
+
+test('filterEntries treats an empty-or-whitespace-only hypothesisId/runId as a real filter matching nothing, mirroring the route (never absent, never an error)', () => {
+  const entries = parseSessionText(FIXTURE);
+  assert.equal(filterEntries(entries, { hypothesisId: '   ' }).length, 0);
+  assert.equal(filterEntries(entries, { runId: '' }).length, 0);
+});
+
+test('foldHypotheses derives latest-wins state with first-title retention and history', () => {
+  const folded = foldHypotheses(parseSessionText(FIXTURE));
+  assert.equal(folded.size, 1);
+  const h1 = folded.get('H1');
+  assert.equal(h1.status, 'CONFIRMED');
+  assert.equal(h1.title, 'null id');
+  assert.equal(h1.note, 'proven');
+  assert.equal(h1.ts, '2026-08-06T10:00:05.000Z');
+  assert.deepEqual(h1.history.map((entry) => entry.status), ['OPEN', 'CONFIRMED']);
+});
+
+test('foldHypotheses keeps file order as the tiebreak for same-millisecond lines', () => {
+  const sameMs =
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN' })
+    + line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'REJECTED' });
+  assert.equal(foldHypotheses(parseSessionText(sameMs)).get('H1').status, 'REJECTED');
+});
+
+test('escapeEvidenceText turns a real newline into the two-character escape text', () => {
+  assert.equal(escapeEvidenceText('a\nb'), 'a\\nb');
+});
+
+test('escapeEvidenceText leaves no character below 0x20 for a string containing a real ESC byte', () => {
+  const withEsc = `${String.fromCharCode(27)}[2J`;
+  const escaped = escapeEvidenceText(withEsc);
+  for (const ch of escaped) assert.equal(ch.charCodeAt(0) < 0x20, false);
+});
+
+test('escapeEvidenceText escapes quotes and backslashes', () => {
+  assert.equal(escapeEvidenceText('she said "hi" \\ ok'), 'she said \\"hi\\" \\\\ ok');
+});
+
+test('escapeEvidenceText leaves plain ASCII and emoji unchanged', () => {
+  assert.equal(escapeEvidenceText('hello world 123'), 'hello world 123');
+  assert.equal(escapeEvidenceText('emoji: \u{1F600}'), 'emoji: \u{1F600}');
+});
+
+test('escapeEvidenceText escapes U+2028 and U+2029, which JSON.stringify leaves bare but renderers treat as line breaks', () => {
+  assert.equal(escapeEvidenceText('a\u2028b'), 'a\\u2028b');
+  assert.equal(escapeEvidenceText('a\u2029b'), 'a\\u2029b');
+});
+
+test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
+  try {
+    await mkdir(path.join(root, '.debug'));
+    await writeFile(path.join(root, '.debug', 'debug-alpha-1.log'), FIXTURE, 'utf8');
+    await writeFile(path.join(root, '.debug', 'debug-beta-2.log'), '', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok', 'utf8');
+    const sessions = await listSessions(root);
+    assert.deepEqual(sessions.map((s) => s.sessionId).sort(), ['alpha-1', 'beta-2']);
+    assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
+    const direct = path.join(root, '.debug', 'debug-beta-2.log');
+    assert.equal(resolveSessionRef(root, direct), direct);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resolveSessionRef rejects path-traversal-shaped bare session ids fail-closed', () => {
+  const root = path.join(tmpdir(), 'evidence-fixed-root');
+  assert.throws(() => resolveSessionRef(root, '../../../etc/passwd'), /invalid_session_ref/);
+  assert.throws(() => resolveSessionRef(root, 'x/../y'), /invalid_session_ref/);
+  assert.equal(resolveSessionRef(root, 'alpha-1'), path.join(root, '.debug', 'debug-alpha-1.log'));
+});
+
+test('listSessions returns an empty array when the project has no .debug directory yet', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
+  try {
+    assert.deepEqual(await listSessions(root), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const { createDebugServer } = require('./debug_server');
+const {
+  createSessionTail,
+  discoverCollector,
+  readSessionLive,
+} = require('./debug_evidence');
+
+const LAUNCH = 'evidence-test-launch-token-with-entropy';
+
+const listen = (server) => new Promise((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+});
+
+const close = (server) => new Promise((resolve, reject) => {
+  server.close((error) => (error ? reject(error) : resolve()));
+});
+
+const httpJson = (port, pathname, { method = 'GET', headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const request = http.request({ hostname: '127.0.0.1', port, path: pathname, method, headers }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, text }));
+    });
+    request.on('error', reject);
+    if (body !== undefined) request.write(JSON.stringify(body));
+    request.end();
+  });
+
+const withLiveSession = async (run) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-live-'));
+  const server = createDebugServer({ projectRoot: root, token: LAUNCH, redactionEnv: {} });
+  const port = await listen(server);
+  try {
+    const minted = await httpJson(port, '/session', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { name: 'live' },
+    });
+    const session = JSON.parse(minted.text);
+    const log = (msg, extra = {}) => httpJson(port, '/log', {
+      method: 'POST',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg, ...extra },
+    });
+    return await run({ root, port, session, log });
+  } finally {
+    await close(server);
+    await rm(root, { recursive: true, force: true });
+  }
+};
+
+test('readSessionLive matches filterEntries over the same data (GET parity)', async () => {
+  await withLiveSession(async ({ root, port, session, log }) => {
+    await log('e1', { hypothesisId: 'H1', runId: 'r1' });
+    await log('e2', { hypothesisId: 'H2' });
+    await httpJson(port, '/hypothesis', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${LAUNCH}` },
+      body: { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+    });
+    await log('e3', { runId: 'r2' });
+    const filePath = path.join(root, session.log_file);
+    const fileEntries = await readSessionFile(filePath);
+    for (const filters of [
+      {},
+      { type: 'hypothesis' },
+      { type: 'event' },
+      { hypothesisId: 'H1' },
+      { runId: 'r2' },
+      { type: 'event', hypothesisId: 'H1' },
+      { limit: 2 },
+      // Padded values: the route trims query values before comparing; the
+      // core must too. Clean fixtures alone cannot detect trim divergence.
+      { hypothesisId: '  H1  ' },
+      { runId: '  r2  ' },
+      // Time bounds are the filters most likely to diverge on inclusivity
+      // or NaN handling; the local path and the route parse them
+      // independently. Cover matching boundaries and non-matching ranges.
+      { sinceTs: '2026-08-06T10:00:01.000Z' },
+      { untilTs: '2026-08-06T10:00:04.000Z' },
+      { sinceTs: '2026-08-06T10:00:01.000Z', untilTs: '2026-08-06T10:00:04.000Z' },
+      { sinceTs: '2030-01-01T00:00:00.000Z' },
+    ]) {
+      const live = await readSessionLive({ port, token: LAUNCH, sessionId: session.session_id, filters });
+      const local = filterEntries(fileEntries, filters);
+      assert.deepEqual(live.map((e) => e.raw), local.map((e) => e.raw), JSON.stringify(filters));
+    }
+  });
+});
+
+test('readSessionLive surfaces structured errors for 401 and 404', async () => {
+  await withLiveSession(async ({ port, session }) => {
+    await assert.rejects(
+      () => readSessionLive({ port, token: 'wrong-token-entirely', sessionId: session.session_id }),
+      /live_read_unauthorized/,
+    );
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'debug-nope-000000000000' }),
+      /live_read_unknown_session/,
+    );
+  });
+});
+
+test('createSessionTail emits each entry exactly once across polls', async () => {
+  await withLiveSession(async ({ port, session, log }) => {
+    await log('a');
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const first = await tail.poll();
+    assert.deepEqual(first.map((e) => e.parsed.msg), ['a']);
+    await log('b');
+    await log('c');
+    const second = await tail.poll();
+    assert.deepEqual(second.map((e) => e.parsed.msg), ['b', 'c']);
+    const third = await tail.poll();
+    assert.deepEqual(third, []);
+  });
+});
+
+test('createSessionTail settles a deferred poll correctly so a late resolution is safe to ignore (viewer shutdown guard)', async () => {
+  // The viewer's poll loop checks `shuttingDown` after `await tail.poll()`
+  // settles and skips repaint/reschedule if the user quit during the read.
+  // This test guards the invariant that makes that guard sound: a poll that
+  // is in flight when the caller "moves on" still resolves to the correct
+  // fresh entries exactly once (no double-advance of the seen cursor), so
+  // discarding its result after shutdown never loses or duplicates data on
+  // the NEXT real poll.
+  await withLiveSession(async ({ port, session, log }) => {
+    await log('a');
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const pending = tail.poll();
+    // Simulate the user quitting while the read is in flight: the caller
+    // stops caring about this poll's result. Resolve it, but ignore it.
+    const late = await pending;
+    assert.deepEqual(late.map((e) => e.parsed.msg), ['a']);
+    // A subsequent poll after more data must emit only the new entry — the
+    // cursor advanced exactly once for the settled read, never zero times.
+    await log('b');
+    const next = await tail.poll();
+    assert.deepEqual(next.map((e) => e.parsed.msg), ['b']);
+  });
+});
+
+test('discoverCollector reads port and token from .debug', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '8787\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok-value\n', 'utf8');
+    assert.deepEqual(await discoverCollector(root), { port: 8787, token: 'tok-value' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('readSessionLive rejects a session id that would escape the /sessions/:id/logs path before making any request', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: '../health?' }),
+    /invalid_session_ref/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'a b' }),
+    /invalid_session_ref/,
+  );
+});
+
+test('readSessionLive rejects live_read_timeout when the collector never responds', async () => {
+  const server = http.createServer(() => {
+    // Deliberately never write a response — simulates a hung collector.
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'hang-session-1', timeoutMs: 50 }),
+      /live_read_timeout/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects live_read_interrupted when the connection dies mid-body', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Length': '4096' });
+    response.write('{"ts":"2026-08-06T10:00:00.000Z","msg":"partial"}\n');
+    // Destroy the socket mid-body: the client must surface a structured
+    // live_read_* code, never a raw 'aborted'/ECONNRESET.
+    setTimeout(() => response.destroy(), 10);
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'interrupt-session-1' }),
+      /live_read_interrupted/,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test('createSessionTail forwards timeoutMs to each poll', async () => {
+  const server = http.createServer(() => {
+    // Never respond: without forwarding, the tail would use the 5s default
+    // and this test would exceed its own runtime budget.
+  });
+  const port = await listen(server);
+  try {
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: 'hang-session-2', timeoutMs: 50 });
+    await assert.rejects(() => tail.poll(), /live_read_timeout/);
+  } finally {
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
+    /invalid_filter:hypothesisId/,
+  );
+  await assert.rejects(
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { runId: null } }),
+    /invalid_filter:runId/,
+  );
+});
+
+test('discoverCollector rejects collector_not_running when .debug connection files are missing', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-missing-'));
+  try {
+    await assert.rejects(() => discoverCollector(root), /collector_not_running/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_token_invalid for an empty or whitespace-only token file', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badtoken-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '8787\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), '   \n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_token_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverCollector rejects collector_port_invalid for a non-decimal-integer port string like scientific notation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-badport-'));
+  try {
+    await mkdir(path.join(root, '.debug'), { recursive: true });
+    await writeFile(path.join(root, '.debug', 'collector_port'), '1e4\n', 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'tok-value\n', 'utf8');
+    await assert.rejects(() => discoverCollector(root), /collector_port_invalid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
