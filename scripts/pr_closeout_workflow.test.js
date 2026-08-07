@@ -1764,6 +1764,10 @@ test('a strict full run labels its report mode strict with no matrix source', as
   });
   assert.equal(result.report.mode, 'strict');
   assert.equal(result.report.matrixSource, null);
+  // The provisional (first) write must already name its tier — a crashed
+  // run's on-disk report can never masquerade as the other mode.
+  assert.equal(fixture.written[0].mode, 'strict');
+  assert.equal(fixture.written[0].matrixSource, null);
 });
 
 test('engine mode full run: a suppression finding auto-FAILs even an all-green custom matrix, and the report names its tier', async () => {
@@ -1793,4 +1797,14 @@ test('engine mode full run: a suppression finding auto-FAILs even an all-green c
   });
   assert.equal(result.report.overallStatus, 'FAIL');
   assert.equal(result.report.mode, 'engine');
+  // Spec test-group 4 read strictly: the engine RUN's report.json carries the
+  // exact matrixSource provenance block, and the provisional (first) write
+  // already carries both labeling fields by construction.
+  assert.deepEqual(result.report.matrixSource, {
+    source: 'config.engineChecks',
+    digest: '__TEST_DIGEST__',
+    checkCount: 1,
+  });
+  assert.equal(fixture.written[0].mode, 'engine');
+  assert.deepEqual(fixture.written[0].matrixSource, result.report.matrixSource);
 });
