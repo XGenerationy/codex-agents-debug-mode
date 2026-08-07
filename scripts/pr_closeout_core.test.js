@@ -7,6 +7,7 @@ const {
   classifyOutput,
   findCommandFailureNeutralizer,
   scanSuppressionText,
+  validateEngineChecks,
 } = require('./pr_closeout_core');
 
 const EXPECTED_IDS = [
@@ -2126,4 +2127,36 @@ test('blocks fixed Make checks whose recipe neutralizes failure', () => {
     assert.notEqual(check.status, 'BLOCKED', JSON.stringify(check));
     assert.equal(check.resolution, 'fixed');
   }
+});
+
+test('validateEngineChecks normalizes a valid matrix', () => {
+  const defs = validateEngineChecks([
+    { id: 'unit', command: 'cargo test' },
+    { id: 'lint', label: 'Lint', scripts: ['lint', 'lint:all'], baselineSafe: true, timeoutMs: 60000 },
+  ]);
+  assert.deepEqual(defs[0], {
+    id: 'unit', label: 'unit', command: 'cargo test', baselineSafe: false, generator: false, engine: true,
+  });
+  assert.deepEqual(defs[1], {
+    id: 'lint', label: 'Lint', packageCandidates: ['lint', 'lint:all'], baselineSafe: true, generator: false, timeoutMs: 60000, engine: true,
+  });
+});
+
+test('validateEngineChecks fails closed on every malformed shape', () => {
+  assert.throws(() => validateEngineChecks(undefined), /non-empty array/);
+  assert.throws(() => validateEngineChecks([]), /non-empty array/);
+  assert.throws(() => validateEngineChecks(['x']), /must be an object/);
+  assert.throws(() => validateEngineChecks([{ command: 'x' }]), /non-empty string id/);
+  assert.throws(() => validateEngineChecks([{ id: ' padded ', command: 'x' }]), /leading or trailing whitespace/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x' }, { id: 'a', command: 'y' }]), /unique/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', fixed: true }]), /unknown field "fixed"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a' }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', scripts: ['y'] }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: '   ' }]), /command must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: [] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: ['ok', 42] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', label: '' }]), /label must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', baselineSafe: 'yes' }]), /baselineSafe must be a boolean/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 0 }]), /timeoutMs must be a positive integer/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 1.5 }]), /timeoutMs must be a positive integer/);
 });

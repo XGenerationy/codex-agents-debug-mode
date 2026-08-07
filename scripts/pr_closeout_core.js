@@ -293,6 +293,88 @@ const REQUIRED_PROOFS = {
   'hunter-build': 'command',
 };
 
+// Fields an engine-mode check definition may carry. Anything else — most
+// pointedly `fixed`, `packageCandidates`, or `makeCandidates` — is either a
+// weakening vector or a typo; both fail closed rather than being ignored.
+const ENGINE_CHECK_FIELDS = new Set(['id', 'label', 'command', 'scripts', 'baselineSafe', 'generator', 'timeoutMs']);
+
+/**
+ * Validate and normalize `config.engineChecks` into check definitions the
+ * shared resolution pipeline in buildCheckPlan can consume. Engine mode
+ * replaces the strict matrix WHOLESALE (spec decision: no merging, no
+ * inheritance — a hybrid would be neither guarantee), so this is the single
+ * gate every engine matrix passes through. Every violation is a named error
+ * and the whole matrix is rejected — a partially-valid matrix is not a
+ * matrix. Ids are used verbatim in reports, digests, and attestations, so
+ * padded ids are rejected instead of silently trimmed. `baselineSafe`
+ * defaults to false (fail-closed: baseline verification must be opted into,
+ * never assumed). The returned definitions carry `engine: true` so
+ * buildCheckPlan resolves commands through the engine branch (placeholder,
+ * neutralizer, and make-recipe validation — user-supplied commands are never
+ * trusted the way the strict matrix's own hardcoded commands are).
+ * @param {unknown} engineChecks - config.engineChecks as supplied.
+ * @returns {object[]} normalized definitions.
+ */
+const validateEngineChecks = (engineChecks) => {
+  if (!Array.isArray(engineChecks) || engineChecks.length === 0) {
+    throw new Error('Engine mode requires config.engineChecks: a non-empty array of check definitions.');
+  }
+  const seen = new Set();
+  return engineChecks.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Engine check at index ${index} must be an object.`);
+    }
+    for (const field of Object.keys(entry)) {
+      if (!ENGINE_CHECK_FIELDS.has(field)) {
+        throw new Error(`Engine check at index ${index} has unknown field "${field}"; unknown fields are never ignored.`);
+      }
+    }
+    const { id } = entry;
+    if (typeof id !== 'string' || !id.trim()) {
+      throw new Error(`Engine check at index ${index} must have a non-empty string id.`);
+    }
+    if (id !== id.trim()) {
+      throw new Error(`Engine check id "${id}" must not have leading or trailing whitespace.`);
+    }
+    if (seen.has(id)) throw new Error(`Engine check ids must be unique: "${id}" appears more than once.`);
+    seen.add(id);
+    const hasCommand = Object.hasOwn(entry, 'command');
+    const hasScripts = Object.hasOwn(entry, 'scripts');
+    if (hasCommand === hasScripts) {
+      throw new Error(`Engine check "${id}" must define exactly one of "command" or "scripts".`);
+    }
+    if (hasCommand && (typeof entry.command !== 'string' || !entry.command.trim())) {
+      throw new Error(`Engine check "${id}": command must be a non-empty string.`);
+    }
+    if (hasScripts && (
+      !Array.isArray(entry.scripts) || entry.scripts.length === 0
+      || entry.scripts.some((name) => typeof name !== 'string' || !name.trim())
+    )) {
+      throw new Error(`Engine check "${id}": scripts must be a non-empty array of non-empty script names.`);
+    }
+    if (Object.hasOwn(entry, 'label') && (typeof entry.label !== 'string' || !entry.label.trim())) {
+      throw new Error(`Engine check "${id}": label must be a non-empty string when present.`);
+    }
+    for (const flag of ['baselineSafe', 'generator']) {
+      if (Object.hasOwn(entry, flag) && typeof entry[flag] !== 'boolean') {
+        throw new Error(`Engine check "${id}": ${flag} must be a boolean when present.`);
+      }
+    }
+    if (Object.hasOwn(entry, 'timeoutMs') && (!Number.isInteger(entry.timeoutMs) || entry.timeoutMs < 1)) {
+      throw new Error(`Engine check "${id}": timeoutMs must be a positive integer when present.`);
+    }
+    return {
+      id,
+      label: entry.label ?? id,
+      ...(hasCommand ? { command: entry.command } : { packageCandidates: [...entry.scripts] }),
+      baselineSafe: entry.baselineSafe ?? false,
+      generator: entry.generator ?? false,
+      ...(Object.hasOwn(entry, 'timeoutMs') ? { timeoutMs: entry.timeoutMs } : {}),
+      engine: true,
+    };
+  });
+};
+
 /**
  * POSIX single-quote a value for safe interpolation into a shell command
  * string: wraps it in `'...'`, and for each embedded `'` closes the quote,
@@ -1681,4 +1763,5 @@ module.exports = {
   findStatusSignals,
   scanSuppressionText,
   shellQuote,
+  validateEngineChecks,
 };
