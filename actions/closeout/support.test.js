@@ -2,20 +2,27 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { mkdtempSync, readFileSync: readFs, writeFileSync: writeFs } = require('node:fs');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
 
 const {
   ACTION_MARKER,
   buildCommentBody,
   capText,
+  commentSubcommand,
   decideExit,
   escapeActionText,
+  finishSubcommand,
   parseLastJsonLine,
   readPrContext,
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  runSubcommand,
   upsertPrComment,
   validateActionInputs,
+  writeOutputs,
 } = require('./support');
 
 test('validateActionInputs applies defaults and rejects unknown values fail-closed', () => {
@@ -274,4 +281,160 @@ test('upsertPrComment PATCHes only the action-authored marker comment and POSTs 
     },
   });
   assert.ok(posts[1].includes('POST'), 'attacker-only marker comments are ignored: POST a new one');
+});
+
+const makeTempDir = () => mkdtempSync(path.join(tmpdir(), 'closeout-action-'));
+
+test('writeOutputs appends sanitized single-line name=value pairs', () => {
+  const dir = makeTempDir();
+  const outputFile = path.join(dir, 'gh-output');
+  writeFs(outputFile, 'existing=1\n');
+  writeOutputs(outputFile, { status: 'FAIL', mode: 'engine', attestation: 'absent', 'report-path': 'C:\\x\\report.json' });
+  writeOutputs(outputFile, { extra: 'line1\nline2' });
+  const content = readFs(outputFile, 'utf8');
+  assert.match(content, /^existing=1$/m);
+  assert.match(content, /^status=FAIL$/m);
+  assert.match(content, /^mode=engine$/m);
+  assert.match(content, /^attestation=absent$/m);
+  assert.match(content, /^extra=line1 line2$/m);
+  assert.equal(content.split('\n').every((line) => !line.includes('\r')), true);
+});
+
+test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const summaryFile = path.join(dir, 'summary');
+  const outputFile = path.join(dir, 'output');
+  const plan = { planStatus: 'FAIL', mode: 'strict', configDigest: 'd', errors: [], checks: [],
+    admission: { attestation: { status: 'absent', evidence: 'none yet' }, cleanTree: { status: 'PASS', evidence: 'clean' }, preflight: { status: 'PASS' } } };
+  let spawnedArgs;
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile },
+    event: {},
+    spawnCli: (args) => { spawnedArgs = args; return { status: 2, stdout: `${JSON.stringify(plan)}\n`, stderr: '' }; },
+  });
+  assert.equal(exit, 0, 'run never fails the job for gate outcomes; finish decides');
+  assert.ok(spawnedArgs.includes('--plan'));
+  assert.ok(spawnedArgs.includes('--mode'));
+  assert.deepEqual(spawnedArgs.slice(spawnedArgs.indexOf('--base-ref'), spawnedArgs.indexOf('--base-ref') + 2), ['--base-ref', 'origin/main']);
+  const summary = readFs(summaryFile, 'utf8');
+  assert.match(summary, /Closeout plan preview/);
+  assert.match(summary, /absent/);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^status=FAIL$/m);
+  assert.match(outputs, /^attestation=absent$/m);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.tier, 'plan');
+  assert.equal(state.decision.success, true);
+});
+
+test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const summaryFile = path.join(dir, 'summary');
+  const outputFile = path.join(dir, 'output');
+  const reportDir = makeTempDir();
+  const reportJson = path.join(reportDir, 'report.json');
+  const reportMd = path.join(reportDir, 'report.md');
+  writeFs(reportJson, JSON.stringify({ overallStatus: 'FAIL', mode: 'engine', configDigest: 'd9', matrixSource: { checkCount: 1 } }));
+  writeFs(reportMd, '# PR Closeout Evidence\n\n> **ENGINE MODE** banner\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'full', mode: 'engine', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: summaryFile },
+    event: {},
+    spawnCli: () => ({ status: 2, stdout: `${JSON.stringify({ status: 'FAIL', headSha: 'h', report: { json: reportJson, markdown: reportMd } })}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const summary = readFs(summaryFile, 'utf8');
+  assert.match(summary, /Closeout gate result/);
+  assert.match(summary, /> \*\*ENGINE MODE\*\* banner/);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^status=FAIL$/m);
+  assert.match(outputs, /^mode=engine$/m);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 2]);
+});
+
+test('finishSubcommand exits with the recorded decision', () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' } }));
+  assert.equal(finishSubcommand({ outputDir: dir }), 2);
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
+  assert.equal(finishSubcommand({ outputDir: dir }), 0);
+  // Missing state means run never completed: fail closed.
+  assert.equal(finishSubcommand({ outputDir: makeTempDir() }), 3);
+});
+
+test('commentSubcommand upserts in PR context and skips with a notice otherwise', async () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'plan', artifactName: 'ev', renderedSummary: '## Closeout plan preview\nbody', decision: { success: true, exitCode: 0 },
+  }));
+  const calls = [];
+  const code = await commentSubcommand({
+    outputDir: dir,
+    env: { GITHUB_REPOSITORY: 'o/r' },
+    event: { pull_request: { number: 3 } },
+    runGh: async (args) => { calls.push(args); return args.includes('POST') ? { id: 1 } : []; },
+  });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 2);
+
+  const skipped = await commentSubcommand({ outputDir: dir, env: {}, event: {}, runGh: async () => { throw new Error('must not be called'); } });
+  assert.equal(skipped, 0, 'outside PR context the comment step skips, never fails');
+});
+
+test('full tier with lost stdout fails closed and still renders a summary', async () => {
+  // decideExit (Task 2 round) refuses success on exit 0 with no JSON
+  // record; the run step must still surface a summary, and finish applies
+  // the failure — never a TypeError in a composite step.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  await runSubcommand({
+    inputs: { run: 'full', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: '', stderr: '' }),
+  });
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 3]);
+  assert.match(state.decision.reason, /no JSON record/i);
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /BLOCKED/);
+});
+
+test('a hostile base-ref stays one argv element — never a shell string', async () => {
+  // resolveBaseRef returns input verbatim; that is safe ONLY because the CLI
+  // is spawned with an argv array. Pin it (quality-review note, Task 1).
+  const dir = makeTempDir();
+  let spawnedArgs;
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'main --mode engine', config: '', outputDir: path.join(dir, 'e'), artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: (args) => { spawnedArgs = args; return { status: 3, stdout: '{"status":"BLOCKED","error":"x"}\n', stderr: '' }; },
+  });
+  const at = spawnedArgs.indexOf('--base-ref');
+  assert.equal(spawnedArgs[at + 1], 'main --mode engine', 'the hostile value is exactly one argv element');
+  assert.equal(spawnedArgs.filter((a) => a === '--mode').length, 1, 'no injected second --mode flag');
+});
+
+test('a comment API failure propagates — the consumer opted in, silence would lie', async () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'plan', artifactName: 'ev', renderedSummary: 'body', decision: { success: true, exitCode: 0 },
+  }));
+  await assert.rejects(
+    commentSubcommand({
+      outputDir: dir,
+      env: { GITHUB_REPOSITORY: 'o/r' },
+      event: { pull_request: { number: 3 } },
+      runGh: async () => { throw new Error('gh: HTTP 403 Resource not accessible'); },
+    }),
+    /HTTP 403/,
+  );
 });

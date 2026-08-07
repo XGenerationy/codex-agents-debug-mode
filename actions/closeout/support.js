@@ -5,6 +5,10 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
+const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
 const RUN_VALUES = new Set(['plan', 'full']);
 const MODE_VALUES = new Set(['strict', 'engine']);
 const BOOL_VALUES = new Map([['true', true], ['false', false]]);
@@ -338,17 +342,222 @@ const upsertPrComment = async ({ context, body, runGh }) => {
 // NOTE: the real runGh (Task 4) owns JSON parsing; these functions only ever
 // see parsed values.
 
+const GATE_CLI = path.join(__dirname, '..', '..', 'scripts', 'pr_closeout.js');
+const STATE_FILE = 'action-state.json';
+
+/**
+ * Sanitizes one output value to a single line (newlines/CR collapse to a
+ * space) and appends plain name=value lines to the GITHUB_OUTPUT file — no
+ * multiline heredoc form, so there is no delimiter-collision surface.
+ * @param {string} outputFile
+ * @param {Record<string, unknown>} pairs
+ */
+const writeOutputs = (outputFile, pairs) => {
+  const lines = Object.entries(pairs)
+    .map(([name, value]) => `${name}=${String(value ?? '').replace(/\r?\n|\r/g, ' ')}`)
+    .join('\n');
+  appendFileSync(outputFile, `${lines}\n`);
+};
+
+const readEventPayload = (env) => {
+  if (!env.GITHUB_EVENT_PATH) return {};
+  try {
+    return JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+};
+
+const defaultSpawnCli = (args, { env }) => spawnSync(process.execPath, [GATE_CLI, ...args], {
+  encoding: 'utf8',
+  env,
+  maxBuffer: 64 * 1024 * 1024,
+});
+
+/**
+ * The `run` step: validates inputs, resolves the base ref, spawns the gate
+ * CLI, captures its one JSON line, renders the tier's Step Summary, writes
+ * the action outputs, and records the exit decision in the state file for
+ * `finish`. Returns 0 for every GATE outcome — the job's failure is applied
+ * by `finish` AFTER the artifact upload and optional comment steps have run.
+ * Only input-validation errors throw out of here (fail before spawning).
+ * @returns {Promise<number>} process exit code for this step.
+ */
+const runSubcommand = async ({
+  inputs, inputBaseRef = '', config = '', outputDir, artifactName,
+  env = process.env, event = null, spawnCli = defaultSpawnCli,
+}) => {
+  const { run, mode } = validateActionInputs(inputs);
+  const eventPayload = event ?? readEventPayload(env);
+  const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
+  mkdirSync(outputDir, { recursive: true });
+  const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
+  if (baseRef) args.push('--base-ref', baseRef);
+  if (config) args.push('--config', config);
+  if (run === 'plan') args.push('--plan');
+  const result = spawnCli(args, { env });
+  const cliExitCode = result.status;
+  const parsed = parseLastJsonLine(result.stdout);
+  const decision = decideExit({ run, cliExitCode, parsed });
+
+  let renderedSummary;
+  let reportJsonPath = '';
+  let reportMode = '';
+  let attestation = '';
+  let status = '';
+  if (run === 'plan') {
+    if (parsed && typeof parsed.planStatus === 'string') {
+      renderedSummary = renderPlanSummary(parsed, { baseRef });
+      status = parsed.planStatus;
+      reportMode = parsed.mode || '';
+      attestation = parsed.admission?.attestation?.status || '';
+      const planPath = path.join(outputDir, 'plan.json');
+      writeFileSync(planPath, `${JSON.stringify(parsed)}\n`);
+      reportJsonPath = planPath;
+    } else {
+      renderedSummary = [
+        '## Closeout plan preview',
+        '',
+        `**The preview itself failed** — ${escapeActionText(decision.reason)}`,
+        '',
+        `stderr: ${escapeActionText(String(result.stderr || '').slice(0, 4000))}`,
+        '',
+      ].join('\n');
+      status = 'BLOCKED';
+    }
+  } else {
+    let report = {};
+    let reportMarkdown = '';
+    if (parsed?.report?.json) {
+      reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(outputDir, parsed.report.json);
+      try { report = JSON.parse(readFileSync(reportJsonPath, 'utf8')); } catch { report = {}; }
+      const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(outputDir, parsed.report.markdown || 'report.md');
+      try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
+    }
+    status = report.overallStatus || parsed?.status || 'BLOCKED';
+    reportMode = report.mode || '';
+    renderedSummary = renderFullSummary(
+      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
+      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'})`,
+      { artifactName },
+    );
+  }
+
+  if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
+  if (env.GITHUB_OUTPUT) {
+    writeOutputs(env.GITHUB_OUTPUT, {
+      status, mode: reportMode, attestation, 'report-path': reportJsonPath,
+    });
+  }
+  writeFileSync(path.join(outputDir, STATE_FILE), `${JSON.stringify({
+    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, reportJsonPath,
+  })}\n`);
+  process.stdout.write(`closeout-action: ${decision.reason}\n`);
+  return 0;
+};
+
+const readState = (outputDir) => {
+  try {
+    return JSON.parse(readFileSync(path.join(outputDir, STATE_FILE), 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The `finish` step: applies the exit decision recorded by `run`, failing
+ * the job only now — after artifact upload and the optional comment step
+ * have already surfaced the evidence. Missing state fails closed.
+ * @returns {number} process exit code.
+ */
+const finishSubcommand = ({ outputDir }) => {
+  const state = readState(outputDir);
+  if (!state?.decision) {
+    process.stderr.write('closeout-action: no recorded state; the run step never completed.\n');
+    return 3;
+  }
+  process.stdout.write(`closeout-action: ${state.decision.reason}\n`);
+  return state.decision.success ? 0 : (Number.isInteger(state.decision.exitCode) ? state.decision.exitCode : 3);
+};
+
+const defaultRunGh = async (args) => {
+  const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(String(result.stderr || `gh exited ${result.status}`).trim());
+  const stdout = String(result.stdout || '').trim();
+  if (!stdout) return null;
+  try { return JSON.parse(stdout); } catch { return stdout; }
+};
+
+/**
+ * The `comment` step: upserts the marker-tagged PR comment with the tier's
+ * rendered summary. Outside PR context (no repo/PR number) it prints a
+ * notice and succeeds — never fails, never guesses. An API failure DOES
+ * fail the step: the consumer opted into the comment and silence would be
+ * a lie; summary and artifact are already written regardless.
+ * @returns {Promise<number>} process exit code.
+ */
+const commentSubcommand = async ({ outputDir, env = process.env, event = null, runGh = defaultRunGh }) => {
+  const state = readState(outputDir);
+  if (!state) {
+    process.stderr.write('closeout-action: no recorded state; skipping comment.\n');
+    return 0;
+  }
+  const eventPayload = event ?? readEventPayload(env);
+  const context = readPrContext({ env, event: eventPayload });
+  if (!context) {
+    process.stdout.write('closeout-action: not a pull-request context; comment skipped.\n');
+    return 0;
+  }
+  const body = buildCommentBody({ tier: state.tier, rendered: state.renderedSummary || '', artifactName: state.artifactName || 'closeout-evidence' });
+  await upsertPrComment({ context, body, runGh });
+  process.stdout.write(`closeout-action: comment upserted on PR #${context.prNumber}.\n`);
+  return 0;
+};
+
+const main = async () => {
+  const [subcommand] = process.argv.slice(2);
+  const env = process.env;
+  const common = { outputDir: env.CLOSEOUT_OUTPUT_DIR || path.join(env.RUNNER_TEMP || require('node:os').tmpdir(), 'closeout-evidence') };
+  try {
+    if (subcommand === 'run') {
+      process.exitCode = await runSubcommand({
+        ...common,
+        inputs: { run: env.CLOSEOUT_RUN || '', mode: env.CLOSEOUT_MODE || '', prComment: env.CLOSEOUT_PR_COMMENT || '' },
+        inputBaseRef: env.CLOSEOUT_BASE_REF || '',
+        config: env.CLOSEOUT_CONFIG || '',
+        artifactName: env.CLOSEOUT_ARTIFACT_NAME || 'closeout-evidence',
+      });
+    } else if (subcommand === 'finish') {
+      process.exitCode = finishSubcommand(common);
+    } else if (subcommand === 'comment') {
+      process.exitCode = await commentSubcommand(common);
+    } else {
+      throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use run, comment, or finish.`);
+    }
+  } catch (error) {
+    process.stderr.write(`closeout-action: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+};
+
+if (require.main === module) void main();
+
 module.exports = {
   ACTION_MARKER,
   buildCommentBody,
   capText,
+  commentSubcommand,
   decideExit,
   escapeActionText,
+  finishSubcommand,
   parseLastJsonLine,
   readPrContext,
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  runSubcommand,
   upsertPrComment,
   validateActionInputs,
+  writeOutputs,
 };
