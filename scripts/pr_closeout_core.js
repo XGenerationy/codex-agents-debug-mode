@@ -305,13 +305,35 @@ const ENGINE_CHECK_FIELDS = new Set(['id', 'label', 'command', 'scripts', 'basel
 // downstream lookup failing closed by accident.
 const ENGINE_CHECK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+// Split points for the make-gate token scan: whitespace, shell separators/
+// operators (`;&|(){}`), quote/substitution characters (`` ` " ' $ ``), and
+// redirection/assignment characters (`<>=`) — a make invocation dressed up
+// in any of these (`` `make lie` ``, `"make" lie`, `x=`make lie``, `bash -c
+// "make lie"`) still yields a bare make-alias token after the split.
+const MAKE_SPLIT = /[\s;&|(){}`"'$=<>]+/;
+// Names make is actually called under on common platforms — BSD/macOS ship
+// `make` as a symlink to `bmake`/`pmake`, NetBSD ships `pmake`, and Windows
+// toolchains ship `mingw32-make`/`mingw64-make`/`nmake` — not evasion, just
+// the real binary name. A leading path and a `.exe`/`.cmd`/`.bat` suffix are
+// stripped before the alias check, so `/usr/bin/make.exe` and `make` match
+// the same entry.
+const MAKE_ALIASES = new Set(['make', 'gmake', 'bmake', 'pmake', 'nmake', 'mingw32-make', 'mingw64-make']);
+const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, ''));
+
 // Engine-mode make gate: recipe bodies are only inspectable when the command
 // is EXACTLY `make <target>`. Any other command that invokes make — wrapped
 // (`cd x && make lie`), prefixed (`env make lie`, `nice -n 19 make lie`),
-// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), or argumented
+// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), quoted or
+// substituted (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`),
+// aliased (`gmake lie`, `make.exe lie`, `mingw32-make lie`), or argumented
 // (`make lie MYVAR=1`, `make lie && true`) — cannot have its recipe resolved
 // and inspected, so it is BLOCKED rather than admitted uninspected.
-// Token-level matching keeps non-make commands (cmake, make-docs) unaffected.
+// This is a DENYLIST, not a proof of absence: it catches everything
+// reachable by typing the obvious thing — direct invocation, common shell
+// wrapping, common aliasing — but a genuinely exotic evasion (a shell
+// function or alias named e.g. `remake` that execs make, or an alias for
+// make under a name not in MAKE_ALIASES) cannot be enumerated and is not
+// claimed to be caught here.
 const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
   const pure = /^make\s+(\S+)$/.exec(resolvedCommand.trim());
   if (pure) {
@@ -325,11 +347,9 @@ const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
     }
     return null;
   }
-  const invokesMake = resolvedCommand.split(/[\s;&|()]+/).some(
-    (token) => token === 'make' || token.endsWith('/make') || token.endsWith('\\make'),
-  );
+  const invokesMake = resolvedCommand.split(MAKE_SPLIT).some(isMakeToken);
   if (invokesMake) {
-    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected.`;
+    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make" rather than a make invocation, rename the script.`;
   }
   return null;
 };
@@ -821,7 +841,25 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
             : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
         }
-        if (!/^literal:.+/.test(proof.expectedPattern)) {
+        // Mirror strict's exact literal-policy bounds (validCommand, below):
+        // bounded length and no control characters, not just a `literal:`
+        // prefix check — a voluntarily attached engine command proof gets
+        // the identical bar. Control characters are scanned by code point
+        // (not a regex literal) to keep this diff free of embedded escapes.
+        const enginePattern = proof.expectedPattern;
+        let engineHasControlChar = false;
+        for (let charIndex = 0; charIndex < enginePattern.length; charIndex += 1) {
+          const code = enginePattern.charCodeAt(charIndex);
+          if (code < 0x20 || code === 0x7f) {
+            engineHasControlChar = true;
+            break;
+          }
+        }
+        const engineLiteralOk = enginePattern.startsWith('literal:')
+          && enginePattern.length <= 264
+          && enginePattern.length > 'literal:'.length
+          && !engineHasControlChar;
+        if (!engineLiteralOk) {
           const proofEvidence = `Postcondition proof pattern for ${check.label} must be a literal: policy with a non-empty value.`;
           resolved = resolved.status === 'BLOCKED'
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }

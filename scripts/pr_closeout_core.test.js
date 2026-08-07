@@ -2494,3 +2494,132 @@ test('scriptRunner rejects tabs and quote characters, not just newlines', () => 
   });
   assert.equal(valid.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
 });
+
+test('engine make gate blocks shell-quoting/substitution dodges and make aliases (measured fix)', () => {
+  // Clean recipe: every dodge below must block on SHAPE (it never reaches
+  // the pure `make <target>` branch), not on recipe content.
+  const makeRecipes = { lie: 'npm test' };
+  const dodges = [
+    ['backtick-wrapped', '`make lie`'],
+    ['double-quoted make', '"make" lie'],
+    ['single-quoted make', "'make' lie"],
+    ['bash -c double-quoted', 'bash -c "make lie"'],
+    ['sh -c single-quoted', "sh -c 'make lie'"],
+    ['eval double-quoted', 'eval "make lie"'],
+    ['brace group', '{make lie;}'],
+    ['assignment + backtick substitution', 'x=`make lie`'],
+    ['gmake alias', 'gmake lie'],
+    ['make.exe alias', 'make.exe lie'],
+    ['mingw32-make alias', 'mingw32-make lie'],
+    ['pathed .exe alias', '/usr/bin/make.exe lie'],
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map(([, command], index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, [name, command]] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for ${name}: "${command}"`);
+    assert.match(
+      check.evidence,
+      /wraps or argument-extends make and cannot be admitted uninspected/,
+      `expected wrap-form evidence for ${name}: "${command}"`,
+    );
+  }
+});
+
+test('original make-gate dodge corpus remains BLOCKED after the alias/quoting fix (spot-check)', () => {
+  const makeRecipes = { lie: '-npm test' };
+  const spotChecks = ['make lie && true', '/usr/bin/make lie', 'cd x && make lie'];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: spotChecks.map((command, index) => ({ id: `orig${index}`, command })) },
+    makeRecipes,
+  });
+  for (const [index, command] of spotChecks.entries()) {
+    const check = plan.checks.find(({ id }) => id === `orig${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+  }
+});
+
+test('make gate false-positive guards remain clean: cmake, make-docs, make.js, a makerelease script', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake --build .' },
+        { id: 'make-docs', command: 'make-docs build' },
+        { id: 'node-make-js', command: 'node make.js' },
+        { id: 'makerelease-script', command: './scripts/makerelease.sh' },
+      ],
+    },
+  });
+  for (const id of ['cmake-build', 'make-docs', 'node-make-js', 'makerelease-script']) {
+    assert.equal(plan.checks.find((check) => check.id === id).status, undefined, `expected ${id} to resolve cleanly`);
+  }
+});
+
+test('gmake alias is blocked as wrap-form, not treated as a pure recipe-inspectable target', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'gm', command: 'gmake lint' }] },
+    // Recipe is clean: if the pure-form regex mistakenly matched `gmake
+    // lint`, this would resolve PASS-eligible instead of BLOCKED.
+    makeRecipes: { lint: 'eslint .' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'gm');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  assert.doesNotMatch(check.evidence, /neutralizes failures/);
+  assert.doesNotMatch(check.evidence, /No recipe text was captured/);
+});
+
+test('engine command proof literal-policy parity: bounded length and no control characters', () => {
+  const tooLong = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: `literal:${'z'.repeat(300)}` } },
+    },
+  });
+  assert.match(
+    tooLong.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const controlChar = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:a\tb' } },
+    },
+  });
+  assert.match(
+    controlChar.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+});
+
+test('make-gate wrap-form evidence includes an actionable hint for a package script literally named "make"', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'make-script', scripts: ['make'] }] },
+    packageScripts: { make: 'echo building' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'make-script');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(
+    check.evidence,
+    /If this is a package script named "make" rather than a make invocation, rename the script\./,
+  );
+});

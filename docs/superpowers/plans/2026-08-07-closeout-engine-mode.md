@@ -655,6 +655,139 @@ test('scriptRunner rejects tabs and quote characters, not just newlines', () => 
 });
 ```
 
+Round 2 of review hardening (the token predicate itself: shell quoting/substitution and make aliases) appended:
+
+```js
+test('engine make gate blocks shell-quoting/substitution dodges and make aliases (measured fix)', () => {
+  // Clean recipe: every dodge below must block on SHAPE (it never reaches
+  // the pure `make <target>` branch), not on recipe content.
+  const makeRecipes = { lie: 'npm test' };
+  const dodges = [
+    ['backtick-wrapped', '`make lie`'],
+    ['double-quoted make', '"make" lie'],
+    ['single-quoted make', "'make' lie"],
+    ['bash -c double-quoted', 'bash -c "make lie"'],
+    ['sh -c single-quoted', "sh -c 'make lie'"],
+    ['eval double-quoted', 'eval "make lie"'],
+    ['brace group', '{make lie;}'],
+    ['assignment + backtick substitution', 'x=`make lie`'],
+    ['gmake alias', 'gmake lie'],
+    ['make.exe alias', 'make.exe lie'],
+    ['mingw32-make alias', 'mingw32-make lie'],
+    ['pathed .exe alias', '/usr/bin/make.exe lie'],
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map(([, command], index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, [name, command]] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for ${name}: "${command}"`);
+    assert.match(
+      check.evidence,
+      /wraps or argument-extends make and cannot be admitted uninspected/,
+      `expected wrap-form evidence for ${name}: "${command}"`,
+    );
+  }
+});
+
+test('original make-gate dodge corpus remains BLOCKED after the alias/quoting fix (spot-check)', () => {
+  const makeRecipes = { lie: '-npm test' };
+  const spotChecks = ['make lie && true', '/usr/bin/make lie', 'cd x && make lie'];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: spotChecks.map((command, index) => ({ id: `orig${index}`, command })) },
+    makeRecipes,
+  });
+  for (const [index, command] of spotChecks.entries()) {
+    const check = plan.checks.find(({ id }) => id === `orig${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+  }
+});
+
+test('make gate false-positive guards remain clean: cmake, make-docs, make.js, a makerelease script', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake --build .' },
+        { id: 'make-docs', command: 'make-docs build' },
+        { id: 'node-make-js', command: 'node make.js' },
+        { id: 'makerelease-script', command: './scripts/makerelease.sh' },
+      ],
+    },
+  });
+  for (const id of ['cmake-build', 'make-docs', 'node-make-js', 'makerelease-script']) {
+    assert.equal(plan.checks.find((check) => check.id === id).status, undefined, `expected ${id} to resolve cleanly`);
+  }
+});
+
+test('gmake alias is blocked as wrap-form, not treated as a pure recipe-inspectable target', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'gm', command: 'gmake lint' }] },
+    // Recipe is clean: if the pure-form regex mistakenly matched `gmake
+    // lint`, this would resolve PASS-eligible instead of BLOCKED.
+    makeRecipes: { lint: 'eslint .' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'gm');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  assert.doesNotMatch(check.evidence, /neutralizes failures/);
+  assert.doesNotMatch(check.evidence, /No recipe text was captured/);
+});
+
+test('engine command proof literal-policy parity: bounded length and no control characters', () => {
+  const tooLong = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: `literal:${'z'.repeat(300)}` } },
+    },
+  });
+  assert.match(
+    tooLong.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const controlChar = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:a\tb' } },
+    },
+  });
+  assert.match(
+    controlChar.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+});
+
+test('make-gate wrap-form evidence includes an actionable hint for a package script literally named "make"', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'make-script', scripts: ['make'] }] },
+    packageScripts: { make: 'echo building' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'make-script');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(
+    check.evidence,
+    /If this is a package script named "make" rather than a make invocation, rename the script\./,
+  );
+});
+```
+
 - [ ] **Step 2: Run to verify failures**
 
 Run: `node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
@@ -735,16 +868,38 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
   const packageRunner = mode === 'engine' ? scriptRunner : 'pnpm run';
 ```
 
-2b. Review hardening (root cause: the make-recipe gate previously keyed off exact command shape at one call site — a wrapped/prefixed/pathed/flagged/argumented `make` invocation could resolve uninspected). Add a single structural helper, applied on the RESOLVED command on every engine resolution path, near the engine constants (after `ENGINE_CHECK_ID_PATTERN`, before `validateEngineChecks`):
+2b. Review hardening (root cause: the make-recipe gate previously keyed off exact command shape at one call site — a wrapped/prefixed/pathed/flagged/argumented `make` invocation could resolve uninspected). Add a single structural helper, applied on the RESOLVED command on every engine resolution path, near the engine constants (after `ENGINE_CHECK_ID_PATTERN`, before `validateEngineChecks`). Round 2 of review hardened the token predicate itself: the original split/predicate missed shell quoting and substitution (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`, `x=`make lie``) and make aliases (`gmake`, `make.exe`, `mingw32-make`, ...), which are simply what make is CALLED on BSD/macOS/Windows, not evasion. The fixed helper below is a DENYLIST, not a proof of absence — it catches everything reachable by typing the obvious thing, not a genuinely exotic evasion (a shell function/alias named e.g. `remake`):
 
 ```js
+// Split points for the make-gate token scan: whitespace, shell separators/
+// operators (`;&|(){}`), quote/substitution characters (`` ` " ' $ ``), and
+// redirection/assignment characters (`<>=`) — a make invocation dressed up
+// in any of these (`` `make lie` ``, `"make" lie`, `x=`make lie``, `bash -c
+// "make lie"`) still yields a bare make-alias token after the split.
+const MAKE_SPLIT = /[\s;&|(){}`"'$=<>]+/;
+// Names make is actually called under on common platforms — BSD/macOS ship
+// `make` as a symlink to `bmake`/`pmake`, NetBSD ships `pmake`, and Windows
+// toolchains ship `mingw32-make`/`mingw64-make`/`nmake` — not evasion, just
+// the real binary name. A leading path and a `.exe`/`.cmd`/`.bat` suffix are
+// stripped before the alias check, so `/usr/bin/make.exe` and `make` match
+// the same entry.
+const MAKE_ALIASES = new Set(['make', 'gmake', 'bmake', 'pmake', 'nmake', 'mingw32-make', 'mingw64-make']);
+const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, ''));
+
 // Engine-mode make gate: recipe bodies are only inspectable when the command
 // is EXACTLY `make <target>`. Any other command that invokes make — wrapped
 // (`cd x && make lie`), prefixed (`env make lie`, `nice -n 19 make lie`),
-// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), or argumented
+// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), quoted or
+// substituted (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`),
+// aliased (`gmake lie`, `make.exe lie`, `mingw32-make lie`), or argumented
 // (`make lie MYVAR=1`, `make lie && true`) — cannot have its recipe resolved
 // and inspected, so it is BLOCKED rather than admitted uninspected.
-// Token-level matching keeps non-make commands (cmake, make-docs) unaffected.
+// This is a DENYLIST, not a proof of absence: it catches everything
+// reachable by typing the obvious thing — direct invocation, common shell
+// wrapping, common aliasing — but a genuinely exotic evasion (a shell
+// function or alias named e.g. `remake` that execs make, or an alias for
+// make under a name not in MAKE_ALIASES) cannot be enumerated and is not
+// claimed to be caught here.
 const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
   const pure = /^make\s+(\S+)$/.exec(resolvedCommand.trim());
   if (pure) {
@@ -758,15 +913,15 @@ const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
     }
     return null;
   }
-  const invokesMake = resolvedCommand.split(/[\s;&|()]+/).some(
-    (token) => token === 'make' || token.endsWith('/make') || token.endsWith('\\make'),
-  );
+  const invokesMake = resolvedCommand.split(MAKE_SPLIT).some(isMakeToken);
   if (invokesMake) {
-    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected.`;
+    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make" rather than a make invocation, rename the script.`;
   }
   return null;
 };
 ```
+
+Note: the pure-form regex (`/^make\s+(\S+)$/`) intentionally still matches only literal `make` — it is NOT extended to the alias set. A pure `gmake lint` therefore never reaches recipe inspection; it hits the alias predicate in `invokesMake` and is BLOCKED as a wrap-form instead. That is correct-and-safe (still BLOCKED, just via the other message), not a gap — pinned by a dedicated test rather than widening the pure form.
 
 3. Change the map source (~line 377) from `MANDATORY_CHECKS.map((definition) => {` to `definitions.map((definition) => {`, and insert the engine-command branch as the FIRST branch inside the map callback, before the `if (definition.fixed) {` branch:
 
@@ -892,7 +1047,25 @@ const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
             : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
         }
-        if (!/^literal:.+/.test(proof.expectedPattern)) {
+        // Mirror strict's exact literal-policy bounds (validCommand, below):
+        // bounded length and no control characters, not just a `literal:`
+        // prefix check — a voluntarily attached engine command proof gets
+        // the identical bar. Control characters are scanned by code point
+        // (not a regex literal) to keep this diff free of embedded escapes.
+        const enginePattern = proof.expectedPattern;
+        let engineHasControlChar = false;
+        for (let charIndex = 0; charIndex < enginePattern.length; charIndex += 1) {
+          const code = enginePattern.charCodeAt(charIndex);
+          if (code < 0x20 || code === 0x7f) {
+            engineHasControlChar = true;
+            break;
+          }
+        }
+        const engineLiteralOk = enginePattern.startsWith('literal:')
+          && enginePattern.length <= 264
+          && enginePattern.length > 'literal:'.length
+          && !engineHasControlChar;
+        if (!engineLiteralOk) {
           const proofEvidence = `Postcondition proof pattern for ${check.label} must be a literal: policy with a non-empty value.`;
           resolved = resolved.status === 'BLOCKED'
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
