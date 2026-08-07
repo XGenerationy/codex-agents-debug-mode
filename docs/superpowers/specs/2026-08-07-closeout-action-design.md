@@ -2,10 +2,19 @@
 
 Packages the PR closeout gate as a reusable composite GitHub Action so any repo can
 enforce it in CI, on top of sub-project A's engine mode (merged as `0a2ddd1`). Touches
-`actions/closeout/` (new), `.github/workflows/` (two new dogfood workflows),
-`scripts/closeout_action_support.js` (new, with tests), `tools/validate_repository.js`
-(two new zero-dependency checks + count updates), and README pointers. The
+`actions/closeout/` (new: `action.yml`, `support.js`, `support.test.js`, `README.md`),
+`.github/workflows/` (two new dogfood workflows), `tools/workflow_checks.js` (new,
+with tests) wired into `tools/validate_repository.js`, and README pointers. The
 `pr_closeout_*` gate scripts themselves are NOT modified by this sub-project.
+
+Location decision (plan-time amendment): the support script lives at
+`actions/closeout/support.js`, NOT under `scripts/` — the validator's payload census
+ships everything under `scripts/` with the skill, and the action support is CI
+tooling, exactly the "repository governance and CI files" the README says are not
+copied into the skill directory. The skill payload count therefore stays 37. The
+tracked-file census still puts the new files through the safety scan and `node
+--check` automatically, and `node --test` discovers `actions/closeout/support.test.js`
+without any script change.
 
 ## Problem
 
@@ -31,9 +40,10 @@ exists, or a gate that swallows evidence when it fails).
 
 ## Action interface (`actions/closeout/action.yml`)
 
-Composite action; every step's logic lives in `scripts/closeout_action_support.js`
-(reachable as `${{ github.action_path }}/../../scripts/closeout_action_support.js`)
-so it is hermetically testable. The YAML contains wiring only.
+Composite action; every step's logic lives in `actions/closeout/support.js`
+(reachable as `${{ github.action_path }}/support.js`; the gate CLI as
+`${{ github.action_path }}/../../scripts/pr_closeout.js`) so it is hermetically
+testable. The YAML contains wiring only.
 
 Inputs (all strings, validated fail-closed by the support script BEFORE the gate CLI is
 spawned — unknown values are a named error, never a silent default):
@@ -42,6 +52,7 @@ spawned — unknown values are a named error, never a silent default):
 |---|---|---|---|
 | `run` | `plan` \| `full` | `plan` | Preview tier vs enforcing gate. Safe default is the read-only tier. |
 | `mode` | `strict` \| `engine` | `strict` | Forwarded verbatim as `--mode`. The CLI re-validates — the action never widens what the CLI accepts. |
+| `base-ref` | ref | empty | Live PR base ref for `--base-ref`. When empty, the support script resolves it fail-closed down a ladder: `origin/$GITHUB_BASE_REF` (pull_request events) → `origin/<event.pull_request.base.ref>` from the event payload (pull_request_review events) → nothing, in which case the CLI's own `config.baseRef`-or-error contract applies. The resolved value is recorded in the Step Summary. |
 | `config` | path | empty | Optional closeout config path, forwarded when non-empty. |
 | `output-dir` | path | `${{ runner.temp }}/closeout-evidence` | Evidence directory. Default satisfies the gate's outside-the-repository requirement. |
 | `node-version` | version spec | `24` | Passed to SHA-pinned `actions/setup-node` inside the composite. |
@@ -135,7 +146,7 @@ The readiness signal for plan runs lives in the Step Summary and the `status` /
   does not, and is skipped with a notice. `pull_request_review` runs in base-repo
   context with normal token scope.
 
-## Support script (`scripts/closeout_action_support.js`)
+## Support script (`actions/closeout/support.js`)
 
 Zero dependencies, same license/header conventions as sibling scripts. Subcommands
 `run`, `finish`, `comment`; all state between steps flows through files in
@@ -159,9 +170,12 @@ checks are deliberately shallow and honest about it):
 2. **Permissions check:** every workflow file must contain a top-level `permissions:`
    block.
 
-Plus the mechanical count updates for the new files (payload counts, JS file counts —
-whatever the validator's current expectations enumerate). The gate-scan will flag the
-validation-surface change for independent PR review — expected and honest, as always.
+The two predicates live in a new `tools/workflow_checks.js` module (the validator
+requires it; a sibling test file covers the predicates hermetically plus one
+integration spawn of the real validator expecting PASS — same pattern as
+`tools/scan_touched_suppressions.test.js`). The skill payload count stays 37: no new
+file enters the payload roots. The gate-scan will flag the validation-surface change
+for independent PR review — expected and honest, as always.
 
 ## Error handling
 
