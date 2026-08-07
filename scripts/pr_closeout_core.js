@@ -465,7 +465,13 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * @returns {{checks: object[], errors: string[]}}
  */
 const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
-  const commands = config.commands || {};
+  // Engine mode rejects config.commands below, but rejection alone leaves
+  // the map live in the resolution loop, where a scripts-resolved engine
+  // check could still consult a smuggled entry through the configured
+  // branch (which lacks make-recipe inspection). Emptying the map in engine
+  // mode makes that path structurally dead rather than relying on the
+  // errors→FAIL rollup to keep it inert.
+  const commands = mode === 'engine' ? {} : (config.commands || {});
   const qualificationSafe = new Set(config.qualificationSafe || []);
   const resourceGroups = config.resourceGroups || {};
   const targets = new Set(makeTargets);

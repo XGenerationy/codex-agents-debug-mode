@@ -451,6 +451,18 @@ test('engine scriptRunner is validated and applied; strict package-script output
   assert.equal(strict.checks.find(({ id }) => id === 'typecheck').command, 'pnpm run typecheck');
 });
 
+test('engine mode never consults a smuggled config.commands entry: the map is structurally dead, not just error-flagged', () => {
+  const smuggled = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], commands: { lint: 'make lie' } },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(smuggled.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const lint = smuggled.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.resolution, 'package-script');
+  assert.equal(lint.command, 'npm run lint');
+});
+
 test('engine mode validates voluntarily attached proofs at plan time; strict proof behavior unchanged', () => {
   const badShape = buildCheckPlan({
     mode: 'engine',
@@ -488,10 +500,17 @@ Expected: the six new tests fail (buildCheckPlan has no `mode` parameter — eng
 
 - [ ] **Step 3: Implement (surgical edits inside `buildCheckPlan`)**
 
-1. Signature (~line 359): add `mode = 'strict'` as the FIRST destructured option:
+1. Signature (~line 359): add `mode = 'strict'` as the FIRST destructured option, and make the `commands` capture on the next line mode-aware (post-review hardening — a scripts-resolved engine check must never be able to consult a smuggled `config.commands` entry through the configured branch, which lacks make-recipe inspection):
 
 ```js
 const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
+  // Engine mode rejects config.commands below, but rejection alone leaves
+  // the map live in the resolution loop, where a scripts-resolved engine
+  // check could still consult a smuggled entry through the configured
+  // branch (which lacks make-recipe inspection). Emptying the map in engine
+  // mode makes that path structurally dead rather than relying on the
+  // errors→FAIL rollup to keep it inert.
+  const commands = mode === 'engine' ? {} : (config.commands || {});
 ```
 
 2. Immediately after `const errors = [];` (~line 364), insert the mode gates:
