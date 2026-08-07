@@ -368,3 +368,17 @@ test('rejects a --config opened after an ENOENT lstat pre-check finds nothing to
     /must not be a symlink/,
   );
 });
+
+test('parseArgs defaults mode to strict and accepts --mode engine', () => {
+  const { parseArgs } = require('./pr_closeout.js');
+  assert.equal(parseArgs([]).mode, 'strict');
+  assert.equal(parseArgs(['--mode', 'engine']).mode, 'engine');
+  assert.equal(parseArgs(['--mode', 'strict']).mode, 'strict');
+});
+
+test('parseArgs rejects unknown --mode values and a missing value', () => {
+  const { parseArgs } = require('./pr_closeout.js');
+  assert.throws(() => parseArgs(['--mode', 'lenient']), /Unknown --mode value: lenient/);
+  assert.throws(() => parseArgs(['--mode']), /Missing value for --mode/);
+  assert.throws(() => parseArgs(['--mode', '--plan']), /Missing value for --mode/);
+});

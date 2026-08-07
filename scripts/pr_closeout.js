@@ -16,6 +16,7 @@ Options:
   --base-ref <ref>     Live PR base ref, such as origin/main
   --config <path>      Repository-specific closeout JSON
   --output-dir <path>  Evidence directory (default: system temp directory)
+  --mode <strict|engine>  Gate tier (default: strict; engine runs config.engineChecks)
   --plan               Resolve and print commands without executing them
   -h, --help           Show this help
 `;
@@ -32,12 +33,12 @@ Options:
  * @returns {object} parsed options.
  */
 const parseArgs = (argv) => {
-  const options = { repo: process.cwd(), plan: false };
+  const options = { repo: process.cwd(), plan: false, mode: 'strict' };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === '--help' || argument === '-h') options.help = true;
     else if (argument === '--plan') options.plan = true;
-    else if (['--repo', '--base-ref', '--config', '--output-dir'].includes(argument)) {
+    else if (['--repo', '--base-ref', '--config', '--output-dir', '--mode'].includes(argument)) {
       const value = argv[index + 1];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${argument}.`);
       index += 1;
@@ -46,11 +47,17 @@ const parseArgs = (argv) => {
         '--base-ref': 'baseRef',
         '--config': 'configPath',
         '--output-dir': 'outputDir',
+        '--mode': 'mode',
       }[argument];
       options[key] = value;
     } else {
       throw new Error(`Unknown argument: ${argument}`);
     }
+  }
+  // The mode is operator intent, not configuration: an unknown value is a
+  // hard could-not-run error (exit 3 class), never a silent strict fallback.
+  if (options.mode !== 'strict' && options.mode !== 'engine') {
+    throw new Error(`Unknown --mode value: ${options.mode}. Use strict or engine.`);
   }
   return options;
 };
@@ -214,6 +221,7 @@ const main = async () => {
       config,
       outputDir: options.outputDir,
       planOnly: options.plan,
+      mode: options.mode,
     });
     // One JSON line on stdout (JSONL-style contract): no pretty-print indent,
     // so line-oriented wrappers can parse each record as a single line.

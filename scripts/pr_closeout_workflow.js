@@ -921,6 +921,7 @@ const runCloseoutWorkflow = async ({
   config = {},
   outputDir,
   planOnly = false,
+  mode = 'strict',
   dependencies = {},
 } = {}) => {
   // Per-invocation lock box so concurrent runCloseoutWorkflow calls only
@@ -942,6 +943,7 @@ const runCloseoutWorkflow = async ({
       config,
       outputDir,
       planOnly,
+      mode,
       dependencies: { ...d, prepareOutputDirectory: prepareWrapped },
     });
   } finally {
@@ -955,8 +957,18 @@ const runCloseoutWorkflowBody = async ({
   config = {},
   outputDir,
   planOnly = false,
+  mode = 'strict',
   dependencies = {},
 } = {}) => {
+  // Mode is invocation-only: a config file that could switch a strict run
+  // into engine mode would be a silent weakening channel, so its presence in
+  // config is a hard error rather than an ignored key.
+  if (Object.hasOwn(config, 'mode')) {
+    throw new Error('The closeout mode cannot be set from config; pass --mode on the invocation.');
+  }
+  if (mode !== 'strict' && mode !== 'engine') {
+    throw new Error(`Unknown closeout mode "${mode}". Use strict or engine.`);
+  }
   const d = { ...DEFAULTS, ...dependencies };
   const startedAt = new Date().toISOString();
   const initial = await d.resolveRepositoryState({ repo, baseRef });

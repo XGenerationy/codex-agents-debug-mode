@@ -1492,3 +1492,18 @@ test('seals ignored generated output paths after all checks', async () => {
     assert.deepEqual(extraPaths, ['node_modules/.prisma', 'node_modules/@prisma/client', 'generated/client']);
   }
 });
+
+test('config.mode is rejected before any repository work — mode comes only from the invocation', async () => {
+  await assert.rejects(
+    () => runCloseoutWorkflow({
+      repo: process.cwd(),
+      baseRef: 'origin/main',
+      config: { mode: 'engine' },
+      planOnly: true,
+      dependencies: {
+        resolveRepositoryState: async () => { throw new Error('must not be called'); },
+      },
+    }),
+    /mode cannot be set from config/,
+  );
+});
