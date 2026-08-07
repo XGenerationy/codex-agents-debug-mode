@@ -137,19 +137,51 @@ test('rendered markdown/table neutralize markdown-injection forgery from stored 
   assert.equal(tableLines.filter((l) => l.trim().startsWith('**H99')).length, 0);
 });
 
-test('rendered markdown/table keep a backticked disappeared message inside its delimiters', () => {
+test('rendered markdown/table never let a backticked disappeared message break out of its context', () => {
   const before = parseSessionText(
     line({ ts: '2026-08-06T10:00:01.000Z', msg: 'has `backtick` inside', hypothesisId: 'H1' }),
   );
   const diff = computeDiff(before, parseSessionText(''));
 
   const markdown = renderMarkdown(diff);
+  // Markdown no longer wraps disappeared messages in a backtick code span:
+  // a code span treats backticks as delimiters even when backslash-escaped,
+  // so the old `\`...\`` form could let a backticked msg break out and
+  // change the report structure. Plain double-quoted text avoids that.
   const goneLine = markdown.split('\n').find((l) => l.startsWith('- gone: '));
-  assert.equal(goneLine, '- gone: `has \\`backtick\\` inside`');
+  assert.equal(goneLine, '- gone: "has \\`backtick\\` inside"');
+  // No bare backtick can act as a code-span delimiter: every backtick in the
+  // report is backslash-escaped by escapeText. (The old code-span form could
+  // be closed by a backtick even when escaped, since code spans ignore
+  // backslash escapes — quotes make that moot.)
+  for (const ch of [...markdown.matchAll(/`/g)]) {
+    assert.equal(ch.index > 0 && markdown[ch.index - 1] === '\\', true);
+  }
 
   const table = renderTable(diff);
   const tableLine = table.split('\n').find((l) => l.includes('backtick'));
   assert.equal(tableLine, '  - has \\`backtick\\` inside');
+});
+
+test('rendered markdown cannot be broken by a disappeared message crafted to close a code span', () => {
+  // A msg containing its own backtick run was the injection vector: under
+  // the old code-span rendering, the backtick could terminate the span and
+  // the trailing text would render as Markdown. With quote-wrapped plain
+  // text this is impossible.
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', msg: '` close then inject **forged verdict**', hypothesisId: 'H1' }),
+  );
+  const diff = computeDiff(before, parseSessionText(''));
+  const markdown = renderMarkdown(diff);
+  // No bare (unescaped) backtick remains to act as a code-span delimiter:
+  // every backtick is preceded by a backslash, so there is no delimiter run
+  // that could open or close a span.
+  for (const match of markdown.matchAll(/`/g)) {
+    assert.equal(match.index > 0 && markdown[match.index - 1] === '\\', true);
+  }
+  // The forged verdict text stays as escaped content on the gone line, not
+  // rendered as a separate bold Markdown line.
+  assert.equal(markdown.split('\n').filter((l) => l.trim().startsWith('**forged verdict**')).length, 0);
 });
 
 test('computeDiff ignores non-string/missing hypothesis ids without crashing, counts them, and renderers state it', () => {

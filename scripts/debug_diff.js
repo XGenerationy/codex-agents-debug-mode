@@ -199,7 +199,13 @@ const renderMarkdown = (diff) => {
     lines.push(`**${escapeText(h.id)}${title}**  ${statusOr(h.before.status)} → ${statusOr(h.after.status)}`);
     lines.push('');
     lines.push(`- events ${h.before.events} → ${h.after.events}`);
-    for (const msg of h.disappeared) lines.push(`- gone: \`${escapeText(msg)}\``);
+    // Double quotes, not a backtick code span: a Markdown code span treats
+    // backticks as delimiters even when preceded by a backslash, so
+    // escapeText's `\`` escaping cannot guarantee a backticked disappeared
+    // message stays inside its span. Plain text in quotes relies on
+    // escapeText for newline/control neutralization (the real safety) and
+    // matches the note rendering on the next line.
+    for (const msg of h.disappeared) lines.push(`- gone: "${escapeText(msg)}"`);
     if (h.disappearedTruncated > 0) lines.push(`- …and ${h.disappearedTruncated} more disappeared`);
     if (h.after.note) lines.push(`- note: "${escapeText(h.after.note)}"`);
     lines.push('');
