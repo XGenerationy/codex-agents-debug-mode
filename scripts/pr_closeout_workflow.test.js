@@ -12,6 +12,7 @@ const {
   mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  resolvePlanAdmission,
   runCloseoutWorkflow,
 } = require('./pr_closeout_workflow');
 
@@ -1518,6 +1519,12 @@ const planDeps = (digests) => ({
     digests.push(value);
     return `digest-${digests.length}`;
   },
+  // Task 5's admission block now runs unconditionally in plan mode; fake
+  // these three so this digest-focused test doesn't pay for a real `gh`
+  // round trip (and its 60s execFile timeout) on every invocation.
+  readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+  cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+  runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
 });
 
 test('the validation-config digest binds the mode (schemaVersion 3)', async () => {
@@ -1544,6 +1551,11 @@ test('strict and engine digests differ even for identical config bytes, and a ma
     }),
     readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
     digestValidationConfig,
+    // Same reasoning as planDeps above: avoid a real `gh` round trip per
+    // invocation now that plan mode resolves admission unconditionally.
+    readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+    cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+    runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
   });
   const strictPlan = await runCloseoutWorkflow({
     repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {}, dependencies: realDeps(),
@@ -1572,4 +1584,61 @@ test('mergeEngineTimeouts lets inline engine timeouts win over config.timeoutsMs
   );
   assert.deepEqual(mergeEngineTimeouts(undefined, [{ id: 'a', timeoutMs: 100 }]), { a: 100 });
   assert.deepEqual(mergeEngineTimeouts({ a: 1 }, []), { a: 1 });
+});
+
+test('resolvePlanAdmission reports present, absent, and unavailable attestation states plus tree and preflight readiness', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested by reviewer' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: { git: '2.45' } }),
+    },
+  };
+  const present = await resolvePlanAdmission(base);
+  assert.equal(present.attestation.status, 'present');
+  assert.equal(present.cleanTree.status, 'PASS');
+  assert.equal(present.preflight.status, 'PASS');
+
+  const absent = await resolvePlanAdmission({
+    ...base,
+    d: { ...base.d, readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }) },
+  });
+  assert.equal(absent.attestation.status, 'absent');
+  assert.match(absent.attestation.evidence, /no matching attestation/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => { throw new Error('gh: not logged in'); },
+      runPreflight: async () => { throw new Error('probe crashed'); },
+      cleanTreeStatus: async () => { throw new Error('git unavailable'); },
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /gh: not logged in/);
+  assert.equal(unavailable.preflight.status, 'BLOCKED');
+  assert.match(unavailable.preflight.evidence, /probe crashed/);
+  assert.equal(unavailable.cleanTree.status, 'BLOCKED');
+  assert.match(unavailable.cleanTree.evidence, /git unavailable/);
+});
+
+test('planOnly output carries the admission block', async () => {
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-a',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  });
+  assert.equal(plan.admission.attestation.status, 'absent');
+  assert.equal(plan.admission.cleanTree.status, 'PASS');
+  assert.equal(plan.admission.preflight.status, 'PASS');
 });

@@ -897,6 +897,48 @@ const mergeEngineTimeouts = (configTimeouts, checks) => ({
 });
 
 /**
+ * Read-only admission readiness for plan mode: WHY would the full gate block
+ * right now? Consumed by the Action's push-time preview (sub-project B) so an
+ * ordinary push gets an honest "attestation absent / gh unavailable / tree
+ * dirty" answer without paying for the full gate. Every probe failure is
+ * caught into a structured state — plan mode must never throw because gh is
+ * unauthenticated or a probe crashed; that is precisely what it exists to
+ * report. The attestation predicate mirrors the full run's admission
+ * (`initialAttestation.status === 'PASS'` — see attestationAdmitted below).
+ * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, d: object}} options
+ * @returns {Promise<{attestation: object, cleanTree: object, preflight: object}>}
+ */
+const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, d }) => {
+  let attestation;
+  try {
+    const live = await d.readLiveGateAttestation({
+      repo,
+      expectedBaseSha: baseSha,
+      expectedHeadSha: headSha,
+      expectedConfigDigest: configDigest,
+    });
+    attestation = live?.status === 'PASS'
+      ? { status: 'present', evidence: live.evidence }
+      : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
+  } catch (error) {
+    attestation = { status: 'unavailable', evidence: `Attestation lookup failed: ${error.message}` };
+  }
+  let cleanTree;
+  try {
+    cleanTree = await d.cleanTreeStatus(repo);
+  } catch (error) {
+    cleanTree = { status: 'BLOCKED', evidence: `Working tree inspection failed: ${error.message}` };
+  }
+  let preflight;
+  try {
+    preflight = await d.runPreflight({ repo, config, env: process.env });
+  } catch (error) {
+    preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
+  }
+  return { attestation, cleanTree, preflight };
+};
+
+/**
  * Orchestrates a full PR closeout run end to end: resolve repo state, build
  * and admit the check plan, run validation, independently verify GitHub's
  * live gate/PR state, seal the repository against drift, and persist
@@ -1031,9 +1073,18 @@ const runCloseoutWorkflowBody = async ({
       .map(({ id, proof }) => `${id}:postcondition:${proof.command}`),
   ];
   if (planOnly) {
+    const admission = await resolvePlanAdmission({
+      repo: initial.repo,
+      baseSha: initial.baseSha,
+      headSha: initial.headSha,
+      configDigest,
+      config,
+      d,
+    });
     return redactStructure({
       execution: 'not-started',
       mode,
+      admission,
       repository: initial.repo,
       baseRef: initial.baseRef,
       baseSha: initial.baseSha,
@@ -1553,6 +1604,7 @@ module.exports = {
   normalizePersistedPaths,
   prepareOutputDirectory,
   releaseOutputDirLock,
+  resolvePlanAdmission,
   runCloseoutWorkflow,
   sealRepository,
 };
