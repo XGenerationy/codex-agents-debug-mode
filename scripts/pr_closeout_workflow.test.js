@@ -1784,7 +1784,10 @@ test('engine mode full run: a suppression finding auto-FAILs even an all-green c
       file: 'src/a.ts',
       line: 12,
       category: 'suppression',
-      match: '// eslint-disable-next-line',
+      // Neutral placeholder, matching the fixture idiom at the rescan test
+      // above — a literal suppression marker here would trip the repo's own
+      // touched-file scanner on this test file.
+      match: 'forbidden',
     }],
   });
   const result = await runCloseoutWorkflow({
