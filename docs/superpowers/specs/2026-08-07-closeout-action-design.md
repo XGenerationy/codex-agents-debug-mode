@@ -120,6 +120,22 @@ prototype of a later `Object.assign`-style copy).
   All four attestation states render distinctly; `weakened` renders as a warning row
   (it is defensive-only today — recorded in A's spec — but if it ever fires it must
   not look like `absent`).
+- Gate error text never reaches the comment (review decision, Task 4 round 2): the
+  CLI's top-level catch does not redact — its audience was a terminal — so raw stderr
+  and the init-failure error string can carry embedded credentials. They stay on
+  run-log-equivalent surfaces only (Step Summary and artifact, where the same text
+  already appears in the Actions log); the PR comment is permanent, notifies every
+  subscriber, and is indexed, so a broken preview's comment is a fixed-shape pointer
+  ("the preview itself failed — see the Step Summary and run log") and full-tier
+  comments carry status fields plus the fixed artifact pointer, never error text.
+  Real spawn failures (ENOENT, maxBuffer) are named in the Step Summary rather than
+  reported as generic missing-JSON.
+- Degraded full-run labeling (review decision, Task 4 round 2): when `report.json`
+  cannot be read, the human surfaces label the run with the tier the action INVOKED
+  (the validated `--mode` value), never the renderer's strict fallback — an engine
+  run must never read as strict (the same rule sub-project A enforced with the
+  `matrixSource` tell). The machine `mode` output stays report-sourced: empty when
+  unknown is honest for consumers keying on it.
 - Row caps are announced, never silent (review decision, Task 2 round): the plan-error
   list (50), non-PASS preflight rows (20), and check-id list (50, whose header carries
   the true total) each append an "…and N more" pointer at the artifact when clipped —

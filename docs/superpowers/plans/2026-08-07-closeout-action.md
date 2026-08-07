@@ -893,6 +893,67 @@ test('the comment step sends the comment rendering, not the summary embed', asyn
   assert.doesNotMatch(bodyArg, /HUGE EMBEDDED REPORT BODY/);
 });
 
+test('a broken preview comments only a pointer — gate error text stays in summary and artifact', async () => {
+  // The CLI's top-level catch does NOT redact (its audience was a
+  // terminal): raw stderr and the init-failure error can carry an embedded
+  // token. The Step Summary is run-log-equivalent and keeps it; the
+  // permanent, subscriber-notifying COMMENT never carries it.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({
+      status: 3,
+      stdout: `${JSON.stringify({ status: 'BLOCKED', error: 'git ls-remote https://x-access-token:SECRETTOKEN@github.example failed' })}\n`,
+      stderr: 'fatal: SECRETTOKEN in remote',
+    }),
+  });
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /SECRETTOKEN/);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.doesNotMatch(state.renderedComment, /SECRETTOKEN/);
+  assert.match(state.renderedComment, /preview itself failed/i);
+  assert.match(state.renderedComment, /Step Summary and run log/);
+});
+
+test('a degraded engine run never labels itself strict', async () => {
+  // report.json unreadable: the renderer fallback would claim strict, but
+  // the action KNOWS the tier it invoked (same rule as sub-project A's
+  // matrixSource tell). Machine `mode` output stays report-sourced.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  await runSubcommand({
+    inputs: { run: 'full', mode: 'engine', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({
+      status: 2,
+      stdout: `${JSON.stringify({ status: 'FAIL', headSha: 'h', report: { json: path.join(dir, 'missing', 'report.json'), markdown: path.join(dir, 'missing', 'report.md') } })}\n`,
+      stderr: '',
+    }),
+  });
+  const summary = readFs(path.join(dir, 's'), 'utf8');
+  assert.match(summary, /- Mode: engine/);
+  assert.doesNotMatch(summary, /- Mode: strict/);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.match(state.renderedComment, /- Mode: engine/);
+});
+
+test('a spawn failure is named in the summary, not just "no JSON"', async () => {
+  const dir = makeTempDir();
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir: path.join(dir, 'e'), artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: null, stdout: '', stderr: '', error: new Error('spawn node ENOENT') }),
+  });
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /spawn node ENOENT/);
+});
+
 test('finishSubcommand exits with the recorded decision', () => {
   const dir = makeTempDir();
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' } }));
@@ -987,9 +1048,14 @@ none — review decision) at the top of `actions/closeout/support.js`:
 
 ```js
 const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 ```
+
+(`os` is consumed by `main`'s output-dir default — a lazy `require('node:os')`
+inside `main` would be inconsistent with the file's imports; review note, Task 4
+round 2.)
 
 Then append (exports extended; `GATE_CLI` computed from `__dirname`):
 
@@ -1051,6 +1117,10 @@ const runSubcommand = async ({
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);
   const decision = decideExit({ run, cliExitCode, parsed });
+  // A real spawn failure (ENOENT, maxBuffer) must be named, not reported as
+  // a generic missing-JSON — the operator cannot diagnose "no plan JSON"
+  // when the actual cause is a missing CLI (review, Task 4 round 2).
+  const spawnNote = result.error ? ` Spawn error: ${result.error.message}.` : '';
 
   let renderedSummary;
   let renderedComment = '';
@@ -1061,6 +1131,8 @@ const runSubcommand = async ({
   if (run === 'plan') {
     if (parsed && typeof parsed.planStatus === 'string') {
       renderedSummary = renderPlanSummary(parsed, { baseRef });
+      // Plan comments equal the plan summary: gate-redacted content only.
+      renderedComment = renderedSummary;
       status = parsed.planStatus;
       reportMode = parsed.mode || '';
       attestation = parsed.admission?.attestation?.status || '';
@@ -1071,9 +1143,21 @@ const runSubcommand = async ({
       renderedSummary = [
         '## Closeout plan preview',
         '',
-        `**The preview itself failed** — ${escapeActionText(decision.reason)}`,
+        `**The preview itself failed** — ${escapeActionText(decision.reason + spawnNote)}`,
         '',
         `stderr: ${escapeActionText(String(result.stderr || '').slice(0, 4000))}`,
+        '',
+      ].join('\n');
+      // Gate error text (raw stderr; parsed.error inside decision.reason)
+      // is NOT redacted by the CLI's top-level catch — its audience was a
+      // terminal. It stays on run-log-equivalent surfaces (Step Summary,
+      // artifact); the COMMENT is permanent and notifies every subscriber,
+      // so it carries a fixed-shape pointer only (review decision, Task 4
+      // round 2).
+      renderedComment = [
+        '## Closeout plan preview',
+        '',
+        '**The preview itself failed.** See the workflow Step Summary and run log for detail.',
         '',
       ].join('\n');
       status = 'BLOCKED';
@@ -1089,22 +1173,29 @@ const runSubcommand = async ({
     }
     status = report.overallStatus || parsed?.status || 'BLOCKED';
     reportMode = report.mode || '';
+    // The report is the source of truth for the tier label when readable;
+    // when it is NOT, the action still knows the tier it INVOKED — an
+    // engine run must never be labeled strict by the renderer's fallback
+    // (review decision, Task 4 round 2; same rule as sub-project A's
+    // matrixSource tell). The machine `mode` output stays report-sourced:
+    // empty-when-unknown is honest for consumers keying on it.
+    const labelMode = report.mode || mode;
     renderedSummary = renderFullSummary(
-      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
-      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'})`,
+      { overallStatus: status, mode: labelMode, configDigest: report.configDigest },
+      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'}${spawnNote})`,
       { artifactName },
     );
     // Full-tier COMMENTS never carry the embedded report.md (spec): key
     // fields plus a pointer only — the full report lives in the Step
     // Summary and the artifact. The pointer line is a fixed literal so no
-    // operator input rides in it unescaped.
+    // operator input rides in it unescaped, and no gate error text ever
+    // reaches a comment.
     renderedComment = renderFullSummary(
-      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
+      { overallStatus: status, mode: labelMode, configDigest: report.configDigest },
       'See report.md in the evidence artifact named above.',
       { artifactName },
     );
   }
-  if (run === 'plan') renderedComment = renderedSummary;
 
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
   if (env.GITHUB_OUTPUT) {
@@ -1188,7 +1279,7 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
 const main = async () => {
   const [subcommand] = process.argv.slice(2);
   const env = process.env;
-  const common = { outputDir: env.CLOSEOUT_OUTPUT_DIR || path.join(env.RUNNER_TEMP || require('node:os').tmpdir(), 'closeout-evidence') };
+  const common = { outputDir: env.CLOSEOUT_OUTPUT_DIR || path.join(env.RUNNER_TEMP || os.tmpdir(), 'closeout-evidence') };
   try {
     if (subcommand === 'run') {
       process.exitCode = await runSubcommand({
