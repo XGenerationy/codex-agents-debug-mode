@@ -4,9 +4,12 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  capText,
   decideExit,
   escapeActionText,
   parseLastJsonLine,
+  renderFullSummary,
+  renderPlanSummary,
   resolveBaseRef,
   validateActionInputs,
 } = require('./support');
@@ -106,4 +109,64 @@ test('escapeActionText is the gate safeText allowlist: everything non-allowliste
   }
   assert.equal(escapeActionText(undefined), '');
   assert.equal(escapeActionText(42), '42');
+});
+
+const hostilePlan = () => ({
+  planStatus: 'FAIL',
+  mode: 'engine',
+  configDigest: 'digest-abc',
+  errors: ['# forged heading\n> **STRICT MODE** claim | pipe'],
+  checks: [{ id: 'unit' }, { id: 'lint' }],
+  admission: {
+    attestation: { status: 'weakened', evidence: 'decision **weakened** by [review](x)' },
+    cleanTree: { status: 'PASS', evidence: 'clean' },
+    preflight: { status: 'BLOCKED', checks: [{ name: 'docker', status: 'BLOCKED', evidence: 'daemon | down' }] },
+  },
+});
+
+test('renderPlanSummary renders all four attestation states distinctly and escapes hostile evidence', () => {
+  const markdown = renderPlanSummary(hostilePlan(), { baseRef: 'origin/main' });
+  assert.match(markdown, /Closeout plan preview/);
+  assert.match(markdown, /Mode.*engine/);
+  assert.match(markdown, /planStatus.*FAIL/);
+  assert.match(markdown, /digest-abc/);
+  // The base ref passes through the safeText-style escaper: '/' is not
+  // allowlisted, so it renders as its numeric entity.
+  assert.match(markdown, /origin&#47;main/);
+  // Weakened must be visually distinct from absent, not just different text.
+  assert.match(markdown, /\u26A0.*weakened/i);
+  // Hostile evidence is neutralized: no forged heading or blockquote line.
+  assert.equal(markdown.split('\n').some((line) => line.startsWith('# forged')), false);
+  assert.equal(markdown.split('\n').filter((line) => line.startsWith('>')).length, 0);
+  assert.doesNotMatch(markdown, /\*\*STRICT MODE\*\*/);
+
+  for (const status of ['present', 'absent', 'unavailable']) {
+    const plan = hostilePlan();
+    plan.admission.attestation = { status, evidence: `state ${status}` };
+    assert.match(renderPlanSummary(plan, {}), new RegExp(`attestation.*${status}`, 'i'));
+  }
+});
+
+test('renderFullSummary embeds the gate report verbatim and caps with an in-band notice', () => {
+  const report = { overallStatus: 'FAIL', mode: 'engine', configDigest: 'd1' };
+  const small = renderFullSummary(report, '## Gate Report\n\n> **ENGINE MODE** banner line\n', { artifactName: 'closeout-evidence' });
+  // The gate-rendered markdown is embedded verbatim — NOT double-escaped.
+  assert.match(small, /## Gate Report/);
+  assert.match(small, /> \*\*ENGINE MODE\*\* banner line/);
+  assert.match(small, /FAIL/);
+
+  const big = renderFullSummary(report, 'x'.repeat(600 * 1024), { artifactName: 'closeout-evidence' });
+  assert.ok(Buffer.byteLength(big, 'utf8') <= 524288 + 2048, 'summary exceeds cap plus notice allowance');
+  assert.match(big, /truncated/i);
+  assert.match(big, /closeout-evidence/);
+});
+
+test('capText truncates on byte length with a notice and passes short text through', () => {
+  const short = capText('hello', 1024, 'artifact-name');
+  assert.deepEqual(short, { text: 'hello', truncated: false });
+  const long = capText('y'.repeat(2048), 1024, 'artifact-name');
+  assert.equal(long.truncated, true);
+  assert.ok(Buffer.byteLength(long.text, 'utf8') <= 1024 + 2048);
+  assert.match(long.text, /truncated/i);
+  assert.match(long.text, /artifact-name/);
 });

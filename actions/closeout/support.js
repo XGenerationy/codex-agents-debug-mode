@@ -131,10 +131,120 @@ const escapeActionText = (value) => String(value ?? '')
   .replace(/\r\n?|\n/g, ' \u23CE ')
   .replace(/[^A-Za-z0-9 ._\u23CE-]/gu, (character) => `&#${character.codePointAt(0)};`);
 
+// Step Summary hard limit is 1 MiB; the spec caps the embedded report at
+// 512 KiB so the summary chrome around it can never push past the limit.
+const SUMMARY_EMBED_CAP_BYTES = 512 * 1024;
+const COMMENT_CAP_BYTES = 60 * 1024;
+
+/**
+ * Byte-length cap with an in-band truncation notice pointing at the evidence
+ * artifact — silent truncation would read as "that was everything".
+ * @param {string} text
+ * @param {number} maxBytes
+ * @param {string} artifactName
+ * @returns {{text: string, truncated: boolean}}
+ */
+const capText = (text, maxBytes, artifactName) => {
+  const value = String(text ?? '');
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return { text: value, truncated: false };
+  const clipped = Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8');
+  // Drop a possibly-split trailing code point (replacement char from a cut
+  // multibyte sequence) rather than shipping mojibake.
+  const clean = clipped.endsWith('\uFFFD') ? clipped.slice(0, -1) : clipped;
+  return {
+    text: `${clean}\n\n---\n\n**Output truncated at ${maxBytes} bytes.** The complete evidence is in the \`${artifactName}\` artifact.\n`,
+    truncated: true,
+  };
+};
+
+const ATTESTATION_LABELS = new Map([
+  ['present', 'present — a mode-matched attestation covers this exact snapshot'],
+  ['weakened', '\u26A0 weakened — an attestation for this snapshot records a WEAKENED decision'],
+  ['absent', 'absent — no matching approving review yet (normal before review)'],
+  ['unavailable', 'unavailable — the attestation lookup itself could not complete'],
+]);
+
+/**
+ * Renders the plan-preview Step Summary: mode/planStatus/digest header, the
+ * resolved base ref, the four-state admission table (weakened is visually
+ * distinct — it must never read like absent), preflight detail rows, plan
+ * errors, and the check id list. Every gate-sourced string passes through
+ * escapeActionText; job color stays green for honest not-ready states, so
+ * this rendering IS the preview's signal.
+ * @param {object} plan the captured plan JSON.
+ * @param {{baseRef?: string|null}} [context]
+ * @returns {string}
+ */
+const renderPlanSummary = (plan, { baseRef = null } = {}) => {
+  const admission = plan.admission || {};
+  const attestation = admission.attestation || {};
+  const label = ATTESTATION_LABELS.get(attestation.status) || `unknown state: ${escapeActionText(attestation.status)}`;
+  const lines = [
+    '## Closeout plan preview',
+    '',
+    `- Mode: ${escapeActionText(plan.mode || 'strict')}`,
+    `- planStatus: **${escapeActionText(plan.planStatus)}**`,
+    `- Configuration digest: ${escapeActionText(plan.configDigest || 'unresolved')}`,
+    `- Base ref: ${escapeActionText(baseRef || 'from config')}`,
+    '',
+    '### Admission readiness',
+    '',
+    '| Probe | Status | Evidence |',
+    '|---|---|---|',
+    `| attestation | ${label.split(' — ')[0]} | ${escapeActionText(attestation.evidence || label)} |`,
+    `| clean tree | ${escapeActionText(admission.cleanTree?.status || 'unknown')} | ${escapeActionText(admission.cleanTree?.evidence || '')} |`,
+    `| preflight | ${escapeActionText(admission.preflight?.status || 'unknown')} | ${escapeActionText(admission.preflight?.evidence || '')} |`,
+  ];
+  lines.push('', `- Attestation detail: ${label}`);
+  const preflightChecks = Array.isArray(admission.preflight?.checks) ? admission.preflight.checks : [];
+  for (const check of preflightChecks.filter((entry) => entry.status !== 'PASS').slice(0, 20)) {
+    lines.push(`- preflight ${escapeActionText(check.name)}: ${escapeActionText(check.status)} — ${escapeActionText(check.evidence || '')}`);
+  }
+  const errors = Array.isArray(plan.errors) ? plan.errors : [];
+  if (errors.length > 0) {
+    lines.push('', '### Plan errors', '');
+    for (const error of errors.slice(0, 50)) lines.push(`- ${escapeActionText(error)}`);
+  }
+  const checks = Array.isArray(plan.checks) ? plan.checks : [];
+  lines.push('', `### Resolved checks (${checks.length})`, '');
+  lines.push(checks.slice(0, 50).map((check) => escapeActionText(check.id)).join(', ') || '(none)');
+  lines.push('');
+  return lines.join('\n');
+};
+
+/**
+ * Renders the full-run Step Summary: key fields from report.json, then the
+ * gate-written report.md embedded VERBATIM below a divider (it already went
+ * through the gate's own safeText pipeline — re-escaping would corrupt it),
+ * capped at SUMMARY_EMBED_CAP_BYTES with an in-band truncation notice.
+ * @param {object} report parsed report.json (only top-level fields read).
+ * @param {string} reportMarkdown gate-written report.md content.
+ * @param {{artifactName: string}} options
+ * @returns {string}
+ */
+const renderFullSummary = (report, reportMarkdown, { artifactName }) => {
+  const embed = capText(reportMarkdown, SUMMARY_EMBED_CAP_BYTES, artifactName);
+  return [
+    '## Closeout gate result',
+    '',
+    `- Overall status: **${escapeActionText(report.overallStatus)}**`,
+    `- Mode: ${escapeActionText(report.mode || 'strict')}`,
+    `- Configuration digest: ${escapeActionText(report.configDigest || 'unresolved')}`,
+    `- Evidence artifact: \`${escapeActionText(artifactName)}\``,
+    '',
+    '---',
+    '',
+    embed.text,
+  ].join('\n');
+};
+
 module.exports = {
+  capText,
   decideExit,
   escapeActionText,
   parseLastJsonLine,
+  renderFullSummary,
+  renderPlanSummary,
   resolveBaseRef,
   validateActionInputs,
 };
