@@ -193,6 +193,11 @@ permissions:
   pull-requests: write
 ```
 
+`pr-comment: true` also requires `gh` **2.31 or newer** on the runner (the comment
+upsert uses `gh api --paginate --slurp`). GitHub-hosted runners ship a current `gh`;
+on a self-hosted runner with an older one, every comment attempt fails with
+`unknown flag: --slurp`, which reads like an unrelated tooling problem.
+
 **Fork-PR note:** a `pull_request`-triggered workflow running against a fork PR
 receives a reduced, read-only token regardless of the `permissions:` block above.
 `run: plan` still works there — it is read-only by design — but `pr-comment: true`
@@ -239,7 +244,7 @@ plan JSON:
 | State | Meaning |
 |---|---|
 | `present` | A mode-matched attestation for this exact base/head/config-digest snapshot exists. |
-| `weakened` | An attestation matching this snapshot exists but records a weakened decision. **Defensive only today:** the live reader currently only ever returns present-PASS or absent-BLOCKED, so a weakened review lands in `absent` instead — this state is kept for reader evolution. Do not build automation that depends on `weakened` firing yet. |
+| `weakened` | An attestation matching this snapshot exists but records a weakened decision. **Defensive only today:** the live reader only ever returns PASS or BLOCKED, never FAIL, so a weakened review lands in `absent` instead — this state is kept for reader evolution. Do not build automation that depends on `weakened` firing yet. |
 | `absent` | No matching approving review yet (the normal state before review), or the PR head/base has moved past the snapshot the last attestation covered. |
 | `unavailable` | The attestation lookup itself could not complete (`gh` missing, unauthenticated, or a network failure) — distinct from `absent`, which says nothing about whether a review exists. |
 
@@ -254,6 +259,14 @@ instead of the fixed 19-check gate. It is explicitly a **different, and weaker,*
 guarantee than strict, and is labeled as such everywhere: reports, Step Summary, PR
 comment, and the attestation digest. A strict-minted attestation can never satisfy an
 engine-mode admission, and vice versa.
+
+Know this before your first run: **strict preflight requires all eight probes to
+pass** — git, node, pnpm, make, docker, docker-compose, a running docker daemon, and
+prisma — and `strict` is the default `mode`. On any stack other than this
+repository's own (a Rust repo, a Python repo, a plain-npm repo), strict admission
+BLOCKS at preflight: the plan preview stays green (honest not-ready is its normal
+state) but its Step Summary reports probes like `pnpm --version` failing. That is
+the signal you want `mode: engine` with `requiredTools`, not a broken setup.
 
 Point `config` at a JSON file, for example:
 
@@ -276,7 +289,11 @@ Point `config` at a JSON file, for example:
   strict gate assumes. Engine-mode preflight probes only `git` and `node` by default,
   plus whatever names you list here, drawn from the fixed probe catalog (`git`,
   `node`, `pnpm`, `make`, `docker`, `docker-compose`, `docker-daemon`, `prisma`).
-  Declare every tool your `engineChecks` commands actually invoke, or preflight has no
+  npm itself is not in the catalog because it ships with Node — the `node` probe
+  covers it, which is why the npm-only example above declares nothing beyond the
+  always-probed defaults (its `requiredTools` line is the explicit spelling of the
+  default; a check that invoked docker would add `"docker"` and `"docker-daemon"`).
+  Declare every catalog tool your `engineChecks` commands actually invoke, or preflight has no
   way to confirm it is present, and a check depending on it can fail later with no
   preflight evidence explaining why. Strict mode's own preflight, by contrast, always
   runs the full 8-probe catalog including pnpm and prisma — exactly the requirement
@@ -334,6 +351,13 @@ event to resolve from — `workflow_dispatch`, as `closeout-gate.yml` does with 
 that is what your checkout needs.
 
 ## Artifact-name uniqueness and concurrency
+
+The evidence artifact contains the gate's own (redacted) report files plus
+`action-state.json` — the run's recorded exit decision and rendered summaries. On
+failure paths those can embed **unredacted CLI error text** (the same text the run
+log shows), the resolved base ref, and absolute runner paths. The artifact is a
+run-log-equivalent surface by design: treat a downloaded copy with the same care as
+the run log, and don't paste its contents into public threads unreviewed.
 
 `actions/upload-artifact@v4` rejects a duplicate artifact name **within one workflow
 run**. If you invoke this action more than once in the same run — a plan step and a
