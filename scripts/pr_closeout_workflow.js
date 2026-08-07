@@ -881,6 +881,20 @@ const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, in
 };
 
 /**
+ * Merge per-check inline engine timeouts into the id-keyed timeoutsMs map
+ * the command executor consumes. The engine matrix is authoritative for its
+ * own checks, so an inline timeoutMs wins over a config.timeoutsMs entry for
+ * the same id; ids without an inline value keep whatever config supplied.
+ * @param {Record<string, number>|undefined} configTimeouts
+ * @param {Array<{id: string, timeoutMs?: number}>} checks
+ * @returns {Record<string, number>}
+ */
+const mergeEngineTimeouts = (configTimeouts, checks) => ({
+  ...(configTimeouts || {}),
+  ...Object.fromEntries(checks.filter((check) => check.timeoutMs).map((check) => [check.id, check.timeoutMs])),
+});
+
+/**
  * Orchestrates a full PR closeout run end to end: resolve repo state, build
  * and admit the check plan, run validation, independently verify GitHub's
  * live gate/PR state, seal the repository against drift, and persist
@@ -974,6 +988,7 @@ const runCloseoutWorkflowBody = async ({
   const initial = await d.resolveRepositoryState({ repo, baseRef });
   const metadata = await d.readProjectMetadata(initial.repo);
   const plan = buildCheckPlan({
+    mode,
     config,
     ...metadata,
     touchedFiles: initial.touchedFiles,
@@ -985,7 +1000,12 @@ const runCloseoutWorkflowBody = async ({
   const baselineSetupCommand = config.baselineSetupCommand || 'pnpm install --frozen-lockfile --ignore-scripts';
   const { gateIntegrityReview: _gateIntegrityReview, ...validationConfig } = config;
   const configDigest = d.digestValidationConfig({
-    schemaVersion: 2,
+    // schemaVersion 2 -> 3: the digest now binds the gate tier. Deliberate
+    // one-time invalidation of outstanding attestations (spec: Migration
+    // consequence) — a strict-minted attestation can never admit an engine
+    // run because the digests can no longer collide across modes.
+    schemaVersion: 3,
+    mode,
     config: validationConfig,
     resolved: {
       baselineSetupCommand,
@@ -1011,6 +1031,7 @@ const runCloseoutWorkflowBody = async ({
   if (planOnly) {
     return redactStructure({
       execution: 'not-started',
+      mode,
       repository: initial.repo,
       baseRef: initial.baseRef,
       baseSha: initial.baseSha,
@@ -1050,7 +1071,7 @@ const runCloseoutWorkflowBody = async ({
     env: childEnv,
     secretNames: [...(config.requiredEnv || []), ...(config.safeEnv || [])],
     timeoutMs: config.timeoutMs,
-    timeoutsMs: config.timeoutsMs,
+    timeoutsMs: mergeEngineTimeouts(config.timeoutsMs, mode === 'engine' ? plan.checks : []),
     grafanaServiceUrl: config.services?.grafana?.url || null,
   });
   const initialAttestation = await d.readLiveGateAttestation({
@@ -1526,6 +1547,7 @@ module.exports = {
   defaultOutputDir,
   evaluateOverallStatus,
   isSameLockIdentity,
+  mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
   releaseOutputDirLock,

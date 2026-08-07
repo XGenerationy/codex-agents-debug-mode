@@ -9,6 +9,7 @@ const {
   defaultOutputDir,
   evaluateOverallStatus,
   isSameLockIdentity,
+  mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
   runCloseoutWorkflow,
@@ -1506,4 +1507,69 @@ test('config.mode is rejected before any repository work — mode comes only fro
     }),
     /mode cannot be set from config/,
   );
+});
+
+const planDeps = (digests) => ({
+  resolveRepositoryState: async ({ repo, baseRef }) => ({
+    repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+  }),
+  readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+  digestValidationConfig: (value) => {
+    digests.push(value);
+    return `digest-${digests.length}`;
+  },
+});
+
+test('the validation-config digest binds the mode (schemaVersion 3)', async () => {
+  const digests = [];
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: planDeps(digests),
+  });
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] },
+    dependencies: planDeps(digests),
+  });
+  assert.equal(digests[0].schemaVersion, 3);
+  assert.equal(digests[0].mode, 'strict');
+  assert.equal(digests[1].mode, 'engine');
+});
+
+test('strict and engine digests differ even for identical config bytes, and a matrix edit changes the engine digest', async () => {
+  const { digestValidationConfig } = require('./pr_closeout_git');
+  const realDeps = () => ({
+    resolveRepositoryState: async ({ repo, baseRef }) => ({
+      repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+    }),
+    readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+    digestValidationConfig,
+  });
+  const strictPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {}, dependencies: realDeps(),
+  });
+  const enginePlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] }, dependencies: realDeps(),
+  });
+  const editedPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test --all' }] }, dependencies: realDeps(),
+  });
+  assert.notEqual(strictPlan.configDigest, enginePlan.configDigest);
+  assert.notEqual(enginePlan.configDigest, editedPlan.configDigest);
+  assert.equal(strictPlan.mode, 'strict');
+  assert.equal(enginePlan.mode, 'engine');
+});
+
+test('mergeEngineTimeouts lets inline engine timeouts win over config.timeoutsMs', () => {
+  assert.deepEqual(
+    mergeEngineTimeouts({ unit: 5000, lint: 7000 }, [
+      { id: 'unit', timeoutMs: 9000 },
+      { id: 'style' },
+    ]),
+    { unit: 9000, lint: 7000 },
+  );
+  assert.deepEqual(mergeEngineTimeouts(undefined, [{ id: 'a', timeoutMs: 100 }]), { a: 100 });
+  assert.deepEqual(mergeEngineTimeouts({ a: 1 }, []), { a: 1 });
 });
