@@ -3,6 +3,7 @@
 const { readFileSync, readdirSync, lstatSync } = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { findUnpinnedUses, hasTopLevelPermissions } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 const payloadEntries = ['SKILL.md', 'agents', 'assets', 'references', 'scripts'];
@@ -236,6 +237,29 @@ for (const file of javascriptFiles) {
   if (result.status !== 0) {
     const detail = stderr || stdout || `exit ${result.status ?? 'null'}`;
     failures.push(`JavaScript syntax failed for ${file}: ${detail}`);
+  }
+}
+
+// Workflow hygiene: every action reference is immutable (40-hex pin) and
+// every workflow declares its token scope. Shallow regex checks by design —
+// see tools/workflow_checks.js.
+const workflowFiles = safetyScanFiles.filter(
+  (name) => name.startsWith('.github/workflows/') && (name.endsWith('.yml') || name.endsWith('.yaml')),
+);
+const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/[^/]+\/action\.ya?ml$/.test(name));
+for (const file of [...workflowFiles, ...actionMetadataFiles]) {
+  let content;
+  try {
+    content = readFileSync(path.join(root, file), 'utf8');
+  } catch (error) {
+    failures.push(`Workflow hygiene target cannot be read: ${file}: ${error.message}`);
+    continue;
+  }
+  for (const violation of findUnpinnedUses(content)) {
+    failures.push(`${file}:${violation.line} uses unpinned action reference: ${violation.ref}`);
+  }
+  if (workflowFiles.includes(file) && !hasTopLevelPermissions(content)) {
+    failures.push(`${file} is missing a top-level permissions block`);
   }
 }
 
