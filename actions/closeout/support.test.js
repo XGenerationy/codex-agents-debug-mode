@@ -219,6 +219,9 @@ test('readPrContext extracts repo and PR number from env plus event payload, els
   assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'owner/repo' }, event: {} }), null);
   assert.equal(readPrContext({ env: {}, event: { pull_request: { number: 42 } } }), null);
   assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'malformed' }, event: { pull_request: { number: 42 } } }), null);
+  // PR numbers are >= 1; zero/negative would target issues/0 — fail closed.
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'o/r' }, event: { pull_request: { number: 0 } } }), null);
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'o/r' }, event: { pull_request: { number: -3 } } }), null);
 });
 
 test('buildCommentBody starts with the stable marker and caps at the comment limit', () => {
@@ -230,9 +233,18 @@ test('buildCommentBody starts with the stable marker and caps at the comment lim
   assert.match(big, /truncated/i);
 });
 
-test('upsertPrComment PATCHes an existing marker comment and POSTs otherwise', async () => {
+test('upsertPrComment PATCHes only the action-authored marker comment and POSTs otherwise', async () => {
+  const bot = { login: 'github-actions[bot]', type: 'Bot' };
+  const attacker = { login: 'drive-by', type: 'User' };
   const calls = [];
-  const existing = [{ id: 7, body: `${ACTION_MARKER}\nold` }, { id: 8, body: 'unrelated' }];
+  // Slurped shape: one JSON array of page arrays. The attacker's marker
+  // comment is EARLIER than the action's own — the author check, not
+  // ordering, must pick the target (review decision, Task 3 round).
+  const existing = [[
+    { id: 1, body: `${ACTION_MARKER}\nforged`, user: attacker },
+    { id: 7, body: `${ACTION_MARKER}\nold`, user: bot },
+    { id: 8, body: 'unrelated', user: bot },
+  ]];
   const patchingGh = async (args) => {
     calls.push(args);
     if (args.includes('--method') === false) return existing; // list call
@@ -244,15 +256,22 @@ test('upsertPrComment PATCHes an existing marker comment and POSTs otherwise', a
     runGh: patchingGh,
   });
   assert.equal(calls.length, 2);
+  assert.ok(calls[0].includes('--paginate') && calls[0].includes('--slurp'),
+    'list walks every page in one parseable document — page 1 is the OLDEST 30 comments');
   assert.ok(calls[0].join(' ').includes('issues/5/comments'), 'first call lists comments');
-  assert.ok(calls[1].join(' ').includes('issues/comments/7'), 'second call PATCHes the marker comment');
+  assert.ok(calls[1].join(' ').includes('issues/comments/7'),
+    'PATCH targets the action-authored marker comment, never the attacker earlier one');
   assert.ok(calls[1].includes('PATCH'));
 
   const posts = [];
   await upsertPrComment({
     context: { owner: 'o', repo: 'r', prNumber: 5 },
     body: `${ACTION_MARKER}\nnew`,
-    runGh: async (args) => { posts.push(args); return args.includes('POST') ? { id: 9 } : []; },
+    runGh: async (args) => {
+      posts.push(args);
+      if (args.includes('POST')) return { id: 9 };
+      return [[{ id: 1, body: `${ACTION_MARKER}\nforged`, user: attacker }]];
+    },
   });
-  assert.ok(posts[1].includes('POST'), 'no marker comment found: POST a new one');
+  assert.ok(posts[1].includes('POST'), 'attacker-only marker comments are ignored: POST a new one');
 });

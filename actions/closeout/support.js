@@ -280,7 +280,8 @@ const readPrContext = ({ env = {}, event = {} } = {}) => {
   const repository = env.GITHUB_REPOSITORY || '';
   const [owner, repo, ...rest] = repository.split('/');
   const prNumber = event?.pull_request?.number;
-  if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber)) return null;
+  // PR numbers are >= 1; zero/negative would target issues/0 — fail closed.
+  if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber) || prNumber < 1) return null;
   return { owner, repo, prNumber };
 };
 
@@ -293,24 +294,36 @@ const readPrContext = ({ env = {}, event = {} } = {}) => {
  */
 const buildCommentBody = ({ rendered, artifactName }) => {
   const capped = capText(rendered, COMMENT_CAP_BYTES, artifactName);
+  // The 33-byte marker line rides outside the cap. Safe: UTF-8 byte count
+  // >= UTF-16 unit count always, so 61440+33 bytes bounds the comment at
+  // ~4000 units under GitHub's 65536-CHARACTER limit.
   return `${ACTION_MARKER}\n${capped.text}`;
 };
 
 /**
- * Upserts the marker-tagged PR comment via the injectable gh seam: list the
- * first page of issue comments, PATCH the one whose body starts with the
- * marker, else POST a new one. First-page-only matching is a documented
- * bound — the action's own comment stays near the top of any real PR's
- * comment count, and a miss degrades to one duplicate comment, never a lost
- * result.
+ * Upserts the action's PR comment via the injectable gh seam. The list call
+ * walks EVERY page (`--paginate`; the issue-comments API returns
+ * oldest-first with a 30-per-page default, so the action's newest comment
+ * is exactly what a first-page-only read would miss — every later run
+ * would then POST a duplicate on precisely the busiest PRs) and `--slurp`
+ * folds the pages into one parseable JSON array of page arrays (gh >= 2.31;
+ * GitHub-hosted runners ship newer). The PATCH target must carry the marker
+ * AND be authored by the workflow token's own bot identity: the marker is
+ * an invisible HTML comment anyone can post or innocently copy-paste, and
+ * without the author check a drive-by comment posted before the action's
+ * first run either gets silently overwritten under the attacker's name or
+ * fails the step forever (review decision, Task 3 round).
  * @param {{context: {owner, repo, prNumber}, body: string, runGh: Function}} options
  * @returns {Promise<void>}
  */
 const upsertPrComment = async ({ context, body, runGh }) => {
   const { owner, repo, prNumber } = context;
-  const listed = await runGh(['api', `repos/${owner}/${repo}/issues/${prNumber}/comments`, '--jq', '.']);
-  const comments = Array.isArray(listed) ? listed : [];
-  const mine = comments.find((comment) => typeof comment?.body === 'string' && comment.body.startsWith(ACTION_MARKER));
+  const listed = await runGh(['api', '--paginate', '--slurp', `repos/${owner}/${repo}/issues/${prNumber}/comments`]);
+  const comments = Array.isArray(listed) ? listed.flat() : [];
+  const mine = comments.find((comment) => typeof comment?.body === 'string'
+    && comment.body.startsWith(ACTION_MARKER)
+    && comment.user?.type === 'Bot'
+    && comment.user?.login === 'github-actions[bot]');
   if (mine) {
     await runGh(['api', '--method', 'PATCH', `repos/${owner}/${repo}/issues/comments/${mine.id}`, '-f', `body=${body}`]);
     return;
