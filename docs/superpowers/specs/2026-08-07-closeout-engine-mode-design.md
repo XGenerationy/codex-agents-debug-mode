@@ -53,9 +53,9 @@ error and the run is BLOCKED before anything executes:
 
 - `id` — non-empty string, unique across the array (duplicate/non-string/empty → error).
 - Command source — exactly one of the shapes the strict matrix already uses: a fixed
-  `command` (array-of-strings argv form, same resolution rules as today's fixed checks) or
-  a `scripts` discovery list (package.json script names tried in order). Both absent, or
-  both present → error.
+  `command` (a single shell-command string, the same form every `fixed: true` strict
+  check and the executor use) or a `scripts` discovery list (package.json script names
+  tried in order). Both absent, or both present → error.
 - Optional fields mirror strict semantics with the same validation: `timeoutMs` (inline
   value wins over a `config.timeoutsMs` entry for the same id — the matrix is
   authoritative for its own checks), `baselineSafe`, `generator`; `qualificationSafe` and
