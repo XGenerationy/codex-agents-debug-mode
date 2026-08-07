@@ -38,9 +38,11 @@ mode** ships the gate's integrity machinery with a repo-defined check matrix.
 - New CLI flag `--mode strict|engine`, default `strict`. **Config may not set the mode** —
   the operator's invocation must say it, so a config file can never silently weaken a
   strict run. Unknown mode values are a hard error (exit 3 class).
-- **Strict mode is byte-for-byte today's behavior.** Same `MANDATORY_CHECKS`, same
-  `fixed: true` hard errors, same order-locked tests, no behavioral delta. The only
-  additive change visible in strict runs is the new `mode: "strict"` field in reports.
+- **Strict mode is byte-for-byte today's CHECK behavior.** Same `MANDATORY_CHECKS`, same
+  `fixed: true` hard errors, same order-locked tests — matrix, ordering, execution, and
+  rollup are unchanged. Strict-visible deltas are limited to the seven-item set
+  enumerated in Success criteria: additive fields plus the deliberate one-time digest
+  migration; nothing else.
 - **Engine mode replaces the matrix wholesale** with `config.engineChecks` — there is no
   merging with, or selective inheritance from, the strict matrix (a hybrid would be
   neither guarantee). Strict's check ids are not reserved; an engine matrix may reuse a
@@ -144,7 +146,8 @@ Enforced in code and pinned by tests — the engine IS these invariants:
   check count.
 - `report.md`: engine reports render a banner section stating: repo-defined matrix, a
   different and weaker guarantee than the strict 19-check gate, with the matrix digest.
-- Strict reports gain only the `mode` field — no banner, no other change.
+- Strict reports gain exactly: the `mode` field, `matrixSource: null` in `report.json`,
+  and the single `- Mode: strict` line in `report.md` — no banner, no other change.
 - Renderer hardening (review decision, Task 6 round): one normalized mode value drives
   both the markdown label and the banner condition (matched case-insensitively), so no
   mode-value casing or coercion can render an engine label without its warning banner;
@@ -188,6 +191,13 @@ the full gate would block without running it: attestation state for the current
 head (and mode), `gh` availability/auth, toolchain preflight probe results, clean-tree
 state. Probes are read-only; the block is additive to the existing plan output. All
 GitHub interaction stays behind the injectable `runGh` seam so tests are hermetic.
+
+Cost note (review, final round): the admission probes run on every `--plan` in BOTH
+modes — a gh lookup, a clean-tree check, and the preflight probe set. Strict `--plan`
+runs the full 8-probe catalog (measured ~27s with a running Docker daemon; without one,
+the docker probes wait out their connect timeouts) and has no opt-out; engine `--plan`
+narrows to git + node + `requiredTools` (~5s measured). Anyone wiring `--plan` into a
+frequent hook (per-push previews, sub-project B) should budget for this on strict.
 
 Attestation state is a four-value vocabulary, not a boolean (review decision, Task 5):
 
@@ -266,9 +276,17 @@ Attestation state is a four-value vocabulary, not a boolean (review decision, Ta
 
 ## Success criteria
 
-- Strict-mode behavior is provably unchanged: the pre-existing closeout suite passes
-  without modification, and the only observable strict-run delta is the additive
-  `mode` report field.
+- Strict-mode check behavior is provably unchanged: the pre-existing closeout suite
+  passes without modification. The complete strict-visible delta set — every item
+  deliberate and recorded — is exactly: (1) plan output gains `mode`; (2) plan output
+  gains the `admission` block, and its read-only probes now run on every `--plan` (see
+  the cost note under "Plan-mode admission readiness"); (3) the `configDigest` value
+  changes once (digest schemaVersion 2→3 + mode binding — the recorded migration
+  consequence: every outstanding attestation is invalidated on the first post-merge
+  run); (4) the attestation reader's internal-catch return gains
+  `reason: 'unavailable'`; (5) `report.json` gains `mode: "strict"`; (6) `report.json`
+  gains `matrixSource: null`; (7) `report.md` gains the single `- Mode: strict` line.
+  Nothing else.
 - Engine mode cannot run without an explicit operator flag, a valid matrix, and a
   mode-matched attestation — every failure path is a named, tested error.
 - Reports and attestation digests make the tier unmistakable to both humans and machines.
