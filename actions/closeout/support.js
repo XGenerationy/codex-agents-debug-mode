@@ -5,10 +5,6 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
-const path = require('node:path');
-const { spawnSync } = require('node:child_process');
-
 const RUN_VALUES = new Set(['plan', 'full']);
 const MODE_VALUES = new Set(['strict', 'engine']);
 const BOOL_VALUES = new Map([['true', true], ['false', false]]);
@@ -60,7 +56,13 @@ const parseLastJsonLine = (stdout) => {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     try {
       const value = JSON.parse(lines[index]);
-      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+      // An own __proto__ key is inert on the parse itself but hijacks the
+      // prototype of any later Object.assign copy; the gate never emits
+      // one, so such a record can only be hostile or garbled — skip it.
+      if (
+        value && typeof value === 'object' && !Array.isArray(value)
+        && !Object.prototype.hasOwnProperty.call(value, '__proto__')
+      ) return value;
     } catch {
       // Not JSON; keep scanning upward.
     }
@@ -86,6 +88,13 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
       ? { success: true, exitCode: 0, reason: 'gate PASS' }
       : { success: false, exitCode: code, reason: `gate ${label} (exit ${code})` };
   }
+  // Fail CLOSED on anything that is not exactly the plan tier: an
+  // unvalidated run value must never fall into the more permissive branch
+  // and report success for a failing full gate. Unreachable through
+  // validateActionInputs — which is exactly why it is closed here too.
+  if (run !== 'plan') {
+    return { success: false, exitCode: 3, reason: `unknown run tier: ${run}` };
+  }
   if (parsed && typeof parsed.planStatus === 'string') {
     return { success: true, exitCode: 0, reason: `plan captured (planStatus=${parsed.planStatus})` };
   }
@@ -100,30 +109,27 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
 // interpolates evidence-derived text into summaries/comments. Mirrors the
 // gate renderer's safeText semantics (allowlist by escaping the actives);
 // the gate-rendered report.md is embedded verbatim and NOT re-escaped.
-const MARKDOWN_ESCAPES = new Map([
-  ['&', '&amp;'], ['<', '&lt;'], ['>', '&#62;'], ['|', '&#124;'], ['*', '&#42;'],
-  ['_', '&#95;'], ['`', '&#96;'], ['[', '&#91;'], [']', '&#93;'], ['#', '&#35;'],
-]);
-
 /**
- * Escapes one evidence-derived value for safe interpolation into markdown a
- * human will trust: entity-escapes markdown-active characters, renders
- * newlines as a visible return mark, and replaces every other control byte
- * with a space (charCode scan — no control-character regex literals).
+ * Escapes one evidence-derived value for markdown a human will trust: the
+ * EXACT transform of the gate renderer's safeText (pr_closeout_report.js:13)
+ * — newlines collapse to a visible return mark, then every character
+ * outside the safeText allowlist (letters, digits, space, dot, underscore,
+ * the return mark, dash) becomes a numeric HTML entity, control bytes
+ * included (an allowlist cannot miss a control byte). This replaced a
+ * partial denylist in review: strikethrough tildes, tilde code fences, and
+ * GFM autolinked URLs all rendered active through it while its comment
+ * claimed safeText parity. Accepted residuals, identical to the gate's own
+ * reports: the allowlisted underscore, dot, and dash keep their rare
+ * markdown meanings and a bare www.-prefixed word can still autolink —
+ * escaping dots would destroy every path and digest in the output. The
+ * gate-rendered report.md is embedded verbatim elsewhere and never
+ * re-escaped.
  * @param {unknown} value
  * @returns {string}
  */
-const escapeActionText = (value) => {
-  const text = value === undefined || value === null ? '' : String(value);
-  let out = '';
-  for (const char of text.replace(/\r\n/g, '\n')) {
-    if (char === '\n') { out += ' \u23CE '; continue; }
-    const code = char.charCodeAt(0);
-    if (code < 32 || code === 127) { out += ' '; continue; }
-    out += MARKDOWN_ESCAPES.get(char) ?? char;
-  }
-  return out;
-};
+const escapeActionText = (value) => String(value ?? '')
+  .replace(/\r\n?|\n/g, ' \u23CE ')
+  .replace(/[^A-Za-z0-9 ._\u23CE-]/gu, (character) => `&#${character.codePointAt(0)};`);
 
 module.exports = {
   decideExit,

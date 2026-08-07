@@ -48,6 +48,10 @@ test('parseLastJsonLine returns the last parseable JSON object line, else null',
   assert.equal(parseLastJsonLine(''), null);
   // A JSON scalar line is not a record.
   assert.equal(parseLastJsonLine('42\n'), null);
+  // A record with an own __proto__ key can only be hostile or garbled — the
+  // gate never emits one. Rejected structurally so no later consumer can be
+  // prototype-tricked by an Object.assign-style copy (review decision).
+  assert.equal(parseLastJsonLine('{"__proto__":{"planStatus":"PASS"}}\n'), null);
 });
 
 test('decideExit implements the spec exit decision table exactly', () => {
@@ -69,19 +73,33 @@ test('decideExit implements the spec exit decision table exactly', () => {
   assert.deepEqual([fail.success, fail.exitCode], [false, 2]);
   const blocked = decideExit({ run: 'full', cliExitCode: 3, parsed: { status: 'BLOCKED' } });
   assert.deepEqual([blocked.success, blocked.exitCode], [false, 3]);
+  // Unknown tier fails CLOSED (review decision, Task 1 round): an
+  // unvalidated run value must never fall into the more permissive plan
+  // branch and report success for a failing full gate.
+  const mixedCase = decideExit({ run: 'FULL', cliExitCode: 0, parsed: { planStatus: 'PASS' } });
+  assert.deepEqual([mixedCase.success, mixedCase.exitCode], [false, 3]);
+  assert.match(mixedCase.reason, /unknown run tier/i);
+  const missingTier = decideExit({ run: undefined, cliExitCode: 2, parsed: { planStatus: 'PASS' } });
+  assert.deepEqual([missingTier.success, missingTier.exitCode], [false, 3]);
 });
 
-test('escapeActionText neutralizes markdown-active and control characters', () => {
-  assert.equal(escapeActionText('plain text 123'), 'plain text 123');
-  assert.equal(escapeActionText('a & b'), 'a &amp; b');
-  assert.equal(escapeActionText('<img>'), '&lt;img&#62;');
+test('escapeActionText is the gate safeText allowlist: everything non-allowlisted becomes a numeric entity', () => {
+  assert.equal(escapeActionText('plain text 123 file.name_ok-1'), 'plain text 123 file.name_ok-1');
+  assert.equal(escapeActionText('a & b'), 'a &#38; b');
+  assert.equal(escapeActionText('<img>'), '&#60;img&#62;');
   assert.equal(escapeActionText('x | y'), 'x &#124; y');
   assert.equal(escapeActionText('# heading'), '&#35; heading');
-  assert.equal(escapeActionText('> quote **bold** _u_ `c` [l](u)'),
-    '&#62; quote &#42;&#42;bold&#42;&#42; &#95;u&#95; &#96;c&#96; &#91;l&#93;(u)');
+  assert.equal(escapeActionText('~~FAILED~~ ~~~js'), '&#126;&#126;FAILED&#126;&#126; &#126;&#126;&#126;js');
+  assert.equal(escapeActionText('https://evil.example/x'), 'https&#58;&#47;&#47;evil.example&#47;x');
+  assert.equal(
+    escapeActionText('> quote **bold** `c` [l](u)'),
+    '&#62; quote &#42;&#42;bold&#42;&#42; &#96;c&#96; &#91;l&#93;&#40;u&#41;',
+  );
   assert.equal(escapeActionText('line1\nline2\r\nline3'), 'line1 \u23CE line2 \u23CE line3');
   const hostile = `bad${String.fromCharCode(27)}[31mansi${String.fromCharCode(0)}nul`;
   const escaped = escapeActionText(hostile);
+  assert.match(escaped, /&#27;/);
+  assert.match(escaped, /&#0;/);
   for (let index = 0; index < escaped.length; index += 1) {
     const code = escaped.charCodeAt(index);
     assert.ok(code >= 32 && code !== 127, `control byte survived at ${index}`);
