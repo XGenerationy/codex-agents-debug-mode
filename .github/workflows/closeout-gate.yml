@@ -1,0 +1,40 @@
+name: Closeout gate
+
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      base-ref:
+        description: "Live PR base ref (dispatch runs have no PR context)"
+        default: origin/main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: closeout-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Cost guard only: the gate independently re-verifies the live review
+    # state, head SHA, and attestation through gh — this condition just
+    # avoids spending a full run on comment-only review events.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.review.state == 'approved' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out reviewed head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The gate re-verifies the live head via gh and BLOCKS stale
+          # snapshots; the checkout must present the head being attested.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          fetch-depth: 0
+
+      - name: Closeout gate
+        uses: ./actions/closeout
+        with:
+          run: full
+          base-ref: ${{ github.event.inputs.base-ref || '' }}
