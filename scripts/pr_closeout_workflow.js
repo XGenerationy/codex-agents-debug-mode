@@ -1507,6 +1507,12 @@ const runCloseoutWorkflowBody = async ({
     mergeBaseSha: sealedState.mergeBaseSha,
     headSha: sealedState.headSha,
     configDigest,
+    mode,
+    // Engine runs name their matrix provenance so a reader of report.json can
+    // never mistake a repo-defined matrix for the strict 19-check gate.
+    matrixSource: mode === 'engine'
+      ? { source: 'config.engineChecks', digest: configDigest, checkCount: plan.checks.length }
+      : null,
     startedAt,
     finishedAt: new Date().toISOString(),
     toolVersions: preflight.toolVersions,

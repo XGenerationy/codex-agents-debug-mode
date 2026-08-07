@@ -184,6 +184,14 @@ const renderMarkdown = (report) => {
     `- Base SHA: ${safeText(report.baseSha || 'unresolved')}`,
     `- Head SHA: ${safeText(report.headSha || 'unresolved')}`,
     `- Configuration digest: ${safeText(report.configDigest || 'unresolved')}`,
+    `- Mode: ${safeText(report.mode || 'strict')}`,
+    ...(report.mode === 'engine' ? [
+      '',
+      '> **ENGINE MODE** — this run used a repo-defined check matrix '
+        + `(${Number(report.matrixSource?.checkCount) || 0} checks from ${safeText(report.matrixSource?.source || 'config.engineChecks')}, `
+        + `digest ${safeText(report.matrixSource?.digest || 'unresolved')}). `
+        + 'This is a different, weaker guarantee than the strict 19-check gate.',
+    ] : []),
     `- Started: ${safeText(report.startedAt || 'unknown')}`,
     `- Finished: ${safeText(report.finishedAt || 'unknown')}`,
     '',

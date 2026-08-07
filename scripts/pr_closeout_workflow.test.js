@@ -1752,3 +1752,45 @@ test('unknown requiredTools names are a named config error and the plan fails cl
   );
   assert.match(plan.errors.join('\n'), /Known probes:/);
 });
+
+test('a strict full run labels its report mode strict with no matrix source', async () => {
+  const fixture = makeDependencies();
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.mode, 'strict');
+  assert.equal(result.report.matrixSource, null);
+});
+
+test('engine mode full run: a suppression finding auto-FAILs even an all-green custom matrix, and the report names its tier', async () => {
+  // Spec test-group 3: suppression auto-FAIL must override an otherwise
+  // all-green repo-defined matrix, and the report must still say which tier
+  // (engine, not strict) produced it. Reuse makeDependencies' full set of
+  // admission/attestation/execute fakes wholesale (mode-agnostic — the
+  // workflow calls readLiveGateAttestation, cleanTreeStatus, runPreflight,
+  // readGateChanges, scanTouchedSuppressions, and execute the same way
+  // regardless of mode) and inject one finding via the already-supported
+  // finalFindings hook, which lands as the post-attestation rescan result.
+  const fixture = makeDependencies({
+    finalFindings: [{
+      file: 'src/a.ts',
+      line: 12,
+      category: 'suppression',
+      match: '// eslint-disable-next-line',
+    }],
+  });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'echo ok' }] },
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'FAIL');
+  assert.equal(result.report.mode, 'engine');
+});
