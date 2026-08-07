@@ -150,10 +150,15 @@ prototype of a later `Object.assign`-style copy).
   strikethrough, URLs, control bytes). The embedded `report.md` is exempt — it was
   already rendered through the gate's own `safeText` pipeline and re-escaping would
   corrupt it.
-- PR comment (opt-in): same content as the plan summary, prefixed with an HTML marker
-  comment (`<!-- closeout-preview -->` + repo/PR identifiers) enabling upsert-in-place
-  via `gh api` (find comment carrying the marker → PATCH, else POST). Comment bodies
-  are capped at 60 KiB with the same truncation honesty.
+- PR comment (opt-in): same content as the plan summary, prefixed with the HTML marker
+  comment `<!-- closeout-action-preview -->` as the body's first line, enabling
+  upsert-in-place via `gh api` (find comment carrying the marker → PATCH, else POST).
+  No repo/PR identifiers ride in the marker — the upsert lists only the target PR's
+  own comments, so identifiers would be redundant, and the marker is release-pinned
+  (changing it orphans old comments); this exact string is the contract (reconciled to
+  the implemented plan during Task 3 — the spec's earlier `closeout-preview` sketch
+  was never implemented). Comment bodies are capped at 60 KiB with the same
+  truncation honesty.
 
 ## Dogfood workflows (house style: SHA-pinned `uses`, `permissions` block, concurrency group, `fetch-depth: 0`)
 
