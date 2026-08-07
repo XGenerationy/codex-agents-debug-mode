@@ -2336,3 +2336,161 @@ test('engine mode never consults a smuggled config.commands entry: the map is st
   assert.equal(lint.resolution, 'package-script');
   assert.equal(lint.command, 'npm run lint');
 });
+
+test('engine-command make gate blocks every non-bare-make dodge shape on the resolved command', () => {
+  const makeRecipes = { lie: '-npm test', good: 'npm test' };
+  const dodges = [
+    'make lie && true',
+    'make -s lie',
+    'env make lie',
+    'cd x && make lie',
+    'make lie MYVAR=1',
+    '/usr/bin/make lie',
+    'make lie&&echo ok',
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map((command, index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, command] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+    assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  }
+  const pureLie = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-lie', command: 'make lie' }] },
+    makeRecipes,
+  });
+  const lieCheck = pureLie.checks.find(({ id }) => id === 'pure-lie');
+  assert.equal(lieCheck.status, 'BLOCKED');
+  assert.match(lieCheck.evidence, /neutralizes failures/);
+  const pureGood = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-good', command: 'make good' }] },
+    makeRecipes,
+  });
+  const goodCheck = pureGood.checks.find(({ id }) => id === 'pure-good');
+  assert.equal(goodCheck.status, undefined);
+  assert.equal(goodCheck.command, 'make good');
+  const notGated = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake build' },
+        { id: 'make-docs', command: 'make-docs generate' },
+      ],
+    },
+    makeRecipes,
+  });
+  assert.equal(notGated.checks.find(({ id }) => id === 'cmake-build').status, undefined);
+  assert.equal(notGated.checks.find(({ id }) => id === 'make-docs').status, undefined);
+});
+
+test('engine package-script branch runs the resolved command through the same make gate', () => {
+  const pure = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const pureCheck = pure.checks.find(({ id }) => id === 'lint');
+  assert.equal(pureCheck.command, 'make lint');
+  assert.equal(pureCheck.status, 'BLOCKED');
+  assert.match(pureCheck.evidence, /neutralizes failures/);
+  const wrapped = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'nice -n 19 make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const wrappedCheck = wrapped.checks.find(({ id }) => id === 'lint');
+  assert.equal(wrappedCheck.status, 'BLOCKED');
+  assert.match(wrappedCheck.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  // Strict path with the same packageScripts is unchanged: still pnpm run, ungated
+  // (a strict def is never `engine`, so the gate never runs for it, no matter
+  // what makeRecipes contains).
+  const strict = buildCheckPlan({
+    packageScripts: { typecheck: 'tsc --noEmit' },
+    makeRecipes: { typecheck: '-tsc --noEmit' },
+  });
+  const strictCheck = strict.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(strictCheck.command, 'pnpm run typecheck');
+  assert.equal(strictCheck.status, undefined);
+});
+
+test('engine command proofs get strict parity: neutralizer and literal-policy validation at plan time', () => {
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh || true', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const neutralizingCheck = neutralizing.checks.find(({ id }) => id === 'render');
+  assert.equal(neutralizingCheck.status, 'BLOCKED');
+  assert.match(neutralizingCheck.evidence, /Postcondition proof command for .* neutralizes failures \(\|\| true\)\./);
+  const anyPattern = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'anything-at-all' } },
+    },
+  });
+  assert.match(
+    anyPattern.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const emptyLiteral = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:' } },
+    },
+  });
+  assert.match(
+    emptyLiteral.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const goodCheck = good.checks.find(({ id }) => id === 'render');
+  assert.equal(goodCheck.status, undefined);
+  assert.deepEqual(goodCheck.proof, { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' });
+});
+
+test('scriptRunner rejects tabs and quote characters, not just newlines', () => {
+  const tabForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\trun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(tabForm.errors.join('\n'), /single-line non-empty string/);
+  const doubleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run "x"' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(doubleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  const singleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: "npm run 'x'" },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(singleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  // Existing valid runners are unaffected.
+  const valid = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(valid.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+});
