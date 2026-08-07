@@ -56,9 +56,15 @@ error and the run is BLOCKED before anything executes:
   `command` (array-of-strings argv form, same resolution rules as today's fixed checks) or
   a `scripts` discovery list (package.json script names tried in order). Both absent, or
   both present → error.
-- Optional fields mirror strict semantics with the same validation: `timeoutMs`,
-  `resourceGroup`, `qualificationSafe`, `baselineSafe`, `generator`, proof requirements
-  (artifact/semantic proofs as the existing checks define them).
+- Optional fields mirror strict semantics with the same validation: `timeoutMs` (inline
+  value wins over a `config.timeoutsMs` entry for the same id — the matrix is
+  authoritative for its own checks), `baselineSafe`, `generator`; `qualificationSafe` and
+  `resourceGroup` continue to come from their existing id-keyed config maps, and proofs
+  from `config.proofs` (validated at plan time in engine mode even when voluntary).
+- `scripts` discovery runs through an engine-only `config.scriptRunner` (default
+  `npm run`; validated single-line, neutralizer-scanned) — strict keeps its hardcoded
+  `pnpm run` byte-for-byte. `scriptRunner` in a strict config is a hard error like
+  `engineChecks`.
 - Unknown fields → error (never ignored).
 - Empty array, missing `engineChecks` in engine mode, or `engineChecks` present in a
   strict-mode config → error. The strict-mode rejection matters most: a config carrying an
@@ -98,7 +104,10 @@ the resolved engine matrix** (canonical JSON of the validated `engineChecks` for
 mode; a fixed sentinel for strict). Consequences, all deliberate:
 
 - An attestation minted for a strict run can never admit an engine run, and vice versa —
-  rejected at admission with a named error identifying the mode mismatch.
+  the mechanism is the digest itself (mode-crossed attestations can no longer
+  digest-match, so admission rejects them through the existing digest-mismatch
+  evidence), with the running mode visible in the plan admission block and report
+  fields (execution decision).
 - Any edit to the engine matrix invalidates outstanding attestations.
 - Reviewers attesting an engine-mode PR are attesting a specific matrix, visible in the
   digest.
