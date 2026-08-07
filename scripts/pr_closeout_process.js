@@ -3378,6 +3378,11 @@ const TOOL_PROBES = [
   ['docker-daemon', "docker info --format '{{.ServerVersion}}'"],
   ['prisma', 'pnpm prisma --version'],
 ];
+// The catalog is exported (engine-mode requiredTools filters it by NAME) and is
+// itself the guarantee that a config can never supply a probe COMMAND. Frozen,
+// pairs included, so that guarantee is structural rather than conventional.
+for (const pair of TOOL_PROBES) Object.freeze(pair);
+Object.freeze(TOOL_PROBES);
 
 /**
  * Default tool-version probe used by runPreflight. Runs `command` through

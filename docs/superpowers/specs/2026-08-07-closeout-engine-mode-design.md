@@ -87,8 +87,14 @@ error and the run is BLOCKED before anything executes:
   docker. Implementation is sanctioned to touch `pr_closeout_process.js` in exactly one
   way: `runPreflight` gains an optional `toolProbes` parameter defaulting to the
   existing `TOOL_PROBES` table (strict callers pass nothing — zero strict delta), and
-  the table joins the module's exports so the workflow can filter it by name. No other
-  edit to that file is in scope.
+  the table joins the module's exports so the workflow can filter it by name — frozen,
+  pairs included, so the catalog-only guarantee (configs supply probe NAMES, never
+  probe COMMANDS) is structural rather than conventional (review decision, Task 5
+  round 2). No other edit to that file is in scope. One accepted edge (review
+  disposition, Task 5 round 2): when `requiredTools` itself is malformed, the plan
+  admission preflight falls back to the full catalog while the plan reports FAIL —
+  loud and fail-closed; the probe-cost saving simply does not apply on runs that are
+  already doomed.
 - **Resolved-command make gate (review decision):** recipe bodies are only inspectable
   when a command is EXACTLY `make <target>`. On every engine resolution path — inline
   commands AND scriptRunner-resolved scripts — the FINAL resolved command passes a make
@@ -181,7 +187,10 @@ Attestation state is a four-value vocabulary, not a boolean (review decision, Ta
   base/head/config-digest snapshot exists.
 - `weakened` — the live read returned FAIL: an attestation matching this snapshot exists
   but records a weakened decision. Collapsing this into "absent" would hide an active
-  weakening signal from B's push-time preview.
+  weakening signal from B's push-time preview. Note (review, Task 5 round 2): today's
+  reader emits only PASS/BLOCKED — a weakened review fails the `decision=not-weakened`
+  marker match and lands in `absent` — so this state is defensive, kept for reader
+  evolution; sub-project B should not build UI that depends on it firing.
 - `absent` — the live read returned BLOCKED for a snapshot reason (no matching approving
   review, or the PR head/base has moved past the expected snapshot).
 - `unavailable` — the read itself could not complete (gh missing, unauthenticated,
