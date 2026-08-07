@@ -111,10 +111,6 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
   };
 };
 
-// Markdown-active characters neutralized when the support script itself
-// interpolates evidence-derived text into summaries/comments. Mirrors the
-// gate renderer's safeText semantics (allowlist by escaping the actives);
-// the gate-rendered report.md is embedded verbatim and NOT re-escaped.
 /**
  * Escapes one evidence-derived value for markdown a human will trust: the
  * EXACT transform of the gate renderer's safeText (pr_closeout_report.js:13)
