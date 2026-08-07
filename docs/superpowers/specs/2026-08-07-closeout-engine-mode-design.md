@@ -51,7 +51,13 @@ mode** ships the gate's integrity machinery with a repo-defined check matrix.
 An array of check objects validated fail-closed at plan time; any violation is a named
 error and the run is BLOCKED before anything executes:
 
-- `id` — non-empty string, unique across the array (duplicate/non-string/empty → error).
+- `id` — non-empty string, unique across the array (duplicate/non-string/empty → error);
+  charset-gated (`/^[A-Za-z0-9][A-Za-z0-9._-]*$/`) and rejected on `Object.prototype`
+  member collisions, closing prototype-shaped and control-character ids at the gate
+  instead of relying on downstream lookups failing closed by accident (review decision).
+  Field reads are read-once (getter/Proxy entries cannot swap values between validation
+  and emission), and `timeoutMs` is bounded to the 32-bit timer maximum (review
+  decisions).
 - Command source — exactly one of the shapes the strict matrix already uses: a fixed
   `command` (a single shell-command string, the same form every `fixed: true` strict
   check and the executor use) or a `scripts` discovery list (package.json script names

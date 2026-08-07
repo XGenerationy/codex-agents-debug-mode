@@ -298,6 +298,13 @@ const REQUIRED_PROOFS = {
 // weakening vector or a typo; both fail closed rather than being ignored.
 const ENGINE_CHECK_FIELDS = new Set(['id', 'label', 'command', 'scripts', 'baselineSafe', 'generator', 'timeoutMs']);
 
+// Engine ids reach id-keyed plain-object lookups (timeoutsMs, proofs,
+// resourceGroups) and rendered reports downstream: a charset gate plus an
+// Object.prototype collision check (below) closes prototype-shaped and
+// control-character ids deterministically instead of relying on every
+// downstream lookup failing closed by accident.
+const ENGINE_CHECK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 /**
  * Validate and normalize `config.engineChecks` into check definitions the
  * shared resolution pipeline in buildCheckPlan can consume. Engine mode
@@ -324,52 +331,71 @@ const validateEngineChecks = (engineChecks) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new Error(`Engine check at index ${index} must be an object.`);
     }
+    // Read every field exactly once, up front: validation and emission both
+    // use these locals, so a getter/Proxy entry can never swap the emitted
+    // value after validation — read-once makes the fail-closed claim true by
+    // construction, not by JSON.parse happening to produce plain data.
+    const { id, label, command, scripts, baselineSafe, generator, timeoutMs } = entry;
+    const scriptsCopy = Array.isArray(scripts) ? [...scripts] : scripts;
     for (const field of Object.keys(entry)) {
       if (!ENGINE_CHECK_FIELDS.has(field)) {
-        throw new Error(`Engine check at index ${index} has unknown field "${field}"; unknown fields are never ignored.`);
+        const where = typeof id === 'string' && id ? `"${id}"` : `at index ${index}`;
+        const hint = field === 'qualificationSafe' || field === 'resourceGroup'
+          ? ` (${field} belongs in the id-keyed config map config.${field === 'qualificationSafe' ? 'qualificationSafe' : 'resourceGroups'}, not inline)`
+          : '';
+        throw new Error(`Engine check ${where} has unknown field "${field}"; unknown fields are never ignored${hint}.`);
       }
     }
-    const { id } = entry;
     if (typeof id !== 'string' || !id.trim()) {
       throw new Error(`Engine check at index ${index} must have a non-empty string id.`);
     }
     if (id !== id.trim()) {
       throw new Error(`Engine check id "${id}" must not have leading or trailing whitespace.`);
     }
-    if (seen.has(id)) throw new Error(`Engine check ids must be unique: "${id}" appears more than once.`);
+    if (!ENGINE_CHECK_ID_PATTERN.test(id)) {
+      throw new Error(`Engine check id "${id}" must start alphanumeric and use only letters, digits, ".", "_", "-".`);
+    }
+    if (id in {}) {
+      throw new Error(`Engine check id "${id}" collides with an Object.prototype member; choose another id.`);
+    }
+    if (seen.has(id)) throw new Error(`Engine check ids must be unique: "${id}" at index ${index} appears more than once.`);
     seen.add(id);
     const hasCommand = Object.hasOwn(entry, 'command');
     const hasScripts = Object.hasOwn(entry, 'scripts');
     if (hasCommand === hasScripts) {
       throw new Error(`Engine check "${id}" must define exactly one of "command" or "scripts".`);
     }
-    if (hasCommand && (typeof entry.command !== 'string' || !entry.command.trim())) {
+    if (hasCommand && (typeof command !== 'string' || !command.trim())) {
       throw new Error(`Engine check "${id}": command must be a non-empty string.`);
     }
     if (hasScripts && (
-      !Array.isArray(entry.scripts) || entry.scripts.length === 0
-      || entry.scripts.some((name) => typeof name !== 'string' || !name.trim())
+      !Array.isArray(scriptsCopy) || scriptsCopy.length === 0
+      || scriptsCopy.some((name) => typeof name !== 'string' || !name.trim())
     )) {
       throw new Error(`Engine check "${id}": scripts must be a non-empty array of non-empty script names.`);
     }
-    if (Object.hasOwn(entry, 'label') && (typeof entry.label !== 'string' || !entry.label.trim())) {
+    if (Object.hasOwn(entry, 'label') && (typeof label !== 'string' || !label.trim())) {
       throw new Error(`Engine check "${id}": label must be a non-empty string when present.`);
     }
+    const booleanFlags = { baselineSafe, generator };
     for (const flag of ['baselineSafe', 'generator']) {
-      if (Object.hasOwn(entry, flag) && typeof entry[flag] !== 'boolean') {
+      if (Object.hasOwn(entry, flag) && typeof booleanFlags[flag] !== 'boolean') {
         throw new Error(`Engine check "${id}": ${flag} must be a boolean when present.`);
       }
     }
-    if (Object.hasOwn(entry, 'timeoutMs') && (!Number.isInteger(entry.timeoutMs) || entry.timeoutMs < 1)) {
-      throw new Error(`Engine check "${id}": timeoutMs must be a positive integer when present.`);
+    // Upper bound: Node timers clamp durations above 2^31-1 down to ~1ms — a
+    // fail-closed but baffling instant kill — so an over-bound timeout is
+    // rejected here where the author can see why.
+    if (Object.hasOwn(entry, 'timeoutMs') && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2147483647)) {
+      throw new Error(`Engine check "${id}": timeoutMs must be a positive integer no greater than 2147483647 when present.`);
     }
     return {
       id,
-      label: entry.label ?? id,
-      ...(hasCommand ? { command: entry.command } : { packageCandidates: [...entry.scripts] }),
-      baselineSafe: entry.baselineSafe ?? false,
-      generator: entry.generator ?? false,
-      ...(Object.hasOwn(entry, 'timeoutMs') ? { timeoutMs: entry.timeoutMs } : {}),
+      label: label ?? id,
+      ...(hasCommand ? { command } : { packageCandidates: scriptsCopy }),
+      baselineSafe: baselineSafe ?? false,
+      generator: generator ?? false,
+      ...(Object.hasOwn(entry, 'timeoutMs') ? { timeoutMs } : {}),
       engine: true,
     };
   });

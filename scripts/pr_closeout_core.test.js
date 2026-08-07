@@ -2160,3 +2160,39 @@ test('validateEngineChecks fails closed on every malformed shape', () => {
   assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 0 }]), /timeoutMs must be a positive integer/);
   assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 1.5 }]), /timeoutMs must be a positive integer/);
 });
+
+test('validateEngineChecks hardening: id charset, prototype collisions, timer bound, read-once fields', () => {
+  for (const id of ['bad\nid', 'a\tb', '.dot-start', '-dash-start', 'sp ace', '__proto__']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /must start alphanumeric|collides with an Object\.prototype member/,
+    );
+  }
+  for (const id of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /collides with an Object\.prototype member/,
+    );
+  }
+  assert.equal(validateEngineChecks([{ id: 'ok.check_1-x', command: 'x' }])[0].id, 'ok.check_1-x');
+  assert.throws(
+    () => validateEngineChecks([{ id: 'big', command: 'x', timeoutMs: 2147483648 }]),
+    /no greater than 2147483647/,
+  );
+  // Read-once: a getter that swaps its value after the first read cannot
+  // sneak a different command past validation into the emitted definition.
+  let reads = 0;
+  const swapped = validateEngineChecks([{
+    id: 'g1',
+    get command() { reads += 1; return reads === 1 ? 'safe command' : 'npm test || true'; },
+  }])[0];
+  assert.equal(swapped.command, 'safe command');
+  const scriptsSource = ['ok'];
+  const proxied = validateEngineChecks([new Proxy({ id: 'p1', scripts: scriptsSource }, {
+    get(target, property) {
+      if (property === 'scripts') return [...scriptsSource];
+      return target[property];
+    },
+  })])[0];
+  assert.deepEqual(proxied.packageCandidates, ['ok']);
+});
