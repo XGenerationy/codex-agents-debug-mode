@@ -459,7 +459,10 @@ const capText = (text, maxBytes, artifactName) => {
   const value = String(text ?? '');
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) return { text: value, truncated: false };
   // The notice fits INSIDE the budget: content is clipped to what remains
-  // after it, so the returned text never exceeds maxBytes total — Task 3
+  // after it, so the returned text never exceeds maxBytes whenever the
+  // notice itself fits inside it — which both configured caps guarantee by
+  // orders of magnitude; a degenerate cap smaller than the notice ships the
+  // notice alone (a truncated truncation notice would be worse). Task 3
   // feeds this straight into GitHub's hard 65536-character comment limit
   // and an over-budget comment is rejected outright at exactly the moment
   // the operator most needs it (review decision, Task 2 round). The
@@ -504,7 +507,7 @@ const renderPlanSummary = (plan, { baseRef = null } = {}) => {
     '## Closeout plan preview',
     '',
     `- Mode: ${escapeActionText(record.mode || 'strict')}`,
-    `- planStatus: **${escapeActionText(record.planStatus)}**`,
+    `- planStatus: **${escapeActionText(record.planStatus || 'unknown')}**`,
     `- Configuration digest: ${escapeActionText(record.configDigest || 'unresolved')}`,
     `- Base ref: ${escapeActionText(baseRef || 'from config')}`,
     '',
@@ -559,7 +562,7 @@ const renderFullSummary = (report, reportMarkdown, { artifactName }) => {
   return [
     '## Closeout gate result',
     '',
-    `- Overall status: **${escapeActionText(record.overallStatus)}**`,
+    `- Overall status: **${escapeActionText(record.overallStatus || 'unknown')}**`,
     `- Mode: ${escapeActionText(record.mode || 'strict')}`,
     `- Configuration digest: ${escapeActionText(record.configDigest || 'unresolved')}`,
     `- Evidence artifact: \`${escapeActionText(artifactName)}\``,
