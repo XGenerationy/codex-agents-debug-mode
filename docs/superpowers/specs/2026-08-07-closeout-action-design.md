@@ -160,7 +160,10 @@ prototype of a later `Object.assign`-style copy).
   marker is an invisible HTML comment anyone can post or innocently copy-paste, so the
   marker alone must never select whose comment gets overwritten; the AUTHOR check is
   the discriminator, which is also why repo/PR identifiers in the marker would add
-  nothing. The list call walks every page (`gh api --paginate --slurp`; the
+  nothing. Load-bearing coupling (review, Task 3 round 2): the exact-login pin is
+  valid ONLY because action.yml hardcodes `GH_TOKEN: github.token` and exposes no
+  `token` input — adding one (a natural App-token feature request) without revisiting
+  the author check would silently degrade to an unbounded duplicate-comment stream. The list call walks every page (`gh api --paginate --slurp`; the
   issue-comments API returns oldest-first at 30 per page, so the action's newest
   comment is exactly what a first-page read misses — and each miss would post a
   duplicate on precisely the busiest PRs). No action-authored marker comment → POST.

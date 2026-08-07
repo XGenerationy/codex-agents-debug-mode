@@ -320,6 +320,10 @@ const upsertPrComment = async ({ context, body, runGh }) => {
   const { owner, repo, prNumber } = context;
   const listed = await runGh(['api', '--paginate', '--slurp', `repos/${owner}/${repo}/issues/${prNumber}/comments`]);
   const comments = Array.isArray(listed) ? listed.flat() : [];
+  // The exact-login pin is valid ONLY while action.yml hardcodes
+  // GH_TOKEN to github.token. Adding a `token` input (e.g. for App tokens
+  // that author as `my-app[bot]`) without revisiting this check would make
+  // every run miss its own comment and POST an unbounded duplicate stream.
   const mine = comments.find((comment) => typeof comment?.body === 'string'
     && comment.body.startsWith(ACTION_MARKER)
     && comment.user?.type === 'Bot'
