@@ -95,7 +95,8 @@ The two tiers fail differently by design:
 
 | Tier | CLI outcome | Job result |
 |---|---|---|
-| `run: full` | exit 0 | success |
+| `run: full` | exit 0 with the contractual JSON record captured | success |
+| `run: full` | exit 0 but NO parseable JSON record | job fails (exit 3 class) — the gate always writes one line, so its absence means the wrapper or stdout path broke; never PASS on missing evidence (review decision, Task 2 round) |
 | `run: full` | exit 2 (FAIL) or 3 (BLOCKED) | **job fails with the same class**, after summary + artifact are written |
 | `run: plan` | a parseable single-line plan JSON was captured (any exit code) | success — even when `planStatus` is FAIL or admission says `absent`/`unavailable`; pre-review "not ready yet" is the preview's normal honest state, and a preview that goes red before anyone could review trains people to ignore it. The exit code is deliberately not consulted: A's CLI emits a structured JSON line even on blocked runs, the action's own input validation has already excluded flag-misuse before spawning, and remaining config-level errors land honestly in `planStatus` |
 | `run: plan` | no parseable single-line JSON on stdout | job fails — the preview itself is broken, which must be loud |
@@ -119,6 +120,17 @@ prototype of a later `Object.assign`-style copy).
   All four attestation states render distinctly; `weakened` renders as a warning row
   (it is defensive-only today — recorded in A's spec — but if it ever fires it must
   not look like `absent`).
+- Row caps are announced, never silent (review decision, Task 2 round): the plan-error
+  list (50), non-PASS preflight rows (20), and check-id list (50, whose header carries
+  the true total) each append an "…and N more" pointer at the artifact when clipped —
+  a clipped error list read as complete makes the operator conclude the gate invents
+  new errors on the next push. `capText`'s byte cap keeps its notice INSIDE the
+  budget (total return ≤ maxBytes — the comment cap feeds GitHub's hard 65536-char
+  limit, where an over-budget body is rejected at exactly the moment the operator
+  most needs it), and the artifact name it names is escaped — one value, one
+  rendering, on every surface. Renderers are null-tolerant: a missing record renders
+  an unknown-state summary; the failure story belongs to the exit decision, never a
+  TypeError in a composite step.
 - Full runs: key fields (overallStatus, mode, digest, engine banner presence) plus the
   gate-written `report.md` embedded verbatim below a divider, capped at 512 KiB (the
   Step Summary hard limit is 1 MiB); when capped, the truncation is announced in the
