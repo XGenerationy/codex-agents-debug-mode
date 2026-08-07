@@ -71,6 +71,24 @@ error and the run is BLOCKED before anything executes:
   `npm run`; validated single-line without tabs/quotes, neutralizer-scanned) — strict
   keeps its hardcoded `pnpm run` byte-for-byte. `scriptRunner` in a strict config is a
   hard error like `engineChecks`.
+- **Engine-only `config.requiredTools` (review decision, Task 5):** an array of
+  preflight probe names drawn from the existing probe catalog (`git`, `node`, `pnpm`,
+  `make`, `docker`, `docker-compose`, `docker-daemon`, `prisma`). Engine-mode preflight
+  probes exactly `git` + `node` (the gate's own dependencies) plus the declared names,
+  deduplicated, in catalog order; strict runs keep the full hardcoded probe list
+  byte-for-byte. A non-array value, a non-string entry, or a name outside the catalog is
+  a named config error (fail-closed, never a silent skip), and `requiredTools` in a
+  strict-mode config is a hard error naming the key — same class as `engineChecks` and
+  `scriptRunner`. Rationale: strict's hardcoded pnpm/prisma/docker probes would block
+  engine admission on every non-pnpm repo — the exact repos engine mode exists to
+  serve — and an explicit declaration keeps the probe set operator-visible and
+  digest-bound (it lives in config, so the existing digest binding covers it). It also
+  removes the ~30s docker-daemon probe cost from `--plan` on repos that never declare
+  docker. Implementation is sanctioned to touch `pr_closeout_process.js` in exactly one
+  way: `runPreflight` gains an optional `toolProbes` parameter defaulting to the
+  existing `TOOL_PROBES` table (strict callers pass nothing — zero strict delta), and
+  the table joins the module's exports so the workflow can filter it by name. No other
+  edit to that file is in scope.
 - **Resolved-command make gate (review decision):** recipe bodies are only inspectable
   when a command is EXACTLY `make <target>`. On every engine resolution path — inline
   commands AND scriptRunner-resolved scripts — the FINAL resolved command passes a make
@@ -152,10 +170,28 @@ Consequences, all deliberate:
 ## Plan-mode admission readiness
 
 `--plan` output gains an `admission` block so B's push-time preview can honestly say *why*
-the full gate would block without running it: attestation present/absent for the current
+the full gate would block without running it: attestation state for the current
 head (and mode), `gh` availability/auth, toolchain preflight probe results, clean-tree
 state. Probes are read-only; the block is additive to the existing plan output. All
 GitHub interaction stays behind the injectable `runGh` seam so tests are hermetic.
+
+Attestation state is a four-value vocabulary, not a boolean (review decision, Task 5):
+
+- `present` — the live read returned PASS: a mode-matched attestation for this exact
+  base/head/config-digest snapshot exists.
+- `weakened` — the live read returned FAIL: an attestation matching this snapshot exists
+  but records a weakened decision. Collapsing this into "absent" would hide an active
+  weakening signal from B's push-time preview.
+- `absent` — the live read returned BLOCKED for a snapshot reason (no matching approving
+  review, or the PR head/base has moved past the expected snapshot).
+- `unavailable` — the read itself could not complete (gh missing, unauthenticated,
+  network failure). `readLiveGateAttestation` never throws — its internal catch converts
+  every error into BLOCKED — so this state needs a machine-readable discriminator: the
+  catch-path return gains an additive `reason: 'unavailable'` field. This is a
+  deliberate, spec-recorded strict-visible addition (same class as the report `mode`
+  field); mapping MUST use the field, never prose-matching on evidence text. Injected
+  readers that throw (test fakes) still map to `unavailable` via the admission helper's
+  own catch.
 
 ## Error handling
 
@@ -166,6 +202,8 @@ GitHub interaction stays behind the injectable `runGh` seam so tests are hermeti
 | Engine mode without `engineChecks` | hard error |
 | Engine matrix schema violation (dup/non-string id, both/neither command source, unknown field, empty array) | named error per violation; plan BLOCKED; nothing executes |
 | Attestation mode mismatch (strict-minted attestation at engine admission or vice versa) | named admission error; run BLOCKED |
+| `requiredTools` not an array, non-string entry, or name outside the probe catalog | named config error; plan BLOCKED |
+| `requiredTools` in a strict-mode config | hard error naming the key — same class as `engineChecks`/`scriptRunner` |
 | Fixed-check override in strict mode | unchanged hard error (existing behavior, re-pinned) |
 
 ## Testing (repo requirements: `node --test --test-concurrency=1`, zero dependencies, hermetic — injected `runGh`/fs fakes, no network)
@@ -188,7 +226,14 @@ GitHub interaction stays behind the injectable `runGh` seam so tests are hermeti
    an engine matrix edit changes the digest; a strict-minted attestation is rejected at
    engine-mode admission (and vice versa) with the named mode-mismatch error.
 6. **Plan admission block:** attestation-missing, gh-unavailable, and dirty-tree shapes
-   surface as structured fields in plan output via injected fakes.
+   surface as structured fields in plan output via injected fakes; the four attestation
+   states are distinguished end-to-end (PASS→present, FAIL→weakened,
+   snapshot-BLOCKED→absent, reason-tagged catch path→unavailable) and the
+   `reason: 'unavailable'` discriminator is pinned at the github reader's catch path;
+   engine-mode preflight probes exactly git+node+declared `requiredTools`
+   (probe-set assertion via an injected `runPreflight` capturing `toolProbes`), strict
+   preflight passes no `toolProbes` and keeps the full catalog; unknown `requiredTools`
+   names are a named error.
 7. **Regression battery:** full suite 0 fail; `npm run validate` PASS;
    `npm run scan:suppressions` clean (the gate-scan will flag the validation-surface
    changes for PR-time independent review — by design, reported honestly).

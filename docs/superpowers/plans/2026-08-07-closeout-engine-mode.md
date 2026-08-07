@@ -1263,8 +1263,11 @@ git commit -m "feat(closeout): mode-bound attestation digest, engine timeouts, p
 ### Task 5: Plan-mode `admission` block
 
 **Files:**
-- Modify: `scripts/pr_closeout_workflow.js` (planOnly branch ~999-1022; new helper; exports)
-- Test: `scripts/pr_closeout_workflow.test.js` (append)
+- Modify: `scripts/pr_closeout_workflow.js` (planOnly branch ~999-1022; new helpers; exports)
+- Modify: `scripts/pr_closeout_github.js` (readLiveGateAttestation internal catch ~:484 — additive `reason: 'unavailable'` field; fix round)
+- Modify: `scripts/pr_closeout_process.js` (spec-sanctioned single change: `runPreflight` optional `toolProbes = TOOL_PROBES` parameter + `TOOL_PROBES` export; fix round)
+- Modify: `scripts/pr_closeout_core.js` (strict-mode rejection of `config.requiredTools`, same mechanism as the `scriptRunner` strict rejection; fix round)
+- Test: `scripts/pr_closeout_workflow.test.js`, `scripts/pr_closeout_github.test.js`, `scripts/pr_closeout_core.test.js` (append)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1346,12 +1349,18 @@ In `scripts/pr_closeout_workflow.js`, add near the other helpers (before `runClo
  * dirty" answer without paying for the full gate. Every probe failure is
  * caught into a structured state — plan mode must never throw because gh is
  * unauthenticated or a probe crashed; that is precisely what it exists to
- * report. The attestation predicate mirrors the full run's admission
- * (`initialAttestation.status === 'PASS'` — see attestationAdmitted below).
- * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, d: object}} options
+ * report. Attestation mapping is the spec's four-state vocabulary: PASS →
+ * `present`; FAIL → `weakened` (an attestation for this snapshot exists but
+ * records a weakened decision — hiding it inside "absent" would suppress an
+ * active weakening signal); BLOCKED carrying the reader's machine-readable
+ * `reason: 'unavailable'` discriminator → `unavailable` (the read itself
+ * could not complete); any other BLOCKED → `absent` (snapshot reasons: no
+ * matching review, or the PR head/base moved). A reader that throws (test
+ * fakes; the real reader never throws) also maps to `unavailable`.
+ * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, toolProbes?: Array, d: object}} options
  * @returns {Promise<{attestation: object, cleanTree: object, preflight: object}>}
  */
-const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, d }) => {
+const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, toolProbes, d }) => {
   let attestation;
   try {
     const live = await d.readLiveGateAttestation({
@@ -1362,7 +1371,11 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     });
     attestation = live?.status === 'PASS'
       ? { status: 'present', evidence: live.evidence }
-      : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
+      : live?.status === 'FAIL'
+        ? { status: 'weakened', evidence: live.evidence || 'A live attestation matching this snapshot records a weakened decision.' }
+        : live?.reason === 'unavailable'
+          ? { status: 'unavailable', evidence: live.evidence || 'Live attestation lookup could not complete.' }
+          : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
   } catch (error) {
     attestation = { status: 'unavailable', evidence: `Attestation lookup failed: ${error.message}` };
   }
@@ -1374,7 +1387,7 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
   }
   let preflight;
   try {
-    preflight = await d.runPreflight({ repo, config, env: process.env });
+    preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
   } catch (error) {
     preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
   }
@@ -1415,6 +1428,193 @@ Expected: all pass, including Task 4's tests (their planDeps fixtures don't inje
 ```bash
 git add scripts/pr_closeout_workflow.js scripts/pr_closeout_workflow.test.js
 git commit -m "feat(closeout): plan-mode admission readiness block"
+```
+
+(with the standard two trailers)
+
+#### Task 5 fix round (review decisions): four-state attestation + engine `requiredTools` preflight
+
+Two Importants from quality review, both resolved as spec amendments (see spec sections
+"Plan-mode admission readiness" and the `requiredTools` bullet under "Engine matrix
+schema"). The Minor (33s docker-daemon probe cost on every `--plan`) is resolved by the
+same `requiredTools` change: undeclared probes never run.
+
+- [ ] **Step 6: Write the failing tests**
+
+Append to `scripts/pr_closeout_github.test.js`:
+
+```js
+test('readLiveGateAttestation tags its internal catch path with a machine-readable unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async () => { throw new Error('gh: command not found'); },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, 'unavailable');
+  assert.match(result.evidence, /gh: command not found/);
+});
+
+test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return { number: 7, author: { login: 'a' }, headRefOid: 'movedhead', baseRefOid: 'base123' };
+      return [[]];
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, undefined);
+});
+```
+
+Append to `scripts/pr_closeout_workflow.test.js`:
+
+```js
+test('resolvePlanAdmission distinguishes weakened and unavailable from absent', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'FAIL', evidence: 'decision recorded as weakened' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  };
+  const weakened = await resolvePlanAdmission(base);
+  assert.equal(weakened.attestation.status, 'weakened');
+  assert.match(weakened.attestation.evidence, /weakened/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => ({
+        status: 'BLOCKED',
+        reason: 'unavailable',
+        evidence: 'Live GitHub gate attestation was unavailable: gh: command not found',
+      }),
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /unavailable/);
+});
+
+test('engine-mode preflight probes exactly git, node, and declared requiredTools', async () => {
+  // Reuse this branch's planDeps-style fixture; only runPreflight differs.
+  let captured = 'not-called';
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['make'] },
+    dependencies: {
+      // ...the same fakes the existing engine planOnly tests inject...
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node', 'make']);
+  assert.ok(captured.every(([, command]) => typeof command === 'string' && command.length > 0));
+});
+
+test('engine mode without requiredTools probes only git and node', async () => {
+  let captured = 'not-called';
+  // same fixture, config: { engineChecks: [...] } with no requiredTools
+  // assert.deepEqual(captured.map(([name]) => name), ['git', 'node']);
+});
+
+test('strict mode passes no toolProbes filter to preflight', async () => {
+  let captured = 'sentinel';
+  // same fixture in strict mode; assert.equal(captured, undefined) after the run
+});
+
+test('unknown requiredTools names are a named config error and the plan fails closed', async () => {
+  // engine planOnly run with config.requiredTools = ['blender'];
+  // assert the plan reports FAIL through the existing errors containment and the
+  // error text matches /requiredTools\[0\] names unknown preflight probe "blender"/
+  // and lists the known probe names.
+});
+```
+
+Append to `scripts/pr_closeout_core.test.js`:
+
+```js
+test('requiredTools in a strict-mode config is a hard error naming the key', () => {
+  // Same mechanism and test shape as the existing scriptRunner-in-strict rejection test.
+  // The error message must name requiredTools explicitly.
+});
+```
+
+- [ ] **Step 7: Implement**
+
+1. `scripts/pr_closeout_github.js` — add `reason: 'unavailable'` to the internal-catch
+   return of `readLiveGateAttestation` (~:484-495). Additive field only; every other
+   return path is untouched (snapshot-mismatch BLOCKED returns carry no `reason`).
+2. `scripts/pr_closeout_process.js` — the spec-sanctioned single change:
+   `runPreflight` gains `toolProbes = TOOL_PROBES` in its destructured options, the
+   probe loop iterates `toolProbes` instead of the module constant, and `TOOL_PROBES`
+   joins the exports. Nothing else in the file changes.
+3. `scripts/pr_closeout_core.js` — reject `config.requiredTools` in strict mode with a
+   hard error naming the key, placed beside and using the same mechanism as the
+   `scriptRunner` strict rejection.
+4. `scripts/pr_closeout_workflow.js` — add and export:
+
+```js
+const ENGINE_BASE_TOOLS = ['git', 'node'];
+
+/**
+ * Engine-mode preflight probe selection (spec: "Engine-only config.requiredTools").
+ * Returns the filtered [name, command] probe entries — always git + node (the
+ * gate's own dependencies) plus the declared names, deduplicated, in catalog
+ * order — or named errors when the declaration is malformed or names a probe
+ * outside the catalog. Fail-closed: errors mean NO probe list; the caller feeds
+ * them into the existing errors → FAIL containment chain.
+ */
+const resolveEngineToolProbes = (requiredTools, toolProbes) => {
+  if (requiredTools !== undefined && !Array.isArray(requiredTools)) {
+    return { probes: null, errors: ['config.requiredTools must be an array of preflight probe names.'] };
+  }
+  const errors = [];
+  const catalog = new Set(toolProbes.map(([name]) => name));
+  const declared = requiredTools || [];
+  declared.forEach((name, index) => {
+    if (typeof name !== 'string' || !name) {
+      errors.push(`config.requiredTools[${index}] must be a non-empty string.`);
+    } else if (!catalog.has(name)) {
+      errors.push(`config.requiredTools[${index}] names unknown preflight probe "${name}". Known probes: ${[...catalog].join(', ')}.`);
+    }
+  });
+  if (errors.length > 0) return { probes: null, errors };
+  const wanted = new Set([...ENGINE_BASE_TOOLS, ...declared]);
+  return { probes: toolProbes.filter(([name]) => wanted.has(name)), errors };
+};
+```
+
+   Extend the existing `require('./pr_closeout_process')` line with `TOOL_PROBES`.
+   In the body, after config validation, engine mode computes
+   `resolveEngineToolProbes(config.requiredTools, TOOL_PROBES)`; its errors join the
+   same containment chain as engine matrix validation errors (planStatus FAIL,
+   admission FAIL, nothing executes). Thread the resulting probe list (engine) or
+   `undefined` (strict) as `toolProbes` into all three `d.runPreflight` call sites:
+   the plan-admission helper, the full-run preflight (~:1175), and `captureVersions`
+   (~:1324).
+
+- [ ] **Step 8: Run to verify green**
+
+Run each alone, foreground, sequentially:
+`node --test --test-concurrency=1 scripts/pr_closeout_github.test.js`
+`node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
+`node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: all pass; no pre-existing test modified. `node --check` on all four touched scripts.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add scripts/pr_closeout_github.js scripts/pr_closeout_process.js scripts/pr_closeout_core.js scripts/pr_closeout_workflow.js scripts/pr_closeout_github.test.js scripts/pr_closeout_core.test.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): four-state admission attestation, engine requiredTools preflight"
 ```
 
 (with the standard two trailers)
