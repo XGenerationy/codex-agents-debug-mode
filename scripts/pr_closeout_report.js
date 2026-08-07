@@ -175,6 +175,14 @@ const normalizeReportPaths = (value, {
  * @returns {string} the rendered Markdown document (no trailing newline).
  */
 const renderMarkdown = (report) => {
+  // One normalized mode value drives BOTH the label and the banner so they can
+  // never disagree, and the banner matches case-insensitively — no casing of
+  // "engine" may render an engine label without its weaker-guarantee warning.
+  // Absence falls back to the matrixSource tell (non-null only on engine runs),
+  // so stripping the mode field from an engine report.json cannot downgrade it
+  // to a strict claim; true legacy reports (neither field) predate engine mode
+  // and really were strict.
+  const reportMode = String(report.mode || (report.matrixSource ? 'engine' : 'strict'));
   const lines = [
     '# PR Closeout Evidence',
     '',
@@ -184,6 +192,14 @@ const renderMarkdown = (report) => {
     `- Base SHA: ${safeText(report.baseSha || 'unresolved')}`,
     `- Head SHA: ${safeText(report.headSha || 'unresolved')}`,
     `- Configuration digest: ${safeText(report.configDigest || 'unresolved')}`,
+    `- Mode: ${safeText(reportMode)}`,
+    ...(reportMode.toLowerCase() === 'engine' ? [
+      '',
+      '> **ENGINE MODE** — this run used a repo-defined check matrix '
+        + `(${Number(report.matrixSource?.checkCount) || 0} checks from ${safeText(report.matrixSource?.source || 'config.engineChecks')}, `
+        + `digest ${safeText(report.matrixSource?.digest || 'unresolved')}). `
+        + 'This is a different, weaker guarantee than the strict 19-check gate.',
+    ] : []),
     `- Started: ${safeText(report.startedAt || 'unknown')}`,
     `- Finished: ${safeText(report.finishedAt || 'unknown')}`,
     '',

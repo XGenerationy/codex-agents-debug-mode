@@ -11,6 +11,7 @@ const test = require('node:test');
 const {
   SPAWN_MARK_ENV,
   MAX_ARTIFACT_HASH_BYTES,
+  TOOL_PROBES,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,
@@ -3578,4 +3579,9 @@ test('rejects Grafana live frames that carry no real series values', async () =>
   }, 'confirmation');
   assert.equal(legacyNullSeries.status, 'FAIL');
   assert.match(legacyNullSeries.evidence, /non-empty frame data/i);
+});
+
+test('TOOL_PROBES catalog is frozen, pairs included', () => {
+  assert.equal(Object.isFrozen(TOOL_PROBES), true);
+  for (const pair of TOOL_PROBES) assert.equal(Object.isFrozen(pair), true);
 });
