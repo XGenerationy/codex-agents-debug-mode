@@ -184,6 +184,46 @@ test('rendered markdown cannot be broken by a disappeared message crafted to clo
   assert.equal(markdown.split('\n').filter((l) => l.trim().startsWith('**forged verdict**')).length, 0);
 });
 
+test('rendered markdown/table escape raw-HTML and link-shaped untrusted content across msg/title/status/note', () => {
+  // The Markdown report is pasted into PRs; if a consumer renders it with
+  // HTML enabled, raw <...> becomes an XSS path and [t](javascript:...)
+  // becomes an attacker-controlled link. escapeText backslash-escapes all
+  // Markdown-significant punctuation so untrusted values render as literal
+  // text. (The renderer's own structural punctuation — e.g. the parentheses
+  // in "disappeared after fix (H1):" — is the tool's literal output, not
+  // untrusted content, so it is correctly not escaped.)
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', msg: '<img src=x onerror=alert(1)>', hypothesisId: 'H1' }),
+  );
+  const after = parseSessionText(
+    line({
+      ts: '2026-08-06T11:00:01.000Z',
+      type: 'hypothesis',
+      hypothesisId: 'H1',
+      status: 'OPEN',
+      title: 'evil [click](javascript:alert(1)) title',
+      note: 'see [also](http://x) & <b>',
+    }),
+  );
+  const diff = computeDiff(before, after);
+  const markdown = renderMarkdown(diff);
+  // Every UNTRUSTED payload's significant chars are backslash-escaped in
+  // the Markdown output. Check each surface: title (in the **...** line),
+  // msg (gone line), note. The status here is 'OPEN' (no special chars).
+  assert.match(markdown, /evil \\\[click\\\]\\\(javascript:alert\\\(1\\\)\\\) title/);
+  assert.match(markdown, /gone: "\\\<img src=x onerror=alert\\\(1\\\)\\\>"/);
+  assert.match(markdown, /note: "see \\\[also\\\]\\\(http:\/\/x\\\) \\\& \\\<b\\\>"/);
+  // No raw, unescaped HTML tag or active link token from the payloads
+  // remains (the escaped forms contain a preceding backslash).
+  assert.doesNotMatch(markdown, /(?<!\\)<img/);
+  assert.doesNotMatch(markdown, /(?<!\\)\[click\](?<!\\)\(javascript:/);
+
+  // The table path renders the msg in its disappeared list; it is escaped too.
+  const table = renderTable(diff);
+  assert.match(table, /\\\<img src=x onerror=alert\\\(1\\\)\\\>/);
+  assert.doesNotMatch(table, /(?<!\\)<img/);
+});
+
 test('computeDiff ignores non-string/missing hypothesis ids without crashing, counts them, and renderers state it', () => {
   // Pre-validation logs (exactly what a before-ref commonly is) can carry a
   // numeric hypothesisId on an event line, or a hypothesis-lifecycle line

@@ -324,12 +324,20 @@ const main = async () => {
     }
     try {
       const fresh = await tail.poll();
+      // The user may have quit (shutdown restored the terminal) while this
+      // read was in flight. Bail before mutating entries, repainting into
+      // the now-normal shell, or rescheduling — none of that is wanted
+      // after shutdown.
+      if (shuttingDown) return;
       if (fresh.length > 0) {
         entries = entries.concat(fresh);
         paint();
       }
     } catch {
-      // Session retired mid-watch: fall back to the file, visibly.
+      // Session retired mid-watch: fall back to the file, visibly. But if
+      // the user quit during the failed read, shutdown already restored the
+      // terminal — do not repaint or reschedule.
+      if (shuttingDown) return;
       live = false;
       tail = null;
       try {
@@ -339,6 +347,7 @@ const main = async () => {
         // Stale evidence beats a corrupted terminal: keep the last-known
         // entries instead of surfacing an error on the alternate screen.
       }
+      if (shuttingDown) return;
       paint();
     }
     schedulePoll();

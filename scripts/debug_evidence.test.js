@@ -316,6 +316,30 @@ test('createSessionTail emits each entry exactly once across polls', async () =>
   });
 });
 
+test('createSessionTail settles a deferred poll correctly so a late resolution is safe to ignore (viewer shutdown guard)', async () => {
+  // The viewer's poll loop checks `shuttingDown` after `await tail.poll()`
+  // settles and skips repaint/reschedule if the user quit during the read.
+  // This test guards the invariant that makes that guard sound: a poll that
+  // is in flight when the caller "moves on" still resolves to the correct
+  // fresh entries exactly once (no double-advance of the seen cursor), so
+  // discarding its result after shutdown never loses or duplicates data on
+  // the NEXT real poll.
+  await withLiveSession(async ({ port, session, log }) => {
+    await log('a');
+    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const pending = tail.poll();
+    // Simulate the user quitting while the read is in flight: the caller
+    // stops caring about this poll's result. Resolve it, but ignore it.
+    const late = await pending;
+    assert.deepEqual(late.map((e) => e.parsed.msg), ['a']);
+    // A subsequent poll after more data must emit only the new entry — the
+    // cursor advanced exactly once for the settled read, never zero times.
+    await log('b');
+    const next = await tail.poll();
+    assert.deepEqual(next.map((e) => e.parsed.msg), ['b']);
+  });
+});
+
 test('discoverCollector reads port and token from .debug', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'evidence-disc-'));
   try {

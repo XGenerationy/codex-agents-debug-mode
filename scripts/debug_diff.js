@@ -134,7 +134,26 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 // qualification. JSON output needs none of this — JSON.stringify(diff, ...)
 // already escapes everything correctly there.
 function escapeText(value) {
-  return escapeEvidenceText(value).replaceAll('`', '\\`').replaceAll('│', '¦');
+  return escapeEvidenceText(value)
+    // Markdown-significant punctuation is backslash-escaped so untrusted log
+    // content renders as literal text in the Markdown report (the report is
+    // what gets pasted into PRs). Backslash-escaping (CommonMark) neutralizes:
+    // backticks (code-span delimiters, which ignore backslash INSIDE a span —
+    // so we also avoid wrapping untrusted text in spans), the box-drawing
+    // pipe (table-cell mimicry), raw-HTML delimiters <>& (XSS if a consumer
+    // renders md with HTML enabled), and link/image syntax []()!. Table
+    // output shows the literal backslash+char, consistent with how it already
+    // rendered escaped backticks. JSON output needs none of this.
+    .replaceAll('`', '\\`')
+    .replaceAll('│', '¦')
+    .replaceAll('<', '\\<')
+    .replaceAll('>', '\\>')
+    .replaceAll('&', '\\&')
+    .replaceAll('[', '\\[')
+    .replaceAll(']', '\\]')
+    .replaceAll('(', '\\(')
+    .replaceAll(')', '\\)')
+    .replaceAll('!', '\\!');
 }
 
 // Stored status is untrusted log content, and older logs can carry a
