@@ -77,10 +77,15 @@ error and the run is BLOCKED before anything executes:
   gate: the pure form gets its recipe inspected (uncaptured or failure-neutralizing
   recipes → BLOCKED), and any other command that invokes make (wrapped, prefixed,
   pathed, flagged, or argument-extended — `cd x && make lie`, `env make lie`,
-  `/usr/bin/make lie`, `make -s lie`, `make lie && true`) is BLOCKED outright: an
-  uninspectable make invocation is never admitted. Token-level matching leaves
-  non-make commands (`cmake`, `make-docs`) unaffected. Strict definitions never pass
-  through this gate (invariance).
+  `/usr/bin/make lie`, `make -s lie`, `make lie && true`, quoted/substituted forms,
+  and the platform aliases `gmake`/`bmake`/`pmake`/`nmake`/`mingw32-make`/
+  `mingw64-make`/`make.exe`) is BLOCKED outright: an uninspectable make invocation is
+  never admitted. The alias predicate is honestly a denylist — genuinely exotic
+  wrappers cannot be enumerated; the gate blocks everything reachable by typing the
+  obvious thing and does not claim completeness. Token-level basename matching leaves
+  non-make commands (`cmake`, `make-docs`, `node make.js`) unaffected; a package
+  script literally named `make` is blocked errs-safe with a rename hint. Strict
+  definitions never pass through this gate (invariance).
 - **Engine command proofs get strict parity at plan time (review decision):** a
   postcondition command proof is neutralizer-scanned and its `expectedPattern` must be
   a non-empty `literal:` policy — both enforced at admission, mirroring the strict path
