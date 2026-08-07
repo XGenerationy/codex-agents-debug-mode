@@ -777,9 +777,11 @@ git commit -m "feat(action): marker-tagged PR comment upsert behind injectable g
 - Modify: `actions/closeout/support.test.js` (append)
 
 State contract between steps: `run` writes `<output-dir>/action-state.json` —
-`{tier, mode, baseRef, cliExitCode, decision, parsed, reportJsonPath?, artifactName}` —
-and `comment`/`finish` read it. All GitHub env-file paths (`GITHUB_OUTPUT`,
-`GITHUB_STEP_SUMMARY`) and the spawn/gh/env/event seams are injectable.
+`{tier, mode, baseRef, cliExitCode, decision, artifactName, renderedSummary, reportJsonPath}`
+— and `comment`/`finish` read it (`renderedSummary`, not the raw `parsed` record, is
+what `comment` needs: the body is rebuilt without re-deriving the rendering). All
+GitHub env-file paths (`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`) and the
+spawn/gh/env/event seams are injectable.
 
 - [ ] **Step 1: Write the failing tests**
 
