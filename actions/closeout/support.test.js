@@ -385,6 +385,67 @@ test('the comment step sends the comment rendering, not the summary embed', asyn
   assert.doesNotMatch(bodyArg, /HUGE EMBEDDED REPORT BODY/);
 });
 
+test('a broken preview comments only a pointer — gate error text stays in summary and artifact', async () => {
+  // The CLI's top-level catch does NOT redact (its audience was a
+  // terminal): raw stderr and the init-failure error can carry an embedded
+  // token. The Step Summary is run-log-equivalent and keeps it; the
+  // permanent, subscriber-notifying COMMENT never carries it.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({
+      status: 3,
+      stdout: `${JSON.stringify({ status: 'BLOCKED', error: 'git ls-remote https://x-access-token:SECRETTOKEN@github.example failed' })}\n`,
+      stderr: 'fatal: SECRETTOKEN in remote',
+    }),
+  });
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /SECRETTOKEN/);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.doesNotMatch(state.renderedComment, /SECRETTOKEN/);
+  assert.match(state.renderedComment, /preview itself failed/i);
+  assert.match(state.renderedComment, /Step Summary and run log/);
+});
+
+test('a degraded engine run never labels itself strict', async () => {
+  // report.json unreadable: the renderer fallback would claim strict, but
+  // the action KNOWS the tier it invoked (same rule as sub-project A's
+  // matrixSource tell). Machine `mode` output stays report-sourced.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  await runSubcommand({
+    inputs: { run: 'full', mode: 'engine', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({
+      status: 2,
+      stdout: `${JSON.stringify({ status: 'FAIL', headSha: 'h', report: { json: path.join(dir, 'missing', 'report.json'), markdown: path.join(dir, 'missing', 'report.md') } })}\n`,
+      stderr: '',
+    }),
+  });
+  const summary = readFs(path.join(dir, 's'), 'utf8');
+  assert.match(summary, /- Mode: engine/);
+  assert.doesNotMatch(summary, /- Mode: strict/);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.match(state.renderedComment, /- Mode: engine/);
+});
+
+test('a spawn failure is named in the summary, not just "no JSON"', async () => {
+  const dir = makeTempDir();
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir: path.join(dir, 'e'), artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: null, stdout: '', stderr: '', error: new Error('spawn node ENOENT') }),
+  });
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /spawn node ENOENT/);
+});
+
 test('finishSubcommand exits with the recorded decision', () => {
   const dir = makeTempDir();
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' } }));

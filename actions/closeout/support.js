@@ -6,6 +6,7 @@
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
 const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
@@ -399,6 +400,10 @@ const runSubcommand = async ({
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);
   const decision = decideExit({ run, cliExitCode, parsed });
+  // A real spawn failure (ENOENT, maxBuffer) must be named, not reported as
+  // a generic missing-JSON — the operator cannot diagnose "no plan JSON"
+  // when the actual cause is a missing CLI (review, Task 4 round 2).
+  const spawnNote = result.error ? ` Spawn error: ${result.error.message}.` : '';
 
   let renderedSummary;
   let renderedComment = '';
@@ -409,6 +414,8 @@ const runSubcommand = async ({
   if (run === 'plan') {
     if (parsed && typeof parsed.planStatus === 'string') {
       renderedSummary = renderPlanSummary(parsed, { baseRef });
+      // Plan comments equal the plan summary: gate-redacted content only.
+      renderedComment = renderedSummary;
       status = parsed.planStatus;
       reportMode = parsed.mode || '';
       attestation = parsed.admission?.attestation?.status || '';
@@ -419,9 +426,21 @@ const runSubcommand = async ({
       renderedSummary = [
         '## Closeout plan preview',
         '',
-        `**The preview itself failed** — ${escapeActionText(decision.reason)}`,
+        `**The preview itself failed** — ${escapeActionText(decision.reason + spawnNote)}`,
         '',
         `stderr: ${escapeActionText(String(result.stderr || '').slice(0, 4000))}`,
+        '',
+      ].join('\n');
+      // Gate error text (raw stderr; parsed.error inside decision.reason)
+      // is NOT redacted by the CLI's top-level catch — its audience was a
+      // terminal. It stays on run-log-equivalent surfaces (Step Summary,
+      // artifact); the COMMENT is permanent and notifies every subscriber,
+      // so it carries a fixed-shape pointer only (review decision, Task 4
+      // round 2).
+      renderedComment = [
+        '## Closeout plan preview',
+        '',
+        '**The preview itself failed.** See the workflow Step Summary and run log for detail.',
         '',
       ].join('\n');
       status = 'BLOCKED';
@@ -437,22 +456,29 @@ const runSubcommand = async ({
     }
     status = report.overallStatus || parsed?.status || 'BLOCKED';
     reportMode = report.mode || '';
+    // The report is the source of truth for the tier label when readable;
+    // when it is NOT, the action still knows the tier it INVOKED — an
+    // engine run must never be labeled strict by the renderer's fallback
+    // (review decision, Task 4 round 2; same rule as sub-project A's
+    // matrixSource tell). The machine `mode` output stays report-sourced:
+    // empty-when-unknown is honest for consumers keying on it.
+    const labelMode = report.mode || mode;
     renderedSummary = renderFullSummary(
-      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
-      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'})`,
+      { overallStatus: status, mode: labelMode, configDigest: report.configDigest },
+      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'}${spawnNote})`,
       { artifactName },
     );
     // Full-tier COMMENTS never carry the embedded report.md (spec): key
     // fields plus a pointer only — the full report lives in the Step
     // Summary and the artifact. The pointer line is a fixed literal so no
-    // operator input rides in it unescaped.
+    // operator input rides in it unescaped, and no gate error text ever
+    // reaches a comment.
     renderedComment = renderFullSummary(
-      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
+      { overallStatus: status, mode: labelMode, configDigest: report.configDigest },
       'See report.md in the evidence artifact named above.',
       { artifactName },
     );
   }
-  if (run === 'plan') renderedComment = renderedSummary;
 
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
   if (env.GITHUB_OUTPUT) {
@@ -536,7 +562,7 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
 const main = async () => {
   const [subcommand] = process.argv.slice(2);
   const env = process.env;
-  const common = { outputDir: env.CLOSEOUT_OUTPUT_DIR || path.join(env.RUNNER_TEMP || require('node:os').tmpdir(), 'closeout-evidence') };
+  const common = { outputDir: env.CLOSEOUT_OUTPUT_DIR || path.join(env.RUNNER_TEMP || os.tmpdir(), 'closeout-evidence') };
   try {
     if (subcommand === 'run') {
       process.exitCode = await runSubcommand({
