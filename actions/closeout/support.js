@@ -401,6 +401,7 @@ const runSubcommand = async ({
   const decision = decideExit({ run, cliExitCode, parsed });
 
   let renderedSummary;
+  let renderedComment = '';
   let reportJsonPath = '';
   let reportMode = '';
   let attestation = '';
@@ -441,7 +442,17 @@ const runSubcommand = async ({
       reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'})`,
       { artifactName },
     );
+    // Full-tier COMMENTS never carry the embedded report.md (spec): key
+    // fields plus a pointer only — the full report lives in the Step
+    // Summary and the artifact. The pointer line is a fixed literal so no
+    // operator input rides in it unescaped.
+    renderedComment = renderFullSummary(
+      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
+      'See report.md in the evidence artifact named above.',
+      { artifactName },
+    );
   }
+  if (run === 'plan') renderedComment = renderedSummary;
 
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
   if (env.GITHUB_OUTPUT) {
@@ -450,7 +461,7 @@ const runSubcommand = async ({
     });
   }
   writeFileSync(path.join(outputDir, STATE_FILE), `${JSON.stringify({
-    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, reportJsonPath,
+    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath,
   })}\n`);
   process.stdout.write(`closeout-action: ${decision.reason}\n`);
   return 0;
@@ -509,7 +520,14 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
     process.stdout.write('closeout-action: not a pull-request context; comment skipped.\n');
     return 0;
   }
-  const body = buildCommentBody({ tier: state.tier, rendered: state.renderedSummary || '', artifactName: state.artifactName || 'closeout-evidence' });
+  const body = buildCommentBody({
+    tier: state.tier,
+    // renderedComment is the comment-specific rendering (full tier: key
+    // fields + pointer, never the embedded report.md); the summary is only
+    // a fallback for a state written by an older run step.
+    rendered: state.renderedComment || state.renderedSummary || '',
+    artifactName: state.artifactName || 'closeout-evidence',
+  });
   await upsertPrComment({ context, body, runGh });
   process.stdout.write(`closeout-action: comment upserted on PR #${context.prNumber}.\n`);
   return 0;

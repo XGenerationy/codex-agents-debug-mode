@@ -356,6 +356,33 @@ test('runSubcommand end-to-end (full tier): reads report.json/report.md and reco
   assert.match(outputs, /^mode=engine$/m);
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 2]);
+  // Spec: full-tier COMMENTS carry key fields + an artifact pointer, never
+  // the embedded report.md — the summary keeps the embed, the comment
+  // rendering must not.
+  assert.match(state.renderedSummary, /> \*\*ENGINE MODE\*\* banner/);
+  assert.doesNotMatch(state.renderedComment, /> \*\*ENGINE MODE\*\* banner/);
+  assert.match(state.renderedComment, /See report\.md in the evidence artifact/);
+  assert.match(state.renderedComment, /Closeout gate result/);
+});
+
+test('the comment step sends the comment rendering, not the summary embed', async () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'full', artifactName: 'ev',
+    renderedSummary: '## Closeout gate result\nfields\n\n---\n\nHUGE EMBEDDED REPORT BODY',
+    renderedComment: '## Closeout gate result\nfields\n\nSee report.md in the evidence artifact named above.',
+    decision: { success: false, exitCode: 2 },
+  }));
+  const calls = [];
+  await commentSubcommand({
+    outputDir: dir,
+    env: { GITHUB_REPOSITORY: 'o/r' },
+    event: { pull_request: { number: 3 } },
+    runGh: async (args) => { calls.push(args); return args.includes('POST') ? { id: 1 } : [[]]; },
+  });
+  const bodyArg = calls[1].find((argument) => argument.startsWith('body='));
+  assert.match(bodyArg, /Closeout gate result/);
+  assert.doesNotMatch(bodyArg, /HUGE EMBEDDED REPORT BODY/);
 });
 
 test('finishSubcommand exits with the recorded decision', () => {
