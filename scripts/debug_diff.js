@@ -133,27 +133,22 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 // promise report structure NEVER reflects log content, without
 // qualification. JSON output needs none of this — JSON.stringify(diff, ...)
 // already escapes everything correctly there.
+// Markdown-inline-structural punctuation is backslash-escaped so untrusted
+// log content renders as literal text in the Markdown report (the report is
+// what gets pasted into PRs): emphasis/strong (* _), code spans (`), links
+// and images ([ ] ( ) !), and raw-HTML delimiters (< > & — XSS if a consumer
+// renders md with HTML enabled). These are exactly the characters that can
+// forge inline Markdown structure; other ASCII punctuation (= : / , " ' etc.)
+// has no inline structural meaning and is left untouched to keep the report
+// readable. The box-drawing pipe is the one exception: it must become a
+// DIFFERENT character (¦), not just a backslashed one, because the TABLE
+// renderer's cell borders are real │ that the terminal prints regardless of
+// a preceding backslash. JSON output needs none of this.
+const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&]/g;
 function escapeText(value) {
   return escapeEvidenceText(value)
-    // Markdown-significant punctuation is backslash-escaped so untrusted log
-    // content renders as literal text in the Markdown report (the report is
-    // what gets pasted into PRs). Backslash-escaping (CommonMark) neutralizes:
-    // backticks (code-span delimiters, which ignore backslash INSIDE a span —
-    // so we also avoid wrapping untrusted text in spans), the box-drawing
-    // pipe (table-cell mimicry), raw-HTML delimiters <>& (XSS if a consumer
-    // renders md with HTML enabled), and link/image syntax []()!. Table
-    // output shows the literal backslash+char, consistent with how it already
-    // rendered escaped backticks. JSON output needs none of this.
-    .replaceAll('`', '\\`')
     .replaceAll('│', '¦')
-    .replaceAll('<', '\\<')
-    .replaceAll('>', '\\>')
-    .replaceAll('&', '\\&')
-    .replaceAll('[', '\\[')
-    .replaceAll(']', '\\]')
-    .replaceAll('(', '\\(')
-    .replaceAll(')', '\\)')
-    .replaceAll('!', '\\!');
+    .replace(MARKDOWN_PUNCTUATION, '\\$&');
 }
 
 // Stored status is untrusted log content, and older logs can carry a

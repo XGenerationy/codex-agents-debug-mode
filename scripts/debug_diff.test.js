@@ -163,35 +163,44 @@ test('rendered markdown/table never let a backticked disappeared message break o
   assert.equal(tableLine, '  - has \\`backtick\\` inside');
 });
 
-test('rendered markdown cannot be broken by a disappeared message crafted to close a code span', () => {
-  // A msg containing its own backtick run was the injection vector: under
-  // the old code-span rendering, the backtick could terminate the span and
-  // the trailing text would render as Markdown. With quote-wrapped plain
-  // text this is impossible.
+test('rendered markdown cannot be broken by a disappeared message crafted to forge structure', () => {
+  // A msg containing its own backtick run, emphasis, or a leading header
+  // was the injection vector under the old code-span rendering. With plain
+  // quote-wrapped text AND full structural escaping, none of it can render
+  // as Markdown: backticks, asterisks, and every inline-structural char are
+  // backslash-escaped.
   const before = parseSessionText(
     line({ ts: '2026-08-06T10:00:01.000Z', msg: '` close then inject **forged verdict**', hypothesisId: 'H1' }),
   );
   const diff = computeDiff(before, parseSessionText(''));
   const markdown = renderMarkdown(diff);
-  // No bare (unescaped) backtick remains to act as a code-span delimiter:
-  // every backtick is preceded by a backslash, so there is no delimiter run
-  // that could open or close a span.
-  for (const match of markdown.matchAll(/`/g)) {
-    assert.equal(match.index > 0 && markdown[match.index - 1] === '\\', true);
+  // Scope the scan to the gone line that carries the untrusted payload: the
+  // renderer's OWN structural markers (the **H1...** bold wrapper, the ##
+  // heading) are intentionally not escaped, so scanning the whole markdown
+  // for bare `*`/`` ` `` would flag the tool's own output. The guarantee is
+  // that the untrusted MESSAGE content is literal.
+  const goneLine = markdown.split('\n').find((l) => l.startsWith('- gone: '));
+  assert.equal(goneLine !== undefined, true);
+  for (const match of goneLine.matchAll(/[`*]/g)) {
+    assert.equal(match.index > 0 && goneLine[match.index - 1] === '\\', true, `unescaped ${goneLine[match.index]} at ${match.index}`);
   }
-  // The forged verdict text stays as escaped content on the gone line, not
-  // rendered as a separate bold Markdown line.
+  // The emphasis asterisks are escaped too, so **forged verdict** cannot
+  // render as bold — neither inline nor as its own line. This is the real
+  // guarantee (the previous assertion only checked for a separate line and
+  // its comment overclaimed "escaped content" while * was still bare).
   assert.equal(markdown.split('\n').filter((l) => l.trim().startsWith('**forged verdict**')).length, 0);
+  // The escaped form appears verbatim on the gone line.
+  assert.match(goneLine, /gone: ".*\\\*\\\*forged verdict\\\*\\\*"/);
 });
 
-test('rendered markdown/table escape raw-HTML and link-shaped untrusted content across msg/title/status/note', () => {
-  // The Markdown report is pasted into PRs; if a consumer renders it with
-  // HTML enabled, raw <...> becomes an XSS path and [t](javascript:...)
-  // becomes an attacker-controlled link. escapeText backslash-escapes all
-  // Markdown-significant punctuation so untrusted values render as literal
-  // text. (The renderer's own structural punctuation — e.g. the parentheses
-  // in "disappeared after fix (H1):" — is the tool's literal output, not
-  // untrusted content, so it is correctly not escaped.)
+test('rendered markdown/table escape Markdown-structural untrusted content across msg/title/status/note', () => {
+  // The Markdown report is pasted into PRs. escapeText backslash-escapes the
+  // full inline-structural punctuation set so untrusted log content renders
+  // as literal text: emphasis/strong (* _), code spans (`), links/images
+  // ([ ] ( ) !), raw HTML (< > & — XSS if a consumer renders md with HTML
+  // enabled). The renderer's own structural punctuation (e.g. the parens in
+  // "disappeared after fix (H1):") is the tool's literal output, not
+  // untrusted content, so it is correctly not escaped.
   const before = parseSessionText(
     line({ ts: '2026-08-06T10:00:01.000Z', msg: '<img src=x onerror=alert(1)>', hypothesisId: 'H1' }),
   );
@@ -202,26 +211,46 @@ test('rendered markdown/table escape raw-HTML and link-shaped untrusted content 
       hypothesisId: 'H1',
       status: 'OPEN',
       title: 'evil [click](javascript:alert(1)) title',
-      note: 'see [also](http://x) & <b>',
+      note: 'see [also](http://x) & <b> plus *bold* and _ital_',
     }),
   );
   const diff = computeDiff(before, after);
   const markdown = renderMarkdown(diff);
-  // Every UNTRUSTED payload's significant chars are backslash-escaped in
-  // the Markdown output. Check each surface: title (in the **...** line),
-  // msg (gone line), note. The status here is 'OPEN' (no special chars).
+  // Every untrusted structural char is backslash-escaped. The renderer's OWN
+  // structural markers (the **...** wrapper around H1+title, the ## heading)
+  // are intentionally not escaped, so the per-char scan is scoped to the
+  // lines carrying untrusted content (gone line, note line) and the title's
+  // payload is verified by regex inside its wrapper.
   assert.match(markdown, /evil \\\[click\\\]\\\(javascript:alert\\\(1\\\)\\\) title/);
-  assert.match(markdown, /gone: "\\\<img src=x onerror=alert\\\(1\\\)\\\>"/);
-  assert.match(markdown, /note: "see \\\[also\\\]\\\(http:\/\/x\\\) \\\& \\\<b\\\>"/);
-  // No raw, unescaped HTML tag or active link token from the payloads
-  // remains (the escaped forms contain a preceding backslash).
+  assert.match(markdown, /gone: "\\<img src=x onerror=alert\\\(1\\\)\\>"/);
+  assert.match(markdown, /note: "see \\\[also\\\]\\\(http:\/\/x\\\) \\& \\<b\\> plus \\\*bold\\\* and \\\_ital\\\_"/);
+  const structural = ['<', '>', '&', '[', ']', '(', ')', '*', '_'];
+  for (const line of markdown.split('\n')) {
+    // Only gone/note lines are pure untrusted-content lines (no renderer
+    // wrapper punctuation), so every structural char there must be escaped.
+    if (line.startsWith('- gone: ') || line.startsWith('- note: ')) {
+      for (const ch of structural) {
+        for (let i = 0; i < line.length; i += 1) {
+          if (line[i] === ch) {
+            assert.equal(i > 0 && line[i - 1] === '\\', true, `unescaped ${ch} in: ${line}`);
+          }
+        }
+      }
+    }
+  }
+  // No raw (unescaped) HTML tag or active link from the payloads remains.
   assert.doesNotMatch(markdown, /(?<!\\)<img/);
-  assert.doesNotMatch(markdown, /(?<!\\)\[click\](?<!\\)\(javascript:/);
-
-  // The table path renders the msg in its disappeared list; it is escaped too.
+  // The table path renders the msg in its disappeared list; escaped too.
   const table = renderTable(diff);
-  assert.match(table, /\\\<img src=x onerror=alert\\\(1\\\)\\\>/);
-  assert.doesNotMatch(table, /(?<!\\)<img/);
+  const tableGoneLine = table.split('\n').find((l) => l.startsWith('  - '));
+  assert.equal(tableGoneLine !== undefined, true);
+  for (const ch of structural) {
+    for (let i = 0; i < tableGoneLine.length; i += 1) {
+      if (tableGoneLine[i] === ch) {
+        assert.equal(i > 0 && tableGoneLine[i - 1] === '\\', true, `unescaped ${ch} in table gone line`);
+      }
+    }
+  }
 });
 
 test('computeDiff ignores non-string/missing hypothesis ids without crashing, counts them, and renderers state it', () => {
