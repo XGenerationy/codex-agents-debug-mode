@@ -318,7 +318,10 @@ const MAKE_SPLIT = /[\s;&|(){}`"'$=<>]+/;
 // stripped before the alias check, so `/usr/bin/make.exe` and `make` match
 // the same entry.
 const MAKE_ALIASES = new Set(['make', 'gmake', 'bmake', 'pmake', 'nmake', 'mingw32-make', 'mingw64-make']);
-const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, ''));
+// Case-insensitive: Windows and default-macOS filesystems resolve `MAKE`/
+// `Make.Exe` to the same binary, and Windows toolchains are explicitly in
+// this alias set's threat model (mingw32-make, nmake).
+const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, '').toLowerCase());
 
 // Engine-mode make gate: recipe bodies are only inspectable when the command
 // is EXACTLY `make <target>`. Any other command that invokes make — wrapped
@@ -349,7 +352,7 @@ const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
   }
   const invokesMake = resolvedCommand.split(MAKE_SPLIT).some(isMakeToken);
   if (invokesMake) {
-    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make" rather than a make invocation, rename the script.`;
+    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make", rename the script; if "make" here is a bare argument (a test filter, pattern, or workspace name), this gate cannot distinguish it from an invocation — rephrase the command.`;
   }
   return null;
 };
