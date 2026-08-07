@@ -610,6 +610,9 @@ test('readPrContext extracts repo and PR number from env plus event payload, els
   assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'owner/repo' }, event: {} }), null);
   assert.equal(readPrContext({ env: {}, event: { pull_request: { number: 42 } } }), null);
   assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'malformed' }, event: { pull_request: { number: 42 } } }), null);
+  // PR numbers are >= 1; zero/negative would target issues/0 — fail closed.
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'o/r' }, event: { pull_request: { number: 0 } } }), null);
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'o/r' }, event: { pull_request: { number: -3 } } }), null);
 });
 
 test('buildCommentBody starts with the stable marker and caps at the comment limit', () => {
@@ -621,9 +624,18 @@ test('buildCommentBody starts with the stable marker and caps at the comment lim
   assert.match(big, /truncated/i);
 });
 
-test('upsertPrComment PATCHes an existing marker comment and POSTs otherwise', async () => {
+test('upsertPrComment PATCHes only the action-authored marker comment and POSTs otherwise', async () => {
+  const bot = { login: 'github-actions[bot]', type: 'Bot' };
+  const attacker = { login: 'drive-by', type: 'User' };
   const calls = [];
-  const existing = [{ id: 7, body: `${ACTION_MARKER}\nold` }, { id: 8, body: 'unrelated' }];
+  // Slurped shape: one JSON array of page arrays. The attacker's marker
+  // comment is EARLIER than the action's own — the author check, not
+  // ordering, must pick the target (review decision, Task 3 round).
+  const existing = [[
+    { id: 1, body: `${ACTION_MARKER}\nforged`, user: attacker },
+    { id: 7, body: `${ACTION_MARKER}\nold`, user: bot },
+    { id: 8, body: 'unrelated', user: bot },
+  ]];
   const patchingGh = async (args) => {
     calls.push(args);
     if (args.includes('--method') === false) return existing; // list call
@@ -635,17 +647,24 @@ test('upsertPrComment PATCHes an existing marker comment and POSTs otherwise', a
     runGh: patchingGh,
   });
   assert.equal(calls.length, 2);
+  assert.ok(calls[0].includes('--paginate') && calls[0].includes('--slurp'),
+    'list walks every page in one parseable document — page 1 is the OLDEST 30 comments');
   assert.ok(calls[0].join(' ').includes('issues/5/comments'), 'first call lists comments');
-  assert.ok(calls[1].join(' ').includes('issues/comments/7'), 'second call PATCHes the marker comment');
+  assert.ok(calls[1].join(' ').includes('issues/comments/7'),
+    'PATCH targets the action-authored marker comment, never the attacker earlier one');
   assert.ok(calls[1].includes('PATCH'));
 
   const posts = [];
   await upsertPrComment({
     context: { owner: 'o', repo: 'r', prNumber: 5 },
     body: `${ACTION_MARKER}\nnew`,
-    runGh: async (args) => { posts.push(args); return args.includes('POST') ? { id: 9 } : []; },
+    runGh: async (args) => {
+      posts.push(args);
+      if (args.includes('POST')) return { id: 9 };
+      return [[{ id: 1, body: `${ACTION_MARKER}\nforged`, user: attacker }]];
+    },
   });
-  assert.ok(posts[1].includes('POST'), 'no marker comment found: POST a new one');
+  assert.ok(posts[1].includes('POST'), 'attacker-only marker comments are ignored: POST a new one');
 });
 ```
 
@@ -675,7 +694,8 @@ const readPrContext = ({ env = {}, event = {} } = {}) => {
   const repository = env.GITHUB_REPOSITORY || '';
   const [owner, repo, ...rest] = repository.split('/');
   const prNumber = event?.pull_request?.number;
-  if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber)) return null;
+  // PR numbers are >= 1; zero/negative would target issues/0 — fail closed.
+  if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber) || prNumber < 1) return null;
   return { owner, repo, prNumber };
 };
 
@@ -688,24 +708,36 @@ const readPrContext = ({ env = {}, event = {} } = {}) => {
  */
 const buildCommentBody = ({ rendered, artifactName }) => {
   const capped = capText(rendered, COMMENT_CAP_BYTES, artifactName);
+  // The 33-byte marker line rides outside the cap. Safe: UTF-8 byte count
+  // >= UTF-16 unit count always, so 61440+33 bytes bounds the comment at
+  // ~4000 units under GitHub's 65536-CHARACTER limit.
   return `${ACTION_MARKER}\n${capped.text}`;
 };
 
 /**
- * Upserts the marker-tagged PR comment via the injectable gh seam: list the
- * first page of issue comments, PATCH the one whose body starts with the
- * marker, else POST a new one. First-page-only matching is a documented
- * bound — the action's own comment stays near the top of any real PR's
- * comment count, and a miss degrades to one duplicate comment, never a lost
- * result.
+ * Upserts the action's PR comment via the injectable gh seam. The list call
+ * walks EVERY page (`--paginate`; the issue-comments API returns
+ * oldest-first with a 30-per-page default, so the action's newest comment
+ * is exactly what a first-page-only read would miss — every later run
+ * would then POST a duplicate on precisely the busiest PRs) and `--slurp`
+ * folds the pages into one parseable JSON array of page arrays (gh >= 2.31;
+ * GitHub-hosted runners ship newer). The PATCH target must carry the marker
+ * AND be authored by the workflow token's own bot identity: the marker is
+ * an invisible HTML comment anyone can post or innocently copy-paste, and
+ * without the author check a drive-by comment posted before the action's
+ * first run either gets silently overwritten under the attacker's name or
+ * fails the step forever (review decision, Task 3 round).
  * @param {{context: {owner, repo, prNumber}, body: string, runGh: Function}} options
  * @returns {Promise<void>}
  */
 const upsertPrComment = async ({ context, body, runGh }) => {
   const { owner, repo, prNumber } = context;
-  const listed = await runGh(['api', `repos/${owner}/${repo}/issues/${prNumber}/comments`, '--jq', '.']);
-  const comments = Array.isArray(listed) ? listed : [];
-  const mine = comments.find((comment) => typeof comment?.body === 'string' && comment.body.startsWith(ACTION_MARKER));
+  const listed = await runGh(['api', '--paginate', '--slurp', `repos/${owner}/${repo}/issues/${prNumber}/comments`]);
+  const comments = Array.isArray(listed) ? listed.flat() : [];
+  const mine = comments.find((comment) => typeof comment?.body === 'string'
+    && comment.body.startsWith(ACTION_MARKER)
+    && comment.user?.type === 'Bot'
+    && comment.user?.login === 'github-actions[bot]');
   if (mine) {
     await runGh(['api', '--method', 'PATCH', `repos/${owner}/${repo}/issues/comments/${mine.id}`, '-f', `body=${body}`]);
     return;

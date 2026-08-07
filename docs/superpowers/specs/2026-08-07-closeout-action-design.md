@@ -151,14 +151,22 @@ prototype of a later `Object.assign`-style copy).
   already rendered through the gate's own `safeText` pipeline and re-escaping would
   corrupt it.
 - PR comment (opt-in): same content as the plan summary, prefixed with the HTML marker
-  comment `<!-- closeout-action-preview -->` as the body's first line, enabling
-  upsert-in-place via `gh api` (find comment carrying the marker → PATCH, else POST).
-  No repo/PR identifiers ride in the marker — the upsert lists only the target PR's
-  own comments, so identifiers would be redundant, and the marker is release-pinned
-  (changing it orphans old comments); this exact string is the contract (reconciled to
-  the implemented plan during Task 3 — the spec's earlier `closeout-preview` sketch
-  was never implemented). Comment bodies are capped at 60 KiB with the same
-  truncation honesty.
+  comment `<!-- closeout-action-preview -->` as the body's first line. The marker is
+  release-pinned (changing it orphans old comments); this exact string is the contract
+  (reconciled to the implemented plan during Task 3 — the spec's earlier
+  `closeout-preview` sketch was never implemented). Upsert-in-place via `gh api`
+  (review decisions, Task 3 round): the PATCH target must carry the marker AND be
+  authored by the workflow token's own bot identity (`github-actions[bot]`) — the
+  marker is an invisible HTML comment anyone can post or innocently copy-paste, so the
+  marker alone must never select whose comment gets overwritten; the AUTHOR check is
+  the discriminator, which is also why repo/PR identifiers in the marker would add
+  nothing. The list call walks every page (`gh api --paginate --slurp`; the
+  issue-comments API returns oldest-first at 30 per page, so the action's newest
+  comment is exactly what a first-page read misses — and each miss would post a
+  duplicate on precisely the busiest PRs). No action-authored marker comment → POST.
+  Comment bodies are capped at 60 KiB with the same truncation honesty; the marker
+  line rides outside the cap (UTF-8 bytes ≥ UTF-16 units, so the byte cap bounds the
+  comment ~4000 units under GitHub's 65536-character limit).
 
 ## Dogfood workflows (house style: SHA-pinned `uses`, `permissions` block, concurrency group, `fetch-depth: 0`)
 
