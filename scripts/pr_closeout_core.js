@@ -464,12 +464,62 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], makeRecipes?: Record<string, string>, touchedFiles?: string[], mergeBaseSha?: string}} options
  * @returns {{checks: object[], errors: string[]}}
  */
-const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
+const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
   const commands = config.commands || {};
   const qualificationSafe = new Set(config.qualificationSafe || []);
   const resourceGroups = config.resourceGroups || {};
   const targets = new Set(makeTargets);
   const errors = [];
+  // Unknown mode: fail closed with an empty plan rather than guessing a tier.
+  if (mode !== 'strict' && mode !== 'engine') {
+    return { checks: [], errors: [`Unknown closeout mode "${mode}". Use strict or engine.`] };
+  }
+  // Engine-only keys in a strict run are weakening attempts (someone trying
+  // to swap the matrix or its script runner without saying --mode engine) —
+  // named errors, never silently ignored keys.
+  if (mode === 'strict') {
+    if (Object.hasOwn(config, 'engineChecks')) {
+      errors.push('config.engineChecks is only valid with --mode engine; a strict run never accepts a replacement matrix.');
+    }
+    if (Object.hasOwn(config, 'scriptRunner')) {
+      errors.push('config.scriptRunner is only valid with --mode engine.');
+    }
+  }
+  // Engine mode: the matrix is engineChecks, full stop. config.commands
+  // coexisting with it would create a second command source and an override
+  // ambiguity, so it is rejected outright.
+  if (mode === 'engine' && Object.hasOwn(config, 'commands')) {
+    errors.push('Engine mode defines commands inline in engineChecks; config.commands is not accepted in engine mode.');
+  }
+  // The script runner used for engine `scripts` discovery. Strict keeps its
+  // hardcoded `pnpm run` (byte-identical output); engine defaults to the
+  // ecosystem-neutral `npm run` and accepts an override that is itself
+  // validated like any other command fragment.
+  let scriptRunner = 'npm run';
+  if (mode === 'engine' && Object.hasOwn(config, 'scriptRunner')) {
+    if (typeof config.scriptRunner !== 'string' || !config.scriptRunner.trim() || /[\r\n]/.test(config.scriptRunner)) {
+      errors.push('scriptRunner must be a single-line non-empty string.');
+    } else {
+      const runnerNeutralizer = findCommandFailureNeutralizer(config.scriptRunner);
+      if (runnerNeutralizer) {
+        errors.push(`scriptRunner neutralizes failures (${runnerNeutralizer}); closeout cannot admit a failure-hiding runner.`);
+      } else {
+        scriptRunner = config.scriptRunner.trim();
+      }
+    }
+  }
+  // Engine matrix validation converts throws into the errors channel so the
+  // caller still gets a machine-readable BLOCKED plan (and the provisional
+  // report path still works) instead of an exception.
+  let definitions = MANDATORY_CHECKS;
+  if (mode === 'engine') {
+    try {
+      definitions = validateEngineChecks(config.engineChecks);
+    } catch (error) {
+      return { checks: [], errors: [...errors, error.message] };
+    }
+  }
+  const packageRunner = mode === 'engine' ? scriptRunner : 'pnpm run';
   if (Object.hasOwn(config, 'gateIntegrityReview')) {
     errors.push('gateIntegrityReview self-attestation is forbidden; use the required live GitHub PR review attestation.');
   }
@@ -482,8 +532,58 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
     }
   }
   const expand = (command) => expandCommand(command, touchedFiles, { mergeBaseSha });
-  const checks = MANDATORY_CHECKS.map((definition) => {
+  const checks = definitions.map((definition) => {
     const configured = commands[definition.id];
+    if (definition.engine && definition.command) {
+      // Engine commands are user-supplied: apply the full distrust pipeline
+      // the configured-command branch uses (placeholder, neutralizer) PLUS
+      // the make-recipe inspection the fixed branch applies to `make`
+      // invocations — an engine matrix must not be able to smuggle a
+      // failure-hiding recipe behind a clean-looking `make target`.
+      const trimmed = definition.command.trim();
+      if (/^(?:<[^>]+>|REPLACE(?:_|\b))/i.test(trimmed)) {
+        return {
+          ...definition,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Replace the example placeholder for ${definition.label}.`,
+        };
+      }
+      const engineCommand = expand(trimmed);
+      const engineNeutralizer = findCommandFailureNeutralizer(engineCommand);
+      if (engineNeutralizer) {
+        return {
+          ...definition,
+          command: engineCommand,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Engine command for ${definition.label} neutralizes failures (${engineNeutralizer}); closeout cannot admit a failure-hiding command.`,
+        };
+      }
+      const engineMakeTarget = /^make\s+(\S+)$/.exec(trimmed)?.[1];
+      if (engineMakeTarget) {
+        if (!Object.hasOwn(makeRecipes, engineMakeTarget)) {
+          return {
+            ...definition,
+            command: engineCommand,
+            status: 'BLOCKED',
+            resolution: 'engine-command',
+            evidence: `No recipe text was captured for make target "${engineMakeTarget}" (${definition.label}); closeout cannot trust an uninspected recipe.`,
+          };
+        }
+        const engineRecipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[engineMakeTarget]);
+        if (engineRecipeNeutralizer) {
+          return {
+            ...definition,
+            command: engineCommand,
+            status: 'BLOCKED',
+            resolution: 'engine-command',
+            evidence: `Make recipe for ${definition.label} neutralizes failures (${engineRecipeNeutralizer}); closeout cannot admit a failure-hiding recipe.`,
+          };
+        }
+      }
+      return { ...definition, command: engineCommand, resolution: 'engine-command' };
+    }
     if (definition.fixed) {
       if (configured !== undefined && configured !== definition.command) {
         errors.push(`Configuration cannot override fixed check ${definition.id}.`);
@@ -562,13 +662,13 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
       if (packageNeutralizer) {
         return {
           ...definition,
-          command: `pnpm run ${packageScript}`,
+          command: `${packageRunner} ${packageScript}`,
           status: 'BLOCKED',
           resolution: 'package-script',
           evidence: `Package script "${packageScript}" for ${definition.label} neutralizes failures (${packageNeutralizer}); closeout cannot admit a failure-hiding package script.`,
         };
       }
-      return { ...definition, command: `pnpm run ${packageScript}`, resolution: 'package-script' };
+      return { ...definition, command: `${packageRunner} ${packageScript}`, resolution: 'package-script' };
     }
     const makeTarget = definition.makeCandidates?.find((candidate) => targets.has(candidate));
     if (makeTarget) {
@@ -631,6 +731,33 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
       resolved = resolved.status === 'BLOCKED'
         ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
         : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+    }
+    // Engine mode: a voluntarily attached proof (no REQUIRED_PROOFS entry
+    // exists for engine ids) is still validated at plan time — a malformed
+    // proof must block admission here exactly like a required one, not fail
+    // later inside the executor. Strict behavior is untouched: strict checks
+    // only ever carry proofs through the proofType path above.
+    if (mode === 'engine' && proof && !proofType) {
+      const engineArtifact = proof?.type === 'artifact'
+        && typeof proof.path === 'string' && proof.path.trim();
+      const engineCommandProof = proof?.type === 'command'
+        && typeof proof.command === 'string' && proof.command.trim()
+        && typeof proof.expectedPattern === 'string' && proof.expectedPattern.trim();
+      if (!engineArtifact && !engineCommandProof) {
+        const proofEvidence = `Configured proof for ${check.label} is malformed; engine proofs must be a complete artifact or command proof.`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      } else if (engineArtifact) {
+        const rel = String(proof.path).replaceAll('\\', '/').trim();
+        if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
+          || rel.split('/').includes('..') || rel.startsWith('../')) {
+          const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+      }
     }
     // Validate proof policies at plan time so unusable proofs cannot be
     // attested as admissible (Codex #4782132804). Mirrors executor rules.

@@ -2196,3 +2196,131 @@ test('validateEngineChecks hardening: id charset, prototype collisions, timer bo
   })])[0];
   assert.deepEqual(proxied.packageCandidates, ['ok']);
 });
+
+test('strict mode rejects engine-only config keys as weakening attempts, never ignores them', () => {
+  const withMatrix = buildCheckPlan({ config: { engineChecks: [{ id: 'a', command: 'x' }] } });
+  assert.match(withMatrix.errors.join('\n'), /engineChecks is only valid with --mode engine/);
+  const withRunner = buildCheckPlan({ config: { scriptRunner: 'npm run' } });
+  assert.match(withRunner.errors.join('\n'), /scriptRunner is only valid with --mode engine/);
+  // The strict matrix itself still resolves; the error rides alongside.
+  assert.equal(withMatrix.checks.length, MANDATORY_CHECKS.length);
+});
+
+test('engine mode resolves inline commands and script discovery through the shared pipeline', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'unit', command: 'cargo test --workspace' },
+        { id: 'lint', scripts: ['lint:ci', 'lint'] },
+        { id: 'ghost', scripts: ['does-not-exist'] },
+      ],
+    },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.deepEqual(plan.errors, []);
+  assert.deepEqual(plan.checks.map(({ id }) => id), ['unit', 'lint', 'ghost']);
+  const unit = plan.checks.find(({ id }) => id === 'unit');
+  assert.equal(unit.command, 'cargo test --workspace');
+  assert.equal(unit.resolution, 'engine-command');
+  assert.equal(unit.status, undefined);
+  const lint = plan.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.command, 'npm run lint');
+  assert.equal(lint.resolution, 'package-script');
+  const ghost = plan.checks.find(({ id }) => id === 'ghost');
+  assert.equal(ghost.status, 'BLOCKED');
+  assert.equal(ghost.resolution, 'unresolved');
+});
+
+test('engine mode never trusts user-supplied commands: placeholder, neutralizer, and make-recipe validation', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'todo', command: '<replace me>' },
+        { id: 'hidden', command: 'npm test || true' },
+        { id: 'uncaptured', command: 'make smoke' },
+        { id: 'neutralized', command: 'make lie' },
+      ],
+    },
+    makeRecipes: { lie: '-npm test' },
+  });
+  assert.equal(plan.checks.find(({ id }) => id === 'todo').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'todo').evidence, /placeholder/i);
+  assert.equal(plan.checks.find(({ id }) => id === 'hidden').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'hidden').evidence, /neutralizes failures/);
+  assert.equal(plan.checks.find(({ id }) => id === 'uncaptured').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'uncaptured').evidence, /No recipe text was captured/);
+  assert.equal(plan.checks.find(({ id }) => id === 'neutralized').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'neutralized').evidence, /neutralizes failures/);
+});
+
+test('engine mode fails closed at the matrix level: invalid matrix or forbidden keys yield BLOCKED-empty plans', () => {
+  const invalid = buildCheckPlan({ mode: 'engine', config: { engineChecks: [{ id: 'a' }] } });
+  assert.deepEqual(invalid.checks, []);
+  assert.match(invalid.errors.join('\n'), /exactly one of "command" or "scripts"/);
+  const missing = buildCheckPlan({ mode: 'engine', config: {} });
+  assert.deepEqual(missing.checks, []);
+  assert.match(missing.errors.join('\n'), /non-empty array/);
+  const withCommands = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'a', command: 'x' }], commands: { a: 'y' } },
+  });
+  assert.match(withCommands.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const badMode = buildCheckPlan({ mode: 'lenient' });
+  assert.deepEqual(badMode.checks, []);
+  assert.match(badMode.errors.join('\n'), /Unknown closeout mode/);
+});
+
+test('engine scriptRunner is validated and applied; strict package-script output is untouched', () => {
+  const custom = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(custom.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run || true &&' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(neutralizing.errors.join('\n'), /scriptRunner neutralizes failures/);
+  const multiline = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\nrun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(multiline.errors.join('\n'), /single-line non-empty string/);
+  // Strict path still emits pnpm run — byte-identical to today.
+  const strict = buildCheckPlan({ packageScripts: { typecheck: 'tsc --noEmit' } });
+  assert.equal(strict.checks.find(({ id }) => id === 'typecheck').command, 'pnpm run typecheck');
+});
+
+test('engine mode validates voluntarily attached proofs at plan time; strict proof behavior unchanged', () => {
+  const badShape = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '' } },
+    },
+  });
+  assert.equal(badShape.checks.find(({ id }) => id === 'render').status, 'BLOCKED');
+  assert.match(badShape.checks.find(({ id }) => id === 'render').evidence, /proof/i);
+  const escaping = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '../outside.json' } },
+    },
+  });
+  assert.match(escaping.checks.find(({ id }) => id === 'render').evidence, /relative worktree path without ".."/);
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: 'artifacts/render.json' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+  assert.deepEqual(good.checks.find(({ id }) => id === 'render').proof, { type: 'artifact', path: 'artifacts/render.json' });
+});
