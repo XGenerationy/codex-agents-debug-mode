@@ -1330,10 +1330,13 @@ git commit -m "feat(action): run/comment/finish orchestration with injectable se
 
 - [ ] **Step 1: Resolve the upload-artifact pin**
 
-Run: `gh api repos/actions/upload-artifact/commits/v4 --jq '.sha'` and note the SHA plus
-the current v4.x tag name (`gh api repos/actions/upload-artifact/tags --jq '.[0].name'`).
-Do NOT invent a SHA. The checkout and setup-node pins below are reused verbatim from
-this repo's `validate.yml`.
+Run: `gh api repos/actions/upload-artifact/commits/v4 --jq '.sha'` and note the SHA.
+For the tag comment, do NOT take the newest repo tag (upstream ships v5+ lines whose
+newest tag does not correspond to the v4 SHA); instead find the v4.x tag whose ref
+resolves to the SAME sha (`gh api repos/actions/upload-artifact/git/refs/tags/v4.6.2
+--jq '.object.sha'`-style cross-check — executed: v4 → ea165f8d65b6e75b540449e92b4886f43607fa02
+= v4.6.2, used as the comment). Do NOT invent a SHA. The checkout and setup-node pins
+below are reused verbatim from this repo's `validate.yml`.
 
 - [ ] **Step 2: Create `actions/closeout/action.yml`**
 
