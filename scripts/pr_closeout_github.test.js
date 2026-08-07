@@ -697,3 +697,32 @@ test('returns BLOCKED instead of inventing live evidence when GitHub is unavaila
   assert.equal(result.status, 'BLOCKED');
   assert.match(result.evidence, /authentication required/i);
 });
+
+test('readLiveGateAttestation tags its internal catch path with a machine-readable unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async () => { throw new Error('gh: command not found'); },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, 'unavailable');
+  assert.match(result.evidence, /gh: command not found/);
+});
+
+test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return { number: 7, author: { login: 'a' }, headRefOid: 'movedhead', baseRefOid: 'base123' };
+      return [[]];
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, undefined);
+});

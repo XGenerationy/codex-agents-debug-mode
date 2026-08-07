@@ -542,6 +542,9 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
     if (Object.hasOwn(config, 'scriptRunner')) {
       errors.push('config.scriptRunner is only valid with --mode engine.');
     }
+    if (Object.hasOwn(config, 'requiredTools')) {
+      errors.push('config.requiredTools is only valid with --mode engine.');
+    }
   }
   // Engine mode: the matrix is engineChecks, full stop. config.commands
   // coexisting with it would create a second command source and an override

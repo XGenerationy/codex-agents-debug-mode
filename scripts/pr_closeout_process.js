@@ -3668,6 +3668,7 @@ const runPreflight = async ({
   probeTcp = probeTcpDefault,
   probeRedis = probeRedisDefault,
   probeHttp = probeGrafanaHealthDefault,
+  toolProbes = TOOL_PROBES,
 } = {}) => {
   const checks = [];
   const toolVersions = {};
@@ -3719,7 +3720,7 @@ const runPreflight = async ({
     env: commandEnv,
     knownSiblingMarks: activeSpawnMarks,
   }));
-  for (const [name, command] of TOOL_PROBES) {
+  for (const [name, command] of toolProbes) {
     // A probe that rejects (spawn throws synchronously under resource
     // exhaustion, or an infrastructure error) must not escape this loop and
     // abort runCloseoutWorkflow -- that would emit only the top-level error and
@@ -3853,6 +3854,7 @@ const runPreflight = async ({
 module.exports = {
   SPAWN_MARK_ENV,
   MAX_ARTIFACT_HASH_BYTES,
+  TOOL_PROBES,
   createCommandExecutor,
   createDecodedRedactor,
   createStreamingRedactor,

@@ -2635,3 +2635,11 @@ test('make-gate alias matching is case-insensitive: Windows/macOS spellings cann
     assert.equal(plan.checks.find(({ id }) => id === 'm1').status, 'BLOCKED', command);
   }
 });
+
+test('requiredTools in a strict-mode config is a hard error naming the key', () => {
+  // Same mechanism and test shape as the existing scriptRunner-in-strict rejection test.
+  const withRequiredTools = buildCheckPlan({ config: { requiredTools: ['make'] } });
+  assert.match(withRequiredTools.errors.join('\n'), /requiredTools is only valid with --mode engine/);
+  // The strict matrix itself still resolves; the error rides alongside.
+  assert.equal(withRequiredTools.checks.length, MANDATORY_CHECKS.length);
+});

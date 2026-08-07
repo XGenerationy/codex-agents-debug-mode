@@ -20,7 +20,7 @@ const {
   verifyGeneratorReproducibility,
 } = require('./pr_closeout_git');
 const { gateAttestationMarker, readLiveGateAttestation, readLivePrState } = require('./pr_closeout_github');
-const { createCommandExecutor, redactStructure, runPreflight } = require('./pr_closeout_process');
+const { createCommandExecutor, redactStructure, runPreflight, TOOL_PROBES } = require('./pr_closeout_process');
 const { writeEvidenceReport } = require('./pr_closeout_report');
 const {
   cleanTreeStatus,
@@ -896,6 +896,35 @@ const mergeEngineTimeouts = (configTimeouts, checks) => ({
   ...Object.fromEntries(checks.filter((check) => check.timeoutMs).map((check) => [check.id, check.timeoutMs])),
 });
 
+const ENGINE_BASE_TOOLS = ['git', 'node'];
+
+/**
+ * Engine-mode preflight probe selection (spec: "Engine-only config.requiredTools").
+ * Returns the filtered [name, command] probe entries — always git + node (the
+ * gate's own dependencies) plus the declared names, deduplicated, in catalog
+ * order — or named errors when the declaration is malformed or names a probe
+ * outside the catalog. Fail-closed: errors mean NO probe list; the caller feeds
+ * them into the existing errors → FAIL containment chain.
+ */
+const resolveEngineToolProbes = (requiredTools, toolProbes) => {
+  if (requiredTools !== undefined && !Array.isArray(requiredTools)) {
+    return { probes: null, errors: ['config.requiredTools must be an array of preflight probe names.'] };
+  }
+  const errors = [];
+  const catalog = new Set(toolProbes.map(([name]) => name));
+  const declared = requiredTools || [];
+  declared.forEach((name, index) => {
+    if (typeof name !== 'string' || !name) {
+      errors.push(`config.requiredTools[${index}] must be a non-empty string.`);
+    } else if (!catalog.has(name)) {
+      errors.push(`config.requiredTools[${index}] names unknown preflight probe "${name}". Known probes: ${[...catalog].join(', ')}.`);
+    }
+  });
+  if (errors.length > 0) return { probes: null, errors };
+  const wanted = new Set([...ENGINE_BASE_TOOLS, ...declared]);
+  return { probes: toolProbes.filter(([name]) => wanted.has(name)), errors };
+};
+
 /**
  * Read-only admission readiness for plan mode: WHY would the full gate block
  * right now? Consumed by the Action's push-time preview (sub-project B) so an
@@ -903,12 +932,18 @@ const mergeEngineTimeouts = (configTimeouts, checks) => ({
  * dirty" answer without paying for the full gate. Every probe failure is
  * caught into a structured state — plan mode must never throw because gh is
  * unauthenticated or a probe crashed; that is precisely what it exists to
- * report. The attestation predicate mirrors the full run's admission
- * (`initialAttestation.status === 'PASS'` — see attestationAdmitted below).
- * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, d: object}} options
+ * report. Attestation mapping is the spec's four-state vocabulary: PASS →
+ * `present`; FAIL → `weakened` (an attestation for this snapshot exists but
+ * records a weakened decision — hiding it inside "absent" would suppress an
+ * active weakening signal); BLOCKED carrying the reader's machine-readable
+ * `reason: 'unavailable'` discriminator → `unavailable` (the read itself
+ * could not complete); any other BLOCKED → `absent` (snapshot reasons: no
+ * matching review, or the PR head/base moved). A reader that throws (test
+ * fakes; the real reader never throws) also maps to `unavailable`.
+ * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, toolProbes?: Array, d: object}} options
  * @returns {Promise<{attestation: object, cleanTree: object, preflight: object}>}
  */
-const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, d }) => {
+const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, toolProbes, d }) => {
   let attestation;
   try {
     const live = await d.readLiveGateAttestation({
@@ -919,7 +954,11 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     });
     attestation = live?.status === 'PASS'
       ? { status: 'present', evidence: live.evidence }
-      : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
+      : live?.status === 'FAIL'
+        ? { status: 'weakened', evidence: live.evidence || 'A live attestation matching this snapshot records a weakened decision.' }
+        : live?.reason === 'unavailable'
+          ? { status: 'unavailable', evidence: live.evidence || 'Live attestation lookup could not complete.' }
+          : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
   } catch (error) {
     attestation = { status: 'unavailable', evidence: `Attestation lookup failed: ${error.message}` };
   }
@@ -931,7 +970,7 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
   }
   let preflight;
   try {
-    preflight = await d.runPreflight({ repo, config, env: process.env });
+    preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
   } catch (error) {
     preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
   }
@@ -1040,6 +1079,20 @@ const runCloseoutWorkflowBody = async ({
     // not a hard-coded origin/main, so non-main PR bases are correct.
     mergeBaseSha: initial.mergeBaseSha || initial.baseSha,
   });
+  // Engine-only requiredTools narrows the preflight probe catalog to git+node
+  // plus the declared names (spec: "Engine-only config.requiredTools"); a
+  // malformed or unknown-name declaration is fail-closed — its errors join
+  // the plan's existing errors → FAIL containment chain rather than being
+  // reported separately. Strict runs never override the probe list: passing
+  // `undefined` keeps runPreflight's own default (the full hardcoded
+  // catalog), byte-identical to today's strict behavior.
+  const toolProbeResolution = mode === 'engine'
+    ? resolveEngineToolProbes(config.requiredTools, TOOL_PROBES)
+    : { probes: undefined, errors: [] };
+  if (toolProbeResolution.errors.length) {
+    plan.errors = [...plan.errors, ...toolProbeResolution.errors];
+  }
+  const toolProbes = toolProbeResolution.probes ?? undefined;
   const planStatus = planStatusFor(plan);
   const baselineSetupCommand = config.baselineSetupCommand || 'pnpm install --frozen-lockfile --ignore-scripts';
   const { gateIntegrityReview: _gateIntegrityReview, ...validationConfig } = config;
@@ -1079,6 +1132,7 @@ const runCloseoutWorkflowBody = async ({
       headSha: initial.headSha,
       configDigest,
       config,
+      toolProbes,
       d,
     });
     return redactStructure({
@@ -1172,7 +1226,7 @@ const runCloseoutWorkflowBody = async ({
     if (initialTree.status === 'PASS') {
       initialFingerprint = await d.workingTreeFingerprint(initial.repo, reproducibilityPaths);
       const [observedPreflight, initialGateChanges, observedSuppressions] = await Promise.all([
-        d.runPreflight({ repo: initial.repo, config, env: childEnv }),
+        d.runPreflight({ repo: initial.repo, config, env: childEnv, toolProbes }),
         d.readGateChanges(initial.repo, initial.mergeBaseSha || initial.baseSha),
         d.scanTouchedSuppressions(initial.repo, initial.touchedFiles),
       ]);
@@ -1330,6 +1384,7 @@ const runCloseoutWorkflowBody = async ({
             // process.env and leaking ambient CI credentials into the baseline
             // comparison.
             env: childEnv,
+            toolProbes,
           })).toolVersions,
         }));
         // verifyBaseline can reclassify a generator confirmation row away
@@ -1604,6 +1659,7 @@ module.exports = {
   normalizePersistedPaths,
   prepareOutputDirectory,
   releaseOutputDirLock,
+  resolveEngineToolProbes,
   resolvePlanAdmission,
   runCloseoutWorkflow,
   sealRepository,

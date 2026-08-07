@@ -1642,3 +1642,113 @@ test('planOnly output carries the admission block', async () => {
   assert.equal(plan.admission.cleanTree.status, 'PASS');
   assert.equal(plan.admission.preflight.status, 'PASS');
 });
+
+test('resolvePlanAdmission distinguishes weakened and unavailable from absent', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'FAIL', evidence: 'decision recorded as weakened' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  };
+  const weakened = await resolvePlanAdmission(base);
+  assert.equal(weakened.attestation.status, 'weakened');
+  assert.match(weakened.attestation.evidence, /weakened/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => ({
+        status: 'BLOCKED',
+        reason: 'unavailable',
+        evidence: 'Live GitHub gate attestation was unavailable: gh: command not found',
+      }),
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /unavailable/);
+});
+
+test('engine-mode preflight probes exactly git, node, and declared requiredTools', async () => {
+  // Reuse this branch's planDeps-style fixture; only runPreflight differs.
+  let captured = 'not-called';
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['make'] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-tools',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.notEqual(plan.planStatus, 'FAIL');
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node', 'make']);
+  assert.ok(captured.every(([, command]) => typeof command === 'string' && command.length > 0));
+});
+
+test('engine mode without requiredTools probes only git and node', async () => {
+  let captured = 'not-called';
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-default',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node']);
+});
+
+test('strict mode passes no toolProbes filter to preflight', async () => {
+  let captured = 'sentinel';
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-strict-tools',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.equal(captured, undefined);
+});
+
+test('unknown requiredTools names are a named config error and the plan fails closed', async () => {
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['blender'] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-unknown-tool',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  });
+  assert.equal(plan.planStatus, 'FAIL');
+  assert.match(
+    plan.errors.join('\n'),
+    /requiredTools\[0\] names unknown preflight probe "blender"/,
+  );
+  assert.match(plan.errors.join('\n'), /Known probes:/);
+});
