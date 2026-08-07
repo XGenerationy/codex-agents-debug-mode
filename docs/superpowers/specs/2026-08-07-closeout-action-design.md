@@ -52,7 +52,7 @@ spawned — unknown values are a named error, never a silent default):
 |---|---|---|---|
 | `run` | `plan` \| `full` | `plan` | Preview tier vs enforcing gate. Safe default is the read-only tier. |
 | `mode` | `strict` \| `engine` | `strict` | Forwarded verbatim as `--mode`. The CLI re-validates — the action never widens what the CLI accepts. |
-| `base-ref` | ref | empty | Live PR base ref for `--base-ref`. When empty, the support script resolves it fail-closed down a ladder: `origin/$GITHUB_BASE_REF` (pull_request events) → `origin/<event.pull_request.base.ref>` from the event payload (pull_request_review events) → nothing, in which case the CLI's own `config.baseRef`-or-error contract applies. The resolved value is recorded in the Step Summary. |
+| `base-ref` | ref | empty | Live PR base ref for `--base-ref`. An explicit value is passed to the CLI VERBATIM — no `origin/` prefixing; the operator's value is authoritative. When empty, the support script resolves fail-closed down a ladder: `origin/$GITHUB_BASE_REF` (pull_request events) → `origin/<event.pull_request.base.ref>` from the event payload (pull_request_review events) → nothing, in which case the CLI's own `config.baseRef`-or-error contract applies. The automatic branches prefix `origin/` because env/event carry bare branch names; consumers must therefore check out with `fetch-depth: 0` (full history) or `origin/<branch>` does not exist and the gate errors — a stated consumer requirement, not an assumption (README §9). The resolved value is recorded in the Step Summary. |
 | `config` | path | empty | Optional closeout config path, forwarded when non-empty. |
 | `output-dir` | path | `${{ runner.temp }}/closeout-evidence` | Evidence directory. Default satisfies the gate's outside-the-repository requirement. |
 | `node-version` | version spec | `24` | Passed to SHA-pinned `actions/setup-node` inside the composite. |
@@ -104,6 +104,14 @@ The two tiers fail differently by design:
 The readiness signal for plan runs lives in the Step Summary and the `status` /
 `attestation` outputs, not in the job's color.
 
+Defense in depth (review decision, Task 1 round): the exit-decision function itself
+fails CLOSED on any tier value that is not exactly `plan` or `full` — input
+validation normally makes that unreachable, but an unvalidated value must never fall
+into the more permissive plan branch and report success for a failing full gate. The
+JSON-line parser likewise rejects any record carrying an own `__proto__` key
+(the gate never emits one; such a record is hostile or garbled, and would hijack the
+prototype of a later `Object.assign`-style copy).
+
 ## Step Summary and PR comment rendering
 
 - Plan runs: a summary table — mode, planStatus, config digest, and the admission
@@ -117,13 +125,19 @@ The readiness signal for plan runs lives in the Step Summary and the `status` /
   summary itself with a pointer to the artifact. B embeds the gate's own `report.md` —
   it does NOT re-render `report.json` through `renderMarkdown`, so the re-render
   contract stays unexercised (updates A's consumer note 4: B is not that first caller).
-- Escaping: every evidence-derived string that the support script itself interpolates
-  into markdown (admission evidence lines, error messages) passes through a local
-  allowlist escaper mirroring `pr_closeout_report.js`'s `safeText` semantics
-  (entity-escape markdown-active characters, collapse control characters); tests pin
-  hostile payloads (forged headings, blockquotes, pipes, ANSI/control bytes). The
-  embedded `report.md` is exempt — it was already rendered through the gate's own
-  `safeText` pipeline and re-escaping would corrupt it.
+- Escaping (review decision, Task 1 round): every evidence-derived string that the
+  support script itself interpolates into markdown passes through `escapeActionText`,
+  which is the EXACT `safeText` transform from `pr_closeout_report.js` — newline
+  collapse to the visible return mark, then numeric-entity escape of every character
+  outside the allowlist `[A-Za-z0-9 ._⏎-]`, control bytes included. A partial
+  markdown-denylist claiming safeText parity was rejected in review (strikethrough
+  tildes, tilde fences, and GFM-autolinked URLs rendered active through it). Accepted
+  residuals, identical to the gate's own reports and documented in code: allowlisted
+  `_`/`.`/`-` keep their rare markdown meanings; a bare www.-prefixed word can still
+  autolink. Tests pin hostile payloads (forged headings, blockquotes, pipes,
+  strikethrough, URLs, control bytes). The embedded `report.md` is exempt — it was
+  already rendered through the gate's own `safeText` pipeline and re-escaping would
+  corrupt it.
 - PR comment (opt-in): same content as the plan summary, prefixed with an HTML marker
   comment (`<!-- closeout-preview -->` + repo/PR identifiers) enabling upsert-in-place
   via `gh api` (find comment carrying the marker → PATCH, else POST). Comment bodies

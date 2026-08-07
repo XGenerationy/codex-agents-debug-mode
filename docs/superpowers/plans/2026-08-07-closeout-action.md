@@ -88,6 +88,10 @@ test('parseLastJsonLine returns the last parseable JSON object line, else null',
   assert.equal(parseLastJsonLine(''), null);
   // A JSON scalar line is not a record.
   assert.equal(parseLastJsonLine('42\n'), null);
+  // A record with an own __proto__ key can only be hostile or garbled — the
+  // gate never emits one. Rejected structurally so no later consumer can be
+  // prototype-tricked by an Object.assign-style copy (review decision).
+  assert.equal(parseLastJsonLine('{"__proto__":{"planStatus":"PASS"}}\n'), null);
 });
 
 test('decideExit implements the spec exit decision table exactly', () => {
@@ -109,19 +113,33 @@ test('decideExit implements the spec exit decision table exactly', () => {
   assert.deepEqual([fail.success, fail.exitCode], [false, 2]);
   const blocked = decideExit({ run: 'full', cliExitCode: 3, parsed: { status: 'BLOCKED' } });
   assert.deepEqual([blocked.success, blocked.exitCode], [false, 3]);
+  // Unknown tier fails CLOSED (review decision, Task 1 round): an
+  // unvalidated run value must never fall into the more permissive plan
+  // branch and report success for a failing full gate.
+  const mixedCase = decideExit({ run: 'FULL', cliExitCode: 0, parsed: { planStatus: 'PASS' } });
+  assert.deepEqual([mixedCase.success, mixedCase.exitCode], [false, 3]);
+  assert.match(mixedCase.reason, /unknown run tier/i);
+  const missingTier = decideExit({ run: undefined, cliExitCode: 2, parsed: { planStatus: 'PASS' } });
+  assert.deepEqual([missingTier.success, missingTier.exitCode], [false, 3]);
 });
 
-test('escapeActionText neutralizes markdown-active and control characters', () => {
-  assert.equal(escapeActionText('plain text 123'), 'plain text 123');
-  assert.equal(escapeActionText('a & b'), 'a &amp; b');
-  assert.equal(escapeActionText('<img>'), '&lt;img&#62;');
+test('escapeActionText is the gate safeText allowlist: everything non-allowlisted becomes a numeric entity', () => {
+  assert.equal(escapeActionText('plain text 123 file.name_ok-1'), 'plain text 123 file.name_ok-1');
+  assert.equal(escapeActionText('a & b'), 'a &#38; b');
+  assert.equal(escapeActionText('<img>'), '&#60;img&#62;');
   assert.equal(escapeActionText('x | y'), 'x &#124; y');
   assert.equal(escapeActionText('# heading'), '&#35; heading');
-  assert.equal(escapeActionText('> quote **bold** _u_ `c` [l](u)'),
-    '&#62; quote &#42;&#42;bold&#42;&#42; &#95;u&#95; &#96;c&#96; &#91;l&#93;(u)');
+  assert.equal(escapeActionText('~~FAILED~~ ~~~js'), '&#126;&#126;FAILED&#126;&#126; &#126;&#126;&#126;js');
+  assert.equal(escapeActionText('https://evil.example/x'), 'https&#58;&#47;&#47;evil.example&#47;x');
+  assert.equal(
+    escapeActionText('> quote **bold** `c` [l](u)'),
+    '&#62; quote &#42;&#42;bold&#42;&#42; &#96;c&#96; &#91;l&#93;&#40;u&#41;',
+  );
   assert.equal(escapeActionText('line1\nline2\r\nline3'), 'line1 \u23CE line2 \u23CE line3');
   const hostile = `bad${String.fromCharCode(27)}[31mansi${String.fromCharCode(0)}nul`;
   const escaped = escapeActionText(hostile);
+  assert.match(escaped, /&#27;/);
+  assert.match(escaped, /&#0;/);
   for (let index = 0; index < escaped.length; index += 1) {
     const code = escaped.charCodeAt(index);
     assert.ok(code >= 32 && code !== 127, `control byte survived at ${index}`);
@@ -147,10 +165,6 @@ Create `actions/closeout/support.js`:
 // wiring; every decision lives here so it is hermetically testable. Zero
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
-
-const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
-const path = require('node:path');
-const { spawnSync } = require('node:child_process');
 
 const RUN_VALUES = new Set(['plan', 'full']);
 const MODE_VALUES = new Set(['strict', 'engine']);
@@ -203,7 +217,13 @@ const parseLastJsonLine = (stdout) => {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     try {
       const value = JSON.parse(lines[index]);
-      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+      // An own __proto__ key is inert on the parse itself but hijacks the
+      // prototype of any later Object.assign copy; the gate never emits
+      // one, so such a record can only be hostile or garbled — skip it.
+      if (
+        value && typeof value === 'object' && !Array.isArray(value)
+        && !Object.prototype.hasOwnProperty.call(value, '__proto__')
+      ) return value;
     } catch {
       // Not JSON; keep scanning upward.
     }
@@ -229,6 +249,13 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
       ? { success: true, exitCode: 0, reason: 'gate PASS' }
       : { success: false, exitCode: code, reason: `gate ${label} (exit ${code})` };
   }
+  // Fail CLOSED on anything that is not exactly the plan tier: an
+  // unvalidated run value must never fall into the more permissive branch
+  // and report success for a failing full gate. Unreachable through
+  // validateActionInputs — which is exactly why it is closed here too.
+  if (run !== 'plan') {
+    return { success: false, exitCode: 3, reason: `unknown run tier: ${run}` };
+  }
   if (parsed && typeof parsed.planStatus === 'string') {
     return { success: true, exitCode: 0, reason: `plan captured (planStatus=${parsed.planStatus})` };
   }
@@ -243,30 +270,27 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
 // interpolates evidence-derived text into summaries/comments. Mirrors the
 // gate renderer's safeText semantics (allowlist by escaping the actives);
 // the gate-rendered report.md is embedded verbatim and NOT re-escaped.
-const MARKDOWN_ESCAPES = new Map([
-  ['&', '&amp;'], ['<', '&lt;'], ['>', '&#62;'], ['|', '&#124;'], ['*', '&#42;'],
-  ['_', '&#95;'], ['`', '&#96;'], ['[', '&#91;'], [']', '&#93;'], ['#', '&#35;'],
-]);
-
 /**
- * Escapes one evidence-derived value for safe interpolation into markdown a
- * human will trust: entity-escapes markdown-active characters, renders
- * newlines as a visible return mark, and replaces every other control byte
- * with a space (charCode scan — no control-character regex literals).
+ * Escapes one evidence-derived value for markdown a human will trust: the
+ * EXACT transform of the gate renderer's safeText (pr_closeout_report.js:13)
+ * — newlines collapse to a visible return mark, then every character
+ * outside the safeText allowlist (letters, digits, space, dot, underscore,
+ * the return mark, dash) becomes a numeric HTML entity, control bytes
+ * included (an allowlist cannot miss a control byte). This replaced a
+ * partial denylist in review: strikethrough tildes, tilde code fences, and
+ * GFM autolinked URLs all rendered active through it while its comment
+ * claimed safeText parity. Accepted residuals, identical to the gate's own
+ * reports: the allowlisted underscore, dot, and dash keep their rare
+ * markdown meanings and a bare www.-prefixed word can still autolink —
+ * escaping dots would destroy every path and digest in the output. The
+ * gate-rendered report.md is embedded verbatim elsewhere and never
+ * re-escaped.
  * @param {unknown} value
  * @returns {string}
  */
-const escapeActionText = (value) => {
-  const text = value === undefined || value === null ? '' : String(value);
-  let out = '';
-  for (const char of text.replace(/\r\n/g, '\n')) {
-    if (char === '\n') { out += ' \u23CE '; continue; }
-    const code = char.charCodeAt(0);
-    if (code < 32 || code === 127) { out += ' '; continue; }
-    out += MARKDOWN_ESCAPES.get(char) ?? char;
-  }
-  return out;
-};
+const escapeActionText = (value) => String(value ?? '')
+  .replace(/\r\n?|\n/g, ' \u23CE ')
+  .replace(/[^A-Za-z0-9 ._\u23CE-]/gu, (character) => `&#${character.codePointAt(0)};`);
 
 module.exports = {
   decideExit,
@@ -277,7 +301,7 @@ module.exports = {
 };
 ```
 
-(`appendFileSync`, `mkdirSync`, `readFileSync`, `writeFileSync`, `path`, `spawnSync` are consumed by Tasks 3–4; keeping the requires now avoids churn — if `node --check` or a linting eye objects to unused bindings, keep them and note they are wired in the same sub-project.)
+(Task 1 needs NO node imports — all five functions are pure. Tasks 3–4 introduce their own `node:fs`/`node:path`/`node:child_process` requires when they wire I/O; a foundation file that a reviewer reads to understand the trust boundary must not import `spawnSync` it never calls — review decision, Task 1 round.)
 
 - [ ] **Step 4: Run to verify green**
 
@@ -325,7 +349,9 @@ test('renderPlanSummary renders all four attestation states distinctly and escap
   assert.match(markdown, /Mode.*engine/);
   assert.match(markdown, /planStatus.*FAIL/);
   assert.match(markdown, /digest-abc/);
-  assert.match(markdown, /origin\/main/);
+  // The base ref passes through the safeText-style escaper: '/' is not
+  // allowlisted, so it renders as its numeric entity.
+  assert.match(markdown, /origin&#47;main/);
   // Weakened must be visually distinct from absent, not just different text.
   assert.match(markdown, /\u26A0.*weakened/i);
   // Hostile evidence is neutralized: no forged heading or blockquote line.
@@ -763,6 +789,23 @@ test('commentSubcommand upserts in PR context and skips with a notice otherwise'
   assert.equal(skipped, 0, 'outside PR context the comment step skips, never fails');
 });
 
+test('a hostile base-ref stays one argv element — never a shell string', async () => {
+  // resolveBaseRef returns input verbatim; that is safe ONLY because the CLI
+  // is spawned with an argv array. Pin it (quality-review note, Task 1).
+  const dir = makeTempDir();
+  let spawnedArgs;
+  await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'main --mode engine', config: '', outputDir: path.join(dir, 'e'), artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: (args) => { spawnedArgs = args; return { status: 3, stdout: '{"status":"BLOCKED","error":"x"}\n', stderr: '' }; },
+  });
+  const at = spawnedArgs.indexOf('--base-ref');
+  assert.equal(spawnedArgs[at + 1], 'main --mode engine', 'the hostile value is exactly one argv element');
+  assert.equal(spawnedArgs.filter((a) => a === '--mode').length, 1, 'no injected second --mode flag');
+});
+
 test('a comment API failure propagates — the consumer opted in, silence would lie', async () => {
   const dir = makeTempDir();
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
@@ -787,7 +830,16 @@ Expected: new tests fail; earlier pass.
 
 - [ ] **Step 3: Implement**
 
-Append to `actions/closeout/support.js` (exports extended; `GATE_CLI` computed from `__dirname`):
+First add the node imports this task introduces (Task 1 deliberately shipped with
+none — review decision) at the top of `actions/closeout/support.js`:
+
+```js
+const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+```
+
+Then append (exports extended; `GATE_CLI` computed from `__dirname`):
 
 ```js
 const GATE_CLI = path.join(__dirname, '..', '..', 'scripts', 'pr_closeout.js');
@@ -1416,6 +1468,12 @@ from Task 5 as the examples — copy their final text verbatim into fenced block
    and the one-time digest migration note for consumers upgrading across it.
 8. **Preview cost note:** strict plan runs the full 8-probe preflight (~27s measured
    with a running Docker daemon); engine narrows via `requiredTools`.
+9. **Checkout requirements (consumer contract):** the gate needs full history —
+   `fetch-depth: 0` on the consumer's checkout step is REQUIRED (the default depth-1
+   checkout has no `origin/<branch>` refs and the gate errors); and an explicit
+   `base-ref` input is passed to the CLI verbatim (no `origin/` prefixing — the
+   operator's value is authoritative), while the automatic ladder branches prefix
+   `origin/` because env/event carry bare branch names. State both explicitly.
 
 Safety constraints for the doc itself: no credential-shaped strings (the validator's
 `sk-`/`ghp_` patterns — write example tokens as `<your-token>`), no personal paths, no
