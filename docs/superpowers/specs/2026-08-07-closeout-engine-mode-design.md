@@ -139,7 +139,9 @@ Consequences, all deliberate:
   digest-match, so admission rejects them through the existing digest-mismatch
   evidence), with the running mode visible in the plan admission block and report
   fields (execution decision).
-- Any edit to the engine matrix invalidates outstanding attestations.
+- Any edit to the engine matrix invalidates outstanding attestations — including
+  reordering it: confirmation executes the matrix strictly serially, so order is
+  load-bearing and digested positionally, like any other matrix edit.
 - Reviewers attesting an engine-mode PR are attesting a specific matrix, visible in the
   digest.
 - **Migration consequence, deliberate:** because the digest input changes, any attestation

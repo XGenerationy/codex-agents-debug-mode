@@ -884,7 +884,9 @@ const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, in
  * Merge per-check inline engine timeouts into the id-keyed timeoutsMs map
  * the command executor consumes. The engine matrix is authoritative for its
  * own checks, so an inline timeoutMs wins over a config.timeoutsMs entry for
- * the same id; ids without an inline value keep whatever config supplied.
+ * the same id; ids without a truthy inline value keep whatever config
+ * supplied (validateEngineChecks bounds real inline values to 1..2^31-1
+ * upstream, so 0/negative can only reach this helper via direct calls).
  * @param {Record<string, number>|undefined} configTimeouts
  * @param {Array<{id: string, timeoutMs?: number}>} checks
  * @returns {Record<string, number>}
