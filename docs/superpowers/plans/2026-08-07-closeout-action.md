@@ -459,7 +459,7 @@ const capText = (text, maxBytes, artifactName) => {
   const value = String(text ?? '');
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) return { text: value, truncated: false };
   // The notice fits INSIDE the budget: content is clipped to what remains
-  // after it, so the returned text never exceeds maxBytes total \u2014 Task 3
+  // after it, so the returned text never exceeds maxBytes total — Task 3
   // feeds this straight into GitHub's hard 65536-character comment limit
   // and an over-budget comment is rejected outright at exactly the moment
   // the operator most needs it (review decision, Task 2 round). The
