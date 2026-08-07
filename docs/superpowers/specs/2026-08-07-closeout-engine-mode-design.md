@@ -126,8 +126,13 @@ Enforced in code and pinned by tests — the engine IS these invariants:
 
 The attestation line format stays `PR-CLOSEOUT-ATTESTATION v1 base=<sha> head=<sha>
 config=<digest> decision=not-weakened`. The digest input now incorporates the **mode and
-the resolved engine matrix** (canonical JSON of the validated `engineChecks` for engine
-mode; a fixed sentinel for strict). Consequences, all deliberate:
+the resolved engine matrix**: the digested object gains a top-level `mode` field
+(`'strict'` | `'engine'`) as its own discriminator — mode-crossed digests differ by
+construction, with no sentinel/matrix collision risk — and the matrix content flows
+through the existing `config` (which carries `engineChecks` verbatim) and
+`resolved.checks` (the validated, resolved matrix) fields, so a matrix edit changes the
+digest through both channels (implementation decision, recorded at Task 4 review).
+Consequences, all deliberate:
 
 - An attestation minted for a strict run can never admit an engine run, and vice versa —
   the mechanism is the digest itself (mode-crossed attestations can no longer
