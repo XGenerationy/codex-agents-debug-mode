@@ -114,7 +114,7 @@ test('decideExit implements the spec exit decision table exactly', () => {
 test('escapeActionText neutralizes markdown-active and control characters', () => {
   assert.equal(escapeActionText('plain text 123'), 'plain text 123');
   assert.equal(escapeActionText('a & b'), 'a &amp; b');
-  assert.equal(escapeActionText('<img>'), '&lt;img&gt;');
+  assert.equal(escapeActionText('<img>'), '&lt;img&#62;');
   assert.equal(escapeActionText('x | y'), 'x &#124; y');
   assert.equal(escapeActionText('# heading'), '&#35; heading');
   assert.equal(escapeActionText('> quote **bold** _u_ `c` [l](u)'),
