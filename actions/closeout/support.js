@@ -268,13 +268,74 @@ const renderFullSummary = (report, reportMarkdown, { artifactName }) => {
   ].join('\n');
 };
 
+// First line of every action-authored PR comment; the upsert finds and
+// replaces the comment whose body starts with this exact marker. Stable
+// across releases — changing it would orphan old comments.
+const ACTION_MARKER = '<!-- closeout-action-preview -->';
+
+/**
+ * PR context from env + event payload: both GITHUB_REPOSITORY (owner/repo)
+ * and a pull_request.number must be present, else null — the comment step
+ * skips with a notice outside PR context, never guesses.
+ * @param {{env: object, event: object}} options
+ * @returns {{owner: string, repo: string, prNumber: number}|null}
+ */
+const readPrContext = ({ env = {}, event = {} } = {}) => {
+  const repository = env.GITHUB_REPOSITORY || '';
+  const [owner, repo, ...rest] = repository.split('/');
+  const prNumber = event?.pull_request?.number;
+  if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber)) return null;
+  return { owner, repo, prNumber };
+};
+
+/**
+ * Comment body = marker line + the tier's rendered summary, capped at the
+ * spec's 60 KiB comment limit with the in-band truncation notice. Full runs
+ * pass the key-fields rendering, never the embedded report.md.
+ * @param {{tier: string, rendered: string, artifactName: string}} options
+ * @returns {string}
+ */
+const buildCommentBody = ({ rendered, artifactName }) => {
+  const capped = capText(rendered, COMMENT_CAP_BYTES, artifactName);
+  return `${ACTION_MARKER}\n${capped.text}`;
+};
+
+/**
+ * Upserts the marker-tagged PR comment via the injectable gh seam: list the
+ * first page of issue comments, PATCH the one whose body starts with the
+ * marker, else POST a new one. First-page-only matching is a documented
+ * bound — the action's own comment stays near the top of any real PR's
+ * comment count, and a miss degrades to one duplicate comment, never a lost
+ * result.
+ * @param {{context: {owner, repo, prNumber}, body: string, runGh: Function}} options
+ * @returns {Promise<void>}
+ */
+const upsertPrComment = async ({ context, body, runGh }) => {
+  const { owner, repo, prNumber } = context;
+  const listed = await runGh(['api', `repos/${owner}/${repo}/issues/${prNumber}/comments`, '--jq', '.']);
+  const comments = Array.isArray(listed) ? listed : [];
+  const mine = comments.find((comment) => typeof comment?.body === 'string' && comment.body.startsWith(ACTION_MARKER));
+  if (mine) {
+    await runGh(['api', '--method', 'PATCH', `repos/${owner}/${repo}/issues/comments/${mine.id}`, '-f', `body=${body}`]);
+    return;
+  }
+  await runGh(['api', '--method', 'POST', `repos/${owner}/${repo}/issues/${prNumber}/comments`, '-f', `body=${body}`]);
+};
+
+// NOTE: the real runGh (Task 4) owns JSON parsing; these functions only ever
+// see parsed values.
+
 module.exports = {
+  ACTION_MARKER,
+  buildCommentBody,
   capText,
   decideExit,
   escapeActionText,
   parseLastJsonLine,
+  readPrContext,
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  upsertPrComment,
   validateActionInputs,
 };

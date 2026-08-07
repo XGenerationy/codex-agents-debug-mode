@@ -4,13 +4,17 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  ACTION_MARKER,
+  buildCommentBody,
   capText,
   decideExit,
   escapeActionText,
   parseLastJsonLine,
+  readPrContext,
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  upsertPrComment,
   validateActionInputs,
 } = require('./support');
 
@@ -204,4 +208,51 @@ test('row caps are announced, never silent', () => {
   assert.match(markdown, /and 10 more \(full list in the plan JSON in the artifact\)/);
   assert.match(markdown, /and 11 more non-PASS preflight probes/);
   assert.equal((markdown.match(/^- error /gm) || []).length, 50);
+});
+
+test('readPrContext extracts repo and PR number from env plus event payload, else null', () => {
+  const context = readPrContext({
+    env: { GITHUB_REPOSITORY: 'owner/repo' },
+    event: { pull_request: { number: 42 } },
+  });
+  assert.deepEqual(context, { owner: 'owner', repo: 'repo', prNumber: 42 });
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'owner/repo' }, event: {} }), null);
+  assert.equal(readPrContext({ env: {}, event: { pull_request: { number: 42 } } }), null);
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'malformed' }, event: { pull_request: { number: 42 } } }), null);
+});
+
+test('buildCommentBody starts with the stable marker and caps at the comment limit', () => {
+  const body = buildCommentBody({ tier: 'plan', rendered: renderPlanSummary(hostilePlan(), {}), artifactName: 'ev' });
+  assert.ok(body.startsWith(ACTION_MARKER), 'marker must be the first line for upsert matching');
+  assert.match(body, /Closeout plan preview/);
+  const big = buildCommentBody({ tier: 'full', rendered: 'z'.repeat(80 * 1024), artifactName: 'ev' });
+  assert.ok(Buffer.byteLength(big, 'utf8') <= 60 * 1024 + 4096);
+  assert.match(big, /truncated/i);
+});
+
+test('upsertPrComment PATCHes an existing marker comment and POSTs otherwise', async () => {
+  const calls = [];
+  const existing = [{ id: 7, body: `${ACTION_MARKER}\nold` }, { id: 8, body: 'unrelated' }];
+  const patchingGh = async (args) => {
+    calls.push(args);
+    if (args.includes('--method') === false) return existing; // list call
+    return { id: 7 };
+  };
+  await upsertPrComment({
+    context: { owner: 'o', repo: 'r', prNumber: 5 },
+    body: `${ACTION_MARKER}\nnew`,
+    runGh: patchingGh,
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].join(' ').includes('issues/5/comments'), 'first call lists comments');
+  assert.ok(calls[1].join(' ').includes('issues/comments/7'), 'second call PATCHes the marker comment');
+  assert.ok(calls[1].includes('PATCH'));
+
+  const posts = [];
+  await upsertPrComment({
+    context: { owner: 'o', repo: 'r', prNumber: 5 },
+    body: `${ACTION_MARKER}\nnew`,
+    runGh: async (args) => { posts.push(args); return args.includes('POST') ? { id: 9 } : []; },
+  });
+  assert.ok(posts[1].includes('POST'), 'no marker comment found: POST a new one');
 });
