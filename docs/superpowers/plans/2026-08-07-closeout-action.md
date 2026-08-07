@@ -1612,7 +1612,13 @@ Expected: FAIL — module missing.
 // validator. Deliberately regex-level — no YAML parser exists in a
 // zero-dependency repo — and honest about it: these catch the failure modes
 // that matter (a mutable action ref, a workflow with no permissions
-// declaration) without claiming to understand YAML structure.
+// declaration) without claiming to understand YAML structure. Known escape:
+// a `uses:` written in YAML flow style (`- {uses: x@v1}`) is not matched
+// and therefore not checked — flow style is never written by hand in
+// workflows, and dodging the check requires deliberately reformatting your
+// own file to evade your own validator. Block scalars, aliases, and every
+// other near-miss form measured in review get captured as a garbage ref
+// and flagged, which is the fail-closed direction.
 
 const USES_LINE = /^\s*(?:-\s+)?uses:\s*(['"]?)([^\s#]+)\1\s*(?:#.*)?$/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
@@ -1662,7 +1668,10 @@ const { findUnpinnedUses, hasTopLevelPermissions } = require('./workflow_checks'
 const workflowFiles = safetyScanFiles.filter(
   (name) => name.startsWith('.github/workflows/') && (name.endsWith('.yml') || name.endsWith('.yaml')),
 );
-const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/[^/]+\/action\.ya?ml$/.test(name));
+// `.+` (not `[^/]+`): a nested action (actions/group/name/action.yml) is an
+// ordinary layout for a repo that grows a second action, and the day it
+// appears is exactly the day nobody re-reads this census (review, Task 6).
+const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/.+\/action\.ya?ml$/.test(name));
 for (const file of [...workflowFiles, ...actionMetadataFiles]) {
   let content;
   try {

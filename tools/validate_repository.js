@@ -246,7 +246,10 @@ for (const file of javascriptFiles) {
 const workflowFiles = safetyScanFiles.filter(
   (name) => name.startsWith('.github/workflows/') && (name.endsWith('.yml') || name.endsWith('.yaml')),
 );
-const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/[^/]+\/action\.ya?ml$/.test(name));
+// `.+` (not `[^/]+`): a nested action (actions/group/name/action.yml) is an
+// ordinary layout for a repo that grows a second action, and the day it
+// appears is exactly the day nobody re-reads this census (review, Task 6).
+const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/.+\/action\.ya?ml$/.test(name));
 for (const file of [...workflowFiles, ...actionMetadataFiles]) {
   let content;
   try {
