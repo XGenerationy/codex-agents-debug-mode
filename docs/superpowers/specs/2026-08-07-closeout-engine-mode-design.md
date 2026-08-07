@@ -200,9 +200,9 @@ Attestation state is a four-value vocabulary, not a boolean (review decision, Ta
 | Unknown `--mode` value | error before any work, exit 3 class |
 | `engineChecks` in config during a strict run | hard error naming the key — weakening attempt, never ignored |
 | Engine mode without `engineChecks` | hard error |
-| Engine matrix schema violation (dup/non-string id, both/neither command source, unknown field, empty array) | named error per violation; plan BLOCKED; nothing executes |
+| Engine matrix schema violation (dup/non-string id, both/neither command source, unknown field, empty array) | named error per violation; planStatus FAIL; admission FAIL; nothing executes |
 | Attestation mode mismatch (strict-minted attestation at engine admission or vice versa) | named admission error; run BLOCKED |
-| `requiredTools` not an array, non-string entry, or name outside the probe catalog | named config error; plan BLOCKED |
+| `requiredTools` not an array, non-string entry, or name outside the probe catalog | named config error; planStatus FAIL (same containment as engine matrix errors); nothing executes |
 | `requiredTools` in a strict-mode config | hard error naming the key — same class as `engineChecks`/`scriptRunner` |
 | Fixed-check override in strict mode | unchanged hard error (existing behavior, re-pinned) |
 
