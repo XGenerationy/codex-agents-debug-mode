@@ -91,24 +91,31 @@ One module owns everything both tools must agree on:
   already NDJSON); both exist so intent reads clearly in scripts.
 - **TUI (layout C):** full-width stream (auto-tail, verdict lines highlighted `◆`), then a
   full-width hypothesis table (id, status, title/note, last-update time), then a key bar.
-  Keys: `f` edit filter, `s` session picker overlay, `tab` focus stream/table (scroll
-  focused region), `space` pause/resume tail, `q` quit. ANSI alternate screen + raw-mode
-  stdin, resize-aware. No curses dependency.
+  Keys: `f` edit filter, `tab` focus stream/table (scroll focused region), `space`
+  pause/resume tail, `q` quit. ANSI alternate screen + raw-mode stdin, resize-aware. No
+  curses dependency. (A session-picker overlay is a documented future addition; it returns
+  to the key bar once `renderFrame` implements its rendering. It is intentionally absent
+  from the initial implementation so no advertised key is a dead control.)
 - **Testability by design:** the TUI's state transitions are pure reducers
   (`(state, key) → state`) covered by unit tests; only the thin ANSI painter is exempt from
   CI (documented). Agent mode is covered end-to-end by spawning the real CLI.
-- **Crash safety (review decisions):** any `await` inside an un-awaited `setInterval`/event
-  callback is a process-killer `main().catch` cannot reach — the poll's file-fallback read
-  is therefore guarded (on failure, keep last-known entries: stale evidence beats a
-  corrupted terminal), and a `process.on('exit')` hook unconditionally leaves the alternate
-  screen and restores cooked mode so no failure mode strands the terminal. Ctrl+C quits
-  from every mode (raw stdin swallows ISIG). Frame clipping is code-point-safe (never emits
-  a lone surrogate); display-width handling (CJK/emoji double-width) is explicitly out of
-  scope for a zero-dependency tool.
+- **Crash safety and single-flight polling (review decisions):** the live tail is driven by
+  a self-rescheduling `setTimeout` that schedules the next poll only after the prior poll
+  settles, so a slow collector can never overlap polls (createSessionTail additionally
+  deduplicates concurrent `poll()` callers via an in-flight promise). The poll's
+  file-fallback read is guarded (on failure, keep last-known entries: stale evidence beats
+  a corrupted terminal), and a `process.on('exit')` hook unconditionally leaves the
+  alternate screen and restores cooked mode so no failure mode strands the terminal.
+  Ctrl+C quits from every mode (raw stdin swallows ISIG). Frame clipping is code-point-safe
+  (never emits a lone surrogate); display-width handling (CJK/emoji double-width) is
+  explicitly out of scope for a zero-dependency tool. A live-read failure that is not
+  `collector_not_running` is surfaced on stderr before the file fallback rather than
+  silently downgrading, so auth/session/port/token errors are visible.
 - **CLI:** `node debug_viewer.js [projectRoot] --session <id|path> [--hypothesis <id>]
   [--type all|event|hypothesis] [--since <ISO>] [--until <ISO>] [--run <id>] [--limit <n>]
-  [--live|--file] [--json|--plain]`. Without `--session` in TUI mode, open the picker;
-  in agent mode, exit with a usage error (agents must be explicit).
+  [--live|--file] [--json|--plain]`. `--live` and `--file` are mutually exclusive. Without
+  `--session` in TUI mode, the most recent session under `.debug` is selected; in agent
+  mode, exit with a usage error (agents must be explicit).
 
 ## `scripts/debug_diff.js`
 

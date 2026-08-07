@@ -78,6 +78,12 @@ const parseViewerArgs = (argv) => {
   if (parsed.filters.type !== undefined && !['all', 'event', 'hypothesis'].includes(parsed.filters.type)) {
     throw new Error('viewer_usage:--type must be all|event|hypothesis');
   }
+  // Mutually exclusive sources: agent mode prefers --live and the TUI
+  // prefers --file, so accepting both would make the data source depend on
+  // whether stdout is a TTY. Reject the combination rather than guessing.
+  if (parsed.forceLive && parsed.forceFile) {
+    throw new Error('viewer_usage:--live and --file are mutually exclusive');
+  }
   return parsed;
 };
 
@@ -116,13 +122,14 @@ const createInitialState = ({ sessionId }) => ({
   activeFilter: undefined,
   streamScroll: 0,
   tableScroll: 0,
-  pickerOpen: false,
 });
 
 // (state, key) -> state, no side effects. Keys mirror the spec: tab focus,
-// space pause, f filter entry (text until return/escape), s session picker,
-// q quit. Unknown keys are no-ops — an unmapped keystroke must never
-// mutate state.
+// space pause, f filter entry (text until return/escape), q quit. Unknown
+// keys are no-ops — an unmapped keystroke must never mutate state. (The
+// session picker documented in the spec is intentionally absent here:
+// renderFrame has no rendering for it yet, so a toggling `s` key would be
+// a dead control. It returns when the picker overlay is implemented.)
 const reduce = (state, key) => {
   // Nullish or shapeless key input is a no-op — never throw on a malformed
   // event, and never mutate state for something that isn't a real key.
@@ -153,7 +160,6 @@ const reduce = (state, key) => {
   if (key.name === 'tab') return { ...state, focus: state.focus === 'stream' ? 'table' : 'stream' };
   if (key.name === 'space') return { ...state, paused: !state.paused };
   if (key.name === 'f') return { ...state, mode: 'filter-input', filterDraft: '' };
-  if (key.name === 's') return { ...state, pickerOpen: !state.pickerOpen };
   if (key.name === 'up' || key.name === 'down') {
     const delta = key.name === 'up' ? -1 : 1;
     if (state.focus === 'stream') return { ...state, streamScroll: Math.max(0, state.streamScroll + delta) };
@@ -201,7 +207,14 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   const tableHeight = Math.min(Math.max(tableRows.length, 1), Math.max(3, Math.floor(rows / 3)));
   const streamHeight = rows - tableHeight - 3;
   const streamRows = entries.map((entry) => formatEntryRow(entry.parsed));
-  const visibleStream = streamRows.slice(-(streamHeight + state.streamScroll), streamRows.length - state.streamScroll || undefined);
+  // Clamp the scroll to what actually exists. The previous `length - scroll
+  // || undefined` collapsed to the newest rows whenever the difference hit 0
+  // (i.e. scroll equalled the row count), so scrolling fully back returned
+  // the newest window instead of the oldest. Compute the window explicitly.
+  const maxScroll = Math.max(0, streamRows.length - Math.max(0, streamHeight));
+  const scroll = Math.min(Math.max(0, state.streamScroll), maxScroll);
+  const end = streamRows.length - scroll;
+  const visibleStream = streamRows.slice(Math.max(0, end - Math.max(0, streamHeight)), end);
   const status = state.paused ? 'paused' : (live ? '● live' : 'file');
   const filterBadge = state.activeFilter ? `  [${state.activeFilter}]` : '';
   const lines = [];
@@ -209,7 +222,7 @@ const renderFrame = (state, entries, { columns, rows, live }) => {
   for (let i = 0; i < streamHeight; i += 1) lines.push(clip(visibleStream[i] ?? ''));
   lines.push(clip(`─ hypotheses ${'─'.repeat(Math.max(0, columns))}`));
   for (let i = 0; i < tableHeight; i += 1) lines.push(clip(tableRows[i + state.tableScroll] ?? ''));
-  lines.push(clip('f:filter  s:sessions  tab:focus  space:pause  q:quit'));
+  lines.push(clip('f:filter  tab:focus  space:pause  q:quit'));
   return lines.slice(0, rows).join('\n');
 };
 
@@ -244,21 +257,32 @@ const main = async () => {
   let entries = [];
   let live = false;
   let tail = null;
+  let liveUnavailableReason;
   if (!parsed.forceFile) {
     try {
       const collector = await discoverCollector(parsed.projectRoot);
       tail = createSessionTail({ ...collector, sessionId });
       entries = await tail.poll();
       live = true;
-    } catch {
+    } catch (error) {
+      // `collector_not_running` is the normal offline case and silently
+      // falls through to the file. Every other code (live_read_unauthorized,
+      // live_read_unknown_session, invalid_session_ref, collector_port_invalid,
+      // collector_token_invalid, live_read_connect_failed, ...) is a real
+      // misconfiguration the operator must see, not a silent downgrade to
+      // stale file content with no explanation.
+      liveUnavailableReason = error.message;
       tail = null;
     }
   }
   if (!live) {
     if (parsed.forceLive) {
-      process.stderr.write('collector not reachable; --live unavailable\n');
+      process.stderr.write(`--live unavailable: ${liveUnavailableReason ?? 'unknown'}\n`);
       process.exitCode = 1;
       return;
+    }
+    if (liveUnavailableReason !== undefined && liveUnavailableReason !== 'collector_not_running') {
+      process.stderr.write(`live read failed (${liveUnavailableReason}); falling back to the session file\n`);
     }
     entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
   }
@@ -280,8 +304,24 @@ const main = async () => {
   });
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
-  const pollTimer = setInterval(async () => {
-    if (state.paused || tail === null) return;
+  // Self-rescheduling poll loop: the next poll is scheduled ONLY after the
+  // previous one settles. setInterval(async ...) can start a new poll before
+  // the prior async tick completes; createSessionTail has a single-flight
+  // guard, but overlapping ticks would still pile up in-flight work and
+  // repeated full-log downloads. setTimeout-after-settlement keeps exactly
+  // one poll in flight at a time.
+  let pollTimer = null;
+  let shuttingDown = false;
+  const schedulePoll = () => {
+    if (shuttingDown) return;
+    pollTimer = setTimeout(poll, 500);
+  };
+  const poll = async () => {
+    pollTimer = null;
+    if (state.paused || tail === null) {
+      schedulePoll();
+      return;
+    }
     try {
       const fresh = await tail.poll();
       if (fresh.length > 0) {
@@ -296,16 +336,17 @@ const main = async () => {
         entries = await readSessionFile(resolveSessionRef(parsed.projectRoot, sessionId));
       } catch {
         // Fallback read failed too (collector stopped AND log removed).
-        // setInterval never awaits this callback, so an unhandled
-        // rejection here would kill the process with the alt-screen
-        // still active and raw mode still on — stale evidence beats a
-        // corrupted terminal, so keep the last-known entries instead.
+        // Stale evidence beats a corrupted terminal: keep the last-known
+        // entries instead of surfacing an error on the alternate screen.
       }
       paint();
     }
-  }, 500);
+    schedulePoll();
+  };
+  schedulePoll();
   const shutdown = () => {
-    clearInterval(pollTimer);
+    shuttingDown = true;
+    if (pollTimer) clearTimeout(pollTimer);
     process.stdout.off('resize', paint);
     process.stdout.write('\u001b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);

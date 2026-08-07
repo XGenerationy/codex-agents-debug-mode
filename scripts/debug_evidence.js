@@ -26,6 +26,14 @@ const parseSessionText = (text) => {
     } catch {
       throw new Error(`malformed_session_line:${lineNumber}`);
     }
+    // The collector writes one JSON object per line. Anything else (null, a
+    // bare number, an array) is tampering or truncation, and would reach
+    // every consumer (filterEntries, foldHypotheses, messagesByHypothesis)
+    // as a non-object they dereference unguarded — a raw TypeError instead
+    // of the structured malformed_session_line:<n> this function promises.
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`malformed_session_line:${lineNumber}`);
+    }
     entries.push({ raw, parsed });
   }
   return entries;
@@ -50,7 +58,14 @@ const readSessionFile = async (filePath) => {
 // interpolated parsed/folded field in a human renderer MUST route through
 // this. Agent outputs (byte-verbatim NDJSON, schema:1 JSON) MUST NEVER use
 // it — they carry source values unmodified by contract.
-const escapeEvidenceText = (value) => JSON.stringify(String(value)).slice(1, -1);
+const escapeEvidenceText = (value) => JSON.stringify(String(value))
+  .slice(1, -1)
+  // JSON.stringify escapes C0 controls, quotes, and backslashes but leaves
+  // U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) untouched.
+  // Several Markdown/text renderers treat both as line breaks, so the human
+  // surfaces would still let stored log content forge a new visual line.
+  .replaceAll('\u2028', '\\u2028')
+  .replaceAll('\u2029', '\\u2029');
 
 const FILTER_KEYS = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
 const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
@@ -152,7 +167,12 @@ const foldHypotheses = (entries) => {
   return folded;
 };
 
-const SESSION_FILE_PATTERN = /^debug-(.+)\.log$/;
+// The captured id must satisfy SESSION_ID_PATTERN below: a greedy `(.+)`
+// would turn `debug-a.log.log` into the id `a.log`, which resolveSessionRef
+// then mistakes for a .log file path and returns unchanged — emitting an id
+// that resolves to the wrong location and fails the bare-id guard on the
+// live path.
+const SESSION_FILE_PATTERN = /^debug-([A-Za-z0-9_-]+)\.log$/;
 // Mirrors the route's path segment pattern (GET /sessions/:id/logs matches
 // `/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/`) — the same documented security
 // control applies here: a bare id is interpolated into a filesystem path
@@ -224,6 +244,13 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
   let hypothesisIdFilter;
   let runIdFilter;
   try {
+    // Parity with filterEntries: an unknown key (e.g. `surprise`) must fail
+    // closed here too. Without this, the route would silently ignore it and
+    // return unfiltered results while the local path throws — a parity break
+    // the parity test cannot generate, since it only ever feeds valid keys.
+    for (const key of Object.keys(filters)) {
+      if (!FILTER_KEYS.has(key)) throw new Error(`invalid_filter:${key}`);
+    }
     hypothesisIdFilter = normalizeJoinKeyFilter(filters, 'hypothesisId');
     runIdFilter = normalizeJoinKeyFilter(filters, 'runId');
   } catch (error) {
@@ -267,7 +294,14 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
       else reject(new Error(`live_read_failed:${response.statusCode}`));
     });
   });
-  request.on('error', reject);
+  request.on('error', (error) => {
+    // destroy(new Error('live_read_timeout')) routes here too — keep that
+    // code, and give every other socket failure (ECONNREFUSED, ECONNRESET,
+    // ...) the same structured shape callers match on via /^live_read_/,
+    // preserving the original error as the cause.
+    if (error?.message?.startsWith('live_read_')) reject(error);
+    else reject(new Error(`live_read_connect_failed:${error?.code ?? 'unknown'}`, { cause: error }));
+  });
   // A collector that accepts the connection and never responds (or dies
   // mid-body) would otherwise hang this promise forever — the worst case
   // for createSessionTail below, a silent freeze with no error surfaced.
@@ -289,12 +323,27 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
 // polling aggressively.
 const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
   let seen = 0;
+  // Single-flight guard: the viewer polls on a timer, and a slow collector
+  // can let a second poll start before the first settles. poll() reads the
+  // full log and writes `seen` across an await — without this guard,
+  // overlapping polls can update `seen` out of order and re-emit entries.
+  // Holding the in-flight promise and returning it to concurrent callers
+  // guarantees `seen` advances exactly once per completed read.
+  let inFlight = null;
   return {
-    async poll() {
-      const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
-      const fresh = entries.slice(seen);
-      seen = entries.length;
-      return fresh;
+    poll() {
+      if (inFlight) return inFlight;
+      inFlight = (async () => {
+        try {
+          const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
+          const fresh = entries.slice(seen);
+          seen = entries.length;
+          return fresh;
+        } finally {
+          inFlight = null;
+        }
+      })();
+      return inFlight;
     },
   };
 };

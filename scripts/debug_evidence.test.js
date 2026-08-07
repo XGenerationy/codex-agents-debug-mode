@@ -38,6 +38,16 @@ test('parseSessionText fails closed on a malformed line, naming the line number'
   );
 });
 
+test('parseSessionText fails closed on a JSON-valid line that is not an object', () => {
+  // JSON.parse accepts null, numbers, and arrays; each would otherwise reach
+  // filterEntries/foldHypotheses as a non-object they dereference unguarded,
+  // throwing a raw TypeError instead of the structured malformed_session_line
+  // contract.
+  assert.throws(() => parseSessionText('{"ok":1}\nnull\n'), /malformed_session_line:2/);
+  assert.throws(() => parseSessionText('42\n'), /malformed_session_line:1/);
+  assert.throws(() => parseSessionText('[1,2]\n'), /malformed_session_line:1/);
+});
+
 test('readSessionFile ignores an incomplete trailing line (torn tail)', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'evidence-'));
   try {
@@ -146,6 +156,11 @@ test('escapeEvidenceText escapes quotes and backslashes', () => {
 test('escapeEvidenceText leaves plain ASCII and emoji unchanged', () => {
   assert.equal(escapeEvidenceText('hello world 123'), 'hello world 123');
   assert.equal(escapeEvidenceText('emoji: \u{1F600}'), 'emoji: \u{1F600}');
+});
+
+test('escapeEvidenceText escapes U+2028 and U+2029, which JSON.stringify leaves bare but renderers treat as line breaks', () => {
+  assert.equal(escapeEvidenceText('a\u2028b'), 'a\\u2028b');
+  assert.equal(escapeEvidenceText('a\u2029b'), 'a\\u2029b');
 });
 
 test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {
@@ -258,6 +273,13 @@ test('readSessionLive matches filterEntries over the same data (GET parity)', as
       // core must too. Clean fixtures alone cannot detect trim divergence.
       { hypothesisId: '  H1  ' },
       { runId: '  r2  ' },
+      // Time bounds are the filters most likely to diverge on inclusivity
+      // or NaN handling; the local path and the route parse them
+      // independently. Cover matching boundaries and non-matching ranges.
+      { sinceTs: '2026-08-06T10:00:01.000Z' },
+      { untilTs: '2026-08-06T10:00:04.000Z' },
+      { sinceTs: '2026-08-06T10:00:01.000Z', untilTs: '2026-08-06T10:00:04.000Z' },
+      { sinceTs: '2030-01-01T00:00:00.000Z' },
     ]) {
       const live = await readSessionLive({ port, token: LAUNCH, sessionId: session.session_id, filters });
       const local = filterEntries(fileEntries, filters);

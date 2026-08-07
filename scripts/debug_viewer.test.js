@@ -189,7 +189,7 @@ test('renderFrame paints layout C: stream, verdict table, key bar', () => {
   assert.match(frame, /clicked/);
   assert.match(frame, /◆ H1 → CONFIRMED/);
   assert.match(frame, /H1\s+CONFIRMED\s+null id/);
-  assert.match(frame, /f:filter\s+s:sessions\s+tab:focus\s+space:pause\s+q:quit/);
+  assert.match(frame, /f:filter\s+tab:focus\s+space:pause\s+q:quit/);
 });
 
 test('renderFrame marks paused state and truncates to the terminal width', () => {
@@ -213,6 +213,32 @@ test('renderFrame clips at a code-point boundary, never splitting a surrogate pa
   const rows = frame.split('\n');
   assert.equal(rows.length, 12);
   for (const row of rows) assert.equal(row.isWellFormed(), true);
+});
+
+test('renderFrame scrolls the stream window and never wraps back to the newest rows', () => {
+  // streamScroll selects the visible window; the previous slice logic
+  // collapsed to the newest rows when the scroll reached the row count
+  // (length - scroll === 0 fell back to undefined). Scrolling fully back
+  // must show the OLDEST window, with the newest row out of view.
+  // rows=7 → tableHeight=1 → streamHeight=3, so with 5 entries scrolling
+  // actually moves the window (maxScroll = 5 - 3 = 2).
+  const entries = Array.from({ length: 5 }, (_, i) => ({
+    raw: '',
+    parsed: { ts: '2026-08-06T10:00:01.000Z', msg: `m${i}` },
+  }));
+  const base = createInitialState({ sessionId: 's1' });
+  const opts = { columns: 80, rows: 7, live: false };
+  // At scroll 0 the newest rows are in view: m2, m3, m4 (window of 3).
+  const newest = renderFrame(base, entries, opts);
+  assert.match(newest, /m4/);
+  // Scrolled fully back (clamped to maxScroll=2): the OLDEST window m0,m1,m2
+  // is shown — m4 must be gone, which is exactly the regression the old
+  // `|| undefined` produced wrong.
+  const scrolled = renderFrame({ ...base, streamScroll: 5 }, entries, opts);
+  assert.doesNotMatch(scrolled, /m4/);
+  assert.match(scrolled, /m0/);
+  // Scrolling past the max is clamped, never throws.
+  assert.doesNotThrow(() => renderFrame({ ...base, streamScroll: 99 }, entries, opts));
 });
 
 test('renderFrame escapes embedded newlines so log content cannot forge a header line or break the row-count invariant', () => {

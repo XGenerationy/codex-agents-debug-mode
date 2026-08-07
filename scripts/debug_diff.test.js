@@ -175,6 +175,38 @@ test('computeDiff ignores non-string/missing hypothesis ids without crashing, co
   assert.equal(json.summary.ignoredMalformedIds, 2);
 });
 
+test('renderers survive a non-string status and never let it forge table structure', () => {
+  // foldHypotheses copies parsed.status verbatim, so a numeric status (42)
+  // reaches statusOr().padEnd() — without the escape+truncate fix it would
+  // throw TypeError — and a status containing a newline/box-drawing pipe
+  // could otherwise forge a row. statusOr now escapes and coerces it.
+  const before = parseSessionText(
+    line({ ts: '2026-08-06T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 42 }),
+  );
+  const after = parseSessionText(
+    line({ ts: '2026-08-06T11:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'A\n│ FORGED │ FORGED │ 9' }),
+  );
+  const diff = computeDiff(before, after);
+  assert.doesNotThrow(() => renderTable(diff));
+  assert.doesNotThrow(() => renderMarkdown(diff));
+  // Every bordered row must stay the same width — a forged pipe cannot
+  // create extra columns — and the row count must match a single hypothesis
+  // (top, header, divider, one data row, bottom).
+  const borderedLines = renderTable(diff).split('\n').filter((l) => /^[│┌├└]/.test(l));
+  assert.equal(new Set(borderedLines.map((l) => l.length)).size, 1);
+  assert.equal(borderedLines.length, 5);
+  const markdown = renderMarkdown(diff);
+  // The only hypothesis is H1, so the ONLY `**...**` verdict line must be
+  // the real H1 one. The embedded newline in the after-status is neutralized
+  // (it becomes literal "\n"), so it cannot spawn a separate forged verdict
+  // line — the literal word "FORGED" stays on the H1 line as escaped text.
+  const boldLines = markdown.split('\n').filter((l) => l.startsWith('**'));
+  assert.equal(boldLines.length, 1);
+  assert.equal(/^\*\*H1\b/.test(boldLines[0]), true);
+  // No line in the markdown is a standalone forged heading.
+  assert.equal(markdown.split('\n').filter((l) => l.trim() === '│ FORGED │').length, 0);
+});
+
 test('CLI: unknown flag fails closed with exit 2 and nothing on stdout', async () => {
   await withSessionDir(async (root) => {
     const result = await run(['a', 'b', root, '--json']);

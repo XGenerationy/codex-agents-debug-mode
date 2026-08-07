@@ -22,7 +22,10 @@ const messagesByHypothesis = (entries) => {
   const buckets = new Map();
   for (const { parsed } of entries) {
     if (parsed.type !== undefined) continue;
-    const key = parsed.hypothesisId ?? '';
+    // Only an ABSENT id is untagged. A present-but-null id is malformed and
+    // must reach computeDiff's malformed accounting, exactly like `42` —
+    // `?? ''` would silently merge it into the untagged bucket.
+    const key = parsed.hypothesisId === undefined ? '' : parsed.hypothesisId;
     if (!buckets.has(key)) buckets.set(key, { messages: new Set(), events: 0 });
     const bucket = buckets.get(key);
     bucket.events += 1;
@@ -114,8 +117,6 @@ const computeDiff = (beforeEntries, afterEntries) => {
 
 const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 
-const statusOr = (status) => status ?? '—';
-
 // Stored msg/note/title text is untrusted — it is written by whatever
 // process is being debugged, not by this tool. The rendered report IS the
 // evidence that gets pasted into PRs/chat, so raw interpolation would let
@@ -132,7 +133,21 @@ const statusOr = (status) => status ?? '—';
 // promise report structure NEVER reflects log content, without
 // qualification. JSON output needs none of this — JSON.stringify(diff, ...)
 // already escapes everything correctly there.
-const escapeText = (value) => escapeEvidenceText(value).replaceAll('`', '\\`').replaceAll('│', '¦');
+function escapeText(value) {
+  return escapeEvidenceText(value).replaceAll('`', '\\`').replaceAll('│', '¦');
+}
+
+// Stored status is untrusted log content, and older logs can carry a
+// non-string value (foldHypotheses copies parsed.status verbatim). Escape
+// it like every other rendered field, coerce to a string so `.padEnd`
+// cannot throw on a number, cap it so it cannot widen or misalign the
+// status columns, and retain the em-dash fallback for nullish values.
+const STATUS_COLUMN_MAX = 12;
+function statusOr(status) {
+  if (status === null || status === undefined) return '—';
+  const text = escapeText(status);
+  return text.length > STATUS_COLUMN_MAX ? `${text.slice(0, STATUS_COLUMN_MAX - 1)}…` : text;
+}
 
 // Hypothesis ids are short identifiers by convention; 40 chars comfortably
 // fits real-world ids while keeping the bordered table readable if an
@@ -233,7 +248,12 @@ const main = async () => {
     return;
   }
   const { positional, format: formatArg } = parsed;
-  if (positional.length < 2) {
+  // Reject any count other than two or three: a lower bound alone would
+  // silently accept extra args (e.g. `debug_diff.js a b /root extra`), and
+  // a mistyped ref or shell-glob expansion would then produce a report over
+  // the wrong sessions with no warning — contradicting the fail-closed
+  // stance documented above.
+  if (positional.length < 2 || positional.length > 3) {
     process.stderr.write(`${USAGE}\n`);
     process.exitCode = 2;
     return;
