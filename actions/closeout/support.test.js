@@ -84,6 +84,13 @@ test('decideExit implements the spec exit decision table exactly', () => {
   assert.match(mixedCase.reason, /unknown run tier/i);
   const missingTier = decideExit({ run: undefined, cliExitCode: 2, parsed: { planStatus: 'PASS' } });
   assert.deepEqual([missingTier.success, missingTier.exitCode], [false, 3]);
+  // Full-tier success additionally requires the contractual JSON record
+  // (review decision, Task 2 round): the gate always writes one line, so
+  // exit 0 with nothing parseable means the wrapper or stdout path broke —
+  // never report PASS on missing evidence.
+  const silentPass = decideExit({ run: 'full', cliExitCode: 0, parsed: null });
+  assert.deepEqual([silentPass.success, silentPass.exitCode], [false, 3]);
+  assert.match(silentPass.reason, /no JSON record/i);
 });
 
 test('escapeActionText is the gate safeText allowlist: everything non-allowlisted becomes a numeric entity', () => {
@@ -161,12 +168,40 @@ test('renderFullSummary embeds the gate report verbatim and caps with an in-band
   assert.match(big, /closeout-evidence/);
 });
 
-test('capText truncates on byte length with a notice and passes short text through', () => {
+test('capText keeps notice INSIDE the budget and escapes the artifact name', () => {
   const short = capText('hello', 1024, 'artifact-name');
   assert.deepEqual(short, { text: 'hello', truncated: false });
   const long = capText('y'.repeat(2048), 1024, 'artifact-name');
   assert.equal(long.truncated, true);
-  assert.ok(Buffer.byteLength(long.text, 'utf8') <= 1024 + 2048);
+  // The whole return — content plus notice — never exceeds maxBytes:
+  // Task 3 feeds this straight into GitHub's hard comment limit.
+  assert.ok(Buffer.byteLength(long.text, 'utf8') <= 1024);
   assert.match(long.text, /truncated/i);
   assert.match(long.text, /artifact-name/);
+  // Operator input gets one rendering everywhere: a backtick-laden name
+  // cannot break out of the notice's code span.
+  const hostileName = capText('y'.repeat(2048), 1024, 'ev`INJ`');
+  assert.match(hostileName.text, /ev&#96;INJ&#96;/);
+});
+
+test('renderers tolerate a missing record instead of crashing the summary step', () => {
+  const planSummary = renderPlanSummary(null, {});
+  assert.match(planSummary, /Closeout plan preview/);
+  assert.match(planSummary, /unknown/i);
+  const fullSummary = renderFullSummary(null, 'gate markdown body', { artifactName: 'ev' });
+  assert.match(fullSummary, /Closeout gate result/);
+  assert.match(fullSummary, /gate markdown body/);
+});
+
+test('row caps are announced, never silent', () => {
+  const plan = hostilePlan();
+  plan.errors = Array.from({ length: 60 }, (unused, index) => `error ${index}`);
+  plan.admission.preflight = {
+    status: 'BLOCKED',
+    checks: Array.from({ length: 31 }, (unused, index) => ({ name: `probe${index}`, status: 'BLOCKED', evidence: 'down' })),
+  };
+  const markdown = renderPlanSummary(plan, {});
+  assert.match(markdown, /and 10 more \(full list in the plan JSON in the artifact\)/);
+  assert.match(markdown, /and 11 more non-PASS preflight probes/);
+  assert.equal((markdown.match(/^- error /gm) || []).length, 50);
 });

@@ -84,9 +84,15 @@ const decideExit = ({ run, cliExitCode, parsed }) => {
   if (run === 'full') {
     const code = Number.isInteger(cliExitCode) ? cliExitCode : 3;
     const label = parsed?.status || parsed?.overallStatus || 'unknown';
-    return code === 0
-      ? { success: true, exitCode: 0, reason: 'gate PASS' }
-      : { success: false, exitCode: code, reason: `gate ${label} (exit ${code})` };
+    if (code === 0) {
+      // The gate always writes one JSON line; exit 0 with nothing parseable
+      // means the wrapper or stdout path broke. Never report PASS on
+      // missing evidence (review decision, Task 2 round).
+      return parsed
+        ? { success: true, exitCode: 0, reason: 'gate PASS' }
+        : { success: false, exitCode: 3, reason: 'gate exited 0 but produced no JSON record' };
+    }
+    return { success: false, exitCode: code, reason: `gate ${label} (exit ${code})` };
   }
   // Fail CLOSED on anything that is not exactly the plan tier: an
   // unvalidated run value must never fall into the more permissive branch
@@ -147,14 +153,20 @@ const COMMENT_CAP_BYTES = 60 * 1024;
 const capText = (text, maxBytes, artifactName) => {
   const value = String(text ?? '');
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) return { text: value, truncated: false };
-  const clipped = Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8');
+  // The notice fits INSIDE the budget: content is clipped to what remains
+  // after it, so the returned text never exceeds maxBytes total — Task 3
+  // feeds this straight into GitHub's hard 65536-character comment limit
+  // and an over-budget comment is rejected outright at exactly the moment
+  // the operator most needs it (review decision, Task 2 round). The
+  // artifact name is escaped here for the same reason it is escaped in the
+  // full summary: one value, one rendering, in every surface.
+  const notice = `\n\n---\n\n**Output truncated at ${maxBytes} bytes.** The complete evidence is in the \`${escapeActionText(artifactName)}\` artifact.\n`;
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(notice, 'utf8'));
+  const clipped = Buffer.from(value, 'utf8').subarray(0, budget).toString('utf8');
   // Drop a possibly-split trailing code point (replacement char from a cut
   // multibyte sequence) rather than shipping mojibake.
   const clean = clipped.endsWith('\uFFFD') ? clipped.slice(0, -1) : clipped;
-  return {
-    text: `${clean}\n\n---\n\n**Output truncated at ${maxBytes} bytes.** The complete evidence is in the \`${artifactName}\` artifact.\n`,
-    truncated: true,
-  };
+  return { text: `${clean}${notice}`, truncated: true };
 };
 
 const ATTESTATION_LABELS = new Map([
@@ -176,15 +188,19 @@ const ATTESTATION_LABELS = new Map([
  * @returns {string}
  */
 const renderPlanSummary = (plan, { baseRef = null } = {}) => {
-  const admission = plan.admission || {};
+  // Null-tolerant: the renderers must never be the crash site when a caller
+  // hands them a missing record (review decision, Task 2 round) — the
+  // failure story belongs to decideExit, not a TypeError in a summary step.
+  const record = plan || {};
+  const admission = record.admission || {};
   const attestation = admission.attestation || {};
   const label = ATTESTATION_LABELS.get(attestation.status) || `unknown state: ${escapeActionText(attestation.status)}`;
   const lines = [
     '## Closeout plan preview',
     '',
-    `- Mode: ${escapeActionText(plan.mode || 'strict')}`,
-    `- planStatus: **${escapeActionText(plan.planStatus)}**`,
-    `- Configuration digest: ${escapeActionText(plan.configDigest || 'unresolved')}`,
+    `- Mode: ${escapeActionText(record.mode || 'strict')}`,
+    `- planStatus: **${escapeActionText(record.planStatus)}**`,
+    `- Configuration digest: ${escapeActionText(record.configDigest || 'unresolved')}`,
     `- Base ref: ${escapeActionText(baseRef || 'from config')}`,
     '',
     '### Admission readiness',
@@ -197,15 +213,25 @@ const renderPlanSummary = (plan, { baseRef = null } = {}) => {
   ];
   lines.push('', `- Attestation detail: ${label}`);
   const preflightChecks = Array.isArray(admission.preflight?.checks) ? admission.preflight.checks : [];
-  for (const check of preflightChecks.filter((entry) => entry.status !== 'PASS').slice(0, 20)) {
+  const failingProbes = preflightChecks.filter((entry) => entry.status !== 'PASS');
+  for (const check of failingProbes.slice(0, 20)) {
     lines.push(`- preflight ${escapeActionText(check.name)}: ${escapeActionText(check.status)} — ${escapeActionText(check.evidence || '')}`);
   }
-  const errors = Array.isArray(plan.errors) ? plan.errors : [];
+  // Row caps are ANNOUNCED, never silent (review decision, Task 2 round):
+  // a clipped error list read as complete makes the operator conclude the
+  // gate invents new errors on the next push.
+  if (failingProbes.length > 20) {
+    lines.push(`- …and ${failingProbes.length - 20} more non-PASS preflight probes (full detail in the artifact).`);
+  }
+  const errors = Array.isArray(record.errors) ? record.errors : [];
   if (errors.length > 0) {
     lines.push('', '### Plan errors', '');
     for (const error of errors.slice(0, 50)) lines.push(`- ${escapeActionText(error)}`);
+    if (errors.length > 50) {
+      lines.push(`- …and ${errors.length - 50} more (full list in the plan JSON in the artifact).`);
+    }
   }
-  const checks = Array.isArray(plan.checks) ? plan.checks : [];
+  const checks = Array.isArray(record.checks) ? record.checks : [];
   lines.push('', `### Resolved checks (${checks.length})`, '');
   lines.push(checks.slice(0, 50).map((check) => escapeActionText(check.id)).join(', ') || '(none)');
   lines.push('');
@@ -223,13 +249,14 @@ const renderPlanSummary = (plan, { baseRef = null } = {}) => {
  * @returns {string}
  */
 const renderFullSummary = (report, reportMarkdown, { artifactName }) => {
+  const record = report || {};
   const embed = capText(reportMarkdown, SUMMARY_EMBED_CAP_BYTES, artifactName);
   return [
     '## Closeout gate result',
     '',
-    `- Overall status: **${escapeActionText(report.overallStatus)}**`,
-    `- Mode: ${escapeActionText(report.mode || 'strict')}`,
-    `- Configuration digest: ${escapeActionText(report.configDigest || 'unresolved')}`,
+    `- Overall status: **${escapeActionText(record.overallStatus)}**`,
+    `- Mode: ${escapeActionText(record.mode || 'strict')}`,
+    `- Configuration digest: ${escapeActionText(record.configDigest || 'unresolved')}`,
     `- Evidence artifact: \`${escapeActionText(artifactName)}\``,
     '',
     '---',
