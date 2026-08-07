@@ -75,7 +75,7 @@ Expected: the two new CLI tests fail (`mode` is `undefined`, `--mode` is an unkn
 
 In `scripts/pr_closeout.js`:
 
-1. HELP text — add one line after the `--output-dir` row:
+1. HELP text — add one line after the `--output-dir` row and re-pad the sibling rows so every description starts at the same column (post-review alignment):
 
 ```
   --mode <strict|engine>  Gate tier (default: strict; engine runs config.engineChecks)

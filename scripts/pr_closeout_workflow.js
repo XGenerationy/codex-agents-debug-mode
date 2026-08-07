@@ -912,7 +912,7 @@ const admissionStatus = ({ planStatus, preflight, gateIntegrity, initialTree, in
  * fingerprinted once more, the evidence-write seal computed by comparing
  * pre- and post-write state, and the final report (true `overallStatus`,
  * completed seal) written over it.
- * @param {{repo: string, baseRef: string, config?: object, outputDir?: string, planOnly?: boolean, dependencies?: object}} options `dependencies` overrides any of `DEFAULTS` (repo-state/git/GitHub/process/report I/O) for tests.
+ * @param {{repo: string, baseRef: string, config?: object, outputDir?: string, planOnly?: boolean, mode?: 'strict'|'engine', dependencies?: object}} options `mode` defaults to `'strict'` and is invocation-only (config.mode is rejected); `dependencies` overrides any of `DEFAULTS` (repo-state/git/GitHub/process/report I/O) for tests.
  * @returns {Promise<{report: object, paths: object}|object>} the full evidence report and its written paths; a redacted plan preview when `planOnly` is true.
  */
 const runCloseoutWorkflow = async ({

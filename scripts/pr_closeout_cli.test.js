@@ -91,6 +91,13 @@ test('rejects unknown arguments as a usage error', () => {
   assert.match(result.stderr, /Unknown argument/);
 });
 
+test('rejects an unknown --mode value at process level: exit 3 with the machine-readable BLOCKED line', () => {
+  const result = spawnSync(process.execPath, [script, '--mode', 'lenient'], { encoding: 'utf8' });
+  assert.equal(result.status, 3);
+  assert.match(result.stderr, /Unknown --mode value: lenient/);
+  assert.equal(JSON.parse(result.stdout.trim()).status, 'BLOCKED');
+});
+
 test('readCloseoutConfig parses a bounded regular config file', async () => {
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-config-'));

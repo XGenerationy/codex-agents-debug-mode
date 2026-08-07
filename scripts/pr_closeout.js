@@ -12,19 +12,21 @@ const HELP = `Usage: pr_closeout.js --repo <path> --base-ref <ref> [options]
 Run the mandatory 19-check PR closeout gate and write JSON, Markdown, and raw logs.
 
 Options:
-  --repo <path>        Repository worktree (default: current directory)
-  --base-ref <ref>     Live PR base ref, such as origin/main
-  --config <path>      Repository-specific closeout JSON
-  --output-dir <path>  Evidence directory (default: system temp directory)
+  --repo <path>           Repository worktree (default: current directory)
+  --base-ref <ref>        Live PR base ref, such as origin/main
+  --config <path>         Repository-specific closeout JSON
+  --output-dir <path>     Evidence directory (default: system temp directory)
   --mode <strict|engine>  Gate tier (default: strict; engine runs config.engineChecks)
-  --plan               Resolve and print commands without executing them
-  -h, --help           Show this help
+  --plan                  Resolve and print commands without executing them
+  -h, --help              Show this help
 `;
 
 /**
- * Parses CLI argv into `{ repo, plan, help, baseRef?, configPath?,
- * outputDir? }`. `repo` defaults to `process.cwd()`. Flags that take a
- * value (`--repo`, `--base-ref`, `--config`, `--output-dir`) throw if the
+ * Parses CLI argv into `{ repo, plan, mode, help, baseRef?, configPath?,
+ * outputDir? }`. `repo` defaults to `process.cwd()` and `mode` to `'strict'`
+ * (validated after the loop: only `strict`/`engine` are accepted). Flags
+ * that take a value (`--repo`, `--base-ref`, `--config`, `--output-dir`,
+ * `--mode`) throw if the
  * next token is missing or itself looks like another flag (starts with
  * `--`), so a dropped value can never silently swallow the next flag. Any
  * unrecognized argument throws immediately rather than being ignored, so a
