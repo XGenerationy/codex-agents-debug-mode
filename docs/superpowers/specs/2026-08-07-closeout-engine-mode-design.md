@@ -68,9 +68,24 @@ error and the run is BLOCKED before anything executes:
   `resourceGroup` continue to come from their existing id-keyed config maps, and proofs
   from `config.proofs` (validated at plan time in engine mode even when voluntary).
 - `scripts` discovery runs through an engine-only `config.scriptRunner` (default
-  `npm run`; validated single-line, neutralizer-scanned) — strict keeps its hardcoded
-  `pnpm run` byte-for-byte. `scriptRunner` in a strict config is a hard error like
-  `engineChecks`.
+  `npm run`; validated single-line without tabs/quotes, neutralizer-scanned) — strict
+  keeps its hardcoded `pnpm run` byte-for-byte. `scriptRunner` in a strict config is a
+  hard error like `engineChecks`.
+- **Resolved-command make gate (review decision):** recipe bodies are only inspectable
+  when a command is EXACTLY `make <target>`. On every engine resolution path — inline
+  commands AND scriptRunner-resolved scripts — the FINAL resolved command passes a make
+  gate: the pure form gets its recipe inspected (uncaptured or failure-neutralizing
+  recipes → BLOCKED), and any other command that invokes make (wrapped, prefixed,
+  pathed, flagged, or argument-extended — `cd x && make lie`, `env make lie`,
+  `/usr/bin/make lie`, `make -s lie`, `make lie && true`) is BLOCKED outright: an
+  uninspectable make invocation is never admitted. Token-level matching leaves
+  non-make commands (`cmake`, `make-docs`) unaffected. Strict definitions never pass
+  through this gate (invariance).
+- **Engine command proofs get strict parity at plan time (review decision):** a
+  postcondition command proof is neutralizer-scanned and its `expectedPattern` must be
+  a non-empty `literal:` policy — both enforced at admission, mirroring the strict path
+  and the executor's policy rules, so an engine check can never carry a proof that
+  cannot fail.
 - Unknown fields → error (never ignored).
 - Empty array, missing `engineChecks` in engine mode, or `engineChecks` present in a
   strict-mode config → error. The strict-mode rejection matters most: a config carrying an
