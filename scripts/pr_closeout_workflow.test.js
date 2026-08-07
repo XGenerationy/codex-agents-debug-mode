@@ -1618,10 +1618,46 @@ test('resolvePlanAdmission reports present, absent, and unavailable attestation 
   });
   assert.equal(unavailable.attestation.status, 'unavailable');
   assert.match(unavailable.attestation.evidence, /gh: not logged in/);
+  // A dirty/throwing tree blocks preflight before any probe runs: preflight
+  // reports the unclean tree, not the probe crash, because cleanTreeStatus did
+  // not resolve to PASS (mirrors the full-gate precondition).
   assert.equal(unavailable.preflight.status, 'BLOCKED');
-  assert.match(unavailable.preflight.evidence, /probe crashed/);
+  assert.match(unavailable.preflight.evidence, /working tree was not clean/);
   assert.equal(unavailable.cleanTree.status, 'BLOCKED');
   assert.match(unavailable.cleanTree.evidence, /git unavailable/);
+});
+
+test('resolvePlanAdmission does not run preflight probes when the working tree is dirty', async () => {
+  // Regression guard for the plan-mode clean-tree precondition: a dirty tree
+  // must short-circuit preflight (no spawned binaries, no service probes) just
+  // like runCloseoutWorkflowBody. runPreflight is a sentinel that throws if it
+  // is ever invoked on a non-PASS tree.
+  let preflightCalled = false;
+  const result = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'BLOCKED', evidence: 'uncommitted changes present' }),
+      runPreflight: async () => { preflightCalled = true; return { status: 'PASS' }; },
+    },
+  });
+  assert.equal(preflightCalled, false);
+  assert.equal(result.cleanTree.status, 'BLOCKED');
+  assert.equal(result.preflight.status, 'BLOCKED');
+  assert.match(result.preflight.evidence, /working tree was not clean/);
+  assert.match(result.preflight.evidence, /uncommitted changes present/);
+
+  // And preflight still runs (and surfaces its own failure) on a clean tree.
+  const cleanTreeResult = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => { throw new Error('probe crashed'); },
+    },
+  });
+  assert.equal(cleanTreeResult.preflight.status, 'BLOCKED');
+  assert.match(cleanTreeResult.preflight.evidence, /probe crashed/);
 });
 
 test('planOnly output carries the admission block', async () => {

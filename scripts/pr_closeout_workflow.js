@@ -969,10 +969,22 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     cleanTree = { status: 'BLOCKED', evidence: `Working tree inspection failed: ${error.message}` };
   }
   let preflight;
-  try {
-    preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
-  } catch (error) {
-    preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
+  if (cleanTree?.status !== 'PASS') {
+    // Mirror the full-gate precondition (runCloseoutWorkflowBody): runPreflight
+    // spawns binaries and contacts config.services/config.ports, so it must not
+    // run against an unclean snapshot. A dirty tree is already its own admission
+    // blocker; reporting preflight as BLOCKED keeps the preview honest without
+    // probing a tree admission would reject anyway.
+    preflight = {
+      status: 'BLOCKED',
+      evidence: `Preflight did not run because the working tree was not clean: ${cleanTree?.evidence}`,
+    };
+  } else {
+    try {
+      preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
+    } catch (error) {
+      preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
+    }
   }
   return { attestation, cleanTree, preflight };
 };

@@ -293,6 +293,22 @@ const REQUIRED_PROOFS = {
   'hunter-build': 'command',
 };
 
+// Shared proof-policy helpers. Both the strict REQUIRED_PROOFS path and the
+// engine voluntary-proof path call these so the two can never drift on the
+// artifact escape rules or the bounded literal: policy (length and
+// control-character) rules. Control characters are tested with the same regex
+// literal in both call sites.
+const artifactPathEscapes = (value) => {
+  const rel = String(value).replaceAll('\\', '/').trim();
+  return path.isAbsolute(value) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
+    || rel.split('/').includes('..') || rel.startsWith('../');
+};
+
+const isBoundedLiteralPolicy = (policy) => policy.startsWith('literal:')
+  && policy.length <= 264
+  && policy.length > 'literal:'.length
+  && !/[\u0000-\u001f\u007f]/u.test(policy);
+
 // Fields an engine-mode check definition may carry. Anything else — most
 // pointedly `fixed`, `packageCandidates`, or `makeCandidates` — is either a
 // weakening vector or a typo; both fail closed rather than being ignored.
@@ -827,9 +843,7 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
           ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
           : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
       } else if (engineArtifact) {
-        const rel = String(proof.path).replaceAll('\\', '/').trim();
-        if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
-          || rel.split('/').includes('..') || rel.startsWith('../')) {
+        if (artifactPathEscapes(proof.path)) {
           const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
           resolved = resolved.status === 'BLOCKED'
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
@@ -850,22 +864,8 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
         // Mirror strict's exact literal-policy bounds (validCommand, below):
         // bounded length and no control characters, not just a `literal:`
         // prefix check — a voluntarily attached engine command proof gets
-        // the identical bar. Control characters are scanned by code point
-        // (not a regex literal) to keep this diff free of embedded escapes.
-        const enginePattern = proof.expectedPattern;
-        let engineHasControlChar = false;
-        for (let charIndex = 0; charIndex < enginePattern.length; charIndex += 1) {
-          const code = enginePattern.charCodeAt(charIndex);
-          if (code < 0x20 || code === 0x7f) {
-            engineHasControlChar = true;
-            break;
-          }
-        }
-        const engineLiteralOk = enginePattern.startsWith('literal:')
-          && enginePattern.length <= 264
-          && enginePattern.length > 'literal:'.length
-          && !engineHasControlChar;
-        if (!engineLiteralOk) {
+        // the identical bar via the shared isBoundedLiteralPolicy helper.
+        if (!isBoundedLiteralPolicy(proof.expectedPattern)) {
           const proofEvidence = `Postcondition proof pattern for ${check.label} must be a literal: policy with a non-empty value.`;
           resolved = resolved.status === 'BLOCKED'
             ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
@@ -876,9 +876,7 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
     // Validate proof policies at plan time so unusable proofs cannot be
     // attested as admissible (Codex #4782132804). Mirrors executor rules.
     if (validArtifact) {
-      const rel = String(proof.path).replaceAll('\\', '/').trim();
-      if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
-        || rel.split('/').includes('..') || rel.startsWith('../')) {
+      if (artifactPathEscapes(proof.path)) {
         const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
         resolved = resolved.status === 'BLOCKED'
           ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
@@ -908,10 +906,7 @@ const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, mak
       const policy = String(proof.expectedPattern || '');
       const hunterOk = check.id === 'hunter-build'
         && policy === 'semantic:docker-compose-running-healthy';
-      const literalOk = policy.startsWith('literal:')
-        && policy.length <= 264
-        && policy.length > 'literal:'.length
-        && !/[\u0000-\u001f\u007f]/u.test(policy);
+      const literalOk = isBoundedLiteralPolicy(policy);
       if (!hunterOk && !literalOk) {
         const proofEvidence = check.id === 'hunter-build'
           ? 'Hunter proof requires expectedPattern semantic:docker-compose-running-healthy at plan time.'
