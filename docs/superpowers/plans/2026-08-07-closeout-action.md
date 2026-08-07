@@ -777,9 +777,12 @@ git commit -m "feat(action): marker-tagged PR comment upsert behind injectable g
 - Modify: `actions/closeout/support.test.js` (append)
 
 State contract between steps: `run` writes `<output-dir>/action-state.json` —
-`{tier, mode, baseRef, cliExitCode, decision, artifactName, renderedSummary, reportJsonPath}`
-— and `comment`/`finish` read it (`renderedSummary`, not the raw `parsed` record, is
-what `comment` needs: the body is rebuilt without re-deriving the rendering). All
+`{tier, mode, baseRef, cliExitCode, decision, artifactName, renderedSummary,
+renderedComment, reportJsonPath}` — and `comment`/`finish` read it. `renderedComment`
+is the comment-specific rendering (spec: full-tier comments carry the key-fields
+block plus an artifact pointer, NEVER the embedded report.md — that lives in the
+Step Summary and the artifact; plan-tier comments equal the plan summary). The
+comment step rebuilds its body from state without re-deriving any rendering. All
 GitHub env-file paths (`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`) and the
 spawn/gh/env/event seams are injectable.
 
@@ -861,6 +864,33 @@ test('runSubcommand end-to-end (full tier): reads report.json/report.md and reco
   assert.match(outputs, /^mode=engine$/m);
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 2]);
+  // Spec: full-tier COMMENTS carry key fields + an artifact pointer, never
+  // the embedded report.md — the summary keeps the embed, the comment
+  // rendering must not.
+  assert.match(state.renderedSummary, /> \*\*ENGINE MODE\*\* banner/);
+  assert.doesNotMatch(state.renderedComment, /> \*\*ENGINE MODE\*\* banner/);
+  assert.match(state.renderedComment, /See report\.md in the evidence artifact/);
+  assert.match(state.renderedComment, /Closeout gate result/);
+});
+
+test('the comment step sends the comment rendering, not the summary embed', async () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'full', artifactName: 'ev',
+    renderedSummary: '## Closeout gate result\nfields\n\n---\n\nHUGE EMBEDDED REPORT BODY',
+    renderedComment: '## Closeout gate result\nfields\n\nSee report.md in the evidence artifact named above.',
+    decision: { success: false, exitCode: 2 },
+  }));
+  const calls = [];
+  await commentSubcommand({
+    outputDir: dir,
+    env: { GITHUB_REPOSITORY: 'o/r' },
+    event: { pull_request: { number: 3 } },
+    runGh: async (args) => { calls.push(args); return args.includes('POST') ? { id: 1 } : [[]]; },
+  });
+  const bodyArg = calls[1].find((argument) => argument.startsWith('body='));
+  assert.match(bodyArg, /Closeout gate result/);
+  assert.doesNotMatch(bodyArg, /HUGE EMBEDDED REPORT BODY/);
 });
 
 test('finishSubcommand exits with the recorded decision', () => {
@@ -1023,6 +1053,7 @@ const runSubcommand = async ({
   const decision = decideExit({ run, cliExitCode, parsed });
 
   let renderedSummary;
+  let renderedComment = '';
   let reportJsonPath = '';
   let reportMode = '';
   let attestation = '';
@@ -1063,7 +1094,17 @@ const runSubcommand = async ({
       reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'})`,
       { artifactName },
     );
+    // Full-tier COMMENTS never carry the embedded report.md (spec): key
+    // fields plus a pointer only — the full report lives in the Step
+    // Summary and the artifact. The pointer line is a fixed literal so no
+    // operator input rides in it unescaped.
+    renderedComment = renderFullSummary(
+      { overallStatus: status, mode: report.mode, configDigest: report.configDigest },
+      'See report.md in the evidence artifact named above.',
+      { artifactName },
+    );
   }
+  if (run === 'plan') renderedComment = renderedSummary;
 
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
   if (env.GITHUB_OUTPUT) {
@@ -1072,7 +1113,7 @@ const runSubcommand = async ({
     });
   }
   writeFileSync(path.join(outputDir, STATE_FILE), `${JSON.stringify({
-    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, reportJsonPath,
+    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath,
   })}\n`);
   process.stdout.write(`closeout-action: ${decision.reason}\n`);
   return 0;
@@ -1131,7 +1172,14 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
     process.stdout.write('closeout-action: not a pull-request context; comment skipped.\n');
     return 0;
   }
-  const body = buildCommentBody({ tier: state.tier, rendered: state.renderedSummary || '', artifactName: state.artifactName || 'closeout-evidence' });
+  const body = buildCommentBody({
+    tier: state.tier,
+    // renderedComment is the comment-specific rendering (full tier: key
+    // fields + pointer, never the embedded report.md); the summary is only
+    // a fallback for a state written by an older run step.
+    rendered: state.renderedComment || state.renderedSummary || '',
+    artifactName: state.artifactName || 'closeout-evidence',
+  });
   await upsertPrComment({ context, body, runGh });
   process.stdout.write(`closeout-action: comment upserted on PR #${context.prNumber}.\n`);
   return 0;
