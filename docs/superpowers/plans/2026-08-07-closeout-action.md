@@ -1375,16 +1375,16 @@ inputs:
 
 outputs:
   status:
-    description: "overallStatus (full) or planStatus (plan)"
+    description: "overallStatus (full) or planStatus (plan); empty until the gate step has run"
     value: ${{ steps.gate.outputs.status }}
   mode:
-    description: "The gate-reported mode of the run"
+    description: "The gate-reported mode of the run; empty until the gate step has run"
     value: ${{ steps.gate.outputs.mode }}
   attestation:
-    description: "Plan runs: present | weakened | absent | unavailable"
+    description: "Plan runs: present | weakened | absent | unavailable; empty until the gate step has run"
     value: ${{ steps.gate.outputs.attestation }}
   report-path:
-    description: "Path of report.json (full) or the captured plan JSON (plan)"
+    description: "Path of report.json (full) or the captured plan JSON (plan); empty until the gate step has run"
     value: ${{ steps.gate.outputs.report-path }}
 
 runs:
@@ -1488,9 +1488,16 @@ permissions:
   contents: read
   pull-requests: read
 
+# cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
+# concurrency is evaluated before the job-level if, so a comment-only review
+# submitted mid-run would otherwise cancel an in-flight gate and then skip
+# itself — leaving the PR with no gate result and no automatic re-trigger. A
+# cancelled gate result is a missing gate result; a superseded run invalidates
+# itself anyway because the attestation is head-bound. The preview workflow
+# keeps newest-wins cancellation, where it is correct.
 concurrency:
   group: closeout-gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   gate:
@@ -1738,6 +1745,15 @@ from Task 5 as the examples — copy their final text verbatim into fenced block
    `base-ref` input is passed to the CLI verbatim (no `origin/` prefixing — the
    operator's value is authoritative), while the automatic ladder branches prefix
    `origin/` because env/event carry bare branch names. State both explicitly.
+10. **Artifact-name uniqueness (consumer contract, review Task 5):** upload-artifact
+    v4 rejects a duplicate artifact name WITHIN one workflow run, so invoking this
+    action more than once per run (plan + full in one workflow, or an OS matrix)
+    requires a distinct `artifact-name` per invocation (e.g. suffix the job or
+    matrix key — composite input defaults cannot embed expressions, so the action
+    cannot do it for you). The failure otherwise reads as an artifacts
+    infrastructure error, not a gate error. Also note: gate workflows should set
+    `cancel-in-progress: false` (a cancelled enforcing run is a missing gate
+    result); previews keep newest-wins.
 
 Safety constraints for the doc itself: no credential-shaped strings (the validator's
 `sk-`/`ghp_` patterns — write example tokens as `<your-token>`), no personal paths, no

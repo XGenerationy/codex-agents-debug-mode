@@ -32,16 +32,16 @@ inputs:
 
 outputs:
   status:
-    description: "overallStatus (full) or planStatus (plan)"
+    description: "overallStatus (full) or planStatus (plan); empty until the gate step has run"
     value: ${{ steps.gate.outputs.status }}
   mode:
-    description: "The gate-reported mode of the run"
+    description: "The gate-reported mode of the run; empty until the gate step has run"
     value: ${{ steps.gate.outputs.mode }}
   attestation:
-    description: "Plan runs: present | weakened | absent | unavailable"
+    description: "Plan runs: present | weakened | absent | unavailable; empty until the gate step has run"
     value: ${{ steps.gate.outputs.attestation }}
   report-path:
-    description: "Path of report.json (full) or the captured plan JSON (plan)"
+    description: "Path of report.json (full) or the captured plan JSON (plan); empty until the gate step has run"
     value: ${{ steps.gate.outputs.report-path }}
 
 runs:

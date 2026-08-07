@@ -198,7 +198,12 @@ prototype of a later `Object.assign`-style copy).
   explicitly (`ref: ${{ github.event.pull_request.head.sha }}`, `fetch-depth: 0`) —
   the gate independently re-verifies the live head via gh and BLOCKS stale snapshots,
   but the checkout must present the head being attested. Runs `run: full`. Concurrency
-  group keyed per PR so a re-review supersedes an in-flight run.
+  group keyed per PR with `cancel-in-progress: false` (review decision, Task 5 round):
+  workflow-level concurrency is evaluated before the job-level `if`, so a comment-only
+  review submitted mid-run would otherwise cancel an in-flight enforcing gate and then
+  skip itself — no gate result, no automatic re-trigger. A cancelled gate result is a
+  missing gate result; a superseded run self-invalidates via the head-bound
+  attestation. The preview keeps newest-wins cancellation, where it is correct.
 - Fork-PR honesty note (README + workflow comments): `pull_request` from forks gets a
   read-only token — the preview works (it is read-only by design); the comment opt-in
   does not, and is skipped with a notice. `pull_request_review` runs in base-repo

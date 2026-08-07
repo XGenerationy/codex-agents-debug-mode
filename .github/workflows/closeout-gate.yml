@@ -13,9 +13,16 @@ permissions:
   contents: read
   pull-requests: read
 
+# cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
+# concurrency is evaluated before the job-level if, so a comment-only review
+# submitted mid-run would otherwise cancel an in-flight gate and then skip
+# itself — leaving the PR with no gate result and no automatic re-trigger. A
+# cancelled gate result is a missing gate result; a superseded run invalidates
+# itself anyway because the attestation is head-bound. The preview workflow
+# keeps newest-wins cancellation, where it is correct.
 concurrency:
   group: closeout-gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   gate:
