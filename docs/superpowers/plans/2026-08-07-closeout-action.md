@@ -461,7 +461,7 @@ const renderPlanSummary = (plan, { baseRef = null } = {}) => {
     '',
     '| Probe | Status | Evidence |',
     '|---|---|---|',
-    `| attestation | ${label.split(' \u2014 ')[0]} | ${escapeActionText(attestation.evidence || label)} |`,
+    `| attestation | ${label.split(' — ')[0]} | ${escapeActionText(attestation.evidence || label)} |`,
     `| clean tree | ${escapeActionText(admission.cleanTree?.status || 'unknown')} | ${escapeActionText(admission.cleanTree?.evidence || '')} |`,
     `| preflight | ${escapeActionText(admission.preflight?.status || 'unknown')} | ${escapeActionText(admission.preflight?.evidence || '')} |`,
   ];
