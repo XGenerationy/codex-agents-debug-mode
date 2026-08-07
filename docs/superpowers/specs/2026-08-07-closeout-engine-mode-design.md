@@ -145,6 +145,14 @@ Enforced in code and pinned by tests — the engine IS these invariants:
 - `report.md`: engine reports render a banner section stating: repo-defined matrix, a
   different and weaker guarantee than the strict 19-check gate, with the matrix digest.
 - Strict reports gain only the `mode` field — no banner, no other change.
+- Renderer hardening (review decision, Task 6 round): one normalized mode value drives
+  both the markdown label and the banner condition (matched case-insensitively), so no
+  mode-value casing or coercion can render an engine label without its warning banner;
+  and when `mode` is absent the renderer falls back to the `matrixSource` tell (non-null
+  only on engine runs) rather than claiming strict — stripping one field from an engine
+  `report.json` cannot upgrade its markdown to the stronger strict claim, while true
+  legacy reports (neither field) still render strict. Reachable today only through the
+  exported `renderMarkdown`; live the moment sub-project B re-renders stored reports.
 
 ## Attestation digest binding
 

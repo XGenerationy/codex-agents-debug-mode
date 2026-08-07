@@ -1680,8 +1680,8 @@ Expected: new tests fail (no mode line, no banner, no mode field); pre-existing 
 3. `scripts/pr_closeout_report.js` (~line 186 region — the markdown summary list array containing `- Configuration digest: ...`): add immediately after the configuration-digest entry:
 
 ```js
-    `- Mode: ${safeText(report.mode || 'strict')}`,
-    ...(report.mode === 'engine' ? [
+    `- Mode: ${safeText(reportMode)}`,
+    ...(reportMode.toLowerCase() === 'engine' ? [
       '',
       '> **ENGINE MODE** — this run used a repo-defined check matrix '
         + `(${Number(report.matrixSource?.checkCount) || 0} checks from ${safeText(report.matrixSource?.source || 'config.engineChecks')}, `
@@ -1690,7 +1690,15 @@ Expected: new tests fail (no mode line, no banner, no mode field); pre-existing 
     ] : []),
 ```
 
-NOTE: match the file's actual array/string-building idiom at that site (it is a flat array of markdown lines around line 186; splice accordingly and keep `safeText` — it is the file's existing sanitizer).
+where `reportMode` is declared once above the lines array (quality-review round: one
+normalized value drives both label and banner so they can never disagree; matrixSource
+tell prevents a stripped mode field downgrading an engine report to a strict claim):
+
+```js
+  const reportMode = String(report.mode || (report.matrixSource ? 'engine' : 'strict'));
+```
+
+NOTE: match the file's actual array/string-building idiom at that site (it is a flat array of markdown lines around line 186; splice accordingly and keep `safeText` — it is the file's existing sanitizer). The quality round also added: a report.test.js test pinning banner-vs-casing/stripped-mode/legacy rendering, and (commit 5aecdf2) matrixSource deep-equal + provisional written[0] labeling pins in the two new workflow tests.
 
 - [ ] **Step 4: Run to verify green**
 

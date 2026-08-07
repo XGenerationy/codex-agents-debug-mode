@@ -762,3 +762,26 @@ test('markdown renders the mode line in both modes and the engine banner only in
   assert.match(engineMarkdown, /engine-digest-1/);
   assert.match(engineMarkdown, /3 checks/);
 });
+
+test('markdown banner cannot be dodged by mode casing or a stripped mode field', () => {
+  // Casing: any spelling of engine must carry the weaker-guarantee banner —
+  // an engine label without its warning is the failure mode being pinned.
+  const cased = hostileReport();
+  cased.mode = 'ENGINE';
+  cased.matrixSource = { source: 'config.engineChecks', digest: 'd1', checkCount: 1 };
+  assert.match(renderMarkdown(cased), /ENGINE MODE/);
+
+  // Stripped mode: matrixSource is non-null only on engine runs, so deleting
+  // the mode field from an engine report must not upgrade it to a strict claim.
+  const stripped = hostileReport();
+  stripped.matrixSource = { source: 'config.engineChecks', digest: 'd1', checkCount: 1 };
+  const strippedMarkdown = renderMarkdown(stripped);
+  assert.match(strippedMarkdown, /- Mode: engine/);
+  assert.match(strippedMarkdown, /ENGINE MODE/);
+
+  // True legacy report (neither field): predates engine mode, really strict.
+  const legacy = hostileReport();
+  const legacyMarkdown = renderMarkdown(legacy);
+  assert.match(legacyMarkdown, /- Mode: strict/);
+  assert.doesNotMatch(legacyMarkdown, /ENGINE MODE/);
+});
