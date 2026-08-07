@@ -206,8 +206,12 @@ prototype of a later `Object.assign`-style copy).
   attestation. The preview keeps newest-wins cancellation, where it is correct.
 - Fork-PR honesty note (README + workflow comments): `pull_request` from forks gets a
   read-only token — the preview works (it is read-only by design); the comment opt-in
-  does not, and is skipped with a notice. `pull_request_review` runs in base-repo
-  context with normal token scope.
+  does not, and the comment step FAILS with the gh 403 (reconciled, Task 7 round: the
+  skip-with-notice applies only OUTSIDE PR context — a fork PR has full PR context, and
+  the error-table row "comment API failure fails the step" plus its pinning test are
+  the authority; a silent skip would hide that an opted-into comment never posted).
+  Consumers must not enable `pr-comment` on fork-reachable `pull_request` workflows.
+  `pull_request_review` runs in base-repo context with normal token scope.
 
 ## Support script (`actions/closeout/support.js`)
 

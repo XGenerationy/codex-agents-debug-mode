@@ -196,11 +196,13 @@ permissions:
 **Fork-PR note:** a `pull_request`-triggered workflow running against a fork PR
 receives a reduced, read-only token regardless of the `permissions:` block above.
 `run: plan` still works there — it is read-only by design — but `pr-comment: true`
-will not: the token cannot write to the PR, and the comment step notices this and
-skips with a notice rather than failing the job. `pull_request_review` runs in the
-base repository's own context with the workflow's normal token scope, so the
-enforcing gate (triggered by `pull_request_review`, as in `closeout-gate.yml`) is
-unaffected.
+will not: the token cannot write to the PR, so the comment step **fails the job
+with the gh 403 error**. That is deliberate — you opted into the comment, and a
+silent skip would hide that it never posted (the Step Summary and artifact are
+already written by then either way). Do not enable `pr-comment` on workflows that
+fork PRs can trigger. `pull_request_review` runs in the base repository's own
+context with the workflow's normal token scope, so the enforcing gate (triggered
+by `pull_request_review`, as in `closeout-gate.yml`) is unaffected.
 
 ## Failure semantics
 
