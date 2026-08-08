@@ -72,13 +72,23 @@ const assertOutputOutsideWorkspace = ({ outputDir, workspace = '' }) => {
   const resolveAgainstWorkspace = (candidate) => (path.isAbsolute(candidate)
     ? candidate
     : path.resolve(rootResolved, candidate));
-  const inside = (candidate) => {
-    const relative = path.relative(rootResolved, resolveAgainstWorkspace(candidate));
+  const inside = (rootBase, candidate) => {
+    const relative = path.relative(rootBase, candidate);
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
   };
-  if (inside(outputDir)) {
+  // Logical containment check: catch `output-dir: .`, workspace-relative
+  // paths, and `..` escapes against the workspace root as configured.
+  if (inside(rootResolved, resolveAgainstWorkspace(outputDir))) {
     throw new Error(`Evidence output directory must be outside the repository workspace: ${outputDir}`);
   }
+  // Physical containment check: a symlinked workspace root (common on some
+  // self-hosted runners, or when GITHUB_WORKSPACE points through a link) makes
+  // the logical comparison meaningless for the realpath-resolved output path.
+  // realpath BOTH the workspace root and the output target so the comparison
+  // is physical-against-physical; a realpath failure of the root falls back to
+  // the longest existing ancestor (the workspace root normally exists, but
+  // fail-closed rather than trusting the logical path if it does not).
+  const rootPhysical = realpathAncestor(rootResolved);
   let physical;
   try {
     physical = realpathSync(resolveAgainstWorkspace(outputDir));
@@ -88,7 +98,7 @@ const assertOutputOutsideWorkspace = ({ outputDir, workspace = '' }) => {
     // ancestor can't smuggle an inside-workspace target past this check.
     physical = realpathAncestor(resolveAgainstWorkspace(outputDir));
   }
-  if (inside(physical)) {
+  if (inside(rootPhysical, physical)) {
     throw new Error(`Evidence output directory resolves inside the repository workspace (via symlink): ${outputDir}`);
   }
 };
@@ -392,10 +402,20 @@ const upsertPrComment = async ({ context, body, runGh }) => {
   // GH_TOKEN to github.token. Adding a `token` input (e.g. for App tokens
   // that author as `my-app[bot]`) without revisiting this check would make
   // every run miss its own comment and POST an unbounded duplicate stream.
-  const mine = comments.find((comment) => typeof comment?.body === 'string'
-    && comment.body.startsWith(ACTION_MARKER)
-    && comment.user?.type === 'Bot'
-    && comment.user?.login === 'github-actions[bot]');
+  // Select the NEWEST matching marker comment by id: the issue-comments API
+  // returns oldest-first, so Array.find would PATCH the oldest and leave
+  // newer duplicates stale (from rerun races, prior duplication, or a
+  // drive-by marker comment). GitHub comment ids are globally monotonic, so
+  // the largest id is the newest regardless of page order after flattening.
+  const mine = comments
+    .filter((comment) => typeof comment?.body === 'string'
+      && comment.body.startsWith(ACTION_MARKER)
+      && comment.user?.type === 'Bot'
+      && comment.user?.login === 'github-actions[bot]')
+    .reduce(
+      (newest, comment) => (newest === null || Number(comment.id) > Number(newest.id) ? comment : newest),
+      null,
+    );
   if (mine) {
     await runGh(['api', '--method', 'PATCH', `repos/${owner}/${repo}/issues/comments/${mine.id}`, '-f', `body=${body}`]);
     return;

@@ -37,12 +37,17 @@ jobs:
     # Cost guard only: the gate independently re-verifies the live review
     # state, head SHA, and attestation through gh — this condition just
     # avoids spending a full run on comment-only review events. The
-    # pull_request triggers (opened/reopened/synchronize) and the
-    # dismissed/edited review events run unconditionally: a head change or a
-    # revoked/revised approval must produce a fresh gate result so a stale
-    # PASS cannot outlive the state it attested (the gate then BLOCKS on the
-    # no-longer-APPROVED review decision rather than trusting the prior run).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || github.event.action == 'edited' }}
+    # pull_request triggers (opened/reopened/synchronize), a dismissed
+    # approval, a newly-submitted approval, and an EDITED approval all run:
+    # a head change or a revoked/revised approval must produce a fresh gate
+    # result so a stale PASS cannot outlive the state it attested (the gate
+    # then BLOCKS on the no-longer-APPROVED review decision rather than
+    # trusting the prior run). The edited clause is constrained to approvals:
+    # an edited approval may have its attestation-marker body changed, which
+    # must invalidate the gate, but an edited NON-approval (a comment-only
+    # review edit) is unchanged state and has nothing to invalidate — running
+    # the full gate on it is pure cost.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head

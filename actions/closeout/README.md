@@ -114,7 +114,7 @@ jobs:
     # unconditionally: a head change or a revoked/revised approval must
     # produce a fresh gate result (the gate then BLOCKS on the
     # no-longer-APPROVED review decision rather than trusting the prior run).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || github.event.action == 'edited' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head

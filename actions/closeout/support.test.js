@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { mkdtempSync, readFileSync: readFs, writeFileSync: writeFs } = require('node:fs');
+const { mkdtempSync, readFileSync: readFs, symlinkSync, writeFileSync: writeFs } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
@@ -284,6 +284,30 @@ test('upsertPrComment PATCHes only the action-authored marker comment and POSTs 
   assert.ok(posts[1].includes('POST'), 'attacker-only marker comments are ignored: POST a new one');
 });
 
+test('upsertPrComment PATCHes the NEWEST marker comment when duplicates exist', async () => {
+  // Regression for the oldest-vs-newest selection bug: with two action-
+  // authored marker comments (from rerun races, prior duplication, or a
+  // drive-by bot comment), the upsert must PATCH the newest (largest id) so
+  // it converges on one current comment rather than pinning the oldest
+  // stale one forever. GitHub comment ids are globally monotonic.
+  const bot = { login: 'github-actions[bot]', type: 'Bot' };
+  const calls = [];
+  const existing = [[
+    { id: 7, body: `${ACTION_MARKER}\nold`, user: bot },
+    { id: 42, body: `${ACTION_MARKER}\nstale duplicate`, user: bot },
+  ]];
+  await upsertPrComment({
+    context: { owner: 'o', repo: 'r', prNumber: 5 },
+    body: `${ACTION_MARKER}\nnew`,
+    runGh: async (args) => { calls.push(args); return args.includes('--method') ? { id: 42 } : existing; },
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1].join(' ').includes('issues/comments/42'),
+    'PATCH targets the NEWEST (largest id) marker comment, not the oldest');
+  assert.ok(!calls[1].join(' ').includes('issues/comments/7'),
+    'the older duplicate is not the PATCH target');
+});
+
 const makeTempDir = () => mkdtempSync(path.join(tmpdir(), 'closeout-action-'));
 
 test('writeOutputs appends sanitized single-line name=value pairs', () => {
@@ -487,6 +511,35 @@ test('assertOutputOutsideWorkspace rejects inside-workspace paths before any wri
   // and the ancestor realpath check confirms it stays outside the workspace.
   assert.doesNotThrow(
     () => assertOutputOutsideWorkspace({ outputDir: path.join(outside, 'new-evidence'), workspace }),
+  );
+});
+
+test('assertOutputOutsideWorkspace rejects an inside path reached through a symlinked workspace root', () => {
+  // Regression for the symlinked-workspace bypass: when GITHUB_WORKSPACE is a
+  // symlink, the physical containment check must compare the realpathed
+  // output against the realpathed ROOT, not the logical root. Without that,
+  // /linked-workspace/evidence (logical) maps to /real/repo/evidence
+  // (physical) but the old logical root /linked-workspace hides the
+  // containment. Creating a symlink requires elevated privileges on some
+  // Windows hosts; skip honestly rather than fail when the platform forbids it.
+  const realWorkspace = makeTempDir();
+  const linkedWorkspace = path.join(tmpdir(), `closeout-link-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    symlinkSync(realWorkspace, linkedWorkspace, 'dir');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EEXIST' || error.code === 'EACCES') {
+      // Platform forbids symlink creation without developer mode/admin — the
+      // regression is covered by the realpath-pair logic; skip the live test.
+      return;
+    }
+    throw error;
+  }
+  // An output dir physically inside the real workspace, addressed via the
+  // symlinked workspace root, must be rejected by the physical check.
+  const outputDir = path.join(linkedWorkspace, 'evidence');
+  assert.throws(
+    () => assertOutputOutsideWorkspace({ outputDir, workspace: linkedWorkspace }),
+    /must be outside the repository workspace/,
   );
 });
 
