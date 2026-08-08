@@ -10,8 +10,8 @@
   "engineChecks": [
     {
       "id": "git-diff-check",
-      "label": "Whitespace/error check on PR diff",
-      "command": "git diff --check",
+      "label": "Whitespace/error check on the committed PR range",
+      "command": "git diff --check origin/${GITHUB_BASE_REF:-main}...HEAD",
       "baselineSafe": true
     },
     {

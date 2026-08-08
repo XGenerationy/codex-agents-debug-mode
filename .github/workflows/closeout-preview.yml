@@ -37,3 +37,10 @@ jobs:
         uses: ./actions/closeout
         with:
           run: plan
+          # Match the enforcing gate's mode and matrix so the preview's
+          # attestation marker is digest-compatible with run: full. The
+          # attestation binds to the resolved check matrix and mode; a strict-
+          # mode preview would emit a marker the engine-mode gate can never
+          # accept, leaving every preview's attestation field stuck on absent.
+          mode: engine
+          config: .github/closeout-engine.json

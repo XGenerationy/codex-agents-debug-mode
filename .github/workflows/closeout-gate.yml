@@ -54,13 +54,14 @@ jobs:
       - name: Check out reviewed head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          # Check out the PR head BRANCH ref (not the bare SHA) on PR/review
-          # events: a bare-SHA checkout leaves HEAD detached, and the gate's
-          # argument-less `gh pr view` cannot resolve the PR without a branch.
-          # The branch ref still points at the exact attested head commit; the
-          # gate independently re-verifies the live head via gh and BLOCKS
-          # stale snapshots. workflow_dispatch falls back to github.ref.
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          # Check out the PR head SHA — fork-safe (head.ref names the fork's
+          # branch, which is absent from the base repo and would fail checkout
+          # for fork PRs). The gate's argument-less `gh pr view` resolves the
+          # PR from the Actions event context even though HEAD is detached, so
+          # detached HEAD is not a problem here. The gate independently
+          # re-verifies the live head via gh and BLOCKS stale snapshots.
+          # workflow_dispatch falls back to github.ref.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
           fetch-depth: 0
           # Do NOT persist the checkout's extra git credentials into the
           # local config: the full engine matrix then executes PR-controlled

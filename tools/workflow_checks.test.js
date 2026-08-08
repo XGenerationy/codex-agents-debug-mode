@@ -98,6 +98,21 @@ test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)'
   assert.match(mapViolations[0].ref, /flow-style/);
 });
 
+test('findUnpinnedUses does not false-positive on uses appearing in run strings or comments', () => {
+  // FLOW_USES must only match a { that starts a YAML flow-mapping value
+  // (preceded by `- `, `: `, or `[`), not a `{uses:` that appears inside a
+  // run: string value or a comment — those are text, not YAML keys.
+  const runString = 'run: echo "{uses: foo@bar}"\n';
+  const comment = '# this {uses: something} is a comment\n';
+  const runMultiline = 'run: |\n  echo "{uses: baz} is just text"\n';
+  for (const text of [runString, comment, runMultiline]) {
+    assert.deepEqual(findUnpinnedUses(text), [],
+      `expected no violation for text that is not a YAML flow uses key: ${text.trim()}`);
+  }
+  // A real flow-sequence uses IS still caught (the { follows [).
+  assert.equal(findUnpinnedUses('steps: [{uses: owner/action@main}]\n').length, 1);
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

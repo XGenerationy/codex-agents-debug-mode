@@ -475,7 +475,12 @@ const runSubcommand = async ({
   const eventPayload = event ?? readEventPayload(env);
   const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
   assertOutputOutsideWorkspace({ outputDir, workspace: env.GITHUB_WORKSPACE });
-  mkdirSync(outputDir, { recursive: true });
+  // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
+  // discipline: the evidence dir can hold unredacted runner paths / base refs
+  // before the CLI's own redaction runs, and on a multi-user self-hosted
+  // runner the default umask (typically 0755) would expose them. The CLI
+  // re-applies its own owner-only perms when it takes the directory.
+  mkdirSync(outputDir, { recursive: true, mode: 0o700 });
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);
