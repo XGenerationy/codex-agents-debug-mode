@@ -120,6 +120,6 @@ const findUnpinnedUses = (content) => {
  * @param {string} content workflow YAML text.
  * @returns {boolean}
  */
-const hasTopLevelPermissions = (content) => /^permissions:(\s|$)/m.test(String(content ?? ''));
+const hasTopLevelPermissions = (content) => /^(['"]?)permissions\1:(\s|$)/m.test(String(content ?? ''));
 
 module.exports = { findUnpinnedUses, hasTopLevelPermissions };

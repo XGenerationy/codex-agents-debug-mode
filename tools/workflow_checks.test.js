@@ -123,6 +123,10 @@ test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
   assert.equal(hasTopLevelPermissions('jobs:\n  a:\n    permissions:\n      contents: read\n'), false);
   assert.equal(hasTopLevelPermissions('name: x\n'), false);
+  // A quoted top-level key ("permissions" or 'permissions') is valid YAML and
+  // must be recognized identically to the bare form.
+  assert.equal(hasTopLevelPermissions('"permissions": {contents: read}\n'), true);
+  assert.equal(hasTopLevelPermissions("'permissions': {contents: read}\n"), true);
 });
 
 test('the real validator passes on this repository (integration)', () => {
