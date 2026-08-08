@@ -8,6 +8,7 @@ const path = require('node:path');
 
 const {
   ACTION_MARKER,
+  assertOutputOutsideWorkspace,
   buildCommentBody,
   capText,
   commentSubcommand,
@@ -454,6 +455,55 @@ test('finishSubcommand exits with the recorded decision', () => {
   assert.equal(finishSubcommand({ outputDir: dir }), 0);
   // Missing state means run never completed: fail closed.
   assert.equal(finishSubcommand({ outputDir: makeTempDir() }), 3);
+});
+
+test('assertOutputOutsideWorkspace rejects inside-workspace paths before any write', () => {
+  const workspace = makeTempDir();
+  // A path inside the workspace root (including the workspace itself) is rejected.
+  assert.throws(
+    () => assertOutputOutsideWorkspace({ outputDir: path.join(workspace, 'evidence'), workspace }),
+    /must be outside the repository workspace/,
+  );
+  assert.throws(
+    () => assertOutputOutsideWorkspace({ outputDir: workspace, workspace }),
+    /must be outside the repository workspace/,
+  );
+  // A relative path resolved against the workspace root is rejected when it
+  // lands inside it. `output-dir: .` in action.yml resolves under the cwd,
+  // which is GITHUB_WORKSPACE on the runner.
+  assert.throws(
+    () => assertOutputOutsideWorkspace({ outputDir: '.', workspace }),
+    /must be outside the repository workspace/,
+  );
+  // An escape attempt via `..` from inside the workspace is rejected too.
+  assert.throws(
+    () => assertOutputOutsideWorkspace({ outputDir: path.join(workspace, 'sub', '..', 'ev'), workspace }),
+    /must be outside the repository workspace/,
+  );
+  // A genuinely outside path (a sibling temp dir) is accepted.
+  const outside = makeTempDir();
+  assert.doesNotThrow(() => assertOutputOutsideWorkspace({ outputDir: outside, workspace }));
+  // A not-yet-existing outside path is accepted: the CLI mkdirs it later,
+  // and the ancestor realpath check confirms it stays outside the workspace.
+  assert.doesNotThrow(
+    () => assertOutputOutsideWorkspace({ outputDir: path.join(outside, 'new-evidence'), workspace }),
+  );
+});
+
+test('runSubcommand rejects an inside-workspace output dir before mkdir or any spawn', async () => {
+  const workspace = makeTempDir();
+  let spawned = false;
+  await assert.rejects(
+    () => runSubcommand({
+      inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+      inputBaseRef: '', config: '', outputDir: path.join(workspace, 'evidence'), artifactName: 'ev',
+      env: { GITHUB_WORKSPACE: workspace },
+      event: {},
+      spawnCli: () => { spawned = true; return { status: 0, stdout: '', stderr: '' }; },
+    }),
+    /must be outside the repository workspace/,
+  );
+  assert.equal(spawned, false, 'the CLI must never be spawned for an inside-workspace output dir');
 });
 
 test('commentSubcommand upserts in PR context and skips with a notice otherwise', async () => {

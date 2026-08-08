@@ -77,7 +77,13 @@ name: Closeout gate
 
 on:
   pull_request_review:
-    types: [submitted]
+    types: [submitted, dismissed, edited]
+  pull_request:
+    # Re-run when the review state that admitted a prior gate result changes
+    # without a fresh `submitted` event: a dismissed approval, an edited
+    # review body, a pushed head change, or a reopened PR must each produce a
+    # fresh gate result so a stale PASS cannot outlive the state it attested.
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
     inputs:
       base-ref:
@@ -103,8 +109,12 @@ jobs:
   gate:
     # Cost guard only: the gate independently re-verifies the live review
     # state, head SHA, and attestation through gh — this condition just
-    # avoids spending a full run on comment-only review events.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.review.state == 'approved' }}
+    # avoids spending a full run on comment-only review events. The
+    # pull_request triggers and the dismissed/edited review events run
+    # unconditionally: a head change or a revoked/revised approval must
+    # produce a fresh gate result (the gate then BLOCKS on the
+    # no-longer-APPROVED review decision rather than trusting the prior run).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || github.event.action == 'edited' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -381,3 +391,33 @@ Two related concurrency notes, matching this repository's own dogfood workflows:
 - Preview workflows (`run: plan`) should keep newest-wins cancellation
   (`cancel-in-progress: true`) — there is no enforcement stake in an outdated preview,
   so cancelling it in favor of the newest push is correct and saves runner time.
+
+## Known limitations
+
+Two integrity gaps follow from packaging the gate as an action that consumes itself,
+and are recorded here honestly rather than hidden. Both require changes to the gate
+CLI (`scripts/pr_closeout_*`), which this action consumes as-is and does not modify;
+they are roadmap items, not accepted risk:
+
+- **The enforcing gate is not self-protecting against a PR that modifies the action.**
+  When a PR changes `actions/closeout/action.yml`, `support.js`, or the gate scripts,
+  the dogfood `closeout-gate.yml` checks out that untrusted PR revision and runs
+  `uses: ./actions/closeout` against it — so such a PR could replace the gate's
+  verdict with an unconditional PASS. A self-protecting gate must invoke an immutable
+  revision of the action (for example, the version merged on the base branch) rather
+  than the PR's local copy. Until then, a PR that touches the action or gate scripts
+  requires a maintainer to re-run the gate from the base branch after review; the
+  `statusCheckRollup` and attestation re-verification still catch every other class of
+  PR. Consumers who pin the action to a tag (`uses: owner/repo/actions/closeout@<ref>`)
+  are not affected — only this repository's own `uses: ./actions/closeout` dogfood is.
+- **The running gate observes its own in-progress check as unresolved.** Near the end
+  of a full run, the gate reads the live PR's `statusCheckRollup` and treats every
+  non-PASS check as a blocker; its own `Closeout gate` check is still `IN_PROGRESS`
+  at that moment, so it blocks itself and can never reach PASS while it is a required
+  check. The CLI's `classifyLivePrState` has no self-exclusion today. The practical
+  workaround while this remains: do not make the `Closeout gate` check a **required**
+  merge gate (require the attestation-bearing review instead, which the gate already
+  re-verifies independently), or run the gate via `workflow_dispatch` after the check
+  has a settled state. A proper fix threads a self-exclusion signal (the running
+  check's name or run id) through `readLivePrState` so the live-state classifier omits
+  the gate's own in-progress check.

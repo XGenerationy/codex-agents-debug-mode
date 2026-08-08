@@ -5,7 +5,7 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -47,6 +47,69 @@ const resolveBaseRef = ({ inputBaseRef = '', env = {}, event = {} } = {}) => {
   const eventBase = event?.pull_request?.base?.ref;
   if (typeof eventBase === 'string' && eventBase) return `origin/${eventBase}`;
   return null;
+};
+
+/**
+ * Rejects an evidence output directory that resolves inside the repository
+ * being validated, BEFORE any mkdir or state write. The gate CLI has its own
+ * `assertOutputOutsideRepository` check, but the plan tier returns before
+ * the CLI reaches it, and the wrapper itself calls `mkdirSync(outputDir)`
+ * and writes `plan.json`/`action-state.json` there — so a caller that sets
+ * `output-dir` to `.` or any workspace-relative path would dirty the
+ * checkout and have those files uploaded as evidence. Both the plain
+ * resolved path and the symlink-resolved physical path are compared against
+ * the workspace root, mirroring the CLI's own symlink defense; a realpath
+ * failure fails closed (the path cannot be proven safe).
+ * @param {{outputDir: string, workspace?: string}} options
+ */
+const assertOutputOutsideWorkspace = ({ outputDir, workspace = '' }) => {
+  const root = workspace || process.cwd();
+  const rootResolved = path.resolve(root);
+  // Relative output paths resolve against the workspace root (on the runner
+  // the cwd IS GITHUB_WORKSPACE), so resolve the candidate there before
+  // comparing — `output-dir: .` must be caught, not interpreted against an
+  // arbitrary local cwd.
+  const resolveAgainstWorkspace = (candidate) => (path.isAbsolute(candidate)
+    ? candidate
+    : path.resolve(rootResolved, candidate));
+  const inside = (candidate) => {
+    const relative = path.relative(rootResolved, resolveAgainstWorkspace(candidate));
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  };
+  if (inside(outputDir)) {
+    throw new Error(`Evidence output directory must be outside the repository workspace: ${outputDir}`);
+  }
+  let physical;
+  try {
+    physical = realpathSync(resolveAgainstWorkspace(outputDir));
+  } catch {
+    // The directory may not exist yet (the CLI mkdirs it later). realpath
+    // the EXISTING ancestor closest to it so a symlink planted on an
+    // ancestor can't smuggle an inside-workspace target past this check.
+    physical = realpathAncestor(resolveAgainstWorkspace(outputDir));
+  }
+  if (inside(physical)) {
+    throw new Error(`Evidence output directory resolves inside the repository workspace (via symlink): ${outputDir}`);
+  }
+};
+
+/**
+ * realpathSync the longest existing ancestor of `candidate` so a symlink on
+ * an existing ancestor is resolved even when the target leaf does not yet
+ * exist. Returns the resolved path of that ancestor, or `candidate` itself
+ * if nothing along the chain exists yet (the CLI's own check still runs and
+ * fails closed for a fully nonexistent absolute path that lands inside).
+ */
+const realpathAncestor = (candidate) => {
+  let current = candidate;
+  while (current && current !== path.dirname(current)) {
+    try {
+      return realpathSync(current);
+    } catch {
+      current = path.dirname(current);
+    }
+  }
+  return candidate;
 };
 
 /**
@@ -391,6 +454,7 @@ const runSubcommand = async ({
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
   const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
+  assertOutputOutsideWorkspace({ outputDir, workspace: env.GITHUB_WORKSPACE });
   mkdirSync(outputDir, { recursive: true });
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);
@@ -589,6 +653,7 @@ if (require.main === module) void main();
 
 module.exports = {
   ACTION_MARKER,
+  assertOutputOutsideWorkspace,
   buildCommentBody,
   capText,
   commentSubcommand,

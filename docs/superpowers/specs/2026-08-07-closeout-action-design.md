@@ -295,6 +295,28 @@ rather than pretending a YAML unit test exists.
   A's consumer note — consumers on non-pnpm stacks need it or preflight blocks).
 - No network access in any test.
 
+## Known limitations (roadmap, recorded in the consumer README)
+
+Two integrity gaps follow from packaging the gate as an action this repo consumes
+itself. Both require changes to the gate CLI (`scripts/pr_closeout_*`), which this
+sub-project consumes as-is and does not modify:
+
+- **Self-trust:** the dogfood `closeout-gate.yml` runs `uses: ./actions/closeout`, so a
+  PR that modifies the action or gate scripts can neuter the enforcing gate that
+  validates it. A self-protecting gate must invoke an immutable revision (the
+  base-branch version) instead of the PR's local copy. Consumers who pin the action to
+  a tag are unaffected; only this repository's `uses: ./` dogfood is. Interim control:
+  a PR touching the action or gate scripts requires a maintainer to re-run the gate
+  from the base branch after review.
+- **Self-observation:** the running gate reads the live PR `statusCheckRollup` and
+  treats every non-PASS check as a blocker; its own `Closeout gate` check is still
+  `IN_PROGRESS` at that point, so it blocks itself and cannot reach PASS while it is a
+  required check. `classifyLivePrState` has no self-exclusion today. A proper fix
+  threads a self-exclusion signal (the running check's name or run id) through
+  `readLivePrState`. Interim control: do not make the `Closeout gate` check a required
+  merge gate — require the attestation-bearing review instead, which the gate
+  re-verifies independently.
+
 ## Success criteria
 
 - A consumer repo can enforce the gate with two short workflows copied from the

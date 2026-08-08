@@ -4,15 +4,22 @@
 // validator. Deliberately regex-level — no YAML parser exists in a
 // zero-dependency repo — and honest about it: these catch the failure modes
 // that matter (a mutable action ref, a workflow with no permissions
-// declaration) without claiming to understand YAML structure. Known escape:
-// a `uses:` written in YAML flow style (`- {uses: x@v1}`) is not matched
-// and therefore not checked — flow style is never written by hand in
-// workflows, and dodging the check requires deliberately reformatting your
-// own file to evade your own validator. Block scalars, aliases, and every
-// other near-miss form measured in review get captured as a garbage ref
-// and flagged, which is the fail-closed direction.
+// declaration) without claiming to understand YAML structure. A `uses:` in
+// YAML flow style (`- {uses: x@v1}`) is matched by FLOW_USES and reported
+// as an unsupported-flow-style violation rather than silently skipped: it
+// is fail-closed (an unchecked ref is never allowed through), and parsing
+// the ref out of a flow mapping without a real YAML parser would risk a
+// bypass of its own. Block scalars, aliases, and every other near-miss form
+// measured in review get captured as a garbage ref and flagged, which is
+// the fail-closed direction.
 
 const USES_LINE = /^\s*(?:-\s+)?uses:\s*(['"]?)([^\s#]+)\1\s*(?:#.*)?$/;
+// A `uses:` key inside a YAML flow mapping. Single-line flow mappings that
+// contain `uses:` are the bypass surface (the block-style USES_LINE cannot
+// reach inside `{ ... }`). `[^}]*` keeps the match on one logical mapping;
+// a multi-line flow mapping is vanishingly rare in workflows and still
+// fails closed via the garbage-ref path.
+const FLOW_USES = /^\s*-?\s*\{[^}]*\buses\s*:/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**
@@ -25,6 +32,13 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
 const findUnpinnedUses = (content) => {
   const violations = [];
   String(content ?? '').split(/\r?\n/).forEach((text, index) => {
+    // A flow-style `uses:` (`- {uses: ...}`) cannot be parsed without a YAML
+    // parser; report it as an unsupported-flow-style violation so the pin
+    // check stays unbypassable rather than silently skipping the entry.
+    if (FLOW_USES.test(text)) {
+      violations.push({ line: index + 1, ref: '(flow-style uses: — rewrite in block style)' });
+      return;
+    }
     const match = USES_LINE.exec(text);
     if (!match) return;
     const ref = match[2];

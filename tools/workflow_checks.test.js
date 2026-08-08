@@ -31,6 +31,27 @@ test('findUnpinnedUses flags tags, branches, and docker refs but not 40-hex pins
   assert.equal(findUnpinnedUses(multi)[0].line, 2);
 });
 
+test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)', () => {
+  // Flow-style `uses:` cannot be parsed without a YAML parser, so the check
+  // fails closed rather than letting the entry through unchecked — pinning a
+  // 40-hex SHA inside the flow mapping does NOT make it pass, because the
+  // validator refuses to trust a ref it cannot reliably extract.
+  const flowUnpinned = '  - {uses: actions/checkout@v6}\n';
+  const flowPinned = '  - {uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10}\n';
+  const flowQuoted = "  - {name: x, uses: 'actions/checkout@v6'}\n";
+  for (const flow of [flowUnpinned, flowPinned, flowQuoted]) {
+    const violations = findUnpinnedUses(flow);
+    assert.equal(violations.length, 1, `expected one flow-style violation for: ${flow.trim()}`);
+    assert.match(violations[0].ref, /flow-style uses/);
+    assert.equal(violations[0].line, 1);
+  }
+  // Mixed document: block-style pinned line passes, flow-style line flags.
+  const mixed = 'steps:\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n  - {uses: someone/thing@main}\n';
+  const mixedViolations = findUnpinnedUses(mixed);
+  assert.equal(mixedViolations.length, 1);
+  assert.equal(mixedViolations[0].line, 3);
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

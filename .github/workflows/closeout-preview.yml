@@ -19,6 +19,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          # Check out the PR HEAD, not GitHub's synthetic merge ref. The
+          # plan records this SHA as headSha and the attestation reader
+          # compares it to the PR's actual headRefOid; the default merge-ref
+          # checkout would make every attestation read stale/absent and
+          # render a marker for a SHA no review can carry. workflow_dispatch
+          # has no PR context, so it falls back to the dispatched ref.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
           # Full history: the gate resolves merge-base and diffs the whole
           # PR range, not just the tip commit.
           fetch-depth: 0
