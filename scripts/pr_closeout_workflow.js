@@ -981,7 +981,15 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     };
   } else {
     try {
-      preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
+      // Plan probes get the same allowlisted child environment as the full
+      // gate (ESSENTIAL_ENV + requiredEnv + safeEnv), not raw process.env:
+      // preflight spawns repository-controlled binaries (e.g. `pnpm prisma
+      // --version`), and forwarding the full step env would expose runner
+      // command files (GITHUB_ENV/GITHUB_OUTPUT) and non-credential-shaped
+      // job secrets to PR-controlled code in a preview advertised as
+      // read-only. The parent gh lookups do not use this env — they read
+      // GH_TOKEN from process.env through their own execFile call.
+      preflight = await d.runPreflight({ repo, config, env: buildWorkflowEnvironment(process.env, config), toolProbes });
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
     }

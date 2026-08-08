@@ -5,7 +5,7 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, writeFileSync } = require('node:fs');
+const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -524,7 +524,7 @@ const runSubcommand = async ({
       reportMode = parsed.mode || '';
       attestation = parsed.admission?.attestation?.status || '';
       const planPath = path.join(outputDir, 'plan.json');
-      writeFileSync(planPath, `${JSON.stringify(parsed)}\n`);
+      writeEvidenceFile(outputDir, 'plan.json', `${JSON.stringify(parsed)}\n`);
       reportJsonPath = planPath;
     } else {
       renderedSummary = [
@@ -617,11 +617,36 @@ const runSubcommand = async ({
       status, mode: reportMode, attestation, 'report-path': reportJsonPath,
     });
   }
-  writeFileSync(path.join(outputDir, STATE_FILE), `${JSON.stringify({
+  writeEvidenceFile(outputDir, STATE_FILE, `${JSON.stringify({
     tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath,
   })}\n`);
   process.stdout.write(`closeout-action: ${decision.reason}\n`);
   return 0;
+};
+
+/**
+ * Writes a file in the evidence dir without ever following an existing symlink
+ * at the destination. A repository-defined check that predicts the output dir
+ * could plant action-state.json (or plan.json) as a symlink to a tracked
+ * workspace file; a plain writeFileSync would follow it and overwrite the
+ * workspace file. lstat first: if the destination exists as a symlink (or
+ * anything that is not a regular file), unlink it — unlinking removes the link
+ * itself, never the target. The fresh write then creates a regular file. The
+ * output dir is owner-only (0o700), so nothing else can re-plant the link in
+ * the unlink/write window.
+ * @param {string} outputDir
+ * @param {string} name - file name inside the evidence dir
+ * @param {string} content
+ */
+const writeEvidenceFile = (outputDir, name, content) => {
+  const target = path.join(outputDir, name);
+  try {
+    const info = lstatSync(target);
+    if (info.isSymbolicLink() || !info.isFile()) unlinkSync(target);
+  } catch {
+    // ENOENT: nothing at the destination — the write creates it fresh.
+  }
+  writeFileSync(target, content);
 };
 
 const readState = (outputDir) => {
@@ -735,5 +760,6 @@ module.exports = {
   runSubcommand,
   upsertPrComment,
   validateActionInputs,
+  writeEvidenceFile,
   writeOutputs,
 };

@@ -1667,6 +1667,39 @@ test('resolvePlanAdmission does not run preflight probes when the working tree i
   assert.match(cleanTreeResult.preflight.evidence, /probe crashed/);
 });
 
+test('resolvePlanAdmission passes the allowlisted env to preflight, not raw process.env', async () => {
+  // The plan-path preflight spawns repository-controlled binaries, so it must
+  // receive the same allowlisted child environment as the full gate (Codex:
+  // runner command files and non-credential secrets must not leak into a
+  // preview advertised as read-only).
+  const secretName = 'PR_CLOSEOUT_PLAN_AMBIENT_TEST';
+  const safeName = 'PR_CLOSEOUT_PLAN_SAFE_TEST';
+  const previous = Object.fromEntries(
+    [secretName, safeName].map((name) => [name, process.env[name]]),
+  );
+  process.env[secretName] = 'must-not-reach-probes';
+  process.env[safeName] = 'allowed-value';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: { safeEnv: [safeName] },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(preflightEnv[secretName], undefined, 'ambient env must not reach plan preflight');
+  assert.equal(preflightEnv[safeName], 'allowed-value', 'config safeEnv must reach plan preflight');
+});
+
 test('planOnly output carries the admission block', async () => {
   const plan = await runCloseoutWorkflow({
     repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},

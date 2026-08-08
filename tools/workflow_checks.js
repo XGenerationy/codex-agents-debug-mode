@@ -49,6 +49,14 @@ const COMMENT_LINE = /^\s*#/;
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
 // flagged. (A real `uses:` key cannot coexist with `run:` on one line.)
 const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:run|entrypoint|shell)\s*:/;
+// Any YAML key line that opens a block scalar (`key: |` or `key: >`),
+// regardless of which key it is. A block scalar's body is raw string content
+// on subsequent more-indented lines — `with.script: |` (github-script bodies
+// commonly contain `{ uses: ... }` JS objects), `env:`, `description:`, etc.
+// Tracking must not be scoped to run/shell/entrypoint only. YAML allows: an
+// explicit indentation indicator (`|2`), a chomping indicator (`|-`, `|+`),
+// a trailing comment (`| # cmt`), and any order of indentation+chomping.
+const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**
@@ -60,17 +68,6 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
  * @param {string} content workflow or action YAML text.
  * @returns {Array<{line: number, ref: string}>}
  */
-// A block-scalar indicator at the end of a key line (`run: |`, `shell: >`).
-// The value continues on subsequent MORE-indented lines until indentation
-// drops back to (or below) the key's level — those continuation lines are
-// raw string content (script text), not YAML keys, and must not be scanned.
-// A block-scalar indicator at the end of a key line (`run: |`, `shell: >`).
-// YAML allows: an explicit indentation indicator after the style (`|2`), a
-// chomping indicator (`|-`, `|+`), a comment after the indicator (`| # cmt`),
-// and any order of indentation+chomping (`|2-`, `|-2`). The value continues
-// on subsequent MORE-indented lines until indentation drops back.
-const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
-
 const findUnpinnedUses = (content) => {
   const violations = [];
   const lines = String(content ?? '').split(/\r?\n/);
@@ -90,13 +87,8 @@ const findUnpinnedUses = (content) => {
     }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;
-    // A `run:` (or `entrypoint:`/`shell:`) line's value is a string scalar —
-    // any `uses:` or braces inside it are script text, not YAML keys.
-    if (RUN_SCALAR_LINE.test(text)) {
-      // If this line opens a BLOCK scalar (run: |), track its body.
-      if (BLOCK_SCALAR_HEADER.test(text)) scalarKeyIndent = indent;
-      return;
-    }
+    // A clean block-style uses: is parsed first — it is the one form whose ref
+    // we can extract and pin-check.
     const match = USES_LINE.exec(text);
     if (match) {
       const ref = match[3];
@@ -104,6 +96,17 @@ const findUnpinnedUses = (content) => {
       if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
       return;
     }
+    // Any key line that opens a block scalar: start tracking its body so a
+    // `uses:` inside the string content is not flagged. Checked after
+    // USES_LINE (a uses: key never opens a scalar in valid workflow YAML —
+    // its value is an action reference) and before SUSPICIOUS_USES.
+    if (BLOCK_SCALAR_HEADER.test(text)) {
+      scalarKeyIndent = indent;
+      return;
+    }
+    // A `run:` (or `entrypoint:`/`shell:`) line whose value is inline (not a
+    // block scalar): any `uses:` or braces inside it are script text.
+    if (RUN_SCALAR_LINE.test(text)) return;
     // The line is not a clean block-style uses: — but does it contain a
     // `uses:` token that looks like a YAML key? If so, flag it fail-closed:
     // the regex cannot confirm the ref is safe, so it must not pass silently.

@@ -23,6 +23,7 @@ const {
   runSubcommand,
   upsertPrComment,
   validateActionInputs,
+  writeEvidenceFile,
   writeOutputs,
 } = require('./support');
 
@@ -323,6 +324,32 @@ test('writeOutputs appends sanitized single-line name=value pairs', () => {
   assert.match(content, /^attestation=absent$/m);
   assert.match(content, /^extra=line1 line2$/m);
   assert.equal(content.split('\n').every((line) => !line.includes('\r')), true);
+});
+
+test('writeEvidenceFile never follows a planted symlink at the destination', () => {
+  // A check that predicts the evidence dir could plant the state file as a
+  // symlink to a tracked workspace file. The write must replace the link with
+  // a regular file, never the link's target.
+  const dir = makeTempDir();
+  const victim = path.join(dir, 'workspace-file.txt');
+  writeFs(victim, 'ORIGINAL CONTENT');
+  const evidenceDir = makeTempDir();
+  const statePath = path.join(evidenceDir, 'action-state.json');
+  try {
+    symlinkSync(victim, statePath, 'file');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return; // no symlink privilege on this host
+    throw error;
+  }
+  writeEvidenceFile(evidenceDir, 'action-state.json', '{"safe":true}\n');
+  // The victim is untouched: the link was replaced, not followed.
+  assert.equal(readFs(victim, 'utf8'), 'ORIGINAL CONTENT');
+  // The destination is now a regular file with the new content.
+  const { lstatSync } = require('node:fs');
+  const info = lstatSync(statePath);
+  assert.equal(info.isSymbolicLink(), false, 'destination must no longer be a symlink');
+  assert.equal(info.isFile(), true);
+  assert.equal(readFs(statePath, 'utf8'), '{"safe":true}\n');
 });
 
 test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
