@@ -90,6 +90,12 @@ test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)'
   const mixedViolations = findUnpinnedUses(mixed);
   assert.equal(mixedViolations.length, 1);
   assert.equal(mixedViolations[0].line, 3);
+  // A flow mapping that is a MAP value (not a sequence item) — e.g. a
+  // reusable-workflow reference `release: {uses: ...}` — is also caught.
+  const mapValueFlow = 'release: {uses: octo-org/repo/.github/workflows/release.yml@main}\n';
+  const mapViolations = findUnpinnedUses(mapValueFlow);
+  assert.equal(mapViolations.length, 1, 'map-value flow uses must be caught');
+  assert.match(mapViolations[0].ref, /flow-style/);
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {

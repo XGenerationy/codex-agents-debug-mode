@@ -420,6 +420,28 @@ test('runSubcommand (full tier) fails closed when report.json is missing despite
   assert.match(outputs, /^status=BLOCKED$/m, 'status output must be BLOCKED when the report is unreadable');
 });
 
+test('runSubcommand (full tier) fails closed when a success record omits the report path', async () => {
+  // A full-tier exit-0 record that claims PASS but carries NO report.json path
+  // is not valid evidence — the gate always writes a report on a real run.
+  // The wrapper must fail closed and report BLOCKED, not propagate success.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const exit = await runSubcommand({
+    inputs: { run: 'full', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    // CLI claims success but the record has no report field at all.
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h' })}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0, 'run never fails the job; finish decides');
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.decision.success, false, 'a success record with no report path must not PASS');
+  assert.equal(state.decision.exitCode, 3);
+  const outputs = readFs(path.join(dir, 'o'), 'utf8');
+  assert.match(outputs, /^status=BLOCKED$/m);
+});
+
 test('runSubcommand (full tier) fails closed when report.json parses but is schema-invalid {}', async () => {
   // A schema-invalid report (parses as JSON but has no overallStatus, e.g. {})
   // must be treated as unreadable: JSON.parse succeeds so the earlier read/

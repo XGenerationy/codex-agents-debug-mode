@@ -20,13 +20,16 @@
 // the key, independent of the value's quote. Whitespace around the colon is
 // tolerated for the same reason. The value's opening/closing quote must match.
 const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s#]+)\2\s*(?:#.*)?$/;
-// A `uses:` key inside a YAML flow mapping. Single-line flow mappings that
-// contain `uses:` are the bypass surface (the block-style USES_LINE cannot
-// reach inside `{ ... }`). The key may be quoted (`{"uses": ...}`) just as in
-// block style. `[^}]*` keeps the match on one logical mapping; a multi-line
-// flow mapping is vanishingly rare in workflows and still fails closed via the
+// A `uses:` key inside a YAML flow mapping. Flow mappings are the bypass
+// surface (the block-style USES_LINE cannot reach inside `{ ... }`). The key
+// may be quoted (`{"uses": ...}`), and the mapping may appear as a sequence
+// item (`- {uses: ...}`), a map value (`release: {uses: ...}`), or nested
+// after other keys (`{name: x, uses: ...}`). The match requires a `{` to be
+// present on the line AND a `uses:` key (optionally quoted) anywhere before
+// the closing `}`, so every flow placement is caught; a multi-line flow
+// mapping is vanishingly rare in workflows and still fails closed via the
 // garbage-ref path.
-const FLOW_USES = /^\s*-?\s*\{[^}]*['"]?uses['"]?\s*:/;
+const FLOW_USES = /\{\s*[^}]*['"]?uses['"]?\s*:/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**

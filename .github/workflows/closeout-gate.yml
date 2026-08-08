@@ -54,10 +54,19 @@ jobs:
       - name: Check out reviewed head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          # The gate re-verifies the live head via gh and BLOCKS stale
-          # snapshots; the checkout must present the head being attested.
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          # Check out the PR head BRANCH ref (not the bare SHA) on PR/review
+          # events: a bare-SHA checkout leaves HEAD detached, and the gate's
+          # argument-less `gh pr view` cannot resolve the PR without a branch.
+          # The branch ref still points at the exact attested head commit; the
+          # gate independently re-verifies the live head via gh and BLOCKS
+          # stale snapshots. workflow_dispatch falls back to github.ref.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
           fetch-depth: 0
+          # Do NOT persist the checkout's extra git credentials into the
+          # local config: the full engine matrix then executes PR-controlled
+          # commands (npm test, etc.), and a malicious check could otherwise
+          # use the saved credential helper to push as the workflow token.
+          persist-credentials: false
 
       - name: Closeout gate
         uses: ./actions/closeout

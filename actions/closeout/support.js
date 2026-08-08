@@ -547,6 +547,11 @@ const runSubcommand = async ({
       } catch { report = {}; reportUnreadable = true; }
       const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(outputDir, parsed.report.markdown || 'report.md');
       try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
+    } else {
+      // A full-tier success record that omits the report.json path entirely is
+      // not valid evidence — the gate always writes a report on a real run, so
+      // its absence means the record is incomplete or hostile.
+      reportUnreadable = true;
     }
     status = report.overallStatus || parsed?.status || 'BLOCKED';
     // Integrity guard: a full tier that exited 0 (claimed success) but whose
