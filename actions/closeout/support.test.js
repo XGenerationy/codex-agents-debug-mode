@@ -412,7 +412,31 @@ test('runSubcommand (full tier) fails closed when report.json is missing despite
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.decision.success, false, 'an unverifiable success record must not PASS');
   assert.equal(state.decision.exitCode, 3);
-  assert.match(state.decision.reason, /report\.json was missing or malformed/);
+  assert.match(state.decision.reason, /report\.json was missing, malformed, or schema-invalid/);
+});
+
+test('runSubcommand (full tier) fails closed when report.json parses but is schema-invalid {}', async () => {
+  // A schema-invalid report (parses as JSON but has no overallStatus, e.g. {})
+  // must be treated as unreadable: JSON.parse succeeds so the earlier read/
+  // parse guard does not fire, but the record is not valid gate evidence, and
+  // an exit-0 PASS record must still fail closed rather than propagate success.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const reportDir = makeTempDir();
+  const bogusReport = path.join(reportDir, 'report.json');
+  writeFs(bogusReport, '{}'); // parses, but no overallStatus
+  const exit = await runSubcommand({
+    inputs: { run: 'full', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h', report: { json: bogusReport, markdown: 'report.md' } })}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0, 'run never fails the job; finish decides');
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.decision.success, false, 'a schema-invalid report must not PASS');
+  assert.equal(state.decision.exitCode, 3);
+  assert.match(state.decision.reason, /schema-invalid/);
 });
 
 test('the comment step sends the comment rendering, not the summary embed', async () => {

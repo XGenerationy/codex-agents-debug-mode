@@ -465,3 +465,19 @@ they are roadmap items, not accepted risk:
   runner. Stripping these runner-control vars from the child environment is a gate-CLI
   change (out of this action's scope); until then, treat engine-mode check commands
   with the same trust discipline as any CI step that shares the runner environment.
+- **Reopening a review thread does not re-trigger the gate.** GitHub fires a
+  `pull_request_review_thread` `unresolved` webhook event when a resolved thread
+  reopens, but that event is **not** a supported GitHub Actions workflow trigger
+  (`on:`), so an event-triggered gate cannot observe it. The head SHA is
+  unchanged, so the prior PASS stays live even though `readLivePrState` would
+  now BLOCK on the unresolved thread. Interim control: a head push, a new/edited
+  review, or a manual `workflow_dispatch` re-runs the gate and catches the
+  reopened thread. A scheduled re-validation sweep is the long-term fix.
+- **Manual dispatch runs have no PR context.** On `workflow_dispatch`,
+  `github.event.pull_request.head.sha` is empty, so the checkout falls back to
+  `github.ref` (the branch the dispatch ran on, typically the base branch), and
+  the gate's argument-less `gh pr view` cannot identify the open PR — the gate
+  BLOCKS safely but cannot complete. Dispatch is intentionally an escape hatch
+  for re-running the gate outside the normal event flow; to attest a specific PR
+  via dispatch, ensure the dispatch runs from the PR's head branch (not the base
+  branch), or add the PR context the event-based triggers carry.

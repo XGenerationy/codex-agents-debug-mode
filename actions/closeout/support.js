@@ -535,20 +535,30 @@ const runSubcommand = async ({
     let reportUnreadable = false;
     if (parsed?.report?.json) {
       reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(outputDir, parsed.report.json);
-      try { report = JSON.parse(readFileSync(reportJsonPath, 'utf8')); } catch { report = {}; reportUnreadable = true; }
+      try {
+        report = JSON.parse(readFileSync(reportJsonPath, 'utf8'));
+        // A record that parses but is not a gate report (e.g. `{}`) is not
+        // valid evidence — the success record claimed a report was written, so
+        // a missing overallStatus means the report is schema-invalid.
+        if (!report || typeof report !== 'object' || Array.isArray(report)
+          || typeof report.overallStatus !== 'string') {
+          report = {}; reportUnreadable = true;
+        }
+      } catch { report = {}; reportUnreadable = true; }
       const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(outputDir, parsed.report.markdown || 'report.md');
       try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
     }
     status = report.overallStatus || parsed?.status || 'BLOCKED';
     // Integrity guard: a full tier that exited 0 (claimed success) but whose
-    // report.json is missing or malformed cannot be trusted — the rendered
-    // status fell back to the CLI's self-reported status or BLOCKED, while the
-    // exit decision would still propagate the CLI's exit 0 as job success.
-    // Fail the decision closed so finish fails the job, mirroring decideExit's
-    // "exit 0 with no parseable record" guard. The Step Summary already shows
-    // the degraded status; this only aligns the exit code with it.
+    // report.json is missing, malformed, or schema-invalid (no overallStatus)
+    // cannot be trusted — the rendered status fell back to the CLI's
+    // self-reported status or BLOCKED, while the exit decision would still
+    // propagate the CLI's exit 0 as job success. Fail the decision closed so
+    // finish fails the job, mirroring decideExit's "exit 0 with no parseable
+    // record" guard. The Step Summary already shows the degraded status; this
+    // only aligns the exit code with it.
     if (reportUnreadable && decision.success) {
-      decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing or malformed' };
+      decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing, malformed, or schema-invalid' };
     }
     reportMode = report.mode || '';
     // The report is the source of truth for the tier label when readable;

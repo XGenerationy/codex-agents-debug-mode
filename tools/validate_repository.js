@@ -249,7 +249,14 @@ const workflowFiles = safetyScanFiles.filter(
 // `.+` (not `[^/]+`): a nested action (actions/group/name/action.yml) is an
 // ordinary layout for a repo that grows a second action, and the day it
 // appears is exactly the day nobody re-reads this census (review, Task 6).
-const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/.+\/action\.ya?ml$/.test(name));
+// `.github/actions/**/action.yml` is a second conventional location for local
+// composite actions; without it, a wrapper under .github/actions/ whose own
+// `uses:` references an unpinned remote action escapes the pin check entirely
+// (the calling workflow's `uses: ./.github/actions/wrapper` is a local
+// reference, exempt by design — the wrapper's OWN uses must be checked).
+const actionMetadataFiles = safetyScanFiles.filter(
+  (name) => /^(?:actions|\.github\/actions)\/.+\/action\.ya?ml$/.test(name),
+);
 for (const file of [...workflowFiles, ...actionMetadataFiles]) {
   // Guard against non-regular files (a tracked symlink here would otherwise be
   // followed by readFileSync and could hang on a FIFO or read outside the

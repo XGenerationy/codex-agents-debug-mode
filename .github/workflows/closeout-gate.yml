@@ -63,4 +63,13 @@ jobs:
         uses: ./actions/closeout
         with:
           run: full
+          # This repo is npm-based (no pnpm lockfile, no Prisma), so the
+          # strict 19-check matrix would BLOCK on missing pnpm/Prisma
+          # preflight. Engine mode runs this repo's authoritative checks
+          # (npm test / npm run validate / scan:suppressions / git diff)
+          # declared in .github/closeout-engine.json instead. The attestation
+          # digest binds to the engine matrix, so a strict-minted attestation
+          # can never satisfy this gate and vice versa.
+          mode: engine
+          config: .github/closeout-engine.json
           base-ref: ${{ github.event.inputs.base-ref || '' }}

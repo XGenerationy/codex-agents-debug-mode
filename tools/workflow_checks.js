@@ -22,10 +22,11 @@
 const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s#]+)\2\s*(?:#.*)?$/;
 // A `uses:` key inside a YAML flow mapping. Single-line flow mappings that
 // contain `uses:` are the bypass surface (the block-style USES_LINE cannot
-// reach inside `{ ... }`). `[^}]*` keeps the match on one logical mapping;
-// a multi-line flow mapping is vanishingly rare in workflows and still
-// fails closed via the garbage-ref path.
-const FLOW_USES = /^\s*-?\s*\{[^}]*\buses\s*:/;
+// reach inside `{ ... }`). The key may be quoted (`{"uses": ...}`) just as in
+// block style. `[^}]*` keeps the match on one logical mapping; a multi-line
+// flow mapping is vanishingly rare in workflows and still fails closed via the
+// garbage-ref path.
+const FLOW_USES = /^\s*-?\s*\{[^}]*['"]?uses['"]?\s*:/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**

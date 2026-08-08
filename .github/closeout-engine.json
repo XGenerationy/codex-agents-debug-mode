@@ -1,0 +1,36 @@
+{
+  "baseRef": "origin/main",
+  "parallelism": 2,
+  "timeoutMs": 900000,
+  "requiredEnv": [],
+  "safeEnv": [],
+  "qualificationSafe": [],
+  "resourceGroups": {},
+  "ports": [],
+  "engineChecks": [
+    {
+      "id": "git-diff-check",
+      "label": "Whitespace/error check on PR diff",
+      "command": "git diff --check",
+      "baselineSafe": true
+    },
+    {
+      "id": "npm-test",
+      "label": "Full repository test suite (node --test)",
+      "command": "npm test",
+      "baselineSafe": true
+    },
+    {
+      "id": "npm-validate",
+      "label": "Repository validator (payload census, safety scan, workflow hygiene)",
+      "command": "npm run validate",
+      "baselineSafe": true
+    },
+    {
+      "id": "scan-suppressions",
+      "label": "Touched-file suppression scan",
+      "command": "npm run scan:suppressions",
+      "baselineSafe": true
+    }
+  ]
+}

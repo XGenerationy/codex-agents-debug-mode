@@ -75,7 +75,11 @@ test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)'
   const flowUnpinned = '  - {uses: actions/checkout@v6}\n';
   const flowPinned = '  - {uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10}\n';
   const flowQuoted = "  - {name: x, uses: 'actions/checkout@v6'}\n";
-  for (const flow of [flowUnpinned, flowPinned, flowQuoted]) {
+  // A quoted uses KEY inside a flow mapping (e.g. {"uses": ...}) is valid YAML
+  // and must not bypass the check — FLOW_USES tolerates an optional quote.
+  const flowQuotedKeyDouble = '  - {"uses": actions/checkout@v6}\n';
+  const flowQuotedKeySingle = "  - {'uses': someone/thing@main}\n";
+  for (const flow of [flowUnpinned, flowPinned, flowQuoted, flowQuotedKeyDouble, flowQuotedKeySingle]) {
     const violations = findUnpinnedUses(flow);
     assert.equal(violations.length, 1, `expected one flow-style violation for: ${flow.trim()}`);
     assert.match(violations[0].ref, /flow-style uses/);
