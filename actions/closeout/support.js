@@ -5,7 +5,7 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } = require('node:fs');
+const { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, writeFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -480,7 +480,22 @@ const runSubcommand = async ({
   // before the CLI's own redaction runs, and on a multi-user self-hosted
   // runner the default umask (typically 0755) would expose them. The CLI
   // re-applies its own owner-only perms when it takes the directory.
+  //
+  // FIX (Qodo #6): mkdirSync's `mode` only applies when the directory is
+  // CREATED — a pre-existing permissive outputDir (plausible on self-hosted
+  // runners where runner.temp is a stable path) would keep its old mode and
+  // expose unredacted evidence. Follow with an explicit chmod so the owner-
+  // only guarantee holds regardless of prior state. Mirrors ensureLogsDirSecured
+  // in pr_closeout_process.js. chmodSync is best-effort: some platforms
+  // (Windows) ignore POSIX directory modes, and a failure to tighten an
+  // existing dir must not crash the run; the CLI re-applies 0o700 downstream.
   mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(outputDir, 0o700);
+  } catch {
+    // Platform ignores directory modes, or a permission issue the CLI will
+    // surface when it takes ownership of the directory.
+  }
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);

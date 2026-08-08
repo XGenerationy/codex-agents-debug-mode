@@ -102,8 +102,9 @@ pre_merge_checks:
       via `git ls-files`, not just PR-touched files — every shipped path is
       vetted every run.)
       It also enforces workflow hygiene: every `uses:` in
-      .github/workflows/*.yml, actions/**/action.yml, and
-      .github/actions/**/action.yml is pinned to a 40-hex commit SHA or is a
+      .github/workflows/*.yml and *.yaml, and in actions/**/action.yml,
+      actions/**/action.yaml, .github/actions/**/action.yml, and
+      .github/actions/**/action.yaml, is pinned to a 40-hex commit SHA or is a
       local ./path reference, and every workflow declares a top-level
       `permissions:` block.
     mode: error
@@ -116,9 +117,12 @@ pre_merge_checks:
       any JavaScript file fails node --check.
       FAIL also when a workflow/action metadata file is a symlink or exceeds
       the size bound, any `uses:` reference is not a 40-hex SHA pin or local
-      ./path (including flow-style, quoted-key, and whitespace-variant YAML
-      forms, which are rejected fail-closed), or any workflow file is missing
-      a top-level `permissions:` block.
+      ./path, a `uses:` appears in YAML flow style (e.g. `- {uses: ...}` or
+      `steps: [{uses: ...}]`, which is rejected fail-closed because the ref
+      cannot be safely parsed without a YAML parser), or any workflow file is
+      missing a top-level `permissions:` block. Quoted-key (`- "uses": ...`)
+      and whitespace-variant block forms (`uses : ref`) ARE supported and
+      enforced like ordinary block `uses:` (must be `./...` or `@<40-hex>`).
     issue_assessment:
       severity: error
 

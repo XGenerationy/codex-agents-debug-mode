@@ -1184,6 +1184,16 @@ const runCloseoutWorkflowBody = async ({
     exclusive: explicitOutputDir,
   });
   const childEnv = buildWorkflowEnvironment(process.env, config);
+  // FIX (Qodo #5): engine check processes run under the allowlisted childEnv,
+  // which drops `GITHUB_BASE_REF`, so engine commands that referenced it
+  // silently fell back to `main` even when the gate ran against a different PR
+  // base. Plumb the already-resolved base ref through a dedicated,
+  // non-secret, repo-derived env var that engine commands can rely on. This
+  // does NOT widen the allowlist for ambient env — it injects one trusted
+  // value derived from `initial.baseRef` (already rev-parsed to a stable ref
+  // by resolveRepositoryState), and the engine command's own `:-origin/main`
+  // fallback keeps it safe for any bare invocation that omits it.
+  childEnv.CLOSEOUT_RESOLVED_BASE_REF = initial.baseRef;
   const execute = d.execute || d.createCommandExecutor({
     repo: initial.repo,
     outputDir: resolvedOutput,

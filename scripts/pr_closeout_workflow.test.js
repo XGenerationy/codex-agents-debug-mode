@@ -320,6 +320,11 @@ test('passes only essential and explicitly configured environment variables to c
       assert.equal(environment[safeName], 'safe-value');
       assert.equal(environment[ambientName], undefined);
       assert.ok(environment.PATH || environment.Path);
+      // Qodo #5 regression: the resolved base ref is plumbed to engine checks
+      // via a dedicated, repo-derived env var so engine commands no longer
+      // silently fall back to `main` when GITHUB_BASE_REF is dropped by the
+      // allowlisted environment.
+      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'origin/main');
     }
   } finally {
     for (const [name, value] of Object.entries(previous)) {
