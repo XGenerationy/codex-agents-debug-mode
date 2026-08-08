@@ -221,6 +221,7 @@ If you opt into `pr-comment: true`, add `pull-requests: write`:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
 ```
 
 `gh` **2.31 or newer** is required on the runner for every PR-context invocation

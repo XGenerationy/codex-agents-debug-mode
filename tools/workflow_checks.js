@@ -64,7 +64,12 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
 // The value continues on subsequent MORE-indented lines until indentation
 // drops back to (or below) the key's level — those continuation lines are
 // raw string content (script text), not YAML keys, and must not be scanned.
-const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>][-+]?[ \t]*$/;
+// A block-scalar indicator at the end of a key line (`run: |`, `shell: >`).
+// YAML allows: an explicit indentation indicator after the style (`|2`), a
+// chomping indicator (`|-`, `|+`), a comment after the indicator (`| # cmt`),
+// and any order of indentation+chomping (`|2-`, `|-2`). The value continues
+// on subsequent MORE-indented lines until indentation drops back.
+const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
 
 const findUnpinnedUses = (content) => {
   const violations = [];
@@ -120,6 +125,6 @@ const findUnpinnedUses = (content) => {
  * @param {string} content workflow YAML text.
  * @returns {boolean}
  */
-const hasTopLevelPermissions = (content) => /^(['"]?)permissions\1:(\s|$)/m.test(String(content ?? ''));
+const hasTopLevelPermissions = (content) => /^(['"]?)permissions\1\s*:(\s|$)/m.test(String(content ?? ''));
 
 module.exports = { findUnpinnedUses, hasTopLevelPermissions };

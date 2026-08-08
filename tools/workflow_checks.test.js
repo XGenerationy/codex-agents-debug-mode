@@ -118,6 +118,21 @@ test('findUnpinnedUses skips block-scalar bodies (run: | and shell: >)', () => {
   assert.equal(v[0].line, 3);
 });
 
+test('findUnpinnedUses handles block-scalar header variants (comment, indent indicator)', () => {
+  // YAML allows a comment after the scalar indicator (run: | # cmt) and an
+  // explicit indentation indicator (run: |2). Both must open a scalar whose
+  // body is skipped — otherwise the body's {uses:...} false-positives.
+  const withComment = '  - run: | # build\n    echo "{uses: foo@bar}"\n';
+  assert.deepEqual(findUnpinnedUses(withComment), [],
+    'scalar header with trailing comment must skip body');
+  const withIndent = '  - run: |2\n    echo "{uses: foo@bar}"\n';
+  assert.deepEqual(findUnpinnedUses(withIndent), [],
+    'scalar header with indent indicator must skip body');
+  const withIndentChomp = '  - run: |2-\n    echo "{uses: foo@bar}"\n';
+  assert.deepEqual(findUnpinnedUses(withIndentChomp), [],
+    'scalar header with indent+chomp indicator must skip body');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
@@ -127,6 +142,9 @@ test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   // must be recognized identically to the bare form.
   assert.equal(hasTopLevelPermissions('"permissions": {contents: read}\n'), true);
   assert.equal(hasTopLevelPermissions("'permissions': {contents: read}\n"), true);
+  // Whitespace before the colon (permissions :) is valid YAML — consistent
+  // with the whitespace tolerance USES_LINE already applies to uses: keys.
+  assert.equal(hasTopLevelPermissions('permissions :\n  contents: read\n'), true);
 });
 
 test('the real validator passes on this repository (integration)', () => {
