@@ -413,6 +413,11 @@ test('runSubcommand (full tier) fails closed when report.json is missing despite
   assert.equal(state.decision.success, false, 'an unverifiable success record must not PASS');
   assert.equal(state.decision.exitCode, 3);
   assert.match(state.decision.reason, /report\.json was missing, malformed, or schema-invalid/);
+  // The status output must read BLOCKED, not PASS: the CLI record claimed
+  // PASS but the report is unreadable, so the rendered status must agree with
+  // the failing exit decision rather than contradicting it.
+  const outputs = readFs(path.join(dir, 'o'), 'utf8');
+  assert.match(outputs, /^status=BLOCKED$/m, 'status output must be BLOCKED when the report is unreadable');
 });
 
 test('runSubcommand (full tier) fails closed when report.json parses but is schema-invalid {}', async () => {

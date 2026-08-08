@@ -98,6 +98,9 @@ pre_merge_checks:
       walks the payload tree without following symlinks, fails closed on
       missing entries, scans touched files for public-safety patterns, and
       runs node --check on every JavaScript file.
+      (The public-safety and syntax scans cover ALL tracked repository files
+      via `git ls-files`, not just PR-touched files — every shipped path is
+      vetted every run.)
       It also enforces workflow hygiene: every `uses:` in
       .github/workflows/*.yml, actions/**/action.yml, and
       .github/actions/**/action.yml is pinned to a 40-hex commit SHA or is a

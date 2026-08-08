@@ -551,14 +551,15 @@ const runSubcommand = async ({
     status = report.overallStatus || parsed?.status || 'BLOCKED';
     // Integrity guard: a full tier that exited 0 (claimed success) but whose
     // report.json is missing, malformed, or schema-invalid (no overallStatus)
-    // cannot be trusted — the rendered status fell back to the CLI's
-    // self-reported status or BLOCKED, while the exit decision would still
-    // propagate the CLI's exit 0 as job success. Fail the decision closed so
-    // finish fails the job, mirroring decideExit's "exit 0 with no parseable
-    // record" guard. The Step Summary already shows the degraded status; this
-    // only aligns the exit code with it.
-    if (reportUnreadable && decision.success) {
-      decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing, malformed, or schema-invalid' };
+    // cannot be trusted. Fail the decision closed AND force the status output
+    // to BLOCKED — otherwise status could read PASS (from parsed.status) while
+    // finish fails the job, so the Step Summary/output and the exit code would
+    // disagree. Mirrors decideExit's "exit 0 with no parseable record" guard.
+    if (reportUnreadable) {
+      if (decision.success) {
+        decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing, malformed, or schema-invalid' };
+      }
+      status = 'BLOCKED';
     }
     reportMode = report.mode || '';
     // The report is the source of truth for the tier label when readable;
