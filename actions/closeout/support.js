@@ -483,7 +483,7 @@ const runSubcommand = async ({
   const result = spawnCli(args, { env });
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);
-  const decision = decideExit({ run, cliExitCode, parsed });
+  let decision = decideExit({ run, cliExitCode, parsed });
   // A real spawn failure (ENOENT, maxBuffer) must be named, not reported as
   // a generic missing-JSON — the operator cannot diagnose "no plan JSON"
   // when the actual cause is a missing CLI (review, Task 4 round 2).
@@ -532,13 +532,24 @@ const runSubcommand = async ({
   } else {
     let report = {};
     let reportMarkdown = '';
+    let reportUnreadable = false;
     if (parsed?.report?.json) {
       reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(outputDir, parsed.report.json);
-      try { report = JSON.parse(readFileSync(reportJsonPath, 'utf8')); } catch { report = {}; }
+      try { report = JSON.parse(readFileSync(reportJsonPath, 'utf8')); } catch { report = {}; reportUnreadable = true; }
       const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(outputDir, parsed.report.markdown || 'report.md');
       try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
     }
     status = report.overallStatus || parsed?.status || 'BLOCKED';
+    // Integrity guard: a full tier that exited 0 (claimed success) but whose
+    // report.json is missing or malformed cannot be trusted — the rendered
+    // status fell back to the CLI's self-reported status or BLOCKED, while the
+    // exit decision would still propagate the CLI's exit 0 as job success.
+    // Fail the decision closed so finish fails the job, mirroring decideExit's
+    // "exit 0 with no parseable record" guard. The Step Summary already shows
+    // the degraded status; this only aligns the exit code with it.
+    if (reportUnreadable && decision.success) {
+      decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing or malformed' };
+    }
     reportMode = report.mode || '';
     // The report is the source of truth for the tier label when readable;
     // when it is NOT, the action still knows the tier it INVOKED — an

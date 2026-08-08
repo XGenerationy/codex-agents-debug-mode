@@ -390,6 +390,31 @@ test('runSubcommand end-to-end (full tier): reads report.json/report.md and reco
   assert.match(state.renderedComment, /Closeout gate result/);
 });
 
+test('runSubcommand (full tier) fails closed when report.json is missing despite a success record', async () => {
+  // Integrity guard: a full tier that exited 0 (claimed success) but whose
+  // report.json is missing/malformed cannot be trusted. The exit decision
+  // must fail closed so finish fails the job — the rendered summary already
+  // shows BLOCKED; the exit code must not contradict it by passing.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  // Point at a report.json that does NOT exist; JSON.parse/readFileSync throw.
+  const bogusReport = path.join(dir, 'no-such-report.json');
+  const exit = await runSubcommand({
+    inputs: { run: 'full', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    // CLI claims success (exit 0) with a status PASS record pointing at a
+    // nonexistent report.json — the wrapper must not propagate exit 0.
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h', report: { json: bogusReport, markdown: 'report.md' } })}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0, 'run never fails the job; finish decides');
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.decision.success, false, 'an unverifiable success record must not PASS');
+  assert.equal(state.decision.exitCode, 3);
+  assert.match(state.decision.reason, /report\.json was missing or malformed/);
+});
+
 test('the comment step sends the comment rendering, not the summary embed', async () => {
   const dir = makeTempDir();
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({

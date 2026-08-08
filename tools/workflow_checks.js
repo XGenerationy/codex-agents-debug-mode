@@ -9,11 +9,13 @@
 // as an unsupported-flow-style violation rather than silently skipped: it
 // is fail-closed (an unchecked ref is never allowed through), and parsing
 // the ref out of a flow mapping without a real YAML parser would risk a
-// bypass of its own. Block scalars, aliases, and every other near-miss form
-// measured in review get captured as a garbage ref and flagged, which is
-// the fail-closed direction.
+// bypass of its own. Whitespace around the colon is tolerated because the
+// YAML spec permits it (`uses : ref` is the same key as `uses: ref`) and
+// the ref still extracts cleanly. Block scalars, aliases, and every other
+// near-miss form measured in review get captured as a garbage ref and
+// flagged, which is the fail-closed direction.
 
-const USES_LINE = /^\s*(?:-\s+)?uses:\s*(['"]?)([^\s#]+)\1\s*(?:#.*)?$/;
+const USES_LINE = /^\s*(?:-\s+)?uses\s*:\s*(['"]?)([^\s#]+)\1\s*(?:#.*)?$/;
 // A `uses:` key inside a YAML flow mapping. Single-line flow mappings that
 // contain `uses:` are the bypass surface (the block-style USES_LINE cannot
 // reach inside `{ ... }`). `[^}]*` keeps the match on one logical mapping;

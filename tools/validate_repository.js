@@ -251,6 +251,31 @@ const workflowFiles = safetyScanFiles.filter(
 // appears is exactly the day nobody re-reads this census (review, Task 6).
 const actionMetadataFiles = safetyScanFiles.filter((name) => /^actions\/.+\/action\.ya?ml$/.test(name));
 for (const file of [...workflowFiles, ...actionMetadataFiles]) {
+  // Guard against non-regular files (a tracked symlink here would otherwise be
+  // followed by readFileSync and could hang on a FIFO or read outside the
+  // repo) and oversize files, mirroring scanFileForPublicSafety's defenses.
+  // The safety scan above already records such a target as a failure; this
+  // guard ensures the hygiene loop fails deterministically instead of
+  // following the same problematic path that the safety scan refused.
+  let info;
+  try {
+    info = lstatSync(path.join(root, file));
+  } catch (error) {
+    failures.push(`Workflow hygiene target cannot be inspected: ${file}: ${error.message}`);
+    continue;
+  }
+  if (info.isSymbolicLink()) {
+    failures.push(`Workflow hygiene target must not be a symlink: ${file}`);
+    continue;
+  }
+  if (!info.isFile()) {
+    failures.push(`Workflow hygiene target is not a regular file: ${file}`);
+    continue;
+  }
+  if (info.size > MAX_PAYLOAD_FILE_BYTES) {
+    failures.push(`Workflow hygiene file exceeds validator size bound: ${file}`);
+    continue;
+  }
   let content;
   try {
     content = readFileSync(path.join(root, file), 'utf8');

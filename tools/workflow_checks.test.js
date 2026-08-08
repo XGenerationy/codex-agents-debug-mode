@@ -31,6 +31,24 @@ test('findUnpinnedUses flags tags, branches, and docker refs but not 40-hex pins
   assert.equal(findUnpinnedUses(multi)[0].line, 2);
 });
 
+test('findUnpinnedUses catches whitespace-variant uses keys (YAML allows spaces around the colon)', () => {
+  // The YAML spec permits `uses : ref` (spaces around the colon); GitHub
+  // interprets it as the `uses` key, so the validator must not skip it.
+  const before = '  - uses : actions/checkout@v6\n';
+  const both = '  - uses  :  someone/thing@main\n';
+  for (const variant of [before, both]) {
+    const violations = findUnpinnedUses(variant);
+    assert.equal(violations.length, 1, `expected one violation for: ${variant.trim()}`);
+    assert.ok(violations[0].ref.includes('@'));
+  }
+  // A whitespace-variant PINNED ref still passes (the colon tolerance must
+  // not start false-flagging valid 40-hex pins).
+  assert.deepEqual(
+    findUnpinnedUses('  - uses : actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'),
+    [],
+  );
+});
+
 test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)', () => {
   // Flow-style `uses:` cannot be parsed without a YAML parser, so the check
   // fails closed rather than letting the entry through unchecked — pinning a

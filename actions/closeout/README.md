@@ -57,6 +57,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          # Check out the PR HEAD, not GitHub's synthetic merge ref — the plan
+          # records this SHA and the attestation reader compares it to the PR's
+          # actual headRefOid. workflow_dispatch has no PR context, so it falls
+          # back to the dispatched ref.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
           # Full history: the gate resolves merge-base and diffs the whole
           # PR range, not just the tip commit.
           fetch-depth: 0
@@ -83,7 +88,7 @@ on:
     # without a fresh `submitted` event: a dismissed approval, an edited
     # review body, a pushed head change, or a reopened PR must each produce a
     # fresh gate result so a stale PASS cannot outlive the state it attested.
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
   workflow_dispatch:
     inputs:
       base-ref:
@@ -114,7 +119,7 @@ jobs:
     # unconditionally: a head change or a revoked/revised approval must
     # produce a fresh gate result (the gate then BLOCKS on the
     # no-longer-APPROVED review decision rather than trusting the prior run).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -246,6 +251,17 @@ check matrix and mode. Change the matrix, change the mode, or push a new head co
 and the existing attestation stops matching. `run: full` independently re-verifies all
 of this against the live PR state through `gh` — it never trusts the checked-out
 snapshot alone.
+
+**An ordinary approval is not enough.** The review's body must contain the exact
+`PR-CLOSEOUT-ATTESTATION` marker line that `run: plan` (or `run: full` on a prior
+head) emits for the current base, head, and config digest — bound to all three, so a
+review approving one commit or config cannot be replayed onto another. The plan's Step
+Summary and its `attestation: absent`/`present` output tell you whether a matching
+attestation exists; when it is `absent`, the plan JSON's `gateAttestationRequired`
+field carries the verbatim marker line the approving reviewer must paste into their
+review body. The reviewer must be someone other than the PR author and must hold
+repository write permission (`OWNER`/`MEMBER`/`COLLABORATOR` with proven `WRITE`+);
+`classifyGateAttestation` rejects self-approval and unauthorized authors.
 
 `run: plan` surfaces the live attestation lookup as one of four states, both as the
 `attestation` output and as the `admission.attestation.status` field of the captured
@@ -379,6 +395,17 @@ default that varies per invocation. Miss this and the failure surfaces as an
 artifact-upload error, not a gate error — it reads as unrelated CI infrastructure
 trouble rather than anything this action or the gate did.
 
+The same caveat applies to `output-dir`, and it is the more dangerous of the two:
+two invocations in the same job that both omit `output-dir` share
+`${{ runner.temp }}/closeout-evidence`, so the second run's `action-state.json`
+overwrites the first's, and the first's evidence is uploaded before the
+overwrite only by step ordering. The composite action's input defaults cannot
+embed expressions (no `${{ matrix.os }}`, no step name), so it cannot compute a
+unique per-step path for you. **When you invoke this action more than once in one
+job, give each invocation a distinct `output-dir` too** (a runner-temp-relative
+path is outside the repository and satisfies the evidence-location requirement),
+in addition to a distinct `artifact-name`.
+
 Two related concurrency notes, matching this repository's own dogfood workflows:
 
 - Gate workflows (`run: full`) should set `cancel-in-progress: false` on their
@@ -421,3 +448,20 @@ they are roadmap items, not accepted risk:
   has a settled state. A proper fix threads a self-exclusion signal (the running
   check's name or run id) through `readLivePrState` so the live-state classifier omits
   the gate's own in-progress check.
+- **Event triggers do not cover a base-branch advance.** The attestation is
+  base-SHA-bound, so if the base branch receives a new commit while a PR's head is
+  unchanged, the prior attestation no longer matches and the gate should re-run.
+  GitHub fires no `pull_request` event for a base-only advance (only `synchronize`
+  on head changes), so an event-triggered gate cannot observe it without polling.
+  Interim control: re-run the gate via `workflow_dispatch` (or re-push/re-approve to
+  fire a covered event) after a base-branch merge that affects an open, already-gated
+  PR. A scheduled re-validation sweep is the natural long-term fix.
+- **Runner command-file env vars reach repository-defined validation commands.** In
+  `mode: engine`, the gate CLI's `buildChildEnvironment` passes `GITHUB_PATH`,
+  `GITHUB_ENV`, and `GITHUB_OUTPUT` through to repository-defined commands (they are
+  not credential-shaped, so the sensitive-name filter does not strip them). Those
+  paths live in the isolated `RUNNER_TEMP`/workspace and carry no credentials, but a
+  malicious engine check could write to `GITHUB_PATH`/`GITHUB_ENV` to alter the
+  runner. Stripping these runner-control vars from the child environment is a gate-CLI
+  change (out of this action's scope); until then, treat engine-mode check commands
+  with the same trust discipline as any CI step that shares the runner environment.

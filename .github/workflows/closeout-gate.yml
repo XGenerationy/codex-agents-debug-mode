@@ -4,13 +4,14 @@ on:
   pull_request_review:
     types: [submitted, dismissed, edited]
   pull_request:
-    # Re-run when the review state that admitted a prior gate result changes
-    # without a fresh `submitted` event: a `CHANGES_REQUESTED` submission is
-    # already filtered by the job condition below, but a review dismissal
-    # (dismissed) or an edited approval body lands via pull_request_review,
-    # while a pushed head change or a re-opened PR must re-trigger the gate
+    # Re-run when the review/base state that admitted a prior gate result
+    # changes without a fresh approval: a review dismissal or an edited
+    # approval body lands via pull_request_review; a pushed head change
+    # (synchronize), a re-opened PR (reopened), a newly-opened PR (opened),
+    # or a RETARGET to a different base branch (edited — the attestation is
+    # base-bound, so a retarget invalidates it) all must re-trigger the gate
     # so a stale PASS never outlives the state it attested.
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
   workflow_dispatch:
     inputs:
       base-ref:
@@ -36,18 +37,15 @@ jobs:
   gate:
     # Cost guard only: the gate independently re-verifies the live review
     # state, head SHA, and attestation through gh — this condition just
-    # avoids spending a full run on comment-only review events. The
-    # pull_request triggers (opened/reopened/synchronize), a dismissed
-    # approval, a newly-submitted approval, and an EDITED approval all run:
-    # a head change or a revoked/revised approval must produce a fresh gate
-    # result so a stale PASS cannot outlive the state it attested (the gate
-    # then BLOCKS on the no-longer-APPROVED review decision rather than
-    # trusting the prior run). The edited clause is constrained to approvals:
-    # an edited approval may have its attestation-marker body changed, which
-    # must invalidate the gate, but an edited NON-approval (a comment-only
-    # review edit) is unchanged state and has nothing to invalidate — running
-    # the full gate on it is pure cost.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
+    # avoids spending a full run on COMMENT-only review events. It runs on:
+    # any pull_request activity (head change, reopen, base retarget), a
+    # newly-submitted approval, a dismissed approval, an EDITED approval
+    # (its attestation-marker body may have changed), and a newly-submitted
+    # CHANGES_REQUESTED review (a follow-up changes-requested from the
+    # attesting reviewer flips reviewDecision and must produce a fresh FAIL
+    # gate result rather than leaving the prior PASS live). Pure comment
+    # reviews and comment-only review edits do NOT run — unchanged state.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
