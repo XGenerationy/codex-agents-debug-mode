@@ -15,7 +15,11 @@
 // near-miss form measured in review get captured as a garbage ref and
 // flagged, which is the fail-closed direction.
 
-const USES_LINE = /^\s*(?:-\s+)?uses\s*:\s*(['"]?)([^\s#]+)\1\s*(?:#.*)?$/;
+// The `uses` key may itself be quoted (`- "uses": ref` is valid YAML and
+// GitHub interprets it as the `uses` key) — allow an optional quote around
+// the key, independent of the value's quote. Whitespace around the colon is
+// tolerated for the same reason. The value's opening/closing quote must match.
+const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s#]+)\2\s*(?:#.*)?$/;
 // A `uses:` key inside a YAML flow mapping. Single-line flow mappings that
 // contain `uses:` are the bypass surface (the block-style USES_LINE cannot
 // reach inside `{ ... }`). `[^}]*` keeps the match on one logical mapping;
@@ -43,7 +47,7 @@ const findUnpinnedUses = (content) => {
     }
     const match = USES_LINE.exec(text);
     if (!match) return;
-    const ref = match[2];
+    const ref = match[3];
     if (ref.startsWith('./')) return;
     if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
   });

@@ -31,6 +31,24 @@ test('findUnpinnedUses flags tags, branches, and docker refs but not 40-hex pins
   assert.equal(findUnpinnedUses(multi)[0].line, 2);
 });
 
+test('findUnpinnedUses catches quoted-key uses forms (YAML allows "uses": and uses:\'ref\')', () => {
+  // The YAML spec allows the key itself to be quoted; GitHub interprets
+  // "uses" / 'uses' as the `uses` key, so the validator must not skip it.
+  const doubleQuotedKey = '  - "uses": actions/checkout@v6\n';
+  const singleQuotedKey = "  - 'uses': someone/thing@main\n";
+  const quotedKeyAndValue = '  - "uses": "actions/checkout@v6"\n';
+  for (const variant of [doubleQuotedKey, singleQuotedKey, quotedKeyAndValue]) {
+    const violations = findUnpinnedUses(variant);
+    assert.equal(violations.length, 1, `expected one violation for: ${variant.trim()}`);
+    assert.ok(violations[0].ref.includes('@'));
+  }
+  // A quoted-key PINNED ref still passes.
+  assert.deepEqual(
+    findUnpinnedUses('  - "uses": actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'),
+    [],
+  );
+});
+
 test('findUnpinnedUses catches whitespace-variant uses keys (YAML allows spaces around the colon)', () => {
   // The YAML spec permits `uses : ref` (spaces around the colon); GitHub
   // interprets it as the `uses` key, so the validator must not skip it.
