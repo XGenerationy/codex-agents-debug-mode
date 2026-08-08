@@ -1969,7 +1969,18 @@ const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) =
         && result.exitCode === 1
         && /collector_port_not_private/.test(result.stderr);
       if (!decisive) continue;
-      await verifyStandIn(claimFile);
+      // The release refused to parse/unlink the stand-in (that is what this
+      // test asserts), so the stand-in should still exist. If it does not,
+      // the child's release ran BEFORE the swap landed (deleted the original
+      // claim, then the poller's rename failed because the target was gone) —
+      // a non-decisive race, not a failure. Retry like any other non-decisive
+      // outcome.
+      try {
+        await verifyStandIn(claimFile);
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        throw error;
+      }
       assert.equal(await readFile(path.join(projectRoot, 'swap-target.txt'), 'utf8'), standInContent);
       return;
     } finally {
