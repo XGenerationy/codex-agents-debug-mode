@@ -114,11 +114,11 @@ jobs:
   gate:
     # Cost guard only: the gate independently re-verifies the live review
     # state, head SHA, and attestation through gh — this condition just
-    # avoids spending a full run on comment-only review events. The
-    # pull_request triggers and the dismissed/edited review events run
-    # unconditionally: a head change or a revoked/revised approval must
-    # produce a fresh gate result (the gate then BLOCKS on the
-    # no-longer-APPROVED review decision rather than trusting the prior run).
+    # avoids spending a full run on comment-only review events. It runs on
+    # any pull_request activity, a submitted approval, a submitted
+    # CHANGES_REQUESTED, any dismissed review, and an edited APPROVAL only
+    # (an edited non-approval is unchanged state). Each of these can
+    # invalidate a prior PASS, so they must produce a fresh gate result.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:

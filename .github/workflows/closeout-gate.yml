@@ -39,12 +39,15 @@ jobs:
     # state, head SHA, and attestation through gh — this condition just
     # avoids spending a full run on COMMENT-only review events. It runs on:
     # any pull_request activity (head change, reopen, base retarget), a
-    # newly-submitted approval, a dismissed approval, an EDITED approval
-    # (its attestation-marker body may have changed), and a newly-submitted
+    # newly-submitted approval, any dismissed review (GitHub only fires
+    # `dismissed` for reviews that held a state, so this re-runs the gate
+    # whenever an attestation-holding approval is dismissed), an EDITED
+    # approval only (its attestation-marker body may have changed; an edited
+    # non-approval is unchanged state), and a newly-submitted
     # CHANGES_REQUESTED review (a follow-up changes-requested from the
     # attesting reviewer flips reviewDecision and must produce a fresh FAIL
     # gate result rather than leaving the prior PASS live). Pure comment
-    # reviews and comment-only review edits do NOT run — unchanged state.
+    # reviews do NOT run — unchanged state.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
