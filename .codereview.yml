@@ -96,11 +96,12 @@ pre_merge_checks:
     description: |
       tools/validate_repository.js must report status:PASS. The validator
       walks the payload tree without following symlinks, fails closed on
-      missing entries, scans touched files for public-safety patterns, runs
-      node --check on every JavaScript file, and enforces workflow hygiene:
-      every `uses:` in .github/workflows/*.yml and actions/**/action.yml
-      (and .github/actions/**/action.yml) is pinned to a 40-hex commit SHA or
-      is a local ./path reference, and every workflow declares a top-level
+      missing entries, scans touched files for public-safety patterns, and
+      runs node --check on every JavaScript file.
+      It also enforces workflow hygiene: every `uses:` in
+      .github/workflows/*.yml, actions/**/action.yml, and
+      .github/actions/**/action.yml is pinned to a 40-hex commit SHA or is a
+      local ./path reference, and every workflow declares a top-level
       `permissions:` block.
     mode: error
     run: npm run validate
@@ -108,12 +109,13 @@ pre_merge_checks:
       PASS requires the validator to exit 0 and print status:PASS with the
       expected payload/javascript file counts. FAIL when any required file is
       missing, a payload entry is a symlink, a JSON file does not parse, a
-      payload file exceeds the size bound, a public-safety pattern matches,
-      any JavaScript file fails node --check, a workflow/action metadata file
-      is a symlink or exceeds the size bound, any `uses:` reference is not a
-      40-hex SHA pin or local ./path (including flow-style, quoted-key, and
-      whitespace-variant YAML forms, which are rejected fail-closed), or any
-      workflow file is missing a top-level `permissions:` block.
+      payload file exceeds the size bound, a public-safety pattern matches, or
+      any JavaScript file fails node --check.
+      FAIL also when a workflow/action metadata file is a symlink or exceeds
+      the size bound, any `uses:` reference is not a 40-hex SHA pin or local
+      ./path (including flow-style, quoted-key, and whitespace-variant YAML
+      forms, which are rejected fail-closed), or any workflow file is missing
+      a top-level `permissions:` block.
     issue_assessment:
       severity: error
 
