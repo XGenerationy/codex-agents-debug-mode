@@ -100,6 +100,24 @@ test('findUnpinnedUses does not false-positive on uses in run strings or comment
   }
 });
 
+test('findUnpinnedUses skips block-scalar bodies (run: | and shell: >)', () => {
+  // A block scalar (run: |, shell: >) continues on subsequent more-indented
+  // lines as raw string content — {uses:...} in the body is script text, not a
+  // YAML key. The scanner must track the scalar's indentation and skip body
+  // lines until indentation drops back.
+  const blockLiteral = 'steps:\n  - run: |\n    echo "{uses: foo@bar}"\n    echo done\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n';
+  assert.deepEqual(findUnpinnedUses(blockLiteral), [],
+    'block-literal body with {uses:...} must not false-positive');
+  const foldedScalar = '  shell: >-\n    printf "{uses: foo@bar}"\n  - uses: ./local\n';
+  assert.deepEqual(findUnpinnedUses(foldedScalar), [],
+    'folded-scalar body with {uses:...} must not false-positive');
+  // After the scalar ends (indentation drops), scanning resumes normally.
+  const resume = '  - run: |\n    echo "{uses: x}"\n  - uses: someone/thing@main\n';
+  const v = findUnpinnedUses(resume);
+  assert.equal(v.length, 1, 'a real uses: after the scalar body IS caught');
+  assert.equal(v[0].line, 3);
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

@@ -207,11 +207,13 @@ The minimum `permissions:` block for any workflow that uses this action:
 permissions:
   contents: read
   pull-requests: read
+  checks: read
 ```
 
 `contents: read` covers the checkout; `pull-requests: read` covers the attestation and
 PR-state lookups the gate makes through `gh`, needed on both `run: plan` and
-`run: full`.
+`run: full`; `checks: read` lets the live-state classifier read the PR's
+`statusCheckRollup` (check runs and commit statuses) via `gh pr view --json`.
 
 If you opt into `pr-comment: true`, add `pull-requests: write`:
 

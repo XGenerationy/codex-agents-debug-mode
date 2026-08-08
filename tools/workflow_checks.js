@@ -60,16 +60,38 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
  * @param {string} content workflow or action YAML text.
  * @returns {Array<{line: number, ref: string}>}
  */
+// A block-scalar indicator at the end of a key line (`run: |`, `shell: >`).
+// The value continues on subsequent MORE-indented lines until indentation
+// drops back to (or below) the key's level — those continuation lines are
+// raw string content (script text), not YAML keys, and must not be scanned.
+const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>][-+]?[ \t]*$/;
+
 const findUnpinnedUses = (content) => {
   const violations = [];
-  String(content ?? '').split(/\r?\n/).forEach((text, index) => {
+  const lines = String(content ?? '').split(/\r?\n/);
+  // Block-scalar tracking: when a line opens a `|` or `>` scalar, record the
+  // indentation of the KEY line. Subsequent lines indented MORE than that are
+  // scalar body (script text) and must be skipped. The scalar ends when a line
+  // is indented at or below the key level (or is blank, which YAML treats as
+  // part of the scalar but carries no keys).
+  let scalarKeyIndent = -1;
+  lines.forEach((text, index) => {
+    const indent = text.length - text.replace(/^\s+/, '').length;
+    // Inside a block scalar? Skip body lines that are deeper-indented (or blank).
+    if (scalarKeyIndent >= 0) {
+      if (text.trim() === '' || indent > scalarKeyIndent) return;
+      // Indentation dropped back: the scalar has ended; resume normal scanning.
+      scalarKeyIndent = -1;
+    }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;
-    // A `run:` (or `entrypoint:`) line's value is a string scalar — any
-    // `uses:` or braces inside it are script text, not YAML keys. Skip the
-    // whole line for suspicious-uses detection (a real uses: key would not
-    // coexist with run: on the same line in valid YAML).
-    if (RUN_SCALAR_LINE.test(text)) return;
+    // A `run:` (or `entrypoint:`/`shell:`) line's value is a string scalar —
+    // any `uses:` or braces inside it are script text, not YAML keys.
+    if (RUN_SCALAR_LINE.test(text)) {
+      // If this line opens a BLOCK scalar (run: |), track its body.
+      if (BLOCK_SCALAR_HEADER.test(text)) scalarKeyIndent = indent;
+      return;
+    }
     const match = USES_LINE.exec(text);
     if (match) {
       const ref = match[3];

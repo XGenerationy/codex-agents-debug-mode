@@ -90,12 +90,12 @@ const makeDependencies = ({
     written,
     events,
     dependencies: {
-      resolveRepositoryState: async () => {
+      resolveRepositoryState: async ({ baseRef } = {}) => {
         stateReads += 1;
         events.push(`repository-state:${stateReads}`);
         return {
           repo: 'C:/repo',
-          baseRef: 'origin/main',
+          baseRef: baseRef || 'origin/main',
           baseSha: stateReads === 1 ? 'base123' : (stateReads === 2 ? finalBase : sealBase),
           headSha: stateReads === 1 ? 'head123' : (stateReads === 2 ? finalHead : currentSealHead),
           touchedFiles: ['src/a.ts'],
@@ -306,7 +306,7 @@ test('passes only essential and explicitly configured environment variables to c
 
     await runCloseoutWorkflow({
       repo: 'C:/repo',
-      baseRef: 'origin/main',
+      baseRef: 'origin/release/7',
       config: reviewedConfig({
         requiredEnv: [requiredName],
         safeEnv: [safeName],
@@ -323,8 +323,10 @@ test('passes only essential and explicitly configured environment variables to c
       // Qodo #5 regression: the resolved base ref is plumbed to engine checks
       // via a dedicated, repo-derived env var so engine commands no longer
       // silently fall back to `main` when GITHUB_BASE_REF is dropped by the
-      // allowlisted environment.
-      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'origin/main');
+      // allowlisted environment. A non-main base ref is used so the assertion
+      // proves the injection works (the fallback default is origin/main, so
+      // asserting origin/main would pass even if injection were broken).
+      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'origin/release/7');
     }
   } finally {
     for (const [name, value] of Object.entries(previous)) {
