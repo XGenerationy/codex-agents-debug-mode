@@ -45,6 +45,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  checks: read
 
 concurrency:
   group: closeout-preview-${{ github.ref }}
@@ -73,6 +74,10 @@ jobs:
         uses: ./actions/closeout
         with:
           run: plan
+          # Match the enforcing gate's mode and matrix so the preview's
+          # attestation marker is digest-compatible with run: full.
+          mode: engine
+          config: .github/closeout-engine.json
 ```
 
 ### Enforcing gate — `.github/workflows/closeout-gate.yml`
@@ -98,6 +103,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  checks: read
 
 # cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
 # concurrency is evaluated before the job-level if, so a comment-only review
@@ -129,11 +135,18 @@ jobs:
           # snapshots; the checkout must present the head being attested.
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
           fetch-depth: 0
+          # Do not persist checkout credentials: the gate runs PR-controlled
+          # validation commands that could otherwise use the saved git token.
+          persist-credentials: false
 
       - name: Closeout gate
         uses: ./actions/closeout
         with:
           run: full
+          # Match this repo's engine matrix (npm-based, no pnpm/Prisma).
+          # Consumers on other stacks: use mode: strict or your own engine config.
+          mode: engine
+          config: .github/closeout-engine.json
           base-ref: ${{ github.event.inputs.base-ref || '' }}
 ```
 
@@ -208,10 +221,13 @@ permissions:
   pull-requests: write
 ```
 
-`pr-comment: true` also requires `gh` **2.31 or newer** on the runner (the comment
-upsert uses `gh api --paginate --slurp`). GitHub-hosted runners ship a current `gh`;
-on a self-hosted runner with an older one, every comment attempt fails with
-`unknown flag: --slurp`, which reads like an unrelated tooling problem.
+`gh` **2.31 or newer** is required on the runner for every PR-context invocation
+(`run: plan` and `run: full`), not only when `pr-comment: true`. The core
+attestation reader (`scripts/pr_closeout_github.js`) uses `gh api --paginate
+--slurp` for review/permission lookups, and the comment upsert uses it too; both
+fail with `unknown flag: --slurp` on an older `gh`, surfacing as an unavailable
+attestation. GitHub-hosted runners ship a current `gh`; on a self-hosted runner,
+ensure `gh --version` reports 2.31+.
 
 **Fork-PR note:** a `pull_request`-triggered workflow running against a fork PR
 receives a reduced, read-only token regardless of the `permissions:` block above.
@@ -257,8 +273,9 @@ snapshot alone.
 head) emits for the current base, head, and config digest — bound to all three, so a
 review approving one commit or config cannot be replayed onto another. The plan's Step
 Summary and its `attestation: absent`/`present` output tell you whether a matching
-attestation exists; when it is `absent`, the plan JSON's `gateAttestationRequired`
-field carries the verbatim marker line the approving reviewer must paste into their
+attestation exists; when it is `absent`, the plan JSON's
+`gateIntegrityAttestationRequired.marker` field carries the verbatim marker line the
+approving reviewer must paste into their
 review body. The reviewer must be someone other than the PR author and must hold
 repository write permission (`OWNER`/`MEMBER`/`COLLABORATOR` with proven `WRITE`+);
 `classifyGateAttestation` rejects self-approval and unauthorized authors.

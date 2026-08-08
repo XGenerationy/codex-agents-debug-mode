@@ -21,6 +21,11 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # checks: read is required for the gate's readLivePrState to read the
+  # statusCheckRollup (check runs) via gh pr view --json. Without it, the
+  # live-state classifier cannot see check conclusions once an attestation
+  # admits the run to final verification.
+  checks: read
 
 # cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
 # concurrency is evaluated before the job-level if, so a comment-only review
