@@ -2,40 +2,60 @@
 
 // Shallow, zero-dependency workflow hygiene predicates for the repository
 // validator. Deliberately regex-level — no YAML parser exists in a
-// zero-dependency repo — and honest about it: these catch the failure modes
-// that matter (a mutable action ref, a workflow with no permissions
-// declaration) without claiming to understand YAML structure. A `uses:` in
-// YAML flow style (`- {uses: x@v1}`) is matched by FLOW_USES and reported
-// as an unsupported-flow-style violation rather than silently skipped: it
-// is fail-closed (an unchecked ref is never allowed through), and parsing
-// the ref out of a flow mapping without a real YAML parser would risk a
-// bypass of its own. Whitespace around the colon is tolerated because the
-// YAML spec permits it (`uses : ref` is the same key as `uses: ref`) and
-// the ref still extracts cleanly. Block scalars, aliases, and every other
-// near-miss form measured in review get captured as a garbage ref and
-// flagged, which is the fail-closed direction.
+// zero-dependency repo — and honest about that limitation. The design is
+// CONSERVATIVELY FAIL-CLOSED: any line that contains a `uses:` token the
+// regex cannot positively confirm as a clean block-style pinned/local
+// reference is flagged for manual review. This is the opposite of trying to
+// enumerate every YAML flow/anchor/quoted-key variant (which is a losing
+// game without a real parser): instead, the check trusts ONLY the narrow
+// block-style form it can fully parse, and rejects everything else.
+//
+// What passes without a violation:
+//   - uses: ./local/path           (same-repo local action)
+//   - uses: owner/repo@<40-hex>    (SHA-pinned remote action)
+//   - "uses": 'owner/repo@<40-hex>' (quoted key/value variants)
+//   - uses : owner/repo@<40-hex>    (whitespace around the colon)
+//
+// What is flagged (fail-closed — rewrite in block style or review manually):
+//   - Flow style: - {uses: ...}, release: {uses: ...}, [{uses: ...}]
+//   - Anchors:    uses: &anchor owner/repo@v1
+//   - Multi-entry flow sequences, nested flow mappings
+//   - Any uses: whose ref is not a 40-hex SHA or local ./path
+//
+// Comment lines (#) and run: string values containing the text "uses:" are
+// NOT flagged — they are not YAML keys. A real YAML parser would be the
+// correct long-term fix; until one is added, the conservative fail-closed
+// posture is the honest guarantee.
 
-// The `uses` key may itself be quoted (`- "uses": ref` is valid YAML and
-// GitHub interprets it as the `uses` key) — allow an optional quote around
-// the key, independent of the value's quote. Whitespace around the colon is
-// tolerated for the same reason. The value's opening/closing quote must match.
-const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s#]+)\2\s*(?:#.*)?$/;
-// A `uses:` key inside a YAML flow mapping. Flow mappings are the bypass
-// surface (the block-style USES_LINE cannot reach inside `{ ... }`). The key
-// may be quoted (`{"uses": ...}`), and the mapping may appear as a sequence
-// item (`- {uses: ...}`), a map value (`release: {uses: ...}`), or nested
-// after other keys (`{name: x, uses: ...}`). To avoid false positives, the `{`
-// must start a YAML VALUE — preceded by `- ` (sequence item) or `: ` (map
-// value) — and the line must not be a comment; this excludes `run: echo
-// "{uses:...}"` and `# {uses:...}` which are string/comment text, not keys.
-// A multi-line flow mapping is vanishingly rare in workflows and still fails
-// closed via the garbage-ref path.
-const FLOW_USES = /^[^#]*?(?::\s*|-\s*|\[\s*)\{\s*[^}]*['"]?uses['"]?\s*:/;
+// A clean block-style `uses:` line whose value can be fully extracted. The
+// key may be quoted; whitespace around the colon is tolerated (YAML spec).
+// The value's opening/closing quote must match. An anchor (`&`) on the value
+// or any non-whitespace before the key (flow context) prevents a match, so
+// those lines fall through to the SUSPICIOUS_USES check below.
+const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*)?$/;
+// A `uses` token that looks like a YAML key but is NOT a clean USES_LINE
+// match. This catches flow style (`- {uses: ...}`, `release: {uses: ...}`,
+// `[{uses: ...}]`), anchors (`uses: &name ref`), multi-entry flow sequences,
+// and any other form the block-style regex cannot parse. To avoid false
+// positives on `run:` string values, the token must appear at a YAML KEY
+// position: after optional indentation + optional `-` (block-style key), OR
+// inside `{}`/`[]` (flow context). A `uses:` buried inside a `run: echo
+// uses: foo` string scalar does NOT match because it is preceded by other
+// non-key content, not by a line-start or brace boundary.
+const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?|[{[]\s*)['"]?uses['"]?\s*:/;
+const COMMENT_LINE = /^\s*#/;
+// A line whose YAML value is a raw string scalar (shell script, command).
+// Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
+// a `uses:` or `{uses:}` inside such a value is script text and must not be
+// flagged. (A real `uses:` key cannot coexist with `run:` on one line.)
+const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:run|entrypoint|shell)\s*:/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**
  * Returns one violation per `uses:` line whose reference is neither a
- * same-repo local path (`./...`) nor pinned to a 40-hex commit SHA. Docker
+ * same-repo local path (`./...`) nor pinned to a 40-hex commit SHA, PLUS any
+ * `uses:` token the regex cannot positively parse (flow style, anchors, etc.)
+ * reported as a suspicious-uses violation requiring manual review. Docker
  * references are flagged fail-closed. Line numbers are 1-indexed.
  * @param {string} content workflow or action YAML text.
  * @returns {Array<{line: number, ref: string}>}
@@ -43,18 +63,30 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
 const findUnpinnedUses = (content) => {
   const violations = [];
   String(content ?? '').split(/\r?\n/).forEach((text, index) => {
-    // A flow-style `uses:` (`- {uses: ...}`) cannot be parsed without a YAML
-    // parser; report it as an unsupported-flow-style violation so the pin
-    // check stays unbypassable rather than silently skipping the entry.
-    if (FLOW_USES.test(text)) {
-      violations.push({ line: index + 1, ref: '(flow-style uses: — rewrite in block style)' });
+    // Comment lines never carry a YAML key.
+    if (COMMENT_LINE.test(text)) return;
+    // A `run:` (or `entrypoint:`) line's value is a string scalar — any
+    // `uses:` or braces inside it are script text, not YAML keys. Skip the
+    // whole line for suspicious-uses detection (a real uses: key would not
+    // coexist with run: on the same line in valid YAML).
+    if (RUN_SCALAR_LINE.test(text)) return;
+    const match = USES_LINE.exec(text);
+    if (match) {
+      const ref = match[3];
+      if (ref.startsWith('./')) return;
+      if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
       return;
     }
-    const match = USES_LINE.exec(text);
-    if (!match) return;
-    const ref = match[3];
-    if (ref.startsWith('./')) return;
-    if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
+    // The line is not a clean block-style uses: — but does it contain a
+    // `uses:` token that looks like a YAML key? If so, flag it fail-closed:
+    // the regex cannot confirm the ref is safe, so it must not pass silently.
+    // This catches flow style, anchors, multi-entry sequences, and any other
+    // form a regex cannot parse. The SUSPICIOUS_USES pattern avoids matching
+    // `uses:` inside a quoted run: string value by requiring the token to
+    // appear at a key position (start, after whitespace/dash/brace/semicolon).
+    if (SUSPICIOUS_USES.test(text)) {
+      violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
+    }
   });
   return violations;
 };

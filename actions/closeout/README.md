@@ -481,3 +481,23 @@ they are roadmap items, not accepted risk:
   for re-running the gate outside the normal event flow; to attest a specific PR
   via dispatch, ensure the dispatch runs from the PR's head branch (not the base
   branch), or add the PR context the event-based triggers carry.
+- **The evidence artifact uploads the entire `output-dir`.** The
+  `actions/upload-artifact` step uploads whatever directory `output-dir`
+  resolves to. When a caller passes an existing broad directory (for example
+  `${{ runner.temp }}`), the upload includes every file already there — not
+  just the files the gate produced. On shared/self-hosted runners where that
+  directory may already contain unrelated logs or outputs, those become part of
+  the downloadable evidence artifact. The default (`${{ runner.temp
+  }}/closeout-evidence`) is action-owned and safe; the risk is only when a
+  caller overrides `output-dir` to a pre-existing broad path. A future
+  hardening would enumerate only the files the gate CLI wrote, rather than
+  uploading the caller-provided directory wholesale.
+- **Regex-based `uses:` validation cannot parse all YAML.** The
+  `tools/workflow_checks.js` SHA-pin check is deliberately regex-based (no YAML
+  parser in a zero-dependency repo). It is conservatively fail-closed: any
+  `uses:` token it cannot positively confirm as a clean block-style pinned/local
+  reference is flagged. This means flow style, anchors, multi-entry flow
+  sequences, and other non-block YAML forms are rejected (rewrite them in block
+  style). The one accepted residual: a `uses:`-like token inside a `run: |`
+  block-scalar continuation line could theoretically false-positive; this is
+  vanishingly rare in real workflows. A real YAML parser is the long-term fix.

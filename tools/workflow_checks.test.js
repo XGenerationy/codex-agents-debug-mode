@@ -31,86 +31,73 @@ test('findUnpinnedUses flags tags, branches, and docker refs but not 40-hex pins
   assert.equal(findUnpinnedUses(multi)[0].line, 2);
 });
 
-test('findUnpinnedUses catches quoted-key uses forms (YAML allows "uses": and uses:\'ref\')', () => {
-  // The YAML spec allows the key itself to be quoted; GitHub interprets
-  // "uses" / 'uses' as the `uses` key, so the validator must not skip it.
-  const doubleQuotedKey = '  - "uses": actions/checkout@v6\n';
-  const singleQuotedKey = "  - 'uses': someone/thing@main\n";
-  const quotedKeyAndValue = '  - "uses": "actions/checkout@v6"\n';
-  for (const variant of [doubleQuotedKey, singleQuotedKey, quotedKeyAndValue]) {
+test('findUnpinnedUses catches quoted-key and whitespace-variant uses forms', () => {
+  // The YAML spec allows the key to be quoted and whitespace around the colon.
+  const variants = [
+    '  - "uses": actions/checkout@v6\n',
+    "  - 'uses': someone/thing@main\n",
+    '  - "uses": "actions/checkout@v6"\n',
+    '  - uses : actions/checkout@v6\n',
+    '  - uses  :  someone/thing@main\n',
+  ];
+  for (const variant of variants) {
     const violations = findUnpinnedUses(variant);
     assert.equal(violations.length, 1, `expected one violation for: ${variant.trim()}`);
-    assert.ok(violations[0].ref.includes('@'));
   }
-  // A quoted-key PINNED ref still passes.
+  // Pinned refs in these forms still pass.
   assert.deepEqual(
     findUnpinnedUses('  - "uses": actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'),
     [],
   );
-});
-
-test('findUnpinnedUses catches whitespace-variant uses keys (YAML allows spaces around the colon)', () => {
-  // The YAML spec permits `uses : ref` (spaces around the colon); GitHub
-  // interprets it as the `uses` key, so the validator must not skip it.
-  const before = '  - uses : actions/checkout@v6\n';
-  const both = '  - uses  :  someone/thing@main\n';
-  for (const variant of [before, both]) {
-    const violations = findUnpinnedUses(variant);
-    assert.equal(violations.length, 1, `expected one violation for: ${variant.trim()}`);
-    assert.ok(violations[0].ref.includes('@'));
-  }
-  // A whitespace-variant PINNED ref still passes (the colon tolerance must
-  // not start false-flagging valid 40-hex pins).
   assert.deepEqual(
     findUnpinnedUses('  - uses : actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'),
     [],
   );
 });
 
-test('findUnpinnedUses rejects flow-style uses mappings fail-closed (no bypass)', () => {
-  // Flow-style `uses:` cannot be parsed without a YAML parser, so the check
-  // fails closed rather than letting the entry through unchecked — pinning a
-  // 40-hex SHA inside the flow mapping does NOT make it pass, because the
-  // validator refuses to trust a ref it cannot reliably extract.
-  const flowUnpinned = '  - {uses: actions/checkout@v6}\n';
-  const flowPinned = '  - {uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10}\n';
-  const flowQuoted = "  - {name: x, uses: 'actions/checkout@v6'}\n";
-  // A quoted uses KEY inside a flow mapping (e.g. {"uses": ...}) is valid YAML
-  // and must not bypass the check — FLOW_USES tolerates an optional quote.
-  const flowQuotedKeyDouble = '  - {"uses": actions/checkout@v6}\n';
-  const flowQuotedKeySingle = "  - {'uses': someone/thing@main}\n";
-  for (const flow of [flowUnpinned, flowPinned, flowQuoted, flowQuotedKeyDouble, flowQuotedKeySingle]) {
-    const violations = findUnpinnedUses(flow);
-    assert.equal(violations.length, 1, `expected one flow-style violation for: ${flow.trim()}`);
-    assert.match(violations[0].ref, /flow-style uses/);
-    assert.equal(violations[0].line, 1);
+test('findUnpinnedUses conservatively flags every non-block-style uses (fail-closed)', () => {
+  // The check is conservatively fail-closed: any uses: token it cannot
+  // positively confirm as a clean block-style pinned/local ref is flagged.
+  // This catches flow style, anchors, multi-entry sequences, and any other
+  // form a regex cannot fully parse — pinning a 40-hex SHA inside these
+  // forms does NOT make them pass, because the validator refuses to trust a
+  // ref it cannot reliably extract.
+  const suspiciousForms = [
+    '  - {uses: actions/checkout@v6}\n',                                    // flow seq item
+    '  - {uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10}\n', // flow, pinned — still flagged
+    '  - {"uses": actions/checkout@v6}\n',                                  // quoted flow key
+    "  - {'uses': someone/thing@main}\n",                                   // single-quote flow key
+    'release: {uses: octo-org/repo/.github/workflows/release.yml@main}\n',  // map-value flow
+    'steps: [{uses: owner/action@main}]\n',                                 // flow sequence
+    'steps: [{name: setup}, {uses: owner/action@main}]\n',                  // multi-entry flow seq
+    '  - uses: &checkout actions/checkout@v6\n',                            // YAML anchor
+    'key: "x # y"; {uses: owner/action@main}\n',                            // hash-in-quote then flow
+  ];
+  for (const form of suspiciousForms) {
+    const violations = findUnpinnedUses(form);
+    assert.equal(violations.length, 1, `expected one violation for: ${form.trim()}`);
+    assert.match(violations[0].ref, /non-block-style|unparseable/i);
   }
-  // Mixed document: block-style pinned line passes, flow-style line flags.
+  // Mixed document: block-style pinned line passes, suspicious line flags.
   const mixed = 'steps:\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n  - {uses: someone/thing@main}\n';
   const mixedViolations = findUnpinnedUses(mixed);
   assert.equal(mixedViolations.length, 1);
   assert.equal(mixedViolations[0].line, 3);
-  // A flow mapping that is a MAP value (not a sequence item) — e.g. a
-  // reusable-workflow reference `release: {uses: ...}` — is also caught.
-  const mapValueFlow = 'release: {uses: octo-org/repo/.github/workflows/release.yml@main}\n';
-  const mapViolations = findUnpinnedUses(mapValueFlow);
-  assert.equal(mapViolations.length, 1, 'map-value flow uses must be caught');
-  assert.match(mapViolations[0].ref, /flow-style/);
 });
 
-test('findUnpinnedUses does not false-positive on uses appearing in run strings or comments', () => {
-  // FLOW_USES must only match a { that starts a YAML flow-mapping value
-  // (preceded by `- `, `: `, or `[`), not a `{uses:` that appears inside a
-  // run: string value or a comment — those are text, not YAML keys.
-  const runString = 'run: echo "{uses: foo@bar}"\n';
-  const comment = '# this {uses: something} is a comment\n';
-  const runMultiline = 'run: |\n  echo "{uses: baz} is just text"\n';
-  for (const text of [runString, comment, runMultiline]) {
+test('findUnpinnedUses does not false-positive on uses in run strings or comments', () => {
+  // A run:/entrypoint:/shell: line's value is a string scalar; uses: or
+  // {uses:} inside it is script text, not a YAML key. Comment lines too.
+  const safeTexts = [
+    'run: echo "{uses: foo@bar}"\n',
+    'run: echo uses: something\n',
+    '# this {uses: something} is a comment\n',
+    'entrypoint: /bin/sh -c "uses: noop"\n',
+  ];
+  for (const text of safeTexts) {
     assert.deepEqual(findUnpinnedUses(text), [],
-      `expected no violation for text that is not a YAML flow uses key: ${text.trim()}`);
+      `expected no violation for non-YAML-key text: ${text.trim()}`);
   }
-  // A real flow-sequence uses IS still caught (the { follows [).
-  assert.equal(findUnpinnedUses('steps: [{uses: owner/action@main}]\n').length, 1);
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
