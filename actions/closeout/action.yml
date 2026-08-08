@@ -1,0 +1,90 @@
+name: PR Closeout Gate
+description: >-
+  Evidence-first PR closeout gate: strict 19-check tier or repo-defined engine
+  tier, as a plan preview or the full enforcing run. All logic lives in
+  support.js; this file is wiring only.
+
+inputs:
+  run:
+    description: "plan (read-only preview) or full (enforcing gate)"
+    default: plan
+  mode:
+    description: "strict (19-check gate) or engine (config.engineChecks)"
+    default: strict
+  base-ref:
+    description: "Live PR base ref; empty resolves via GITHUB_BASE_REF or the event payload"
+    default: ""
+  config:
+    description: "Path to a closeout config JSON"
+    default: ""
+  output-dir:
+    description: "Evidence directory (must be outside the repository)"
+    default: ""
+  node-version:
+    description: "Node.js version for the gate"
+    default: "24"
+  pr-comment:
+    description: "true to upsert a marker-tagged PR comment (needs pull-requests: write)"
+    default: "false"
+  artifact-name:
+    description: "Evidence artifact name"
+    default: closeout-evidence
+
+outputs:
+  status:
+    description: "overallStatus (full) or planStatus (plan); empty until the gate step has run"
+    value: ${{ steps.gate.outputs.status }}
+  mode:
+    description: "The gate-reported mode of the run; empty until the gate step has run"
+    value: ${{ steps.gate.outputs.mode }}
+  attestation:
+    description: "Plan runs: present | weakened | absent | unavailable; empty until the gate step has run"
+    value: ${{ steps.gate.outputs.attestation }}
+  report-path:
+    description: "Path of report.json (full) or the captured plan JSON (plan); empty until the gate step has run"
+    value: ${{ steps.gate.outputs.report-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Run closeout gate
+      id: gate
+      shell: bash
+      env:
+        CLOSEOUT_RUN: ${{ inputs.run }}
+        CLOSEOUT_MODE: ${{ inputs.mode }}
+        CLOSEOUT_BASE_REF: ${{ inputs.base-ref }}
+        CLOSEOUT_CONFIG: ${{ inputs.config }}
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        CLOSEOUT_PR_COMMENT: ${{ inputs.pr-comment }}
+        CLOSEOUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/support.js" run
+
+    - name: Upload evidence artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        if-no-files-found: ignore
+
+    - name: Upsert PR comment
+      if: ${{ always() && inputs.pr-comment == 'true' }}
+      shell: bash
+      env:
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/support.js" comment
+
+    - name: Apply gate verdict
+      if: always()
+      shell: bash
+      env:
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+      run: node "${{ github.action_path }}/support.js" finish

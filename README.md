@@ -86,6 +86,13 @@ validation. When the skill is used against an application repository, missing Pr
 Grafana, Hunter, browser, or independent-review evidence must be reported honestly rather than
 converted into a pass.
 
+### Run the gate in CI
+
+The gate ships as a composite GitHub Action at `actions/closeout/` — a read-only
+plan preview for ordinary PR pushes and a review-triggered full gate, in strict or
+engine mode. See [`actions/closeout/README.md`](actions/closeout/README.md); this
+repository dogfoods both workflows (`closeout-preview.yml`, `closeout-gate.yml`).
+
 ## Safety
 
 The skill is fail-closed. Missing infrastructure, uncertain process ownership, incomplete GitHub
