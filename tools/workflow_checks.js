@@ -54,9 +54,10 @@ const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:run|entrypoint|shell)\s*:/;
 // on subsequent more-indented lines — `with.script: |` (github-script bodies
 // commonly contain `{ uses: ... }` JS objects), `env:`, `description:`, etc.
 // Tracking must not be scoped to run/shell/entrypoint only. YAML allows: an
+// optional anchor/tag indicator before the scalar (`key: &name |`), an
 // explicit indentation indicator (`|2`), a chomping indicator (`|-`, `|+`),
 // a trailing comment (`| # cmt`), and any order of indentation+chomping.
-const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
+const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*(?:&\S+\s+|[!&].*?\s+)*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
 const PINNED_REF = /@[0-9a-f]{40}$/;
 
 /**

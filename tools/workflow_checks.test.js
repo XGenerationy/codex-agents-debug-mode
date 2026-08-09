@@ -131,6 +131,10 @@ test('findUnpinnedUses handles block-scalar header variants (comment, indent ind
   const withIndentChomp = '  - run: |2-\n    echo "{uses: foo@bar}"\n';
   assert.deepEqual(findUnpinnedUses(withIndentChomp), [],
     'scalar header with indent+chomp indicator must skip body');
+  // YAML allows an anchor on the scalar value (key: &name |).
+  const withAnchor = 'name: &message |\n  hello {uses: world}\n';
+  assert.deepEqual(findUnpinnedUses(withAnchor), [],
+    'scalar header with anchor indicator must skip body');
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {

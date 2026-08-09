@@ -642,7 +642,12 @@ const writeEvidenceFile = (outputDir, name, content) => {
   const target = path.join(outputDir, name);
   try {
     const info = lstatSync(target);
-    if (info.isSymbolicLink() || !info.isFile()) unlinkSync(target);
+    // A hard link (nlink > 1) to a tracked workspace file reports as a regular
+    // file but shares an inode — a write through it would mutate the workspace
+    // file after the CLI's final seal. Replace it (unlinking removes THIS
+    // directory entry, not the linked target) so the fresh write creates a new
+    // inode owned only by the evidence dir.
+    if (info.isSymbolicLink() || !info.isFile() || info.nlink > 1) unlinkSync(target);
   } catch {
     // ENOENT: nothing at the destination — the write creates it fresh.
   }

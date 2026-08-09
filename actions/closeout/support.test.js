@@ -352,6 +352,32 @@ test('writeEvidenceFile never follows a planted symlink at the destination', () 
   assert.equal(readFs(statePath, 'utf8'), '{"safe":true}\n');
 });
 
+test('writeEvidenceFile refuses a hard-linked destination (shared inode)', () => {
+  // A hard link to a tracked workspace file reports as a regular file but
+  // shares an inode: writing through it would mutate the workspace file after
+  // the CLI's final seal. The write must replace the link (new inode) and
+  // leave the linked target untouched.
+  const dir = makeTempDir();
+  const victim = path.join(dir, 'workspace-file.txt');
+  writeFs(victim, 'ORIGINAL CONTENT');
+  const evidenceDir = makeTempDir();
+  const statePath = path.join(evidenceDir, 'action-state.json');
+  const { linkSync, lstatSync } = require('node:fs');
+  try {
+    linkSync(victim, statePath);
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return; // platform lacks hard-link support
+    throw error;
+  }
+  writeEvidenceFile(evidenceDir, 'action-state.json', '{"safe":true}\n');
+  // The victim is untouched: the hard-link entry was replaced, not followed.
+  assert.equal(readFs(victim, 'utf8'), 'ORIGINAL CONTENT');
+  // The destination is now a regular file with a fresh inode (nlink === 1).
+  const info = lstatSync(statePath);
+  assert.equal(info.nlink, 1, 'destination must be a fresh regular file');
+  assert.equal(readFs(statePath, 'utf8'), '{"safe":true}\n');
+});
+
 test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');

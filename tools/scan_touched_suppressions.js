@@ -276,6 +276,23 @@ const resolveBaseSha = (repoRoot = root) => {
     }
   }
 
+  // The closeout gate injects CLOSEOUT_RESOLVED_BASE_REF (already rev-parsed to
+  // a stable ref like origin/release/7) into engine child environments, since
+  // buildWorkflowEnvironment strips GITHUB_BASE_REF. Consume it here too so the
+  // suppression/gate scan diffs against the correct PR base, not a main fallback.
+  const resolvedBaseRef = (process.env.CLOSEOUT_RESOLVED_BASE_REF || '').trim();
+  if (resolvedBaseRef) {
+    try {
+      const mb = gitScalar(['merge-base', 'HEAD', resolvedBaseRef], { cwd: repoRoot });
+      if (isUsableSha(mb)) {
+        comparisonStyle = 'three-dot';
+        return mb;
+      }
+    } catch {
+      // Fall through to the GITHUB_BASE_REF / origin/main resolution below.
+    }
+  }
+
   const baseRef = (process.env.GITHUB_BASE_REF || '').trim();
   if (baseRef) {
     // Actions provides GITHUB_BASE_REF as the bare branch name (e.g. main).
