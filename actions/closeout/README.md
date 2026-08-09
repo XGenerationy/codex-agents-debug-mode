@@ -363,13 +363,21 @@ Point `config` at a JSON file, for example:
 - **Engine-command environment allowlist:** engine check commands and plan-mode
   preflight probes run under a filtered child environment (`ESSENTIAL_ENV` plus
   your `requiredEnv` / `safeEnv` lists), not the full step environment. This
-  prevents PR-controlled commands from reaching `GITHUB_ENV`/`GITHUB_OUTPUT`
-  (runner command files) or non-credential job secrets. To pass a secret into
-  your engine checks, list it in `safeEnv`; to require it, list it in
-  `requiredEnv` (a missing `requiredEnv` var fails the run before checks
+  prevents PR-controlled commands from reaching runner command files
+  (`GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`,
+  `GITHUB_STATE` — these are hard-denied regardless of config).
+  **Two-tier credential policy:** in a full run (attested), credential-shaped
+  names listed in `safeEnv`/`requiredEnv` ARE passed through — your checks may
+  legitimately need `API_TOKEN`, `DATABASE_URL`, etc. In a plan preview
+  (untrusted, pre-attestation), credential-shaped names matching the sensitive
+  pattern (`TOKEN`, `SECRET`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`, etc.)
+  are hard-denied even when listed in `safeEnv` — a PR cannot exfiltrate
+  credentials via repository-local preflight probes. To pass a secret into
+  your engine checks in a full run, list it in `safeEnv`; to require it, list
+  it in `requiredEnv` (a missing `requiredEnv` var fails the run before checks
   execute). The gate injects one trusted, non-secret, repo-derived variable:
-  `CLOSEOUT_RESOLVED_BASE_REF` (already rev-parsed to a stable ref like
-  `origin/release/7`), so engine commands that need the PR base — for example
+  `CLOSEOUT_RESOLVED_BASE_REF` (already rev-parsed to a stable SHA), so engine
+  commands that need the PR base — for example
   `git diff --check "${CLOSEOUT_RESOLVED_BASE_REF:-origin/main}"...HEAD` —
   resolve the correct base even though `GITHUB_BASE_REF` is stripped from the
   filtered environment. Quote the expansion to survive base refs containing
@@ -538,3 +546,11 @@ they are roadmap items, not accepted risk:
   style). The one accepted residual: a `uses:`-like token inside a `run: |`
   block-scalar continuation line could theoretically false-positive; this is
   vanishingly rare in real workflows. A real YAML parser is the long-term fix.
+- **Reviewer permission checks are N+1.** The gate's `readLivePrState` fetches
+  each matching review's collaborator-permission record individually via `gh`,
+  and the two-snapshot stability check repeats this up to four times. On PRs
+  with many reviews this creates an N+1 network pattern. This is a performance
+  characteristic, not a correctness issue — each lookup is independent and the
+  stability check ensures consistency. A batched GraphQL query would reduce the
+  request count; the current per-review approach is simpler and the N is
+  bounded by the number of reviews on the PR (typically small).

@@ -746,7 +746,10 @@ const DENYLISTED_ENV_NAMES = new Set([
 // Applied ONLY to untrusted plan admission (buildPlanPreflightEnvironment), NOT
 // to full-run command execution (buildWorkflowEnvironment) — a full run is
 // attested and may legitimately need credential-shaped requiredEnv/safeEnv.
-const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+// Broader than pr_closeout_stream.js's SENSITIVE_ENV_NAME: adds bare KEY,
+// LICENSE, CONFIG (catches KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE→FILE),
+// CREDENTIALS (plural), and _AUTH suffix (catches NPM_CONFIG__AUTH).
+const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONFIG|CONNECTION_STRING|COOKIE|CREDENTIAL|CREDENTIALS|DATABASE_URL|DSN|ENCRYPTION_KEY|FILE|KEY|KUBECONFIG|LICENSE|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
 // Full-run environment: ESSENTIAL_ENV + requiredEnv/safeEnv, minus the runner
 // command-file denylist. Credential-shaped names ARE allowed here because a
