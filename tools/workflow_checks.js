@@ -80,6 +80,7 @@ const findUnpinnedUses = (content) => {
   // items where sibling keys share the dash level but body is deeper.
   let scalarBodyIndent = -1;  // active body indent, or -1 when not in a scalar
   let scalarPending = false;   // header seen, waiting for first body line
+  let scalarHeaderIndent = -1; // mapping-key indent of the header's own line
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
     // Inside a block scalar? Skip body lines.
@@ -93,8 +94,19 @@ const findUnpinnedUses = (content) => {
     if (scalarPending) {
       if (text.trim() === '') return; // blank: still waiting for first body line
       scalarPending = false;
-      scalarBodyIndent = indent;
-      return; // this line is body
+      // An empty block scalar: the first non-blank line is at the SAME or
+      // SHALLower indentation as the header's mapping key. YAML parses the
+      // header key as an empty string and this line as a SIBLING key, not body
+      // content. Fall through to normal processing so a sibling `uses:` is
+      // scanned instead of being silently swallowed as the scalar body.
+      if (indent <= scalarHeaderIndent) {
+        scalarHeaderIndent = -1;
+        // fall through: reprocess this line as a normal key line
+      } else {
+        scalarHeaderIndent = -1;
+        scalarBodyIndent = indent;
+        return; // this line is body
+      }
     }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;
@@ -110,9 +122,14 @@ const findUnpinnedUses = (content) => {
     // Any key line that opens a block scalar: start tracking its body so a
     // `uses:` inside the string content is not flagged. Checked after
     // USES_LINE (a uses: key never opens a scalar in valid workflow YAML —
-    // its value is an action reference) and before SUSPICIOUS_USES.
+    // its value is an action reference) and before SUSPICIOUS_USES. Record the
+    // header's effective mapping-key indentation: if the first non-blank line
+    // is NOT more indented, the scalar is empty and that line is a sibling
+    // key, not body. For a sequence item (`  - name: |`), the key column is
+    // two past the dash, so add the `- ` offset to the line indent.
     if (BLOCK_SCALAR_HEADER.test(text)) {
       scalarPending = true;
+      scalarHeaderIndent = indent + (/^\s*-\s+/.test(text) ? 2 : 0);
       return;
     }
     // A `run:` (or `entrypoint:`/`shell:`) line whose value is inline (not a

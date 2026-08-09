@@ -137,6 +137,31 @@ test('findUnpinnedUses handles block-scalar header variants (comment, indent ind
     'scalar header with anchor indicator must skip body');
 });
 
+test('findUnpinnedUses flags a sibling uses key after an empty block scalar', () => {
+  // A block-scalar header (`name: |`) immediately followed by an equally or
+  // less indented non-blank line is an EMPTY scalar in YAML: the header key
+  // parses to an empty string and the following line is a SIBLING key, not
+  // body content. A sibling `uses:` is a real action reference and must be
+  // scanned — the pending-state must not swallow it as scalar body.
+  const seqSibling = 'steps:\n  - name: |\n    uses: owner/action@main\n';
+  const seqV = findUnpinnedUses(seqSibling);
+  assert.equal(seqV.length, 1, 'sibling uses after an empty |-scalar must be flagged');
+  assert.equal(seqV[0].line, 3);
+  const foldedSibling = 'steps:\n  - name: >\n    uses: owner/action@main\n';
+  const foldedV = findUnpinnedUses(foldedSibling);
+  assert.equal(foldedV.length, 1, 'sibling uses after an empty >-scalar must be flagged');
+  assert.equal(foldedV[0].line, 3);
+  const mapSibling = 'name: |\nuses: owner/action@main\n';
+  const mapV = findUnpinnedUses(mapSibling);
+  assert.equal(mapV.length, 1, 'sibling uses at a shallower indent must be flagged');
+  assert.equal(mapV[0].line, 2);
+  // A genuine scalar body (more indented than the header key) is still body:
+  // `uses:` text inside it must NOT be flagged.
+  const realBody = 'name: |\n  echo uses: not-a-key\n';
+  assert.deepEqual(findUnpinnedUses(realBody), [],
+    'a deeper-indented line is real scalar body and must not be flagged');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
