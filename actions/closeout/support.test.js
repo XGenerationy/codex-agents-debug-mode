@@ -542,8 +542,9 @@ test('the comment step sends the comment rendering, not the summary embed', asyn
 test('a broken preview comments only a pointer — gate error text stays in summary and artifact', async () => {
   // The CLI's top-level catch does NOT redact (its audience was a
   // terminal): raw stderr and the init-failure error can carry an embedded
-  // token. The Step Summary is run-log-equivalent and keeps it; the
-  // permanent, subscriber-notifying COMMENT never carries it.
+  // token. The Step Summary is run-log-equivalent but credential-shaped values
+  // in stderr/error text are REDACTED before rendering; the permanent,
+  // subscriber-notifying COMMENT never carries any of it.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
   await runSubcommand({
@@ -553,13 +554,17 @@ test('a broken preview comments only a pointer — gate error text stays in summ
     event: {},
     spawnCli: () => ({
       status: 3,
-      stdout: `${JSON.stringify({ status: 'BLOCKED', error: 'git ls-remote https://x-access-token:SECRETTOKEN@github.example failed' })}\n`,
-      stderr: 'fatal: SECRETTOKEN in remote',
+      stdout: `${JSON.stringify({ status: 'BLOCKED', error: 'git ls-remote https://x-access-token:ghpabcdefghijklmnopqrstuvwxyz0123456789AB@github.example failed' })}\n`,
+      stderr: 'fatal: remote returned token=ghpabcdefghijklmnopqrstuvwxyz0123456789AB',
     }),
   });
-  assert.match(readFs(path.join(dir, 's'), 'utf8'), /SECRETTOKEN/);
+  // The realistic ghp_ token must be REDACTED from the Step Summary.
+  assert.doesNotMatch(readFs(path.join(dir, 's'), 'utf8'), /ghpabcdefghijklmnopqrstuvwxyz0123456789AB/,
+    'credential-shaped stderr must be redacted from the Step Summary');
+  assert.match(readFs(path.join(dir, 's'), 'utf8'), /REDACTED/,
+    'the redaction marker must appear in place of the scrubbed credential');
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
-  assert.doesNotMatch(state.renderedComment, /SECRETTOKEN/);
+  assert.doesNotMatch(state.renderedComment, /ghpabcdefghijklmnopqrstuvwxyz0123456789AB/);
   assert.match(state.renderedComment, /preview itself failed/i);
   assert.match(state.renderedComment, /Step Summary and run log/);
 });

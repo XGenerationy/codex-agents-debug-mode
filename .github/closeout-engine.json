@@ -11,7 +11,7 @@
     {
       "id": "git-diff-check",
       "label": "Whitespace/error check on the committed PR range",
-      "command": "git diff --check ${CLOSEOUT_RESOLVED_BASE_REF:-origin/main}...HEAD",
+      "command": "git diff --check \"${CLOSEOUT_RESOLVED_BASE_REF:-origin/main}\"...HEAD",
       "baselineSafe": true
     },
     {

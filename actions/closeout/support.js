@@ -10,6 +10,30 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+// Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
+// git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
+// Authorization header). Applied to stderr before it reaches the Step Summary
+// or any other rendered surface. The patterns mirror the gate CLI's own
+// secret-detection set, kept deliberately broad: a false positive (replacing a
+// non-secret token-shaped string) is harmless, while a miss is a credential
+// exposure. Mirrors the existing decision that gate error text stays on
+// run-log-equivalent surfaces — but those surfaces still must not carry raw
+// credentials.
+const REDACT_PATTERNS = [
+  // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a word boundary
+  // so a short false-positive prefix does not match.
+  [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
+  // x-access-token:SECRET@host (git remote URL credential embedding)
+  [/(x-access-token|https?):[^\s@/]+@[^\s/]+/g, '$1=[REDACTED:credential]@'],
+  // Generic key=value pairs where the key looks credential-shaped.
+  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*[^\s]+/gi, '$1=[REDACTED]'],
+];
+
+const redactSecrets = (text) => REDACT_PATTERNS.reduce(
+  (acc, [pattern, replacement]) => acc.replace(pattern, replacement),
+  String(text ?? ''),
+);
+
 const RUN_VALUES = new Set(['plan', 'full']);
 const MODE_VALUES = new Set(['strict', 'engine']);
 const BOOL_VALUES = new Map([['true', true], ['false', false]]);
@@ -530,17 +554,19 @@ const runSubcommand = async ({
       renderedSummary = [
         '## Closeout plan preview',
         '',
-        `**The preview itself failed** — ${escapeActionText(decision.reason + spawnNote)}`,
+        `**The preview itself failed** — ${escapeActionText(redactSecrets(decision.reason + spawnNote))}`,
         '',
-        `stderr: ${escapeActionText(String(result.stderr || '').slice(0, 4000))}`,
+        `stderr: ${escapeActionText(redactSecrets(String(result.stderr || '').slice(0, 4000)))}`,
         '',
       ].join('\n');
       // Gate error text (raw stderr; parsed.error inside decision.reason)
       // is NOT redacted by the CLI's top-level catch — its audience was a
       // terminal. It stays on run-log-equivalent surfaces (Step Summary,
-      // artifact); the COMMENT is permanent and notifies every subscriber,
-      // so it carries a fixed-shape pointer only (review decision, Task 4
-      // round 2).
+      // artifact) but credential-shaped values in it are REDACTED by
+      // redactSecrets above so a token echoed by a git remote URL or gh
+      // Authorization header cannot leak. The COMMENT is permanent and
+      // notifies every subscriber, so it carries a fixed-shape pointer only
+      // (review decision, Task 4 round 2).
       renderedComment = [
         '## Closeout plan preview',
         '',
@@ -596,7 +622,7 @@ const runSubcommand = async ({
     const labelMode = report.mode || mode;
     renderedSummary = renderFullSummary(
       { overallStatus: status, mode: labelMode, configDigest: report.configDigest },
-      reportMarkdown || `(no report was written; CLI said: ${parsed?.error || 'nothing'}${spawnNote})`,
+      reportMarkdown || `(no report was written; CLI said: ${redactSecrets(parsed?.error || 'nothing')}${redactSecrets(spawnNote)})`,
       { artifactName },
     );
     // Full-tier COMMENTS never carry the embedded report.md (spec): key
@@ -620,7 +646,7 @@ const runSubcommand = async ({
   writeEvidenceFile(outputDir, STATE_FILE, `${JSON.stringify({
     tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath,
   })}\n`);
-  process.stdout.write(`closeout-action: ${decision.reason}\n`);
+  process.stdout.write(`closeout-action: ${redactSecrets(decision.reason)}\n`);
   return 0;
 };
 
@@ -674,14 +700,20 @@ const finishSubcommand = ({ outputDir }) => {
     process.stderr.write('closeout-action: no recorded state; the run step never completed.\n');
     return 3;
   }
-  process.stdout.write(`closeout-action: ${state.decision.reason}\n`);
+  process.stdout.write(`closeout-action: ${redactSecrets(state.decision.reason)}\n`);
   return state.decision.success ? 0 : (Number.isInteger(state.decision.exitCode) ? state.decision.exitCode : 3);
 };
 
+// Bounded timeout for gh API calls so a hung GitHub API request fails the
+// comment step promptly rather than blocking the workflow until the job-level
+// timeout. 60s is generous for a paginated comment list + one PATCH/POST.
+const GH_TIMEOUT_MS = 60_000;
+
 const defaultRunGh = async (args) => {
-  const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: GH_TIMEOUT_MS });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(String(result.stderr || `gh exited ${result.status}`).trim());
+  if (result.signal === 'SIGTERM') throw new Error(`gh timed out after ${GH_TIMEOUT_MS / 1000}s`);
+  if (result.status !== 0) throw new Error(redactSecrets(String(result.stderr || `gh exited ${result.status}`).trim()));
   const stdout = String(result.stdout || '').trim();
   if (!stdout) return null;
   try { return JSON.parse(stdout); } catch { return stdout; }

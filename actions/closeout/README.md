@@ -360,6 +360,20 @@ Point `config` at a JSON file, for example:
   mode as well as the matrix). The first post-upgrade run reads BLOCKED with a
   digest-mismatch admission error — that is the designed behavior, not a regression.
   Reviewers re-attest the current head and it clears.
+- **Engine-command environment allowlist:** engine check commands and plan-mode
+  preflight probes run under a filtered child environment (`ESSENTIAL_ENV` plus
+  your `requiredEnv` / `safeEnv` lists), not the full step environment. This
+  prevents PR-controlled commands from reaching `GITHUB_ENV`/`GITHUB_OUTPUT`
+  (runner command files) or non-credential job secrets. To pass a secret into
+  your engine checks, list it in `safeEnv`; to require it, list it in
+  `requiredEnv` (a missing `requiredEnv` var fails the run before checks
+  execute). The gate injects one trusted, non-secret, repo-derived variable:
+  `CLOSEOUT_RESOLVED_BASE_REF` (already rev-parsed to a stable ref like
+  `origin/release/7`), so engine commands that need the PR base — for example
+  `git diff --check "${CLOSEOUT_RESOLVED_BASE_REF:-origin/main}"...HEAD` —
+  resolve the correct base even though `GITHUB_BASE_REF` is stripped from the
+  filtered environment. Quote the expansion to survive base refs containing
+  spaces.
 
 ## Preview cost
 
