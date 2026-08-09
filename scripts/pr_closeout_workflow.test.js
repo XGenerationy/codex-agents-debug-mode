@@ -1713,19 +1713,22 @@ test('resolvePlanAdmission blocks when a gitignored path is mutated by the probe
   // cleanTreeStatus respects .gitignore, so a probe mutating a gitignored
   // path (node_modules/.bin, generated artifacts) is invisible to it. The
   // post-probe check now also captures a workingTreeFingerprint before and
-  // after the probe and BLOCKs on mismatch, mirroring the full-run seal. A
-  // fingerprint that changes between the two captures proves a gitignored
-  // mutation and must block the preview advertised as read-only.
-  let callCount = 0;
+  // after the probe and BLOCKs on mismatch, mirroring the full-run seal.
+  //
+  // The fingerprint changes ONLY inside runPreflight (CodeRabbit 3745322364):
+  // returning a different value on every call would pass even if both reads
+  // happened before the probe. Tying the mutation to the probe call proves the
+  // pre-probe read sees the original tree, the probe mutates it, and the
+  // post-probe read sees the change — i.e. the probe is correctly bracketed.
+  let probed = false;
   const result = await resolvePlanAdmission({
     repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
     d: {
       readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
       cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
-      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
-      // Return a different fingerprint each call — the second (post-probe)
-      // capture differs from the first (pre-probe) capture.
-      workingTreeFingerprint: async () => { callCount += 1; return `fp-${callCount}`; },
+      // The probe is the ONLY thing that mutates the tree fingerprint.
+      runPreflight: async () => { probed = true; return { status: 'PASS', checks: [], toolVersions: {} }; },
+      workingTreeFingerprint: async () => (probed ? 'fp-after' : 'fp-before'),
     },
   });
   assert.equal(result.preflight.status, 'BLOCKED');

@@ -39,6 +39,12 @@ const CREDENTIAL_PATTERNS = [
   // consumes the entire BEGIN..END span (including embedded newlines). Mirrors
   // support.js's REDACT_PATTERNS so both layers agree.
   [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
+  // A PEM block with NO key-name prefix — a child process can emit a raw
+  // `-----BEGIN …-----` block (e.g. a TLS library dumping a key to stderr).
+  // The keyed pattern above only matches after `key=`/`key:`, so this generic
+  // fallback catches an un-prefixed block. Runs AFTER the keyed pattern so a
+  // `key=-----BEGIN…` is consumed with its key first (CodeRabbit 3745322356).
+  [/-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a minimum length
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],

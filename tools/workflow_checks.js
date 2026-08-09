@@ -74,7 +74,7 @@ const QUOTED_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
 // `{uses: ...}`, a real bypass. The decode check is the same as the block
 // case; only the boundary preceding the quoted key differs. Single quotes
 // are excluded for the same reason as QUOTED_USES_KEY (no escape processing).
-const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
+const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/g;
 // Resolve YAML double-quoted escape sequences into the actual characters they
 // denote. YAML double-quoted scalars support \uXXXX (4 hex), \UXXXXXXXX (8
 // hex), \xXX (2 hex), plus named escapes (\n, \t, ...); only the code-point
@@ -96,6 +96,14 @@ const decodeDoubleQuotedEscapes = (raw) => String(raw)
 // quotes are excluded: no escape processing in YAML single-quoted scalars.)
 const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*$/;
 const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*$/;
+// An explicit mapping key that is a YAML ALIAS (`? *action_key`). The scanner
+// is line-oriented and cannot resolve aliases, but an alias CAN name `uses`
+// (verified: `name: &action_key uses` then `- ? *action_key` resolves via
+// js-yaml to {uses: ...}). Fail-closed: flag ANY alias explicit key, since the
+// resolver cannot confirm it is NOT `uses`. Alias explicit keys are vanishingly
+// rare in real workflow YAML, so this cannot cause false positives on clean
+// pinned actions.
+const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*$/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
@@ -205,12 +213,17 @@ const findUnpinnedUses = (content) => {
     // The flow-mapping variant: an escape-obfuscated quoted uses key inside
     // `{...}`/`[...]` (e.g. `steps: [{"u\u0073es": ref}]`). QUOTED_USES_KEY is
     // anchored to a block-style line start and misses this; decode at the flow
-    // boundary the same way. Same raw !== decoded guard so a plain flow
-    // `{"uses": ref}` falls through to SUSPICIOUS_USES.
-    const flowQuotedMatch = FLOW_QUOTED_USES_KEY.exec(text);
-    if (flowQuotedMatch && flowQuotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(flowQuotedMatch[1]) === 'uses') {
-      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
-      return;
+    // boundary the same way. A flow mapping can carry MULTIPLE quoted keys on
+    // one line (`[{"name": setup, "u\u0073es": ref}]`), so iterate EVERY match
+    // (CodeRabbit 3745322365) — `.exec` returns only the first. Same
+    // raw !== decoded guard so a plain flow `{"uses": ref}` falls through to
+    // SUSPICIOUS_USES.
+    for (const flowMatch of text.matchAll(FLOW_QUOTED_USES_KEY)) {
+      const raw = flowMatch[1];
+      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
+        violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+        return;
+      }
     }
     // An explicit mapping key `? uses` (value on the following `:` line).
     // The line-oriented scanner cannot re-associate the value, but the marker
@@ -227,6 +240,14 @@ const findUnpinnedUses = (content) => {
     const explicitQuotedMatch = EXPLICIT_QUOTED_KEY.exec(text);
     if (explicitQuotedMatch && explicitQuotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(explicitQuotedMatch[1]) === 'uses') {
       violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      return;
+    }
+    // An alias-backed explicit key: `- ? *action_key` (js-yaml verified to
+    // resolve to {uses: ...} when the anchor names `uses`). The scanner cannot
+    // resolve aliases, so fail-closed: any alias in explicit-key position is
+    // flagged for manual review (Codex 3745332784).
+    if (EXPLICIT_ALIAS_KEY.test(text)) {
+      violations.push({ line: index + 1, ref: '(explicit ? *alias mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
     // Any key line that opens a block scalar: start tracking its body so a

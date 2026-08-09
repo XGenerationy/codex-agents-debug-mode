@@ -287,6 +287,12 @@ test('findUnpinnedUses flags an escape-obfuscated quoted uses key (Codex #14)', 
   // A non-resolving quoted key in flow context must not be flagged here.
   assert.equal(findUnpinnedUses('steps: [{"user": not-uses}]\n').length, 0,
     'a flow-mapping quoted key that does not resolve to uses is not flagged');
+  // A SECOND quoted key in the same flow mapping after another key
+  // (CodeRabbit 3745322365): `[{"name": setup, "u\u0073es": ref}]` — the
+  // escape key is not the first quoted key, so a single .exec missed it.
+  // The scanner now iterates every flow quoted key.
+  assert.equal(findUnpinnedUses('steps: [{"name": setup, "u\\u0073es": owner/action@main}]\n').length, 1,
+    'an escape-obfuscated uses: that is the second quoted key in a flow mapping must be flagged');
 });
 
 test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => {
@@ -309,6 +315,12 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
   // A `? name` explicit key for a NON-uses property must not be flagged.
   assert.equal(findUnpinnedUses('steps:\n  - ? name\n    : build\n').length, 0,
     'an explicit ? key for a non-uses property is not flagged');
+  // An alias-backed explicit key (Codex 3745332784): `name: &action_key uses`
+  // then `- ? *action_key` resolves (js-yaml verified) to {uses: ...}. The
+  // scanner cannot resolve aliases, so any alias in explicit-key position is
+  // flagged fail-closed.
+  assert.equal(findUnpinnedUses('name: &action_key uses\nsteps:\n  - ? *action_key\n    : owner/action@main\n').length, 1,
+    'an alias-backed explicit ? *alias key must be flagged (alias may resolve to uses)');
 });
 
 test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {

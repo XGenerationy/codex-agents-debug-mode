@@ -181,6 +181,21 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
     'error: [REDACTED:pem-block]\nrest of diagnostic',
     'a multi-line PEM block is redacted in full, including continuation lines',
   );
+  // A PEM block with NO key-name prefix (CodeRabbit 3745322356): a child
+  // process can emit a raw `-----BEGIN…-----` block. The keyed pattern only
+  // matches after `key=`/`key:`; the generic fallback catches an un-prefixed
+  // block so the body does not leak.
+  const rawPem = [
+    'stdout: -----BEGIN PLACEHOLDER KEY-----',
+    'MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwamE=',
+    '-----END PLACEHOLDER KEY-----',
+    'end',
+  ].join('\n');
+  assert.equal(
+    redactCredentialPatterns(rawPem),
+    'stdout: [REDACTED:pem-block]\nend',
+    'an un-prefixed PEM block is redacted by the generic fallback',
+  );
   // Ordinary diagnostic text without a credential is preserved verbatim.
   const benign = 'fatal: not a git repository (or any of the parent directories): .git';
   assert.equal(redactCredentialPatterns(benign), benign, 'non-credential diagnostics are unchanged');
