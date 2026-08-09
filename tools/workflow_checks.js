@@ -104,6 +104,14 @@ const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(
 // rare in real workflow YAML, so this cannot cause false positives on clean
 // pinned actions.
 const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?:#.*)?$/;
+// An alias used as an IMPLICIT block-style mapping key — `- *action_key : ref`
+// (with optional whitespace around the colon). When the anchor names `uses`
+// (`name: &action_key uses`), js-yaml resolves this to {uses: ref}. The scanner
+// cannot resolve aliases, so it cannot confirm an alias does NOT name `uses`.
+// Fail-closed: flag any alias in implicit-key position (Codex 3745389802).
+// Anchored to a sequence-item or mapping position so an alias that is a VALUE
+// (`uses: *ref` — a legitimate alias value) is NOT flagged.
+const ALIAS_IMPLICIT_KEY = /^\s*(?:-\s+)?\*\S+\s*:/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
@@ -248,6 +256,15 @@ const findUnpinnedUses = (content) => {
     // flagged for manual review (Codex 3745332784).
     if (EXPLICIT_ALIAS_KEY.test(text)) {
       violations.push({ line: index + 1, ref: '(explicit ? *alias mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      return;
+    }
+    // An alias used as an IMPLICIT block-style mapping key: `- *action_key : ref`
+    // (js-yaml verified to resolve to {uses: ref} when the anchor names `uses`).
+    // The scanner cannot resolve aliases, so fail-closed: any alias in implicit-
+    // key position is flagged. An alias that is a VALUE (`uses: *ref`) is NOT
+    // matched — the alias must precede the colon to be a key (Codex 3745389802).
+    if (ALIAS_IMPLICIT_KEY.test(text)) {
+      violations.push({ line: index + 1, ref: '(*alias: implicit mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
     // Any key line that opens a block scalar: start tracking its body so a

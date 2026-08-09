@@ -327,6 +327,15 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
     'an explicit ? uses key with a trailing comment must be flagged');
   assert.equal(findUnpinnedUses('name: &k uses\nsteps:\n  - ? *k # comment\n    : owner/action@main\n').length, 1,
     'an alias explicit key with a trailing comment must be flagged');
+  // An alias as an IMPLICIT block-style mapping key (Codex 3745389802):
+  // `name: &action_key uses` then `- *action_key : ref` resolves (js-yaml
+  // verified) to {uses: ref}. The scanner cannot resolve aliases, so any alias
+  // in implicit-key position is flagged fail-closed. An alias that is a VALUE
+  // (`key: *alias`) must NOT be flagged.
+  assert.equal(findUnpinnedUses('name: &action_key uses\nsteps:\n  - *action_key : owner/action@main\n').length, 1,
+    'an alias used as an implicit mapping key must be flagged');
+  assert.equal(findUnpinnedUses('env:\n  url: *checkout\n').length, 0,
+    'an alias used as a value for a non-uses key is not flagged here');
 });
 
 test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {
