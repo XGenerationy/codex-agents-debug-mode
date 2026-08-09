@@ -80,13 +80,16 @@ const findUnpinnedUses = (content) => {
   // items where sibling keys share the dash level but body is deeper.
   let scalarBodyIndent = -1;  // active body indent, or -1 when not in a scalar
   let scalarPending = false;   // header seen, waiting for first body line
-  // The column at which the header's mapping KEY begins, in the SAME units as
-  // `indent` (the character column, which for a body line equals its leading-
-  // whitespace count). For a sequence item this is the END of the dash prefix
-  // (`  - name:` → key starts at column 4), so it is the matched prefix length,
-  // NOT the leading-whitespace indent. A following non-blank line is scalar
-  // body only if its column is strictly greater than this key column.
-  let scalarHeaderIndent = -1;
+  // The column at which the header's mapping KEY begins, used to detect an
+  // EMPTY block scalar (first body line at or below this column → sibling key,
+  // not body). For a plain mapping line this equals the line's leading-
+  // whitespace `indent` (the key sits at the start of the non-whitespace text).
+  // For a sequence item it is the END of the actual dash prefix
+  // (`  - name:` → column 4, from the matched `\s*-\s+` prefix), so any amount
+  // of post-dash whitespace is handled. Tracked in its OWN coordinate (the key
+  // column) and compared only against a following line's column — never against
+  // the leading-whitespace `indent`, which is a different unit for seq items.
+  let scalarHeaderKeyColumn = -1;
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
     // Inside a block scalar? Skip body lines.
@@ -100,16 +103,17 @@ const findUnpinnedUses = (content) => {
     if (scalarPending) {
       if (text.trim() === '') return; // blank: still waiting for first body line
       scalarPending = false;
-      // An empty block scalar: the first non-blank line is at the SAME or
-      // SHALLower indentation as the header's mapping key. YAML parses the
-      // header key as an empty string and this line as a SIBLING key, not body
-      // content. Fall through to normal processing so a sibling `uses:` is
-      // scanned instead of being silently swallowed as the scalar body.
-      if (indent <= scalarHeaderIndent) {
-        scalarHeaderIndent = -1;
+      // An empty block scalar: the first non-blank line's column is at or below
+      // the header's mapping KEY column. YAML parses the header key as an empty
+      // string and this line as a SIBLING key, not body content. Fall through to
+      // normal processing so a sibling `uses:` is scanned instead of being
+      // silently swallowed as the scalar body. Compares against the KEY column
+      // (not the leading-whitespace indent) — the two differ for sequence items.
+      if (indent <= scalarHeaderKeyColumn) {
+        scalarHeaderKeyColumn = -1;
         // fall through: reprocess this line as a normal key line
       } else {
-        scalarHeaderIndent = -1;
+        scalarHeaderKeyColumn = -1;
         scalarBodyIndent = indent;
         return; // this line is body
       }
@@ -129,16 +133,16 @@ const findUnpinnedUses = (content) => {
     // `uses:` inside the string content is not flagged. Checked after
     // USES_LINE (a uses: key never opens a scalar in valid workflow YAML —
     // its value is an action reference) and before SUSPICIOUS_USES. Record the
-    // header's effective mapping-key indentation: if the first non-blank line
-    // is NOT more indented, the scalar is empty and that line is a sibling
-    // key, not body. For a sequence item, the key column is the END of the
-    // dash prefix (`  - name:` → key starts after `  - `), measured from the
-    // ACTUALLY matched prefix length — not a constant +2 — so YAML that uses
-    // multiple spaces after the dash (`-  name:`) is handled correctly.
+    // header's leading-whitespace indent AND its mapping KEY column separately:
+    // for a plain mapping line the key column equals the indent; for a sequence
+    // item it is the END of the actual dash prefix (`  - name:` → column 4),
+    // measured from the matched prefix so any post-dash whitespace is handled.
+    // The empty-scalar sibling decision compares the next line's column against
+    // the KEY column, never against the leading-whitespace indent (Qodo #10).
     if (BLOCK_SCALAR_HEADER.test(text)) {
       scalarPending = true;
       const seqPrefix = text.match(/^(\s*-\s+)/);
-      scalarHeaderIndent = seqPrefix ? seqPrefix[1].length : indent;
+      scalarHeaderKeyColumn = seqPrefix ? seqPrefix[1].length : indent;
       return;
     }
     // A `run:` (or `entrypoint:`/`shell:`) line whose value is inline (not a
