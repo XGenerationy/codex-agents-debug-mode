@@ -26,8 +26,8 @@ const REDACT_PATTERNS = [
   // x-access-token:SECRET@host (git remote URL credential embedding)
   [/(x-access-token|https?):[^\s@/]+@[^\s/]+/g, '$1=[REDACTED:credential]@'],
   // Generic key=value pairs where the key looks credential-shaped, including
-  // the value following an auth scheme (Authorization: Bearer <token>).
-  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*\S+/gi, '$1=[REDACTED]'],
+  // the full auth-scheme value (Authorization: Bearer eyJ... → all redacted).
+  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
 ];
 
 const redactSecrets = (text) => REDACT_PATTERNS.reduce(

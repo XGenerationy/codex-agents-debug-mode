@@ -42,7 +42,7 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 // inside `{}`/`[]` (flow context). A `uses:` buried inside a `run: echo
 // uses: foo` string scalar does NOT match because it is preceded by other
 // non-key content, not by a line-start or brace boundary.
-const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?|[{[]\s*)['"]?uses['"]?\s*:/;
+const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?|[{[][^}]*|,\s*)['"]?uses['"]?\s*:/;
 const COMMENT_LINE = /^\s*#/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
