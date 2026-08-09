@@ -293,6 +293,182 @@ const REQUIRED_PROOFS = {
   'hunter-build': 'command',
 };
 
+// Shared proof-policy helpers. Both the strict REQUIRED_PROOFS path and the
+// engine voluntary-proof path call these so the two can never drift on the
+// artifact escape rules or the bounded literal: policy (length and
+// control-character) rules. Control characters are tested with the same regex
+// literal in both call sites.
+const artifactPathEscapes = (value) => {
+  const rel = String(value).replaceAll('\\', '/').trim();
+  return path.isAbsolute(value) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
+    || rel.split('/').includes('..') || rel.startsWith('../');
+};
+
+const isBoundedLiteralPolicy = (policy) => policy.startsWith('literal:')
+  && policy.length <= 264
+  && policy.length > 'literal:'.length
+  && !/[\u0000-\u001f\u007f]/u.test(policy);
+
+// Fields an engine-mode check definition may carry. Anything else — most
+// pointedly `fixed`, `packageCandidates`, or `makeCandidates` — is either a
+// weakening vector or a typo; both fail closed rather than being ignored.
+const ENGINE_CHECK_FIELDS = new Set(['id', 'label', 'command', 'scripts', 'baselineSafe', 'generator', 'timeoutMs']);
+
+// Engine ids reach id-keyed plain-object lookups (timeoutsMs, proofs,
+// resourceGroups) and rendered reports downstream: a charset gate plus an
+// Object.prototype collision check (below) closes prototype-shaped and
+// control-character ids deterministically instead of relying on every
+// downstream lookup failing closed by accident.
+const ENGINE_CHECK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Split points for the make-gate token scan: whitespace, shell separators/
+// operators (`;&|(){}`), quote/substitution characters (`` ` " ' $ ``), and
+// redirection/assignment characters (`<>=`) — a make invocation dressed up
+// in any of these (`` `make lie` ``, `"make" lie`, `x=`make lie``, `bash -c
+// "make lie"`) still yields a bare make-alias token after the split.
+const MAKE_SPLIT = /[\s;&|(){}`"'$=<>]+/;
+// Names make is actually called under on common platforms — BSD/macOS ship
+// `make` as a symlink to `bmake`/`pmake`, NetBSD ships `pmake`, and Windows
+// toolchains ship `mingw32-make`/`mingw64-make`/`nmake` — not evasion, just
+// the real binary name. A leading path and a `.exe`/`.cmd`/`.bat` suffix are
+// stripped before the alias check, so `/usr/bin/make.exe` and `make` match
+// the same entry.
+const MAKE_ALIASES = new Set(['make', 'gmake', 'bmake', 'pmake', 'nmake', 'mingw32-make', 'mingw64-make']);
+// Case-insensitive: Windows and default-macOS filesystems resolve `MAKE`/
+// `Make.Exe` to the same binary, and Windows toolchains are explicitly in
+// this alias set's threat model (mingw32-make, nmake).
+const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, '').toLowerCase());
+
+// Engine-mode make gate: recipe bodies are only inspectable when the command
+// is EXACTLY `make <target>`. Any other command that invokes make — wrapped
+// (`cd x && make lie`), prefixed (`env make lie`, `nice -n 19 make lie`),
+// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), quoted or
+// substituted (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`),
+// aliased (`gmake lie`, `make.exe lie`, `mingw32-make lie`), or argumented
+// (`make lie MYVAR=1`, `make lie && true`) — cannot have its recipe resolved
+// and inspected, so it is BLOCKED rather than admitted uninspected.
+// This is a DENYLIST, not a proof of absence: it catches everything
+// reachable by typing the obvious thing — direct invocation, common shell
+// wrapping, common aliasing — but a genuinely exotic evasion (a shell
+// function or alias named e.g. `remake` that execs make, or an alias for
+// make under a name not in MAKE_ALIASES) cannot be enumerated and is not
+// claimed to be caught here.
+const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
+  const pure = /^make\s+(\S+)$/.exec(resolvedCommand.trim());
+  if (pure) {
+    const target = pure[1];
+    if (!Object.hasOwn(makeRecipes, target)) {
+      return `No recipe text was captured for make target "${target}" (${label}); closeout cannot trust an uninspected recipe.`;
+    }
+    const recipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[target]);
+    if (recipeNeutralizer) {
+      return `Make recipe for ${label} neutralizes failures (${recipeNeutralizer}); closeout cannot admit a failure-hiding recipe.`;
+    }
+    return null;
+  }
+  const invokesMake = resolvedCommand.split(MAKE_SPLIT).some(isMakeToken);
+  if (invokesMake) {
+    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make", rename the script; if "make" here is a bare argument (a test filter, pattern, or workspace name), this gate cannot distinguish it from an invocation — rephrase the command.`;
+  }
+  return null;
+};
+
+/**
+ * Validate and normalize `config.engineChecks` into check definitions the
+ * shared resolution pipeline in buildCheckPlan can consume. Engine mode
+ * replaces the strict matrix WHOLESALE (spec decision: no merging, no
+ * inheritance — a hybrid would be neither guarantee), so this is the single
+ * gate every engine matrix passes through. Every violation is a named error
+ * and the whole matrix is rejected — a partially-valid matrix is not a
+ * matrix. Ids are used verbatim in reports, digests, and attestations, so
+ * padded ids are rejected instead of silently trimmed. `baselineSafe`
+ * defaults to false (fail-closed: baseline verification must be opted into,
+ * never assumed). The returned definitions carry `engine: true` so
+ * buildCheckPlan resolves commands through the engine branch (placeholder,
+ * neutralizer, and make-recipe validation — user-supplied commands are never
+ * trusted the way the strict matrix's own hardcoded commands are).
+ * @param {unknown} engineChecks - config.engineChecks as supplied.
+ * @returns {object[]} normalized definitions.
+ */
+const validateEngineChecks = (engineChecks) => {
+  if (!Array.isArray(engineChecks) || engineChecks.length === 0) {
+    throw new Error('Engine mode requires config.engineChecks: a non-empty array of check definitions.');
+  }
+  const seen = new Set();
+  return engineChecks.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Engine check at index ${index} must be an object.`);
+    }
+    // Read every field exactly once, up front: validation and emission both
+    // use these locals, so a getter/Proxy entry can never swap the emitted
+    // value after validation — read-once makes the fail-closed claim true by
+    // construction, not by JSON.parse happening to produce plain data.
+    const { id, label, command, scripts, baselineSafe, generator, timeoutMs } = entry;
+    const scriptsCopy = Array.isArray(scripts) ? [...scripts] : scripts;
+    for (const field of Object.keys(entry)) {
+      if (!ENGINE_CHECK_FIELDS.has(field)) {
+        const where = typeof id === 'string' && id ? `"${id}"` : `at index ${index}`;
+        const hint = field === 'qualificationSafe' || field === 'resourceGroup'
+          ? ` (${field} belongs in the id-keyed config map config.${field === 'qualificationSafe' ? 'qualificationSafe' : 'resourceGroups'}, not inline)`
+          : '';
+        throw new Error(`Engine check ${where} has unknown field "${field}"; unknown fields are never ignored${hint}.`);
+      }
+    }
+    if (typeof id !== 'string' || !id.trim()) {
+      throw new Error(`Engine check at index ${index} must have a non-empty string id.`);
+    }
+    if (id !== id.trim()) {
+      throw new Error(`Engine check id "${id}" must not have leading or trailing whitespace.`);
+    }
+    if (!ENGINE_CHECK_ID_PATTERN.test(id)) {
+      throw new Error(`Engine check id "${id}" must start alphanumeric and use only letters, digits, ".", "_", "-".`);
+    }
+    if (id in {}) {
+      throw new Error(`Engine check id "${id}" collides with an Object.prototype member; choose another id.`);
+    }
+    if (seen.has(id)) throw new Error(`Engine check ids must be unique: "${id}" at index ${index} appears more than once.`);
+    seen.add(id);
+    const hasCommand = Object.hasOwn(entry, 'command');
+    const hasScripts = Object.hasOwn(entry, 'scripts');
+    if (hasCommand === hasScripts) {
+      throw new Error(`Engine check "${id}" must define exactly one of "command" or "scripts".`);
+    }
+    if (hasCommand && (typeof command !== 'string' || !command.trim())) {
+      throw new Error(`Engine check "${id}": command must be a non-empty string.`);
+    }
+    if (hasScripts && (
+      !Array.isArray(scriptsCopy) || scriptsCopy.length === 0
+      || scriptsCopy.some((name) => typeof name !== 'string' || !name.trim())
+    )) {
+      throw new Error(`Engine check "${id}": scripts must be a non-empty array of non-empty script names.`);
+    }
+    if (Object.hasOwn(entry, 'label') && (typeof label !== 'string' || !label.trim())) {
+      throw new Error(`Engine check "${id}": label must be a non-empty string when present.`);
+    }
+    const booleanFlags = { baselineSafe, generator };
+    for (const flag of ['baselineSafe', 'generator']) {
+      if (Object.hasOwn(entry, flag) && typeof booleanFlags[flag] !== 'boolean') {
+        throw new Error(`Engine check "${id}": ${flag} must be a boolean when present.`);
+      }
+    }
+    // Upper bound: Node timers clamp durations above 2^31-1 down to ~1ms — a
+    // fail-closed but baffling instant kill — so an over-bound timeout is
+    // rejected here where the author can see why.
+    if (Object.hasOwn(entry, 'timeoutMs') && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2147483647)) {
+      throw new Error(`Engine check "${id}": timeoutMs must be a positive integer no greater than 2147483647 when present.`);
+    }
+    return {
+      id,
+      label: label ?? id,
+      ...(hasCommand ? { command } : { packageCandidates: scriptsCopy }),
+      baselineSafe: baselineSafe ?? false,
+      generator: generator ?? false,
+      ...(Object.hasOwn(entry, 'timeoutMs') ? { timeoutMs } : {}),
+      engine: true,
+    };
+  });
+};
+
 /**
  * POSIX single-quote a value for safe interpolation into a shell command
  * string: wraps it in `'...'`, and for each embedded `'` closes the quote,
@@ -356,12 +532,76 @@ const expandCommand = (command, touchedFiles, { mergeBaseSha } = {}) => {
  * @param {{config?: object, packageScripts?: Record<string, string>, makeTargets?: string[], makeRecipes?: Record<string, string>, touchedFiles?: string[], mergeBaseSha?: string}} options
  * @returns {{checks: object[], errors: string[]}}
  */
-const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
-  const commands = config.commands || {};
+const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
+  // Engine mode rejects config.commands below, but rejection alone leaves
+  // the map live in the resolution loop, where a scripts-resolved engine
+  // check could still consult a smuggled entry through the configured
+  // branch (which lacks make-recipe inspection). Emptying the map in engine
+  // mode makes that path structurally dead rather than relying on the
+  // errors→FAIL rollup to keep it inert.
+  const commands = mode === 'engine' ? {} : (config.commands || {});
   const qualificationSafe = new Set(config.qualificationSafe || []);
   const resourceGroups = config.resourceGroups || {};
   const targets = new Set(makeTargets);
   const errors = [];
+  // Unknown mode: fail closed with an empty plan rather than guessing a tier.
+  if (mode !== 'strict' && mode !== 'engine') {
+    return { checks: [], errors: [`Unknown closeout mode "${mode}". Use strict or engine.`] };
+  }
+  // Engine-only keys in a strict run are weakening attempts (someone trying
+  // to swap the matrix or its script runner without saying --mode engine) —
+  // named errors, never silently ignored keys.
+  if (mode === 'strict') {
+    if (Object.hasOwn(config, 'engineChecks')) {
+      errors.push('config.engineChecks is only valid with --mode engine; a strict run never accepts a replacement matrix.');
+    }
+    if (Object.hasOwn(config, 'scriptRunner')) {
+      errors.push('config.scriptRunner is only valid with --mode engine.');
+    }
+    if (Object.hasOwn(config, 'requiredTools')) {
+      errors.push('config.requiredTools is only valid with --mode engine.');
+    }
+  }
+  // Engine mode: the matrix is engineChecks, full stop. config.commands
+  // coexisting with it would create a second command source and an override
+  // ambiguity, so it is rejected outright.
+  if (mode === 'engine' && Object.hasOwn(config, 'commands')) {
+    errors.push('Engine mode defines commands inline in engineChecks; config.commands is not accepted in engine mode.');
+  }
+  // The script runner used for engine `scripts` discovery. Strict keeps its
+  // hardcoded `pnpm run` (byte-identical output); engine defaults to the
+  // ecosystem-neutral `npm run` and accepts an override that is itself
+  // validated like any other command fragment.
+  let scriptRunner = 'npm run';
+  if (mode === 'engine' && Object.hasOwn(config, 'scriptRunner')) {
+    // Tabs and quote characters are rejected alongside newlines: a tab can
+    // pass for whitespace in downstream shell splitting, and an embedded
+    // quote can reopen/escape the surrounding shell-quoting the resolved
+    // command is spliced into — both are command-fragment injection vectors,
+    // not just cosmetic single-line concerns.
+    if (typeof config.scriptRunner !== 'string' || !config.scriptRunner.trim() || /[\r\n\t"']/.test(config.scriptRunner)) {
+      errors.push('scriptRunner must be a single-line non-empty string without tabs or quotes.');
+    } else {
+      const runnerNeutralizer = findCommandFailureNeutralizer(config.scriptRunner);
+      if (runnerNeutralizer) {
+        errors.push(`scriptRunner neutralizes failures (${runnerNeutralizer}); closeout cannot admit a failure-hiding runner.`);
+      } else {
+        scriptRunner = config.scriptRunner.trim();
+      }
+    }
+  }
+  // Engine matrix validation converts throws into the errors channel so the
+  // caller still gets a machine-readable BLOCKED plan (and the provisional
+  // report path still works) instead of an exception.
+  let definitions = MANDATORY_CHECKS;
+  if (mode === 'engine') {
+    try {
+      definitions = validateEngineChecks(config.engineChecks);
+    } catch (error) {
+      return { checks: [], errors: [...errors, error.message] };
+    }
+  }
+  const packageRunner = mode === 'engine' ? scriptRunner : 'pnpm run';
   if (Object.hasOwn(config, 'gateIntegrityReview')) {
     errors.push('gateIntegrityReview self-attestation is forbidden; use the required live GitHub PR review attestation.');
   }
@@ -374,8 +614,50 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
     }
   }
   const expand = (command) => expandCommand(command, touchedFiles, { mergeBaseSha });
-  const checks = MANDATORY_CHECKS.map((definition) => {
+  const checks = definitions.map((definition) => {
     const configured = commands[definition.id];
+    if (definition.engine && definition.command) {
+      // Engine commands are user-supplied: apply the full distrust pipeline
+      // the configured-command branch uses (placeholder, neutralizer) PLUS
+      // the make-recipe inspection the fixed branch applies to `make`
+      // invocations — an engine matrix must not be able to smuggle a
+      // failure-hiding recipe behind a clean-looking `make target`.
+      const trimmed = definition.command.trim();
+      if (/^(?:<[^>]+>|REPLACE(?:_|\b))/i.test(trimmed)) {
+        return {
+          ...definition,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Replace the example placeholder for ${definition.label}.`,
+        };
+      }
+      const engineCommand = expand(trimmed);
+      const engineNeutralizer = findCommandFailureNeutralizer(engineCommand);
+      if (engineNeutralizer) {
+        return {
+          ...definition,
+          command: engineCommand,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Engine command for ${definition.label} neutralizes failures (${engineNeutralizer}); closeout cannot admit a failure-hiding command.`,
+        };
+      }
+      // The make gate keys off the RESOLVED command shape, not a narrow
+      // regex against this one call site: wrapped/prefixed/pathed/flagged/
+      // argumented invocations of make are blocked exactly like a bare
+      // `make <target>` whose recipe neutralizes or was never captured.
+      const makeGateEvidence = engineMakeGate(engineCommand, makeRecipes, definition.label);
+      if (makeGateEvidence) {
+        return {
+          ...definition,
+          command: engineCommand,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: makeGateEvidence,
+        };
+      }
+      return { ...definition, command: engineCommand, resolution: 'engine-command' };
+    }
     if (definition.fixed) {
       if (configured !== undefined && configured !== definition.command) {
         errors.push(`Configuration cannot override fixed check ${definition.id}.`);
@@ -451,16 +733,36 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
       // #4781560042).
       const scriptBody = packageScripts[packageScript];
       const packageNeutralizer = findCommandFailureNeutralizer(scriptBody);
+      const resolvedScriptCommand = `${packageRunner} ${packageScript}`;
       if (packageNeutralizer) {
         return {
           ...definition,
-          command: `pnpm run ${packageScript}`,
+          command: resolvedScriptCommand,
           status: 'BLOCKED',
           resolution: 'package-script',
           evidence: `Package script "${packageScript}" for ${definition.label} neutralizes failures (${packageNeutralizer}); closeout cannot admit a failure-hiding package script.`,
         };
       }
-      return { ...definition, command: `pnpm run ${packageScript}`, resolution: 'package-script' };
+      // Engine mode: scriptRunner is user-configurable and can itself be
+      // `make` (or wrap make) — the resolved command must pass through the
+      // same make-recipe gate an inline engine command uses, so a `make
+      // <script>` resolution cannot dodge recipe inspection just because it
+      // arrived via scriptRunner instead of `command`. Strict defs never
+      // reach this: they are never `engine`, and packageRunner is the
+      // hardcoded `pnpm run` there regardless of makeRecipes contents.
+      if (definition.engine) {
+        const gateEvidence = engineMakeGate(resolvedScriptCommand, makeRecipes, definition.label);
+        if (gateEvidence) {
+          return {
+            ...definition,
+            command: resolvedScriptCommand,
+            status: 'BLOCKED',
+            resolution: 'package-script',
+            evidence: gateEvidence,
+          };
+        }
+      }
+      return { ...definition, command: resolvedScriptCommand, resolution: 'package-script' };
     }
     const makeTarget = definition.makeCandidates?.find((candidate) => targets.has(candidate));
     if (makeTarget) {
@@ -524,12 +826,57 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
         ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
         : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
     }
+    // Engine mode: a voluntarily attached proof (no REQUIRED_PROOFS entry
+    // exists for engine ids) is still validated at plan time — a malformed
+    // proof must block admission here exactly like a required one, not fail
+    // later inside the executor. Strict behavior is untouched: strict checks
+    // only ever carry proofs through the proofType path above.
+    if (mode === 'engine' && proof && !proofType) {
+      const engineArtifact = proof?.type === 'artifact'
+        && typeof proof.path === 'string' && proof.path.trim();
+      const engineCommandProof = proof?.type === 'command'
+        && typeof proof.command === 'string' && proof.command.trim()
+        && typeof proof.expectedPattern === 'string' && proof.expectedPattern.trim();
+      if (!engineArtifact && !engineCommandProof) {
+        const proofEvidence = `Configured proof for ${check.label} is malformed; engine proofs must be a complete artifact or command proof.`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      } else if (engineArtifact) {
+        if (artifactPathEscapes(proof.path)) {
+          const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+      } else if (engineCommandProof) {
+        // Strict parity: the executor rejects a neutralizing proof command
+        // and requires a bounded literal:<text> policy (see the validCommand
+        // block below); a voluntarily attached engine command proof must be
+        // held to the identical rules at plan time, not admitted uninspected.
+        const engineProofNeutralizer = findCommandFailureNeutralizer(proof.command);
+        if (engineProofNeutralizer) {
+          const proofEvidence = `Postcondition proof command for ${check.label} neutralizes failures (${engineProofNeutralizer}).`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+        // Mirror strict's exact literal-policy bounds (validCommand, below):
+        // bounded length and no control characters, not just a `literal:`
+        // prefix check — a voluntarily attached engine command proof gets
+        // the identical bar via the shared isBoundedLiteralPolicy helper.
+        if (!isBoundedLiteralPolicy(proof.expectedPattern)) {
+          const proofEvidence = `Postcondition proof pattern for ${check.label} must be a literal: policy with a non-empty value.`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+      }
+    }
     // Validate proof policies at plan time so unusable proofs cannot be
     // attested as admissible (Codex #4782132804). Mirrors executor rules.
     if (validArtifact) {
-      const rel = String(proof.path).replaceAll('\\', '/').trim();
-      if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
-        || rel.split('/').includes('..') || rel.startsWith('../')) {
+      if (artifactPathEscapes(proof.path)) {
         const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
         resolved = resolved.status === 'BLOCKED'
           ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
@@ -559,10 +906,7 @@ const buildCheckPlan = ({ config = {}, packageScripts = {}, makeTargets = [], ma
       const policy = String(proof.expectedPattern || '');
       const hunterOk = check.id === 'hunter-build'
         && policy === 'semantic:docker-compose-running-healthy';
-      const literalOk = policy.startsWith('literal:')
-        && policy.length <= 264
-        && policy.length > 'literal:'.length
-        && !/[\u0000-\u001f\u007f]/u.test(policy);
+      const literalOk = isBoundedLiteralPolicy(policy);
       if (!hunterOk && !literalOk) {
         const proofEvidence = check.id === 'hunter-build'
           ? 'Hunter proof requires expectedPattern semantic:docker-compose-running-healthy at plan time.'
@@ -1681,4 +2025,5 @@ module.exports = {
   findStatusSignals,
   scanSuppressionText,
   shellQuote,
+  validateEngineChecks,
 };

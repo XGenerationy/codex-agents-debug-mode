@@ -485,6 +485,13 @@ const readLiveGateAttestation = async ({
     return {
       provider: 'github-pull-request-review',
       status: 'BLOCKED',
+      // Machine-readable discriminator for the plan-mode admission mapping
+      // (spec: "Plan-mode admission readiness"): this is the ONLY path that
+      // means the read itself could not complete (gh missing, unauthenticated,
+      // network failure) rather than a clean snapshot-reasoned BLOCKED (no
+      // matching review, or the PR head/base moved) — additive field, every
+      // other return path in this function carries no `reason`.
+      reason: 'unavailable',
       baseSha: expectedBaseSha,
       headSha: expectedHeadSha,
       configDigest: expectedConfigDigest,

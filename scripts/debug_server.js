@@ -15,6 +15,7 @@ const {
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 } = require('./pr_closeout_fs');
+const { buildSecretReplacements } = require('./pr_closeout_stream');
 
 /**
  * Synchronous stdout/stderr writes for CLI terminal paths that call
@@ -628,6 +629,51 @@ const configureOrigin = (request, response, allowedOrigins) => {
 // race each other (a parallel append would otherwise grow the file while a
 // second request still holds a stale identity.bytesWritten and false-positive
 // session_log_replaced).
+
+// Shared log-identity invariant for appendSessionEvent (write path) and the
+// GET /sessions/:id/logs read path. Both open the same session.logFile with
+// no-follow semantics and must reject the SAME replacement shapes with the
+// SAME structured conflict, so a hardening applied to one path can never
+// silently leave the other weaker. The stat is taken on the already-opened
+// handle (the caller is responsible for opening and closing it). Throws
+// RequestError('session_log_replaced', 409) on any mismatch; a null/undefined
+// recorded identity is treated as a replacement (defensive: the field is set
+// at session-mint time, so its absence means the log was never established
+// under our control).
+const verifyLogIdentity = async (session, info) => {
+  const identity = session.logFileIdentity;
+  // dev/ino can survive a delete+recreate through inode reuse, so also
+  // require the recorded birth time (when the filesystem reports one on
+  // both sides) and exactly the byte count this server has appended — a
+  // replacement file starts with different content or an empty size.
+  const sameBirth = !identity?.birthtimeMs || !info.birthtimeMs
+    || info.birthtimeMs === identity.birthtimeMs;
+  // nlink > 1 means the session log was hard-linked to another path after
+  // /session; the token/artifact writers already fail closed on that shape.
+  if (
+    !info.isFile() || !identity
+    || info.nlink > 1
+    || info.dev !== identity.dev || info.ino !== identity.ino
+    || !sameBirth
+    || info.size !== identity.bytesWritten
+  ) {
+    throw new RequestError('session_log_replaced', 409);
+  }
+  // Re-verify the opened log still resolves inside the project even if the
+  // original .debug directory was renamed out and replaced with a symlink
+  // to an outside path (inode can still match the moved tree).
+  if (identity.projectRootReal) {
+    let realLog;
+    try {
+      realLog = await realpath(session.logFile);
+    } catch {
+      throw new RequestError('session_log_replaced', 409);
+    }
+    if (!isInsideRoot(identity.projectRootReal, realLog)) {
+      throw new RequestError('session_log_replaced', 409);
+    }
+  }
+};
 const appendSessionEvent = (session, serializedEvent) => {
   const previous = session.appendChain || Promise.resolve();
   const run = previous.catch(() => {}).then(async () => {
@@ -645,41 +691,9 @@ const appendSessionEvent = (session, serializedEvent) => {
       throw error;
     }
     try {
-      const info = await handle.stat();
-      const identity = session.logFileIdentity;
-      // dev/ino can survive a delete+recreate through inode reuse, so also
-      // require the recorded birth time (when the filesystem reports one on
-      // both sides) and exactly the byte count this server has appended — a
-      // replacement file starts with different content or an empty size.
-      const sameBirth = !identity.birthtimeMs || !info.birthtimeMs
-        || info.birthtimeMs === identity.birthtimeMs;
-      // nlink > 1 means the session log was hard-linked to another path after
-      // /session; the token/artifact writers already fail closed on that shape.
-      if (
-        !info.isFile() || !identity
-        || info.nlink > 1
-        || info.dev !== identity.dev || info.ino !== identity.ino
-        || !sameBirth
-        || info.size !== identity.bytesWritten
-      ) {
-        throw new RequestError('session_log_replaced', 409);
-      }
-      // Re-verify the opened log still resolves inside the project even if the
-      // original .debug directory was renamed out and replaced with a symlink
-      // to an outside path (inode can still match the moved tree).
-      if (identity.projectRootReal) {
-        let realLog;
-        try {
-          realLog = await realpath(session.logFile);
-        } catch {
-          throw new RequestError('session_log_replaced', 409);
-        }
-        if (!isInsideRoot(identity.projectRootReal, realLog)) {
-          throw new RequestError('session_log_replaced', 409);
-        }
-      }
+      await verifyLogIdentity(session, await handle.stat());
       await handle.writeFile(serializedEvent, 'utf8');
-      identity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+      session.logFileIdentity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
     } finally {
       await handle.close();
     }
@@ -688,14 +702,246 @@ const appendSessionEvent = (session, serializedEvent) => {
   return run;
 };
 
+// --- Collector-side secret redaction (spec:
+// docs/superpowers/specs/2026-08-05-collector-redaction-design.md) ---
+
+// Escape the regex meta-characters in a literal needle so it matches as a
+// verbatim substring inside a combined RegExp alternation. Mirrors the
+// escapeRegex helper used by the closeout signal scanner.
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Compile a needle list into ONE alternation RegExp and cache it by the
+// replacements array reference. The list is rebuilt only on registerToken
+// (once per session mint), but applyReplacements runs once per event string
+// AND once per object key on every authenticated /log append, so a single
+// combined scan (one engine pass over the text) replaces one full rescan per
+// needle variant. At the default 512-token cap (~7k variants) that turns
+// millions of String.replaceAll comparisons per 64 KB event into one match.
+// Needles are sorted longest-first (buildSecretReplacements guarantees this):
+// in a leftmost alternation the first alternative to match at a position wins,
+// so a longer needle must precede a shorter overlapping one (e.g.
+// "supersecret" before "super") or the shorter would consume its span first.
+// Every needle shares the single replacement '[REDACTED]'; if a caller ever
+// supplied mixed replacements, this fast path is bypassed for the per-needle
+// reduce path that honors each pair individually.
+const combinedScannerCache = new WeakMap();
+// Sentinel cached for a replacements list that cannot use a combined scanner
+// (empty, or mixed replacement values): distinguishes "cached as not eligible"
+// from "not yet cached" (undefined), so the uniformity scan never repeats.
+const NO_COMBINED_SCANNER = Symbol('no-combined-scanner');
+const getCombinedScanner = (replacements) => {
+  if (replacements.length === 0) return null;
+  // Cache lookup FIRST: applyReplacements runs once per string/key on every
+  // /log event, so the uniformity scan must not repeat O(#needles) work once
+  // the combined regex is built. The cache is keyed by the replacements array
+  // reference (rebuilt only on registerToken), so a hit is a single WeakMap
+  // lookup with no per-needle iteration.
+  const cached = combinedScannerCache.get(replacements);
+  if (cached) return cached === NO_COMBINED_SCANNER ? null : cached;
+  // All production needles map to '[REDACTED]'; mixed replacements would make
+  // a single replacement ambiguous, so fall back to the per-needle path. This
+  // uniformity scan runs at most once per replacements list (then cached).
+  const firstReplacement = replacements[0][1];
+  if (!replacements.every(([, replacement]) => replacement === firstReplacement)) {
+    combinedScannerCache.set(replacements, NO_COMBINED_SCANNER);
+    return null;
+  }
+  // Pre-sorted longest-first by buildSecretReplacements; re-sort defensively
+  // so a caller-built list cannot break the longest-match-first guarantee.
+  const pattern = replacements
+    .map(([needle]) => needle)
+    .sort((left, right) => right.length - left.length)
+    .map(escapeRegExp)
+    .join('|');
+  const scanner = { replacement: firstReplacement, regex: new RegExp(pattern, 'g') };
+  combinedScannerCache.set(replacements, scanner);
+  return scanner;
+};
+
+// Apply an already-built [needle, replacement] list to one string. The list
+// must be sorted longest-first (buildSecretReplacements guarantees this):
+// that prevents a shorter needle from consuming a longer needle's span
+// first. It does NOT prevent a needle from matching text inserted by an
+// earlier replacement (e.g. a secret whose value is literally "REDACTED"
+// re-matches inside "[REDACTED]") — that direction can only over-redact,
+// never reveal. Matching is case-sensitive, same as the closeout streaming
+// redactor's default. Longest-first ordering is a hard precondition for
+// callers that build their own list.
+const applyReplacements = (text, replacements) => {
+  const scanner = getCombinedScanner(replacements);
+  if (scanner) return text.replace(scanner.regex, scanner.replacement);
+  return replacements.reduce(
+    (current, [needle, replacement]) => current.replaceAll(needle, replacement),
+    text,
+  );
+};
+
+// Deep-walk a parsed /log event and redact every string it contains — leaf
+// values, array items, and object KEYS (a client could use a secret as a
+// key). Input always comes from JSON.parse, so only plain objects, arrays,
+// strings, numbers, booleans, and null occur, and cycles are impossible.
+// Rebuilds containers instead of mutating, so a failure part-way can never
+// leave a half-redacted event that later gets persisted. When two sibling
+// keys collide after redaction (or a redacted key collides with a literal
+// one), the later entry is suffixed deterministically ([REDACTED]#2, ...)
+// rather than silently overwriting the earlier entry. Entries are installed
+// with Object.defineProperty rather than plain assignment: JSON.parse
+// produces "__proto__" as an ordinary own enumerable property, but
+// `output[key] = value` would instead invoke the inherited
+// Object.prototype.__proto__ setter — silently dropping the entry from the
+// output and repointing the rebuilt object's prototype. defineProperty
+// always creates/overwrites an own data property regardless of the key's
+// name, so "__proto__" round-trips like any other key.
+// An explicit depth bound (REDACTION_MAX_DEPTH) makes the fail-closed path
+// for hostile nesting deterministic: instead of relying on whichever native
+// stack (the walk itself or a later JSON.stringify) exhausts first — which
+// varies by platform stack size and Node version — input deeper than the
+// bound throws a defined error that redactEventForAppend maps to a single
+// documented code. 64 is far above any legitimate event shape (real /log
+// events nest a handful of levels) while staying well clear of stack limits.
+const REDACTION_MAX_DEPTH = 64;
+const redactEventValue = (value, replacements, depth = 0) => {
+  if (depth > REDACTION_MAX_DEPTH) throw new Error('redaction_depth_exceeded');
+  if (typeof value === 'string') return applyReplacements(value, replacements);
+  if (Array.isArray(value)) return value.map((item) => redactEventValue(item, replacements, depth + 1));
+  if (value && typeof value === 'object') {
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+      let redactedKey = applyReplacements(key, replacements);
+      if (Object.hasOwn(output, redactedKey)) {
+        let suffix = 2;
+        while (Object.hasOwn(output, `${redactedKey}#${suffix}`)) suffix += 1;
+        redactedKey = `${redactedKey}#${suffix}`;
+      }
+      Object.defineProperty(output, redactedKey, {
+        value: redactEventValue(entry, replacements, depth + 1),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    return output;
+  }
+  return value;
+};
+
+// Fail-closed wrapper used by the /log handler: any walk failure rejects the
+// event (nothing is persisted) instead of falling back to raw evidence.
+const redactEventForAppend = (event, replacements) => {
+  try {
+    return redactEventValue(event, replacements);
+  } catch {
+    throw new RequestError('log_redaction_failed', 500);
+  }
+};
+
+// Owns the needle list for one collector process. `tokens` is an append-only
+// registry (launch token first, then every minted session token — retired
+// sessions' tokens deliberately stay registered so a stale token in a later
+// event body still redacts). Rebuilds derive entirely from the registry
+// (push-then-rebuild in the /session handler), so concurrent rebuilds are
+// idempotent and last-writer-wins can never drop a concurrent session's
+// token. Tokens enter buildSecretReplacements as explicitly-named synthetic
+// env entries, which grants them full encoded-variant expansion with no
+// minimum-length filter and requires no change to the reviewed closeout
+// module. `envSnapshot` is copied once at construction (not re-read on each
+// rebuild), so a caller mutating the object it passed in — or live
+// `process.env` — after construction cannot change the needle set out from
+// under an already-built context. The synthetic name prefix is derived to
+// provably avoid colliding with any real env var name already in the
+// snapshot: a literal `__COLLECTOR_TOKEN_0` in the environment must not
+// shadow (and thereby un-redact) either that real value or a token
+// registered under the same index. The registry is capped (default 512
+// tokens per process) so a client looping failed /session calls cannot grow
+// rebuild cost at request rate; exceeding the cap throws and the /session
+// handler must treat that as fail-closed (reject the mint) rather than
+// degrade redaction or rebuild cost. Every token — supplied at construction
+// or via registerToken — is validated as a non-empty string; silently
+// accepting anything else would register a token that can never actually
+// redact, i.e. a fail-open hole. Misconfigured option inputs (names, env
+// snapshot, token list, maxTokens) throw rather than silently weakening
+// redaction or disabling the registry cap.
+const createRedactionContext = (envSnapshot, explicitNames, initialTokens, { maxTokens = 512 } = {}) => {
+  if (!Array.isArray(explicitNames)) throw new Error('invalid_redaction_names');
+  // Validate maxTokens before either token-limit comparison: a non-integer or
+  // sub-1 value (e.g. NaN passed via `redactionMaxTokens: Number(envVar)`)
+  // makes both `length > maxTokens` and `length >= maxTokens` evaluate to
+  // false, growing the registry without bound and disabling the cap that
+  // bounds per-event redaction cost. Reject fail-closed, matching the other
+  // option-input validations.
+  if (!Number.isInteger(maxTokens) || maxTokens < 1) throw new Error('invalid_redaction_max_tokens');
+  if (envSnapshot === null || typeof envSnapshot !== 'object' || Array.isArray(envSnapshot)) {
+    throw new Error('invalid_redaction_env');
+  }
+  if (!Array.isArray(initialTokens)) throw new Error('invalid_redaction_tokens');
+  const snapshot = { ...envSnapshot };
+  for (const initial of initialTokens) {
+    if (typeof initial !== 'string' || initial.length === 0) {
+      throw new Error('invalid_redaction_token');
+    }
+  }
+  if (initialTokens.length > maxTokens) throw new Error('redaction_token_registry_full');
+  const tokens = [...initialTokens];
+  // Keep prepending underscores until no real env var name in the snapshot
+  // starts with the candidate prefix, so synthetic names can never collide
+  // with (and thereby shadow) an actual environment variable.
+  let syntheticPrefix = '__COLLECTOR_TOKEN_';
+  while (Object.keys(snapshot).some((key) => key.startsWith(syntheticPrefix))) {
+    syntheticPrefix = `_${syntheticPrefix}`;
+  }
+  let replacements;
+  const rebuild = () => {
+    const synthetic = {};
+    const syntheticNames = [];
+    tokens.forEach((tokenValue, index) => {
+      const name = `${syntheticPrefix}${index}`;
+      synthetic[name] = tokenValue;
+      syntheticNames.push(name);
+    });
+    replacements = buildSecretReplacements(
+      { ...snapshot, ...synthetic },
+      [...explicitNames, ...syntheticNames],
+    );
+  };
+  rebuild();
+  return {
+    registerToken(tokenValue) {
+      if (typeof tokenValue !== 'string' || tokenValue.length === 0) {
+        throw new Error('invalid_redaction_token');
+      }
+      if (tokens.length >= maxTokens) throw new Error('redaction_token_registry_full');
+      tokens.push(tokenValue);
+      rebuild();
+    },
+    replacements: () => replacements,
+    // Cardinality only (never a token value); used for the /health headroom
+    // fields and the single 80%-threshold warning, so an operator can restart
+    // the collector before the lifetime cap starts refusing mints.
+    tokenCount: () => tokens.length,
+    maxTokens: () => maxTokens,
+  };
+};
+
+// Valid hypothesis lifecycle statuses (spec:
+// docs/superpowers/specs/2026-08-06-hypothesis-endpoint-design.md). Any
+// status may follow any status — the append-only log preserves the audit
+// trail; only the vocabulary is fixed.
+const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUSIVE']);
+
 /**
  * Build (but do not start) the loopback-only debug-session HTTP collector.
  * Every request is gated by `isAllowedHost` (TCP peer must be loopback, Host
  * header must match) before any route logic runs. Routes: `GET /health`
- * (unauthenticated identity probe), `POST /session` (requires the launch
- * `token`, creates a session and its append-only NDJSON log under
- * `<projectRoot>/.debug`), and `POST /log` (requires that session's own
- * token — see authorizeRequest — and appends one redaction-free event line).
+ * (unauthenticated identity probe), `GET /auth` (unauthenticated
+ * challenge–response HMAC proof used internally for relaunch/port-conflict
+ * detection; not part of the client-facing protocol), `POST /session`
+ * (requires the launch `token`, creates a session and its append-only NDJSON
+ * log under `<projectRoot>/.debug`), `POST /log` (requires that session's
+ * own token — see authorizeRequest — and appends one event line after
+ * fail-closed known-secret redaction; see createRedactionContext),
+ * `POST /hypothesis` (launch token; appends one hypothesis lifecycle line
+ * through the same redaction and append path), and `GET /sessions/:id/logs`
+ * (launch token; filtered verbatim NDJSON read of a live session's log).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
@@ -708,6 +954,9 @@ const appendSessionEvent = (session, serializedEvent) => {
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
  * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
+ * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
+ * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
+ * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -716,6 +965,9 @@ const createDebugServer = ({
   instanceId = randomBytes(16).toString('hex'),
   allowedOrigins = [],
   limits = {},
+  redactionEnv = { ...process.env },
+  redactionNames = [],
+  redactionMaxTokens = 512,
 } = {}) => {
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
@@ -740,6 +992,68 @@ const createDebugServer = ({
   const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
+  // Fail-closed secret redaction for every persisted event. Built here so a
+  // broken needle build prevents the collector from starting at all; the
+  // launch token is registered from the first build.
+  const redaction = createRedactionContext(redactionEnv, redactionNames, [token], {
+    maxTokens: redactionMaxTokens,
+  });
+  // One structured line on FIRST cap exhaustion only: the terminal state is
+  // otherwise invisible on the collector side (RequestError responses skip
+  // the request.failed stderr line). Event name only — no captured data —
+  // matching the file's opaque-error policy. The write is best-effort: a
+  // broken/closed stderr (EPIPE, destroyed stream) must never turn an
+  // otherwise-successful /session mint into an error response, so the signal
+  // flag is set BEFORE the write and the write is guarded. "Attempted once"
+  // semantics (rather than "written once") keep a permanently-broken stderr
+  // from retrying on every subsequent mint.
+  // process.stderr.write can fail two ways: a synchronous throw (destroyed
+  // stream) and an asynchronous 'error' event (EPIPE on a piped stderr that
+  // surfaces after the write returns). With no 'error' listener, the async
+  // kind would crash the process as an uncaughtException. Attach a no-op
+  // 'error' listener once so either failure mode is absorbed, and use the
+  // write callback as a second net so a callback-reported error never throws.
+  let stderrErrorListenerAttached = false;
+  const writeStderrBestEffort = (line) => {
+    if (!stderrErrorListenerAttached) {
+      stderrErrorListenerAttached = true;
+      // No-op listener: swallows async stream errors (EPIPE, etc.) so they
+      // never become uncaughtException. Re-added only on the first call, so
+      // adding is idempotent across the process lifetime.
+      process.stderr.on('error', () => {});
+    }
+    try {
+      process.stderr.write(line, () => {});
+    } catch {
+      // Observability only; never propagate a stream failure into /session.
+    }
+  };
+  let redactionRegistryFullSignaled = false;
+  const signalRegistryFull = () => {
+    if (redactionRegistryFullSignaled) return;
+    redactionRegistryFullSignaled = true;
+    writeStderrBestEffort('{"level":"error","event":"redaction.registry_full"}\n');
+  };
+  // One structured warning the FIRST time the registry crosses 80% of the
+  // lifetime cap, so an operator can restart the collector before mints start
+  // failing (the cap is permanent until process restart; retired sessions keep
+  // their tokens registered by design). Emitted from checkRegistryHeadroom()
+  // right after every successful registerToken. Cardinality only — no token
+  // values — matching the opaque-error policy. 80% bounds headroom for the
+  // remaining 20% of slots at the configured cap (e.g. ~410 of 512). Like the
+  // registry-full signal, the write is best-effort and the flag is set first.
+  const REDACTION_REGISTRY_HEADROOM_THRESHOLD = 0.8;
+  let redactionRegistryHeadroomSignaled = false;
+  const checkRegistryHeadroom = () => {
+    if (redactionRegistryHeadroomSignaled) return;
+    const count = redaction.tokenCount();
+    const cap = redaction.maxTokens();
+    if (cap > 0 && count >= Math.ceil(cap * REDACTION_REGISTRY_HEADROOM_THRESHOLD)) {
+      redactionRegistryHeadroomSignaled = true;
+      writeStderrBestEffort('{"level":"warn","event":"redaction.registry_headroom","tokens":' +
+        `${count},"max":${cap}}\n`);
+    }
+  };
   const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
     && effectiveLimits.sessionIdleTimeoutMs >= 1
     ? effectiveLimits.sessionIdleTimeoutMs
@@ -806,6 +1120,12 @@ const createDebugServer = ({
           instance_id: instanceId,
           project_hash: projectHash,
           ready: collectorReady,
+          // Redaction registry headroom (cardinality only — never a token
+          // value): a supervisor can alert before the lifetime cap starts
+          // refusing mints. Both are 0-based counts of registered tokens vs
+          // the cap; retired sessions keep their tokens registered by design.
+          redaction_tokens: redaction.tokenCount(),
+          redaction_max_tokens: redaction.maxTokens(),
         });
         return;
       }
@@ -862,6 +1182,18 @@ const createDebugServer = ({
           provisional: true,
         });
         try {
+          // Session setup runs to completion BEFORE the session token is
+          // registered. registerToken consumes an append-only registry slot;
+          // if it ran first (as it once did), a caller able to force any later
+          // setup failure (debug_dir_not_directory, mkdir EPERM, ...) could
+          // repeat /session and burn registry slots until
+          // redaction_token_registry_full, permanently disabling new sessions
+          // until restart. Registering in the successful path means only
+          // tokens actually handed to a usable client consume slots. /log
+          // refuses a provisional session with session_initializing, so the
+          // token is still registered before the session can accept /log,
+          // preserving the ordering invariant that a rebuild failure rejects
+          // the session fail-closed.
           // Reject a symlinked, non-directory, or escaped .debug path before
           // writing session evidence. A regular *file* named .debug would make
           // mkdir throw ENOTDIR and surface as an unstructured 500; a
@@ -920,8 +1252,10 @@ const createDebugServer = ({
           try {
             const info = await handle.stat();
             if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
-            // /log writes redaction-free runtime evidence. The 0600 mode above
-            // is a no-op against Windows' inherited DACL, so another local
+            // /log events are redacted only for KNOWN secrets (see
+            // createRedactionContext); treat log contents as sensitive. The
+            // 0600 mode above is a no-op against Windows' inherited DACL, so
+            // another local
             // user with inherited access to a shared checkout could read this
             // log; establish a protected, current-user-only ACL before any
             // event can be appended (mirrors collector_token's own Windows
@@ -1001,6 +1335,34 @@ const createDebugServer = ({
             throw error;
           }
           await handle.close();
+          // Push-then-rebuild at the END of the successful setup path: the
+          // token joins the append-only registry only once .debug validation,
+          // directory creation, and the session log all succeeded, so only
+          // tokens handed out to clients consume registry slots. Concurrent
+          // mints still converge (whichever rebuild runs last includes every
+          // registered token). A late failure here (registry cap or rebuild)
+          // is caught below: the session is deleted and the mint rejected, but
+          // the already-created session log file remains on disk (it was
+          // written through a no-follow, contained descriptor and holds no
+          // captured evidence yet, so leaving it is safe and consistent with
+          // retireInactiveSessions keeping retired logs on disk).
+          try {
+            redaction.registerToken(sessionToken);
+          } catch (error) {
+            // redaction_token_registry_full is a permanent, restart-only
+            // condition (the lifetime mint cap); everything else is a
+            // transient rebuild failure a client may retry. Distinct codes
+            // keep the two diagnosable; neither leaks captured data.
+            if (error?.message === 'redaction_token_registry_full') {
+              signalRegistryFull();
+              throw new RequestError('session_registry_full', 500);
+            }
+            throw new RequestError('session_redaction_failed', 500);
+          }
+          // Warn once when the registry crosses 80% of the lifetime cap, so an
+          // operator can restart before mints start failing. Runs only on a
+          // successful registration (the cap check above threw otherwise).
+          checkRegistryHeadroom();
           delete sessions.get(sessionId).provisional;
         } catch (error) {
           sessions.delete(sessionId);
@@ -1041,19 +1403,45 @@ const createDebugServer = ({
         if (typeof payload.msg !== 'string' || payload.msg.trim() === '') {
           throw new RequestError('invalid_message');
         }
-        // Refresh after authentication and message validation, before the
-        // awaited append, so concurrent allocation cannot retire a session
-        // whose valid event is in flight.
-        session.lastActivityAt = Date.now();
         if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
           throw new RequestError('event_limit_reached', 429);
         }
 
         const event = { ts: new Date().toISOString(), msg: payload.msg };
         for (const key of ['data', 'hypothesisId', 'loc', 'runId']) {
-          if (payload[key] !== undefined) event[key] = payload[key];
+          if (payload[key] === undefined) continue;
+          // hypothesisId and runId are the join keys that POST /hypothesis
+          // lines and sub-project B's filters/diff match on byte-exactly;
+          // trim string values here and in /hypothesis so "  H1  " and "H1"
+          // cannot silently become distinct hypotheses. A non-string value
+          // (e.g. hypothesisId: 42 or runId: {}) can never join with a
+          // hypothesis line and is silently invisible to GET ?hypothesisId=42
+          // (the query string is compared with !== against the stored value),
+          // so reject it with the same structured code /hypothesis uses —
+          // silently persisting it would be fail-open by another name. A
+          // whitespace-only value trims to "", which is just as unjoinable and
+          // which /hypothesis already rejects for hypothesisId, so reject it
+          // here too rather than persisting an empty join key.
+          if (key === 'hypothesisId' || key === 'runId') {
+            if (typeof payload[key] !== 'string') throw new RequestError('invalid_join_key');
+            if (payload[key].trim() === '') throw new RequestError('invalid_join_key');
+          }
+          event[key] = (key === 'hypothesisId' || key === 'runId')
+            ? payload[key].trim()
+            : payload[key];
         }
-        const serializedEvent = `${JSON.stringify(event)}\n`;
+        // Refresh AFTER all payload validation (msg + join keys) but BEFORE
+        // the awaited append, so concurrent allocation cannot retire a session
+        // whose VALID event is in flight — while an invalid request rejected
+        // below this point does NOT extend the session lifetime and cannot be
+        // abused to stall retireInactiveSessions or exhaust maxSessions.
+        session.lastActivityAt = Date.now();
+        // Redact BEFORE serialization and BEFORE capacity reservation: a
+        // redaction failure rejects the event with nothing persisted and no
+        // reservation to roll back. Byte accounting below intentionally uses
+        // post-redaction bytes ([REDACTED] may shrink or grow an event).
+        const redactedEvent = redactEventForAppend(event, redaction.replacements());
+        const serializedEvent = `${JSON.stringify(redactedEvent)}\n`;
         const eventBytes = Buffer.byteLength(serializedEvent);
         if (totalBytes + eventBytes > effectiveLimits.maxTotalBytes) {
           throw new RequestError('storage_limit_reached', 429);
@@ -1074,6 +1462,211 @@ const createDebugServer = ({
           throw error;
         }
         sendJson(response, 202, { status: 'recorded' });
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/hypothesis') {
+        // Hypotheses are agent/operator artifacts: they authenticate with the
+        // LAUNCH token (the capability the operator already holds via
+        // .debug/collector_token), never the per-session token — the
+        // instrumented app keeps exactly one write capability: /log events.
+        // Auth precedes the body read, like /session.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const payload = await readJson(request, effectiveLimits.maxBodyBytes, effectiveLimits.bodyTimeoutMs);
+        const sessionId = payload.sessionId || payload.session_id;
+        const session = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        if (typeof payload.hypothesisId !== 'string' || payload.hypothesisId.trim() === '') {
+          throw new RequestError('invalid_hypothesis_id');
+        }
+        const hypothesisId = payload.hypothesisId.trim();
+        if (!HYPOTHESIS_STATUSES.has(payload.status)) {
+          throw new RequestError('invalid_hypothesis_status');
+        }
+        // Optional fields must be strings when present: silently dropping or
+        // coercing a non-string would hide caller bugs (fail-open by another
+        // name), so reject with a structured code instead.
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined && typeof payload[key] !== 'string') {
+            throw new RequestError('invalid_hypothesis_field');
+          }
+        }
+        // Same refresh point as /log: after auth and validation, before the
+        // awaited append, so concurrent retirement cannot race a valid write.
+        session.lastActivityAt = Date.now();
+        if (session.eventCount >= effectiveLimits.maxEventsPerSession) {
+          throw new RequestError('event_limit_reached', 429);
+        }
+        // Server-stamped, allowlisted assembly mirrors /log: ts and type are
+        // never client-controlled, and only known optional fields are copied.
+        const line = {
+          ts: new Date().toISOString(),
+          type: 'hypothesis',
+          hypothesisId,
+          status: payload.status,
+        };
+        for (const key of ['title', 'note', 'runId']) {
+          if (payload[key] !== undefined) {
+            line[key] = key === 'runId' ? payload[key].trim() : payload[key];
+          }
+        }
+        const redactedLine = redactEventForAppend(line, redaction.replacements());
+        const serializedLine = `${JSON.stringify(redactedLine)}\n`;
+        const lineBytes = Buffer.byteLength(serializedLine);
+        if (totalBytes + lineBytes > effectiveLimits.maxTotalBytes) {
+          throw new RequestError('storage_limit_reached', 429);
+        }
+        session.eventCount += 1;
+        totalBytes += lineBytes;
+        try {
+          await appendSessionEvent(session, serializedLine);
+        } catch (error) {
+          session.eventCount -= 1;
+          totalBytes -= lineBytes;
+          throw error;
+        }
+        sendJson(response, 202, { status: 'recorded' });
+        return;
+      }
+
+      const sessionLogsMatch = request.method === 'GET'
+        ? pathname.match(/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/)
+        : null;
+      if (sessionLogsMatch) {
+        // Reads are a launch-token capability (see POST /hypothesis). The id
+        // is used ONLY as a map key — client input never reaches filesystem
+        // path construction, so there is no traversal surface.
+        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        retireInactiveSessions();
+        const session = sessions.get(sessionLogsMatch[1]);
+        if (!session) {
+          sendJson(response, 404, { error: 'unknown_session' });
+          return;
+        }
+        if (session.provisional) {
+          sendJson(response, 425, { error: 'session_initializing' });
+          return;
+        }
+        // Fail-closed query parsing: unknown parameter names are rejected so
+        // a typo cannot silently disable a filter and widen what is returned.
+        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
+        const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        const seenParams = new Set();
+        for (const name of query.keys()) {
+          // Unknown names AND duplicates are rejected: a typo or a stray
+          // repeated parameter must never silently change what is returned.
+          if (!allowedParams.has(name) || seenParams.has(name)) {
+            throw new RequestError('invalid_query');
+          }
+          seenParams.add(name);
+        }
+        const typeFilter = query.get('type') ?? 'all';
+        if (!['all', 'event', 'hypothesis'].includes(typeFilter)) {
+          throw new RequestError('invalid_query');
+        }
+        const parseBound = (name) => {
+          const value = query.get(name);
+          if (value === null) return undefined;
+          const parsed = Date.parse(value);
+          if (Number.isNaN(parsed)) throw new RequestError('invalid_query');
+          return parsed;
+        };
+        const sinceTs = parseBound('sinceTs');
+        const untilTs = parseBound('untilTs');
+        let limit = effectiveLimits.maxEventsPerSession;
+        const rawLimit = query.get('limit');
+        if (rawLimit !== null) {
+          if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1) throw new RequestError('invalid_query');
+          limit = Math.min(Number(rawLimit), effectiveLimits.maxEventsPerSession);
+        }
+        const hypothesisFilter = query.get('hypothesisId')?.trim() ?? undefined;
+        const runFilter = query.get('runId')?.trim() ?? undefined;
+        // Serialize ONLY the identity check + bounded byte read on the
+        // per-session append chain: no append can interleave mid-read, so the
+        // identity check and the byte window are consistent and a torn
+        // trailing line cannot be observed. The chain is released (and the
+        // file handle closed) BEFORE the response is parsed/filtered, so
+        // concurrent /log and POST /hypothesis appends are not blocked while
+        // we scan the captured text. Parsing/filtering operate on a frozen
+        // snapshot: the bytes were identity-checked and read under the chain,
+        // so a concurrent append can only add a NEW line that this snapshot
+        // predates — it cannot mutate already-captured bytes.
+        const previous = session.appendChain || Promise.resolve();
+        const readSnapshot = previous.catch(() => {}).then(async () => {
+          let handle;
+          try {
+            handle = await openNoFollow(session.logFile, constants.O_RDONLY);
+          } catch (error) {
+            if (['ELOOP', 'ENXIO', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EPERM', 'EACCES'].includes(error?.code)) {
+              throw new RequestError('session_log_replaced', 409);
+            }
+            throw error;
+          }
+          try {
+            await verifyLogIdentity(session, await handle.stat());
+            // Read exactly the bytes this server wrote: bytesWritten bounds
+            // the window, so appended-after or truncated content can never
+            // slip in (size was already checked equal inside verifyLogIdentity).
+            const buffer = Buffer.alloc(session.logFileIdentity.bytesWritten);
+            let offset = 0;
+            while (offset < buffer.length) {
+              const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+              if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
+              offset += bytesRead;
+            }
+            return buffer.toString('utf8');
+          } finally {
+            await handle.close();
+          }
+        });
+        // The chain stored on session.appendChain MUST resolve to undefined
+        // (parity with appendSessionEvent): assigning readSnapshot directly
+        // would leave session.appendChain holding the whole decoded log text
+        // until the next append replaces it — up to maxTotalBytes retained
+        // for an idle read-then-sleep session. The caller still awaits
+        // readSnapshot for the text; the chain keeps only the serialization
+        // guarantee, not the payload.
+        session.appendChain = readSnapshot.then(() => undefined, () => undefined);
+        const text = await readSnapshot;
+        // Scan the snapshot tail-first: only the last `limit` matching lines
+        // are kept, so ?limit=1 parses one line instead of walking the whole
+        // (up to maxTotalBytes) log. The output is reversed back into append
+        // order at the end.
+        const tail = [];
+        for (let end = text.length, start = text.lastIndexOf('\n', end - 1);
+          start >= -1 && tail.length < limit;
+          end = start, start = start === -1 ? -2 : text.lastIndexOf('\n', start - 1)) {
+          const rawLine = start === -1 ? text.slice(0, end) : text.slice(start + 1, end);
+          if (!rawLine) continue;
+          // Server-written lines always parse (they were JSON.stringify'd at
+          // append time); a parse failure here would mean identity-checked
+          // bytes changed underneath us and surfaces as internal_error.
+          const parsed = JSON.parse(rawLine);
+          // Lines WITHOUT type are events (spec definition). An unknown future
+          // type must not be swept into ?type=event — it matches only type=all.
+          const lineType = parsed.type === undefined ? 'event' : parsed.type;
+          if (typeFilter !== 'all' && lineType !== typeFilter) continue;
+          if (hypothesisFilter !== undefined && parsed.hypothesisId !== hypothesisFilter) continue;
+          if (runFilter !== undefined && parsed.runId !== runFilter) continue;
+          if (sinceTs !== undefined || untilTs !== undefined) {
+            const lineTs = Date.parse(parsed.ts);
+            if (Number.isNaN(lineTs)) continue;
+            if (sinceTs !== undefined && lineTs < sinceTs) continue;
+            if (untilTs !== undefined && lineTs > untilTs) continue;
+          }
+          tail.push(rawLine);
+        }
+        const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
+        response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        response.end(body);
         return;
       }
 
@@ -1518,6 +2111,14 @@ const parseAllowedOrigins = (value) =>
     .map((origin) => origin.trim())
     .filter(Boolean);
 
+// DEBUG_REDACT_NAMES: comma-separated env-var names that must always be
+// redacted from persisted events regardless of value length (the CLI-facing
+// mirror of the closeout config's `names` opt-in).
+const parseRedactNames = (value) => String(value ?? '')
+  .split(',')
+  .map((name) => name.trim())
+  .filter(Boolean);
+
 const main = () => {
   const [projectArgument] = process.argv.slice(2);
   if (projectArgument === '--help' || projectArgument === '-h') {
@@ -1540,6 +2141,7 @@ const main = () => {
     projectRoot,
     token,
     allowedOrigins: parseAllowedOrigins(process.env.DEBUG_ALLOWED_ORIGIN),
+    redactionNames: parseRedactNames(process.env.DEBUG_REDACT_NAMES),
   });
   server.once('error', async (error) => {
     if (error.code === 'EADDRINUSE') {
@@ -2061,16 +2663,21 @@ if (require.main === module) main();
 module.exports = {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  REDACTION_MAX_DEPTH,
   RequestError,
   createDebugServer,
+  createRedactionContext,
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
+  parseRedactNames,
   probeLaunchToken,
   probeReadyCollector,
   probeServer,
   readJson,
   reclaimStaleCollectorClaim,
+  redactEventForAppend,
+  redactEventValue,
   resolvePowerShellExecutable,
   unlinkOwnedClaimIfUnchanged,
 };

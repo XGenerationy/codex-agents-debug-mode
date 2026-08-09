@@ -11,19 +11,26 @@ const test = require('node:test');
 const {
   COLLECTOR_SERVICE,
   COLLECTOR_VERSION,
+  REDACTION_MAX_DEPTH,
   RequestError,
   createDebugServer,
+  createRedactionContext,
   isInsideRoot,
   isSameFileIdentity,
   openNoFollowSync,
+  parseRedactNames,
   probeLaunchToken,
   probeReadyCollector,
   probeServer,
   readJson,
   reclaimStaleCollectorClaim,
+  redactEventForAppend,
+  redactEventValue,
   resolvePowerShellExecutable,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
+
+const { buildSecretReplacements } = require('./pr_closeout_stream');
 
 const TEST_LAUNCH_TOKEN = 'test-launch-token-with-enough-entropy-for-fixtures';
 
@@ -44,7 +51,7 @@ const close = (server) =>
     });
   });
 
-const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathname = '/' } = {}) =>
+const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathname = '/', rawBody } = {}) =>
   new Promise((resolve, reject) => {
     const url = new URL(pathname, baseUrl);
     const request = http.request(
@@ -76,7 +83,15 @@ const requestJson = (baseUrl, { agent, body, headers = {}, method = 'GET', pathn
       },
     );
     request.on('error', reject);
-    if (body !== undefined) request.write(JSON.stringify(body));
+    // rawBody bypasses this client's own JSON.stringify: a hostile-nesting
+    // fixture deep enough to blow the SERVER's redaction-walk stack can also
+    // overflow the *test client's* native stringify recursion budget (they
+    // are different code paths with different per-level costs), which would
+    // fail the test for a reason unrelated to the server behavior under
+    // test. rawBody lets a caller hand over pre-built JSON text instead.
+    assert.equal(body === undefined || rawBody === undefined, true);
+    if (rawBody !== undefined) request.write(rawBody);
+    else if (body !== undefined) request.write(JSON.stringify(body));
     request.end();
   });
 
@@ -304,6 +319,11 @@ test('exposes collector-specific health without exposing credentials or paths', 
     // Before markCollectorReady(), /health must report ready:false so a
     // concurrent relaunch cannot claim already_running mid token write.
     assert.equal(response.body.ready, false);
+    // /health exposes redaction registry headroom (cardinality only — never a
+    // token value): the launch token occupies exactly one slot at startup.
+    assert.equal(response.body.redaction_tokens, 1);
+    assert.equal(response.body.redaction_max_tokens, 512);
+    assert.equal(JSON.stringify(response.body).includes(TEST_LAUNCH_TOKEN), false);
     server.markCollectorReady();
     const readyResponse = await requestJson(baseUrl, { pathname: '/health' });
     assert.equal(readyResponse.body.ready, true);
@@ -1765,11 +1785,12 @@ test(
   'writes a session log with a protected current-user-only Windows ACL',
   { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
   async () => {
-    // Codex UeruJ: /log writes redaction-free runtime evidence, and the 0600
-    // mode set at session-log creation is a no-op against Windows' inherited
-    // DACL -- another local user with inherited access to a shared checkout
-    // could otherwise read captured diagnostic data. Assert the same
-    // current-user-only ACL invariant already covered for collector_token.
+    // Codex UeruJ: /log events are redacted only for known secrets; treat
+    // log contents as sensitive. The 0600 mode set at session-log creation
+    // is a no-op against Windows' inherited DACL -- another local user
+    // with inherited access to a shared checkout could otherwise read
+    // captured diagnostic data. Assert the same current-user-only ACL
+    // invariant already covered for collector_token.
     const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-windows-log-acl-'));
     const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
     const baseUrl = await listen(server);
@@ -3330,3 +3351,1344 @@ test(
     }
   },
 );
+
+test('redactEventValue redacts string leaves, nested data, and object keys', () => {
+  const replacements = buildSecretReplacements(
+    { API_TOKEN: 'supersecretvalue123' },
+    [],
+  );
+  const event = {
+    ts: '2026-08-05T00:00:00.000Z',
+    msg: 'auth failed for supersecretvalue123',
+    data: {
+      nested: { detail: 'retry with supersecretvalue123 now' },
+      supersecretvalue123: 'used as key',
+      list: ['supersecretvalue123', 42, true, null],
+    },
+  };
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(redacted.msg, 'auth failed for [REDACTED]');
+  assert.equal(redacted.data.nested.detail, 'retry with [REDACTED] now');
+  assert.equal(redacted.data['[REDACTED]'], 'used as key');
+  assert.deepEqual(redacted.data.list, ['[REDACTED]', 42, true, null]);
+  assert.equal(Object.hasOwn(redacted.data, 'supersecretvalue123'), false);
+});
+
+test('redactEventValue leaves non-string leaves untouched and returns new objects', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { msg: 'clean', data: { count: 7, ok: false, none: null } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepEqual(redacted, event);
+  assert.notEqual(redacted, event);
+  assert.notEqual(redacted.data, event.data);
+});
+
+test('redactEventValue does not mutate the input event', () => {
+  // The source invariant is that containers are rebuilt, not mutated, so a
+  // part-way failure can never leave a half-redacted event. The clean-input
+  // test above passes whether or not the walk mutates in place, so pin the
+  // invariant on a secret-bearing event where mutation would actually matter.
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { msg: 'saw supersecretvalue123', data: { supersecretvalue123: 'k' } };
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(redacted.msg, 'saw [REDACTED]');
+  assert.equal(event.msg, 'saw supersecretvalue123');
+  assert.equal(Object.hasOwn(event.data, 'supersecretvalue123'), true);
+});
+
+test('redactEventValue disambiguates colliding keys deterministically', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2 } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepEqual(redacted, { data: { '[REDACTED]': 1, '[REDACTED]#2': 2 } });
+  assert.deepStrictEqual(Object.keys(redacted.data), ['[REDACTED]', '[REDACTED]#2']);
+});
+
+test('redactEventValue disambiguates a third colliding key against the already-suffixed one', () => {
+  // NOTE: the suffix loop disambiguates against the current candidate key,
+  // not a stripped "logical base" name. A literal '[REDACTED]#2' colliding
+  // with the '[REDACTED]#2' produced by the previous entry therefore becomes
+  // '[REDACTED]#2#2', not '[REDACTED]#3' -- verified by running the actual
+  // implementation rather than hand-derived, since the two disambiguation
+  // strategies diverge on this exact input.
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = { data: { supersecretvalue123: 1, '[REDACTED]': 2, '[REDACTED]#2': 3 } };
+  const redacted = redactEventValue(event, replacements);
+  assert.deepStrictEqual(redacted, { data: { '[REDACTED]': 1, '[REDACTED]#2': 2, '[REDACTED]#2#2': 3 } });
+  assert.deepStrictEqual(Object.keys(redacted.data), ['[REDACTED]', '[REDACTED]#2', '[REDACTED]#2#2']);
+});
+
+test('redactEventValue preserves a JSON __proto__ key as an own property without touching the prototype', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  const event = JSON.parse('{"msg":"hi","data":{"__proto__":{"inner":"supersecretvalue123"},"keep":"me"}}');
+  const redacted = redactEventValue(event, replacements);
+  assert.equal(
+    JSON.stringify(redacted),
+    '{"msg":"hi","data":{"__proto__":{"inner":"[REDACTED]"},"keep":"me"}}',
+  );
+  assert.equal(Object.getPrototypeOf(redacted.data), Object.prototype);
+});
+
+test('redactEventForAppend maps walk failures to log_redaction_failed 500', () => {
+  // The walk IS reachable-and-throwable over HTTP via deep nesting inside
+  // maxBodyBytes (see the 'hostile deep nesting' integration test); this
+  // unit test pins the exact RequestError mapping (code + status)
+  // independent of platform stack depth.
+  // A RegExp needle makes String.prototype.replaceAll throw (non-global
+  // regex), standing in for any unexpected walk failure.
+  const poisoned = [[/x/, '[REDACTED]']];
+  assert.throws(
+    () => redactEventForAppend({ msg: 'x' }, poisoned),
+    (error) => error instanceof RequestError
+      && error.code === 'log_redaction_failed'
+      && error.status === 500,
+  );
+});
+
+test('createRedactionContext folds env, explicit names, and tokens; registry rebuild is idempotent', () => {
+  const context = createRedactionContext(
+    { API_TOKEN: 'supersecretvalue123', SHORT_TOKEN: 'tiny' },
+    ['SHORT_TOKEN'],
+    ['launch-token-value-with-entropy'],
+  );
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  assert.equal(apply('a supersecretvalue123 b'), 'a [REDACTED] b');
+  assert.equal(apply('short tiny value'), 'short [REDACTED] value');
+  assert.equal(apply('bearer launch-token-value-with-entropy'), 'bearer [REDACTED]');
+  assert.equal(apply('session-token-added-later-abc'), 'session-token-added-later-abc');
+  context.registerToken('session-token-added-later-abc');
+  assert.equal(apply('session-token-added-later-abc'), '[REDACTED]');
+  // Earlier tokens survive later registrations (append-only registry).
+  context.registerToken('another-token-registered-after');
+  assert.equal(apply('bearer launch-token-value-with-entropy'), 'bearer [REDACTED]');
+  assert.equal(apply('session-token-added-later-abc'), '[REDACTED]');
+});
+
+test('createRedactionContext caps the token registry and leaves it intact after the cap throws', () => {
+  const context = createRedactionContext({}, [], ['t-0'], { maxTokens: 2 });
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  context.registerToken('t-1');
+  assert.throws(
+    () => context.registerToken('t-2'),
+    /redaction_token_registry_full/,
+  );
+  // The registry (and its derived replacements) must be unchanged by the
+  // rejected registration -- both earlier tokens still redact.
+  assert.equal(apply('has t-0 in it'), 'has [REDACTED] in it');
+  assert.equal(apply('has t-1 in it'), 'has [REDACTED] in it');
+});
+
+test('createRedactionContext rejects invalid tokens at construction and via registerToken', () => {
+  assert.throws(
+    () => createRedactionContext({}, [], ['']),
+    /invalid_redaction_token/,
+  );
+  const context = createRedactionContext({}, [], ['seed-token-value']);
+  assert.throws(() => context.registerToken(''), /invalid_redaction_token/);
+  assert.throws(() => context.registerToken(undefined), /invalid_redaction_token/);
+});
+
+test('createRedactionContext derives a synthetic prefix that cannot shadow a real env var', () => {
+  // A literal __COLLECTOR_TOKEN_0 in the environment must not shadow itself
+  // (via the {...snapshot, ...synthetic} spread) nor the token registered
+  // under the same index -- both must still redact.
+  const context = createRedactionContext(
+    { __COLLECTOR_TOKEN_0: 'realenvsecretvalue' },
+    [],
+    ['thelaunchtokenvalue'],
+  );
+  const apply = (text) => redactEventValue({ msg: text }, context.replacements()).msg;
+  assert.equal(apply('contains realenvsecretvalue here'), 'contains [REDACTED] here');
+  assert.equal(apply('contains thelaunchtokenvalue here'), 'contains [REDACTED] here');
+});
+
+test('createRedactionContext rejects initialTokens exceeding maxTokens', () => {
+  assert.throws(
+    () => createRedactionContext({}, [], ['t-0', 't-1', 't-2'], { maxTokens: 2 }),
+    /redaction_token_registry_full/,
+  );
+});
+
+test('createRedactionContext rejects non-integer or sub-1 maxTokens fail-closed', () => {
+  // A non-numeric maxTokens (e.g. NaN from `Number(envVar)`) makes both
+  // `length > maxTokens` and `length >= maxTokens` evaluate to false, which
+  // would silently disable the registry cap and grow per-event redaction cost
+  // without bound. The cap must reject fail-closed, not fail open. Note
+  // `undefined` is intentionally excluded: the destructure default
+  // (`maxTokens = 512`) substitutes a valid cap, so omitting the option is
+  // the documented happy path.
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '512', null, true]) {
+    assert.throws(
+      () => createRedactionContext({}, [], [], { maxTokens: bad }),
+      /invalid_redaction_max_tokens/,
+      `maxTokens=${String(bad)} should be rejected`,
+    );
+  }
+  // A valid integer cap is accepted and still enforces the bound.
+  const context = createRedactionContext({}, [], ['t-0'], { maxTokens: 1 });
+  assert.throws(() => context.registerToken('t-1'), /redaction_token_registry_full/);
+});
+
+const withRedactionServer = async (redactionEnv, redactionNames, run) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv,
+    redactionNames,
+  });
+  const baseUrl = await listen(server);
+  try {
+    return await run({ baseUrl, projectRoot });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+};
+
+const readSessionLines = async (projectRoot, session) => {
+  const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+  return raw.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+};
+
+test('POST /log persists env secrets as [REDACTED] in msg, nested data, and keys', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'refused supersecretvalue123 upstream',
+        data: {
+          nested: { echo: 'value supersecretvalue123 seen' },
+          supersecretvalue123: 'as key',
+        },
+      },
+    });
+    assert.equal(response.status, 202);
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'refused [REDACTED] upstream');
+    assert.equal(event.data.nested.echo, 'value [REDACTED] seen');
+    assert.equal(event.data['[REDACTED]'], 'as key');
+    assert.equal(JSON.stringify(event).includes('supersecretvalue123'), false);
+  });
+});
+
+test('POST /log redacts encoded variants (base64, URL-encoded, JSON-escaped)', async () => {
+  const secret = 'p@ss word+42!"quoted"';
+  await withRedactionServer({ DB_PASSWORD: secret }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const base64 = Buffer.from(secret, 'utf8').toString('base64');
+    const urlEncoded = encodeURIComponent(secret);
+    const jsonEscaped = JSON.stringify(secret).slice(1, -1);
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'variants observed',
+        data: { base64, urlEncoded, jsonEscaped },
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.data.base64, '[REDACTED]');
+    assert.equal(event.data.urlEncoded, '[REDACTED]');
+    assert.equal(event.data.jsonEscaped, '[REDACTED]');
+  });
+});
+
+test('short auto-discovered values persist; redactionNames opt-in redacts them', async () => {
+  await withRedactionServer({ SHORT_TOKEN: 'tiny' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'value tiny stays' },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'value tiny stays');
+  });
+  await withRedactionServer({ SHORT_TOKEN: 'tiny' }, ['SHORT_TOKEN'], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'value tiny goes' },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'value [REDACTED] goes');
+  });
+});
+
+test('secret-free events keep their exact shape (regression guard)', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'Function entry',
+        data: { userId: null },
+        hypothesisId: 'H1',
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.deepEqual(
+      { msg: event.msg, data: event.data, hypothesisId: event.hypothesisId },
+      { msg: 'Function entry', data: { userId: null }, hypothesisId: 'H1' },
+    );
+  });
+});
+
+test('createDebugServer refuses to start when the initial redaction build fails', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  const poisonedEnv = new Proxy({}, {
+    ownKeys() { throw new Error('poisoned env'); },
+  });
+  try {
+    assert.throws(() => createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      redactionEnv: poisonedEnv,
+    }), /poisoned env/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('createRedactionContext rejects a non-array explicitNames fail-closed', () => {
+  assert.throws(
+    () => createRedactionContext({}, 'SHORT_TOKEN', ['t-0']),
+    /invalid_redaction_names/,
+  );
+});
+
+test('createRedactionContext rejects null or non-object env snapshots fail-closed', () => {
+  assert.throws(() => createRedactionContext(null, [], ['t-0']), /invalid_redaction_env/);
+  assert.throws(() => createRedactionContext('env', [], ['t-0']), /invalid_redaction_env/);
+  assert.throws(() => createRedactionContext([], [], ['t-0']), /invalid_redaction_env/);
+});
+
+test('hostile deep nesting is rejected fail-closed with nothing persisted', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'baseline ok' },
+    });
+    const logPath = path.join(projectRoot, session.log_file);
+    const before = await readFile(logPath, 'utf8');
+    // redactEventValue enforces an explicit REDACTION_MAX_DEPTH bound and
+    // throws once input exceeds it, so the fail-closed outcome is a stated
+    // contract rather than whichever native stack (the walk or a later
+    // JSON.stringify) exhausts first on the running platform. A depth just
+    // past the bound trips the walk deterministically; the event rejects with
+    // the single documented code log_redaction_failed (mapped by
+    // redactEventForAppend), nothing is persisted, and the session recovers.
+    const depth = REDACTION_MAX_DEPTH + 1;
+    const rawBody = `{"sessionId":${JSON.stringify(session.session_id)},"sessionToken":${JSON.stringify(session.session_token)},"msg":"hostile nesting","data":${'['.repeat(depth)}0${']'.repeat(depth)}}`;
+    const rejected = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      rawBody,
+    });
+    assert.equal(rejected.status, 500);
+    assert.equal(rejected.body.error, 'log_redaction_failed');
+    const after = await readFile(logPath, 'utf8');
+    assert.equal(after, before);
+    const recovered = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'recovered ok' },
+    });
+    assert.equal(recovered.status, 202);
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.msg), ['baseline ok', 'recovered ok']);
+  });
+});
+
+test('redactEventValue rejects nesting at exactly the configured depth bound', () => {
+  const replacements = buildSecretReplacements({ API_TOKEN: 'supersecretvalue123' }, []);
+  // The walk tracks depth as it recurses into containers. Wrapping in
+  // `{ data: ... }` enters the top object at depth 0 and recurses into the
+  // data value at depth 1, so an N-level array nest reaches its leaf at
+  // depth N + 1. REDACTION_MAX_DEPTH - 1 levels (leaf at the bound) are
+  // accepted; one more level (leaf past the bound) throws the defined error.
+  let within = 0;
+  for (let i = 0; i < REDACTION_MAX_DEPTH - 1; i += 1) within = [within];
+  assert.doesNotThrow(() => redactEventValue({ data: within }, replacements));
+  let beyond = 0;
+  for (let i = 0; i < REDACTION_MAX_DEPTH; i += 1) beyond = [beyond];
+  assert.throws(
+    () => redactEventValue({ data: beyond }, replacements),
+    /redaction_depth_exceeded/,
+  );
+});
+
+test('createRedactionContext rejects a non-array initialTokens fail-closed', () => {
+  assert.throws(() => createRedactionContext({}, [], 'abc'), /invalid_redaction_tokens/);
+  assert.throws(() => createRedactionContext({}, [], null), /invalid_redaction_tokens/);
+});
+
+test('collector launch and session tokens are redacted from event bodies, cross-session', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const sessionA = (await createSession(baseUrl, 'session-a')).body;
+    const sessionB = (await createSession(baseUrl, 'session-b')).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: sessionA.session_id,
+        sessionToken: sessionA.session_token,
+        msg: `launch=${TEST_LAUNCH_TOKEN} mine=${sessionA.session_token} other=${sessionB.session_token}`,
+      },
+    });
+    const [event] = await readSessionLines(projectRoot, sessionA);
+    assert.equal(event.msg, 'launch=[REDACTED] mine=[REDACTED] other=[REDACTED]');
+  });
+});
+
+test('a full token registry rejects the session fail-closed with session_registry_full', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-'));
+  // redactionMaxTokens: 2 = launch token + exactly one session mint. The
+  // second mint exceeds the cap inside registerToken, which the /session
+  // handler maps to session_registry_full (permanent cap state,
+  // distinguished from transient session_redaction_failed). This exercises
+  // the fail-closed path through a supported seam. NOTE: a post-construction
+  // poisoned env Proxy CANNOT trigger this path anymore —
+  // createRedactionContext snapshots env once at construction (review
+  // round-1 hardening). If a Proxy-based variant of this test goes red, the
+  // test is wrong, not the snapshot: do NOT revert the snapshot to live env
+  // reads.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 2,
+  });
+  const baseUrl = await listen(server);
+  try {
+    const healthy = await createSession(baseUrl);
+    assert.equal(healthy.status, 201);
+    // Capture stderr around ONLY the two failing mints: the healthy mint
+    // above and the /log call below must not contribute to the count, so a
+    // stray unrelated stderr write elsewhere can't mask a miscount here.
+    const stderrLines = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    try {
+      const rejected = await createSession(baseUrl);
+      assert.equal(rejected.status, 500);
+      assert.equal(rejected.body.error, 'session_registry_full');
+      // The cap state is permanent (restart-only): a THIRD mint attempt must
+      // fail the same way, not fall back to the transient code or recover.
+      const rejectedAgain = await createSession(baseUrl);
+      assert.equal(rejectedAgain.status, 500);
+      assert.equal(rejectedAgain.body.error, 'session_registry_full');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(
+      stderrLines.filter((line) => line.includes('"event":"redaction.registry_full"')).length,
+      1,
+    );
+    // The healthy session keeps recording after the failed mints: the
+    // registry and needle list are intact (cap check precedes the push).
+    const logged = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: healthy.body.session_id,
+        sessionToken: healthy.body.session_token,
+        msg: 'still recording',
+      },
+    });
+    assert.equal(logged.status, 202);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('a failed /session setup does not burn a redaction registry slot', async () => {
+  // registerToken now runs at the END of successful session setup, not the
+  // start. A caller able to force a setup failure (debug_dir_not_directory,
+  // mkdir EPERM, ...) must not consume a registry slot, or it could repeat
+  // /session and exhaust the lifetime cap (redaction_token_registry_full),
+  // permanently disabling new sessions until process restart.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-burn-'));
+  // .debug is a regular file, so every /session fails at debug_dir_not_directory
+  // before reaching registerToken.
+  await writeFile(path.join(projectRoot, '.debug'), 'not-a-directory');
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    // maxTokens: 2 = launch token + exactly one session mint.
+    redactionMaxTokens: 2,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // Repeatedly force a failed setup: none of these consume a slot.
+    for (let i = 0; i < 5; i += 1) {
+      const failed = await createSession(baseUrl);
+      assert.equal(failed.status, 409);
+      assert.equal(failed.body.error, 'debug_dir_not_directory');
+    }
+    // Remove the blocker and confirm a real session still mints: the registry
+    // still has one free slot because the failed setups never registered.
+    await rm(path.join(projectRoot, '.debug'));
+    const healthy = await createSession(baseUrl);
+    assert.equal(healthy.status, 201, JSON.stringify(healthy.body));
+    // The next mint exceeds the cap (launch + one session token).
+    const rejected = await createSession(baseUrl);
+    assert.equal(rejected.status, 500);
+    assert.equal(rejected.body.error, 'session_registry_full');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('registry headroom warns once at 80% and /health exposes token counts', async () => {
+  // The lifetime cap is permanent until restart and retired sessions keep
+  // their tokens registered, so a long-running collector that mints past 80%
+  // is on track to refuse every further mint. Two operational signals cover
+  // it: a single warn-level stderr line the first time the registry crosses
+  // 80%, and the registered/cap counts exposed in GET /health (cardinality
+  // only — never a token value).
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-headroom-'));
+  // maxTokens: 6 = launch token + 5 session mints. 80% of 6 = 4.8 -> ceil = 5,
+  // so the threshold is crossed when the 5th token registers (launch + 4
+  // sessions), i.e. after the 4th successful /session.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 6,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // /health reports the launch token (1 of 6) before any session.
+    const health0 = await requestJson(baseUrl, { pathname: '/health' });
+    assert.equal(health0.body.redaction_tokens, 1);
+    assert.equal(health0.body.redaction_max_tokens, 6);
+
+    const stderrLines = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    let headroomCount;
+    try {
+      // Mint 3 sessions (tokens 2,3,4): still under the 5-token threshold.
+      for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
+      headroomCount = stderrLines.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length;
+      assert.equal(headroomCount, 0);
+      // /health now reports 4 registered tokens.
+      const health4 = await requestJson(baseUrl, { pathname: '/health' });
+      assert.equal(health4.body.redaction_tokens, 4);
+
+      // 4th session registers the 5th token (>= ceil(6*0.8)=5): warning fires.
+      await createSession(baseUrl, 'threshold');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    const headroomAfter = stderrLines.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length;
+    assert.equal(headroomAfter, 1, 'headroom warning must fire exactly once at the threshold');
+    // The single line carries cardinality only — no token value leaks.
+    const headroomLine = stderrLines.find((line) => line.includes('"event":"redaction.registry_headroom"'));
+    assert.match(headroomLine, /"tokens":5,"max":6/);
+    assert.equal(headroomLine.includes(TEST_LAUNCH_TOKEN), false);
+
+    // A 5th session registers the 6th token (still >= threshold): the warning
+    // must NOT fire a second time (one-shot, like signalRegistryFull).
+    const stderrLines2 = [];
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLines2.push(String(chunk));
+      return originalWrite.call(process.stderr, chunk, ...rest);
+    };
+    try {
+      await createSession(baseUrl, 'past-threshold');
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    assert.equal(
+      stderrLines2.filter((line) => line.includes('"event":"redaction.registry_headroom"')).length,
+      0,
+      'headroom warning must not repeat after the threshold',
+    );
+    const health6 = await requestJson(baseUrl, { pathname: '/health' });
+    assert.equal(health6.body.redaction_tokens, 6);
+    assert.equal(health6.body.redaction_max_tokens, 6);
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('a stderr write failure cannot break an otherwise-successful /session mint', async () => {
+  // The headroom warning and the registry-full signal write to stderr on the
+  // successful /session path. A broken/closed stderr (EPIPE, destroyed stream)
+  // must NOT propagate into /session handling — observability is best-effort.
+  // This mints past the 80% headroom threshold so the warning write actually
+  // runs, then forces that write to throw and asserts the mint still succeeds.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-stderr-'));
+  // maxTokens: 6 = launch token + 5 session mints; 80% of 6 = ceil(4.8) = 5.
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionMaxTokens: 6,
+  });
+  const baseUrl = await listen(server);
+  try {
+    // Mint 3 sessions (tokens 2,3,4): under the threshold, no warning yet.
+    for (let i = 0; i < 3; i += 1) await createSession(baseUrl, `pre-${i}`);
+    // Replace stderr.write with a function that throws, simulating a broken
+    // stream, for the 4th mint that registers the 5th token (>= threshold).
+    // Count invocations so the test cannot pass if the headroom signal ever
+    // stops firing on this mint (a threshold/constant change would otherwise
+    // leave the 201 assertion true but exercising nothing).
+    const originalWrite = process.stderr.write;
+    let writeAttempts = 0;
+    process.stderr.write = (_chunk, _cb) => {
+      writeAttempts += 1;
+      throw new Error('simulated broken stderr (EPIPE)');
+    };
+    let mintStatus;
+    try {
+      const threshold = await createSession(baseUrl, 'threshold');
+      mintStatus = threshold.status;
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    // The mint must succeed despite the stderr write throwing.
+    assert.equal(mintStatus, 201);
+    // Pin that the throwing write actually ran; otherwise this test passes
+    // even when the headroom signal never fires.
+    assert.equal(writeAttempts >= 1, true, 'the stderr write must have been attempted');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('byte accounting uses post-redaction bytes', async () => {
+  // The aggregate byte cap intentionally counts POST-redaction bytes: a raw
+  // event whose secret-laden message exceeds maxTotalBytes, but whose redacted
+  // form fits, must be accepted (202) and the on-disk size must stay under the
+  // cap. A regression that reserved pre-redaction bytes would reject this event
+  // or leave totalBytes out of step with the file size.
+  const secret = 'supersecretvalue123'.repeat(8); // 152 chars raw, 10 redacted
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-redact-bytes-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: { API_TOKEN: secret },
+    // Above the redacted event size (~60 bytes), below the raw size (~202).
+    limits: { maxTotalBytes: 150 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const accepted = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: `leaked ${secret}`,
+      },
+    });
+    assert.equal(accepted.status, 202);
+    const logPath = path.join(projectRoot, session.log_file);
+    const { size } = await stat(logPath);
+    // The collector rejects only when totalBytes + eventBytes > maxTotalBytes,
+    // so == maxTotalBytes is within the cap. Assert <= (not strict <) to match
+    // the implementation's inclusive semantics.
+    assert.equal(size <= 150, true, `on-disk size ${size} must be within the 150-byte cap`);
+    const [event] = await readSessionLines(projectRoot, session);
+    assert.equal(event.msg, 'leaked [REDACTED]');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('redactEventValue redacts secrets containing regex meta-characters', () => {
+  // applyReplacements compiles needles into a single combined RegExp; the
+  // needles are escaped so a secret containing regex syntax (., *, +, ?, ^,
+  // [, ], (, ), |, $, {, }, \) matches as a verbatim substring, not as
+  // pattern. A leading ^ is the fail-open case: unescaped it compiles as an
+  // anchor, never matches, and the secret would persist unredacted.
+  const secret = '^a.b*c+d?e[f]g(h)i|j$k{l}m\\n';
+  const replacements = buildSecretReplacements(
+    { API_TOKEN: secret },
+    [],
+  );
+  const redacted = redactEventValue(
+    { msg: `secret is ${secret} here`, data: { [secret]: 'value' } },
+    replacements,
+  );
+  assert.equal(redacted.msg, 'secret is [REDACTED] here');
+  assert.equal(redacted.data['[REDACTED]'], 'value');
+});
+
+test('parseRedactNames splits, trims, and drops empty entries', () => {
+  assert.deepEqual(parseRedactNames('NPM_TOKEN, DOCKER_AUTH_CONFIG ,,EXTRA '), [
+    'NPM_TOKEN',
+    'DOCKER_AUTH_CONFIG',
+    'EXTRA',
+  ]);
+  assert.deepEqual(parseRedactNames(undefined), []);
+  assert.deepEqual(parseRedactNames(''), []);
+});
+
+const postHypothesis = (baseUrl, body, headers = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` }) =>
+  requestJson(baseUrl, { method: 'POST', pathname: '/hypothesis', headers, body });
+
+test('POST /hypothesis appends a redacted, allowlisted, server-stamped line', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, {
+      sessionId: session.session_id,
+      hypothesisId: 'H1',
+      status: 'OPEN',
+      title: 'token supersecretvalue123 leaks',
+      note: 'seen in supersecretvalue123 header',
+      runId: 'r1',
+      extraneous: 'dropped',
+      ts: 'client-supplied-ignored',
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(response.body, { status: 'recorded' });
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(line.type, 'hypothesis');
+    assert.equal(line.hypothesisId, 'H1');
+    assert.equal(line.status, 'OPEN');
+    assert.equal(line.title, 'token [REDACTED] leaks');
+    assert.equal(line.note, 'seen in [REDACTED] header');
+    assert.equal(line.runId, 'r1');
+    assert.equal(Object.hasOwn(line, 'extraneous'), false);
+    assert.equal(Number.isNaN(Date.parse(line.ts)), false);
+    assert.notEqual(line.ts, 'client-supplied-ignored');
+  });
+});
+
+test('POST /hypothesis lifecycle appends event-sourced status lines in order', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await postHypothesis(baseUrl, { session_id: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED', note: 'later' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((entry) => [entry.type, entry.hypothesisId, entry.status]), [
+      ['hypothesis', 'H1', 'OPEN'],
+      ['hypothesis', 'H1', 'CONFIRMED'],
+    ]);
+  });
+});
+
+test('POST /hypothesis validates fields fail-closed with nothing persisted', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const cases = [
+      [{ sessionId: session.session_id, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: '   ', status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 42, status: 'OPEN' }, 'invalid_hypothesis_id'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'MAYBE' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'open' }, 'invalid_hypothesis_status'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', title: 42 }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', note: {} }, 'invalid_hypothesis_field'],
+      [{ sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: [] }, 'invalid_hypothesis_field'],
+    ];
+    for (const [body, code] of cases) {
+      const response = await postHypothesis(baseUrl, body);
+      assert.equal(response.status, 400, code);
+      assert.equal(response.body.error, code);
+    }
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('POST /hypothesis enforces the launch-token capability split both ways', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const withSessionToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      { Authorization: `Bearer ${session.session_token}` },
+    );
+    assert.equal(withSessionToken.status, 401);
+    const withNoToken = await postHypothesis(
+      baseUrl,
+      { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' },
+      {},
+    );
+    assert.equal(withNoToken.status, 401);
+    // /log stays session-token-only: the launch token must NOT write events.
+    const launchOnLog = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: TEST_LAUNCH_TOKEN, msg: 'nope' },
+    });
+    assert.equal(launchOnLog.status, 401);
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(raw, '');
+  });
+});
+
+test('hypothesis lines consume the shared event and byte caps', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const first = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(first.status, 202);
+    const second = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H2', status: 'OPEN' });
+    assert.equal(second.status, 429);
+    assert.equal(second.body.error, 'event_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('hypothesis lines respect the aggregate byte cap', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxTotalBytes: 10 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const response = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(response.status, 429);
+    assert.equal(response.body.error, 'storage_limit_reached');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /hypothesis rolls back the event and byte reservation when the append fails', async () => {
+  // Regression guard: a hypothesis reserves eventCount and totalBytes BEFORE
+  // the awaited append (debug_server.js). If appendSessionEvent throws AFTER
+  // that reservation, the catch must restore both counters. We make this
+  // ASSERTION FAIL if the rollback is deleted: both caps are sized for
+  // exactly one hypothesis line, and we retry on the SAME (failed) session.
+  // If the event rollback is missing, session.eventCount stays at 1 and the
+  // cap check runs BEFORE the next append → 429 event_limit_reached (not the
+  // expected 409). If the byte rollback is missing, totalBytes stays
+  // reserved → 429 storage_limit_reached. Either way a missing rollback
+  // changes the second response away from 409 session_log_replaced.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-hypo-rollback-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { maxEventsPerSession: 1, maxTotalBytes: 512 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const logPath = path.join(projectRoot, session.log_file);
+    // Swap the log so appendSessionEvent fails with session_log_replaced
+    // AFTER the hypothesis reserved eventCount=1 / totalBytes=<lineBytes>.
+    await rm(logPath);
+    await writeFile(logPath, '{"forged":"content"}\n');
+    const failed = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(failed.status, 409);
+    assert.equal(failed.body.error, 'session_log_replaced');
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
+    // Discriminator: against the SAME session, with both caps sized for one
+    // line, a leaked reservation surfaces as 429 here. A correctly rolled-
+    // back reservation passes the caps and hits the same swapped-log failure
+    // → 409 session_log_replaced.
+    const retry = await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    assert.equal(retry.status, 409);
+    assert.equal(retry.body.error, 'session_log_replaced');
+    // Nothing was persisted by either failed attempt.
+    assert.equal(await readFile(logPath, 'utf8'), '{"forged":"content"}\n');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /hypothesis rejects unknown sessions', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const unknown = await postHypothesis(baseUrl, {
+      sessionId: 'debug-nope-000000000000',
+      hypothesisId: 'H1',
+      status: 'OPEN',
+    });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error, 'unknown_session');
+  });
+});
+
+test('hypothesisId is stored trimmed on both /hypothesis and /log (shared join key)', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', hypothesisId: '  H1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: '  H1  ', status: 'OPEN' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.hypothesisId), ['H1', 'H1']);
+  });
+});
+
+test('/log rejects non-string and whitespace-only hypothesisId/runId join keys', async () => {
+  // /hypothesis rejects a whitespace-only hypothesisId (invalid_hypothesis_id);
+  // /log must not let the equivalent through on its join keys either, or an
+  // event with hypothesisId: "" could never join a hypothesis line and would
+  // be silently invisible to GET ?hypothesisId= (empty). Both join keys are
+  // held to the same non-empty-after-trim discipline.
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (body) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e', ...body },
+    });
+    for (const key of ['hypothesisId', 'runId']) {
+      const numeric = await log({ [key]: 42 });
+      assert.equal(numeric.status, 400, `${key} numeric`);
+      assert.equal(numeric.body.error, 'invalid_join_key', `${key} numeric`);
+      const object = await log({ [key]: {} });
+      assert.equal(object.status, 400, `${key} object`);
+      assert.equal(object.body.error, 'invalid_join_key', `${key} object`);
+      const blank = await log({ [key]: '   ' });
+      assert.equal(blank.status, 400, `${key} whitespace`);
+      assert.equal(blank.body.error, 'invalid_join_key', `${key} whitespace`);
+    }
+    // Nothing was persisted by the rejected attempts.
+    const lines = await readSessionLines(projectRoot, session);
+    assert.equal(lines.length, 0);
+  });
+});
+
+test('an invalid join-key request does not refresh session activity', async () => {
+  // Regression guard: POST /log must refresh session.lastActivityAt only AFTER
+  // all payload validation, so a request rejected with invalid_join_key does
+  // not extend the session's idle lifetime. Otherwise a buggy or abusive
+  // authenticated client could keep a session alive forever with bad payloads,
+  // stalling retireInactiveSessions and contributing to maxSessions exhaustion.
+  //
+  // Discriminator design: anchor lastActivityAt with a VALID log at t0, then
+  // fire an INVALID join-key request at t0+gap. Without the bug, retirement is
+  // anchored to t0 → session is gone shortly after t0+idleMs. With the bug, the
+  // invalid request refreshes to t0+gap → session lives until t0+gap+idleMs.
+  // A read between those two deadlines (t0+idleMs .. t0+gap+idleMs)
+  // discriminates: 404 (correct) vs 200 (bug). Verified by mutation: reverting
+  // the fix flips this read to 200.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-joinkey-idle-'));
+  const idleMs = 1500;
+  const gap = 600;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    // t0: a VALID log anchors lastActivityAt. (The session-mint POST also
+    // refreshes it, but mint latency is variable; this explicit valid log
+    // gives a known-late anchor independent of mint cost.)
+    const valid = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'anchor' },
+    });
+    assert.equal(valid.status, 202);
+    const t0 = Date.now();
+    // t0+gap: an authenticated request that fails join-key validation.
+    await new Promise((resolve) => setTimeout(resolve, gap));
+    const rejected = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'x', hypothesisId: '   ' },
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error, 'invalid_join_key');
+    // Wait until just past the t0-anchored deadline (t0+idleMs) but still
+    // well before the bug's extended deadline (t0+gap+idleMs).
+    const remain = (t0 + idleMs + 300) - Date.now();
+    if (remain > 0) await new Promise((resolve) => setTimeout(resolve, remain));
+    const after = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    // Correct (no refresh on invalid): session retired → 404.
+    // Buggy (refreshed on invalid): session still live → 200.
+    assert.equal(after.status, 404);
+    assert.equal(JSON.parse(after.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the instrumented app cannot forge hypothesis lines through /log', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const response = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: 'sneaky',
+        type: 'hypothesis',
+        status: 'CONFIRMED',
+      },
+    });
+    assert.equal(response.status, 202);
+    const [line] = await readSessionLines(projectRoot, session);
+    assert.equal(Object.hasOwn(line, 'type'), false);
+    assert.equal(Object.hasOwn(line, 'status'), false);
+  });
+});
+
+test('events and hypothesis lines interleave in append order with the type discriminator', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (msg) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+    });
+    await log('before');
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    await log('after');
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(
+      lines.map((line) => [line.type === 'hypothesis' ? 'hypothesis' : 'event', line.msg ?? line.status]),
+      [['event', 'before'], ['hypothesis', 'OPEN'], ['event', 'after']],
+    );
+  });
+});
+
+const requestRaw = (baseUrl, { headers = {}, method = 'GET', pathname = '/', timeoutMs = 30000 } = {}) =>
+  new Promise((resolve, reject) => {
+    const url = new URL(pathname, baseUrl);
+    let settled = false;
+    const request = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method,
+        headers,
+      },
+      (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { text += chunk; });
+        response.on('end', () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status: response.statusCode, headers: response.headers, text });
+        });
+        // A response stream can error after the headers arrive (e.g. a torn
+        // socket mid-body); without this listener neither resolve nor reject
+        // runs and the test hangs until the runner kills it.
+        response.on('error', (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        });
+      },
+    );
+    // Wall-clock bound: an unresponsive server or a lost connection must
+    // fail with the timeout error instead of hanging the whole test run.
+    // Reject DIRECTLY from the timer: request.destroy(error) emits 'error'
+    // synchronously, and the error handler below guards on `settled`, so if
+    // we set settled=true before destroying, nobody would reject and the
+    // promise would hang — the exact failure this timer prevents.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const error = new Error(`requestRaw timeout after ${timeoutMs}ms`);
+      request.destroy(error);
+      reject(error);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    request.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    request.end();
+  });
+
+const LAUNCH_AUTH = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` };
+
+const seedReadableSession = async (baseUrl) => {
+  const session = (await createSession(baseUrl)).body;
+  const log = (body) => requestJson(baseUrl, {
+    method: 'POST',
+    pathname: '/log',
+    body: { sessionId: session.session_id, sessionToken: session.session_token, ...body },
+  });
+  await log({ msg: 'e1', hypothesisId: 'H1', runId: 'r1' });
+  await log({ msg: 'e2', hypothesisId: 'H2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+  await log({ msg: 'e3', runId: 'r2' });
+  await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'CONFIRMED' });
+  return session;
+};
+
+test('GET /sessions/:id/logs requires the launch token and serves verbatim NDJSON', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = await seedReadableSession(baseUrl);
+    const noAuth = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs` });
+    assert.equal(noAuth.status, 401);
+    const sessionAuth = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: { Authorization: `Bearer ${session.session_token}` },
+    });
+    assert.equal(sessionAuth.status, 401);
+    const ok = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers['content-type'], 'application/x-ndjson');
+    const raw = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    // Verbatim guarantee: an unfiltered read IS the stored bytes.
+    assert.equal(ok.text, raw);
+    for (const line of ok.text.split('\n').filter(Boolean)) JSON.parse(line);
+  });
+});
+
+test('GET /sessions/:id/logs filters combine and limit is tail-biased', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    const fetchLogs = async (query) => {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 200, query);
+      return res.text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    };
+    assert.deepEqual((await fetchLogs('?type=hypothesis')).map((l) => l.status), ['OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?type=event')).map((l) => l.msg), ['e1', 'e2', 'e3']);
+    assert.deepEqual((await fetchLogs('?hypothesisId=H1')).map((l) => l.msg ?? l.status), ['e1', 'OPEN', 'CONFIRMED']);
+    assert.deepEqual((await fetchLogs('?runId=r2')).map((l) => l.msg), ['e3']);
+    assert.deepEqual((await fetchLogs('?type=event&hypothesisId=H1')).map((l) => l.msg), ['e1']);
+    assert.deepEqual((await fetchLogs('?limit=2')).map((l) => l.msg ?? l.status), ['e3', 'CONFIRMED']);
+    const all = await fetchLogs('');
+    const boundary = all[2].ts;
+    const since = await fetchLogs(`?sinceTs=${encodeURIComponent(boundary)}`);
+    assert.equal(since.length >= 3, true);
+    assert.equal(since.every((l) => Date.parse(l.ts) >= Date.parse(boundary)), true);
+    const until = await fetchLogs(`?untilTs=${encodeURIComponent(boundary)}`);
+    assert.equal(until.every((l) => Date.parse(l.ts) <= Date.parse(boundary)), true);
+  });
+});
+
+test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = await seedReadableSession(baseUrl);
+    for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1', '?type=all&type=all', '?limit=1&limit=2']) {
+      const res = await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs${query}`,
+        headers: LAUNCH_AUTH,
+      });
+      assert.equal(res.status, 400, query);
+      assert.equal(JSON.parse(res.text).error, 'invalid_query', query);
+    }
+  });
+});
+
+// NOTE (plan revision): originally one combined test with sessionIdleTimeoutMs: 5 —
+// that retires the session before the swapped-file GET arrives (404 masks the 409),
+// deterministically on slower environments. Split: swapped-identity runs on a
+// default-idle server; retirement gets its own short-idle server.
+test('GET /sessions/:id/logs rejects unknown sessions and swapped log files fail-closed', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: LAUNCH_AUTH });
+    assert.equal(unknown.status, 404);
+    assert.equal(JSON.parse(unknown.text).error, 'unknown_session');
+    const session = (await createSession(baseUrl)).body;
+    // Swap the log file out from under the recorded identity.
+    const logPath = path.join(projectRoot, session.log_file);
+    await rm(logPath);
+    await writeFile(logPath, '{"msg":"forged"}\n');
+    const swapped = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(swapped.status, 409);
+    assert.equal(JSON.parse(swapped.text).error, 'session_log_replaced');
+  });
+});
+
+test('GET /sessions/:id/logs is live-only: retired sessions return 404', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: 5 },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const retired = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(retired.status, 404);
+    assert.equal(JSON.parse(retired.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET /sessions/:id/logs output never contains a raw known secret', async () => {
+  await withRedactionServer({ API_TOKEN: 'supersecretvalue123' }, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'leak supersecretvalue123' },
+    });
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.includes('supersecretvalue123'), false);
+    assert.equal(res.text.includes('[REDACTED]'), true);
+  });
+});
+
+test('concurrent appends never produce torn GET output', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const log = (i) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: {
+        sessionId: session.session_id,
+        sessionToken: session.session_token,
+        msg: `event-${i} ${'x'.repeat(200)}`,
+      },
+    });
+    await log(0);
+    // Determinism: await a small batch of appends BEFORE issuing any read so
+    // at least one append is provably ahead of every read. The remaining
+    // appends are then issued concurrently with the reads, which still
+    // exercises real interleaving — but the outcome no longer depends on
+    // microtask-enqueue order (which could otherwise let every read land
+    // before the first append and observe only the seeded line).
+    for (let i = 1; i <= 5; i += 1) {
+      await log(i);
+    }
+    const writes = [];
+    const reads = [];
+    for (let i = 6; i <= 30; i += 1) {
+      writes.push(log(i));
+      if (i % 3 === 0) {
+        reads.push(requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH }));
+      }
+    }
+    await Promise.all(writes);
+    // At least one read must observe an appended entry beyond the single
+    // seeded event-0 line, otherwise the test exercises no interleaving and
+    // passes trivially. Counts the parsed lines on each read body.
+    let observedBeyondSeed = false;
+    for (const read of await Promise.all(reads)) {
+      assert.equal(read.status, 200);
+      const lines = read.text.split('\n').filter(Boolean);
+      for (const line of lines) JSON.parse(line);
+      if (read.text.length) assert.equal(read.text.endsWith('\n'), true);
+      if (lines.length > 1) observedBeyondSeed = true;
+    }
+    assert.equal(observedBeyondSeed, true);
+  });
+});
+
+test('GET does not refresh session activity (reads are observers)', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-read-'));
+  // The idle budget must comfortably exceed this environment's measured
+  // POST /session cost (~460-730ms of real disk + ACL work): lastActivityAt
+  // is stamped BEFORE that setup work, so a too-small budget can expire
+  // before the first read even dispatches.
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const createdAt = Date.now();
+    const first = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    // Assert the pre-expiry 200 only when we provably raced the budget: on a
+    // pathologically slow environment the property assertion below still holds.
+    if (Date.now() - createdAt < idleMs) assert.equal(first.status, 200);
+    // Keep issuing reads WHILE waiting out the budget: if reads refreshed
+    // lastActivityAt, the session could never retire and the final read
+    // would stay 200 forever.
+    let last = first;
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    }
+    assert.equal(last.status, 404);
+    assert.equal(JSON.parse(last.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['content-type'], 'application/x-ndjson');
+    assert.equal(res.text, '');
+  });
+});
+
+test('runId is stored trimmed on both routes and joins GET filters', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'e1', runId: '  r1  ' },
+    });
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: '  r1  ' });
+    const lines = await readSessionLines(projectRoot, session);
+    assert.deepEqual(lines.map((line) => line.runId), ['r1', 'r1']);
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs?runId=r1`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.split('\n').filter(Boolean).length, 2);
+  });
+});

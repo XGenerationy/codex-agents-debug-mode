@@ -91,6 +91,13 @@ test('rejects unknown arguments as a usage error', () => {
   assert.match(result.stderr, /Unknown argument/);
 });
 
+test('rejects an unknown --mode value at process level: exit 3 with the machine-readable BLOCKED line', () => {
+  const result = spawnSync(process.execPath, [script, '--mode', 'lenient'], { encoding: 'utf8' });
+  assert.equal(result.status, 3);
+  assert.match(result.stderr, /Unknown --mode value: lenient/);
+  assert.equal(JSON.parse(result.stdout.trim()).status, 'BLOCKED');
+});
+
 test('readCloseoutConfig parses a bounded regular config file', async () => {
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-config-'));
@@ -367,4 +374,18 @@ test('rejects a --config opened after an ENOENT lstat pre-check finds nothing to
     }),
     /must not be a symlink/,
   );
+});
+
+test('parseArgs defaults mode to strict and accepts --mode engine', () => {
+  const { parseArgs } = require('./pr_closeout.js');
+  assert.equal(parseArgs([]).mode, 'strict');
+  assert.equal(parseArgs(['--mode', 'engine']).mode, 'engine');
+  assert.equal(parseArgs(['--mode', 'strict']).mode, 'strict');
+});
+
+test('parseArgs rejects unknown --mode values and a missing value', () => {
+  const { parseArgs } = require('./pr_closeout.js');
+  assert.throws(() => parseArgs(['--mode', 'lenient']), /Unknown --mode value: lenient/);
+  assert.throws(() => parseArgs(['--mode']), /Missing value for --mode/);
+  assert.throws(() => parseArgs(['--mode', '--plan']), /Missing value for --mode/);
 });

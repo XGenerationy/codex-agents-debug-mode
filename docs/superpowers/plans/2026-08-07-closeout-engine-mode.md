@@ -1,0 +1,1741 @@
+# Closeout Engine Mode Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add an explicit `--mode strict|engine` tier to the PR closeout gate — strict stays byte-for-byte today's 19-check gate; engine mode runs a config-supplied matrix through the same integrity machinery, with mode-bound attestation digests, labeled reports, and a plan-mode admission block.
+
+**Architecture:** The mode enters at the CLI (`pr_closeout.js`), threads through `runCloseoutWorkflow` into `buildCheckPlan` (`pr_closeout_core.js`), which sources definitions from either `MANDATORY_CHECKS` or a new fail-closed `validateEngineChecks(config.engineChecks)`. The attestation digest input gains `mode` (schemaVersion 2→3 — deliberate one-time invalidation, recorded in the spec). Reports gain a `mode` field and an engine-only banner. `--plan` gains an `admission` block. Spec: `docs/superpowers/specs/2026-08-07-closeout-engine-mode-design.md`.
+
+**Tech Stack:** Node >= 20, CommonJS, zero dependencies, `node --test --test-concurrency=1`, hermetic tests with injected `runGh`/dependency fakes.
+
+**Ground rules for every task:**
+- Branch `feat/closeout-engine-mode`. Never push. One commit per task, message as specified, each ending with exactly:
+
+```
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013VQCeNzNXziDk5maCRSSvp
+```
+
+- STRICT-MODE INVARIANCE IS THE PRIME DIRECTIVE: no existing test may be modified (additive appends to test files only), and no strict-run behavior may change except the additive `mode` report/plan field. If a change you're making would alter any existing test's outcome, STOP and report BLOCKED.
+- `pr_closeout_process.js` (3879 lines) and `pr_closeout_process.test.js` must not be read whole or modified. `pr_closeout_core.js`/`pr_closeout_workflow.js`/`pr_closeout_repo.js`/their tests are 1500-3600 lines: bounded reads around the anchors this plan names, never whole-file reads.
+- Run only ONE test invocation at a time, foreground (concurrent suites cause spurious access violations on this machine). Targeted runs during TDD; ONE full `npm test` only in Task 7.
+
+---
+
+### Task 1: CLI `--mode` flag + workflow-entry mode guard
+
+**Files:**
+- Modify: `scripts/pr_closeout.js` (parseArgs ~lines 34-56, HELP ~10-21, main ~198-217)
+- Modify: `scripts/pr_closeout_workflow.js` (wrapper ~936-946, body signature ~952-959)
+- Test: `scripts/pr_closeout_cli.test.js` (append), `scripts/pr_closeout_workflow.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_cli.test.js` (it already requires `parseArgs` from `./pr_closeout`; if not, extend its existing destructured require):
+
+```js
+test('parseArgs defaults mode to strict and accepts --mode engine', () => {
+  assert.equal(parseArgs([]).mode, 'strict');
+  assert.equal(parseArgs(['--mode', 'engine']).mode, 'engine');
+  assert.equal(parseArgs(['--mode', 'strict']).mode, 'strict');
+});
+
+test('parseArgs rejects unknown --mode values and a missing value', () => {
+  assert.throws(() => parseArgs(['--mode', 'lenient']), /Unknown --mode value: lenient/);
+  assert.throws(() => parseArgs(['--mode']), /Missing value for --mode/);
+  assert.throws(() => parseArgs(['--mode', '--plan']), /Missing value for --mode/);
+});
+```
+
+Append to `scripts/pr_closeout_workflow.test.js` (NOTE: model the dependency-injection shape on the file's existing `runCloseoutWorkflow` tests — it exports `runCloseoutWorkflow` from `./pr_closeout_workflow`; the injected `resolveRepositoryState` fake that throws proves the rejection happens before any repository work):
+
+```js
+test('config.mode is rejected before any repository work — mode comes only from the invocation', async () => {
+  await assert.rejects(
+    () => runCloseoutWorkflow({
+      repo: process.cwd(),
+      baseRef: 'origin/main',
+      config: { mode: 'engine' },
+      planOnly: true,
+      dependencies: {
+        resolveRepositoryState: async () => { throw new Error('must not be called'); },
+      },
+    }),
+    /mode cannot be set from config/,
+  );
+});
+```
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_cli.test.js scripts/pr_closeout_workflow.test.js`
+Expected: the two new CLI tests fail (`mode` is `undefined`, `--mode` is an unknown argument); the workflow test fails (config.mode is currently ignored). All pre-existing tests still pass.
+
+- [ ] **Step 3: Implement**
+
+In `scripts/pr_closeout.js`:
+
+1. HELP text — add one line after the `--output-dir` row and re-pad the sibling rows so every description starts at the same column (post-review alignment):
+
+```
+  --mode <strict|engine>  Gate tier (default: strict; engine runs config.engineChecks)
+```
+
+2. `parseArgs` — initialize `const options = { repo: process.cwd(), plan: false, mode: 'strict' };`, add `'--mode'` to the value-flag array `['--repo', '--base-ref', '--config', '--output-dir', '--mode']` and to the key map (`'--mode': 'mode'`), and after the parse loop, before `return options;`:
+
+```js
+  // The mode is operator intent, not configuration: an unknown value is a
+  // hard could-not-run error (exit 3 class), never a silent strict fallback.
+  if (options.mode !== 'strict' && options.mode !== 'engine') {
+    throw new Error(`Unknown --mode value: ${options.mode}. Use strict or engine.`);
+  }
+```
+
+3. `main` — pass the mode through: add `mode: options.mode,` to the `runCloseoutWorkflow({...})` call alongside `planOnly`.
+
+In `scripts/pr_closeout_workflow.js`:
+
+1. `runCloseoutWorkflow` wrapper (~line 936): accept `mode = 'strict'` in its destructured params and forward `mode,` in the object it passes to `runCloseoutWorkflowBody` (the call at ~940-946 that currently forwards `repo, baseRef, config, outputDir, planOnly, dependencies`).
+2. `runCloseoutWorkflowBody` (~line 952): accept `mode = 'strict'` and add, as the FIRST statements of the body (before `const d = ...`):
+
+```js
+  // Mode is invocation-only: a config file that could switch a strict run
+  // into engine mode would be a silent weakening channel, so its presence in
+  // config is a hard error rather than an ignored key.
+  if (Object.hasOwn(config, 'mode')) {
+    throw new Error('The closeout mode cannot be set from config; pass --mode on the invocation.');
+  }
+  if (mode !== 'strict' && mode !== 'engine') {
+    throw new Error(`Unknown closeout mode "${mode}". Use strict or engine.`);
+  }
+```
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_cli.test.js scripts/pr_closeout_workflow.test.js`
+Expected: all pass, including every pre-existing test. `node --check scripts/pr_closeout.js scripts/pr_closeout_workflow.js` clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout.js scripts/pr_closeout_workflow.js scripts/pr_closeout_cli.test.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): --mode flag, invocation-only, fail-closed"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 2: `validateEngineChecks` — fail-closed engine matrix schema
+
+**Files:**
+- Modify: `scripts/pr_closeout_core.js` (insert after `REQUIRED_PROOFS`, ~line 294; extend `module.exports` ~line 1674)
+- Test: `scripts/pr_closeout_core.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_core.test.js` (add `validateEngineChecks` to the existing destructured require at the top — additive edit to that require only):
+
+```js
+test('validateEngineChecks normalizes a valid matrix', () => {
+  const defs = validateEngineChecks([
+    { id: 'unit', command: 'cargo test' },
+    { id: 'lint', label: 'Lint', scripts: ['lint', 'lint:all'], baselineSafe: true, timeoutMs: 60000 },
+  ]);
+  assert.deepEqual(defs[0], {
+    id: 'unit', label: 'unit', command: 'cargo test', baselineSafe: false, generator: false, engine: true,
+  });
+  assert.deepEqual(defs[1], {
+    id: 'lint', label: 'Lint', packageCandidates: ['lint', 'lint:all'], baselineSafe: true, generator: false, timeoutMs: 60000, engine: true,
+  });
+});
+
+test('validateEngineChecks fails closed on every malformed shape', () => {
+  assert.throws(() => validateEngineChecks(undefined), /non-empty array/);
+  assert.throws(() => validateEngineChecks([]), /non-empty array/);
+  assert.throws(() => validateEngineChecks(['x']), /must be an object/);
+  assert.throws(() => validateEngineChecks([{ command: 'x' }]), /non-empty string id/);
+  assert.throws(() => validateEngineChecks([{ id: ' padded ', command: 'x' }]), /leading or trailing whitespace/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x' }, { id: 'a', command: 'y' }]), /unique/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', fixed: true }]), /unknown field "fixed"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a' }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', scripts: ['y'] }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: '   ' }]), /command must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: [] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: ['ok', 42] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', label: '' }]), /label must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', baselineSafe: 'yes' }]), /baselineSafe must be a boolean/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 0 }]), /timeoutMs must be a positive integer/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 1.5 }]), /timeoutMs must be a positive integer/);
+});
+
+test('validateEngineChecks hardening: id charset, prototype collisions, timer bound, read-once fields', () => {
+  for (const id of ['bad\nid', 'a\tb', '.dot-start', '-dash-start', 'sp ace', '__proto__']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /must start alphanumeric|collides with an Object\.prototype member/,
+    );
+  }
+  for (const id of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /collides with an Object\.prototype member/,
+    );
+  }
+  assert.equal(validateEngineChecks([{ id: 'ok.check_1-x', command: 'x' }])[0].id, 'ok.check_1-x');
+  assert.throws(
+    () => validateEngineChecks([{ id: 'big', command: 'x', timeoutMs: 2147483648 }]),
+    /no greater than 2147483647/,
+  );
+  // Read-once: a getter that swaps its value after the first read cannot
+  // sneak a different command past validation into the emitted definition.
+  let reads = 0;
+  const swapped = validateEngineChecks([{
+    id: 'g1',
+    get command() { reads += 1; return reads === 1 ? 'safe command' : 'npm test || true'; },
+  }])[0];
+  assert.equal(swapped.command, 'safe command');
+  const scriptsSource = ['ok'];
+  const proxied = validateEngineChecks([new Proxy({ id: 'p1', scripts: scriptsSource }, {
+    get(target, property) {
+      if (property === 'scripts') return [...scriptsSource];
+      return target[property];
+    },
+  })])[0];
+  assert.deepEqual(proxied.packageCandidates, ['ok']);
+});
+```
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 --test-name-pattern="validateEngineChecks" scripts/pr_closeout_core.test.js`
+Expected: both fail (`validateEngineChecks` is not exported). Then run the file WITHOUT the name pattern once to confirm every pre-existing test still passes.
+
+- [ ] **Step 3: Implement (insert into `scripts/pr_closeout_core.js` immediately after the `REQUIRED_PROOFS` block, ~line 294)**
+
+```js
+// Fields an engine-mode check definition may carry. Anything else — most
+// pointedly `fixed`, `packageCandidates`, or `makeCandidates` — is either a
+// weakening vector or a typo; both fail closed rather than being ignored.
+const ENGINE_CHECK_FIELDS = new Set(['id', 'label', 'command', 'scripts', 'baselineSafe', 'generator', 'timeoutMs']);
+
+// Engine ids reach id-keyed plain-object lookups (timeoutsMs, proofs,
+// resourceGroups) and rendered reports downstream: a charset gate plus an
+// Object.prototype collision check (below) closes prototype-shaped and
+// control-character ids deterministically instead of relying on every
+// downstream lookup failing closed by accident.
+const ENGINE_CHECK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Validate and normalize `config.engineChecks` into check definitions the
+ * shared resolution pipeline in buildCheckPlan can consume. Engine mode
+ * replaces the strict matrix WHOLESALE (spec decision: no merging, no
+ * inheritance — a hybrid would be neither guarantee), so this is the single
+ * gate every engine matrix passes through. Every violation is a named error
+ * and the whole matrix is rejected — a partially-valid matrix is not a
+ * matrix. Ids are used verbatim in reports, digests, and attestations, so
+ * padded ids are rejected instead of silently trimmed. `baselineSafe`
+ * defaults to false (fail-closed: baseline verification must be opted into,
+ * never assumed). The returned definitions carry `engine: true` so
+ * buildCheckPlan resolves commands through the engine branch (placeholder,
+ * neutralizer, and make-recipe validation — user-supplied commands are never
+ * trusted the way the strict matrix's own hardcoded commands are).
+ * @param {unknown} engineChecks - config.engineChecks as supplied.
+ * @returns {object[]} normalized definitions.
+ */
+const validateEngineChecks = (engineChecks) => {
+  if (!Array.isArray(engineChecks) || engineChecks.length === 0) {
+    throw new Error('Engine mode requires config.engineChecks: a non-empty array of check definitions.');
+  }
+  const seen = new Set();
+  return engineChecks.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Engine check at index ${index} must be an object.`);
+    }
+    // Read every field exactly once, up front: validation and emission both
+    // use these locals, so a getter/Proxy entry can never swap the emitted
+    // value after validation — read-once makes the fail-closed claim true by
+    // construction, not by JSON.parse happening to produce plain data.
+    const { id, label, command, scripts, baselineSafe, generator, timeoutMs } = entry;
+    const scriptsCopy = Array.isArray(scripts) ? [...scripts] : scripts;
+    for (const field of Object.keys(entry)) {
+      if (!ENGINE_CHECK_FIELDS.has(field)) {
+        const where = typeof id === 'string' && id ? `"${id}"` : `at index ${index}`;
+        const hint = field === 'qualificationSafe' || field === 'resourceGroup'
+          ? ` (${field} belongs in the id-keyed config map config.${field === 'qualificationSafe' ? 'qualificationSafe' : 'resourceGroups'}, not inline)`
+          : '';
+        throw new Error(`Engine check ${where} has unknown field "${field}"; unknown fields are never ignored${hint}.`);
+      }
+    }
+    if (typeof id !== 'string' || !id.trim()) {
+      throw new Error(`Engine check at index ${index} must have a non-empty string id.`);
+    }
+    if (id !== id.trim()) {
+      throw new Error(`Engine check id "${id}" must not have leading or trailing whitespace.`);
+    }
+    if (!ENGINE_CHECK_ID_PATTERN.test(id)) {
+      throw new Error(`Engine check id "${id}" must start alphanumeric and use only letters, digits, ".", "_", "-".`);
+    }
+    if (id in {}) {
+      throw new Error(`Engine check id "${id}" collides with an Object.prototype member; choose another id.`);
+    }
+    if (seen.has(id)) throw new Error(`Engine check ids must be unique: "${id}" at index ${index} appears more than once.`);
+    seen.add(id);
+    const hasCommand = Object.hasOwn(entry, 'command');
+    const hasScripts = Object.hasOwn(entry, 'scripts');
+    if (hasCommand === hasScripts) {
+      throw new Error(`Engine check "${id}" must define exactly one of "command" or "scripts".`);
+    }
+    if (hasCommand && (typeof command !== 'string' || !command.trim())) {
+      throw new Error(`Engine check "${id}": command must be a non-empty string.`);
+    }
+    if (hasScripts && (
+      !Array.isArray(scriptsCopy) || scriptsCopy.length === 0
+      || scriptsCopy.some((name) => typeof name !== 'string' || !name.trim())
+    )) {
+      throw new Error(`Engine check "${id}": scripts must be a non-empty array of non-empty script names.`);
+    }
+    if (Object.hasOwn(entry, 'label') && (typeof label !== 'string' || !label.trim())) {
+      throw new Error(`Engine check "${id}": label must be a non-empty string when present.`);
+    }
+    const booleanFlags = { baselineSafe, generator };
+    for (const flag of ['baselineSafe', 'generator']) {
+      if (Object.hasOwn(entry, flag) && typeof booleanFlags[flag] !== 'boolean') {
+        throw new Error(`Engine check "${id}": ${flag} must be a boolean when present.`);
+      }
+    }
+    // Upper bound: Node timers clamp durations above 2^31-1 down to ~1ms — a
+    // fail-closed but baffling instant kill — so an over-bound timeout is
+    // rejected here where the author can see why.
+    if (Object.hasOwn(entry, 'timeoutMs') && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2147483647)) {
+      throw new Error(`Engine check "${id}": timeoutMs must be a positive integer no greater than 2147483647 when present.`);
+    }
+    return {
+      id,
+      label: label ?? id,
+      ...(hasCommand ? { command } : { packageCandidates: scriptsCopy }),
+      baselineSafe: baselineSafe ?? false,
+      generator: generator ?? false,
+      ...(Object.hasOwn(entry, 'timeoutMs') ? { timeoutMs } : {}),
+      engine: true,
+    };
+  });
+};
+```
+
+Extend `module.exports` (~line 1674 region) with `validateEngineChecks` (alphabetical position).
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
+Expected: all pass including the two new tests and every pre-existing one (the order-locked matrix test at the top of the file is untouched). `node --check scripts/pr_closeout_core.js` clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout_core.js scripts/pr_closeout_core.test.js
+git commit -m "feat(closeout): fail-closed engine matrix validation"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 3: `buildCheckPlan` mode support — engine resolution, strict guard
+
+**Files:**
+- Modify: `scripts/pr_closeout_core.js` (`buildCheckPlan` ~lines 359-507)
+- Test: `scripts/pr_closeout_core.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_core.test.js`:
+
+```js
+test('strict mode rejects engine-only config keys as weakening attempts, never ignores them', () => {
+  const withMatrix = buildCheckPlan({ config: { engineChecks: [{ id: 'a', command: 'x' }] } });
+  assert.match(withMatrix.errors.join('\n'), /engineChecks is only valid with --mode engine/);
+  const withRunner = buildCheckPlan({ config: { scriptRunner: 'npm run' } });
+  assert.match(withRunner.errors.join('\n'), /scriptRunner is only valid with --mode engine/);
+  // The strict matrix itself still resolves; the error rides alongside.
+  assert.equal(withMatrix.checks.length, MANDATORY_CHECKS.length);
+});
+
+test('engine mode resolves inline commands and script discovery through the shared pipeline', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'unit', command: 'cargo test --workspace' },
+        { id: 'lint', scripts: ['lint:ci', 'lint'] },
+        { id: 'ghost', scripts: ['does-not-exist'] },
+      ],
+    },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.deepEqual(plan.errors, []);
+  assert.deepEqual(plan.checks.map(({ id }) => id), ['unit', 'lint', 'ghost']);
+  const unit = plan.checks.find(({ id }) => id === 'unit');
+  assert.equal(unit.command, 'cargo test --workspace');
+  assert.equal(unit.resolution, 'engine-command');
+  assert.equal(unit.status, undefined);
+  const lint = plan.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.command, 'npm run lint');
+  assert.equal(lint.resolution, 'package-script');
+  const ghost = plan.checks.find(({ id }) => id === 'ghost');
+  assert.equal(ghost.status, 'BLOCKED');
+  assert.equal(ghost.resolution, 'unresolved');
+});
+
+test('engine mode never trusts user-supplied commands: placeholder, neutralizer, and make-recipe validation', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'todo', command: '<replace me>' },
+        { id: 'hidden', command: 'npm test || true' },
+        { id: 'uncaptured', command: 'make smoke' },
+        { id: 'neutralized', command: 'make lie' },
+      ],
+    },
+    makeRecipes: { lie: '-npm test' },
+  });
+  assert.equal(plan.checks.find(({ id }) => id === 'todo').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'todo').evidence, /placeholder/i);
+  assert.equal(plan.checks.find(({ id }) => id === 'hidden').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'hidden').evidence, /neutralizes failures/);
+  assert.equal(plan.checks.find(({ id }) => id === 'uncaptured').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'uncaptured').evidence, /No recipe text was captured/);
+  assert.equal(plan.checks.find(({ id }) => id === 'neutralized').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'neutralized').evidence, /neutralizes failures/);
+});
+
+test('engine mode fails closed at the matrix level: invalid matrix or forbidden keys yield BLOCKED-empty plans', () => {
+  const invalid = buildCheckPlan({ mode: 'engine', config: { engineChecks: [{ id: 'a' }] } });
+  assert.deepEqual(invalid.checks, []);
+  assert.match(invalid.errors.join('\n'), /exactly one of "command" or "scripts"/);
+  const missing = buildCheckPlan({ mode: 'engine', config: {} });
+  assert.deepEqual(missing.checks, []);
+  assert.match(missing.errors.join('\n'), /non-empty array/);
+  const withCommands = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'a', command: 'x' }], commands: { a: 'y' } },
+  });
+  assert.match(withCommands.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const badMode = buildCheckPlan({ mode: 'lenient' });
+  assert.deepEqual(badMode.checks, []);
+  assert.match(badMode.errors.join('\n'), /Unknown closeout mode/);
+});
+
+test('engine scriptRunner is validated and applied; strict package-script output is untouched', () => {
+  const custom = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(custom.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run || true &&' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(neutralizing.errors.join('\n'), /scriptRunner neutralizes failures/);
+  const multiline = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\nrun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(multiline.errors.join('\n'), /single-line non-empty string/);
+  // Strict path still emits pnpm run — byte-identical to today.
+  const strict = buildCheckPlan({ packageScripts: { typecheck: 'tsc --noEmit' } });
+  assert.equal(strict.checks.find(({ id }) => id === 'typecheck').command, 'pnpm run typecheck');
+});
+
+test('engine mode never consults a smuggled config.commands entry: the map is structurally dead, not just error-flagged', () => {
+  const smuggled = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], commands: { lint: 'make lie' } },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(smuggled.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const lint = smuggled.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.resolution, 'package-script');
+  assert.equal(lint.command, 'npm run lint');
+});
+
+test('engine mode validates voluntarily attached proofs at plan time; strict proof behavior unchanged', () => {
+  const badShape = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '' } },
+    },
+  });
+  assert.equal(badShape.checks.find(({ id }) => id === 'render').status, 'BLOCKED');
+  assert.match(badShape.checks.find(({ id }) => id === 'render').evidence, /proof/i);
+  const escaping = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '../outside.json' } },
+    },
+  });
+  assert.match(escaping.checks.find(({ id }) => id === 'render').evidence, /relative worktree path without ".."/);
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: 'artifacts/render.json' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+  assert.deepEqual(good.checks.find(({ id }) => id === 'render').proof, { type: 'artifact', path: 'artifacts/render.json' });
+});
+```
+
+Review hardening (post-review: resolved-command make gate on every engine path, proof parity) appended:
+
+```js
+test('engine-command make gate blocks every non-bare-make dodge shape on the resolved command', () => {
+  const makeRecipes = { lie: '-npm test', good: 'npm test' };
+  const dodges = [
+    'make lie && true',
+    'make -s lie',
+    'env make lie',
+    'cd x && make lie',
+    'make lie MYVAR=1',
+    '/usr/bin/make lie',
+    'make lie&&echo ok',
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map((command, index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, command] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+    assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  }
+  const pureLie = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-lie', command: 'make lie' }] },
+    makeRecipes,
+  });
+  const lieCheck = pureLie.checks.find(({ id }) => id === 'pure-lie');
+  assert.equal(lieCheck.status, 'BLOCKED');
+  assert.match(lieCheck.evidence, /neutralizes failures/);
+  const pureGood = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-good', command: 'make good' }] },
+    makeRecipes,
+  });
+  const goodCheck = pureGood.checks.find(({ id }) => id === 'pure-good');
+  assert.equal(goodCheck.status, undefined);
+  assert.equal(goodCheck.command, 'make good');
+  const notGated = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake build' },
+        { id: 'make-docs', command: 'make-docs generate' },
+      ],
+    },
+    makeRecipes,
+  });
+  assert.equal(notGated.checks.find(({ id }) => id === 'cmake-build').status, undefined);
+  assert.equal(notGated.checks.find(({ id }) => id === 'make-docs').status, undefined);
+});
+
+test('engine package-script branch runs the resolved command through the same make gate', () => {
+  const pure = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const pureCheck = pure.checks.find(({ id }) => id === 'lint');
+  assert.equal(pureCheck.command, 'make lint');
+  assert.equal(pureCheck.status, 'BLOCKED');
+  assert.match(pureCheck.evidence, /neutralizes failures/);
+  const wrapped = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'nice -n 19 make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const wrappedCheck = wrapped.checks.find(({ id }) => id === 'lint');
+  assert.equal(wrappedCheck.status, 'BLOCKED');
+  assert.match(wrappedCheck.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  // Strict path with the same packageScripts is unchanged: still pnpm run, ungated
+  // (a strict def is never `engine`, so the gate never runs for it, no matter
+  // what makeRecipes contains).
+  const strict = buildCheckPlan({
+    packageScripts: { typecheck: 'tsc --noEmit' },
+    makeRecipes: { typecheck: '-tsc --noEmit' },
+  });
+  const strictCheck = strict.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(strictCheck.command, 'pnpm run typecheck');
+  assert.equal(strictCheck.status, undefined);
+});
+
+test('engine command proofs get strict parity: neutralizer and literal-policy validation at plan time', () => {
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh || true', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const neutralizingCheck = neutralizing.checks.find(({ id }) => id === 'render');
+  assert.equal(neutralizingCheck.status, 'BLOCKED');
+  assert.match(neutralizingCheck.evidence, /Postcondition proof command for .* neutralizes failures \(\|\| true\)\./);
+  const anyPattern = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'anything-at-all' } },
+    },
+  });
+  assert.match(
+    anyPattern.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const emptyLiteral = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:' } },
+    },
+  });
+  assert.match(
+    emptyLiteral.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const goodCheck = good.checks.find(({ id }) => id === 'render');
+  assert.equal(goodCheck.status, undefined);
+  assert.deepEqual(goodCheck.proof, { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' });
+});
+
+test('scriptRunner rejects tabs and quote characters, not just newlines', () => {
+  const tabForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\trun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(tabForm.errors.join('\n'), /single-line non-empty string/);
+  const doubleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run "x"' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(doubleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  const singleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: "npm run 'x'" },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(singleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  // Existing valid runners are unaffected.
+  const valid = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(valid.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+});
+```
+
+Round 2 of review hardening (the token predicate itself: shell quoting/substitution and make aliases) appended:
+
+```js
+test('engine make gate blocks shell-quoting/substitution dodges and make aliases (measured fix)', () => {
+  // Clean recipe: every dodge below must block on SHAPE (it never reaches
+  // the pure `make <target>` branch), not on recipe content.
+  const makeRecipes = { lie: 'npm test' };
+  const dodges = [
+    ['backtick-wrapped', '`make lie`'],
+    ['double-quoted make', '"make" lie'],
+    ['single-quoted make', "'make' lie"],
+    ['bash -c double-quoted', 'bash -c "make lie"'],
+    ['sh -c single-quoted', "sh -c 'make lie'"],
+    ['eval double-quoted', 'eval "make lie"'],
+    ['brace group', '{make lie;}'],
+    ['assignment + backtick substitution', 'x=`make lie`'],
+    ['gmake alias', 'gmake lie'],
+    ['make.exe alias', 'make.exe lie'],
+    ['mingw32-make alias', 'mingw32-make lie'],
+    ['pathed .exe alias', '/usr/bin/make.exe lie'],
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map(([, command], index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, [name, command]] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for ${name}: "${command}"`);
+    assert.match(
+      check.evidence,
+      /wraps or argument-extends make and cannot be admitted uninspected/,
+      `expected wrap-form evidence for ${name}: "${command}"`,
+    );
+  }
+});
+
+test('original make-gate dodge corpus remains BLOCKED after the alias/quoting fix (spot-check)', () => {
+  const makeRecipes = { lie: '-npm test' };
+  const spotChecks = ['make lie && true', '/usr/bin/make lie', 'cd x && make lie'];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: spotChecks.map((command, index) => ({ id: `orig${index}`, command })) },
+    makeRecipes,
+  });
+  for (const [index, command] of spotChecks.entries()) {
+    const check = plan.checks.find(({ id }) => id === `orig${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+  }
+});
+
+test('make gate false-positive guards remain clean: cmake, make-docs, make.js, a makerelease script', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake --build .' },
+        { id: 'make-docs', command: 'make-docs build' },
+        { id: 'node-make-js', command: 'node make.js' },
+        { id: 'makerelease-script', command: './scripts/makerelease.sh' },
+      ],
+    },
+  });
+  for (const id of ['cmake-build', 'make-docs', 'node-make-js', 'makerelease-script']) {
+    assert.equal(plan.checks.find((check) => check.id === id).status, undefined, `expected ${id} to resolve cleanly`);
+  }
+});
+
+test('gmake alias is blocked as wrap-form, not treated as a pure recipe-inspectable target', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'gm', command: 'gmake lint' }] },
+    // Recipe is clean: if the pure-form regex mistakenly matched `gmake
+    // lint`, this would resolve PASS-eligible instead of BLOCKED.
+    makeRecipes: { lint: 'eslint .' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'gm');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  assert.doesNotMatch(check.evidence, /neutralizes failures/);
+  assert.doesNotMatch(check.evidence, /No recipe text was captured/);
+});
+
+test('engine command proof literal-policy parity: bounded length and no control characters', () => {
+  const tooLong = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: `literal:${'z'.repeat(300)}` } },
+    },
+  });
+  assert.match(
+    tooLong.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const controlChar = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:a\tb' } },
+    },
+  });
+  assert.match(
+    controlChar.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+});
+
+test('make-gate wrap-form evidence includes an actionable hint for a package script literally named "make"', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'make-script', scripts: ['make'] }] },
+    packageScripts: { make: 'echo building' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'make-script');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(
+    check.evidence,
+    /If this is a package script named "make", rename the script; if "make" here is a bare argument/,
+  );
+});
+
+test('make-gate alias matching is case-insensitive: Windows/macOS spellings cannot dodge inspection', () => {
+  const makeRecipes = { lie: '-npm test' };
+  for (const command of ['MAKE lie', 'Make lie', 'GMAKE lie', 'MAKE.EXE lie', 'Make.Exe lie', 'C:\\tools\\NMAKE.exe lie']) {
+    const plan = buildCheckPlan({
+      mode: 'engine',
+      config: { engineChecks: [{ id: 'm1', command }] },
+      makeRecipes,
+    });
+    assert.equal(plan.checks.find(({ id }) => id === 'm1').status, 'BLOCKED', command);
+  }
+});
+```
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
+Expected: the six new tests fail (buildCheckPlan has no `mode` parameter — engine configs resolve against MANDATORY_CHECKS and strict runs ignore engineChecks); every pre-existing test passes.
+
+- [ ] **Step 3: Implement (surgical edits inside `buildCheckPlan`)**
+
+1. Signature (~line 359): add `mode = 'strict'` as the FIRST destructured option, and make the `commands` capture on the next line mode-aware (post-review hardening — a scripts-resolved engine check must never be able to consult a smuggled `config.commands` entry through the configured branch, which lacks make-recipe inspection):
+
+```js
+const buildCheckPlan = ({ mode = 'strict', config = {}, packageScripts = {}, makeTargets = [], makeRecipes = {}, touchedFiles = [], mergeBaseSha } = {}) => {
+  // Engine mode rejects config.commands below, but rejection alone leaves
+  // the map live in the resolution loop, where a scripts-resolved engine
+  // check could still consult a smuggled entry through the configured
+  // branch (which lacks make-recipe inspection). Emptying the map in engine
+  // mode makes that path structurally dead rather than relying on the
+  // errors→FAIL rollup to keep it inert.
+  const commands = mode === 'engine' ? {} : (config.commands || {});
+```
+
+2. Immediately after `const errors = [];` (~line 364), insert the mode gates:
+
+```js
+  // Unknown mode: fail closed with an empty plan rather than guessing a tier.
+  if (mode !== 'strict' && mode !== 'engine') {
+    return { checks: [], errors: [`Unknown closeout mode "${mode}". Use strict or engine.`] };
+  }
+  // Engine-only keys in a strict run are weakening attempts (someone trying
+  // to swap the matrix or its script runner without saying --mode engine) —
+  // named errors, never silently ignored keys.
+  if (mode === 'strict') {
+    if (Object.hasOwn(config, 'engineChecks')) {
+      errors.push('config.engineChecks is only valid with --mode engine; a strict run never accepts a replacement matrix.');
+    }
+    if (Object.hasOwn(config, 'scriptRunner')) {
+      errors.push('config.scriptRunner is only valid with --mode engine.');
+    }
+  }
+  // Engine mode: the matrix is engineChecks, full stop. config.commands
+  // coexisting with it would create a second command source and an override
+  // ambiguity, so it is rejected outright.
+  if (mode === 'engine' && Object.hasOwn(config, 'commands')) {
+    errors.push('Engine mode defines commands inline in engineChecks; config.commands is not accepted in engine mode.');
+  }
+  // The script runner used for engine `scripts` discovery. Strict keeps its
+  // hardcoded `pnpm run` (byte-identical output); engine defaults to the
+  // ecosystem-neutral `npm run` and accepts an override that is itself
+  // validated like any other command fragment.
+  let scriptRunner = 'npm run';
+  if (mode === 'engine' && Object.hasOwn(config, 'scriptRunner')) {
+    // Tabs and quote characters are rejected alongside newlines: a tab can
+    // pass for whitespace in downstream shell splitting, and an embedded
+    // quote can reopen/escape the surrounding shell-quoting the resolved
+    // command is spliced into — both are command-fragment injection vectors,
+    // not just cosmetic single-line concerns.
+    if (typeof config.scriptRunner !== 'string' || !config.scriptRunner.trim() || /[\r\n\t"']/.test(config.scriptRunner)) {
+      errors.push('scriptRunner must be a single-line non-empty string without tabs or quotes.');
+    } else {
+      const runnerNeutralizer = findCommandFailureNeutralizer(config.scriptRunner);
+      if (runnerNeutralizer) {
+        errors.push(`scriptRunner neutralizes failures (${runnerNeutralizer}); closeout cannot admit a failure-hiding runner.`);
+      } else {
+        scriptRunner = config.scriptRunner.trim();
+      }
+    }
+  }
+  // Engine matrix validation converts throws into the errors channel so the
+  // caller still gets a machine-readable BLOCKED plan (and the provisional
+  // report path still works) instead of an exception.
+  let definitions = MANDATORY_CHECKS;
+  if (mode === 'engine') {
+    try {
+      definitions = validateEngineChecks(config.engineChecks);
+    } catch (error) {
+      return { checks: [], errors: [...errors, error.message] };
+    }
+  }
+  const packageRunner = mode === 'engine' ? scriptRunner : 'pnpm run';
+```
+
+2b. Review hardening (root cause: the make-recipe gate previously keyed off exact command shape at one call site — a wrapped/prefixed/pathed/flagged/argumented `make` invocation could resolve uninspected). Add a single structural helper, applied on the RESOLVED command on every engine resolution path, near the engine constants (after `ENGINE_CHECK_ID_PATTERN`, before `validateEngineChecks`). Round 2 of review hardened the token predicate itself: the original split/predicate missed shell quoting and substitution (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`, `x=`make lie``) and make aliases (`gmake`, `make.exe`, `mingw32-make`, ...), which are simply what make is CALLED on BSD/macOS/Windows, not evasion. The fixed helper below is a DENYLIST, not a proof of absence — it catches everything reachable by typing the obvious thing, not a genuinely exotic evasion (a shell function/alias named e.g. `remake`):
+
+```js
+// Split points for the make-gate token scan: whitespace, shell separators/
+// operators (`;&|(){}`), quote/substitution characters (`` ` " ' $ ``), and
+// redirection/assignment characters (`<>=`) — a make invocation dressed up
+// in any of these (`` `make lie` ``, `"make" lie`, `x=`make lie``, `bash -c
+// "make lie"`) still yields a bare make-alias token after the split.
+const MAKE_SPLIT = /[\s;&|(){}`"'$=<>]+/;
+// Names make is actually called under on common platforms — BSD/macOS ship
+// `make` as a symlink to `bmake`/`pmake`, NetBSD ships `pmake`, and Windows
+// toolchains ship `mingw32-make`/`mingw64-make`/`nmake` — not evasion, just
+// the real binary name. A leading path and a `.exe`/`.cmd`/`.bat` suffix are
+// stripped before the alias check, so `/usr/bin/make.exe` and `make` match
+// the same entry.
+const MAKE_ALIASES = new Set(['make', 'gmake', 'bmake', 'pmake', 'nmake', 'mingw32-make', 'mingw64-make']);
+// Case-insensitive: Windows and default-macOS filesystems resolve `MAKE`/
+// `Make.Exe` to the same binary, and Windows toolchains are explicitly in
+// this alias set's threat model (mingw32-make, nmake).
+const isMakeToken = (token) => MAKE_ALIASES.has(token.split(/[/\\]/).pop().replace(/\.(?:exe|cmd|bat)$/i, '').toLowerCase());
+
+// Engine-mode make gate: recipe bodies are only inspectable when the command
+// is EXACTLY `make <target>`. Any other command that invokes make — wrapped
+// (`cd x && make lie`), prefixed (`env make lie`, `nice -n 19 make lie`),
+// pathed (`/usr/bin/make lie`), flagged (`make -s lie`), quoted or
+// substituted (`` `make lie` ``, `"make" lie`, `bash -c "make lie"`),
+// aliased (`gmake lie`, `make.exe lie`, `mingw32-make lie`), or argumented
+// (`make lie MYVAR=1`, `make lie && true`) — cannot have its recipe resolved
+// and inspected, so it is BLOCKED rather than admitted uninspected.
+// This is a DENYLIST, not a proof of absence: it catches everything
+// reachable by typing the obvious thing — direct invocation, common shell
+// wrapping, common aliasing — but a genuinely exotic evasion (a shell
+// function or alias named e.g. `remake` that execs make, or an alias for
+// make under a name not in MAKE_ALIASES) cannot be enumerated and is not
+// claimed to be caught here.
+const engineMakeGate = (resolvedCommand, makeRecipes, label) => {
+  const pure = /^make\s+(\S+)$/.exec(resolvedCommand.trim());
+  if (pure) {
+    const target = pure[1];
+    if (!Object.hasOwn(makeRecipes, target)) {
+      return `No recipe text was captured for make target "${target}" (${label}); closeout cannot trust an uninspected recipe.`;
+    }
+    const recipeNeutralizer = findMakeRecipeNeutralizer(makeRecipes[target]);
+    if (recipeNeutralizer) {
+      return `Make recipe for ${label} neutralizes failures (${recipeNeutralizer}); closeout cannot admit a failure-hiding recipe.`;
+    }
+    return null;
+  }
+  const invokesMake = resolvedCommand.split(MAKE_SPLIT).some(isMakeToken);
+  if (invokesMake) {
+    return `Engine commands may invoke make only as a bare "make <target>" so the recipe can be inspected; "${resolvedCommand}" (${label}) wraps or argument-extends make and cannot be admitted uninspected. If this is a package script named "make", rename the script; if "make" here is a bare argument (a test filter, pattern, or workspace name), this gate cannot distinguish it from an invocation — rephrase the command.`;
+  }
+  return null;
+};
+```
+
+Note: the pure-form regex (`/^make\s+(\S+)$/`) intentionally still matches only literal `make` — it is NOT extended to the alias set. A pure `gmake lint` therefore never reaches recipe inspection; it hits the alias predicate in `invokesMake` and is BLOCKED as a wrap-form instead. That is correct-and-safe (still BLOCKED, just via the other message), not a gap — pinned by a dedicated test rather than widening the pure form.
+
+3. Change the map source (~line 377) from `MANDATORY_CHECKS.map((definition) => {` to `definitions.map((definition) => {`, and insert the engine-command branch as the FIRST branch inside the map callback, before the `if (definition.fixed) {` branch:
+
+```js
+    if (definition.engine && definition.command) {
+      // Engine commands are user-supplied: apply the full distrust pipeline
+      // the configured-command branch uses (placeholder, neutralizer) PLUS
+      // the make-recipe inspection the fixed branch applies to `make`
+      // invocations — an engine matrix must not be able to smuggle a
+      // failure-hiding recipe behind a clean-looking `make target`.
+      const trimmed = definition.command.trim();
+      if (/^(?:<[^>]+>|REPLACE(?:_|\b))/i.test(trimmed)) {
+        return {
+          ...definition,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Replace the example placeholder for ${definition.label}.`,
+        };
+      }
+      const engineCommand = expand(trimmed);
+      const engineNeutralizer = findCommandFailureNeutralizer(engineCommand);
+      if (engineNeutralizer) {
+        return {
+          ...definition,
+          command: engineCommand,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: `Engine command for ${definition.label} neutralizes failures (${engineNeutralizer}); closeout cannot admit a failure-hiding command.`,
+        };
+      }
+      // The make gate keys off the RESOLVED command shape, not a narrow
+      // regex against this one call site: wrapped/prefixed/pathed/flagged/
+      // argumented invocations of make are blocked exactly like a bare
+      // `make <target>` whose recipe neutralizes or was never captured.
+      const makeGateEvidence = engineMakeGate(engineCommand, makeRecipes, definition.label);
+      if (makeGateEvidence) {
+        return {
+          ...definition,
+          command: engineCommand,
+          status: 'BLOCKED',
+          resolution: 'engine-command',
+          evidence: makeGateEvidence,
+        };
+      }
+      return { ...definition, command: engineCommand, resolution: 'engine-command' };
+    }
+```
+
+4. In the package-script branch (~lines 446-464): replace both `` `pnpm run ${packageScript}` `` occurrences with a shared `resolvedScriptCommand = `${packageRunner} ${packageScript}`` (Strict output is unchanged because `packageRunner` is `'pnpm run'` in strict mode), and — review hardening — run the SAME `engineMakeGate` on that resolved string for `definition.engine` checks only, so a `scriptRunner` of `make` (or a wrapped/prefixed form of it) cannot dodge recipe inspection just because it arrived via `scripts` instead of `command`:
+
+```js
+      const scriptBody = packageScripts[packageScript];
+      const packageNeutralizer = findCommandFailureNeutralizer(scriptBody);
+      const resolvedScriptCommand = `${packageRunner} ${packageScript}`;
+      if (packageNeutralizer) {
+        return {
+          ...definition,
+          command: resolvedScriptCommand,
+          status: 'BLOCKED',
+          resolution: 'package-script',
+          evidence: `Package script "${packageScript}" for ${definition.label} neutralizes failures (${packageNeutralizer}); closeout cannot admit a failure-hiding package script.`,
+        };
+      }
+      // Engine mode: scriptRunner is user-configurable and can itself be
+      // `make` (or wrap make) — the resolved command must pass through the
+      // same make-recipe gate an inline engine command uses, so a `make
+      // <script>` resolution cannot dodge recipe inspection just because it
+      // arrived via scriptRunner instead of `command`. Strict defs never
+      // reach this: they are never `engine`, and packageRunner is the
+      // hardcoded `pnpm run` there regardless of makeRecipes contents.
+      if (definition.engine) {
+        const gateEvidence = engineMakeGate(resolvedScriptCommand, makeRecipes, definition.label);
+        if (gateEvidence) {
+          return {
+            ...definition,
+            command: resolvedScriptCommand,
+            status: 'BLOCKED',
+            resolution: 'package-script',
+            evidence: gateEvidence,
+          };
+        }
+      }
+      return { ...definition, command: resolvedScriptCommand, resolution: 'package-script' };
+```
+
+5. In the second-pass map (~lines 507-527), extend the proof handling: after the existing `if (proofType && !validArtifact && !validCommand) { ... }` block, add the engine-only validation for voluntarily attached proofs (checks with no REQUIRED_PROOFS entry). It must reuse the SAME artifact-path rules the `validArtifact` branch applies (the block at ~lines 529-537), plus — review hardening — strict proof-command parity (neutralizer scan and literal-policy check) for a voluntarily attached engine command proof:
+
+```js
+    // Engine mode: a voluntarily attached proof (no REQUIRED_PROOFS entry
+    // exists for engine ids) is still validated at plan time — a malformed
+    // proof must block admission here exactly like a required one, not fail
+    // later inside the executor. Strict behavior is untouched: strict checks
+    // only ever carry proofs through the proofType path above.
+    if (mode === 'engine' && proof && !proofType) {
+      const engineArtifact = proof?.type === 'artifact'
+        && typeof proof.path === 'string' && proof.path.trim();
+      const engineCommandProof = proof?.type === 'command'
+        && typeof proof.command === 'string' && proof.command.trim()
+        && typeof proof.expectedPattern === 'string' && proof.expectedPattern.trim();
+      if (!engineArtifact && !engineCommandProof) {
+        const proofEvidence = `Configured proof for ${check.label} is malformed; engine proofs must be a complete artifact or command proof.`;
+        resolved = resolved.status === 'BLOCKED'
+          ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+          : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+      } else if (engineArtifact) {
+        const rel = String(proof.path).replaceAll('\\', '/').trim();
+        if (path.isAbsolute(proof.path) || rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)
+          || rel.split('/').includes('..') || rel.startsWith('../')) {
+          const proofEvidence = `Artifact proof path must be a relative worktree path without "..": ${proof.path}`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+      } else if (engineCommandProof) {
+        // Strict parity: the executor rejects a neutralizing proof command
+        // and requires a bounded literal:<text> policy (see the validCommand
+        // block below); a voluntarily attached engine command proof must be
+        // held to the identical rules at plan time, not admitted uninspected.
+        const engineProofNeutralizer = findCommandFailureNeutralizer(proof.command);
+        if (engineProofNeutralizer) {
+          const proofEvidence = `Postcondition proof command for ${check.label} neutralizes failures (${engineProofNeutralizer}).`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+        // Mirror strict's exact literal-policy bounds (validCommand, below):
+        // bounded length and no control characters, not just a `literal:`
+        // prefix check — a voluntarily attached engine command proof gets
+        // the identical bar. Control characters are scanned by code point
+        // (not a regex literal) to keep this diff free of embedded escapes.
+        const enginePattern = proof.expectedPattern;
+        let engineHasControlChar = false;
+        for (let charIndex = 0; charIndex < enginePattern.length; charIndex += 1) {
+          const code = enginePattern.charCodeAt(charIndex);
+          if (code < 0x20 || code === 0x7f) {
+            engineHasControlChar = true;
+            break;
+          }
+        }
+        const engineLiteralOk = enginePattern.startsWith('literal:')
+          && enginePattern.length <= 264
+          && enginePattern.length > 'literal:'.length
+          && !engineHasControlChar;
+        if (!engineLiteralOk) {
+          const proofEvidence = `Postcondition proof pattern for ${check.label} must be a literal: policy with a non-empty value.`;
+          resolved = resolved.status === 'BLOCKED'
+            ? { ...resolved, evidence: `${resolved.evidence} ${proofEvidence}` }
+            : { ...resolved, status: 'BLOCKED', evidence: proofEvidence };
+        }
+      }
+    }
+```
+
+NOTE: the second-pass map callback must have `mode` in scope — it is defined in `buildCheckPlan`'s closure, so no signature change is needed there. Verify the variable names in the second pass match the file (`resolved`, `proof`, `proofType`, `check`) — they are quoted here from the current source at ~lines 507-527.
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
+Expected: all pass — the six new tests AND every pre-existing test (the strict path is byte-identical: same matrix source object, same `pnpm run` literal output, no new errors for engine-free configs). `node --check scripts/pr_closeout_core.js` clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout_core.js scripts/pr_closeout_core.test.js
+git commit -m "feat(closeout): buildCheckPlan engine mode — shared distrust pipeline, strict guard"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 4: Workflow threading — mode-bound digest, engine timeouts, plan `mode`
+
+**Files:**
+- Modify: `scripts/pr_closeout_workflow.js` (body ~952-1043; exports)
+- Test: `scripts/pr_closeout_workflow.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_workflow.test.js`. NOTE: model fixture plumbing on the file's existing planOnly tests — the assertions below are the contract; the injected dependency set (`resolveRepositoryState`, `readProjectMetadata`, `digestValidationConfig`) mirrors what the file already injects for plan-mode tests. Add `mergeEngineTimeouts` to the destructured require from `./pr_closeout_workflow`.
+
+```js
+const planDeps = (digests) => ({
+  resolveRepositoryState: async ({ repo, baseRef }) => ({
+    repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+  }),
+  readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+  digestValidationConfig: (value) => {
+    digests.push(value);
+    return `digest-${digests.length}`;
+  },
+});
+
+test('the validation-config digest binds the mode (schemaVersion 3)', async () => {
+  const digests = [];
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: planDeps(digests),
+  });
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] },
+    dependencies: planDeps(digests),
+  });
+  assert.equal(digests[0].schemaVersion, 3);
+  assert.equal(digests[0].mode, 'strict');
+  assert.equal(digests[1].mode, 'engine');
+});
+
+test('strict and engine digests differ even for identical config bytes, and a matrix edit changes the engine digest', async () => {
+  const { digestValidationConfig } = require('./pr_closeout_git');
+  const realDeps = () => ({
+    resolveRepositoryState: async ({ repo, baseRef }) => ({
+      repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+    }),
+    readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+    digestValidationConfig,
+  });
+  const strictPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {}, dependencies: realDeps(),
+  });
+  const enginePlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] }, dependencies: realDeps(),
+  });
+  const editedPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test --all' }] }, dependencies: realDeps(),
+  });
+  assert.notEqual(strictPlan.configDigest, enginePlan.configDigest);
+  assert.notEqual(enginePlan.configDigest, editedPlan.configDigest);
+  assert.equal(strictPlan.mode, 'strict');
+  assert.equal(enginePlan.mode, 'engine');
+});
+
+test('mergeEngineTimeouts lets inline engine timeouts win over config.timeoutsMs', () => {
+  assert.deepEqual(
+    mergeEngineTimeouts({ unit: 5000, lint: 7000 }, [
+      { id: 'unit', timeoutMs: 9000 },
+      { id: 'style' },
+    ]),
+    { unit: 9000, lint: 7000 },
+  );
+  assert.deepEqual(mergeEngineTimeouts(undefined, [{ id: 'a', timeoutMs: 100 }]), { a: 100 });
+  assert.deepEqual(mergeEngineTimeouts({ a: 1 }, []), { a: 1 });
+});
+```
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: the three new tests fail (digest input has schemaVersion 2 and no mode; plan output has no `mode`; `mergeEngineTimeouts` not exported). Pre-existing tests pass — EXCEPT any pre-existing test that pins the digest input's `schemaVersion: 2` or a literal digest value: if one exists, STOP and report it to the coordinator before touching it (expected outcome per spec: the digest input change is deliberate; the coordinator will rule on the specific test).
+
+- [ ] **Step 3: Implement**
+
+In `scripts/pr_closeout_workflow.js`:
+
+1. `runCloseoutWorkflowBody`: pass `mode` into `buildCheckPlan` (~line 964): add `mode,` as the first property of its options object.
+2. Digest input (~line 975): change to
+
+```js
+  const configDigest = d.digestValidationConfig({
+    // schemaVersion 2 -> 3: the digest now binds the gate tier. Deliberate
+    // one-time invalidation of outstanding attestations (spec: Migration
+    // consequence) — a strict-minted attestation can never admit an engine
+    // run because the digests can no longer collide across modes.
+    schemaVersion: 3,
+    mode,
+    config: validationConfig,
+    resolved: {
+      baselineSetupCommand,
+      checks: plan.checks.map((check) => ({
+        id: check.id,
+        command: check.command,
+        resolution: check.resolution,
+        qualificationSafe: check.qualificationSafe,
+        resourceGroup: check.resourceGroup,
+        baselineSafe: check.baselineSafe,
+        generator: check.generator,
+        proof: check.proof,
+      })),
+    },
+  });
+```
+
+3. planOnly return (~line 1000): add `mode,` immediately after `execution: 'not-started',`.
+4. New exported pure helper (place near the other small helpers, before `runCloseoutWorkflowBody`):
+
+```js
+/**
+ * Merge per-check inline engine timeouts into the id-keyed timeoutsMs map
+ * the command executor consumes. The engine matrix is authoritative for its
+ * own checks, so an inline timeoutMs wins over a config.timeoutsMs entry for
+ * the same id; ids without an inline value keep whatever config supplied.
+ * @param {Record<string, number>|undefined} configTimeouts
+ * @param {Array<{id: string, timeoutMs?: number}>} checks
+ * @returns {Record<string, number>}
+ */
+const mergeEngineTimeouts = (configTimeouts, checks) => ({
+  ...(configTimeouts || {}),
+  ...Object.fromEntries(checks.filter((check) => check.timeoutMs).map((check) => [check.id, check.timeoutMs])),
+});
+```
+
+5. Executor wiring (~line 1041): change `timeoutsMs: config.timeoutsMs,` to `timeoutsMs: mergeEngineTimeouts(config.timeoutsMs, mode === 'engine' ? plan.checks : []),`.
+6. Export `mergeEngineTimeouts` from the module's exports.
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: all pass. `node --check scripts/pr_closeout_workflow.js` clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout_workflow.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): mode-bound attestation digest, engine timeouts, plan mode field"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 5: Plan-mode `admission` block
+
+**Files:**
+- Modify: `scripts/pr_closeout_workflow.js` (planOnly branch ~999-1022; new helpers; exports)
+- Modify: `scripts/pr_closeout_github.js` (readLiveGateAttestation internal catch ~:484 — additive `reason: 'unavailable'` field; fix round)
+- Modify: `scripts/pr_closeout_process.js` (spec-sanctioned single change: `runPreflight` optional `toolProbes = TOOL_PROBES` parameter + `TOOL_PROBES` export; fix round)
+- Modify: `scripts/pr_closeout_core.js` (strict-mode rejection of `config.requiredTools`, same mechanism as the `scriptRunner` strict rejection; fix round)
+- Test: `scripts/pr_closeout_workflow.test.js`, `scripts/pr_closeout_github.test.js`, `scripts/pr_closeout_core.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_workflow.test.js` (add `resolvePlanAdmission` to the destructured require):
+
+```js
+test('resolvePlanAdmission reports present, absent, and unavailable attestation states plus tree and preflight readiness', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested by reviewer' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: { git: '2.45' } }),
+    },
+  };
+  const present = await resolvePlanAdmission(base);
+  assert.equal(present.attestation.status, 'present');
+  assert.equal(present.cleanTree.status, 'PASS');
+  assert.equal(present.preflight.status, 'PASS');
+
+  const absent = await resolvePlanAdmission({
+    ...base,
+    d: { ...base.d, readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }) },
+  });
+  assert.equal(absent.attestation.status, 'absent');
+  assert.match(absent.attestation.evidence, /no matching attestation/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => { throw new Error('gh: not logged in'); },
+      runPreflight: async () => { throw new Error('probe crashed'); },
+      cleanTreeStatus: async () => { throw new Error('git unavailable'); },
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /gh: not logged in/);
+  assert.equal(unavailable.preflight.status, 'BLOCKED');
+  assert.match(unavailable.preflight.evidence, /probe crashed/);
+  assert.equal(unavailable.cleanTree.status, 'BLOCKED');
+  assert.match(unavailable.cleanTree.evidence, /git unavailable/);
+});
+
+test('planOnly output carries the admission block', async () => {
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-a',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  });
+  assert.equal(plan.admission.attestation.status, 'absent');
+  assert.equal(plan.admission.cleanTree.status, 'PASS');
+  assert.equal(plan.admission.preflight.status, 'PASS');
+});
+```
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: both new tests fail (`resolvePlanAdmission` not exported; plan output has no `admission`). Pre-existing tests pass — NOTE: if any pre-existing planOnly test injects NO `readLiveGateAttestation`/`cleanTreeStatus`/`runPreflight` fake and starts failing because the real dependencies now run in plan mode, that is a real behavioral conflict: resolve it by having `resolvePlanAdmission` catch those failures into `unavailable`/`BLOCKED` states (the design below already does — plan mode must never throw because gh or git probes fail). Do not modify the pre-existing test.
+
+- [ ] **Step 3: Implement**
+
+In `scripts/pr_closeout_workflow.js`, add near the other helpers (before `runCloseoutWorkflowBody`):
+
+```js
+/**
+ * Read-only admission readiness for plan mode: WHY would the full gate block
+ * right now? Consumed by the Action's push-time preview (sub-project B) so an
+ * ordinary push gets an honest "attestation absent / gh unavailable / tree
+ * dirty" answer without paying for the full gate. Every probe failure is
+ * caught into a structured state — plan mode must never throw because gh is
+ * unauthenticated or a probe crashed; that is precisely what it exists to
+ * report. Attestation mapping is the spec's four-state vocabulary: PASS →
+ * `present`; FAIL → `weakened` (an attestation for this snapshot exists but
+ * records a weakened decision — hiding it inside "absent" would suppress an
+ * active weakening signal); BLOCKED carrying the reader's machine-readable
+ * `reason: 'unavailable'` discriminator → `unavailable` (the read itself
+ * could not complete); any other BLOCKED → `absent` (snapshot reasons: no
+ * matching review, or the PR head/base moved). A reader that throws (test
+ * fakes; the real reader never throws) also maps to `unavailable`.
+ * @param {{repo: string, baseSha: string, headSha: string, configDigest: string, config?: object, toolProbes?: Array, d: object}} options
+ * @returns {Promise<{attestation: object, cleanTree: object, preflight: object}>}
+ */
+const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, config = {}, toolProbes, d }) => {
+  let attestation;
+  try {
+    const live = await d.readLiveGateAttestation({
+      repo,
+      expectedBaseSha: baseSha,
+      expectedHeadSha: headSha,
+      expectedConfigDigest: configDigest,
+    });
+    attestation = live?.status === 'PASS'
+      ? { status: 'present', evidence: live.evidence }
+      : live?.status === 'FAIL'
+        ? { status: 'weakened', evidence: live.evidence || 'A live attestation matching this snapshot records a weakened decision.' }
+        : live?.reason === 'unavailable'
+          ? { status: 'unavailable', evidence: live.evidence || 'Live attestation lookup could not complete.' }
+          : { status: 'absent', evidence: live?.evidence || 'No live attestation matches the current base, head, and config digest.' };
+  } catch (error) {
+    attestation = { status: 'unavailable', evidence: `Attestation lookup failed: ${error.message}` };
+  }
+  let cleanTree;
+  try {
+    cleanTree = await d.cleanTreeStatus(repo);
+  } catch (error) {
+    cleanTree = { status: 'BLOCKED', evidence: `Working tree inspection failed: ${error.message}` };
+  }
+  let preflight;
+  try {
+    preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
+  } catch (error) {
+    preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
+  }
+  return { attestation, cleanTree, preflight };
+};
+```
+
+NOTE: before wiring, confirm with a bounded read how the full-run path invokes `d.runPreflight` (~line 1089: `d.runPreflight({ repo: initial.repo, config, env: childEnv })`) and mirror that argument shape; plan mode passes `process.env` because `childEnv` is built only on the full-run path — the preflight only probes tool presence/versions, and building the full child environment in plan mode would be work plan mode exists to avoid.
+
+In the planOnly branch (~line 999), compute and include the block:
+
+```js
+  if (planOnly) {
+    const admission = await resolvePlanAdmission({
+      repo: initial.repo,
+      baseSha: initial.baseSha,
+      headSha: initial.headSha,
+      configDigest,
+      config,
+      d,
+    });
+    return redactStructure({
+      execution: 'not-started',
+      mode,
+      admission,
+      ...
+```
+
+(keep every existing field of the returned object exactly as it is today — only `mode` and `admission` are added). Export `resolvePlanAdmission`.
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: all pass, including Task 4's tests (their planDeps fixtures don't inject the three admission dependencies — the DEFAULTS versions run and are caught into structured states, or the injected fakes cover them; if a Task 4 test now hits a real `gh` call, extend THAT test's `planDeps` (it is new in this branch, not pre-existing) with the three fakes from the planOnly test above). `node --check` clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout_workflow.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): plan-mode admission readiness block"
+```
+
+(with the standard two trailers)
+
+#### Task 5 fix round (review decisions): four-state attestation + engine `requiredTools` preflight
+
+Two Importants from quality review, both resolved as spec amendments (see spec sections
+"Plan-mode admission readiness" and the `requiredTools` bullet under "Engine matrix
+schema"). The Minor (33s docker-daemon probe cost on every `--plan`) is resolved by the
+same `requiredTools` change: undeclared probes never run.
+
+- [ ] **Step 6: Write the failing tests**
+
+Append to `scripts/pr_closeout_github.test.js`:
+
+```js
+test('readLiveGateAttestation tags its internal catch path with a machine-readable unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async () => { throw new Error('gh: command not found'); },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, 'unavailable');
+  assert.match(result.evidence, /gh: command not found/);
+});
+
+test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async () => {
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return { number: 7, author: { login: 'a' }, headRefOid: 'movedhead', baseRefOid: 'base123' };
+      return [[]];
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.equal(result.reason, undefined);
+});
+```
+
+Append to `scripts/pr_closeout_workflow.test.js`:
+
+```js
+test('resolvePlanAdmission distinguishes weakened and unavailable from absent', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'FAIL', evidence: 'decision recorded as weakened' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  };
+  const weakened = await resolvePlanAdmission(base);
+  assert.equal(weakened.attestation.status, 'weakened');
+  assert.match(weakened.attestation.evidence, /weakened/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => ({
+        status: 'BLOCKED',
+        reason: 'unavailable',
+        evidence: 'Live GitHub gate attestation was unavailable: gh: command not found',
+      }),
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /unavailable/);
+});
+
+test('engine-mode preflight probes exactly git, node, and declared requiredTools', async () => {
+  // Reuse this branch's planDeps-style fixture; only runPreflight differs.
+  let captured = 'not-called';
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['make'] },
+    dependencies: {
+      // ...the same fakes the existing engine planOnly tests inject...
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node', 'make']);
+  assert.ok(captured.every(([, command]) => typeof command === 'string' && command.length > 0));
+});
+
+test('engine mode without requiredTools probes only git and node', async () => {
+  let captured = 'not-called';
+  // same fixture, config: { engineChecks: [...] } with no requiredTools
+  // assert.deepEqual(captured.map(([name]) => name), ['git', 'node']);
+});
+
+test('strict mode passes no toolProbes filter to preflight', async () => {
+  let captured = 'sentinel';
+  // same fixture in strict mode; assert.equal(captured, undefined) after the run
+});
+
+test('unknown requiredTools names are a named config error and the plan fails closed', async () => {
+  // engine planOnly run with config.requiredTools = ['blender'];
+  // assert the plan reports FAIL through the existing errors containment and the
+  // error text matches /requiredTools\[0\] names unknown preflight probe "blender"/
+  // and lists the known probe names.
+});
+```
+
+Append to `scripts/pr_closeout_core.test.js`:
+
+```js
+test('requiredTools in a strict-mode config is a hard error naming the key', () => {
+  // Same mechanism and test shape as the existing scriptRunner-in-strict rejection test.
+  // The error message must name requiredTools explicitly.
+});
+```
+
+- [ ] **Step 7: Implement**
+
+1. `scripts/pr_closeout_github.js` — add `reason: 'unavailable'` to the internal-catch
+   return of `readLiveGateAttestation` (~:484-495). Additive field only; every other
+   return path is untouched (snapshot-mismatch BLOCKED returns carry no `reason`).
+2. `scripts/pr_closeout_process.js` — the spec-sanctioned single change:
+   `runPreflight` gains `toolProbes = TOOL_PROBES` in its destructured options, the
+   probe loop iterates `toolProbes` instead of the module constant, and `TOOL_PROBES`
+   joins the exports. Nothing else in the file changes.
+3. `scripts/pr_closeout_core.js` — reject `config.requiredTools` in strict mode with a
+   hard error naming the key, placed beside and using the same mechanism as the
+   `scriptRunner` strict rejection.
+4. `scripts/pr_closeout_workflow.js` — add and export:
+
+```js
+const ENGINE_BASE_TOOLS = ['git', 'node'];
+
+/**
+ * Engine-mode preflight probe selection (spec: "Engine-only config.requiredTools").
+ * Returns the filtered [name, command] probe entries — always git + node (the
+ * gate's own dependencies) plus the declared names, deduplicated, in catalog
+ * order — or named errors when the declaration is malformed or names a probe
+ * outside the catalog. Fail-closed: errors mean NO probe list; the caller feeds
+ * them into the existing errors → FAIL containment chain.
+ */
+const resolveEngineToolProbes = (requiredTools, toolProbes) => {
+  if (requiredTools !== undefined && !Array.isArray(requiredTools)) {
+    return { probes: null, errors: ['config.requiredTools must be an array of preflight probe names.'] };
+  }
+  const errors = [];
+  const catalog = new Set(toolProbes.map(([name]) => name));
+  const declared = requiredTools || [];
+  declared.forEach((name, index) => {
+    if (typeof name !== 'string' || !name) {
+      errors.push(`config.requiredTools[${index}] must be a non-empty string.`);
+    } else if (!catalog.has(name)) {
+      errors.push(`config.requiredTools[${index}] names unknown preflight probe "${name}". Known probes: ${[...catalog].join(', ')}.`);
+    }
+  });
+  if (errors.length > 0) return { probes: null, errors };
+  const wanted = new Set([...ENGINE_BASE_TOOLS, ...declared]);
+  return { probes: toolProbes.filter(([name]) => wanted.has(name)), errors };
+};
+```
+
+   Extend the existing `require('./pr_closeout_process')` line with `TOOL_PROBES`.
+   In the body, after config validation, engine mode computes
+   `resolveEngineToolProbes(config.requiredTools, TOOL_PROBES)`; its errors join the
+   same containment chain as engine matrix validation errors (planStatus FAIL,
+   admission FAIL, nothing executes). Thread the resulting probe list (engine) or
+   `undefined` (strict) as `toolProbes` into all three `d.runPreflight` call sites:
+   the plan-admission helper, the full-run preflight (~:1175), and `captureVersions`
+   (~:1324).
+
+- [ ] **Step 8: Run to verify green**
+
+Run each alone, foreground, sequentially:
+`node --test --test-concurrency=1 scripts/pr_closeout_github.test.js`
+`node --test --test-concurrency=1 scripts/pr_closeout_core.test.js`
+`node --test --test-concurrency=1 scripts/pr_closeout_workflow.test.js`
+Expected: all pass; no pre-existing test modified. `node --check` on all four touched scripts.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add scripts/pr_closeout_github.js scripts/pr_closeout_process.js scripts/pr_closeout_core.js scripts/pr_closeout_workflow.js scripts/pr_closeout_github.test.js scripts/pr_closeout_core.test.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): four-state admission attestation, engine requiredTools preflight"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 6: Report labeling — `mode` field, engine banner
+
+**Files:**
+- Modify: `scripts/pr_closeout_workflow.js` (report assembly ~1361-1374; provisional report — grep `PROVISIONAL` / the forced-BLOCKED report write ~907-914)
+- Modify: `scripts/pr_closeout_report.js` (markdown summary list ~line 186 region)
+- Test: `scripts/pr_closeout_report.test.js` (append), `scripts/pr_closeout_workflow.test.js` (append)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `scripts/pr_closeout_report.test.js` (NOTE: mirror the file's existing pattern for building a minimal report object and rendering markdown — it feeds report objects to the exported renderer; reuse whatever minimal fixture helper its existing tests use and extend it with the new fields):
+
+```js
+test('markdown renders the mode line in both modes and the engine banner only in engine mode', () => {
+  const strictReport = hostileReport();
+  strictReport.mode = 'strict';
+  strictReport.matrixSource = null;
+  const strictMarkdown = renderMarkdown(strictReport);
+  assert.match(strictMarkdown, /- Mode: strict/);
+  assert.doesNotMatch(strictMarkdown, /ENGINE MODE/);
+
+  const engineReport = hostileReport();
+  engineReport.mode = 'engine';
+  engineReport.matrixSource = { source: 'config.engineChecks', digest: 'engine-digest-1', checkCount: 3 };
+  const engineMarkdown = renderMarkdown(engineReport);
+  assert.match(engineMarkdown, /- Mode: engine/);
+  assert.match(engineMarkdown, /ENGINE MODE/);
+  assert.match(engineMarkdown, /repo-defined check matrix/);
+  assert.match(engineMarkdown, /different, weaker guarantee than the strict 19-check gate/);
+  assert.match(engineMarkdown, /engine-digest-1/);
+  assert.match(engineMarkdown, /3 checks/);
+});
+```
+
+(`hostileReport()` is the file's existing report-fixture builder and `renderMarkdown` its existing renderer export — both already in the file; extend the top require only if `renderMarkdown` is somehow absent from it, which it is not as of `97676da`.)
+
+Append to `scripts/pr_closeout_workflow.test.js` TWO tests. First, a field-presence test cloned from the file's cheapest existing full-run fixture asserting `report.mode === 'strict'` and `report.matrixSource === null` on a strict run. Second — this is spec test-group 3's core case — an engine-mode full-run test cloned from an existing full-run fixture (reuse its injected `execute`/dependency fakes wholesale) with: `mode: 'engine'`, a config of `{ engineChecks: [{ id: 'unit', command: 'echo ok' }] }` (adjust the command to whatever the fixture's fake executor accepts), and the injected `scanTouchedSuppressions` returning one finding — assert the run's `overallStatus` is `FAIL` (suppression auto-FAIL overrides an all-green custom matrix) and `report.mode === 'engine'`. If the existing full-run fixtures resist a clone (they are substantial), report BLOCKED with what you found rather than weakening the assertion — this test is a spec requirement, not an optional nicety. Do not modify any pre-existing test.
+
+- [ ] **Step 2: Run to verify failures**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_report.test.js scripts/pr_closeout_workflow.test.js`
+Expected: new tests fail (no mode line, no banner, no mode field); pre-existing pass.
+
+- [ ] **Step 3: Implement**
+
+1. `scripts/pr_closeout_workflow.js` report assembly (~1361): after `configDigest,` add:
+
+```js
+    mode,
+    // Engine runs name their matrix provenance so a reader of report.json can
+    // never mistake a repo-defined matrix for the strict 19-check gate.
+    matrixSource: mode === 'engine'
+      ? { source: 'config.engineChecks', digest: configDigest, checkCount: plan.checks.length }
+      : null,
+```
+
+2. Locate the provisional forced-BLOCKED report assembly (grep `provisional` case-insensitively in `pr_closeout_workflow.js`, ~907-914 region) and add the same two fields there, so a crashed run's report still names its tier.
+3. `scripts/pr_closeout_report.js` (~line 186 region — the markdown summary list array containing `- Configuration digest: ...`): add immediately after the configuration-digest entry:
+
+```js
+    `- Mode: ${safeText(reportMode)}`,
+    ...(reportMode.toLowerCase() === 'engine' ? [
+      '',
+      '> **ENGINE MODE** — this run used a repo-defined check matrix '
+        + `(${Number(report.matrixSource?.checkCount) || 0} checks from ${safeText(report.matrixSource?.source || 'config.engineChecks')}, `
+        + `digest ${safeText(report.matrixSource?.digest || 'unresolved')}). `
+        + 'This is a different, weaker guarantee than the strict 19-check gate.',
+    ] : []),
+```
+
+where `reportMode` is declared once above the lines array (quality-review round: one
+normalized value drives both label and banner so they can never disagree; matrixSource
+tell prevents a stripped mode field downgrading an engine report to a strict claim):
+
+```js
+  const reportMode = String(report.mode || (report.matrixSource ? 'engine' : 'strict'));
+```
+
+NOTE: match the file's actual array/string-building idiom at that site (it is a flat array of markdown lines around line 186; splice accordingly and keep `safeText` — it is the file's existing sanitizer). The quality round also added: a report.test.js test pinning banner-vs-casing/stripped-mode/legacy rendering, and (commit 5aecdf2) matrixSource deep-equal + provisional written[0] labeling pins in the two new workflow tests.
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `node --test --test-concurrency=1 scripts/pr_closeout_report.test.js scripts/pr_closeout_workflow.test.js`
+Expected: all pass. `node --check` on both modified files clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/pr_closeout_workflow.js scripts/pr_closeout_report.js scripts/pr_closeout_report.test.js scripts/pr_closeout_workflow.test.js
+git commit -m "feat(closeout): mode-labeled reports with engine banner"
+```
+
+(with the standard two trailers)
+
+---
+
+### Task 7: Full verification + review handoff
+
+- [ ] **Step 1:** `npm test` — foreground, ONCE, 10-minute timeout; expect 0 fail (pre-existing skips OK). The strict-invariance claim is proven here: every pre-existing closeout test passes unmodified.
+- [ ] **Step 2:** `git diff codex/publish-debug-skill...HEAD --stat` — confirm ONLY these files changed: `pr_closeout.js`, `pr_closeout_core.js`, `pr_closeout_workflow.js`, `pr_closeout_report.js`, plus the two files sanctioned by the Task 5 fix round, `pr_closeout_github.js` (additive `reason: 'unavailable'` on the reader's internal catch) and `pr_closeout_process.js` (the spec-sanctioned `toolProbes` parameter + frozen `TOOL_PROBES` export ONLY), their six test files, the spec, and this plan. `pr_closeout_git.js`, `pr_closeout_runner.js`, `pr_closeout_stream.js`, `debug_server.js`, and all evidence tools: zero lines. (This list was amended during execution — the original predated the Task 5 fix round; the amendment is the record.)
+- [ ] **Step 3:** `npm run validate` → PASS (payload file COUNT is unchanged — no new files; if it fails, something created a file this plan does not sanction). `npm run scan:suppressions` → no suppression findings; the gate-scan will print its BLOCKED advisory for validation-surface changes — expected and honest, report it verbatim.
+- [ ] **Step 4:** Confirm test-file changes are append-only: `git diff codex/publish-debug-skill...HEAD -- scripts/pr_closeout_core.test.js scripts/pr_closeout_cli.test.js scripts/pr_closeout_workflow.test.js scripts/pr_closeout_report.test.js scripts/pr_closeout_github.test.js scripts/pr_closeout_process.test.js | grep '^-' | grep -v '^---'` must output nothing (no deleted lines) except the sanctioned require-line extensions (`TOOL_PROBES` joined an existing destructure in `pr_closeout_process.test.js`); report any deletion honestly.
+- [ ] **Step 5:** Report results to the coordinator; the final whole-implementation review follows via the coordinator's standing reviewer.
+
+---
+
+## Spec test-group traceability
+
+| Spec test group | Where |
+|---|---|
+| 1. Strict invariance | Task 1 (default mode), Task 3 (engineChecks/scriptRunner rejected in strict, `pnpm run` output pinned), Task 6 (strict report fields), Task 7 (whole unmodified suite green) |
+| 2. Engine matrix validation | Task 2 (schema), Task 3 (BLOCKED-empty plans, forbidden `commands`, distrust pipeline, scriptRunner) |
+| 3. Invariant preservation | Task 6 (engine full-run: suppression ⇒ FAIL over a green custom matrix; provisional report carries mode — pinned empirically via `written[0]` in commit 5aecdf2). Qualification short-circuit, env allowlist, and output-dir checks are mode-independent code paths this plan does not touch — their existing tests, passing unmodified (Task 7), are the evidence; re-running them "under engine mode" would exercise identical code. |
+| 4. Labeling | Task 6 (report `mode`/`matrixSource`, markdown banner, provisional report) |
+| 5. Digest binding | Task 4 (mode in digest input, schemaVersion 3, strict≠engine digests, matrix edit changes digest). The spec's "named mode-mismatch error" is delivered mechanically: mode-crossed attestations can no longer digest-match, so admission rejects them through the existing digest-mismatch evidence, and the mode is visible in the plan admission block and report fields. Recorded as an execution decision to sync into the spec. |
+| 6. Plan admission block | Task 5 + fix round (four-state attestation present/weakened/absent/unavailable with the `reason: 'unavailable'` reader discriminator; cleanTree; preflight — all failure-proof; engine `requiredTools` probe-set selection with strict passing no filter) |
+| 7. Regression battery | Task 7 |
+
+Plan-level decisions to sync into the spec during execution (coordinator): `scriptRunner` config key (engine-only, validated, default `npm run`); digest-mismatch as the mode-mismatch mechanism; inline `timeoutMs` winning over `config.timeoutsMs` for engine ids.

@@ -9,8 +9,10 @@ const {
   defaultOutputDir,
   evaluateOverallStatus,
   isSameLockIdentity,
+  mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  resolvePlanAdmission,
   runCloseoutWorkflow,
 } = require('./pr_closeout_workflow');
 
@@ -1491,4 +1493,357 @@ test('seals ignored generated output paths after all checks', async () => {
   for (const extraPaths of fingerprintCalls) {
     assert.deepEqual(extraPaths, ['node_modules/.prisma', 'node_modules/@prisma/client', 'generated/client']);
   }
+});
+
+test('config.mode is rejected before any repository work — mode comes only from the invocation', async () => {
+  await assert.rejects(
+    () => runCloseoutWorkflow({
+      repo: process.cwd(),
+      baseRef: 'origin/main',
+      config: { mode: 'engine' },
+      planOnly: true,
+      dependencies: {
+        resolveRepositoryState: async () => { throw new Error('must not be called'); },
+      },
+    }),
+    /mode cannot be set from config/,
+  );
+});
+
+const planDeps = (digests) => ({
+  resolveRepositoryState: async ({ repo, baseRef }) => ({
+    repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+  }),
+  readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+  digestValidationConfig: (value) => {
+    digests.push(value);
+    return `digest-${digests.length}`;
+  },
+  // Task 5's admission block now runs unconditionally in plan mode; fake
+  // these three so this digest-focused test doesn't pay for a real `gh`
+  // round trip (and its 60s execFile timeout) on every invocation.
+  readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+  cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+  runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+});
+
+test('the validation-config digest binds the mode (schemaVersion 3)', async () => {
+  const digests = [];
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: planDeps(digests),
+  });
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] },
+    dependencies: planDeps(digests),
+  });
+  assert.equal(digests[0].schemaVersion, 3);
+  assert.equal(digests[0].mode, 'strict');
+  assert.equal(digests[1].mode, 'engine');
+});
+
+test('strict and engine digests differ even for identical config bytes, and a matrix edit changes the engine digest', async () => {
+  const { digestValidationConfig } = require('./pr_closeout_git');
+  const realDeps = () => ({
+    resolveRepositoryState: async ({ repo, baseRef }) => ({
+      repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+    }),
+    readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+    digestValidationConfig,
+    // Same reasoning as planDeps above: avoid a real `gh` round trip per
+    // invocation now that plan mode resolves admission unconditionally.
+    readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+    cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+    runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+  });
+  const strictPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {}, dependencies: realDeps(),
+  });
+  const enginePlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test' }] }, dependencies: realDeps(),
+  });
+  const editedPlan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'cargo test --all' }] }, dependencies: realDeps(),
+  });
+  assert.notEqual(strictPlan.configDigest, enginePlan.configDigest);
+  assert.notEqual(enginePlan.configDigest, editedPlan.configDigest);
+  assert.equal(strictPlan.mode, 'strict');
+  assert.equal(enginePlan.mode, 'engine');
+});
+
+test('mergeEngineTimeouts lets inline engine timeouts win over config.timeoutsMs', () => {
+  assert.deepEqual(
+    mergeEngineTimeouts({ unit: 5000, lint: 7000 }, [
+      { id: 'unit', timeoutMs: 9000 },
+      { id: 'style' },
+    ]),
+    { unit: 9000, lint: 7000 },
+  );
+  assert.deepEqual(mergeEngineTimeouts(undefined, [{ id: 'a', timeoutMs: 100 }]), { a: 100 });
+  assert.deepEqual(mergeEngineTimeouts({ a: 1 }, []), { a: 1 });
+});
+
+test('resolvePlanAdmission reports present, absent, and unavailable attestation states plus tree and preflight readiness', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested by reviewer' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: { git: '2.45' } }),
+    },
+  };
+  const present = await resolvePlanAdmission(base);
+  assert.equal(present.attestation.status, 'present');
+  assert.equal(present.cleanTree.status, 'PASS');
+  assert.equal(present.preflight.status, 'PASS');
+
+  const absent = await resolvePlanAdmission({
+    ...base,
+    d: { ...base.d, readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }) },
+  });
+  assert.equal(absent.attestation.status, 'absent');
+  assert.match(absent.attestation.evidence, /no matching attestation/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => { throw new Error('gh: not logged in'); },
+      runPreflight: async () => { throw new Error('probe crashed'); },
+      cleanTreeStatus: async () => { throw new Error('git unavailable'); },
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /gh: not logged in/);
+  // A dirty/throwing tree blocks preflight before any probe runs: preflight
+  // reports the unclean tree, not the probe crash, because cleanTreeStatus did
+  // not resolve to PASS (mirrors the full-gate precondition).
+  assert.equal(unavailable.preflight.status, 'BLOCKED');
+  assert.match(unavailable.preflight.evidence, /working tree was not clean/);
+  assert.equal(unavailable.cleanTree.status, 'BLOCKED');
+  assert.match(unavailable.cleanTree.evidence, /git unavailable/);
+});
+
+test('resolvePlanAdmission does not run preflight probes when the working tree is dirty', async () => {
+  // Regression guard for the plan-mode clean-tree precondition: a dirty tree
+  // must short-circuit preflight (no spawned binaries, no service probes) just
+  // like runCloseoutWorkflowBody. runPreflight is a sentinel that throws if it
+  // is ever invoked on a non-PASS tree.
+  let preflightCalled = false;
+  const result = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'BLOCKED', evidence: 'uncommitted changes present' }),
+      runPreflight: async () => { preflightCalled = true; return { status: 'PASS' }; },
+    },
+  });
+  assert.equal(preflightCalled, false);
+  assert.equal(result.cleanTree.status, 'BLOCKED');
+  assert.equal(result.preflight.status, 'BLOCKED');
+  assert.match(result.preflight.evidence, /working tree was not clean/);
+  assert.match(result.preflight.evidence, /uncommitted changes present/);
+
+  // And preflight still runs (and surfaces its own failure) on a clean tree.
+  const cleanTreeResult = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => { throw new Error('probe crashed'); },
+    },
+  });
+  assert.equal(cleanTreeResult.preflight.status, 'BLOCKED');
+  assert.match(cleanTreeResult.preflight.evidence, /probe crashed/);
+});
+
+test('planOnly output carries the admission block', async () => {
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-a',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  });
+  assert.equal(plan.admission.attestation.status, 'absent');
+  assert.equal(plan.admission.cleanTree.status, 'PASS');
+  assert.equal(plan.admission.preflight.status, 'PASS');
+});
+
+test('resolvePlanAdmission distinguishes weakened and unavailable from absent', async () => {
+  const base = {
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'FAIL', evidence: 'decision recorded as weakened' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  };
+  const weakened = await resolvePlanAdmission(base);
+  assert.equal(weakened.attestation.status, 'weakened');
+  assert.match(weakened.attestation.evidence, /weakened/);
+
+  const unavailable = await resolvePlanAdmission({
+    ...base,
+    d: {
+      ...base.d,
+      readLiveGateAttestation: async () => ({
+        status: 'BLOCKED',
+        reason: 'unavailable',
+        evidence: 'Live GitHub gate attestation was unavailable: gh: command not found',
+      }),
+    },
+  });
+  assert.equal(unavailable.attestation.status, 'unavailable');
+  assert.match(unavailable.attestation.evidence, /unavailable/);
+});
+
+test('engine-mode preflight probes exactly git, node, and declared requiredTools', async () => {
+  // Reuse this branch's planDeps-style fixture; only runPreflight differs.
+  let captured = 'not-called';
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['make'] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-tools',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.notEqual(plan.planStatus, 'FAIL');
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node', 'make']);
+  assert.ok(captured.every(([, command]) => typeof command === 'string' && command.length > 0));
+});
+
+test('engine mode without requiredTools probes only git and node', async () => {
+  let captured = 'not-called';
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-default',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.deepEqual(captured.map(([name]) => name), ['git', 'node']);
+});
+
+test('strict mode passes no toolProbes filter to preflight', async () => {
+  let captured = 'sentinel';
+  await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, config: {},
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-strict-tools',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async (options) => { captured = options.toolProbes; return { status: 'PASS', checks: [], toolVersions: {} }; },
+    },
+  });
+  assert.equal(captured, undefined);
+});
+
+test('unknown requiredTools names are a named config error and the plan fails closed', async () => {
+  const plan = await runCloseoutWorkflow({
+    repo: process.cwd(), baseRef: 'origin/main', planOnly: true, mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', command: 'echo lint' }], requiredTools: ['blender'] },
+    dependencies: {
+      resolveRepositoryState: async ({ repo, baseRef }) => ({
+        repo, baseRef, baseSha: 'basesha000', headSha: 'headsha000', mergeBaseSha: 'mergebase000', touchedFiles: [],
+      }),
+      readProjectMetadata: async () => ({ packageScripts: {}, makeTargets: [], makeRecipes: {} }),
+      digestValidationConfig: () => 'digest-engine-unknown-tool',
+      readLiveGateAttestation: async () => ({ status: 'BLOCKED', evidence: 'no matching attestation' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+    },
+  });
+  assert.equal(plan.planStatus, 'FAIL');
+  assert.match(
+    plan.errors.join('\n'),
+    /requiredTools\[0\] names unknown preflight probe "blender"/,
+  );
+  assert.match(plan.errors.join('\n'), /Known probes:/);
+});
+
+test('a strict full run labels its report mode strict with no matrix source', async () => {
+  const fixture = makeDependencies();
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    config: reviewedConfig(),
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.mode, 'strict');
+  assert.equal(result.report.matrixSource, null);
+  // The provisional (first) write must already name its tier — a crashed
+  // run's on-disk report can never masquerade as the other mode.
+  assert.equal(fixture.written[0].mode, 'strict');
+  assert.equal(fixture.written[0].matrixSource, null);
+});
+
+test('engine mode full run: a suppression finding auto-FAILs even an all-green custom matrix, and the report names its tier', async () => {
+  // Spec test-group 3: suppression auto-FAIL must override an otherwise
+  // all-green repo-defined matrix, and the report must still say which tier
+  // (engine, not strict) produced it. Reuse makeDependencies' full set of
+  // admission/attestation/execute fakes wholesale (mode-agnostic — the
+  // workflow calls readLiveGateAttestation, cleanTreeStatus, runPreflight,
+  // readGateChanges, scanTouchedSuppressions, and execute the same way
+  // regardless of mode) and inject one finding via the already-supported
+  // finalFindings hook, which lands as the post-attestation rescan result.
+  const fixture = makeDependencies({
+    finalFindings: [{
+      file: 'src/a.ts',
+      line: 12,
+      category: 'suppression',
+      // Neutral placeholder, matching the fixture idiom at the rescan test
+      // above — a literal suppression marker here would trip the repo's own
+      // touched-file scanner on this test file.
+      match: 'forbidden',
+    }],
+  });
+  const result = await runCloseoutWorkflow({
+    repo: 'C:/repo',
+    baseRef: 'origin/main',
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'unit', command: 'echo ok' }] },
+    outputDir: 'C:/evidence',
+    dependencies: fixture.dependencies,
+  });
+  assert.equal(result.report.overallStatus, 'FAIL');
+  assert.equal(result.report.mode, 'engine');
+  // Spec test-group 4 read strictly: the engine RUN's report.json carries the
+  // exact matrixSource provenance block, and the provisional (first) write
+  // already carries both labeling fields by construction.
+  assert.deepEqual(result.report.matrixSource, {
+    source: 'config.engineChecks',
+    digest: '__TEST_DIGEST__',
+    checkCount: 1,
+  });
+  assert.equal(fixture.written[0].mode, 'engine');
+  assert.deepEqual(fixture.written[0].matrixSource, result.report.matrixSource);
 });

@@ -7,6 +7,7 @@ const {
   classifyOutput,
   findCommandFailureNeutralizer,
   scanSuppressionText,
+  validateEngineChecks,
 } = require('./pr_closeout_core');
 
 const EXPECTED_IDS = [
@@ -2126,4 +2127,519 @@ test('blocks fixed Make checks whose recipe neutralizes failure', () => {
     assert.notEqual(check.status, 'BLOCKED', JSON.stringify(check));
     assert.equal(check.resolution, 'fixed');
   }
+});
+
+test('validateEngineChecks normalizes a valid matrix', () => {
+  const defs = validateEngineChecks([
+    { id: 'unit', command: 'cargo test' },
+    { id: 'lint', label: 'Lint', scripts: ['lint', 'lint:all'], baselineSafe: true, timeoutMs: 60000 },
+  ]);
+  assert.deepEqual(defs[0], {
+    id: 'unit', label: 'unit', command: 'cargo test', baselineSafe: false, generator: false, engine: true,
+  });
+  assert.deepEqual(defs[1], {
+    id: 'lint', label: 'Lint', packageCandidates: ['lint', 'lint:all'], baselineSafe: true, generator: false, timeoutMs: 60000, engine: true,
+  });
+});
+
+test('validateEngineChecks fails closed on every malformed shape', () => {
+  assert.throws(() => validateEngineChecks(undefined), /non-empty array/);
+  assert.throws(() => validateEngineChecks([]), /non-empty array/);
+  assert.throws(() => validateEngineChecks(['x']), /must be an object/);
+  assert.throws(() => validateEngineChecks([{ command: 'x' }]), /non-empty string id/);
+  assert.throws(() => validateEngineChecks([{ id: ' padded ', command: 'x' }]), /leading or trailing whitespace/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x' }, { id: 'a', command: 'y' }]), /unique/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', fixed: true }]), /unknown field "fixed"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a' }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', scripts: ['y'] }]), /exactly one of "command" or "scripts"/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: '   ' }]), /command must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: [] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', scripts: ['ok', 42] }]), /non-empty array of non-empty script names/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', label: '' }]), /label must be a non-empty string/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', baselineSafe: 'yes' }]), /baselineSafe must be a boolean/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 0 }]), /timeoutMs must be a positive integer/);
+  assert.throws(() => validateEngineChecks([{ id: 'a', command: 'x', timeoutMs: 1.5 }]), /timeoutMs must be a positive integer/);
+});
+
+test('validateEngineChecks hardening: id charset, prototype collisions, timer bound, read-once fields', () => {
+  for (const id of ['bad\nid', 'a\tb', '.dot-start', '-dash-start', 'sp ace', '__proto__']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /must start alphanumeric|collides with an Object\.prototype member/,
+    );
+  }
+  for (const id of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.throws(
+      () => validateEngineChecks([{ id, command: 'x' }]),
+      /collides with an Object\.prototype member/,
+    );
+  }
+  assert.equal(validateEngineChecks([{ id: 'ok.check_1-x', command: 'x' }])[0].id, 'ok.check_1-x');
+  assert.throws(
+    () => validateEngineChecks([{ id: 'big', command: 'x', timeoutMs: 2147483648 }]),
+    /no greater than 2147483647/,
+  );
+  // Read-once: a getter that swaps its value after the first read cannot
+  // sneak a different command past validation into the emitted definition.
+  let reads = 0;
+  const swapped = validateEngineChecks([{
+    id: 'g1',
+    get command() { reads += 1; return reads === 1 ? 'safe command' : 'npm test || true'; },
+  }])[0];
+  assert.equal(swapped.command, 'safe command');
+  const scriptsSource = ['ok'];
+  const proxied = validateEngineChecks([new Proxy({ id: 'p1', scripts: scriptsSource }, {
+    get(target, property) {
+      if (property === 'scripts') return [...scriptsSource];
+      return target[property];
+    },
+  })])[0];
+  assert.deepEqual(proxied.packageCandidates, ['ok']);
+});
+
+test('strict mode rejects engine-only config keys as weakening attempts, never ignores them', () => {
+  const withMatrix = buildCheckPlan({ config: { engineChecks: [{ id: 'a', command: 'x' }] } });
+  assert.match(withMatrix.errors.join('\n'), /engineChecks is only valid with --mode engine/);
+  const withRunner = buildCheckPlan({ config: { scriptRunner: 'npm run' } });
+  assert.match(withRunner.errors.join('\n'), /scriptRunner is only valid with --mode engine/);
+  // The strict matrix itself still resolves; the error rides alongside.
+  assert.equal(withMatrix.checks.length, MANDATORY_CHECKS.length);
+});
+
+test('engine mode resolves inline commands and script discovery through the shared pipeline', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'unit', command: 'cargo test --workspace' },
+        { id: 'lint', scripts: ['lint:ci', 'lint'] },
+        { id: 'ghost', scripts: ['does-not-exist'] },
+      ],
+    },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.deepEqual(plan.errors, []);
+  assert.deepEqual(plan.checks.map(({ id }) => id), ['unit', 'lint', 'ghost']);
+  const unit = plan.checks.find(({ id }) => id === 'unit');
+  assert.equal(unit.command, 'cargo test --workspace');
+  assert.equal(unit.resolution, 'engine-command');
+  assert.equal(unit.status, undefined);
+  const lint = plan.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.command, 'npm run lint');
+  assert.equal(lint.resolution, 'package-script');
+  const ghost = plan.checks.find(({ id }) => id === 'ghost');
+  assert.equal(ghost.status, 'BLOCKED');
+  assert.equal(ghost.resolution, 'unresolved');
+});
+
+test('engine mode never trusts user-supplied commands: placeholder, neutralizer, and make-recipe validation', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'todo', command: '<replace me>' },
+        { id: 'hidden', command: 'npm test || true' },
+        { id: 'uncaptured', command: 'make smoke' },
+        { id: 'neutralized', command: 'make lie' },
+      ],
+    },
+    makeRecipes: { lie: '-npm test' },
+  });
+  assert.equal(plan.checks.find(({ id }) => id === 'todo').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'todo').evidence, /placeholder/i);
+  assert.equal(plan.checks.find(({ id }) => id === 'hidden').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'hidden').evidence, /neutralizes failures/);
+  assert.equal(plan.checks.find(({ id }) => id === 'uncaptured').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'uncaptured').evidence, /No recipe text was captured/);
+  assert.equal(plan.checks.find(({ id }) => id === 'neutralized').status, 'BLOCKED');
+  assert.match(plan.checks.find(({ id }) => id === 'neutralized').evidence, /neutralizes failures/);
+});
+
+test('engine mode fails closed at the matrix level: invalid matrix or forbidden keys yield BLOCKED-empty plans', () => {
+  const invalid = buildCheckPlan({ mode: 'engine', config: { engineChecks: [{ id: 'a' }] } });
+  assert.deepEqual(invalid.checks, []);
+  assert.match(invalid.errors.join('\n'), /exactly one of "command" or "scripts"/);
+  const missing = buildCheckPlan({ mode: 'engine', config: {} });
+  assert.deepEqual(missing.checks, []);
+  assert.match(missing.errors.join('\n'), /non-empty array/);
+  const withCommands = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'a', command: 'x' }], commands: { a: 'y' } },
+  });
+  assert.match(withCommands.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const badMode = buildCheckPlan({ mode: 'lenient' });
+  assert.deepEqual(badMode.checks, []);
+  assert.match(badMode.errors.join('\n'), /Unknown closeout mode/);
+});
+
+test('engine scriptRunner is validated and applied; strict package-script output is untouched', () => {
+  const custom = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(custom.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run || true &&' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(neutralizing.errors.join('\n'), /scriptRunner neutralizes failures/);
+  const multiline = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\nrun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(multiline.errors.join('\n'), /single-line non-empty string/);
+  // Strict path still emits pnpm run — byte-identical to today.
+  const strict = buildCheckPlan({ packageScripts: { typecheck: 'tsc --noEmit' } });
+  assert.equal(strict.checks.find(({ id }) => id === 'typecheck').command, 'pnpm run typecheck');
+});
+
+test('engine mode validates voluntarily attached proofs at plan time; strict proof behavior unchanged', () => {
+  const badShape = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '' } },
+    },
+  });
+  assert.equal(badShape.checks.find(({ id }) => id === 'render').status, 'BLOCKED');
+  assert.match(badShape.checks.find(({ id }) => id === 'render').evidence, /proof/i);
+  const escaping = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: '../outside.json' } },
+    },
+  });
+  assert.match(escaping.checks.find(({ id }) => id === 'render').evidence, /relative worktree path without ".."/);
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'artifact', path: 'artifacts/render.json' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+  assert.deepEqual(good.checks.find(({ id }) => id === 'render').proof, { type: 'artifact', path: 'artifacts/render.json' });
+});
+
+test('engine mode never consults a smuggled config.commands entry: the map is structurally dead, not just error-flagged', () => {
+  const smuggled = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], commands: { lint: 'make lie' } },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(smuggled.errors.join('\n'), /config\.commands is not accepted in engine mode/);
+  const lint = smuggled.checks.find(({ id }) => id === 'lint');
+  assert.equal(lint.resolution, 'package-script');
+  assert.equal(lint.command, 'npm run lint');
+});
+
+test('engine-command make gate blocks every non-bare-make dodge shape on the resolved command', () => {
+  const makeRecipes = { lie: '-npm test', good: 'npm test' };
+  const dodges = [
+    'make lie && true',
+    'make -s lie',
+    'env make lie',
+    'cd x && make lie',
+    'make lie MYVAR=1',
+    '/usr/bin/make lie',
+    'make lie&&echo ok',
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map((command, index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, command] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+    assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  }
+  const pureLie = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-lie', command: 'make lie' }] },
+    makeRecipes,
+  });
+  const lieCheck = pureLie.checks.find(({ id }) => id === 'pure-lie');
+  assert.equal(lieCheck.status, 'BLOCKED');
+  assert.match(lieCheck.evidence, /neutralizes failures/);
+  const pureGood = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'pure-good', command: 'make good' }] },
+    makeRecipes,
+  });
+  const goodCheck = pureGood.checks.find(({ id }) => id === 'pure-good');
+  assert.equal(goodCheck.status, undefined);
+  assert.equal(goodCheck.command, 'make good');
+  const notGated = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake build' },
+        { id: 'make-docs', command: 'make-docs generate' },
+      ],
+    },
+    makeRecipes,
+  });
+  assert.equal(notGated.checks.find(({ id }) => id === 'cmake-build').status, undefined);
+  assert.equal(notGated.checks.find(({ id }) => id === 'make-docs').status, undefined);
+});
+
+test('engine package-script branch runs the resolved command through the same make gate', () => {
+  const pure = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const pureCheck = pure.checks.find(({ id }) => id === 'lint');
+  assert.equal(pureCheck.command, 'make lint');
+  assert.equal(pureCheck.status, 'BLOCKED');
+  assert.match(pureCheck.evidence, /neutralizes failures/);
+  const wrapped = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'nice -n 19 make' },
+    packageScripts: { lint: 'eslint .' },
+    makeRecipes: { lint: '-eslint .' },
+  });
+  const wrappedCheck = wrapped.checks.find(({ id }) => id === 'lint');
+  assert.equal(wrappedCheck.status, 'BLOCKED');
+  assert.match(wrappedCheck.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  // Strict path with the same packageScripts is unchanged: still pnpm run, ungated
+  // (a strict def is never `engine`, so the gate never runs for it, no matter
+  // what makeRecipes contains).
+  const strict = buildCheckPlan({
+    packageScripts: { typecheck: 'tsc --noEmit' },
+    makeRecipes: { typecheck: '-tsc --noEmit' },
+  });
+  const strictCheck = strict.checks.find(({ id }) => id === 'typecheck');
+  assert.equal(strictCheck.command, 'pnpm run typecheck');
+  assert.equal(strictCheck.status, undefined);
+});
+
+test('engine command proofs get strict parity: neutralizer and literal-policy validation at plan time', () => {
+  const neutralizing = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh || true', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const neutralizingCheck = neutralizing.checks.find(({ id }) => id === 'render');
+  assert.equal(neutralizingCheck.status, 'BLOCKED');
+  assert.match(neutralizingCheck.evidence, /Postcondition proof command for .* neutralizes failures \(\|\| true\)\./);
+  const anyPattern = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'anything-at-all' } },
+    },
+  });
+  assert.match(
+    anyPattern.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const emptyLiteral = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:' } },
+    },
+  });
+  assert.match(
+    emptyLiteral.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  const goodCheck = good.checks.find(({ id }) => id === 'render');
+  assert.equal(goodCheck.status, undefined);
+  assert.deepEqual(goodCheck.proof, { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' });
+});
+
+test('scriptRunner rejects tabs and quote characters, not just newlines', () => {
+  const tabForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm\trun' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(tabForm.errors.join('\n'), /single-line non-empty string/);
+  const doubleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'npm run "x"' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(doubleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  const singleQuoteForm = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: "npm run 'x'" },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.match(singleQuoteForm.errors.join('\n'), /single-line non-empty string/);
+  // Existing valid runners are unaffected.
+  const valid = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'lint', scripts: ['lint'] }], scriptRunner: 'pnpm run' },
+    packageScripts: { lint: 'eslint .' },
+  });
+  assert.equal(valid.checks.find(({ id }) => id === 'lint').command, 'pnpm run lint');
+});
+
+test('engine make gate blocks shell-quoting/substitution dodges and make aliases (measured fix)', () => {
+  // Clean recipe: every dodge below must block on SHAPE (it never reaches
+  // the pure `make <target>` branch), not on recipe content.
+  const makeRecipes = { lie: 'npm test' };
+  const dodges = [
+    ['backtick-wrapped', '`make lie`'],
+    ['double-quoted make', '"make" lie'],
+    ['single-quoted make', "'make' lie"],
+    ['bash -c double-quoted', 'bash -c "make lie"'],
+    ['sh -c single-quoted', "sh -c 'make lie'"],
+    ['eval double-quoted', 'eval "make lie"'],
+    ['brace group', '{make lie;}'],
+    ['assignment + backtick substitution', 'x=`make lie`'],
+    ['gmake alias', 'gmake lie'],
+    ['make.exe alias', 'make.exe lie'],
+    ['mingw32-make alias', 'mingw32-make lie'],
+    ['pathed .exe alias', '/usr/bin/make.exe lie'],
+  ];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: dodges.map(([, command], index) => ({ id: `dodge${index}`, command })),
+    },
+    makeRecipes,
+  });
+  for (const [index, [name, command]] of dodges.entries()) {
+    const check = plan.checks.find(({ id }) => id === `dodge${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for ${name}: "${command}"`);
+    assert.match(
+      check.evidence,
+      /wraps or argument-extends make and cannot be admitted uninspected/,
+      `expected wrap-form evidence for ${name}: "${command}"`,
+    );
+  }
+});
+
+test('original make-gate dodge corpus remains BLOCKED after the alias/quoting fix (spot-check)', () => {
+  const makeRecipes = { lie: '-npm test' };
+  const spotChecks = ['make lie && true', '/usr/bin/make lie', 'cd x && make lie'];
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: spotChecks.map((command, index) => ({ id: `orig${index}`, command })) },
+    makeRecipes,
+  });
+  for (const [index, command] of spotChecks.entries()) {
+    const check = plan.checks.find(({ id }) => id === `orig${index}`);
+    assert.equal(check.status, 'BLOCKED', `expected BLOCKED for "${command}"`);
+  }
+});
+
+test('make gate false-positive guards remain clean: cmake, make-docs, make.js, a makerelease script', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [
+        { id: 'cmake-build', command: 'cmake --build .' },
+        { id: 'make-docs', command: 'make-docs build' },
+        { id: 'node-make-js', command: 'node make.js' },
+        { id: 'makerelease-script', command: './scripts/makerelease.sh' },
+      ],
+    },
+  });
+  for (const id of ['cmake-build', 'make-docs', 'node-make-js', 'makerelease-script']) {
+    assert.equal(plan.checks.find((check) => check.id === id).status, undefined, `expected ${id} to resolve cleanly`);
+  }
+});
+
+test('gmake alias is blocked as wrap-form, not treated as a pure recipe-inspectable target', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'gm', command: 'gmake lint' }] },
+    // Recipe is clean: if the pure-form regex mistakenly matched `gmake
+    // lint`, this would resolve PASS-eligible instead of BLOCKED.
+    makeRecipes: { lint: 'eslint .' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'gm');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(check.evidence, /wraps or argument-extends make and cannot be admitted uninspected/);
+  assert.doesNotMatch(check.evidence, /neutralizes failures/);
+  assert.doesNotMatch(check.evidence, /No recipe text was captured/);
+});
+
+test('engine command proof literal-policy parity: bounded length and no control characters', () => {
+  const tooLong = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: `literal:${'z'.repeat(300)}` } },
+    },
+  });
+  assert.match(
+    tooLong.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const controlChar = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:a\tb' } },
+    },
+  });
+  assert.match(
+    controlChar.checks.find(({ id }) => id === 'render').evidence,
+    /must be a literal: policy with a non-empty value/,
+  );
+  const good = buildCheckPlan({
+    mode: 'engine',
+    config: {
+      engineChecks: [{ id: 'render', command: 'node render.js' }],
+      proofs: { render: { type: 'command', command: 'check.sh', expectedPattern: 'literal:ok' } },
+    },
+  });
+  assert.equal(good.checks.find(({ id }) => id === 'render').status, undefined);
+});
+
+test('make-gate wrap-form evidence includes an actionable hint for a package script literally named "make"', () => {
+  const plan = buildCheckPlan({
+    mode: 'engine',
+    config: { engineChecks: [{ id: 'make-script', scripts: ['make'] }] },
+    packageScripts: { make: 'echo building' },
+  });
+  const check = plan.checks.find(({ id }) => id === 'make-script');
+  assert.equal(check.status, 'BLOCKED');
+  assert.match(
+    check.evidence,
+    /If this is a package script named "make", rename the script; if "make" here is a bare argument/,
+  );
+});
+
+test('make-gate alias matching is case-insensitive: Windows/macOS spellings cannot dodge inspection', () => {
+  const makeRecipes = { lie: '-npm test' };
+  for (const command of ['MAKE lie', 'Make lie', 'GMAKE lie', 'MAKE.EXE lie', 'Make.Exe lie', 'C:\\tools\\NMAKE.exe lie']) {
+    const plan = buildCheckPlan({
+      mode: 'engine',
+      config: { engineChecks: [{ id: 'm1', command }] },
+      makeRecipes,
+    });
+    assert.equal(plan.checks.find(({ id }) => id === 'm1').status, 'BLOCKED', command);
+  }
+});
+
+test('requiredTools in a strict-mode config is a hard error naming the key', () => {
+  // Same mechanism and test shape as the existing scriptRunner-in-strict rejection test.
+  const withRequiredTools = buildCheckPlan({ config: { requiredTools: ['make'] } });
+  assert.match(withRequiredTools.errors.join('\n'), /requiredTools is only valid with --mode engine/);
+  // The strict matrix itself still resolves; the error rides alongside.
+  assert.equal(withRequiredTools.checks.length, MANDATORY_CHECKS.length);
 });
