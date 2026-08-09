@@ -8,6 +8,10 @@ permissions:
   contents: read
   pull-requests: read
   checks: read
+  # statuses: read covers legacy commit-status contexts (StatusContext) in the
+  # statusCheckRollup the preview's readLivePrState classifies — mirrors the
+  # gate workflow (Codex 3745211664).
+  statuses: read
 
 concurrency:
   group: closeout-preview-${{ github.ref }}

@@ -301,9 +301,46 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
     'an explicit ? uses key without a dash must be flagged');
   assert.equal(findUnpinnedUses('steps:\n  - ? "uses"\n    : owner/action@main\n').length, 1,
     'an explicit ? "uses" quoted key must be flagged');
+  // The escape-obfuscated variant: `- ? "u\u0073es"` (js-yaml verified to
+  // resolve to {uses: ...}). EXPLICIT_USES_KEY matches only the literal
+  // spelling; the decode check catches the escape form fail-closed.
+  assert.equal(findUnpinnedUses('steps:\n  - ? "u\\u0073es"\n    : owner/action@main\n').length, 1,
+    'an escape-obfuscated explicit ? "u\\u0073es" key must be flagged');
   // A `? name` explicit key for a NON-uses property must not be flagged.
   assert.equal(findUnpinnedUses('steps:\n  - ? name\n    : build\n').length, 0,
     'an explicit ? key for a non-uses property is not flagged');
+});
+
+test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {
+  // Git object IDs are case-insensitive hexadecimal; a SHA may contain A-F.
+  // The lowercase-only PINNED_REF falsely flagged valid immutable pins like
+  // actions/checkout@DF4CB1C... as unpinned. The match is now case-insensitive.
+  assert.deepEqual(findUnpinnedUses('steps:\n  - uses: actions/checkout@DF4CB1C069E1874EDD31B4311F1884172CEC0E10\n'), [],
+    'an uppercase-hex 40-char SHA is a valid pin');
+  assert.deepEqual(findUnpinnedUses('steps:\n  - uses: actions/checkout@Df4Cb1C069e1874edD31b4311f1884172ceC0e10\n'), [],
+    'a mixed-case-hex 40-char SHA is a valid pin');
+  // A non-SHA ref (tag/branch) is still correctly flagged unpinned.
+  assert.equal(findUnpinnedUses('steps:\n  - uses: actions/checkout@v6\n').length, 1,
+    'a tag ref is still flagged unpinned');
+  // A too-short hex string (not 40 chars) is still flagged.
+  assert.equal(findUnpinnedUses('steps:\n  - uses: actions/checkout@ABCDEF\n').length, 1,
+    'a short hex string is not a valid pin');
+});
+
+test('findUnpinnedUses flags flow uses after an apostrophe in a quoted value (Codex #1657)', () => {
+  // The quote-context check previously COUNTED each ' and " char before the
+  // match position. An apostrophe inside a double-quoted value — `name: "can't"`
+  // — inflated the single-quote count to odd, falsely marking a later
+  // `{uses: ...}` as "inside a quoted string" and suppressing the violation.
+  // The scanner now walks the prefix tracking the active quote context, so a
+  // quote char inside the OTHER type's string is ignored.
+  assert.equal(findUnpinnedUses('steps: [{name: "can\'t"}, {uses: owner/action@main}]\n').length, 1,
+    'an apostrophe inside a double-quoted value must not suppress a later flow uses');
+  assert.equal(findUnpinnedUses('steps: [{name: "a\\"b"}, {uses: owner/action@main}]\n').length, 1,
+    'an escaped double-quote inside a double-quoted value must not suppress a later flow uses');
+  // A uses genuinely inside a quoted value is still correctly suppressed.
+  assert.equal(findUnpinnedUses('name: "steps: [{uses: owner/action@main}]"\n').length, 0,
+    'a uses inside a complete double-quoted value is still not flagged');
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {

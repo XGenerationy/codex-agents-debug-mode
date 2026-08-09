@@ -26,6 +26,12 @@ permissions:
   # live-state classifier cannot see check conclusions once an attestation
   # admits the run to final verification.
   checks: read
+  # statuses: read covers the LEGACY commit-status contexts (StatusContext)
+  # that statusCheckRollup can also return — normalizeCheck classifies them
+  # alongside check runs, and a repo with a legacy status context (e.g. an
+  # external CI posting a commit status) would otherwise be unreadable,
+  # leaving the gate BLOCKED on an unavailable rollup (Codex 3745211664).
+  statuses: read
 
 # cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
 # concurrency is evaluated before the job-level if, so a comment-only review

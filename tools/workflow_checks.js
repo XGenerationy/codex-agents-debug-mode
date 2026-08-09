@@ -89,8 +89,13 @@ const decodeDoubleQuotedEscapes = (raw) => String(raw)
 // re-associate the value line, but it does not need to: `? uses` (with the
 // value pending on the next line) is itself proof of a `uses` key whose
 // reference this regex cannot positively pin-check, so it is flagged
-// fail-closed. Optional tag/anchor prefix mirrors SUSPICIOUS_USES.
+// fail-closed. Optional tag/anchor prefix mirrors SUSPICIOUS_USES. The key
+// may be double-quoted AND escape-obfuscated — `- ? "u\u0073es"` (js-yaml
+// verified to resolve to {uses: ...}) — so EXPLICIT_QUOTED_KEY captures the
+// raw quoted text for the same decode check QUOTED_USES_KEY applies. (Single
+// quotes are excluded: no escape processing in YAML single-quoted scalars.)
 const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*$/;
+const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*$/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
@@ -105,7 +110,12 @@ const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:['"]?)(?:run|entrypoint|shell)(?:['"]?)
 // explicit indentation indicator (`|2`), a chomping indicator (`|-`, `|+`),
 // a trailing comment (`| # cmt`), and any order of indentation+chomping.
 const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*(?:&\S+\s+|[!&].*?\s+)*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
-const PINNED_REF = /@[0-9a-f]{40}$/;
+// A pinned action reference: a full 40-character commit SHA. Git object IDs
+// are case-insensitive hexadecimal, so a SHA may contain A-F as well as a-f
+// (GitHub renders them in either case). The match is case-insensitive so a
+// valid immutable pin like actions/checkout@DF4CB1C... is not falsely flagged
+// as unpinned (Codex 3745211652).
+const PINNED_REF = /@[0-9a-fA-F]{40}$/;
 
 /**
  * Returns one violation per `uses:` line whose reference is neither a
@@ -210,6 +220,15 @@ const findUnpinnedUses = (content) => {
       violations.push({ line: index + 1, ref: '(explicit ? uses mapping key — rewrite in clean block style or review manually)' });
       return;
     }
+    // The escape-obfuscated explicit-key variant: `- ? "u\u0073es"` (js-yaml
+    // verified to resolve to {uses: ...}). EXPLICIT_USES_KEY matches only the
+    // literal `uses` spelling; decode the quoted explicit key the same way and
+    // flag fail-closed when it resolves to `uses`.
+    const explicitQuotedMatch = EXPLICIT_QUOTED_KEY.exec(text);
+    if (explicitQuotedMatch && explicitQuotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(explicitQuotedMatch[1]) === 'uses') {
+      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      return;
+    }
     // Any key line that opens a block scalar: start tracking its body so a
     // `uses:` inside the string content is not flagged. Checked after
     // USES_LINE (a uses: key never opens a scalar in valid workflow YAML —
@@ -247,12 +266,34 @@ const findUnpinnedUses = (content) => {
     // `uses:` keys in block style, or rename the env/with key, to clear the flag.
     const suspiciousMatch = SUSPICIOUS_USES.exec(text);
     if (suspiciousMatch) {
+      // Determine whether the match sits inside a quoted YAML scalar. A naive
+      // per-character quote COUNT is wrong when one quote type appears inside a
+      // value quoted with the OTHER type — e.g. `name: "can't"` has an apostrophe
+      // inside a double-quoted string, and counting it as an unmatched single
+      // quote would falsely mark a later `{uses: ...}` as "inside a string"
+      // (Codex 3745211657). Walk the prefix tracking the active quote context:
+      // a quote char only toggles state when it matches the currently-open
+      // quote type (or opens a new context when none is open). Backslash escapes
+      // inside double quotes are respected.
       const beforeMatch = text.substring(0, suspiciousMatch.index);
-      const doubleQuotes = (beforeMatch.match(/"/g) || []).length;
-      const singleQuotes = (beforeMatch.match(/'/g) || []).length;
-      const insideDoubleQuoted = doubleQuotes % 2 === 1;
-      const insideSingleQuoted = singleQuotes % 2 === 1;
-      if (!insideDoubleQuoted && !insideSingleQuoted) {
+      let inDouble = false;
+      let inSingle = false;
+      for (let i = 0; i < beforeMatch.length; i += 1) {
+        const ch = beforeMatch[i];
+        if (inDouble) {
+          if (ch === '\\') { i += 1; } // skip the escaped char
+          else if (ch === '"') inDouble = false;
+        } else if (inSingle) {
+          // YAML single-quoted strings escape a quote by doubling it (''); a
+          // lone ' closes, '' is an escaped literal quote.
+          if (ch === "'") {
+            if (beforeMatch[i + 1] === "'") i += 1; // escaped '' — stay in string
+            else inSingle = false;
+          }
+        } else if (ch === '"') inDouble = true;
+        else if (ch === "'") inSingle = true;
+      }
+      if (!inDouble && !inSingle) {
         violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
       }
     }
