@@ -275,6 +275,18 @@ test('findUnpinnedUses flags an escape-obfuscated quoted uses key (Codex #14)', 
     'a quoted key that does not resolve to uses is not flagged');
   assert.equal(findUnpinnedUses("steps:\n  - 'u\\u0073es': owner/action@main\n").length, 0,
     'single-quoted escapes are literal in YAML and must not be flagged');
+  // The flow-mapping variant: an escape-obfuscated quoted uses key INSIDE a
+  // flow mapping/sequence — `steps: [{"u\u0073es": ref}]` (js-yaml verified to
+  // resolve to {uses: ...}). QUOTED_USES_KEY is anchored to a block line start
+  // and misses this; the FLOW_QUOTED_USES_KEY variant decodes at the flow
+  // boundary and flags it fail-closed.
+  assert.equal(findUnpinnedUses('steps: [{"u\\u0073es": owner/action@main}]\n').length, 1,
+    'an escape-obfuscated quoted uses: inside a flow mapping must be flagged');
+  assert.equal(findUnpinnedUses('jobs: [{name: a}, {"u\\u0073es": owner/action@main}]\n').length, 1,
+    'an escape-obfuscated uses: after a comma in a flow sequence must be flagged');
+  // A non-resolving quoted key in flow context must not be flagged here.
+  assert.equal(findUnpinnedUses('steps: [{"user": not-uses}]\n').length, 0,
+    'a flow-mapping quoted key that does not resolve to uses is not flagged');
 });
 
 test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => {

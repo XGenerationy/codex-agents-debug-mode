@@ -66,6 +66,15 @@ const COMMENT_LINE = /^\s*#/;
 // unicode/hex escape processing (only `''` for a literal quote), so an escape
 // in single quotes stays literal and cannot spell `uses` obliquely.
 const QUOTED_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
+// A double-quoted YAML mapping key INSIDE a flow mapping/sequence — after a
+// `{`, `[`, or `,` boundary (optionally preceded by a key:value pair's value
+// and whitespace). Catches the flow-style escape-obfuscated `uses` key that
+// QUOTED_USES_KEY (anchored to a block-style line start) misses — e.g.
+// `steps: [{"u\u0073es": owner/action@main}]` parses (js-yaml verified) to
+// `{uses: ...}`, a real bypass. The decode check is the same as the block
+// case; only the boundary preceding the quoted key differs. Single quotes
+// are excluded for the same reason as QUOTED_USES_KEY (no escape processing).
+const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
 // Resolve YAML double-quoted escape sequences into the actual characters they
 // denote. YAML double-quoted scalars support \uXXXX (4 hex), \UXXXXXXXX (8
 // hex), \xXX (2 hex), plus named escapes (\n, \t, ...); only the code-point
@@ -175,7 +184,21 @@ const findUnpinnedUses = (content) => {
     // `uses`, flag the line fail-closed (the reference is unparseable by this
     // line-oriented regex because the value may carry its own quoting).
     const quotedMatch = QUOTED_USES_KEY.exec(text);
-    if (quotedMatch && decodeDoubleQuotedEscapes(quotedMatch[1]) === 'uses') {
+    // Only flag when the RAW key differs from its decoded value — a plain
+    // `"uses"` (raw === decoded) is a clean quoted key already caught by
+    // USES_LINE/SUSPICIOUS_USES, so let it fall through. The decode check
+    // exists solely for escape-obfuscated keys (raw `u\u0073es` → `uses`).
+    if (quotedMatch && quotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(quotedMatch[1]) === 'uses') {
+      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      return;
+    }
+    // The flow-mapping variant: an escape-obfuscated quoted uses key inside
+    // `{...}`/`[...]` (e.g. `steps: [{"u\u0073es": ref}]`). QUOTED_USES_KEY is
+    // anchored to a block-style line start and misses this; decode at the flow
+    // boundary the same way. Same raw !== decoded guard so a plain flow
+    // `{"uses": ref}` falls through to SUSPICIOUS_USES.
+    const flowQuotedMatch = FLOW_QUOTED_USES_KEY.exec(text);
+    if (flowQuotedMatch && flowQuotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(flowQuotedMatch[1]) === 'uses') {
       violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
       return;
     }

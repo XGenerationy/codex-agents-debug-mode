@@ -1901,7 +1901,14 @@ const swapClaimAfterCreate = (claimFile, stagedFile) => {
       await new Promise((resolve) => setImmediate(resolve));
     }
   };
-  poll().catch(() => {});
+  // Expose the poll promise so a caller that sets `stopped = true` can AWAIT
+  // the in-flight iteration's completion before reading `state.landed`. A
+  // single `setImmediate` wait is not enough: the poller may be mid-`lstat`
+  // (or mid-`rename`) when `stopped` flips, and that pending operation can
+  // still land the swap AFTER the caller captures `swapped` — leaving the
+  // assertion to pass on a non-decisive attempt. Awaiting `done` guarantees
+  // the poller has observed `stopped` and exited its loop.
+  state.done = poll().catch(() => {});
   return state;
 };
 
@@ -1930,14 +1937,17 @@ const runClaimSwapAttempt = async (plantStaged) => {
     swap = swapClaimAfterCreate(claimFile, stagedFile);
     const result = await launched.outcome;
     const exitAt = Date.now();
-    // Stop the poller BEFORE capturing the landed state, and let any in-flight
-    // poll iteration settle, so `swapped` is the poller's final state — not a
+    // Stop the poller BEFORE capturing the landed state, and AWAIT its
+    // in-flight iteration, so `swapped` is the poller's final state — not a
     // value that could flip to true between the capture here and the finally's
-    // stop (which previously left the stand-in/claim relationship ambiguous
-    // for the caller's verifyStandIn). The child is dead by now (outcome
-    // resolved on exit), so the release has already run.
+    // stop. A single setImmediate is NOT enough: the poller may be mid-lstat
+    // (or mid-rename) when `stopped` flips, and that pending op can land the
+    // swap after `swapped` was captured. Awaiting `swap.done` guarantees the
+    // poller observed `stopped` and exited before we read `state.landed`.
+    // The child is dead by now (outcome resolved on exit), so the release
+    // has already run.
     swap.stopped = true;
-    await new Promise((resolve) => setImmediate(resolve));
+    await swap.done;
     return { projectRoot, debugDir, claimFile, result, swapped: swap.landed, swapAt: swap.swapAt, exitAt, standInContent };
   } catch (error) {
     // On any throw (plantStaged failed, outcome rejected) the caller never
@@ -1952,8 +1962,12 @@ const runClaimSwapAttempt = async (plantStaged) => {
   } finally {
     // Stop the swap poller on every path; left running it would keep lstat-ing
     // a deleted claim path on every setImmediate tick for the rest of the
-    // process (CodeRabbit review).
-    if (swap) swap.stopped = true;
+    // process (CodeRabbit review). Await its completion so the in-flight
+    // iteration finishes before the test ends (Codex 3745151753).
+    if (swap) {
+      swap.stopped = true;
+      await swap.done;
+    }
     stopCli(child);
   }
 };
