@@ -253,6 +253,47 @@ test('findUnpinnedUses flags a tagged/anchored uses key that YAML resolves to a 
     'a clean pinned uses: is unaffected by the tag/anchor handling');
 });
 
+test('findUnpinnedUses flags an escape-obfuscated quoted uses key (Codex #14)', () => {
+  // A YAML double-quoted key spelled with a unicode escape that resolves to
+  // `uses` — `- "u\u0073es": owner/action@main` — parses (verified with
+  // js-yaml) to an ordinary unpinned `{uses: "owner/action@main"}`. Neither
+  // USES_LINE nor SUSPICIOUS_USES match the literal `uses` token (the key is
+  // `u\u0073es`), so the bypass slips through. The scanner now decodes
+  // \uXXXX/\UXXXXXXXX/\xXX escapes in a double-quoted key and flags it
+  // fail-closed when the decoded value is `uses`. (Single-quoted keys are
+  // excluded: YAML single-quoted scalars have no escape processing, so an
+  // escape there stays literal and cannot spell `uses` obliquely.)
+  assert.equal(findUnpinnedUses('steps:\n  - "u\\u0073es": owner/action@main\n').length, 1,
+    '"u\\u0073es": resolves to a uses: key and must be flagged');
+  assert.equal(findUnpinnedUses('steps:\n  - "\\x75ses": owner/action@main\n').length, 1,
+    'a \\xXX hex escape spelling uses must be flagged');
+  assert.equal(findUnpinnedUses('"\\u0075\\u0073\\u0065\\u0073": owner/action@main\n').length, 1,
+    'a fully-escaped uses key must be flagged');
+  // A plain quoted uses: is already caught by USES_LINE (no regression); a
+  // quoted key that does NOT resolve to uses must not be flagged here.
+  assert.equal(findUnpinnedUses('steps:\n  - "user": not-uses\n').length, 0,
+    'a quoted key that does not resolve to uses is not flagged');
+  assert.equal(findUnpinnedUses("steps:\n  - 'u\\u0073es': owner/action@main\n").length, 0,
+    'single-quoted escapes are literal in YAML and must not be flagged');
+});
+
+test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => {
+  // YAML's explicit mapping-key form — `- ? uses` followed by `: ref` on the
+  // next line — parses (verified with js-yaml) to `{uses: "owner/action@main"}`.
+  // The line-oriented scanner cannot re-associate the value line, but the
+  // `? uses` marker alone proves a `uses` key exists whose ref this regex
+  // cannot pin-check, so it is flagged fail-closed.
+  assert.equal(findUnpinnedUses('steps:\n  - ? uses\n    : owner/action@main\n').length, 1,
+    'an explicit ? uses mapping key must be flagged');
+  assert.equal(findUnpinnedUses('jobs:\n  b:\n    steps:\n      ? uses\n      : owner/action@main\n').length, 1,
+    'an explicit ? uses key without a dash must be flagged');
+  assert.equal(findUnpinnedUses('steps:\n  - ? "uses"\n    : owner/action@main\n').length, 1,
+    'an explicit ? "uses" quoted key must be flagged');
+  // A `? name` explicit key for a NON-uses property must not be flagged.
+  assert.equal(findUnpinnedUses('steps:\n  - ? name\n    : build\n').length, 0,
+    'an explicit ? key for a non-uses property is not flagged');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

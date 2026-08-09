@@ -694,16 +694,33 @@ const runSubcommand = async ({
  */
 const writeEvidenceFile = (outputDir, name, content) => {
   const target = path.join(outputDir, name);
+  // A hard link (nlink > 1) to a tracked workspace file reports as a regular
+  // file but shares an inode — a write through it would mutate the workspace
+  // file after the CLI's final seal. Replace it (unlinking removes THIS
+  // directory entry, not the linked target) so the fresh write creates a new
+  // inode owned only by the evidence dir.
+  //
+  // The catch is scoped to ENOENT ONLY: lstatSync throws ENOENT when nothing
+  // exists at the destination (the normal case — the write creates it fresh).
+  // If an unsafe entry IS present, lstatSync succeeds and the conditional
+  // unlinkSync runs; an unlink FAILURE here (EPERM/EACCES/EBUSY, or the entry
+  // being a directory) must NOT be swallowed, because the code would then
+  // fall through to writeFileSync(target) and write THROUGH the still-linked
+  // target — exactly the workspace mutation this function exists to prevent.
+  // Any non-ENOENT error propagates and fails the run step fail-closed.
+  let info;
   try {
-    const info = lstatSync(target);
-    // A hard link (nlink > 1) to a tracked workspace file reports as a regular
-    // file but shares an inode — a write through it would mutate the workspace
-    // file after the CLI's final seal. Replace it (unlinking removes THIS
-    // directory entry, not the linked target) so the fresh write creates a new
-    // inode owned only by the evidence dir.
-    if (info.isSymbolicLink() || !info.isFile() || info.nlink > 1) unlinkSync(target);
-  } catch {
-    // ENOENT: nothing at the destination — the write creates it fresh.
+    info = lstatSync(target);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    info = null;
+  }
+  if (info && (info.isSymbolicLink() || !info.isFile() || info.nlink > 1)) {
+    try {
+      unlinkSync(target);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   }
   writeFileSync(target, content);
 };

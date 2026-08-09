@@ -749,7 +749,7 @@ const DENYLISTED_ENV_NAMES = new Set([
 // Broader than pr_closeout_stream.js's SENSITIVE_ENV_NAME: adds bare KEY,
 // LICENSE, CONFIG (catches KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE→FILE),
 // CREDENTIALS (plural), and _AUTH suffix (catches NPM_CONFIG__AUTH).
-const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONFIG|CONNECTION_STRING|COOKIE|CREDENTIAL|CREDENTIALS|DATABASE_URL|DSN|ENCRYPTION_KEY|FILE|KEY|KUBECONFIG|LICENSE|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTHORIZATION|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONFIG|CONNECTION_STRING|COOKIE|CREDENTIAL|CREDENTIALS|DATABASE_URL|DSN|ENCRYPTION_KEY|FILE|KEY|KUBECONFIG|LICENSE|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
 // Full-run environment: ESSENTIAL_ENV + requiredEnv/safeEnv, minus the runner
 // command-file denylist. Credential-shaped names ARE allowed here because a
@@ -1018,6 +1018,25 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       evidence: `Preflight did not run because the working tree was not clean: ${cleanTree?.evidence}`,
     };
   } else {
+    // Mirror the full-gate seal (runCloseoutWorkflowBody): capture a
+    // working-tree fingerprint BEFORE the probe so a repository-local binary
+    // mutating a GITIGNORED path (node_modules/.bin, generated artifacts, the
+    // prisma client dirs) is caught — cleanTreeStatus respects .gitignore and
+    // would miss such a mutation. The fingerprint folds in the
+    // reproducibilityPaths (config.reproducibilityPaths + the prisma client
+    // dirs) so the same set is observed before and after.
+    const reproducibilityPaths = [...new Set([
+      'node_modules/.prisma',
+      'node_modules/@prisma/client',
+      ...(config.reproducibilityPaths || []),
+    ])];
+    let preProbeFingerprint;
+    try {
+      preProbeFingerprint = await d.workingTreeFingerprint(repo, reproducibilityPaths);
+    } catch (error) {
+      preflight = { status: 'BLOCKED', evidence: `Pre-preflight fingerprint failed: ${error.message}` };
+      return { attestation, cleanTree, preflight };
+    }
     try {
       // Plan probes get the same allowlisted child environment as the full
       // gate (ESSENTIAL_ENV + requiredEnv + safeEnv), not raw process.env:
@@ -1033,11 +1052,21 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     }
     // Recheck the tree after preflight regardless of PASS/FAIL: a probe binary
     // could modify a tracked file even on a failing/throwing exit. A dirty
-    // post-probe tree must BLOCK the preview and surface the dirt.
+    // post-probe tree must BLOCK the preview and surface the dirt. Use BOTH
+    // cleanTreeStatus (catches tracked-file mutations) AND the fingerprint
+    // (catches gitignored-path mutations cleanTreeStatus cannot see).
     try {
       const postProbeTree = await d.cleanTreeStatus(repo);
       if (postProbeTree.status !== 'PASS') {
         preflight = { status: 'BLOCKED', evidence: `Working tree was clean before preflight but dirty after: ${postProbeTree.evidence}` };
+      } else {
+        const postProbeFingerprint = await d.workingTreeFingerprint(repo, reproducibilityPaths);
+        if (postProbeFingerprint !== preProbeFingerprint) {
+          preflight = {
+            status: 'BLOCKED',
+            evidence: `Working tree fingerprint changed during preflight (a gitignored path was mutated): ${postProbeFingerprint}`,
+          };
+        }
       }
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Post-preflight tree check failed: ${error.message}` };

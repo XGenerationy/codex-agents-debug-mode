@@ -379,6 +379,33 @@ test('writeEvidenceFile refuses a hard-linked destination (shared inode)', () =>
   assert.equal(readFs(statePath, 'utf8'), '{"safe":true}\n');
 });
 
+test('writeEvidenceFile fails closed when an unsafe target cannot be unlinked (Codex #3)', () => {
+  // The broad catch formerly swallowed EVERY error from lstatSync/unlinkSync,
+  // so if unlinkSync(target) failed (EPERM/EACCES/EBUSY) on a symlink/hardlink
+  // destination, execution fell through to writeFileSync(target) and wrote
+  // THROUGH the still-linked target — mutating the workspace file this
+  // function exists to protect. The catch is now scoped to ENOENT only: any
+  // other unlink failure propagates and fails the run step.
+  //
+  // Reproduce the unsafe-unlinkable case by planting a DIRECTORY at the
+  // evidence path: lstatSync succeeds (it is not ENOENT), isFile() is false
+  // so the unlink branch runs, and unlinkSync on a non-empty directory throws
+  // EPERM/EISDIR — which must propagate rather than be swallowed.
+  const evidenceDir = makeTempDir();
+  const dirTarget = path.join(evidenceDir, 'action-state.json');
+  mkdirSync(dirTarget, { recursive: true }); // a directory where a file is expected
+  const victim = path.join(evidenceDir, 'workspace-file.txt');
+  writeFs(victim, 'ORIGINAL CONTENT');
+  // The directory is NOT a link to the victim, but the point is the same: an
+  // unsafe entry that cannot be removed must abort, never fall through to a
+  // write that could touch an unintended target.
+  assert.throws(
+    () => writeEvidenceFile(evidenceDir, 'action-state.json', '{"safe":true}\n'),
+    (error) => ['EPERM', 'EISDIR', 'ENOTEMPTY'].includes(error?.code),
+    'a non-ENOENT unlink failure must propagate, not fall through to writeFileSync',
+  );
+});
+
 test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');

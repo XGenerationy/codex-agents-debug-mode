@@ -1640,6 +1640,7 @@ test('resolvePlanAdmission reports present, absent, and unavailable attestation 
       readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested by reviewer' }),
       cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
       runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: { git: '2.45' } }),
+      workingTreeFingerprint: async () => 'fp-stable',
     },
   };
   const present = await resolvePlanAdmission(base);
@@ -1701,10 +1702,34 @@ test('resolvePlanAdmission does not run preflight probes when the working tree i
       readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
       cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
       runPreflight: async () => { throw new Error('probe crashed'); },
+      workingTreeFingerprint: async () => 'fp-stable',
     },
   });
   assert.equal(cleanTreeResult.preflight.status, 'BLOCKED');
   assert.match(cleanTreeResult.preflight.evidence, /probe crashed/);
+});
+
+test('resolvePlanAdmission blocks when a gitignored path is mutated by the probe (Codex #10)', async () => {
+  // cleanTreeStatus respects .gitignore, so a probe mutating a gitignored
+  // path (node_modules/.bin, generated artifacts) is invisible to it. The
+  // post-probe check now also captures a workingTreeFingerprint before and
+  // after the probe and BLOCKs on mismatch, mirroring the full-run seal. A
+  // fingerprint that changes between the two captures proves a gitignored
+  // mutation and must block the preview advertised as read-only.
+  let callCount = 0;
+  const result = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: {} }),
+      // Return a different fingerprint each call — the second (post-probe)
+      // capture differs from the first (pre-probe) capture.
+      workingTreeFingerprint: async () => { callCount += 1; return `fp-${callCount}`; },
+    },
+  });
+  assert.equal(result.preflight.status, 'BLOCKED');
+  assert.match(result.preflight.evidence, /fingerprint changed during preflight/);
 });
 
 test('resolvePlanAdmission passes the allowlisted env to preflight, not raw process.env', async () => {
@@ -1728,6 +1753,7 @@ test('resolvePlanAdmission passes the allowlisted env to preflight, not raw proc
         readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
         cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
         runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
       },
     });
   } finally {
@@ -1738,6 +1764,43 @@ test('resolvePlanAdmission passes the allowlisted env to preflight, not raw proc
   }
   assert.equal(preflightEnv[secretName], undefined, 'ambient env must not reach plan preflight');
   assert.equal(preflightEnv[safeName], 'allowed-value', 'config safeEnv must reach plan preflight');
+});
+
+test('resolvePlanAdmission hard-denies credential-named vars even when safeEnv opts in (Codex #7, CodeRabbit #16)', async () => {
+  // Plan admission runs BEFORE attestation on PR-controlled code, so a
+  // credential-shaped variable must be hard-denied from preflight EVEN IF an
+  // operator (or a compromised config) lists it in safeEnv. Two forms must be
+  // caught: a name the SENSITIVE_ENV_PATTERN already matches (API_TOKEN), and
+  // the AUTHORIZATION gap — `AUTH` in the pattern was anchored with a trailing
+  // `(?:$|_)`, so `AUTHORIZATION` (AUTH + 'O') and `HTTP_AUTHORIZATION` slipped
+  // through. A regression in the plan-preflight sanitizer would let a
+  // repository-local probe read a real bearer token.
+  const credNames = ['API_TOKEN', 'AUTHORIZATION', 'HTTP_AUTHORIZATION'];
+  const previous = Object.fromEntries(credNames.map((name) => [name, process.env[name]]));
+  for (const name of credNames) process.env[name] = 'bearer must-not-reach-probes';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      // A hostile/misconfigured safeEnv tries to opt the credentials in.
+      config: { safeEnv: credNames },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  for (const name of credNames) {
+    assert.equal(preflightEnv[name], undefined,
+      `${name} must be hard-denied from plan preflight even when listed in safeEnv`);
+  }
 });
 
 test('planOnly output carries the admission block', async () => {

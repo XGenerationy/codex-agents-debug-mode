@@ -54,6 +54,34 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 // rather than risk an unpinned-action bypass.
 const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*|,\s*)(?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:/;
 const COMMENT_LINE = /^\s*#/;
+// A double-quoted YAML mapping key at a block-style key position, capturing the
+// raw (escape-laden) key text. Used to catch an obfuscated `uses` key spelled
+// with unicode/hex escapes that YAML resolves to an ordinary `uses` property —
+// e.g. `"u\u0073es": owner/action@main` parses (js-yaml verified) to
+// `{uses: "owner/action@main"}`, a real unpinned-action bypass that neither
+// USES_LINE (its key group requires the literal `uses`) nor SUSPICIOUS_USES
+// (its `['"]?uses['"]?` is also literal) recognizes. The optional tag/anchor
+// prefix mirrors SUSPICIOUS_USES so a tagged/anchored quoted-escape key is also
+// caught. Single quotes are excluded: YAML single-quoted strings have NO
+// unicode/hex escape processing (only `''` for a literal quote), so an escape
+// in single quotes stays literal and cannot spell `uses` obliquely.
+const QUOTED_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
+// Resolve YAML double-quoted escape sequences into the actual characters they
+// denote. YAML double-quoted scalars support \uXXXX (4 hex), \UXXXXXXXX (8
+// hex), \xXX (2 hex), plus named escapes (\n, \t, ...); only the code-point
+// escapes can form characters that spell `uses` obliquely, so decoding those
+// three is sufficient to decide whether a quoted key RESOLVES to `uses`.
+const decodeDoubleQuotedEscapes = (raw) => String(raw)
+  .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+  .replace(/\\U([0-9a-fA-F]{8})/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+  .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
+// YAML explicit mapping-key marker: `? <key>` on its own line, with the value
+// on a following `: <value>` line. The scanner is line-oriented and cannot
+// re-associate the value line, but it does not need to: `? uses` (with the
+// value pending on the next line) is itself proof of a `uses` key whose
+// reference this regex cannot positively pin-check, so it is flagged
+// fail-closed. Optional tag/anchor prefix mirrors SUSPICIOUS_USES.
+const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*$/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
@@ -137,6 +165,26 @@ const findUnpinnedUses = (content) => {
       const ref = match[3];
       if (ref.startsWith('./')) return;
       if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
+      return;
+    }
+    // An obfuscated `uses` key spelled with YAML double-quoted escapes that
+    // resolve to `uses` — e.g. `"u\u0073es": owner/action@main` (js-yaml
+    // verified to parse to {uses: ...}). USES_LINE and SUSPICIOUS_USES match
+    // only the literal `uses` token, so the escape form bypasses them both.
+    // Decode the quoted key's code-point escapes and, if it resolves to
+    // `uses`, flag the line fail-closed (the reference is unparseable by this
+    // line-oriented regex because the value may carry its own quoting).
+    const quotedMatch = QUOTED_USES_KEY.exec(text);
+    if (quotedMatch && decodeDoubleQuotedEscapes(quotedMatch[1]) === 'uses') {
+      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      return;
+    }
+    // An explicit mapping key `? uses` (value on the following `:` line).
+    // The line-oriented scanner cannot re-associate the value, but the marker
+    // alone proves a `uses` key exists whose ref cannot be pin-checked here —
+    // flag fail-closed rather than let an unpinned reference pass unseen.
+    if (EXPLICIT_USES_KEY.test(text)) {
+      violations.push({ line: index + 1, ref: '(explicit ? uses mapping key — rewrite in clean block style or review manually)' });
       return;
     }
     // Any key line that opens a block scalar: start tracking its body so a

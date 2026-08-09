@@ -506,15 +506,16 @@ they are roadmap items, not accepted risk:
   Interim control: re-run the gate via `workflow_dispatch` (or re-push/re-approve to
   fire a covered event) after a base-branch merge that affects an open, already-gated
   PR. A scheduled re-validation sweep is the natural long-term fix.
-- **Runner command-file env vars reach repository-defined validation commands.** In
-  `mode: engine`, the gate CLI's `buildChildEnvironment` passes `GITHUB_PATH`,
-  `GITHUB_ENV`, and `GITHUB_OUTPUT` through to repository-defined commands (they are
-  not credential-shaped, so the sensitive-name filter does not strip them). Those
-  paths live in the isolated `RUNNER_TEMP`/workspace and carry no credentials, but a
-  malicious engine check could write to `GITHUB_PATH`/`GITHUB_ENV` to alter the
-  runner. Stripping these runner-control vars from the child environment is a gate-CLI
-  change (out of this action's scope); until then, treat engine-mode check commands
-  with the same trust discipline as any CI step that shares the runner environment.
+- **Runner command-file env vars are hard-denied from child commands.** The gate
+  CLI's `buildWorkflowEnvironment` (used by both the plan preflight and the
+  attested full run, including `mode: engine`) strips `GITHUB_PATH`,
+  `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`, and `GITHUB_STATE` via
+  `DENYLISTED_ENV_NAMES` before spawning any repository-defined command, so a
+  malicious check cannot write to those files to alter the runner. (`GH_TOKEN`/
+  `GITHUB_TOKEN` are likewise stripped.) Treat engine-mode check commands with
+  the same trust discipline as any CI step that shares the runner environment;
+  this denylist is the action's contribution to that posture, not a substitute
+  for runner hygiene.
 - **Reopening a review thread does not re-trigger the gate.** GitHub fires a
   `pull_request_review_thread` `unresolved` webhook event when a resolved thread
   reopens, but that event is **not** a supported GitHub Actions workflow trigger
