@@ -30,7 +30,14 @@ const REDACT_PATTERNS = [
   [/(x-access-token):[^\s@/]+@/g, '$1=[REDACTED:credential]@'],
   // Generic key=value pairs where the key looks credential-shaped, including
   // the full auth-scheme value (Authorization: Bearer eyJ... → all redacted).
-  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
+  // The key-name families mirror the gate CLI's SENSITIVE_ENV_PATTERN (and the
+  // denylist): token/password/secret/credential PLUS the *_key spellings
+  // (api_key, access_key, private_key, signing_key) and client_secret, which a
+  // diagnostic can echo as `api_key=...`/`access_key=...` after an invalid
+  // input or a spawn failure. Underscore AND hyphen separators are matched so
+  // `api-key=` is covered too. Without these, the terminal catch and the
+  // failure summary/state artifact could emit a raw *_key value verbatim.
+  [/(Authorization|Bearer|token|password|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|client[_-]?secret)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
 ];
 
 const redactSecrets = (text) => REDACT_PATTERNS.reduce(

@@ -42,7 +42,12 @@ const CREDENTIAL_PATTERNS = [
   [/(x-access-token):[^\s@/]+@/g, '$1=[REDACTED:credential]@'],
   // Generic key=value pairs where the key looks credential-shaped, including
   // the full auth-scheme value (Authorization: Bearer eyJ... → all redacted).
-  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
+  // Mirrors support.js's REDACT_PATTERNS and the gate CLI's
+  // SENSITIVE_ENV_PATTERN: token/password/secret/credential PLUS the *_key
+  // spellings (api_key, access_key, private_key, signing_key) and
+  // client_secret, with underscore AND hyphen separators, so a diagnostic
+  // echoing `api_key=...`/`access_key=...` is redacted too.
+  [/(Authorization|Bearer|token|password|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|client[_-]?secret)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
 ];
 
 /**

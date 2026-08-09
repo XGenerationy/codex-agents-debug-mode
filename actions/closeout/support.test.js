@@ -857,3 +857,32 @@ test('the terminal main() catch redacts a credential-shaped invalid input (Qodo 
   assert.match(stderr, /closeout-action:/,
     'the terminal catch signature line is still emitted for diagnostics');
 });
+
+test('redaction covers api_key/access_key/private_key name families (Codex #3745074709)', () => {
+  // The terminal catch's redactor (REDACT_PATTERNS) previously recognized only
+  // token/password/secret/credential/Bearer/Authorization spellings. A
+  // diagnostic echoing `api_key=...`/`access_key=...`/`private_key=...` — the
+  // same families the gate CLI's SENSITIVE_ENV_PATTERN denies — would pass
+  // through verbatim. The pattern now covers the *_key spellings (underscore
+  // AND hyphen separators) and client_secret. Drive the REAL entry point so the
+  // actual redactor runs; the value is built by concatenation to keep this
+  // source clean of a credential literal.
+  const secret = ['sk', '-', 'live', '_', 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'].join('');
+  const invalidRun = `api_key=${secret}`;
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'support.js'), 'run'], {
+    env: {
+      ...process.env,
+      CLOSEOUT_RUN: invalidRun,
+      CLOSEOUT_MODE: 'strict',
+      CLOSEOUT_OUTPUT_DIR: makeTempDir(),
+    },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1, 'an invalid input must still exit non-zero');
+  const stderr = result.stderr || '';
+  assert.doesNotMatch(stderr, new RegExp(secret),
+    'an api_key=... value must be redacted from stderr');
+  assert.match(stderr, /api_key=\[REDACTED\]/,
+    'the api_key name is preserved and only its value is redacted');
+});

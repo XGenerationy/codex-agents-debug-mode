@@ -131,6 +131,38 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
     'error: [REDACTED:token] invalid token',
     'a bare ghp_ token is redacted',
   );
+  // The *_key / client_secret name families mirror the gate CLI's
+  // SENSITIVE_ENV_PATTERN (Codex #3745074709): a diagnostic echoing
+  // `api_key=...`/`access_key=...`/`private_key=...` must be redacted, with
+  // underscore AND hyphen separators. The key NAME is preserved; the value
+  // (the whole rest of the line, like Authorization: Bearer) is replaced —
+  // greedy-to-EOL is the safer choice (never leaves a trailing credential
+  // fragment).
+  assert.equal(
+    redactCredentialPatterns('config error: api_key=sk_live_AbCdEf0123456789 invalid'),
+    'config error: api_key=[REDACTED]',
+    'an api_key=... value is redacted (underscore separator)',
+  );
+  assert.equal(
+    redactCredentialPatterns('probe: api-key=sk_live_AbCdEf0123456789 rejected'),
+    'probe: api-key=[REDACTED]',
+    'an api-key=... value is redacted (hyphen separator)',
+  );
+  assert.equal(
+    redactCredentialPatterns('aws: access_key=AKIAIOSFODNN7EXAMPLE expired'),
+    'aws: access_key=[REDACTED]',
+    'an access_key=... value is redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns('tls: private_key=MIIEvQIBADANBgkqhkiG9w0BAQE leak'),
+    'tls: private_key=[REDACTED]',
+    'a private_key=... value is redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns('oauth: client_secret=cs_live_abc123 invalid'),
+    'oauth: client_secret=[REDACTED]',
+    'a client_secret=... value is redacted',
+  );
   // Ordinary diagnostic text without a credential is preserved verbatim.
   const benign = 'fatal: not a git repository (or any of the parent directories): .git';
   assert.equal(redactCredentialPatterns(benign), benign, 'non-credential diagnostics are unchanged');
