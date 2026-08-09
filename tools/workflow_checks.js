@@ -72,19 +72,28 @@ const PINNED_REF = /@[0-9a-f]{40}$/;
 const findUnpinnedUses = (content) => {
   const violations = [];
   const lines = String(content ?? '').split(/\r?\n/);
-  // Block-scalar tracking: when a line opens a `|` or `>` scalar, record the
-  // indentation of the KEY line. Subsequent lines indented MORE than that are
-  // scalar body (script text) and must be skipped. The scalar ends when a line
-  // is indented at or below the key level (or is blank, which YAML treats as
-  // part of the scalar but carries no keys).
-  let scalarKeyIndent = -1;
+  // Block-scalar tracking: when a line opens a `|` or `>` scalar, enter a
+  // "pending" state. The FIRST non-blank body line's indentation determines
+  // the scalar body indent — subsequent lines at or deeper than that are body
+  // (script text) and must be skipped. The scalar ends when a non-blank line
+  // is less indented than the body indent. This correctly handles sequence
+  // items where sibling keys share the dash level but body is deeper.
+  let scalarBodyIndent = -1;  // active body indent, or -1 when not in a scalar
+  let scalarPending = false;   // header seen, waiting for first body line
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
-    // Inside a block scalar? Skip body lines that are deeper-indented (or blank).
-    if (scalarKeyIndent >= 0) {
-      if (text.trim() === '' || indent > scalarKeyIndent) return;
-      // Indentation dropped back: the scalar has ended; resume normal scanning.
-      scalarKeyIndent = -1;
+    // Inside a block scalar? Skip body lines.
+    if (scalarBodyIndent >= 0) {
+      if (text.trim() === '' || indent >= scalarBodyIndent) return;
+      scalarBodyIndent = -1; // indentation dropped: scalar ended
+    }
+    // Pending (header seen, no body yet)? First non-blank line sets body indent.
+    if (scalarPending) {
+      scalarPending = false;
+      if (text.trim() !== '') {
+        scalarBodyIndent = indent;
+        return; // this line is body
+      }
     }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;
@@ -102,7 +111,7 @@ const findUnpinnedUses = (content) => {
     // USES_LINE (a uses: key never opens a scalar in valid workflow YAML —
     // its value is an action reference) and before SUSPICIOUS_USES.
     if (BLOCK_SCALAR_HEADER.test(text)) {
-      scalarKeyIndent = indent;
+      scalarPending = true;
       return;
     }
     // A `run:` (or `entrypoint:`/`shell:`) line whose value is inline (not a

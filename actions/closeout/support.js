@@ -618,6 +618,14 @@ const runSubcommand = async ({
         decision = { success: false, exitCode: 3, reason: 'gate reported success but report.json was missing, malformed, or schema-invalid' };
       }
       status = 'BLOCKED';
+    } else if (decision.success && status !== 'PASS') {
+      // Integrity guard: the CLI exited 0 (success) but the readable report
+      // says FAIL or BLOCKED — the exit code and the report disagree. This can
+      // happen if a shared output-dir is reused and a second invocation
+      // overwrites the report after the first CLI releases its lock. Fail the
+      // decision closed so finish does not propagate exit 0 against a FAIL
+      // report.
+      decision = { success: false, exitCode: 3, reason: `gate exited 0 but report overallStatus is ${status}` };
     }
     reportMode = report.mode || '';
     // The report is the source of truth for the tier label when readable;
