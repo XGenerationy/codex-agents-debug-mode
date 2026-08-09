@@ -1219,7 +1219,7 @@ const runCloseoutWorkflowBody = async ({
   // value derived from `initial.baseRef` (already rev-parsed to a stable ref
   // by resolveRepositoryState), and the engine command's own `:-origin/main`
   // fallback keeps it safe for any bare invocation that omits it.
-  childEnv.CLOSEOUT_RESOLVED_BASE_REF = initial.baseRef;
+  childEnv.CLOSEOUT_RESOLVED_BASE_REF = initial.baseSha;
   const execute = d.execute || d.createCommandExecutor({
     repo: initial.repo,
     outputDir: resolvedOutput,

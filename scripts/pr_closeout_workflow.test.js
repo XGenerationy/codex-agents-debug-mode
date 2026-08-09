@@ -320,13 +320,12 @@ test('passes only essential and explicitly configured environment variables to c
       assert.equal(environment[safeName], 'safe-value');
       assert.equal(environment[ambientName], undefined);
       assert.ok(environment.PATH || environment.Path);
-      // Qodo #5 regression: the resolved base ref is plumbed to engine checks
-      // via a dedicated, repo-derived env var so engine commands no longer
+      // The resolved base SHA (immutable, not the mutable ref name) is plumbed
+      // to engine checks via a dedicated env var so engine commands no longer
       // silently fall back to `main` when GITHUB_BASE_REF is dropped by the
-      // allowlisted environment. A non-main base ref is used so the assertion
-      // proves the injection works (the fallback default is origin/main, so
-      // asserting origin/main would pass even if injection were broken).
-      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'origin/release/7');
+      // allowlisted environment. A non-main base is used so the assertion
+      // proves the injection works (the fallback default is origin/main).
+      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'base123');
     }
   } finally {
     for (const [name, value] of Object.entries(previous)) {
@@ -336,21 +335,10 @@ test('passes only essential and explicitly configured environment variables to c
   }
 });
 
-test('buildWorkflowEnvironment hard-denies credential and runner-control names even when listed in safeEnv', () => {
+test('buildWorkflowEnvironment hard-denies credential and runner-control names even when listed in safeEnv', async () => {
   // A PR-controlled config can list GH_TOKEN in safeEnv to exfiltrate the
   // workflow token via a repository-local preflight probe. The denylist must
   // override the config opt-in unconditionally.
-  const { ...deps } = {};
-  const env = {
-    GH_TOKEN: 'dummy-token-value',
-    GITHUB_TOKEN: 'dummy-token-value-too',
-    GITHUB_ENV: '/tmp/should_not_reach',
-    GITHUB_PATH: '/tmp/should_not_reach',
-    PATH: '/usr/bin',
-    MY_SAFE_SECRET: 'allowed',
-  };
-  // buildWorkflowEnvironment is not exported; reach it via the workflow's
-  // child env by running the full-gate path with a capturing executor.
   let capturedEnv;
   const fixture = makeDependencies();
   delete fixture.dependencies.execute;
@@ -358,14 +346,14 @@ test('buildWorkflowEnvironment hard-denies credential and runner-control names e
     capturedEnv = e;
     return async () => ({ status: 'PASS', exitCode: 0 });
   };
-  const previous = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
-  process.env.GH_TOKEN = env.GH_TOKEN;
-  process.env.GITHUB_TOKEN = env.GITHUB_TOKEN;
-  process.env.GITHUB_ENV = env.GITHUB_ENV;
-  process.env.GITHUB_PATH = env.GITHUB_PATH;
+  const names = ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ENV', 'GITHUB_PATH'];
+  const previous = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+  process.env.GH_TOKEN = 'dummy-token-value';
+  process.env.GITHUB_TOKEN = 'dummy-token-value-too';
+  process.env.GITHUB_ENV = '/tmp/should_not_reach';
+  process.env.GITHUB_PATH = '/tmp/should_not_reach';
   try {
-    // No await needed: the workflow returns a report synchronously when deps are stubbed.
-    void runCloseoutWorkflow({
+    await runCloseoutWorkflow({
       repo: '/r',
       baseRef: 'origin/main',
       config: { safeEnv: ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ENV', 'GITHUB_PATH', 'MY_SAFE_SECRET'], engineChecks: [{ id: 'noop', command: 'true' }] },
