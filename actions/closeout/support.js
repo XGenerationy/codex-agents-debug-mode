@@ -25,8 +25,9 @@ const REDACT_PATTERNS = [
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
   // x-access-token:SECRET@host (git remote URL credential embedding)
   [/(x-access-token|https?):[^\s@/]+@[^\s/]+/g, '$1=[REDACTED:credential]@'],
-  // Generic key=value pairs where the key looks credential-shaped.
-  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*[^\s]+/gi, '$1=[REDACTED]'],
+  // Generic key=value pairs where the key looks credential-shaped, including
+  // the value following an auth scheme (Authorization: Bearer <token>).
+  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*\S+/gi, '$1=[REDACTED]'],
 ];
 
 const redactSecrets = (text) => REDACT_PATTERNS.reduce(
@@ -495,6 +496,11 @@ const runSubcommand = async ({
   inputs, inputBaseRef = '', config = '', outputDir, artifactName,
   env = process.env, event = null, spawnCli = defaultSpawnCli,
 }) => {
+  // Remove any stale state file from a PREVIOUS run before anything else —
+  // even before input validation, which can throw. If a later step fails
+  // before writing fresh state, the always()-triggered comment step reads
+  // no state and skips, instead of posting the previous run's decision.
+  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
   const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
@@ -520,13 +526,6 @@ const runSubcommand = async ({
     // Platform ignores directory modes, or a permission issue the CLI will
     // surface when it takes ownership of the directory.
   }
-  // Remove any stale state file from a PREVIOUS run in this output-dir before
-  // doing anything. If the run step throws before writing fresh state (e.g.
-  // input validation fails), the always()-triggered comment step would
-  // otherwise read and post the previous run's decision — a stale PASS comment
-  // on a red workflow. Removing the file first guarantees commentSubcommand's
-  // "no state → skip" path fires.
-  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);

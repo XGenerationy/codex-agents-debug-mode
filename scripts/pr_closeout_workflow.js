@@ -732,11 +732,13 @@ const ESSENTIAL_ENV = new Set([
  */
 // Names a PR-controlled config can NEVER opt into via requiredEnv/safeEnv:
 // they carry the workflow token or runner command-file paths that PR code must
-// not reach. buildChildEnvironment already strips credential-shaped names for
-// child command processes, but buildWorkflowEnvironment is what feeds the PLAN
-// preflight and engine check processes, and its config is part of the PR — so
-// a hard denylist here prevents a PR from adding GH_TOKEN to safeEnv to
-// exfiltrate the token via a repository-local preflight probe.
+// not reach, OR they match the generic sensitive-name predicate (mirrors
+// pr_closeout_stream.js's SENSITIVE_ENV_NAME). buildChildEnvironment already
+// strips credential-shaped names for child command processes, but
+// buildWorkflowEnvironment feeds the PLAN preflight and engine check processes,
+// and its config is part of the PR — so a hard denylist here prevents a PR
+// from adding GH_TOKEN (or AWS_SECRET_ACCESS_KEY, LICENSE_KEY, etc.) to safeEnv
+// to exfiltrate them via a repository-local preflight probe.
 const DENYLISTED_ENV_NAMES = new Set([
   'GH_TOKEN',
   'GITHUB_TOKEN',
@@ -745,6 +747,9 @@ const DENYLISTED_ENV_NAMES = new Set([
   'GITHUB_OUTPUT',
   'GITHUB_STEP_SUMMARY',
 ]);
+// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME — credential-shaped
+// suffix/prefix patterns that must NEVER pass through a PR-controlled allowlist.
+const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
@@ -754,6 +759,7 @@ const buildWorkflowEnvironment = (env, config) => {
   return Object.fromEntries(Object.entries(env).filter(([name]) => {
     const upper = name.toUpperCase();
     if (DENYLISTED_ENV_NAMES.has(upper)) return false;
+    if (SENSITIVE_ENV_PATTERN.test(name)) return false;
     return ESSENTIAL_ENV.has(upper) || explicit.has(upper);
   }));
 };
