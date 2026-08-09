@@ -254,11 +254,13 @@ const workflowFiles = safetyScanFiles.filter(
 // `uses:` references an unpinned remote action escapes the pin check entirely
 // (the calling workflow's `uses: ./.github/actions/wrapper` is a local
 // reference, exempt by design — the wrapper's OWN uses must be checked).
-// The path segment between the root and action.yml is optional, so an action
-// placed directly at actions/action.yml or .github/actions/action.yml (root
-// level, no subdirectory) is also covered.
+// Discover `action.yml`/`action.yaml` at ANY tracked path, not just
+// `actions/` and `.github/actions/`: a local reference like `uses: ./ci/wrapper`
+// is exempt by construction, and the wrapper's own `uses:` must be pin-checked
+// wherever it lives. Restricting to conventional roots would let an action
+// placed under `ci/` or `tools/` hide an unpinned remote `uses:`.
 const actionMetadataFiles = safetyScanFiles.filter(
-  (name) => /^(?:actions|\.github\/actions)(?:\/.+)?\/action\.ya?ml$/.test(name),
+  (name) => /(?:^|\/)action\.ya?ml$/.test(name) && !name.startsWith('.github/workflows/'),
 );
 for (const file of [...workflowFiles, ...actionMetadataFiles]) {
   // Guard against non-regular files (a tracked symlink here would otherwise be
