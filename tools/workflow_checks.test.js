@@ -321,6 +321,12 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
   // flagged fail-closed.
   assert.equal(findUnpinnedUses('name: &action_key uses\nsteps:\n  - ? *action_key\n    : owner/action@main\n').length, 1,
     'an alias-backed explicit ? *alias key must be flagged (alias may resolve to uses)');
+  // A trailing YAML comment must not defeat detection (Qodo 3745372289): all
+  // three explicit-key regexes allow an optional `# comment` after the key.
+  assert.equal(findUnpinnedUses('steps:\n  - ? uses # comment\n    : owner/action@main\n').length, 1,
+    'an explicit ? uses key with a trailing comment must be flagged');
+  assert.equal(findUnpinnedUses('name: &k uses\nsteps:\n  - ? *k # comment\n    : owner/action@main\n').length, 1,
+    'an alias explicit key with a trailing comment must be flagged');
 });
 
 test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {

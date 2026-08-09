@@ -94,8 +94,8 @@ const decodeDoubleQuotedEscapes = (raw) => String(raw)
 // verified to resolve to {uses: ...}) — so EXPLICIT_QUOTED_KEY captures the
 // raw quoted text for the same decode check QUOTED_USES_KEY applies. (Single
 // quotes are excluded: no escape processing in YAML single-quoted scalars.)
-const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*$/;
-const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*$/;
+const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*(?:#.*)?$/;
+const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(?:#.*)?$/;
 // An explicit mapping key that is a YAML ALIAS (`? *action_key`). The scanner
 // is line-oriented and cannot resolve aliases, but an alias CAN name `uses`
 // (verified: `name: &action_key uses` then `- ? *action_key` resolves via
@@ -103,7 +103,7 @@ const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*$
 // resolver cannot confirm it is NOT `uses`. Alias explicit keys are vanishingly
 // rare in real workflow YAML, so this cannot cause false positives on clean
 // pinned actions.
-const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*$/;
+const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?:#.*)?$/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
