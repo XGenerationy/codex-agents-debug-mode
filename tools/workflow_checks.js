@@ -87,13 +87,14 @@ const findUnpinnedUses = (content) => {
       if (text.trim() === '' || indent >= scalarBodyIndent) return;
       scalarBodyIndent = -1; // indentation dropped: scalar ended
     }
-    // Pending (header seen, no body yet)? First non-blank line sets body indent.
+    // Pending (header seen, no body yet)? First NON-BLANK line sets body indent.
+    // Blank lines between the header and the first body line do not end the
+    // scalar in YAML — they are part of the scalar's content. Stay pending.
     if (scalarPending) {
+      if (text.trim() === '') return; // blank: still waiting for first body line
       scalarPending = false;
-      if (text.trim() !== '') {
-        scalarBodyIndent = indent;
-        return; // this line is body
-      }
+      scalarBodyIndent = indent;
+      return; // this line is body
     }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;

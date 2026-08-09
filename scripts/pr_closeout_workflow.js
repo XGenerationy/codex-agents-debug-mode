@@ -746,10 +746,12 @@ const DENYLISTED_ENV_NAMES = new Set([
   'GITHUB_PATH',
   'GITHUB_OUTPUT',
   'GITHUB_STEP_SUMMARY',
+  'GITHUB_STATE',
 ]);
-// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME — credential-shaped
-// suffix/prefix patterns that must NEVER pass through a PR-controlled allowlist.
-const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME plus the NPM _auth suffix
+// — credential-shaped patterns that must NEVER pass through a PR-controlled
+// allowlist. The _AUTH alternative covers NPM_CONFIG__AUTH and similar.
+const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
