@@ -1930,6 +1930,14 @@ const runClaimSwapAttempt = async (plantStaged) => {
     swap = swapClaimAfterCreate(claimFile, stagedFile);
     const result = await launched.outcome;
     const exitAt = Date.now();
+    // Stop the poller BEFORE capturing the landed state, and let any in-flight
+    // poll iteration settle, so `swapped` is the poller's final state — not a
+    // value that could flip to true between the capture here and the finally's
+    // stop (which previously left the stand-in/claim relationship ambiguous
+    // for the caller's verifyStandIn). The child is dead by now (outcome
+    // resolved on exit), so the release has already run.
+    swap.stopped = true;
+    await new Promise((resolve) => setImmediate(resolve));
     return { projectRoot, debugDir, claimFile, result, swapped: swap.landed, swapAt: swap.swapAt, exitAt, standInContent };
   } catch (error) {
     // On any throw (plantStaged failed, outcome rejected) the caller never
@@ -1969,16 +1977,28 @@ const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) =
         && result.exitCode === 1
         && /collector_port_not_private/.test(result.stderr);
       if (!decisive) continue;
-      // The release refused to parse/unlink the stand-in (that is what this
-      // test asserts), so the stand-in should still exist. If it does not,
-      // the child's release ran BEFORE the swap landed (deleted the original
-      // claim, then the poller's rename failed because the target was gone) —
-      // a non-decisive race, not a failure. Retry like any other non-decisive
-      // outcome.
+      // A landed swap means the stand-in is at collector_claim, and every
+      // stand-in type is guarded by an early-return release check (oversized
+      // size, symlink type, or hard-link nlink), so the release can never
+      // unlink a landed stand-in. An ENOENT here therefore means the stand-in
+      // was deleted AFTER the swap landed — exactly the release regression
+      // this test exists to catch. Fail loudly with diagnostics; never retry
+      // a landed attempt's missing stand-in (that would mask the regression).
       try {
         await verifyStandIn(claimFile);
       } catch (error) {
-        if (error?.code === 'ENOENT') continue;
+        if (error?.code === 'ENOENT') {
+          let stagedState = 'n/a';
+          let claimState = 'missing';
+          try { stagedState = `${(await lstat(path.join(projectRoot, '.debug', 'collector_claim.staged'))).size}B`; } catch { stagedState = 'absent'; }
+          try { const i = await lstat(claimFile); claimState = `${i.size}B link=${i.isSymbolicLink()}`; } catch { claimState = 'absent'; }
+          throw new Error(
+            `stand-in vanished after a landed swap (landed=${swapped} margin=${exitAt - swapAt}ms `
+            + `claim=${claimState} staged=${stagedState}): the release deleted the swapped-in `
+            + `claim it was supposed to refuse`,
+            { cause: error },
+          );
+        }
         throw error;
       }
       assert.equal(await readFile(path.join(projectRoot, 'swap-target.txt'), 'utf8'), standInContent);
