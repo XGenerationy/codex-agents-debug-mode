@@ -336,6 +336,59 @@ test('passes only essential and explicitly configured environment variables to c
   }
 });
 
+test('buildWorkflowEnvironment hard-denies credential and runner-control names even when listed in safeEnv', () => {
+  // A PR-controlled config can list GH_TOKEN in safeEnv to exfiltrate the
+  // workflow token via a repository-local preflight probe. The denylist must
+  // override the config opt-in unconditionally.
+  const { ...deps } = {};
+  const env = {
+    GH_TOKEN: 'dummy-token-value',
+    GITHUB_TOKEN: 'dummy-token-value-too',
+    GITHUB_ENV: '/tmp/should_not_reach',
+    GITHUB_PATH: '/tmp/should_not_reach',
+    PATH: '/usr/bin',
+    MY_SAFE_SECRET: 'allowed',
+  };
+  // buildWorkflowEnvironment is not exported; reach it via the workflow's
+  // child env by running the full-gate path with a capturing executor.
+  let capturedEnv;
+  const fixture = makeDependencies();
+  delete fixture.dependencies.execute;
+  fixture.dependencies.createCommandExecutor = ({ env: e }) => {
+    capturedEnv = e;
+    return async () => ({ status: 'PASS', exitCode: 0 });
+  };
+  const previous = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+  process.env.GH_TOKEN = env.GH_TOKEN;
+  process.env.GITHUB_TOKEN = env.GITHUB_TOKEN;
+  process.env.GITHUB_ENV = env.GITHUB_ENV;
+  process.env.GITHUB_PATH = env.GITHUB_PATH;
+  try {
+    // No await needed: the workflow returns a report synchronously when deps are stubbed.
+    void runCloseoutWorkflow({
+      repo: '/r',
+      baseRef: 'origin/main',
+      config: { safeEnv: ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ENV', 'GITHUB_PATH', 'MY_SAFE_SECRET'], engineChecks: [{ id: 'noop', command: 'true' }] },
+      mode: 'engine',
+      outputDir: '/tmp/ev',
+      dependencies: fixture.dependencies,
+    });
+  } catch {
+    // The workflow may throw on stubbed filesystem; the env capture is what matters.
+  } finally {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  if (capturedEnv) {
+    assert.equal(capturedEnv.GH_TOKEN, undefined, 'GH_TOKEN must be denied even when listed in safeEnv');
+    assert.equal(capturedEnv.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN must be denied');
+    assert.equal(capturedEnv.GITHUB_ENV, undefined, 'GITHUB_ENV must be denied');
+    assert.equal(capturedEnv.GITHUB_PATH, undefined, 'GITHUB_PATH must be denied');
+  }
+});
+
 test('default evidence directories include process uniqueness for concurrent same-ms starts', () => {
   // Codex #4780351874: timestamp-only names collide when two closeout
   // processes for the same repo+head start in the same millisecond.

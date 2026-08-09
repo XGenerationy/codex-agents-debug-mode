@@ -730,14 +730,32 @@ const ESSENTIAL_ENV = new Set([
  * @param {{requiredEnv?: string[], safeEnv?: string[]}} config
  * @returns {NodeJS.ProcessEnv}
  */
+// Names a PR-controlled config can NEVER opt into via requiredEnv/safeEnv:
+// they carry the workflow token or runner command-file paths that PR code must
+// not reach. buildChildEnvironment already strips credential-shaped names for
+// child command processes, but buildWorkflowEnvironment is what feeds the PLAN
+// preflight and engine check processes, and its config is part of the PR — so
+// a hard denylist here prevents a PR from adding GH_TOKEN to safeEnv to
+// exfiltrate the token via a repository-local preflight probe.
+const DENYLISTED_ENV_NAMES = new Set([
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GITHUB_ENV',
+  'GITHUB_PATH',
+  'GITHUB_OUTPUT',
+  'GITHUB_STEP_SUMMARY',
+]);
+
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
     ...(config.requiredEnv || []),
     ...(config.safeEnv || []),
   ].map((name) => String(name).toUpperCase()));
-  return Object.fromEntries(Object.entries(env).filter(([name]) => (
-    ESSENTIAL_ENV.has(name.toUpperCase()) || explicit.has(name.toUpperCase())
-  )));
+  return Object.fromEntries(Object.entries(env).filter(([name]) => {
+    const upper = name.toUpperCase();
+    if (DENYLISTED_ENV_NAMES.has(upper)) return false;
+    return ESSENTIAL_ENV.has(upper) || explicit.has(upper);
+  }));
 };
 
 /**

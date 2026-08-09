@@ -520,6 +520,13 @@ const runSubcommand = async ({
     // Platform ignores directory modes, or a permission issue the CLI will
     // surface when it takes ownership of the directory.
   }
+  // Remove any stale state file from a PREVIOUS run in this output-dir before
+  // doing anything. If the run step throws before writing fresh state (e.g.
+  // input validation fails), the always()-triggered comment step would
+  // otherwise read and post the previous run's decision — a stale PASS comment
+  // on a red workflow. Removing the file first guarantees commentSubcommand's
+  // "no state → skip" path fires.
+  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);
