@@ -122,11 +122,20 @@ const findUnpinnedUses = (content) => {
     // `uses:` token that looks like a YAML key? If so, flag it fail-closed:
     // the regex cannot confirm the ref is safe, so it must not pass silently.
     // This catches flow style, anchors, multi-entry sequences, and any other
-    // form a regex cannot parse. The SUSPICIOUS_USES pattern avoids matching
-    // `uses:` inside a quoted run: string value by requiring the token to
-    // appear at a key position (start, after whitespace/dash/brace/semicolon).
-    if (SUSPICIOUS_USES.test(text)) {
-      violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
+    // form a regex cannot parse. BUT: exclude lines where the `uses:` match is
+    // inside a quoted scalar value (e.g. `name: "{uses: foo}"`), where it is
+    // string text, not a YAML key. A simple quote-count check: if the match
+    // position is between an odd number of quotes, it's inside a string.
+    const suspiciousMatch = SUSPICIOUS_USES.exec(text);
+    if (suspiciousMatch) {
+      const beforeMatch = text.substring(0, suspiciousMatch.index);
+      const doubleQuotes = (beforeMatch.match(/"/g) || []).length;
+      const singleQuotes = (beforeMatch.match(/'/g) || []).length;
+      const insideDoubleQuoted = doubleQuotes % 2 === 1;
+      const insideSingleQuoted = singleQuotes % 2 === 1;
+      if (!insideDoubleQuoted && !insideSingleQuoted) {
+        violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
+      }
     }
   });
   return violations;

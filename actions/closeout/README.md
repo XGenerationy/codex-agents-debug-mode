@@ -368,7 +368,12 @@ Point `config` at a JSON file, for example:
   `GITHUB_STATE` — these are hard-denied regardless of config).
   **Two-tier credential policy:** in a full run (attested), credential-shaped
   names listed in `safeEnv`/`requiredEnv` ARE passed through — your checks may
-  legitimately need `API_TOKEN`, `DATABASE_URL`, etc. In a plan preview
+  legitimately need `API_TOKEN`, `DATABASE_URL`, etc. **Exception:**
+  `GH_TOKEN` and `GITHUB_TOKEN` are ALWAYS stripped from the child
+  environment (even in full runs) to prevent engine checks from using the
+  workflow token for authenticated git/API operations; consumers needing
+  GitHub auth in checks must provide their own token via a separate
+  `safeEnv` entry. In a plan preview
   (untrusted, pre-attestation), credential-shaped names matching the sensitive
   pattern (`TOKEN`, `SECRET`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`, etc.)
   are hard-denied even when listed in `safeEnv` — a PR cannot exfiltrate

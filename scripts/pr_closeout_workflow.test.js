@@ -369,12 +369,11 @@ test('buildWorkflowEnvironment hard-denies credential and runner-control names e
       else process.env[k] = v;
     }
   }
-  if (capturedEnv) {
-    assert.equal(capturedEnv.GH_TOKEN, undefined, 'GH_TOKEN must be denied even when listed in safeEnv');
-    assert.equal(capturedEnv.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN must be denied');
-    assert.equal(capturedEnv.GITHUB_ENV, undefined, 'GITHUB_ENV must be denied');
-    assert.equal(capturedEnv.GITHUB_PATH, undefined, 'GITHUB_PATH must be denied');
-  }
+  assert.ok(capturedEnv, 'the command executor must have been called so the env was captured');
+  assert.equal(capturedEnv.GH_TOKEN, undefined, 'GH_TOKEN must be denied even when listed in safeEnv');
+  assert.equal(capturedEnv.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN must be denied');
+  assert.equal(capturedEnv.GITHUB_ENV, undefined, 'GITHUB_ENV must be denied');
+  assert.equal(capturedEnv.GITHUB_PATH, undefined, 'GITHUB_PATH must be denied');
 });
 
 test('default evidence directories include process uniqueness for concurrent same-ms starts', () => {

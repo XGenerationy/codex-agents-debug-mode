@@ -23,8 +23,11 @@ const REDACT_PATTERNS = [
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a word boundary
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
-  // x-access-token:SECRET@host (git remote URL credential embedding)
-  [/(x-access-token|https?):[^\s@/]+@[^\s/]+/g, '$1=[REDACTED:credential]@'],
+  // Credential embedding in a URL: scheme://user:pass@host or user:pass@host.
+  // Replace the credential part only, preserving the scheme and host for
+  // diagnostics (the host is not secret — the credential is).
+  [/(?:(?:https?|git|ssh):\/\/)[^\s@/]+@[^\s/]+/g, '[REDACTED:url-credential]@'],
+  [/(x-access-token):[^\s@/]+@/g, '$1=[REDACTED:credential]@'],
   // Generic key=value pairs where the key looks credential-shaped, including
   // the full auth-scheme value (Authorization: Bearer eyJ... → all redacted).
   [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
@@ -729,7 +732,7 @@ const GH_TIMEOUT_MS = 60_000;
 const defaultRunGh = async (args) => {
   const result = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: GH_TIMEOUT_MS });
   if (result.error) throw result.error;
-  if (result.signal === 'SIGTERM') throw new Error(`gh timed out after ${GH_TIMEOUT_MS / 1000}s`);
+  if (result.signal === 'SIGTERM') throw new Error(`gh timed out after ${GH_TIMEOUT_MS / 1000}s (args redacted)`);
   if (result.status !== 0) throw new Error(redactSecrets(String(result.stderr || `gh exited ${result.status}`).trim()));
   const stdout = String(result.stdout || '').trim();
   if (!stdout) return null;
