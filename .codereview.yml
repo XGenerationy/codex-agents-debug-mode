@@ -102,11 +102,13 @@ pre_merge_checks:
       via `git ls-files`, not just PR-touched files — every shipped path is
       vetted every run.)
       It also enforces workflow hygiene: every `uses:` in
-      .github/workflows/*.yml and *.yaml, and in actions/**/action.yml,
-      actions/**/action.yaml, .github/actions/**/action.yml, and
-      .github/actions/**/action.yaml, is pinned to a 40-hex commit SHA or is a
-      local ./path reference, and every workflow declares a top-level
-      `permissions:` block.
+      .github/workflows/*.yml and *.yaml, and in ANY tracked action.yml /
+      action.yaml (discovered via `git ls-files` at any path, not only under
+      actions/** or .github/actions/**), is pinned to a 40-hex commit SHA or is
+      a local ./path reference, and every workflow declares a top-level
+      `permissions:` block. Scanning action metadata at every tracked path — not
+      just the conventional roots — prevents an unpinned remote `uses:` from
+      hiding under ci/, tools/, or any other directory.
     mode: error
     run: npm run validate
     instructions: |

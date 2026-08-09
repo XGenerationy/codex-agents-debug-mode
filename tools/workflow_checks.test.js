@@ -162,6 +162,27 @@ test('findUnpinnedUses flags a sibling uses key after an empty block scalar', ()
     'a deeper-indented line is real scalar body and must not be flagged');
 });
 
+test('findUnpinnedUses flags sibling uses after a multi-space sequence dash', () => {
+  // YAML permits any amount of whitespace after the sequence `-` marker
+  // (`-  name:` or `-   name:`), so the effective mapping-key column is the
+  // END of the actual dash prefix, not a constant indent+2. An empty block
+  // scalar header with a multi-space dash must still treat an equally-indented
+  // following line as a sibling key, not scalar body — otherwise an unpinned
+  // sibling `uses:` evades the fail-closed scan.
+  const twoSpace = 'steps:\n  -  name: |\n     uses: owner/action@main\n';
+  const twoSpaceV = findUnpinnedUses(twoSpace);
+  assert.equal(twoSpaceV.length, 1, 'sibling uses after a 2-space-dash empty scalar must be flagged');
+  assert.equal(twoSpaceV[0].line, 3);
+  const threeSpace = 'steps:\n  -   name: |\n      uses: owner/action@main\n';
+  const threeSpaceV = findUnpinnedUses(threeSpace);
+  assert.equal(threeSpaceV.length, 1, 'sibling uses after a 3-space-dash empty scalar must be flagged');
+  assert.equal(threeSpaceV[0].line, 3);
+  // A genuine deeper body line (past the true key column) is still scalar body.
+  const realBody = 'steps:\n  -  name: |\n        echo uses: not-a-key\n';
+  assert.deepEqual(findUnpinnedUses(realBody), [],
+    'a deeper-indented line is real scalar body and must not be flagged');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

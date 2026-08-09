@@ -20,6 +20,44 @@ const isSensitiveEnvName = (name) => {
   return SENSITIVE_ENV_NAME.test(key) || SENSITIVE_NPM_AUTH.test(key);
 };
 
+// Pattern-based redaction for credential-bearing values that can leak into a
+// thrown error.message from git/gh (or any wrapped CLI) and would NOT be caught
+// by the value-based buildSecretReplacements redactor, because the credential
+// is embedded in the diagnostic text rather than present as a known env value
+// (e.g. a git remote URL embedding x-access-token:TOKEN, a gh error echoing an
+// Authorization header, or a literal ghp_ token in a URL). Applied at the CLI's
+// top-level error emission so neither stderr nor the machine-readable BLOCKED
+// JSON record carries a raw credential. A false positive (redacting a non-secret
+// token-shaped string) is harmless; a miss is a credential exposure, so the set
+// is deliberately broad. Mirrors actions/closeout/support.js's REDACT_PATTERNS
+// so the action layer and the gate CLI agree on what a credential looks like.
+const CREDENTIAL_PATTERNS = [
+  // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a minimum length
+  // so a short false-positive prefix does not match.
+  [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
+  // Credential embedding in a URL: scheme://user:pass@host. Replace the
+  // credential part only, preserving the scheme and host for diagnostics (the
+  // host is not secret — the credential is).
+  [/(?:(?:https?|git|ssh):\/\/)[^\s@/]+@[^\s/]+/g, '[REDACTED:url-credential]@'],
+  [/(x-access-token):[^\s@/]+@/g, '$1=[REDACTED:credential]@'],
+  // Generic key=value pairs where the key looks credential-shaped, including
+  // the full auth-scheme value (Authorization: Bearer eyJ... → all redacted).
+  [/(Authorization|Bearer|token|password|secret|credential)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
+];
+
+/**
+ * Redacts credential-bearing patterns from arbitrary text (typically a thrown
+ * error.message). Unlike the value-based `redactSecrets`, this catches
+ * credentials embedded in diagnostic text even when the raw secret value is not
+ * a known env value. Returns the redacted string; non-string input is coerced.
+ * @param {string} text
+ * @returns {string}
+ */
+const redactCredentialPatterns = (text) => CREDENTIAL_PATTERNS.reduce(
+  (acc, [pattern, replacement]) => acc.replace(pattern, replacement),
+  String(text ?? ''),
+);
+
 /**
  * Filters `env` down to a child-process-safe environment: any name that
  * `isSensitiveEnvName` flags is dropped unless it appears (case-insensitively)
@@ -405,4 +443,5 @@ module.exports = {
   createStreamingReplacer,
   createStreamingSignalScanner,
   isSensitiveEnvName,
+  redactCredentialPatterns,
 };

@@ -330,12 +330,28 @@ const readReviewerPermissions = async ({
     headSha: expectedHeadSha,
     configDigest: expectedConfigDigest,
   });
+  // Collect the unique set of non-authoritative reviewers who left an
+  // attestation-shaped review, BEFORE issuing any network call. GitHub's
+  // collaborators/permission endpoint is per-user (no batch API), so the prior
+  // sequential await loop was an N+1: one gh api call per reviewer, one after
+  // another. Issue them with bounded concurrency instead — each distinct
+  // reviewer is still queried exactly once (dedup is resolved upfront), and a
+  // hard cap keeps the request fan-out small even on a PR with many reviews.
   const reviewerPermissions = new Map();
+  const seen = new Set();
+  const pending = [];
   for (const review of reviews) {
     if (!reviewMatchesAttestationShape({ review, prAuthor, expectedHeadSha, marker })) continue;
     const reviewer = review.user.login;
     const association = String(review.author_association || review.authorAssociation || '').toUpperCase();
-    if (AUTHORITATIVE_ASSOCIATIONS.has(association) || reviewerPermissions.has(reviewer.toLowerCase())) continue;
+    if (AUTHORITATIVE_ASSOCIATIONS.has(association)) continue;
+    const key = reviewer.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pending.push(reviewer);
+  }
+  const PERMISSION_CONCURRENCY = 4;
+  const lookupPermission = async (reviewer) => {
     try {
       const permission = await runGh([
         'api',
@@ -345,6 +361,9 @@ const readReviewerPermissions = async ({
     } catch {
       reviewerPermissions.set(reviewer.toLowerCase(), null);
     }
+  };
+  for (let i = 0; i < pending.length; i += PERMISSION_CONCURRENCY) {
+    await Promise.all(pending.slice(i, i + PERMISSION_CONCURRENCY).map(lookupPermission));
   }
   return reviewerPermissions;
 };
@@ -842,4 +861,5 @@ module.exports = {
   gateAttestationMarker,
   readLiveGateAttestation,
   readLivePrState,
+  readReviewerPermissions,
 };

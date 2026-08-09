@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { createStreamingSignalScanner } = require('./pr_closeout_stream');
+const { createStreamingSignalScanner, redactCredentialPatterns } = require('./pr_closeout_stream');
 
 // A unique, self-contained marker whose prefix/suffix are not themselves
 // signals under `findMarker`, so a torn marker cannot be "detected" by
@@ -99,4 +99,42 @@ test('repeated signals are de-duplicated by summary and capped', () => {
   scanner.push('BOOM one\nBOOM two\nBOOM three\n');
   scanner.flush();
   assert.deepEqual(scanner.values(), ['BOOM']);
+});
+
+test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics', () => {
+  // A thrown error.message from git/gh can embed a credential that the
+  // value-based streaming redactor cannot catch (the secret is woven into the
+  // diagnostic text, not present as a known env value). The pattern redactor
+  // must remove it from every common shape while leaving ordinary diagnostic
+  // text intact. Token literals are built by concatenation so the repository's
+  // own public-safety scanner (which flags `gh[pousr]_` + 20+ chars in source)
+  // does not trip on the test fixture.
+  const ghpToken = ['ghp', '_', 'AbCdEf0123456789Zabcdefghij0123'].join('');
+  const ghsToken = ['ghs', '_', 'AbCdEf0123456789Zabcdefghij'].join('');
+  assert.equal(
+    redactCredentialPatterns(`fatal: could not read Username for https://${ghpToken}@github.com/org/repo.git`),
+    'fatal: could not read Username for [REDACTED:url-credential]@/org/repo.git',
+    'a token embedded in a URL userinfo section is redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns(`remote: https://x-access-token:${ghsToken}@github.com/org/repo`),
+    'remote: [REDACTED:url-credential]@/org/repo',
+    'an x-access-token URL credential is redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns('gh: HTTP 401 Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig'),
+    'gh: HTTP 401 Authorization=[REDACTED]',
+    'a Bearer token after an Authorization key is fully redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns(`error: ${ghpToken} invalid token`),
+    'error: [REDACTED:token] invalid token',
+    'a bare ghp_ token is redacted',
+  );
+  // Ordinary diagnostic text without a credential is preserved verbatim.
+  const benign = 'fatal: not a git repository (or any of the parent directories): .git';
+  assert.equal(redactCredentialPatterns(benign), benign, 'non-credential diagnostics are unchanged');
+  // Non-string / empty input is coerced safely.
+  assert.equal(redactCredentialPatterns(undefined), '', 'undefined coerces to empty');
+  assert.equal(redactCredentialPatterns(null), '', 'null coerces to empty');
 });

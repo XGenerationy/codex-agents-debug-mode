@@ -15,7 +15,11 @@ const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 
 
 // resolveBaseSha reads process.env directly; save/restore the keys it consults
 // so the tests stay hermetic regardless of the ambient CI environment.
-const ENV_KEYS = ['CLOSEOUT_BASE_SHA', 'GITHUB_BASE_SHA', 'GITHUB_EVENT_BEFORE', 'GITHUB_BASE_REF'];
+// CLOSEOUT_RESOLVED_BASE_REF is read FIRST and takes precedence, so it must be
+// cleared too — otherwise an ambient value (e.g. a developer shell or a CI job
+// inheriting the closeout gate's injected env) makes the fixture merge-base
+// against a ref that does not exist in the fixture repo and fails non-deterministically.
+const ENV_KEYS = ['CLOSEOUT_RESOLVED_BASE_REF', 'CLOSEOUT_BASE_SHA', 'GITHUB_BASE_SHA', 'GITHUB_EVENT_BEFORE', 'GITHUB_BASE_REF'];
 
 const setScanEnv = (eventBefore) => {
   const saved = {};
@@ -78,6 +82,27 @@ test('GITHUB_EVENT_BEFORE naming a fetched commit selects the two-dot preimage b
   try {
     const base = resolveBaseSha(repo);
     assert.equal(base, firstSha);
+    assert.equal(getComparisonStyle(), 'two-dot');
+  } finally {
+    restoreEnv();
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('an ambient CLOSEOUT_RESOLVED_BASE_REF does not leak into the fixture base', async () => {
+  // resolveBaseSha reads CLOSEOUT_RESOLVED_BASE_REF FIRST and takes precedence.
+  // If a developer shell or CI job inherits the closeout gate's injected env,
+  // an ambient value pointing at a ref absent from the fixture repo would make
+  // the merge-base fail and the test fail non-deterministically. Set it BEFORE
+  // the hermetic harness so the harness captures and clears it — proving the
+  // fixture's normal base resolution runs regardless of the ambient value.
+  const repo = await fixtureRepo();
+  const firstSha = git(repo, 'rev-list', '--max-parents=0', 'HEAD');
+  process.env.CLOSEOUT_RESOLVED_BASE_REF = 'origin/some/ref/absent/from/fixture';
+  const restoreEnv = setScanEnv(firstSha);
+  try {
+    const base = resolveBaseSha(repo);
+    assert.equal(base, firstSha, 'ambient CLOSEOUT_RESOLVED_BASE_REF must not steer the fixture base');
     assert.equal(getComparisonStyle(), 'two-dot');
   } finally {
     restoreEnv();

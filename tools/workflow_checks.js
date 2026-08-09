@@ -125,11 +125,14 @@ const findUnpinnedUses = (content) => {
     // its value is an action reference) and before SUSPICIOUS_USES. Record the
     // header's effective mapping-key indentation: if the first non-blank line
     // is NOT more indented, the scalar is empty and that line is a sibling
-    // key, not body. For a sequence item (`  - name: |`), the key column is
-    // two past the dash, so add the `- ` offset to the line indent.
+    // key, not body. For a sequence item, the key column is the END of the
+    // dash prefix (`  - name:` → key starts after `  - `), measured from the
+    // ACTUALLY matched prefix length — not a constant +2 — so YAML that uses
+    // multiple spaces after the dash (`-  name:`) is handled correctly.
     if (BLOCK_SCALAR_HEADER.test(text)) {
       scalarPending = true;
-      scalarHeaderIndent = indent + (/^\s*-\s+/.test(text) ? 2 : 0);
+      const seqPrefix = text.match(/^(\s*-\s+)/);
+      scalarHeaderIndent = seqPrefix ? seqPrefix[1].length : indent;
       return;
     }
     // A `run:` (or `entrypoint:`/`shell:`) line whose value is inline (not a

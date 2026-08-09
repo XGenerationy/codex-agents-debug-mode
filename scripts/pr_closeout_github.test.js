@@ -7,6 +7,7 @@ const {
   gateAttestationMarker,
   readLiveGateAttestation,
   readLivePrState,
+  readReviewerPermissions,
 } = require('./pr_closeout_github');
 
 const cleanAttestation = (extra = {}) => ({
@@ -725,4 +726,54 @@ test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.reason, undefined);
+});
+
+test('readReviewerPermissions resolves unique reviewers with bounded concurrency and dedup', async () => {
+  // GitHub's collaborators/permission endpoint is per-user, so the prior loop
+  // awaited one gh api call per reviewer sequentially (N+1). The lookup now
+  // resolves the unique reviewer set with bounded concurrency. This injects a
+  // runGh that records every call and tracks the maximum number in flight, then
+  // asserts: every distinct non-authoritative reviewer is queried exactly once
+  // (dedup), authoritative associations are skipped, and concurrency is capped.
+  const marker = gateAttestationMarker({ baseSha: 'base123', headSha: 'head123', configDigest: 'cfg123' });
+  const reviews = [
+    approvedReview({ user: { login: 'alice' }, author_association: 'CONTRIBUTOR', body: marker }),
+    // duplicate reviewer — must be queried once, not twice
+    approvedReview({ user: { login: 'alice' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'bob' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'carol' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'dave' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'eve' }, author_association: 'CONTRIBUTOR', body: marker }),
+    // OWNER association is authoritative — no permission lookup needed
+    approvedReview({ user: { login: 'frank' }, author_association: 'OWNER', body: marker }),
+  ];
+  const calls = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const permissions = await readReviewerPermissions({
+    repo: 'repo',
+    repository: 'owner/repo',
+    reviews,
+    prAuthor: 'pr-author',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      const reviewer = args[1].split('/').slice(-2)[0];
+      calls.push(reviewer);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      return { permission: 'write', user: { login: reviewer } };
+    },
+  });
+  // Each distinct non-authoritative reviewer queried exactly once (dedup).
+  assert.deepEqual([...calls].sort(), ['alice', 'bob', 'carol', 'dave', 'eve']);
+  // Authoritative (OWNER) frank was skipped.
+  assert.equal(permissions.has('frank'), false);
+  // Concurrency was bounded (cap is 4; 5 distinct reviewers → at most 4 in flight).
+  assert.ok(maxInFlight <= 4, `concurrency must be bounded (got maxInFlight=${maxInFlight})`);
+  // Each resolved permission is recorded.
+  assert.equal(permissions.get('alice').permission, 'write');
 });
