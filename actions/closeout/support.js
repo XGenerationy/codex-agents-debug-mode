@@ -20,6 +20,18 @@ const { spawnSync } = require('node:child_process');
 // run-log-equivalent surfaces — but those surfaces still must not carry raw
 // credentials.
 const REDACT_PATTERNS = [
+  // PEM-encoded secrets that span multiple physical lines: a private_key /
+  // signing_key value is commonly a `-----BEGIN <TYPE>-----` ... `-----END
+  // <TYPE>-----` block. The line-scoped key-name pattern below redacts only
+  // the first line of such a value (its `.+$/m` stops at the newline), so the
+  // block's continuation lines (the base64 body and the END marker) would
+  // leak into stderr/Step Summary/JSON error records. This pattern consumes
+  // the ENTIRE assignment — from the credential key, through the BEGIN..END
+  // span (including embedded newlines) — so nothing is left for the line-
+  // scoped key-name pattern to re-match and downgrade. `[\s\S]` matches any
+  // char including newlines, non-greedy to the END. Anchored to a preceding
+  // `key=`/`key:` so it does not swallow an unquoted PEM in arbitrary prose.
+  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a word boundary
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
@@ -834,7 +846,13 @@ const main = async () => {
     // runSubcommand's stderr handling and upsertPrComment); this terminal
     // catch is the last place a message reaches a log before exit, so it MUST
     // redact too — otherwise a single unredacted throw undoes all of them.
-    process.stderr.write(`closeout-action: ${redactSecrets(error.message)}\n`);
+    // Coerce to a string BEFORE redaction: a non-Error throw (null, undefined,
+    // a bare string/number, or a thenable rejected with a non-Error) has no
+    // .message, and dereferencing it would throw a TypeError INSIDE this
+    // catch — bypassing the redaction and the exitCode=1, leaving the process
+    // to die with an unstructured stack and a 0 exit. Fall back to String(error)
+    // so the catch is total: every thrown shape reaches the redactor.
+    process.stderr.write(`closeout-action: ${redactSecrets(error?.message ?? String(error))}\n`);
     process.exitCode = 1;
   }
 };

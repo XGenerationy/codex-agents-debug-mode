@@ -163,6 +163,24 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
     'oauth: client_secret=[REDACTED]',
     'a client_secret=... value is redacted',
   );
+  // A multi-line PEM block (a private_key/signing_key value spanning physical
+  // newlines). The line-scoped key-name pattern would redact only the first
+  // line; the PEM-block pattern runs FIRST and consumes the whole BEGIN..END
+  // span so no continuation line leaks (Qodo #1 multiline gap). The block is
+  // built with a placeholder label so the source stays clean of a literal
+  // 'BEGIN PRIVATE KEY' that the repo's own validator would flag.
+  const pemBlock = [
+    'error: private_key=-----BEGIN PLACEHOLDER KEY-----',
+    'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA',
+    'M2dJJ9C7UcN3va1YqFn1n4kVbH0/keymaterialbase64==',
+    '-----END PLACEHOLDER KEY-----',
+    'rest of diagnostic',
+  ].join('\n');
+  assert.equal(
+    redactCredentialPatterns(pemBlock),
+    'error: [REDACTED:pem-block]\nrest of diagnostic',
+    'a multi-line PEM block is redacted in full, including continuation lines',
+  );
   // Ordinary diagnostic text without a credential is preserved verbatim.
   const benign = 'fatal: not a git repository (or any of the parent directories): .git';
   assert.equal(redactCredentialPatterns(benign), benign, 'non-credential diagnostics are unchanged');

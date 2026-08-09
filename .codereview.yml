@@ -125,6 +125,15 @@ pre_merge_checks:
       missing a top-level `permissions:` block. Quoted-key (`- "uses": ...`)
       and whitespace-variant block forms (`uses : ref`) ARE supported and
       enforced like ordinary block `uses:` (must be `./...` or `@<40-hex>`).
+      The scanner also rejects, fail-closed, YAML forms that obscure the `uses`
+      key spelling — a tag (`- !!str uses: ref`), an anchor on the key
+      (`- &step uses: ref`, alone or combined with a tag), an escape-obfuscated
+      double-quoted key (`- "u\u0073es": ref`, which resolves to `uses`), and
+      the explicit mapping-key form (`- ? uses` / `: ref`). These are reported
+      as suspicious-uses violations (rewrite in clean block style or review
+      manually) because a regex cannot positively confirm the ref is pinned;
+      single-quoted escapes are not flagged (YAML single-quoted scalars have no
+      escape processing, so they cannot spell `uses` obliquely).
     issue_assessment:
       severity: error
 

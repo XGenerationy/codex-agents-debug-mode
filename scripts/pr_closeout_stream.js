@@ -32,6 +32,13 @@ const isSensitiveEnvName = (name) => {
 // is deliberately broad. Mirrors actions/closeout/support.js's REDACT_PATTERNS
 // so the action layer and the gate CLI agree on what a credential looks like.
 const CREDENTIAL_PATTERNS = [
+  // PEM-encoded secrets that span multiple physical lines (a private_key /
+  // signing_key value is commonly a `-----BEGIN <TYPE>-----` ... `-----END
+  // <TYPE>-----` block). The line-scoped key-name pattern below redacts only
+  // the first line of such a value, so this multi-line pattern runs FIRST and
+  // consumes the entire BEGIN..END span (including embedded newlines). Mirrors
+  // support.js's REDACT_PATTERNS so both layers agree.
+  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a minimum length
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],

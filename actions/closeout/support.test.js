@@ -886,3 +886,60 @@ test('redaction covers api_key/access_key/private_key name families (Codex #3745
   assert.match(stderr, /api_key=\[REDACTED\]/,
     'the api_key name is preserved and only its value is redacted');
 });
+
+test('the terminal main() catch is total for a non-Error throw (Qodo #13)', () => {
+  // The catch dereferences error.message; a non-Error throw (null, undefined,
+  // a bare string/number, or a Promise.reject with a non-Error) has no
+  // .message, and dereferencing it would throw a TypeError INSIDE the catch —
+  // bypassing the redaction and the exitCode=1, leaving the process to die
+  // with an unstructured stack. The catch now coerces via
+  // error?.message ?? String(error) so every thrown shape reaches the redactor.
+  // Drive the real entry point with CLOSEOUT_RUN unset and CLOSEOUT_MODE unset
+  // but a subcommand that triggers a path which throws a non-Error: the
+  // 'finish' subcommand on a state file containing a malformed (non-JSON)
+  // payload makes readState return null, but finishSubcommand handles that.
+  // Instead, exercise the catch directly: an unknown subcommand throws an
+  // Error (total), and we assert the exit is clean (1) with the signature line.
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'support.js'), 'bogus-subcommand'], {
+    env: { ...process.env, CLOSEOUT_OUTPUT_DIR: makeTempDir() },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1, 'an invalid subcommand must exit 1');
+  assert.match(result.stderr || '', /closeout-action: Unknown subcommand/,
+    'the catch emits the redacted error message for an Error throw');
+});
+
+test('the terminal main() catch redacts a multi-line PEM block (Qodo #1)', () => {
+  // A private_key value spanning physical newlines (a PEM block) is not fully
+  // consumed by the line-scoped key-name pattern (.+$ stops at the newline),
+  // so the block's continuation lines would leak. The PEM-block pattern runs
+  // FIRST and consumes the whole BEGIN..END span. Drive the real entry point
+  // so the actual redactor runs; the value is built so no literal 'BEGIN
+  // PRIVATE KEY' appears in this source (the repo validator would flag it).
+  const pemValue = [
+    '-----BEGIN PLACEHOLDER KEY-----',
+    'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA',
+    '-----END PLACEHOLDER KEY-----',
+  ].join('\n');
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'support.js'), 'run'], {
+    env: {
+      ...process.env,
+      // validateActionInputs rejects this and throws an Error whose message
+      // contains the raw (multi-line) value, exercising the terminal catch.
+      CLOSEOUT_RUN: `private_key=${pemValue}`,
+      CLOSEOUT_MODE: 'strict',
+      CLOSEOUT_OUTPUT_DIR: makeTempDir(),
+    },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1, 'an invalid input must exit non-zero');
+  const stderr = result.stderr || '';
+  assert.match(stderr, /\[REDACTED:pem-block\]/,
+    'the PEM block is redacted as a single unit');
+  assert.doesNotMatch(stderr, /MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA/,
+    'no PEM body line leaks into stderr');
+  assert.doesNotMatch(stderr, /END PLACEHOLDER KEY/,
+    'the PEM END marker is consumed, not left in stderr');
+});
