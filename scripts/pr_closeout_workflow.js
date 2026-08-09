@@ -730,15 +730,9 @@ const ESSENTIAL_ENV = new Set([
  * @param {{requiredEnv?: string[], safeEnv?: string[]}} config
  * @returns {NodeJS.ProcessEnv}
  */
-// Names a PR-controlled config can NEVER opt into via requiredEnv/safeEnv:
-// they carry the workflow token or runner command-file paths that PR code must
-// not reach, OR they match the generic sensitive-name predicate (mirrors
-// pr_closeout_stream.js's SENSITIVE_ENV_NAME). buildChildEnvironment already
-// strips credential-shaped names for child command processes, but
-// buildWorkflowEnvironment feeds the PLAN preflight and engine check processes,
-// and its config is part of the PR — so a hard denylist here prevents a PR
-// from adding GH_TOKEN (or AWS_SECRET_ACCESS_KEY, LICENSE_KEY, etc.) to safeEnv
-// to exfiltrate them via a repository-local preflight probe.
+// Runner command-file names that must NEVER pass to PR-controlled processes
+// (plan preflight or full-run commands) regardless of config. These are not
+// credentials — they are runner-control surfaces.
 const DENYLISTED_ENV_NAMES = new Set([
   'GH_TOKEN',
   'GITHUB_TOKEN',
@@ -748,11 +742,15 @@ const DENYLISTED_ENV_NAMES = new Set([
   'GITHUB_STEP_SUMMARY',
   'GITHUB_STATE',
 ]);
-// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME plus the NPM _auth suffix
-// — credential-shaped patterns that must NEVER pass through a PR-controlled
-// allowlist. The _AUTH alternative covers NPM_CONFIG__AUTH and similar.
+// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME plus the NPM _auth suffix.
+// Applied ONLY to untrusted plan admission (buildPlanPreflightEnvironment), NOT
+// to full-run command execution (buildWorkflowEnvironment) — a full run is
+// attested and may legitimately need credential-shaped requiredEnv/safeEnv.
 const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONNECTION_STRING|COOKIE|CREDENTIAL|DATABASE_URL|DSN|ENCRYPTION_KEY|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
 
+// Full-run environment: ESSENTIAL_ENV + requiredEnv/safeEnv, minus the runner
+// command-file denylist. Credential-shaped names ARE allowed here because a
+// full run is attested and may legitimately need them (API_TOKEN, etc.).
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
     ...(config.requiredEnv || []),
@@ -761,9 +759,20 @@ const buildWorkflowEnvironment = (env, config) => {
   return Object.fromEntries(Object.entries(env).filter(([name]) => {
     const upper = name.toUpperCase();
     if (DENYLISTED_ENV_NAMES.has(upper)) return false;
-    if (SENSITIVE_ENV_PATTERN.test(name)) return false;
     return ESSENTIAL_ENV.has(upper) || explicit.has(upper);
   }));
+};
+
+// Plan-preflight environment: same as full-run, PLUS the sensitive-name pattern
+// is hard-denied. Plan admission runs BEFORE attestation on PR-controlled code,
+// so a PR cannot exfiltrate credentials via repository-local preflight probes
+// by listing them in safeEnv. Once a run is attested, buildWorkflowEnvironment
+// (above) restores the explicit-allowlist behavior for legitimate credentials.
+const buildPlanPreflightEnvironment = (env, config) => {
+  const filtered = buildWorkflowEnvironment(env, config);
+  return Object.fromEntries(Object.entries(filtered).filter(([name]) => (
+    !SENSITIVE_ENV_PATTERN.test(name)
+  )));
 };
 
 /**
@@ -1015,7 +1024,7 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       // job secrets to PR-controlled code in a preview advertised as
       // read-only. The parent gh lookups do not use this env — they read
       // GH_TOKEN from process.env through their own execFile call.
-      preflight = await d.runPreflight({ repo, config, env: buildWorkflowEnvironment(process.env, config), toolProbes });
+      preflight = await d.runPreflight({ repo, config, env: buildPlanPreflightEnvironment(process.env, config), toolProbes });
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
     }

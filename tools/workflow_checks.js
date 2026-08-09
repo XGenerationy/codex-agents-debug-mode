@@ -48,7 +48,7 @@ const COMMENT_LINE = /^\s*#/;
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so
 // a `uses:` or `{uses:}` inside such a value is script text and must not be
 // flagged. (A real `uses:` key cannot coexist with `run:` on one line.)
-const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:run|entrypoint|shell)\s*:/;
+const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:['"]?)(?:run|entrypoint|shell)(?:['"]?)\s*:/;
 // Any YAML key line that opens a block scalar (`key: |` or `key: >`),
 // regardless of which key it is. A block scalar's body is raw string content
 // on subsequent more-indented lines — `with.script: |` (github-script bodies

@@ -496,15 +496,18 @@ const runSubcommand = async ({
   inputs, inputBaseRef = '', config = '', outputDir, artifactName,
   env = process.env, event = null, spawnCli = defaultSpawnCli,
 }) => {
-  // Remove any stale state file from a PREVIOUS run before anything else —
-  // even before input validation, which can throw. If a later step fails
-  // before writing fresh state, the always()-triggered comment step reads
-  // no state and skips, instead of posting the previous run's decision.
-  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
   const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
+  // Validate the output directory is outside the workspace BEFORE any stale-
+  // state cleanup: an inside-workspace output-dir must fail without touching
+  // the checkout, not delete a tracked action-state.json first.
   assertOutputOutsideWorkspace({ outputDir, workspace: env.GITHUB_WORKSPACE });
+  // Remove any stale state file from a PREVIOUS run before doing anything else.
+  // If a later step fails before writing fresh state, the always()-triggered
+  // comment step reads no state and skips, instead of posting the previous
+  // run's decision. Safe to do now: the output dir is proven outside the workspace.
+  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
   // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
   // discipline: the evidence dir can hold unredacted runner paths / base refs
   // before the CLI's own redaction runs, and on a multi-user self-hosted
