@@ -219,15 +219,18 @@ test('findUnpinnedUses exempts a uses token inside a quoted scalar value (Qodo #
     'a flow-style action uses: is still flagged');
 });
 
-test('findUnpinnedUses flags a tagged uses key that YAML resolves to a property (Codex P2)', () => {
-  // A YAML tag applied to the key — `- !!str uses: owner/action@main` —
-  // parses (verified with js-yaml) to an ordinary `{uses: "owner/action@main"}`
-  // mapping. Neither USES_LINE (blocked by the `!!str ` prefix) nor the old
-  // SUSPICIOUS_USES (no tag allowance) saw it, so an unpinned remote action
-  // could bypass the pinning check. The scanner now treats any tag indicator
-  // before the key as fail-closed suspicious: it cannot confirm the ref is
-  // safe, so it flags for manual review rather than silently passing.
+test('findUnpinnedUses flags a tagged/anchored uses key that YAML resolves to a property (Codex P2, CodeRabbit)', () => {
+  // A YAML tag or anchor applied to the key — `- !!str uses:` / `- &step uses:`
+  // / `- &step !!str uses:` / `- !!str &step uses:` — parses (verified with
+  // js-yaml) to an ordinary unpinned `{uses: "owner/action@main"}` mapping.
+  // Neither USES_LINE (blocked by the `!!str `/`&step ` prefix) nor the old
+  // SUSPICIOUS_USES (no tag/anchor allowance) saw these, so an unpinned remote
+  // action could bypass the pinning check. The scanner now treats any tag
+  // (`!!str`, `!`, `!<...>`) or anchor (`&name`) indicator before the key, in
+  // either order and combination, as fail-closed suspicious: it cannot confirm
+  // the ref is safe, so it flags for manual review rather than silently passing.
   const flagged = (ref) => findUnpinnedUses(ref).length === 1;
+  // Tag-only forms.
   assert.equal(flagged('steps:\n  - !!str uses: owner/action@main\n'), true,
     '!!str uses: resolves to a real unpinned uses and must be flagged');
   assert.equal(flagged('steps:\n  - ! uses: owner/action@main\n'), true,
@@ -236,10 +239,18 @@ test('findUnpinnedUses flags a tagged uses key that YAML resolves to a property 
     'an angle-bracket tag on uses: must be flagged');
   assert.equal(flagged('steps:\n  - !!str "uses": owner/action@main\n'), true,
     'a tag on a quoted uses: key must be flagged');
-  // A tag is vanishingly rare on real workflow keys, but a clean PINNED uses:
-  // (the overwhelmingly common form) must never regress.
+  // Anchor-before-key forms (CodeRabbit): the anchor alone, or combined with
+  // a tag in either order, all resolve to {uses: ...} via js-yaml.
+  assert.equal(flagged('steps:\n  - &step uses: owner/action@main\n'), true,
+    '&step uses: (anchor on the key) resolves to a real unpinned uses and must be flagged');
+  assert.equal(flagged('steps:\n  - &step !!str uses: owner/action@main\n'), true,
+    '&step !!str uses: (anchor then tag) must be flagged');
+  assert.equal(flagged('steps:\n  - !!str &step uses: owner/action@main\n'), true,
+    '!!str &step uses: (tag then anchor) must be flagged');
+  // A tag/anchor is vanishingly rare on real workflow keys, but a clean
+  // PINNED uses: (the overwhelmingly common form) must never regress.
   assert.deepEqual(findUnpinnedUses('steps:\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'), [],
-    'a clean pinned uses: is unaffected by the tag handling');
+    'a clean pinned uses: is unaffected by the tag/anchor handling');
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
