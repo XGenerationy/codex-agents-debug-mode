@@ -80,7 +80,13 @@ const findUnpinnedUses = (content) => {
   // items where sibling keys share the dash level but body is deeper.
   let scalarBodyIndent = -1;  // active body indent, or -1 when not in a scalar
   let scalarPending = false;   // header seen, waiting for first body line
-  let scalarHeaderIndent = -1; // mapping-key indent of the header's own line
+  // The column at which the header's mapping KEY begins, in the SAME units as
+  // `indent` (the character column, which for a body line equals its leading-
+  // whitespace count). For a sequence item this is the END of the dash prefix
+  // (`  - name:` → key starts at column 4), so it is the matched prefix length,
+  // NOT the leading-whitespace indent. A following non-blank line is scalar
+  // body only if its column is strictly greater than this key column.
+  let scalarHeaderIndent = -1;
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
     // Inside a block scalar? Skip body lines.
@@ -146,6 +152,14 @@ const findUnpinnedUses = (content) => {
     // inside a quoted scalar value (e.g. `name: "{uses: foo}"`), where it is
     // string text, not a YAML key. A simple quote-count check: if the match
     // position is between an odd number of quotes, it's inside a string.
+    //
+    // Residual (Qodo #14, accepted limitation): a `uses:` that is a VALUE-LEVEL
+    // key inside a flow mapping for a non-action context — `env: {uses: production}`
+    // or `with: {uses: x}` — is also flagged. A regex cannot distinguish that
+    // from a real reusable-workflow reference `release: {uses: owner/repo/.github/...}`,
+    // which MUST be caught. The fail-closed posture (flag what cannot be
+    // positively confirmed) is the documented contract: rewrite value-level
+    // `uses:` keys in block style, or rename the env/with key, to clear the flag.
     const suspiciousMatch = SUSPICIOUS_USES.exec(text);
     if (suspiciousMatch) {
       const beforeMatch = text.substring(0, suspiciousMatch.index);

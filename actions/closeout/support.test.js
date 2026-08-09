@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { mkdtempSync, readFileSync: readFs, symlinkSync, writeFileSync: writeFs } = require('node:fs');
+const { mkdtempSync, mkdirSync, readFileSync: readFs, symlinkSync, writeFileSync: writeFs } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
@@ -406,6 +406,37 @@ test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outp
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.tier, 'plan');
   assert.equal(state.decision.success, true);
+});
+
+test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {
+  // The stale-state cleanup must only swallow the benign ENOENT ("no previous
+  // state") case. Any other unlink failure (here: action-state.json exists as
+  // a DIRECTORY, so unlink fails with EISDIR) must FAIL the run step rather
+  // than silently leave the old state for the always()-gated comment step to
+  // post as the current run's decision.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  mkdirSync(outputDir, { recursive: true });
+  // Plant a hostile action-state.json that is a directory: unlinkSync throws
+  // EISDIR (not ENOENT), which must propagate.
+  mkdirSync(path.join(outputDir, 'action-state.json'));
+  await assert.rejects(
+    runSubcommand({
+      inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+      inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+      env: { GITHUB_BASE_REF: 'main' },
+      event: {},
+      spawnCli: () => ({ status: 0, stdout: '{}\n', stderr: '' }),
+    }),
+    (error) => {
+      // The unlink of a directory fails with EISDIR (POSIX) or EPERM (Windows);
+      // either way it is NOT the benign ENOENT the cleanup is allowed to swallow.
+      assert.notEqual(error?.code, 'ENOENT', 'ENOENT must be the only swallowed unlink error');
+      assert.ok(['EISDIR', 'EPERM'].includes(error?.code), `expected a non-ENOENT unlink error, got ${error?.code}`);
+      return true;
+    },
+    'a non-ENOENT unlink failure must fail the run step, not be masked',
+  );
 });
 
 test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {

@@ -510,7 +510,15 @@ const runSubcommand = async ({
   // If a later step fails before writing fresh state, the always()-triggered
   // comment step reads no state and skips, instead of posting the previous
   // run's decision. Safe to do now: the output dir is proven outside the workspace.
-  try { unlinkSync(path.join(outputDir, STATE_FILE)); } catch { /* nothing to clear */ }
+  // Only the benign "no previous state" (ENOENT) case is ignored: any other
+  // unlink failure (EACCES/EPERM, or the path being a directory/symlink the
+  // safety checks did not catch) must FAIL the run step rather than silently
+  // leave the old state in place for the comment step to post (Qodo #13).
+  try {
+    unlinkSync(path.join(outputDir, STATE_FILE));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
   // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
   // discipline: the evidence dir can hold unredacted runner paths / base refs
   // before the CLI's own redaction runs, and on a multi-user self-hosted

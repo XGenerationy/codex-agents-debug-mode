@@ -183,6 +183,38 @@ test('findUnpinnedUses flags sibling uses after a multi-space sequence dash', ()
     'a deeper-indented line is real scalar body and must not be flagged');
 });
 
+test('findUnpinnedUses does not false-positive on a valid deeper block-scalar body (Qodo #10)', () => {
+  // The empty-scalar sibling detection compares the first body line's column
+  // against the header's KEY column (the END of any dash prefix), measured in
+  // the same units as the line's leading-whitespace indent. A genuine scalar
+  // body is strictly more indented than the key column, so it is correctly
+  // treated as body content — even when the body text begins with `uses:`.
+  // (A line at the key column itself is an empty scalar + sibling key, which
+  // IS scanned — see the sibling-uses tests above.)
+  assert.deepEqual(findUnpinnedUses('steps:\n  - run: |\n      uses: not-a-key\n'), [],
+    'a deeper-indented body line beginning with uses: is script text, not a key');
+  assert.deepEqual(findUnpinnedUses('  -  run: |\n        uses: not-a-key\n'), [],
+    'a deeper-indented body under a multi-space dash is script text');
+  assert.deepEqual(findUnpinnedUses('jobs:\n  b:\n    steps:\n      - run: |\n          echo "uses: x"\n'), [],
+    'a realistic nested run block-scalar body is not flagged');
+});
+
+test('findUnpinnedUses exempts a uses token inside a quoted scalar value (Qodo #14)', () => {
+  // A `{uses: ...}` or `uses:` appearing inside a quoted scalar value is
+  // string text, not a YAML key, and must not be flagged. This is the quoted-
+  // scalar case the finding names; an unquoted value-level flow `uses:`
+  // (e.g. `env: {uses: production}`) is a documented accepted limitation of
+  // the conservative fail-closed regex design — see the inline note in
+  // workflow_checks.js.
+  assert.deepEqual(findUnpinnedUses('name: "{uses: foo@bar}"\n'), [],
+    'a {uses:...} inside a double-quoted value is string text');
+  assert.deepEqual(findUnpinnedUses('description: "uses: foo@bar inline"\n'), [],
+    'a uses: inside a double-quoted value is string text');
+  // Real flow-style action references are still caught.
+  assert.equal(findUnpinnedUses('  - {uses: owner/action@main}\n').length, 1,
+    'a flow-style action uses: is still flagged');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
