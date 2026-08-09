@@ -801,7 +801,16 @@ const main = async () => {
       throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use run, comment, or finish.`);
     }
   } catch (error) {
-    process.stderr.write(`closeout-action: ${error.message}\n`);
+    // The thrown message can carry credential-shaped values that bypassed
+    // every upstream redaction point: an invalid action input (e.g. a base-ref
+    // or config value a caller built from a leaked token), or an Error
+    // constructed from raw child-process stderr that echoed a git remote URL
+    // embedding x-access-token:SECRET. Every other surface that emits
+    // untrusted/CLI-derived text already routes through redactSecrets (see
+    // runSubcommand's stderr handling and upsertPrComment); this terminal
+    // catch is the last place a message reaches a log before exit, so it MUST
+    // redact too — otherwise a single unredacted throw undoes all of them.
+    process.stderr.write(`closeout-action: ${redactSecrets(error.message)}\n`);
     process.exitCode = 1;
   }
 };

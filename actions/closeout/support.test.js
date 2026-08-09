@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { mkdtempSync, mkdirSync, readFileSync: readFs, symlinkSync, writeFileSync: writeFs } = require('node:fs');
+const { spawnSync } = require('node:child_process');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
@@ -793,4 +794,39 @@ test('a comment API failure propagates — the consumer opted in, silence would 
     }),
     /HTTP 403/,
   );
+});
+
+test('the terminal main() catch redacts a credential-shaped invalid input (Qodo #1)', () => {
+  // The catch at the end of main() is the LAST surface a thrown message
+  // reaches before the process exits. Every upstream redaction point
+  // (runSubcommand's stderr, upsertPrComment) is bypassed when INPUT
+  // VALIDATION itself throws — validateActionInputs embeds the raw env value
+  // verbatim in its "Unknown run input value: <value>" message, so a hostile
+  // operator who sets CLOSEOUT_RUN to a leaked token would land that token
+  // in the run log unless this terminal catch redacts. This integration test
+  // drives the REAL entry point as a child process (require.main === module)
+  // so the actual catch runs, not a mock. The token is assembled by
+  // concatenation so the literal does not appear in THIS source file either
+  // (the repo's own validator would otherwise flag it on this path).
+  const token = ['ghp', '_', 'qW3rTyUiOpAsDfGhJkLzxCvBnM1234567890'].join('');
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'support.js'), 'run'], {
+    env: {
+      ...process.env,
+      // A token-shaped value in a validated input: rejected by
+      // validateActionInputs, whose Error message contains the raw token.
+      CLOSEOUT_RUN: token,
+      CLOSEOUT_MODE: 'strict',
+      CLOSEOUT_OUTPUT_DIR: makeTempDir(),
+    },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1, 'an invalid input must still exit non-zero');
+  const stderr = result.stderr || '';
+  assert.doesNotMatch(stderr, new RegExp(token),
+    'the leaked token must be redacted from the terminal catch stderr');
+  assert.match(stderr, /REDACTED/,
+    'the redaction marker must replace the credential in stderr');
+  assert.match(stderr, /closeout-action:/,
+    'the terminal catch signature line is still emitted for diagnostics');
 });

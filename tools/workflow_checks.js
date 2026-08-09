@@ -36,13 +36,19 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 // A `uses` token that looks like a YAML key but is NOT a clean USES_LINE
 // match. This catches flow style (`- {uses: ...}`, `release: {uses: ...}`,
 // `[{uses: ...}]`), anchors (`uses: &name ref`), multi-entry flow sequences,
+// TAGGED keys (`- !!str uses: owner/action@main` — js-yaml resolves the tag
+// and the line parses to an ordinary unpinned `uses` property, a real bypass),
 // and any other form the block-style regex cannot parse. To avoid false
 // positives on `run:` string values, the token must appear at a YAML KEY
 // position: after optional indentation + optional `-` (block-style key), OR
 // inside `{}`/`[]` (flow context). A `uses:` buried inside a `run: echo
 // uses: foo` string scalar does NOT match because it is preceded by other
-// non-key content, not by a line-start or brace boundary.
-const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?|[{[][^}]*|,\s*)['"]?uses['"]?\s*:/;
+// non-key content, not by a line-start or brace boundary. The optional tag
+// indicator (`!!str`, `!`, `!<...>`) before the key is matched explicitly so
+// a tag that resolves to a real property cannot slip past — a tagged key is
+// vanishingly rare in real workflow YAML, so matching it is fail-closed:
+// flag for manual review rather than risk an unpinned-action bypass.
+const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+)*|[{[][^}]*|,\s*)(?:!\S*\s+)*['"]?uses['"]?\s*:/;
 const COMMENT_LINE = /^\s*#/;
 // A line whose YAML value is a raw string scalar (shell script, command).
 // Everything after `run:`/`entrypoint:` is string content, not YAML keys, so

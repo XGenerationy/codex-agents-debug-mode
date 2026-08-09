@@ -219,6 +219,29 @@ test('findUnpinnedUses exempts a uses token inside a quoted scalar value (Qodo #
     'a flow-style action uses: is still flagged');
 });
 
+test('findUnpinnedUses flags a tagged uses key that YAML resolves to a property (Codex P2)', () => {
+  // A YAML tag applied to the key — `- !!str uses: owner/action@main` —
+  // parses (verified with js-yaml) to an ordinary `{uses: "owner/action@main"}`
+  // mapping. Neither USES_LINE (blocked by the `!!str ` prefix) nor the old
+  // SUSPICIOUS_USES (no tag allowance) saw it, so an unpinned remote action
+  // could bypass the pinning check. The scanner now treats any tag indicator
+  // before the key as fail-closed suspicious: it cannot confirm the ref is
+  // safe, so it flags for manual review rather than silently passing.
+  const flagged = (ref) => findUnpinnedUses(ref).length === 1;
+  assert.equal(flagged('steps:\n  - !!str uses: owner/action@main\n'), true,
+    '!!str uses: resolves to a real unpinned uses and must be flagged');
+  assert.equal(flagged('steps:\n  - ! uses: owner/action@main\n'), true,
+    'a bare non-specific tag ! on uses: must be flagged');
+  assert.equal(flagged('steps:\n  - !<tag:yaml.org,2002:str> uses: owner/action@main\n'), true,
+    'an angle-bracket tag on uses: must be flagged');
+  assert.equal(flagged('steps:\n  - !!str "uses": owner/action@main\n'), true,
+    'a tag on a quoted uses: key must be flagged');
+  // A tag is vanishingly rare on real workflow keys, but a clean PINNED uses:
+  // (the overwhelmingly common form) must never regress.
+  assert.deepEqual(findUnpinnedUses('steps:\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n'), [],
+    'a clean pinned uses: is unaffected by the tag handling');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
