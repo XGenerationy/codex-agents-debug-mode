@@ -30,6 +30,10 @@ jobs:
           # Full history: the gate resolves merge-base and diffs the whole
           # PR range, not just the tip commit.
           fetch-depth: 0
+          # Do not persist checkout credentials: plan admission can execute
+          # repository-local preflight probes, and a persisted git token could
+          # be exfiltrated from the read-only preview.
+          persist-credentials: false
 
       # Fork-PR note: this preview is read-only by design, so the reduced
       # fork token is sufficient. The pr-comment opt-in would NOT work from

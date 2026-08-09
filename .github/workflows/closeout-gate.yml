@@ -11,7 +11,7 @@ on:
     # or a RETARGET to a different base branch (edited — the attestation is
     # base-bound, so a retarget invalidates it) all must re-trigger the gate
     # so a stale PASS never outlives the state it attested.
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       base-ref:

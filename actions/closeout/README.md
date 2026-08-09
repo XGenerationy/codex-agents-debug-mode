@@ -66,6 +66,9 @@ jobs:
           # Full history: the gate resolves merge-base and diffs the whole
           # PR range, not just the tip commit.
           fetch-depth: 0
+          # Do not persist checkout credentials: plan admission can execute
+          # repository-local preflight probes.
+          persist-credentials: false
 
       # Fork-PR note: this preview is read-only by design, so the reduced
       # fork token is sufficient. The pr-comment opt-in would NOT work from
@@ -93,7 +96,7 @@ on:
     # without a fresh `submitted` event: a dismissed approval, an edited
     # review body, a pushed head change, or a reopened PR must each produce a
     # fresh gate result so a stale PASS cannot outlive the state it attested.
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       base-ref:

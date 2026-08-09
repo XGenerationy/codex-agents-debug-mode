@@ -280,6 +280,9 @@ const resolveBaseSha = (repoRoot = root) => {
   // a stable ref like origin/release/7) into engine child environments, since
   // buildWorkflowEnvironment strips GITHUB_BASE_REF. Consume it here too so the
   // suppression/gate scan diffs against the correct PR base, not a main fallback.
+  // If the injected ref is set but merge-base fails (unfetched, renamed,
+  // deleted), fail CLOSED rather than silently falling back to an unrelated
+  // base — a wrong-base scan can miss touched suppressions or gate weakenings.
   const resolvedBaseRef = (process.env.CLOSEOUT_RESOLVED_BASE_REF || '').trim();
   if (resolvedBaseRef) {
     try {
@@ -288,8 +291,11 @@ const resolveBaseSha = (repoRoot = root) => {
         comparisonStyle = 'three-dot';
         return mb;
       }
-    } catch {
-      // Fall through to the GITHUB_BASE_REF / origin/main resolution below.
+    } catch (error) {
+      throw new Error(
+        `CLOSEOUT_RESOLVED_BASE_REF was set to "${resolvedBaseRef}" but merge-base failed: `
+        + `${error.message}. Refusing to fall back to an unrelated base for the suppression/gate scan.`,
+      );
     }
   }
 
