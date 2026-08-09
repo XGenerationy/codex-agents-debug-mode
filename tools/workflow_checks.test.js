@@ -188,12 +188,16 @@ test('findUnpinnedUses does not false-positive on a valid deeper block-scalar bo
   // against the header's KEY column (the END of any dash prefix), measured in
   // the same units as the line's leading-whitespace indent. A genuine scalar
   // body is strictly more indented than the key column, so it is correctly
-  // treated as body content — even when the body text begins with `uses:`.
+  // treated as body content — even when the body text contains a token that
+  // SUSPICIOUS_USES would otherwise flag. The body token `{uses: owner/action@main}`
+  // is chosen deliberately: it matches SUSPICIOUS_USES in isolation, so this
+  // test proves scalar-body tracking actively suppresses it (a `uses:`-like
+  // script fragment would be a false positive without tracking).
   // (A line at the key column itself is an empty scalar + sibling key, which
   // IS scanned — see the sibling-uses tests above.)
-  assert.deepEqual(findUnpinnedUses('steps:\n  - run: |\n      uses: not-a-key\n'), [],
-    'a deeper-indented body line beginning with uses: is script text, not a key');
-  assert.deepEqual(findUnpinnedUses('  -  run: |\n        uses: not-a-key\n'), [],
+  assert.deepEqual(findUnpinnedUses('steps:\n  - run: |\n      {uses: owner/action@main}\n'), [],
+    'a deeper-indented body line matching SUSPICIOUS_USES is script text, not a key');
+  assert.deepEqual(findUnpinnedUses('  -  run: |\n        {uses: owner/action@main}\n'), [],
     'a deeper-indented body under a multi-space dash is script text');
   assert.deepEqual(findUnpinnedUses('jobs:\n  b:\n    steps:\n      - run: |\n          echo "uses: x"\n'), [],
     'a realistic nested run block-scalar body is not flagged');

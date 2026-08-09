@@ -772,8 +772,10 @@ test('readReviewerPermissions resolves unique reviewers with bounded concurrency
   assert.deepEqual([...calls].sort(), ['alice', 'bob', 'carol', 'dave', 'eve']);
   // Authoritative (OWNER) frank was skipped.
   assert.equal(permissions.has('frank'), false);
-  // Concurrency was bounded (cap is 4; 5 distinct reviewers → at most 4 in flight).
-  assert.ok(maxInFlight <= 4, `concurrency must be bounded (got maxInFlight=${maxInFlight})`);
+  // Concurrency reached the configured batch cap (4): with 5 distinct eligible
+  // reviewers and a yielding runGh stub, a sequential loop (maxInFlight === 1)
+  // would reintroduce the N+1 — so assert the cap is actually exercised.
+  assert.equal(maxInFlight, 4, `lookups must run in batches of four (got maxInFlight=${maxInFlight})`);
   // Each resolved permission is recorded.
   assert.equal(permissions.get('alice').permission, 'write');
 });

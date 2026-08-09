@@ -98,6 +98,11 @@ test('an ambient CLOSEOUT_RESOLVED_BASE_REF does not leak into the fixture base'
   // fixture's normal base resolution runs regardless of the ambient value.
   const repo = await fixtureRepo();
   const firstSha = git(repo, 'rev-list', '--max-parents=0', 'HEAD');
+  // Capture the original value so it is restored in finally — `setScanEnv`
+  // captures the keys it knows about, but this test injects the value itself
+  // after the capture, so without an explicit save/restore the injected ref
+  // would leak into later tests.
+  const previousResolvedBaseRef = process.env.CLOSEOUT_RESOLVED_BASE_REF;
   process.env.CLOSEOUT_RESOLVED_BASE_REF = 'origin/some/ref/absent/from/fixture';
   const restoreEnv = setScanEnv(firstSha);
   try {
@@ -106,6 +111,8 @@ test('an ambient CLOSEOUT_RESOLVED_BASE_REF does not leak into the fixture base'
     assert.equal(getComparisonStyle(), 'two-dot');
   } finally {
     restoreEnv();
+    if (previousResolvedBaseRef === undefined) delete process.env.CLOSEOUT_RESOLVED_BASE_REF;
+    else process.env.CLOSEOUT_RESOLVED_BASE_REF = previousResolvedBaseRef;
     await rm(repo, { recursive: true, force: true });
   }
 });
