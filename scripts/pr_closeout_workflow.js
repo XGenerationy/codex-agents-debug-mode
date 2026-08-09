@@ -1031,6 +1031,19 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
     }
+    // Recheck the tree after preflight: a repository-local probe binary could
+    // modify a tracked file and exit successfully, leaving the pre-probe
+    // cleanTree stale. A dirty post-probe tree must BLOCK the preview.
+    if (preflight.status === 'PASS') {
+      try {
+        const postProbeTree = await d.cleanTreeStatus(repo);
+        if (postProbeTree.status !== 'PASS') {
+          preflight = { status: 'BLOCKED', evidence: `Working tree was clean before preflight but dirty after: ${postProbeTree.evidence}` };
+        }
+      } catch (error) {
+        preflight = { status: 'BLOCKED', evidence: `Post-preflight tree check failed: ${error.message}` };
+      }
+    }
   }
   return { attestation, cleanTree, preflight };
 };
