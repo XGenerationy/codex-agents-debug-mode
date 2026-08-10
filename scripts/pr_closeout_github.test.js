@@ -1,7 +1,12 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
+
 const {
+  buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
   gateAttestationMarker,
@@ -59,6 +64,11 @@ const classifyPr = (pr) => classifyLivePrState({
   expectedBaseSha: 'base123',
   gateAttestation: cleanAttestation(),
 });
+
+const ghEnvKeys = ['GITHUB_ACTIONS', 'GITHUB_REF_NAME', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_PATH'];
+const ghEnvSaved = {};
+test.beforeEach(() => { for (const key of ghEnvKeys) { ghEnvSaved[key] = process.env[key]; } });
+test.afterEach(() => { for (const key of ghEnvKeys) { if (ghEnvSaved[key] === undefined) { delete process.env[key]; } else { process.env[key] = ghEnvSaved[key]; } } });
 
 test('accepts only an independent exact GitHub review attestation marker', () => {
   const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
@@ -726,6 +736,71 @@ test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.reason, undefined);
+});
+
+test('buildGhArgs injects PR number and --repo for pr view under GITHUB_ACTIONS', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REF_NAME = '7/merge';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['pr', 'view', '7', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+});
+
+test('buildGhArgs passes through when GITHUB_ACTIONS is not set', () => {
+  delete process.env.GITHUB_ACTIONS;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs passes through when GITHUB_REPOSITORY is missing', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  delete process.env.GITHUB_REPOSITORY;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs passes through when --repo is already present', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['pr', 'view', '--repo', 'foo/bar'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs appends --repo for repo view under GITHUB_ACTIONS', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['repo', 'view'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['repo', 'view', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+});
+
+test('buildGhArgs pr view passes through when PR number is unresolvable', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REF_NAME = 'feat/closeout-action';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_EVENT_PATH;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs pr view falls back to GITHUB_EVENT_PATH for PR number', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-'));
+  try {
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ pull_request: { number: 42 } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    const result = buildGhArgs(args);
+    assert.deepStrictEqual(result, ['pr', 'view', '42', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('readReviewerPermissions resolves unique reviewers with bounded concurrency and dedup', async () => {

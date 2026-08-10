@@ -1,5 +1,6 @@
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
+const { readFileSync } = require('node:fs');
 
 const execFileAsync = promisify(execFile);
 
@@ -180,8 +181,43 @@ const classifyGateAttestation = ({
   };
 };
 
+const readActionsPrNumber = ({ env }) => {
+  const refName = env.GITHUB_REF_NAME || '';
+  const refMatch = refName.match(/^(\d+)\/merge$/);
+  if (refMatch) return Number(refMatch[1]);
+  if (env.GITHUB_EVENT_PATH) {
+    try {
+      const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
+      const n = Number(event?.pull_request?.number);
+      if (Number.isFinite(n) && n > 0) return n;
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+};
+
+const buildGhArgs = (args, { repo } = {}) => {
+  if (!Array.isArray(args) || args.length < 2) return args;
+  if (process.env.GITHUB_ACTIONS !== 'true') return args;
+  const repository = process.env.GITHUB_REPOSITORY || '';
+  if (!repository.includes('/')) return args;
+  if (args.includes('--repo')) return args;
+
+  const [sub, action] = args;
+  if (sub === 'pr' && action === 'view') {
+    const number = readActionsPrNumber({ env: process.env });
+    if (!number) return args;
+    return ['pr', 'view', String(number), ...args.slice(2), '--repo', repository];
+  }
+  if (sub === 'repo' && action === 'view') {
+    return [...args, '--repo', repository];
+  }
+  return args;
+};
 const defaultRunGh = async (args, { repo } = {}) => {
-  const { stdout } = await execFileAsync('gh', args, {
+  const finalArgs = buildGhArgs(args, { repo });
+  const { stdout } = await execFileAsync('gh', finalArgs, {
     cwd: repo,
     encoding: 'utf8',
     maxBuffer: 20_000_000,
@@ -856,6 +892,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
 };
 
 module.exports = {
+  buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
   gateAttestationMarker,
