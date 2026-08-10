@@ -770,12 +770,20 @@ test('buildGhArgs passes through when --repo is already present', () => {
   assert.strictEqual(result, args);
 });
 
-test('buildGhArgs appends --repo for repo view under GITHUB_ACTIONS', () => {
+test('buildGhArgs injects repository positionally for repo view under GITHUB_ACTIONS', () => {
   process.env.GITHUB_ACTIONS = 'true';
   process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
   const args = ['repo', 'view'];
   const result = buildGhArgs(args);
-  assert.deepStrictEqual(result, ['repo', 'view', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  assert.deepStrictEqual(result, ['repo', 'view', 'XGenerationy/codex-agents-debug-mode']);
+});
+
+test('buildGhArgs injects repository positionally before flags for repo view --json', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['repo', 'view', '--json', 'nameWithOwner'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner']);
 });
 
 test('buildGhArgs pr view passes through when PR number is unresolvable', () => {

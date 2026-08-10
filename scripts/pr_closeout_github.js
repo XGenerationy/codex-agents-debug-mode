@@ -211,7 +211,8 @@ const buildGhArgs = (args, { repo } = {}) => {
     return ['pr', 'view', String(number), ...args.slice(2), '--repo', repository];
   }
   if (sub === 'repo' && action === 'view') {
-    return [...args, '--repo', repository];
+    // gh repo view takes the repository positionally; --repo is not a valid flag
+    return ['repo', 'view', repository, ...args.slice(2)];
   }
   return args;
 };
