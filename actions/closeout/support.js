@@ -31,13 +31,13 @@ const REDACT_PATTERNS = [
   // scoped key-name pattern to re-match and downgrade. `[\s\S]` matches any
   // char including newlines, non-greedy to the END. Anchored to a preceding
   // `key=`/`key:` so it does not swallow an unquoted PEM in arbitrary prose.
-  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
   // A PEM block with NO key-name prefix — a child process (or a CLI diagnostic)
   // can emit a raw `-----BEGIN …-----` block. The keyed pattern above only
   // matches after `key=`/`key:`, so this generic fallback catches an un-prefixed
   // block. Runs AFTER the keyed pattern so `key=-----BEGIN…` is consumed with its
   // key first (CodeRabbit 3745322356).
-  [/-{5}BEGIN [A-Z ]+-{5}[\s\S]*?-{5}END [A-Z ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a word boundary
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
@@ -55,6 +55,14 @@ const REDACT_PATTERNS = [
   // input or a spawn failure. Underscore AND hyphen separators are matched so
   // `api-key=` is covered too. Without these, the terminal catch and the
   // failure summary/state artifact could emit a raw *_key value verbatim.
+  // A standard space-delimited Bearer credential (`Bearer eyJ...` with no
+  // colon or equals sign) — every alternation above requires `[:=]`, so a raw
+  // bearer token emitted by a child process diagnostic would leak. Match the
+  // RFC 6750 scheme form and redact the credential following it (CodeRabbit
+  // #6X72Zq). Runs before the generic key=value pattern so the longer match
+  // wins; case-insensitive; the credential is the first non-space token after
+  // the scheme name.
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED:token]'],
   [/(Authorization|Bearer|token|password|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|client[_-]?secret)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
 ];
 
@@ -317,7 +325,7 @@ const ATTESTATION_LABELS = new Map([
  * @param {{baseRef?: string|null}} [context]
  * @returns {string}
  */
-const renderPlanSummary = (plan, { baseRef = null } = {}) => {
+const renderPlanSummary = (plan, { baseRef = null, artifactName = 'plan.json' } = {}) => {
   // Null-tolerant: the renderers must never be the crash site when a caller
   // hands them a missing record (review decision, Task 2 round) — the
   // failure story belongs to decideExit, not a TypeError in a summary step.
@@ -365,7 +373,15 @@ const renderPlanSummary = (plan, { baseRef = null } = {}) => {
   lines.push('', `### Resolved checks (${checks.length})`, '');
   lines.push(checks.slice(0, 50).map((check) => escapeActionText(check.id)).join(', ') || '(none)');
   lines.push('');
-  return lines.join('\n');
+  // Apply a total byte cap with an in-band artifact pointer, mirroring
+  // renderFullSummary's SUMMARY_EMBED_CAP_BYTES discipline (CodeRabbit #6XsD7q).
+  // Row caps above are per-section; a PR-controlled engine config can still
+  // produce a single error string that expands to more than 1 MiB through
+  // escapeActionText, exceeding GitHub's 1 MiB Step Summary limit and
+  // preventing the preview's primary readiness signal from being uploaded.
+  // The full plan is always in the plan.json artifact, so truncation is
+  // lossless from the operator's perspective.
+  return capText(lines.join('\n'), SUMMARY_EMBED_CAP_BYTES, artifactName).text;
 };
 
 /**
@@ -524,17 +540,18 @@ const runSubcommand = async ({
   inputs, inputBaseRef = '', config = '', outputDir, artifactName,
   env = process.env, event = null, spawnCli = defaultSpawnCli,
 }) => {
-  const { run, mode } = validateActionInputs(inputs);
-  const eventPayload = event ?? readEventPayload(env);
-  const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
-  // Validate the output directory is outside the workspace BEFORE any stale-
-  // state cleanup: an inside-workspace output-dir must fail without touching
-  // the checkout, not delete a tracked action-state.json first.
+  // Stale-state cleanup must run BEFORE input validation (CodeRabbit #6XsD7s):
+  // if an allowed pre-existing external output-dir carries action-state.json
+  // from a PRIOR run and the current `run`/`mode`/`pr-comment` value is
+  // invalid, validateActionInputs would throw below and the composite's
+  // always() artifact/comment/finish steps would read the STALE state and
+  // announce the previous PASS. Clearing first guarantees a failed run step
+  // cannot leave a previous PASS state in place for the comment step to post.
+  //
+  // The output-directory containment check still runs FIRST of all: an inside-
+  // workspace output-dir must fail without touching the checkout, not delete a
+  // tracked action-state.json first.
   assertOutputOutsideWorkspace({ outputDir, workspace: env.GITHUB_WORKSPACE });
-  // Remove any stale state file from a PREVIOUS run before doing anything else.
-  // If a later step fails before writing fresh state, the always()-triggered
-  // comment step reads no state and skips, instead of posting the previous
-  // run's decision. Safe to do now: the output dir is proven outside the workspace.
   // Only the benign "no previous state" (ENOENT) case is ignored: any other
   // unlink failure (EACCES/EPERM, or the path being a directory/symlink the
   // safety checks did not catch) must FAIL the run step rather than silently
@@ -544,6 +561,9 @@ const runSubcommand = async ({
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
+  const { run, mode } = validateActionInputs(inputs);
+  const eventPayload = event ?? readEventPayload(env);
+  const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
   // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
   // discipline: the evidence dir can hold unredacted runner paths / base refs
   // before the CLI's own redaction runs, and on a multi-user self-hosted
@@ -559,11 +579,27 @@ const runSubcommand = async ({
   // (Windows) ignore POSIX directory modes, and a failure to tighten an
   // existing dir must not crash the run; the CLI re-applies 0o700 downstream.
   mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  try {
-    chmodSync(outputDir, 0o700);
-  } catch {
-    // Platform ignores directory modes, or a permission issue the CLI will
-    // surface when it takes ownership of the directory.
+  // Fail closed on chmodSync failure (CodeRabbit #6X72Z2): a caller-selected
+  // permissive pre-existing outputDir whose chmod fails or is ineffective
+  // (ACL-based/shared runners) would leave plan.json and action-state.json
+  // writable with inherited permissions, exposing unredacted runner paths
+  // and base refs. On POSIX, fail the run step rather than silently continue
+  // with a permissive directory. Windows is excluded: NTFS ignores POSIX
+  // directory modes entirely, so a chmodSync failure there carries no
+  // security signal and the CLI's owner-only discipline still applies to the
+  // files it writes.
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(outputDir, 0o700);
+    } catch (error) {
+      throw new Error(`failed to secure evidence directory ${outputDir} (mode 0o700): ${error.message}`);
+    }
+  } else {
+    try {
+      chmodSync(outputDir, 0o700);
+    } catch {
+      // Windows ignores POSIX directory modes; the failure carries no signal.
+    }
   }
   const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
   if (baseRef) args.push('--base-ref', baseRef);

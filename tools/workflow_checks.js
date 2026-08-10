@@ -52,8 +52,39 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 // property cannot slip past — these forms are vanishingly rare in real
 // workflow YAML, so matching them is fail-closed: flag for manual review
 // rather than risk an unpinned-action bypass.
-const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*|,\s*)(?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:/;
+const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*|,\s*)(?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:/g;
 const COMMENT_LINE = /^\s*#/;
+// Strip a trailing YAML comment (` #...` or `#...` at line start) from a line,
+// respecting single- and double-quoted scalars. YAML requires a `#` to be at
+// the start of a line OR preceded by whitespace to begin a comment, so
+// `key:value#foo` is NOT a comment. Quote tracking mirrors the SUSPICIOUS_USES
+// quote walker: backslash escapes inside double quotes, `''` inside single.
+// Without this, an apostrophe inside a comment (`# don't use {uses: ...}`)
+// confuses the quote-context walker and either suppresses a real violation or
+// flags comment text as a key — both wrong. The truncation happens before the
+// SUSPICIOUS_USES check; the anchored block/flow regexes above do not need it
+// because they require a key-position start.
+const stripTrailingYamlComment = (text) => {
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inDouble) {
+      if (ch === '\\') { i += 1; }
+      else if (ch === '"') inDouble = false;
+    } else if (inSingle) {
+      if (ch === "'") {
+        if (text[i + 1] === "'") i += 1;
+        else inSingle = false;
+      }
+    } else if (ch === '"') inDouble = true;
+    else if (ch === "'") inSingle = true;
+    else if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]))) {
+      return text.substring(0, i);
+    }
+  }
+  return text;
+};
 // A double-quoted YAML mapping key at a block-style key position, capturing the
 // raw (escape-laden) key text. Used to catch an obfuscated `uses` key spelled
 // with unicode/hex escapes that YAML resolves to an ordinary `uses` property —
@@ -74,7 +105,16 @@ const QUOTED_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/;
 // `{uses: ...}`, a real bypass. The decode check is the same as the block
 // case; only the boundary preceding the quoted key differs. Single quotes
 // are excluded for the same reason as QUOTED_USES_KEY (no escape processing).
-const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*:/g;
+const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*\??\s*"([^"]*)"\s*:/g;
+// A YAML ALIAS used as a mapping key INSIDE a flow mapping/sequence — after a
+// `{`, `[`, or `,` boundary (optionally preceded by a key:value pair's value
+// and whitespace). When the anchor names `uses` (`name: &action_key uses`),
+// js-yaml resolves `steps: [{*action_key: ref}]` to `{uses: ref}`, a real
+// unpinned-action bypass. The scanner cannot resolve aliases, so fail-closed:
+// flag ANY alias in flow-key position. Alias keys are vanishingly rare in real
+// workflow YAML flow mappings, so this cannot cause false positives on clean
+// pinned actions. Mirrors the block-style ALIAS_IMPLICIT_KEY posture.
+const FLOW_ALIAS_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*\*([A-Za-z0-9_-]+)\s*:/g;
 // Resolve YAML double-quoted escape sequences into the actual characters they
 // denote. YAML double-quoted scalars support \uXXXX (4 hex), \UXXXXXXXX (8
 // hex), \xXX (2 hex), plus named escapes (\n, \t, ...); only the code-point
@@ -94,8 +134,8 @@ const decodeDoubleQuotedEscapes = (raw) => String(raw)
 // verified to resolve to {uses: ...}) — so EXPLICIT_QUOTED_KEY captures the
 // raw quoted text for the same decode check QUOTED_USES_KEY applies. (Single
 // quotes are excluded: no escape processing in YAML single-quoted scalars.)
-const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*(?:#.*)?$/;
-const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(?:#.*)?$/;
+const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*(?::[^#]*)?(?:#.*)?$/;
+const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(?::[^#]*)?(?:#.*)?$/;
 // An explicit mapping key that is a YAML ALIAS (`? *action_key`). The scanner
 // is line-oriented and cannot resolve aliases, but an alias CAN name `uses`
 // (verified: `name: &action_key uses` then `- ? *action_key` resolves via
@@ -103,7 +143,7 @@ const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(
 // resolver cannot confirm it is NOT `uses`. Alias explicit keys are vanishingly
 // rare in real workflow YAML, so this cannot cause false positives on clean
 // pinned actions.
-const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?:#.*)?$/;
+const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?::[^#]*)?(?:#.*)?$/;
 // An alias used as an IMPLICIT block-style mapping key — `- *action_key : ref`
 // (with optional whitespace around the colon). When the anchor names `uses`
 // (`name: &action_key uses`), js-yaml resolves this to {uses: ref}. The scanner
@@ -144,7 +184,39 @@ const PINNED_REF = /@[0-9a-fA-F]{40}$/;
  */
 const findUnpinnedUses = (content) => {
   const violations = [];
-  const lines = String(content ?? '').split(/\r?\n/);
+  // Split on CRLF, lone LF, lone CR (legacy Mac), or mixed line endings.
+  const rawLines = String(content ?? '').split(/\r\n|\r|\n/);
+  // Pre-fold YAML double-quoted line continuations inside explicit-key markers.
+  // A continued quoted explicit key like `- ? "u\<NL>  ses"` resolves (js-yaml
+  // verified) to `? "uses"`, but the line-oriented scanner sees two lines and
+  // misses the resolved key (CodeRabbit #6XsD7p). YAML folds `\<newline>` to
+  // empty inside double-quoted strings ONLY — single-quoted strings have no
+  // escape processing, and a `\` at end of line outside any string is invalid
+  // YAML. The pre-fold is conservative: it only joins when a line opens an
+  // explicit-key quoted scalar (`? "..."`) that is unclosed AND ends with `\`,
+  // then appends the next line's content with the `\<newline>` and following
+  // leading whitespace removed, repeating until the quote closes. This cannot
+  // affect `run: |` block scalars (which don't open an explicit-key quoted
+  // marker).
+  const lines = [];
+  for (let i = 0; i < rawLines.length; i += 1) {
+    let line = rawLines[i];
+    let folds = 0;
+    // Match an explicit-key marker opening a double-quoted scalar whose quote
+    // is unclosed and whose last non-whitespace char is a backslash.
+    while (/^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*"[^"]*\\$/.test(line)) {
+      const next = rawLines[i + 1] ?? '';
+      // Drop the trailing `\`, append the next line's leading-whitespace-stripped
+      // content. Re-check (the continuation may itself end with `\`).
+      line = line.replace(/\\$/, '') + next.replace(/^\s+/, '');
+      i += 1;
+      folds += 1;
+      // Safety cap: a quoted key that never closes would otherwise eat the
+      // whole file. 16 continuation lines is far beyond any real key.
+      if (folds > 16) break;
+    }
+    lines.push(line);
+  }
   // Block-scalar tracking: when a line opens a `|` or `>` scalar, enter a
   // "pending" state. The FIRST non-blank body line's indentation determines
   // the scalar body indent — subsequent lines at or deeper than that are body
@@ -231,12 +303,20 @@ const findUnpinnedUses = (content) => {
     // (CodeRabbit 3745322365) — `.exec` returns only the first. Same
     // raw !== decoded guard so a plain flow `{"uses": ref}` falls through to
     // SUSPICIOUS_USES.
-    for (const flowMatch of text.matchAll(FLOW_QUOTED_USES_KEY)) {
-      const raw = flowMatch[1];
-      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
-        violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
-        return;
-      }
+   for (const flowMatch of text.matchAll(FLOW_QUOTED_USES_KEY)) {
+     const raw = flowMatch[1];
+     if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
+       violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+       return;
+     }
+   }
+    // A flow-mapping alias key: `steps: [{*action_key: ref}]` (js-yaml verified
+    // to resolve to {uses: ref} when the anchor names `uses`). The scanner
+    // cannot resolve aliases, so fail-closed: flag any alias in flow-key
+    // position. Iterate matchAll in case multiple aliases appear on one line.
+    if (text.matchAll(FLOW_ALIAS_KEY).next().value) {
+      violations.push({ line: index + 1, ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      return;
     }
     // An explicit mapping key `? uses` (value on the following `:` line).
     // The line-oriented scanner cannot re-associate the value, but the marker
@@ -309,8 +389,17 @@ const findUnpinnedUses = (content) => {
     // which MUST be caught. The fail-closed posture (flag what cannot be
     // positively confirmed) is the documented contract: rewrite value-level
     // `uses:` keys in block style, or rename the env/with key, to clear the flag.
-    const suspiciousMatch = SUSPICIOUS_USES.exec(text);
-    if (suspiciousMatch) {
+    // Strip a trailing YAML comment BEFORE scanning for suspicious uses. A
+    // `# don't use {uses: ...}` trailing comment is comment text, not a key,
+    // and the apostrophe inside it would otherwise corrupt the quote-context
+    // walker below (Codex #1659). Strip at the first `#` outside a quoted
+    // scalar so the walker sees only real YAML tokens.
+    const stripped = stripTrailingYamlComment(text);
+    // Iterate EVERY match, not just the first (`.exec` returns only the first).
+    // A flow line can contain a quoted `uses:` (matched first, but inside a
+    // string so discarded by the quote walker) followed by a real unquoted
+    // `uses:` — single-match would miss the real one (CodeRabbit #6X9422).
+    for (const suspiciousMatch of stripped.matchAll(SUSPICIOUS_USES)) {
       // Determine whether the match sits inside a quoted YAML scalar. A naive
       // per-character quote COUNT is wrong when one quote type appears inside a
       // value quoted with the OTHER type — e.g. `name: "can't"` has an apostrophe
@@ -320,7 +409,7 @@ const findUnpinnedUses = (content) => {
       // a quote char only toggles state when it matches the currently-open
       // quote type (or opens a new context when none is open). Backslash escapes
       // inside double quotes are respected.
-      const beforeMatch = text.substring(0, suspiciousMatch.index);
+      const beforeMatch = stripped.substring(0, suspiciousMatch.index);
       let inDouble = false;
       let inSingle = false;
       for (let i = 0; i < beforeMatch.length; i += 1) {
@@ -340,6 +429,7 @@ const findUnpinnedUses = (content) => {
       }
       if (!inDouble && !inSingle) {
         violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
+        break; // one violation per line is enough
       }
     }
   });
@@ -353,6 +443,11 @@ const findUnpinnedUses = (content) => {
  * @param {string} content workflow YAML text.
  * @returns {boolean}
  */
-const hasTopLevelPermissions = (content) => /^(['"]?)permissions\1\s*:(\s|$)/m.test(String(content ?? ''));
+const hasTopLevelPermissions = (content) => {
+  // Strip a leading UTF-8 BOM so a `permissions:` block at column zero is still
+  // detected when the file is saved as UTF-8 with BOM (Codex #1658).
+  const text = String(content ?? '').replace(/^\uFEFF/, '');
+  return /^(['"]?)permissions\1\s*:(\s|$)/m.test(text);
+};
 
 module.exports = { findUnpinnedUses, hasTopLevelPermissions };

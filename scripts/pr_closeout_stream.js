@@ -38,13 +38,13 @@ const CREDENTIAL_PATTERNS = [
   // the first line of such a value, so this multi-line pattern runs FIRST and
   // consumes the entire BEGIN..END span (including embedded newlines). Mirrors
   // support.js's REDACT_PATTERNS so both layers agree.
-  [/\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*-{5}BEGIN [A-Z0-9 -]+-{5}[\s\S]*?-{5}END [A-Z0-9 -]+-{5}/g, '[REDACTED:pem-block]'],
   // A PEM block with NO key-name prefix — a child process can emit a raw
   // `-----BEGIN …-----` block (e.g. a TLS library dumping a key to stderr).
   // The keyed pattern above only matches after `key=`/`key:`, so this generic
   // fallback catches an un-prefixed block. Runs AFTER the keyed pattern so a
   // `key=-----BEGIN…` is consumed with its key first (CodeRabbit 3745322356).
-  [/-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/-{5}BEGIN [A-Z0-9 -]+-{5}[\s\S]*?-{5}END [A-Z0-9 -]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a minimum length
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
@@ -60,6 +60,11 @@ const CREDENTIAL_PATTERNS = [
   // spellings (api_key, access_key, private_key, signing_key) and
   // client_secret, with underscore AND hyphen separators, so a diagnostic
   // echoing `api_key=...`/`access_key=...` is redacted too.
+  // A standard space-delimited Bearer credential (`Bearer eyJ...` with no
+  // colon or equals sign) — every alternation above requires `[:=]`, so a raw
+  // bearer token emitted by a child process diagnostic would leak. Mirror of
+  // the action-side redactor in support.js (CodeRabbit #6X72Zq).
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED:token]'],
   [/(Authorization|Bearer|token|password|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|client[_-]?secret)\s*[:=]\s*.+$/gim, '$1=[REDACTED]'],
 ];
 

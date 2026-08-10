@@ -91,6 +91,24 @@ test('gitChildEnv preserves only safe.directory GIT_CONFIG_* triples', () => {
   assert.equal(sanitized.GIT_DIR, undefined);
   assert.equal(sanitized.GIT_EXTERNAL_DIFF, undefined);
 });
+test('gitChildEnv caps inherited GIT_CONFIG_COUNT to avoid DoS (CodeRabbit #6X72Zj)', () => {
+  // A wrapper or hostile local invocation could set GIT_CONFIG_COUNT to an
+  // absurd value; the loop previously iterated that many times before any
+  // Git command could run. Counts above the cap are treated as 0 so the loop
+  // is skipped entirely (safe.directory discovery is best-effort anyway —
+  // any sane workflow has far fewer than 256 git-config overrides).
+  const hostile = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    GIT_CONFIG_COUNT: '1000000000',
+    GIT_CONFIG_KEY_0: 'safe.directory',
+    GIT_CONFIG_VALUE_0: '/repo',
+  });
+  assert.equal(hostile.GIT_CONFIG_COUNT, undefined,
+    'an absurd GIT_CONFIG_COUNT is dropped (no iterations performed)');
+  assert.equal(hostile.GIT_CONFIG_KEY_0, undefined,
+    'no GIT_CONFIG_KEY_* triples are emitted when the count is capped out');
+});
 const fixtureRepo = async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-repo-'));
   git(repo, 'init', '--quiet');

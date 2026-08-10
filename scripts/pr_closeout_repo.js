@@ -199,7 +199,16 @@ const gitChildEnv = (source = process.env) => {
   const findKey = (name) => Object.keys(env).find((k) => k.toUpperCase() === name);
   const kept = [];
   const countKey = findKey('GIT_CONFIG_COUNT');
-  const count = countKey && Number.isInteger(Number(env[countKey])) ? Number(env[countKey]) : 0;
+  // Cap the inherited GIT_CONFIG_COUNT at a small validated maximum. A wrapper
+  // or hostile local invocation could set this to an absurd value (e.g.
+  // 1000000000); the loop below would iterate that many times before any Git
+  // command could run, hanging the closeout gate entirely (CodeRabbit #6X72Zj).
+  // 256 is far beyond any real workflow's needs (the safe.directory sanitizer
+  // only keeps safe.directory entries anyway), and any count above it is
+  // treated as 0 so the loop is skipped entirely rather than silently truncated.
+  const GIT_CONFIG_COUNT_MAX = 256;
+  const rawCount = countKey && Number.isInteger(Number(env[countKey])) ? Number(env[countKey]) : 0;
+  const count = rawCount >= 0 && rawCount <= GIT_CONFIG_COUNT_MAX ? rawCount : 0;
   if (count > 0) {
     for (let i = 0; i < count; i++) {
       const kKey = findKey(`GIT_CONFIG_KEY_${i}`);

@@ -121,15 +121,20 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
     'remote: [REDACTED:url-credential]@/org/repo',
     'an x-access-token URL credential is redacted',
   );
+ assert.equal(
+   redactCredentialPatterns('gh: HTTP 401 Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig'),
+   'gh: HTTP 401 Authorization=[REDACTED]',
+   'a Bearer token after an Authorization key is fully redacted',
+ );
   assert.equal(
-    redactCredentialPatterns('gh: HTTP 401 Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig'),
-    'gh: HTTP 401 Authorization=[REDACTED]',
-    'a Bearer token after an Authorization key is fully redacted',
+    redactCredentialPatterns('curl: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig rejected'),
+    'curl: Bearer [REDACTED:token] rejected',
+    'a standalone space-delimited Bearer credential (no Authorization key) is redacted (CodeRabbit #6X72Zq)',
   );
-  assert.equal(
-    redactCredentialPatterns(`error: ${ghpToken} invalid token`),
-    'error: [REDACTED:token] invalid token',
-    'a bare ghp_ token is redacted',
+ assert.equal(
+   redactCredentialPatterns(`error: ${ghpToken} invalid token`),
+   'error: [REDACTED:token] invalid token',
+   'a bare ghp_ token is redacted',
   );
   // The *_key / client_secret name families mirror the gate CLI's
   // SENSITIVE_ENV_PATTERN (Codex #3745074709): a diagnostic echoing

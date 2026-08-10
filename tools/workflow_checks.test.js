@@ -319,8 +319,13 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
   // then `- ? *action_key` resolves (js-yaml verified) to {uses: ...}. The
   // scanner cannot resolve aliases, so any alias in explicit-key position is
   // flagged fail-closed.
-  assert.equal(findUnpinnedUses('name: &action_key uses\nsteps:\n  - ? *action_key\n    : owner/action@main\n').length, 1,
+  const aliasExplicit = findUnpinnedUses('name: &action_key uses\nsteps:\n  - ? *action_key\n    : owner/action@main\n');
+  assert.equal(aliasExplicit.length, 1,
     'an alias-backed explicit ? *alias key must be flagged (alias may resolve to uses)');
+  assert.equal(aliasExplicit[0].line, 3,
+    'the violation reports the alias explicit-key line');
+  assert.match(aliasExplicit[0].ref, /\(explicit \? \*alias mapping key/,
+    'the violation reports the alias explicit-key reason');
   // A trailing YAML comment must not defeat detection (Qodo 3745372289): all
   // three explicit-key regexes allow an optional `# comment` after the key.
   assert.equal(findUnpinnedUses('steps:\n  - ? uses # comment\n    : owner/action@main\n').length, 1,
@@ -332,10 +337,69 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
   // verified) to {uses: ref}. The scanner cannot resolve aliases, so any alias
   // in implicit-key position is flagged fail-closed. An alias that is a VALUE
   // (`key: *alias`) must NOT be flagged.
-  assert.equal(findUnpinnedUses('name: &action_key uses\nsteps:\n  - *action_key : owner/action@main\n').length, 1,
+  const aliasImplicit = findUnpinnedUses('name: &action_key uses\nsteps:\n  - *action_key : owner/action@main\n');
+  assert.equal(aliasImplicit.length, 1,
     'an alias used as an implicit mapping key must be flagged');
+  assert.equal(aliasImplicit[0].line, 3,
+    'the violation reports the alias implicit-key line');
+  assert.match(aliasImplicit[0].ref, /\(\*alias: implicit mapping key/,
+    'the violation reports the alias implicit-key reason');
   assert.equal(findUnpinnedUses('env:\n  url: *checkout\n').length, 0,
     'an alias used as a value for a non-uses key is not flagged here');
+});
+// Regression coverage for inline-value, flow, and continued-key explicit
+// bypasses (CodeRabbit PR7 threads 6X7tKr / 6X72Zm / 6X942y / 6X9422 / 6XsD7p).
+test('findUnpinnedUses flags inline-value explicit-key uses forms (CodeRabbit #6X7tKr)', () => {
+  const inlineLiteral = findUnpinnedUses('steps:\n  - ? uses : owner/action@main\n');
+  assert.equal(inlineLiteral.length, 1);
+  assert.equal(inlineLiteral[0].line, 2);
+  assert.match(inlineLiteral[0].ref, /\(explicit \? uses mapping key/);
+  const inlineQuoted = findUnpinnedUses('steps:\n  - ? "uses" : owner/action@main\n');
+  assert.equal(inlineQuoted.length, 1);
+  assert.equal(inlineQuoted[0].line, 2);
+  assert.match(inlineQuoted[0].ref, /\(explicit \? uses mapping key/);
+  const inlineAlias = findUnpinnedUses('name: &k uses\nsteps:\n  - ? *k : owner/action@main\n');
+  assert.equal(inlineAlias.length, 1);
+  assert.equal(inlineAlias[0].line, 3);
+  assert.match(inlineAlias[0].ref, /\(explicit \? \*alias mapping key/);
+});
+test('findUnpinnedUses flags flow-mapping escape-obfuscated uses keys with explicit-key marker (CodeRabbit #6X72Zm)', () => {
+  const r = findUnpinnedUses('steps: [{? "u\\u0073es": owner/action@main}]\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 1);
+  assert.match(r[0].ref, /quoted uses: key resolves to uses via escape sequences/);
+});
+test('findUnpinnedUses flags alias keys inside flow mappings (CodeRabbit #6X942y)', () => {
+  const r = findUnpinnedUses('name: &action_key uses\nsteps: [{*action_key: owner/action@main}]\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 2);
+  assert.match(r[0].ref, /\(\*alias: flow mapping key/);
+});
+test('findUnpinnedUses scans every suspicious uses token on a flow line (CodeRabbit #6X9422)', () => {
+  const r = findUnpinnedUses('steps: [{with: {x: ok}, name: "foo, uses: fake", uses: owner/action@main}]\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 1);
+  assert.match(r[0].ref, /uses: in non-block-style or unparseable form/);
+});
+test('findUnpinnedUses rejects continued quoted explicit uses keys (CodeRabbit #6XsD7p)', () => {
+  const r = findUnpinnedUses('- ? "u\\\n  ses"\n  : owner/action@main\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 1);
+  assert.match(r[0].ref, /\(explicit \? uses mapping key/);
+});
+test('findUnpinnedUses strips trailing YAML comments before SUSPICIOUS_USES (CodeRabbit #6X7tKy)', () => {
+  assert.equal(findUnpinnedUses('name: build # see {uses: owner/action@main}\n').length, 0,
+    'a {uses:} token inside a trailing comment is not flagged');
+  assert.equal(findUnpinnedUses("name: build # don't use {uses: owner/action@main}\n").length, 0,
+    'a {uses:} token inside a trailing comment with an apostrophe is not flagged');
+  assert.equal(findUnpinnedUses('steps: [{uses: owner/action@main}]\n').length, 1,
+    'a real flow uses: outside any comment is still flagged');
+});
+test('findUnpinnedUses handles mirrored single-quote cases in flow values (CodeRabbit #6X7tLA)', () => {
+  assert.equal(findUnpinnedUses('steps: [{name: \'say "hi"\'}, {uses: owner/action@main}]\n').length, 1,
+    'a double quote inside a single-quoted value must not suppress a later flow uses');
+  assert.equal(findUnpinnedUses("steps: [{name: 'it''s'}, {uses: owner/action@main}]\n").length, 1,
+    "a doubled '' escape inside a single-quoted value must not suppress a later flow uses");
 });
 
 test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {
@@ -382,6 +446,10 @@ test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   // Whitespace before the colon (permissions :) is valid YAML — consistent
   // with the whitespace tolerance USES_LINE already applies to uses: keys.
   assert.equal(hasTopLevelPermissions('permissions :\n  contents: read\n'), true);
+  // A UTF-8 BOM at file start must not defeat column-zero detection
+  // (CodeRabbit #6X72Z8). Without the BOM strip, the regex anchors fail.
+  assert.equal(hasTopLevelPermissions("\uFEFFpermissions:\n  contents: read\n"), true,
+    'a BOM-prefixed permissions block is detected');
 });
 
 test('the real validator passes on this repository (integration)', () => {

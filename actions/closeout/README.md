@@ -123,12 +123,15 @@ jobs:
   gate:
     # Cost guard only: the gate independently re-verifies the live review
     # state, head SHA, and attestation through gh — this condition just
-    # avoids spending a full run on comment-only review events. It runs on
-    # any pull_request activity, a submitted approval, a submitted
-    # CHANGES_REQUESTED, any dismissed review, and an edited APPROVAL only
-    # (an edited non-approval is unchanged state). Each of these can
-    # invalidate a prior PASS, so they must produce a fresh gate result.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
+    # avoids spending a full run on no-op events. It runs on any
+    # pull_request activity, a submitted approval, a submitted
+    # CHANGES_REQUESTED, a submitted COMMENT review (inline review threads
+    # with no approval — those threads can carry unresolved comments that
+    # readLivePrState would block, so a stale PASS cannot survive them),
+    # any dismissed review, and an edited APPROVAL only (an edited
+    # non-approval is unchanged state). Each of these can invalidate a
+    # prior PASS, so they must produce a fresh gate result.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -211,12 +214,16 @@ permissions:
   contents: read
   pull-requests: read
   checks: read
+  statuses: read
 ```
 
 `contents: read` covers the checkout; `pull-requests: read` covers the attestation and
 PR-state lookups the gate makes through `gh`, needed on both `run: plan` and
 `run: full`; `checks: read` lets the live-state classifier read the PR's
-`statusCheckRollup` (check runs and commit statuses) via `gh pr view --json`.
+`statusCheckRollup` check runs via `gh pr view --json`; `statuses: read` covers
+the legacy `StatusContext` entries that also appear in `statusCheckRollup`
+(without it the lookup cannot retrieve the complete rollup and the gate blocks
+as unavailable on PRs that publish commit statuses instead of check runs).
 
 If you opt into `pr-comment: true`, add `pull-requests: write`:
 
@@ -225,6 +232,7 @@ permissions:
   contents: read
   pull-requests: write
   checks: read
+  statuses: read
 ```
 
 `gh` **2.31 or newer** is required on the runner for every PR-context invocation
