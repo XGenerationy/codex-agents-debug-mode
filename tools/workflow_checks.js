@@ -85,6 +85,37 @@ const stripTrailingYamlComment = (text) => {
   }
   return text;
 };
+// True when the character at `matchIndex` in `text` sits inside a YAML quoted
+// scalar (single- or double-quoted). Used by the flow-boundary scanners
+// (FLOW_QUOTED_USES_KEY, FLOW_ALIAS_KEY) and the SUSPICIOUS_USES scanner to
+// suppress matches that are string content, not YAML keys (CodeRabbit #6YEr9a).
+// A naive quote COUNT is wrong when one quote type appears inside a value
+// quoted with the OTHER type — e.g. `name: "can't"` has an apostrophe inside a
+// double-quoted string, and counting it as an unmatched single quote would
+// falsely mark a later `{uses: ...}` as "inside a string" (Codex 3745211657).
+// Walk the prefix tracking the active quote context: a quote char only toggles
+// state when it matches the currently-open quote type (or opens a new context
+// when none is open). Backslash escapes inside double quotes are respected;
+// YAML single-quoted strings escape a quote by doubling it ('').
+const isInsideQuotedScalar = (text, matchIndex) => {
+  const beforeMatch = String(text).substring(0, matchIndex);
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < beforeMatch.length; i += 1) {
+    const ch = beforeMatch[i];
+    if (inDouble) {
+      if (ch === '\\') { i += 1; } // skip the escaped char
+      else if (ch === '"') inDouble = false;
+    } else if (inSingle) {
+      if (ch === "'") {
+        if (beforeMatch[i + 1] === "'") i += 1; // escaped '' — stay in string
+        else inSingle = false;
+      }
+    } else if (ch === '"') inDouble = true;
+    else if (ch === "'") inSingle = true;
+  }
+  return inDouble || inSingle;
+};
 // A double-quoted YAML mapping key at a block-style key position, capturing the
 // raw (escape-laden) key text. Used to catch an obfuscated `uses` key spelled
 // with unicode/hex escapes that YAML resolves to an ordinary `uses` property —
@@ -114,7 +145,7 @@ const FLOW_QUOTED_USES_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*\??\s*"([^"]*)"\s*:/g;
 // flag ANY alias in flow-key position. Alias keys are vanishingly rare in real
 // workflow YAML flow mappings, so this cannot cause false positives on clean
 // pinned actions. Mirrors the block-style ALIAS_IMPLICIT_KEY posture.
-const FLOW_ALIAS_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*\*([A-Za-z0-9_-]+)\s*:/g;
+const FLOW_ALIAS_KEY = /[{[,]\s*(?:!\S*\s+|&\S+\s+)*\??\s*\*([A-Za-z0-9_-]+)\s*:/g;
 // Resolve YAML double-quoted escape sequences into the actual characters they
 // denote. YAML double-quoted scalars support \uXXXX (4 hex), \UXXXXXXXX (8
 // hex), \xXX (2 hex), plus named escapes (\n, \t, ...); only the code-point
@@ -199,9 +230,17 @@ const findUnpinnedUses = (content) => {
   // affect `run: |` block scalars (which don't open an explicit-key quoted
   // marker).
   const lines = [];
+  // Record any explicit-key fold that overflowed the safety cap. The cap
+  // exists to stop a never-closing quoted key from eating the whole file; when
+  // it fires, the partial line still ends inside an unterminated double-quoted
+  // scalar and would not match any downstream pattern, producing a fail-OPEN
+  // path (CodeRabbit #6YEr9d). Fail closed instead: report the overflow as a
+  // violation on the line where the explicit-key marker opened.
+  const foldOverflowLines = [];
   for (let i = 0; i < rawLines.length; i += 1) {
     let line = rawLines[i];
     let folds = 0;
+    const openedAt = i + 1; // 1-based source line index where the marker opened
     // Match an explicit-key marker opening a double-quoted scalar whose quote
     // is unclosed and whose last non-whitespace char is a backslash.
     while (/^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*"[^"]*\\$/.test(line)) {
@@ -212,8 +251,13 @@ const findUnpinnedUses = (content) => {
       i += 1;
       folds += 1;
       // Safety cap: a quoted key that never closes would otherwise eat the
-      // whole file. 16 continuation lines is far beyond any real key.
-      if (folds > 16) break;
+      // whole file. 16 continuation lines is far beyond any real key. When the
+      // cap fires, record the overflow — the partial line cannot be parsed and
+      // must not pass silently (fail-closed, CodeRabbit #6YEr9d).
+      if (folds > 16) {
+        foldOverflowLines.push(openedAt);
+        break;
+      }
     }
     lines.push(line);
   }
@@ -236,6 +280,13 @@ const findUnpinnedUses = (content) => {
   // the leading-whitespace `indent`, which is a different unit for seq items.
   let scalarHeaderKeyColumn = -1;
   let scalarExplicitIndent = 0;  // explicit block-scalar indent indicator (e.g. |2)
+  // Report any fold-overflow violations (CodeRabbit #6YEr9d): an explicit-key
+  // quoted marker whose continuation exceeded the 16-line safety cap. The
+  // partial line cannot be parsed by any downstream pattern, so without this
+  // the unpinned-action bypass would pass silently (fail-open).
+  for (const overflowLine of foldOverflowLines) {
+    violations.push({ line: overflowLine, ref: '(explicit ? quoted mapping key exceeded the 16-line continuation cap — rewrite in clean block style or review manually)' });
+  }
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
     // Inside a block scalar? Skip body lines.
@@ -305,6 +356,11 @@ const findUnpinnedUses = (content) => {
     // SUSPICIOUS_USES.
    for (const flowMatch of text.matchAll(FLOW_QUOTED_USES_KEY)) {
      const raw = flowMatch[1];
+      // Suppress matches whose boundary character sits inside a quoted scalar
+      // (e.g. `name: "a, {\"u\\u0073es\": b}"` — the inner `{` is string
+      // content, not a flow boundary). Mirrors the SUSPICIOUS_USES walker
+      // (CodeRabbit #6YEr9a).
+      if (isInsideQuotedScalar(text, flowMatch.index)) continue;
      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
        violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
        return;
@@ -313,8 +369,12 @@ const findUnpinnedUses = (content) => {
     // A flow-mapping alias key: `steps: [{*action_key: ref}]` (js-yaml verified
     // to resolve to {uses: ref} when the anchor names `uses`). The scanner
     // cannot resolve aliases, so fail-closed: flag any alias in flow-key
-    // position. Iterate matchAll in case multiple aliases appear on one line.
-    if (text.matchAll(FLOW_ALIAS_KEY).next().value) {
+    // position. Iterate matchAll in case multiple aliases appear on one line,
+    // and apply the quote-context walker so an alias-shaped token inside a
+    // quoted scalar (e.g. `name: "a, *k: b"`) does not false-positive
+    // (CodeRabbit #6YEr9a).
+    for (const aliasMatch of text.matchAll(FLOW_ALIAS_KEY)) {
+      if (isInsideQuotedScalar(text, aliasMatch.index)) continue;
       violations.push({ line: index + 1, ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }

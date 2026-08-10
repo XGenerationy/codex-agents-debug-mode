@@ -91,6 +91,26 @@ test('gitChildEnv preserves only safe.directory GIT_CONFIG_* triples', () => {
   assert.equal(sanitized.GIT_DIR, undefined);
   assert.equal(sanitized.GIT_EXTERNAL_DIFF, undefined);
 });
+test('gitChildEnv preserves mixed-case Git_Config_* safe.directory triples (CodeRabbit #6X7tKX)', () => {
+  // Windows env names are case-insensitive; the Codex harness and other
+  // wrappers may inject Git_Config_Count / Git_Config_Key_0 / Git_Config_Value_0
+  // in mixed case. The sanitizer's findKey helper normalizes case-insensitively,
+  // so a mixed-case safe.directory triple is preserved with the normalized
+  // uppercase output keys.
+  const sanitized = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    Git_Config_Count: '1',
+    Git_Config_Key_0: 'safe.directory',
+    Git_Config_Value_0: '/repo',
+    Git_Dir: '/evil',
+  });
+  const remaining = Object.keys(sanitized).sort();
+  assert.deepEqual(remaining, ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'HOME', 'PATH']);
+  assert.equal(sanitized.GIT_CONFIG_COUNT, '1');
+  assert.equal(sanitized.GIT_CONFIG_KEY_0, 'safe.directory');
+  assert.equal(sanitized.GIT_CONFIG_VALUE_0, '/repo');
+});
 test('gitChildEnv caps inherited GIT_CONFIG_COUNT to avoid DoS (CodeRabbit #6X72Zj)', () => {
   // A wrapper or hostile local invocation could set GIT_CONFIG_COUNT to an
   // absurd value; the loop previously iterated that many times before any

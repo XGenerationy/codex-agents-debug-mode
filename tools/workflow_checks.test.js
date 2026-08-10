@@ -376,10 +376,44 @@ test('findUnpinnedUses flags alias keys inside flow mappings (CodeRabbit #6X942y
   assert.match(r[0].ref, /\(\*alias: flow mapping key/);
 });
 test('findUnpinnedUses scans every suspicious uses token on a flow line (CodeRabbit #6X9422)', () => {
+  // Companion negative assertion (CodeRabbit #6YEr9k): the quoted token alone
+  // yields NO violation. Without this, the test would pass even if the quote
+  // walker were broken and reported the quoted token instead of the real one.
+  assert.equal(findUnpinnedUses('steps: [{with: {x: ok}, name: "foo, uses: fake"}]\n').length, 0,
+    'a uses: token inside a quoted flow value alone is not flagged');
   const r = findUnpinnedUses('steps: [{with: {x: ok}, name: "foo, uses: fake", uses: owner/action@main}]\n');
   assert.equal(r.length, 1);
   assert.equal(r[0].line, 1);
   assert.match(r[0].ref, /uses: in non-block-style or unparseable form/);
+});
+test('findUnpinnedUses flags explicit alias keys in flow mappings (CodeRabbit #6YEoRA)', () => {
+  // `name: &action_key uses` then `steps: [{? *action_key: ref}]` resolves
+  // (Ruby Psych) to {uses: ref}. FLOW_ALIAS_KEY now permits the `?`
+  // explicit-key marker inside flow context, mirroring FLOW_QUOTED_USES_KEY.
+  const r = findUnpinnedUses('name: &action_key uses\nsteps: [{? *action_key: owner/action@main}]\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 2);
+  assert.match(r[0].ref, /\(\*alias: flow mapping key/);
+});
+test('findUnpinnedUses suppresses flow-key matches inside quoted scalars (CodeRabbit #6YEr9a)', () => {
+  // An alias-shaped or quoted-uses-shaped token inside a quoted scalar value
+  // is string content, not a YAML key. The quote-context walker is now applied
+  // to FLOW_QUOTED_USES_KEY and FLOW_ALIAS_KEY matches, so neither false-positives.
+  assert.equal(findUnpinnedUses('steps: [{name: "a, *k: b"}]\n').length, 0,
+    'an alias-shaped token inside a quoted value is not flagged');
+  assert.equal(findUnpinnedUses('steps: [{name: "x, {\\"u\\\\u0073es\\": y}"}]\n').length, 0,
+    'a quoted-uses-shaped token inside a quoted value is not flagged');
+});
+test('findUnpinnedUses fails closed on continuation cap overflow (CodeRabbit #6YEr9d)', () => {
+  // A `? "u\\<NL>...ses"` key spread over more than 16 continuation lines
+  // cannot be parsed (the partial line ends inside an unterminated quote).
+  // The cap records the overflow and reports it as a violation rather than
+  // letting the unpinned-action bypass pass silently.
+  const overflow = '- ? "u\\\n' + Array(18).fill('  more\\').join('\n') + '\n  ses"\n  : owner/action@main\n';
+  const r = findUnpinnedUses(overflow);
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 1);
+  assert.match(r[0].ref, /exceeded the 16-line continuation cap/);
 });
 test('findUnpinnedUses rejects continued quoted explicit uses keys (CodeRabbit #6XsD7p)', () => {
   const r = findUnpinnedUses('- ? "u\\\n  ses"\n  : owner/action@main\n');
