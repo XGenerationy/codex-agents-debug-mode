@@ -196,6 +196,19 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
     'stdout: [REDACTED:pem-block]\nend',
     'an un-prefixed PEM block is redacted by the generic fallback',
   );
+  // CodeRabbit: PKCS7 / X509 CRL / CMS labels contain digits and were missed
+  // by the original `[A-Z ]+` regex. Both keyed and unkeyed PEM patterns must
+  // consume labels with digits and spaces.
+  assert.equal(
+    redactCredentialPatterns(`cert=-----BEGIN PKCS7-----\nMIIB-----END PKCS7-----`),
+    '[REDACTED:pem-block]',
+    'a keyed PKCS7 PEM block (digit-containing label) is redacted',
+  );
+  assert.equal(
+    redactCredentialPatterns('stderr: -----BEGIN X509 CRL-----\ndata\n-----END X509 CRL-----'),
+    'stderr: [REDACTED:pem-block]',
+    'an un-prefixed PEM label with digits/spaces is redacted',
+  );
   // Ordinary diagnostic text without a credential is preserved verbatim.
   const benign = 'fatal: not a git repository (or any of the parent directories): .git';
   assert.equal(redactCredentialPatterns(benign), benign, 'non-credential diagnostics are unchanged');
