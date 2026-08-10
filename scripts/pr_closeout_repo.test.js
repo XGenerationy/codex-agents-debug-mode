@@ -65,6 +65,32 @@ test('gitChildEnv strips GIT_* keys case-insensitively (Windows env bypass)', ()
   assert.equal(sanitized.NOT_GIT_RELATED, 'keep');
 });
 
+test('gitChildEnv preserves only safe.directory GIT_CONFIG_* triples', () => {
+  // The Codex harness marks dubious-ownership worktrees as safe by injecting
+  // GIT_CONFIG_COUNT / GIT_CONFIG_KEY_N / GIT_CONFIG_VALUE_N triples. We must
+  // keep safe.directory pairs (so `git merge-base` works) while still stripping
+  // every other GIT_* key including executable-pointing diff.external triples
+  // (CodeRabbit #4781498400, Qodo #4781532944).
+  const sanitized = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    GIT_DIR: '/evil',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'safe.directory',
+    GIT_CONFIG_VALUE_0: '/repo',
+    GIT_CONFIG_KEY_1: 'diff.external',
+    GIT_CONFIG_VALUE_1: '/evil/diff',
+  });
+  const remaining = Object.keys(sanitized).sort();
+  assert.deepEqual(remaining, ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'HOME', 'PATH']);
+  assert.equal(sanitized.GIT_CONFIG_COUNT, '1');
+  assert.equal(sanitized.GIT_CONFIG_KEY_0, 'safe.directory');
+  assert.equal(sanitized.GIT_CONFIG_VALUE_0, '/repo');
+  assert.equal(sanitized.GIT_CONFIG_KEY_1, undefined);
+  assert.equal(sanitized.GIT_CONFIG_VALUE_1, undefined);
+  assert.equal(sanitized.GIT_DIR, undefined);
+  assert.equal(sanitized.GIT_EXTERNAL_DIFF, undefined);
+});
 const fixtureRepo = async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-repo-'));
   git(repo, 'init', '--quiet');

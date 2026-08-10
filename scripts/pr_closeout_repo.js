@@ -173,20 +173,51 @@ const listIgnoreFiles = async (repo) => {
  * @returns {Promise<Buffer>} Raw stdout bytes.
  */
 /**
- * Git env for internal closeout invocations: drop every inherited GIT_*
+ * Git env for internal closeout invocations. Strips every inherited GIT_*
  * variable so caller-controlled routing (GIT_DIR / GIT_WORK_TREE), external
- * helpers (GIT_EXTERNAL_DIFF), and config overrides (GIT_CONFIG_*) cannot
- * redirect, execute, or reconfigure internal git work (CodeRabbit #4781498400).
- * Match case-insensitively: Windows env names are case-insensitive, so a
- * differently-cased key (git_dir / Git_Config_Count) is still observed by
- * Git as GIT_* (Qodo #4781532944).
+ * helpers (GIT_EXTERNAL_DIFF), and config overrides cannot redirect, execute,
+ * or reconfigure internal git work. Executable-pointing keys such as
+ * diff.external, core.pager, core.editor, and core.askpass are stripped
+ * unconditionally -- they are RCE vectors when caller-controlled
+ * (CodeRabbit #4781498400, Qodo #4781532944).
+ *
+ * One narrow exception: the Codex harness marks worktrees with dubious
+ * ownership as safe by injecting GIT_CONFIG_COUNT / GIT_CONFIG_KEY_N /
+ * GIT_CONFIG_VALUE_N triples whose key is `safe.directory`. Stripping those
+ * breaks `git merge-base HEAD origin/main` with "Could not access '<sha>'".
+ * We therefore parse the triple stream case-insensitively (Windows env names
+ * are case-insensitive, so git_dir / Git_Config_Count are observed by Git as
+ * GIT_*), keep only the pairs whose key lowercased is exactly `safe.directory`,
+ * strip every other GIT_* key (including any unparsed GIT_CONFIG_*), and
+ * re-emit the kept pairs as a fresh renumbered triple stream. When nothing is
+ * kept, no GIT_* key survives at all, preserving the all-stripped contract.
  * @param {NodeJS.ProcessEnv} [source=process.env] - Env map to sanitize.
  * @returns {NodeJS.ProcessEnv}
  */
 const gitChildEnv = (source = process.env) => {
   const env = { ...source };
+  const findKey = (name) => Object.keys(env).find((k) => k.toUpperCase() === name);
+  const kept = [];
+  const countKey = findKey('GIT_CONFIG_COUNT');
+  const count = countKey && Number.isInteger(Number(env[countKey])) ? Number(env[countKey]) : 0;
+  if (count > 0) {
+    for (let i = 0; i < count; i++) {
+      const kKey = findKey(`GIT_CONFIG_KEY_${i}`);
+      const vKey = findKey(`GIT_CONFIG_VALUE_${i}`);
+      if (kKey && vKey && String(env[kKey]).toLowerCase() === 'safe.directory') {
+        kept.push([String(env[kKey]), String(env[vKey])]);
+      }
+    }
+  }
   for (const key of Object.keys(env)) {
     if (key.toUpperCase().startsWith('GIT_')) delete env[key];
+  }
+  if (kept.length) {
+    env.GIT_CONFIG_COUNT = String(kept.length);
+    kept.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
   }
   return env;
 };
