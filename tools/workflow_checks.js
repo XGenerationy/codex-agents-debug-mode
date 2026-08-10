@@ -125,7 +125,7 @@ const RUN_SCALAR_LINE = /^\s*(?:-\s+)?(?:['"]?)(?:run|entrypoint|shell)(?:['"]?)
 // optional anchor/tag indicator before the scalar (`key: &name |`), an
 // explicit indentation indicator (`|2`), a chomping indicator (`|-`, `|+`),
 // a trailing comment (`| # cmt`), and any order of indentation+chomping.
-const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*(?:&\S+\s+|[!&].*?\s+)*[|>](?:[1-9][-+]?|[-+]?[1-9]?)[ \t]*(?:#.*)?$/;
+const BLOCK_SCALAR_HEADER = /^\s*(?:-\s+)?\S.*:\s*(?:&\S+\s+|[!&].*?\s+)*[|>](?:([1-9])[-+]?|[-+]?([1-9])?)[ \t]*(?:#.*)?$/;
 // A pinned action reference: a full 40-character commit SHA. Git object IDs
 // are case-insensitive hexadecimal, so a SHA may contain A-F as well as a-f
 // (GitHub renders them in either case). The match is case-insensitive so a
@@ -163,6 +163,7 @@ const findUnpinnedUses = (content) => {
   // column) and compared only against a following line's column — never against
   // the leading-whitespace `indent`, which is a different unit for seq items.
   let scalarHeaderKeyColumn = -1;
+  let scalarExplicitIndent = 0;  // explicit block-scalar indent indicator (e.g. |2)
   lines.forEach((text, index) => {
     const indent = text.length - text.replace(/^\s+/, '').length;
     // Inside a block scalar? Skip body lines.
@@ -184,10 +185,14 @@ const findUnpinnedUses = (content) => {
       // (not the leading-whitespace indent) — the two differ for sequence items.
       if (indent <= scalarHeaderKeyColumn) {
         scalarHeaderKeyColumn = -1;
+        scalarExplicitIndent = 0;
         // fall through: reprocess this line as a normal key line
       } else {
+        scalarBodyIndent = scalarExplicitIndent > 0
+          ? scalarHeaderKeyColumn + scalarExplicitIndent
+          : indent;
         scalarHeaderKeyColumn = -1;
-        scalarBodyIndent = indent;
+        scalarExplicitIndent = 0;
         return; // this line is body
       }
     }
@@ -277,8 +282,10 @@ const findUnpinnedUses = (content) => {
     // measured from the matched prefix so any post-dash whitespace is handled.
     // The empty-scalar sibling decision compares the next line's column against
     // the KEY column, never against the leading-whitespace indent (Qodo #10).
-    if (BLOCK_SCALAR_HEADER.test(text)) {
+    const scalarHeaderMatch = BLOCK_SCALAR_HEADER.exec(text);
+    if (scalarHeaderMatch) {
       scalarPending = true;
+      scalarExplicitIndent = Number(scalarHeaderMatch[1] || scalarHeaderMatch[2]) || 0;
       const seqPrefix = text.match(/^(\s*-\s+)/);
       scalarHeaderKeyColumn = seqPrefix ? seqPrefix[1].length : indent;
       return;
