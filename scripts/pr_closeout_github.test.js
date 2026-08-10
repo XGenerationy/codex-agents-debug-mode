@@ -799,6 +799,7 @@ test('buildGhArgs pr view passes through when PR number is unresolvable', () => 
 test('buildGhArgs pr view falls back to GITHUB_EVENT_PATH for PR number', () => {
   process.env.GITHUB_ACTIONS = 'true';
   process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
   const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-'));
   try {
     writeFileSync(join(dir, 'event.json'), JSON.stringify({ pull_request: { number: 42 } }));
