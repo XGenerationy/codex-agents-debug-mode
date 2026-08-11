@@ -304,6 +304,33 @@ test('readPrContext extracts repo and PR number from env plus event payload, els
   assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'o/r' }, event: { pull_request: { number: -3 } } }), null);
 });
 
+test('readPrContext falls back to workflow_run.pull_requests[0] for a same-repo PR, and fails closed on ambiguity (chatgpt-codex-connector PR7 #6YZpdA)', () => {
+  // workflow_run events carry no top-level pull_request — same fallback,
+  // and the same exactly-one-entry fail-closed rule, as readActionsPrNumber
+  // (CodeRabbit PR7 #6YZkn9).
+  const viaWorkflowRun = readPrContext({
+    env: { GITHUB_REPOSITORY: 'owner/repo' },
+    event: { workflow_run: { pull_requests: [{ number: 42 }] } },
+  });
+  assert.deepEqual(viaWorkflowRun, { owner: 'owner', repo: 'repo', prNumber: 42 });
+  // A direct pull_request field still takes precedence when both are present.
+  const directWins = readPrContext({
+    env: { GITHUB_REPOSITORY: 'owner/repo' },
+    event: { pull_request: { number: 7 }, workflow_run: { pull_requests: [{ number: 42 }] } },
+  });
+  assert.deepEqual(directWins, { owner: 'owner', repo: 'repo', prNumber: 7 });
+  // Empty array (fork PR — not populated for forks): no resolvable PR.
+  assert.equal(readPrContext({ env: { GITHUB_REPOSITORY: 'owner/repo' }, event: { workflow_run: { pull_requests: [] } } }), null);
+  // More than one entry: ambiguous, must not guess.
+  assert.equal(
+    readPrContext({
+      env: { GITHUB_REPOSITORY: 'owner/repo' },
+      event: { workflow_run: { pull_requests: [{ number: 42 }, { number: 43 }] } },
+    }),
+    null,
+  );
+});
+
 test('buildCommentBody starts with the stable marker and caps at the comment limit', () => {
   const body = buildCommentBody({ tier: 'plan', rendered: renderPlanSummary(hostilePlan(), {}), artifactName: 'ev' });
   assert.ok(body.startsWith(ACTION_MARKER), 'marker must be the first line for upsert matching');
@@ -629,15 +656,17 @@ test('runSubcommand clears a stale outputDir/logs directory from a reused output
   // per-check probe log files), which the file-by-file stale-evidence
   // cleanup cannot reach. Left behind, a prior invocation's log files would
   // be presented as evidence for a new, unrelated (and possibly blocked)
-  // invocation. A stale report.json alongside it is the ownership marker
-  // (CodeRabbit PR7 #6YYcNT) proving this directory has genuinely hosted
-  // this action before, so the purge below is expected to run.
+  // invocation. A stale action-state.json with this action's own
+  // authenticated shape (a known tier + a nonce) alongside it is the
+  // ownership marker (CodeRabbit PR7 #6YYcNT / chatgpt-codex-connector PR7
+  // #6YZpcz) proving this directory has genuinely hosted this action
+  // before, so the purge below is expected to run.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
   const logsDir = path.join(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'qualification.probe.attempt-001.log'), 'stale log output\n');
-  writeFs(path.join(outputDir, 'report.json'), '{"overallStatus":"PASS","stale":true}\n');
+  writeFs(path.join(outputDir, 'action-state.json'), `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -654,10 +683,9 @@ test('runSubcommand leaves outputDir/logs alone when nothing else signals a prio
   // have never hosted this action before, and the wrapper has no lock or
   // ownership signal over it at this point in the flow (mkdir/chmod happens
   // later). "logs" is a generic directory name likely to collide with
-  // something unrelated a caller or another tool placed there. Without any
-  // of the action's own well-known evidence filenames (action-state.json,
-  // plan.json, report.json, report.md) present, this logs/ directory must
-  // NOT be treated as this action's stale evidence.
+  // something unrelated a caller or another tool placed there. Without a
+  // genuine action-state.json present, this logs/ directory must NOT be
+  // treated as this action's stale evidence.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
   const logsDir = path.join(outputDir, 'logs');
@@ -675,6 +703,55 @@ test('runSubcommand leaves outputDir/logs alone when nothing else signals a prio
   assert.equal(existsSync(logsDir), true, 'a logs directory with no other ownership marker must not be deleted');
   assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
     'unrelated content inside it must survive untouched');
+});
+test('runSubcommand leaves outputDir/logs alone when only a generic, unauthenticated plan.json/report.json is present (chatgpt-codex-connector PR7 #6YZpcz)', async () => {
+  // plan.json and report.json are generic enough filenames that an
+  // unrelated tool sharing this output-dir could plausibly produce one by
+  // coincidence — their mere presence must not be trusted as proof this
+  // action itself has run here before. Only action-state.json (written
+  // exclusively by this action, with a shape no other tool would
+  // coincidentally reproduce) counts as real ownership evidence.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const logsDir = path.join(outputDir, 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
+  writeFs(path.join(outputDir, 'plan.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  writeFs(path.join(outputDir, 'report.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0);
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(logsDir), true, 'a generic plan.json/report.json alone is not an authenticated ownership marker');
+  assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
+    'unrelated content inside it must survive untouched');
+});
+test('runSubcommand leaves outputDir/logs alone when action-state.json exists but does not match this action\'s own shape (chatgpt-codex-connector PR7 #6YZpcz)', async () => {
+  // An unrelated tool could coincidentally also name a file
+  // "action-state.json"; this must not be trusted as ownership evidence
+  // unless its CONTENT matches this action's authenticated shape (a known
+  // tier value and a nonce string).
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const logsDir = path.join(outputDir, 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
+  writeFs(path.join(outputDir, 'action-state.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0);
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(logsDir), true, 'a same-named but wrongly-shaped action-state.json is not authenticated ownership evidence');
 });
 
 test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {
@@ -1178,6 +1255,26 @@ test('commentSubcommand upserts in PR context and skips with a notice otherwise'
 
   const skipped = await commentSubcommand({ outputDir: dir, env: {}, event: {}, runGh: async () => { throw new Error('must not be called'); } });
   assert.equal(skipped, 0, 'outside PR context the comment step skips, never fails');
+});
+
+test('commentSubcommand rejects a state record left by a different invocation (chatgpt-codex-connector PR7 #6YZpc6)', async () => {
+  // Same race finishSubcommand already guards against (CodeRabbit #6YW9UL),
+  // but here the risk is worse: without this check the comment step would
+  // POST/PATCH the PR with a FOREIGN invocation's tier/status/artifact
+  // pointer — a visible side effect finishSubcommand's own later nonce
+  // check cannot undo after the fact.
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'plan', artifactName: 'ev', renderedSummary: 'foreign summary', decision: { success: true, exitCode: 0 },
+    nonce: 'foreign-invocation-nonce',
+  }));
+  const code = await commentSubcommand({
+    outputDir: dir,
+    env: { GITHUB_REPOSITORY: 'o/r', CLOSEOUT_INVOCATION_NONCE: 'job-own-nonce' },
+    event: { pull_request: { number: 3 } },
+    runGh: async () => { throw new Error('must not be called — the mismatched state must never reach the API'); },
+  });
+  assert.equal(code, 3, 'a state record with a mismatched nonce must not be commented with, even in PR context');
 });
 
 test('full tier with lost stdout fails closed and still renders a summary', async () => {

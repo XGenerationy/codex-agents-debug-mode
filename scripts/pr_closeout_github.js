@@ -191,12 +191,17 @@ const readActionsPrNumber = ({ env }) => {
       const direct = Number(event?.pull_request?.number);
       if (Number.isFinite(direct) && direct > 0) return direct;
       // workflow_run events carry no top-level pull_request; a same-repo
-      // PR's number instead lives at workflow_run.pull_requests[0].number
-      // (CodeRabbit PR7 #6YW9UP). Empty for a fork PR — GitHub does not
-      // populate this array for forks — in which case this falls through
-      // to null, same as no resolvable PR context at all.
-      const viaWorkflowRun = Number(event?.workflow_run?.pull_requests?.[0]?.number);
-      if (Number.isFinite(viaWorkflowRun) && viaWorkflowRun > 0) return viaWorkflowRun;
+      // PR's number instead lives at workflow_run.pull_requests[]. GitHub
+      // documents this as an array (theoretically >1 entries), and it is
+      // empty for a fork PR (not populated for forks). Only trust it when
+      // it names exactly one PR — with more than one we cannot tell which
+      // PR this run belongs to, so fail closed to null rather than guess
+      // (CodeRabbit PR7 #6YZkn9); empty likewise falls through to null.
+      const workflowRunPrs = event?.workflow_run?.pull_requests;
+      if (Array.isArray(workflowRunPrs) && workflowRunPrs.length === 1) {
+        const viaWorkflowRun = Number(workflowRunPrs[0]?.number);
+        if (Number.isFinite(viaWorkflowRun) && viaWorkflowRun > 0) return viaWorkflowRun;
+      }
     } catch {
       /* fall through */
     }
@@ -292,9 +297,23 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
   const runnerName = env.RUNNER_NAME;
   if (!repository || typeof runGh !== 'function' || !runId || !runnerName) return null;
   try {
-    const jobs = await runGh(['api', `repos/${repository}/actions/runs/${runId}/jobs`], { repo });
+    // --paginate: the Jobs API returns 30 jobs per page by default, and a
+    // matrix or multi-job workflow can easily exceed that (CodeRabbit PR7
+    // #6YZkoF). gh api's --paginate merges the `jobs` array across pages
+    // into a single response object here, same as any other object-shaped
+    // (non-bare-array) paginated endpoint.
+    const jobs = await runGh(['api', `repos/${repository}/actions/runs/${runId}/jobs`, '--paginate'], { repo });
     const list = Array.isArray(jobs?.jobs) ? jobs.jobs : [];
-    const ownJob = list.find((job) => job && job.runner_name === runnerName);
+    // A reused self-hosted runner can carry the same runner_name across
+    // sequential jobs within one run, so the first match by name alone
+    // could be an earlier, already-COMPLETED job rather than this one
+    // (CodeRabbit PR7 #6YZkoJ). Only trust a non-COMPLETED match, and only
+    // when it is unique — an ambiguous or absent match resolves to null,
+    // same as any other best-effort failure of this resolver.
+    const activeMatches = list.filter(
+      (job) => job && job.runner_name === runnerName && String(job.status || '').toUpperCase() !== 'COMPLETED',
+    );
+    const ownJob = activeMatches.length === 1 ? activeMatches[0] : null;
     return typeof ownJob?.name === 'string' && ownJob.name ? ownJob.name : null;
   } catch {
     return null;

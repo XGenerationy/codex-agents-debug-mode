@@ -216,6 +216,7 @@ permissions:
   pull-requests: read
   checks: read
   statuses: read
+  actions: read
 ```
 
 `contents: read` covers the checkout; `pull-requests: read` covers the attestation and
@@ -225,6 +226,16 @@ PR-state lookups the gate makes through `gh`, needed on both `run: plan` and
 the legacy `StatusContext` entries that also appear in `statusCheckRollup`
 (without it the lookup cannot retrieve the complete rollup and the gate blocks
 as unavailable on PRs that publish commit statuses instead of check runs).
+`actions: read` is not load-bearing the same way — its absence degrades
+gracefully rather than blocking the run — but it is required for correct
+self-exclusion when the workflow that calls this action runs the gate step
+in a `strategy.matrix` or under a job `name:` override: self-exclusion
+resolves the running job's TRUE displayed name via the Jobs API
+(`GET .../actions/runs/{run_id}/jobs`), and an explicit `permissions:`
+block disables every scope it does not list. Without `actions: read` that
+call 403s, the resolver silently falls back to `null`, and a matrixed or
+renamed gate job can never recognize its own in-progress check in the
+rollup — it stays BLOCKED on itself indefinitely.
 
 If you opt into `pr-comment: true`, add `pull-requests: write`:
 
@@ -234,6 +245,7 @@ permissions:
   pull-requests: write
   checks: read
   statuses: read
+  actions: read
 ```
 
 `gh` **2.31 or newer** is required on the runner for every PR-context invocation

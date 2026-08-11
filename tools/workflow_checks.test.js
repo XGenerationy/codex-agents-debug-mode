@@ -546,6 +546,16 @@ test('findUnpinnedUses does not let a content-only colon extend quote-open conte
   // result DEPENDS on that: if the separator colon failed to grant context,
   // the quote around "a, uses: fake" would never open and that fake inner
   // uses: text would ALSO be scanned as real YAML.
+  //
+  // The combined fixture alone can't prove that: the real `uses:` key
+  // produces length === 1 regardless of whether the quoted `uses: fake`
+  // text was suppressed or counted, since the scan loop stops after the
+  // first violation either way. The negative half below isolates the
+  // quoted fragment alone and asserts it yields zero violations, so the
+  // pair together can actually fail on the regression it documents
+  // (CodeRabbit PR7 #6YZkoM).
+  assert.deepEqual(findUnpinnedUses('steps: [{name: "a, uses: fake"}]\n'), [],
+    'the quoted fake uses: text alone is suppressed by the key-separator colon context');
   assert.equal(findUnpinnedUses('steps: [{name: "a, uses: fake", uses: owner/action@main}]\n').length, 1,
     'a validly-positioned key-separator colon still opens context, suppressing the quoted fake uses: text');
 });

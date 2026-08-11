@@ -46,6 +46,15 @@ permissions:
   # external CI posting a commit status) would otherwise be unreadable,
   # leaving the gate BLOCKED on an unavailable rollup (Codex 3745211664).
   statuses: read
+  # actions: read is required for resolveCurrentJobDisplayName's Jobs API
+  # call (GET .../actions/runs/{run_id}/jobs), used to resolve this job's
+  # true displayed name for self-exclusion on a matrixed/named check
+  # (CodeRabbit PR7 #6YXkRF). An explicit permissions block disables every
+  # unlisted scope, so without this the call 403s, the resolver's catch
+  # falls back to null, self-exclusion silently no-ops for this matrixed
+  # job, and an otherwise-clean gate run permanently BLOCKs on its own
+  # in-progress check (chatgpt-codex-connector PR7 #6YZpcr).
+  actions: read
 
 # cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
 # concurrency is evaluated before the job-level if, so a comment-only review
@@ -87,8 +96,17 @@ jobs:
     # COMPLETED run of a sibling workflow this PR's gate result may have
     # been waiting on (CodeRabbit PR7 #6YW9UP) — the sibling's own
     # conclusion (success/failure/etc.) does not matter here; only that it
-    # finished, so the gate can re-evaluate the live rollup.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') || github.event_name == 'workflow_run' }}
+    # finished, so the gate can re-evaluate the live rollup. Restricted to
+    # workflow_run events whose OWN trigger was pull_request (qodo PR7
+    # #6YZnHn): "Validate" also runs on push to main and workflow_dispatch,
+    # neither of which carries PR context, so an unguarded workflow_run
+    # condition would spend a full gate run on every mainline push only to
+    # land on an unresolvable-PR BLOCKED result. A fork PR's workflow_run
+    # still has event == 'pull_request' and is intentionally let through
+    # here even though its pull_requests[] array is separately empty (see
+    # the workflow_run trigger comment above) — that is a legitimate
+    # PR-associated completion, just one this gate cannot yet resolve.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head

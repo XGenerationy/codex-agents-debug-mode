@@ -66,9 +66,18 @@ const classifyPr = (pr) => classifyLivePrState({
   gateAttestation: cleanAttestation(),
 });
 
-const ghEnvKeys = ['GITHUB_ACTIONS', 'GITHUB_REF_NAME', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_PATH'];
+const ghEnvKeys = ['GITHUB_ACTIONS', 'GITHUB_REF_NAME', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_PATH', 'GITHUB_RUN_ID', 'RUNNER_NAME'];
 const ghEnvSaved = {};
-test.beforeEach(() => { for (const key of ghEnvKeys) { ghEnvSaved[key] = process.env[key]; } });
+test.beforeEach(() => {
+  for (const key of ghEnvKeys) { ghEnvSaved[key] = process.env[key]; }
+  // GITHUB_RUN_ID/RUNNER_NAME are ambient when this suite runs inside this
+  // repo's own GitHub Actions CI, which would otherwise make
+  // resolveCurrentJobDisplayName's extra Jobs API call fire nondeterministically
+  // in tests whose runGh mock doesn't expect it. Clear them by default; tests
+  // that specifically exercise that path set them explicitly.
+  delete process.env.GITHUB_RUN_ID;
+  delete process.env.RUNNER_NAME;
+});
 test.afterEach(() => { for (const key of ghEnvKeys) { if (ghEnvSaved[key] === undefined) { delete process.env[key]; } else { process.env[key] = ghEnvSaved[key]; } } });
 
 test('accepts only an independent exact GitHub review attestation marker', () => {
@@ -484,8 +493,53 @@ test('resolveCurrentJobDisplayName resolves the current job\'s true displayed na
     env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
   });
   assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'matches the job entry whose runner_name equals RUNNER_NAME');
-  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs'],
-    'queries the Jobs API for this specific run');
+  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs', '--paginate'],
+    'queries the Jobs API for this specific run, across all pages');
+});
+
+test('resolveCurrentJobDisplayName paginates so a runner match on a later API page is still found (CodeRabbit PR7 #6YZkoF)', async () => {
+  let capturedArgs;
+  const runGh = async (args) => {
+    capturedArgs = args;
+    // Simulates what gh api --paginate hands back: the `jobs` array already
+    // merged across pages by the CLI, well past the API's 30-per-page
+    // default. The match is deliberately not on a first-30-jobs prefix.
+    const filler = Array.from({ length: 40 }, (_, i) => ({ name: `filler-${i}`, runner_name: `other-runner-${i}` }));
+    return { jobs: [...filler, { name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] };
+  };
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+  });
+  assert.ok(capturedArgs.includes('--paginate'), 'must request every page, not just the default 30-job first page');
+  assert.equal(resolved, 'gate (ubuntu-latest, 20)');
+});
+
+test('resolveCurrentJobDisplayName resolves uniquely when a reused self-hosted runner shares runner_name with an earlier completed job (CodeRabbit PR7 #6YZkoJ)', async () => {
+  const runGh = async () => ({ jobs: [
+    { name: 'earlier-job', runner_name: 'shared-runner', status: 'completed', conclusion: 'success' },
+    { name: 'current-job', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
+  ] });
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'shared-runner' },
+  });
+  assert.equal(resolved, 'current-job', 'skips the earlier completed job sharing the same reused runner_name');
+});
+
+test('resolveCurrentJobDisplayName refuses to guess when multiple non-completed jobs share runner_name (CodeRabbit PR7 #6YZkoJ)', async () => {
+  const runGh = async () => ({ jobs: [
+    { name: 'queued-1', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
+    { name: 'queued-2', runner_name: 'shared-runner', status: 'queued', conclusion: null },
+  ] });
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'shared-runner' },
+  });
+  assert.equal(resolved, null, 'an ambiguous non-completed match is not trustworthy — best-effort null, not a guess');
 });
 
 test('resolveCurrentJobDisplayName is best-effort: null on missing env, API failure, or no match (CodeRabbit PR7 #6YXkRF)', async () => {
@@ -1140,6 +1194,33 @@ test('buildGhArgs pr view has no PR number for a fork PR via workflow_run (empty
     const args = ['pr', 'view', '--json', 'number'];
     // No PR number resolvable: buildGhArgs passes the args through unchanged.
     assert.deepStrictEqual(buildGhArgs(args), args);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view fails closed when workflow_run reports more than one associated PR (CodeRabbit PR7 #6YZkn9)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-multi-'));
+  try {
+    // GitHub documents workflow_run.pull_requests as an array that can carry
+    // more than one entry. Picking [0] unconditionally risks validating the
+    // wrong PR, so this must fail closed to no resolvable number rather than
+    // guess (CodeRabbit PR7 #6YZkn9).
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [{ number: 42 }, { number: 43 }] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(args), args, 'an ambiguous multi-PR payload must not be trusted for either number');
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;

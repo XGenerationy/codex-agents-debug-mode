@@ -442,7 +442,16 @@ const ACTION_MARKER = '<!-- closeout-action-preview -->';
 const readPrContext = ({ env = {}, event = {} } = {}) => {
   const repository = env.GITHUB_REPOSITORY || '';
   const [owner, repo, ...rest] = repository.split('/');
-  const prNumber = event?.pull_request?.number;
+  // workflow_run events carry no top-level pull_request; a same-repo PR's
+  // number instead lives at workflow_run.pull_requests[] (empty for a fork
+  // PR — not populated there). Mirrors the same fallback, and the same
+  // fail-closed exactly-one-entry rule, already applied in
+  // readActionsPrNumber (CodeRabbit PR7 #6YZkn9) — without this, a
+  // workflow_run-triggered run with pr-comment enabled silently skips its
+  // comment instead of updating it (chatgpt-codex-connector PR7 #6YZpdA).
+  const workflowRunPrs = event?.workflow_run?.pull_requests;
+  const prNumber = event?.pull_request?.number
+    ?? (Array.isArray(workflowRunPrs) && workflowRunPrs.length === 1 ? workflowRunPrs[0]?.number : undefined);
   // PR numbers are >= 1; zero/negative would target issues/0 — fail closed.
   if (!owner || !repo || rest.length > 0 || !Number.isInteger(prNumber) || prNumber < 1) return null;
   return { owner, repo, prNumber };
@@ -599,28 +608,32 @@ const runSubcommand = async ({
   // results as current evidence for a run that never produced them. Clear
   // every known evidence filename up front, same ENOENT-only discipline.
   //
-  // Snapshot whether ANY known evidence marker already exists BEFORE this
-  // loop deletes them (CodeRabbit PR7 #6YYcNT): a caller-supplied broad
-  // output-dir (e.g. /tmp, ${{ runner.temp }}) may have NEVER hosted this
-  // action before, and the wrapper has no lock/ownership signal over it at
-  // this point in the flow (mkdir/chmod happens later). None of these
-  // well-known, action-specific filenames are likely to collide with
-  // unrelated content, so unconditionally clearing them (the existing,
-  // previously-reviewed #6YT0KA behavior) is left unchanged. The directory-
-  // wide logs/ purge below is a different risk class — "logs" is a generic
-  // name likely to collide with something unrelated — so it is additionally
-  // gated on this snapshot: only run it when at least one of these markers
-  // was ALREADY present, i.e. this directory has hosted a genuine prior
-  // invocation of this action.
-  const hadPriorEvidence = [STATE_FILE, 'plan.json', 'report.json', 'report.md'].some((staleName) => {
+  // Snapshot whether this directory shows real evidence of a prior
+  // invocation of THIS action, BEFORE the loop below deletes any of these
+  // filenames (CodeRabbit PR7 #6YYcNT / chatgpt-codex-connector PR7
+  // #6YZpcz): a caller-supplied broad output-dir (e.g. /tmp,
+  // ${{ runner.temp }}) may have never hosted this action, and "plan.json"
+  // / "report.json" are generic enough names that an unrelated tool could
+  // plausibly also drop a file by either name — mere filename presence is
+  // not proof of ownership for those two. action-state.json is different:
+  // it is written ONLY by this action (never by the spawned gate CLI
+  // itself, unlike plan.json/report.json/report.md), with a shape no other
+  // tool would coincidentally produce. Require it to both exist AND parse
+  // as that authenticated shape (a known `tier` value plus a `nonce`
+  // string) before trusting this directory as this action's own. The
+  // file-loop cleanup below is unchanged (previously reviewed under
+  // #6YT0KA) — this snapshot only gates the higher-risk directory-wide
+  // logs/ purge further down.
+  const hadPriorEvidence = (() => {
+    let state;
     try {
-      lstatSync(path.join(outputDir, staleName));
-      return true;
+      state = JSON.parse(readFileSync(path.join(outputDir, STATE_FILE), 'utf8'));
     } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
+      if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
       return false;
     }
-  });
+    return Boolean(state) && typeof state === 'object' && RUN_VALUES.has(state.tier) && typeof state.nonce === 'string' && state.nonce !== '';
+  })();
   for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
     try {
       unlinkSync(path.join(outputDir, staleName));
@@ -946,33 +959,42 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // (CodeRabbit #6YTfjs): even if the caller-owned outputDir has been restored
   // to its original broader mode before this write, the file content (which can
   // hold unredacted runner paths / base refs / error text) is still owner-only.
-  writeFileSync(target, content, { mode: 0o600 });
+  //
+  // Create/truncate the target EMPTY first and lock down its access control
+  // while it holds no content yet — only THEN write the (possibly sensitive)
+  // bytes. Writing content and protecting the file afterward left a window
+  // where real evidence (the invocation nonce, exit decision, unredacted
+  // runner paths/error text) sat in a file that still carried the
+  // surrounding directory's inherited permissions/ACL; another account with
+  // access to a broadly-readable outputDir could read it inside that window
+  // (chatgpt-codex-connector PR7 #6YZpcv).
+  writeFileSync(target, '', { mode: 0o600 });
   // writeFileSync's `mode` option only applies when the OPEN call CREATES the
   // file — an ordinary pre-existing regular single-link file (the guard above
   // only unlinks a symlink/non-file/hardlink, not a plain reused file) is
   // opened with O_TRUNC and keeps whatever permissive mode it already had,
   // e.g. 0o644 from a prior invocation of a reused output-dir. chmodSync
-  // unconditionally afterward closes that gap; it is a cheap no-op when the
-  // file was freshly created at 0o600 already (CodeRabbit #6YT0Jx).
+  // unconditionally closes that gap before anything is written into it; it is
+  // a cheap no-op when the file was freshly created at 0o600 already
+  // (CodeRabbit #6YT0Jx).
   chmodSync(target, 0o600);
   // chmodSync(0o600) only clears Windows' read-only attribute bit — it does
-  // NOT establish real access control there, so plan.json/action-state.json
-  // (which can hold the invocation nonce, exit decision, and unredacted
-  // runner paths/error text) would still inherit whatever DACL the
-  // surrounding --output-dir has on a multi-user Windows runner, readable
-  // (and, for action-state.json, writable) by any other local account. The
+  // NOT establish real access control there, so this file would still
+  // inherit whatever DACL the surrounding --output-dir has on a multi-user
+  // Windows runner, readable (and writable) by any other local account. The
   // gate CLI already solves exactly this for its own evidence writes —
   // report.json/report.md (pr_closeout_report.js) and evidence logs
   // (pr_closeout_process.js) — via protectWindowsPrivateFile: a verified,
-  // owner-only Windows DACL, no-op on non-Windows. Apply the same guard here
-  // so the wrapper's OWN evidence files get the identical protection,
-  // fail-closed on any failure to establish it (Codex PR7 review, "Protect
-  // wrapper evidence with a Windows DACL").
+  // owner-only Windows DACL, no-op on non-Windows. Apply the same guard here,
+  // fail-closed on any failure to establish it, and BEFORE any content is
+  // written (Codex PR7 review, "Protect wrapper evidence with a Windows
+  // DACL"; chatgpt-codex-connector PR7 #6YZpcv).
   try {
     protectWindowsPrivateFile(target);
   } catch (error) {
     throw new Error(`failed to protect evidence file with an owner-only ACL: ${target}`, { cause: error });
   }
+  writeFileSync(target, content, { mode: 0o600 });
 };
 
 const readState = (outputDir) => {
@@ -1039,6 +1061,17 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
   if (!state) {
     process.stderr.write('closeout-action: no recorded state; skipping comment.\n');
     return 0;
+  }
+  // Same nonce check finishSubcommand already applies (CodeRabbit #6YW9UL):
+  // a shared output-dir can be overwritten by a different (e.g. plan-tier)
+  // invocation between this job's "run" and "comment" steps. Without this
+  // check here too, the comment step would upsert the PR comment with the
+  // FOREIGN invocation's tier/status/artifact pointer — an externally
+  // visible side effect that finishSubcommand's own later nonce check
+  // cannot undo after the fact (chatgpt-codex-connector PR7 #6YZpc6).
+  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
+    process.stderr.write('closeout-action: recorded state belongs to a different invocation (output-dir was overwritten by a concurrent run); refusing to comment with it.\n');
+    return 3;
   }
   const eventPayload = event ?? readEventPayload(env);
   const context = readPrContext({ env, event: eventPayload });
