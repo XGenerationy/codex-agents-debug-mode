@@ -577,6 +577,33 @@ test('runSubcommand (full tier) fails closed when report.json parses but is sche
   assert.equal(state.decision.exitCode, 3);
   assert.match(state.decision.reason, /schema-invalid/);
 });
+test('runSubcommand (full tier) forces BLOCKED when CLI exits non-zero but report says PASS (CodeRabbit #6YE6QC)', async () => {
+  // Integrity guard (inverse): two invocations reuse an explicit output
+  // directory; the first (failed, exit 2) can read the second invocation's
+  // PASS report after it overwrites report.json, then publish status=PASS
+  // and render a PASS summary even though finish fails the job. Force the
+  // surfaced status to BLOCKED so the Step Summary/output cannot announce
+  // PASS against a failing exit code.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const reportDir = makeTempDir();
+  const passReport = path.join(reportDir, 'report.json');
+  writeFs(passReport, JSON.stringify({ overallStatus: 'PASS', mode: 'strict', configDigest: 'd1' }));
+  const exit = await runSubcommand({
+    inputs: { run: 'full', mode: 'strict', prComment: 'false' },
+    inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    // CLI exits 2 (failure) but the report says PASS — integrity mismatch.
+    spawnCli: () => ({ status: 2, stdout: `${JSON.stringify({ status: 'BLOCKED', headSha: 'h', report: { json: passReport, markdown: 'report.md' } })}\n`, stderr: 'gate failed' }),
+  });
+  assert.equal(exit, 0, 'run never fails the job; finish decides');
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.decision.success, false, 'a failing CLI exit must not be treated as success');
+  assert.match(state.decision.reason, /integrity mismatch/, 'the reason cites the integrity mismatch');
+  const outputs = readFs(path.join(dir, 'o'), 'utf8');
+  assert.match(outputs, /^status=BLOCKED$/m, 'status output must be BLOCKED (not PASS) when exit and report disagree');
+});
 
 test('the comment step sends the comment rendering, not the summary embed', async () => {
   const dir = makeTempDir();
@@ -942,4 +969,31 @@ test('the terminal main() catch redacts a multi-line PEM block (Qodo #1)', () =>
     'no PEM body line leaks into stderr');
   assert.doesNotMatch(stderr, /END PLACEHOLDER KEY/,
     'the PEM END marker is consumed, not left in stderr');
+});
+test('the terminal main() catch redacts a PEM block with a hyphenated label (CodeRabbit #6YE6QB)', () => {
+  // RFC 7468 permits hyphens inside PEM labels (e.g. RSA-PSS PRIVATE KEY).
+  // The action-side patterns previously excluded hyphens while the mirrored
+  // CLI redactor accepted them; the action-side patterns now match the same
+  // [-A-Z0-9 ] character class.
+  const pemValue = [
+    '-----BEGIN RSA-PSS PRIVATE KEY-----',
+    'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA',
+    '-----END RSA-PSS PRIVATE KEY-----',
+  ].join('\n');
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'support.js'), 'run'], {
+    env: {
+      ...process.env,
+      CLOSEOUT_RUN: `private_key=${pemValue}`,
+      CLOSEOUT_MODE: 'strict',
+      CLOSEOUT_OUTPUT_DIR: makeTempDir(),
+    },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1, 'an invalid input must exit non-zero');
+  const hyphenStderr = result.stderr || '';
+  assert.match(hyphenStderr, /\[REDACTED:pem-block\]/,
+    'a PEM block with a hyphenated label is redacted as a single unit');
+  assert.doesNotMatch(hyphenStderr, /MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA/,
+    'no PEM body line leaks into stderr');
 });

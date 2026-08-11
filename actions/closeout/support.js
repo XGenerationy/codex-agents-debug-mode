@@ -31,13 +31,13 @@ const REDACT_PATTERNS = [
   // scoped key-name pattern to re-match and downgrade. `[\s\S]` matches any
   // char including newlines, non-greedy to the END. Anchored to a preceding
   // `key=`/`key:` so it does not swallow an unquoted PEM in arbitrary prose.
-  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/(\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*)-{5}BEGIN [A-Z0-9 -]+-{5}[\s\S]*?-{5}END [A-Z0-9 -]+-{5}/g, '[REDACTED:pem-block]'],
   // A PEM block with NO key-name prefix — a child process (or a CLI diagnostic)
   // can emit a raw `-----BEGIN …-----` block. The keyed pattern above only
   // matches after `key=`/`key:`, so this generic fallback catches an un-prefixed
   // block. Runs AFTER the keyed pattern so `key=-----BEGIN…` is consumed with its
   // key first (CodeRabbit 3745322356).
-  [/-{5}BEGIN [A-Z0-9 ]+-{5}[\s\S]*?-{5}END [A-Z0-9 ]+-{5}/g, '[REDACTED:pem-block]'],
+  [/-{5}BEGIN [A-Z0-9 -]+-{5}[\s\S]*?-{5}END [A-Z0-9 -]+-{5}/g, '[REDACTED:pem-block]'],
   // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_), with a word boundary
   // so a short false-positive prefix does not match.
   [/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/g, '[REDACTED:token]'],
@@ -622,7 +622,7 @@ const runSubcommand = async ({
   let status = '';
   if (run === 'plan') {
     if (parsed && typeof parsed.planStatus === 'string') {
-      renderedSummary = renderPlanSummary(parsed, { baseRef });
+      renderedSummary = renderPlanSummary(parsed, { baseRef, artifactName });
       // Plan comments equal the plan summary: gate-redacted content only.
       renderedComment = renderedSummary;
       status = parsed.planStatus;
@@ -700,6 +700,18 @@ const runSubcommand = async ({
       // decision closed so finish does not propagate exit 0 against a FAIL
       // report.
       decision = { success: false, exitCode: 3, reason: `gate exited 0 but report overallStatus is ${status}` };
+    } else if (!decision.success && status === 'PASS') {
+      // Integrity guard (inverse): the CLI exited non-zero (failure) but the
+      // readable report says PASS — the exit code and the report disagree in
+      // the opposite direction. This can happen if two invocations reuse an
+      // explicit output directory: the first (failed, exit 2) reads the second
+      // invocation's PASS report after it overwrites report.json, then
+      // publishes status=PASS and renders a PASS summary even though finish
+      // fails the job. Force the surfaced status to BLOCKED so the Step
+      // Summary/output cannot announce PASS against a failing exit code
+      // (CodeRabbit #6YE6QC).
+      status = 'BLOCKED';
+      decision = { success: false, exitCode: decision.exitCode || 3, reason: `gate exited ${decision.exitCode} but report overallStatus is PASS — integrity mismatch forced to BLOCKED` };
     }
     reportMode = report.mode || '';
     // The report is the source of truth for the tier label when readable;
