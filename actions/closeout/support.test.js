@@ -477,10 +477,13 @@ test('runSubcommand restores a caller-owned outputDir original mode before the C
   }
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  mkdirSync(outputDir, { recursive: true, mode: 0o755 });
-  chmodSync(outputDir, 0o755);
-  const before = lstatSync(outputDir).mode & 0o777;
-  assert.equal(before, 0o755, 'precondition: caller dir starts at 0o755');
+  // Use a mode WITH the sticky bit (01777, like /tmp) to verify special bits
+  // are preserved across the restore (CodeRabbit #6YTfjs: prior code masked
+  // with 0o777 and would have restored this as 0777, dropping the sticky bit).
+  mkdirSync(outputDir, { recursive: true, mode: 0o1777 });
+  chmodSync(outputDir, 0o1777);
+  const before = lstatSync(outputDir).mode & 0o7777;
+  assert.equal(before, 0o1777, 'precondition: caller dir starts at 0o1777 (sticky)');
   let modeAtSpawn;
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
@@ -488,15 +491,15 @@ test('runSubcommand restores a caller-owned outputDir original mode before the C
     env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
     event: {},
     spawnCli: () => {
-      modeAtSpawn = lstatSync(outputDir).mode & 0o777;
+      modeAtSpawn = lstatSync(outputDir).mode & 0o7777;
       return { status: 0, stdout: '{}\n', stderr: '' };
     },
   });
   assert.equal(exit, 0);
-  assert.equal(modeAtSpawn, 0o755,
-    'caller-owned directory mode is restored to 0o755 before spawnCli (CodeRabbit #6YFOVK)');
-  const after = lstatSync(outputDir).mode & 0o777;
-  assert.equal(after, 0o755, 'the caller-owned directory mode stays 0o755 after the run');
+  assert.equal(modeAtSpawn, 0o1777,
+    'caller-owned directory mode (incl. sticky bit) is restored before spawnCli (#6YFOVK/#6YTfjs)');
+  const after = lstatSync(outputDir).mode & 0o7777;
+  assert.equal(after, 0o1777, 'the caller-owned directory mode stays 0o1777 after the run');
 });
 
 test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {

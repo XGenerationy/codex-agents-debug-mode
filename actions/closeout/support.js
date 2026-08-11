@@ -581,7 +581,10 @@ const runSubcommand = async ({
   // own owner-only perms to the files it writes). This keeps the Qodo #6
   // owner-only guarantee during the window the wrapper writes, without
   // permanently changing a caller-owned directory's mode.
- const priorMode = (() => { try { return lstatSync(outputDir).mode & 0o777; } catch { return null; } })();
+  // Capture the FULL mode including special bits (sticky/setgid/setuid) so
+  // restore is faithful: a caller-supplied /tmp (01777) must be restored to
+  // 01777, not 0777 (CodeRabbit #6YTfjs). Mask 0o7777, not 0o777.
+  const priorMode = (() => { try { return lstatSync(outputDir).mode & 0o7777; } catch { return null; } })();
  const restorePriorMode = () => {
    if (priorMode === null || process.platform === 'win32') return;
    try { chmodSync(outputDir, priorMode); } catch { /* best-effort restore */ }
@@ -813,7 +816,13 @@ const writeEvidenceFile = (outputDir, name, content) => {
       if (error?.code !== 'ENOENT') throw error;
     }
   }
-  writeFileSync(target, content);
+  // Owner-only mode (0o600) on the evidence files themselves, so the wrapper's
+  // writes are confidential regardless of the surrounding directory's mode.
+  // This decouples file confidentiality from the directory-mode restore window
+  // (CodeRabbit #6YTfjs): even if the caller-owned outputDir has been restored
+  // to its original broader mode before this write, the file content (which can
+  // hold unredacted runner paths / base refs / error text) is still owner-only.
+  writeFileSync(target, content, { mode: 0o600 });
 };
 
 const readState = (outputDir) => {
