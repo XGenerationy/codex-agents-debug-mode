@@ -577,17 +577,33 @@ they are roadmap items, not accepted risk:
   for re-running the gate outside the normal event flow; to attest a specific PR
   via dispatch, ensure the dispatch runs from the PR's head branch (not the base
   branch), or add the PR context the event-based triggers carry.
-- **The evidence artifact uploads the entire `output-dir`.** The
+- **The evidence artifact uploads the entire `output-dir`, and stale-evidence
+  cleanup deletes from it, before this invocation has established any
+  ownership of what it finds there (CodeRabbit PR7 #6YYcNT).** The
   `actions/upload-artifact` step uploads whatever directory `output-dir`
   resolves to. When a caller passes an existing broad directory (for example
-  `${{ runner.temp }}`), the upload includes every file already there — not
-  just the files the gate produced. On shared/self-hosted runners where that
-  directory may already contain unrelated logs or outputs, those become part of
-  the downloadable evidence artifact. The default (`${{ runner.temp
-  }}/closeout-evidence`) is action-owned and safe; the risk is only when a
-  caller overrides `output-dir` to a pre-existing broad path. A future
-  hardening would enumerate only the files the gate CLI wrote, rather than
-  uploading the caller-provided directory wholesale.
+  `${{ runner.temp }}` or `/tmp`), the upload includes every file already
+  there — not just the files the gate produced — and, since the round that
+  added stale-evidence cleanup (`plan.json`/`report.json`/`report.md`/
+  `action-state.json`/`logs/`), `runSubcommand` also unconditionally removes
+  anything at those well-known names or `logs/` before the CLI runs, with no
+  way to distinguish this action's own prior output from unrelated content a
+  caller or another tool happens to have placed at the same path. `logs/` in
+  particular is a generic name likely to collide with something unrelated.
+  On shared/self-hosted runners where that directory may already contain
+  unrelated logs or outputs, those become part of the downloadable evidence
+  artifact — or get silently deleted. The default (`${{ runner.temp
+  }}/closeout-evidence` for `output-dir`, paired with **a distinct
+  `output-dir` per invocation** as required above) is action-owned and safe;
+  the risk is only when a caller overrides `output-dir` to a pre-existing
+  broad path shared with other tools or steps. A future hardening would give
+  the wrapper real ownership tracking (a marker file it created and can
+  verify, or coordinating with the gate CLI's own directory lock) before
+  either uploading or deleting, and enumerate only the files the gate CLI
+  wrote rather than operating on the caller-provided directory wholesale.
+  Interim control: point `output-dir` at an action-owned leaf directory
+  (the default, or a dedicated subdirectory you don't share with any other
+  step) rather than a broad shared path.
 - **Regex-based `uses:` validation cannot parse all YAML.** The
   `tools/workflow_checks.js` SHA-pin check is deliberately regex-based (no YAML
   parser in a zero-dependency repo). It is conservatively fail-closed: any

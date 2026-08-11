@@ -394,6 +394,27 @@ test('findUnpinnedUses scans every suspicious uses token on a flow line (CodeRab
   assert.equal(r[0].line, 1);
   assert.match(r[0].ref, /uses: in non-block-style or unparseable form/);
 });
+test('findUnpinnedUses checks quote context at the key candidate, not the match start or the bare uses word (CodeRabbit #6YYcNX)', () => {
+  // The `[{[][^}]*?` branch of SUSPICIOUS_USES starts its OVERALL match at
+  // the `{`/`[` boundary, well before the actual uses: text. Checking quote
+  // context at that early match-start position (rather than at the key
+  // candidate itself) reported this SAFE workflow — no real `uses:` key,
+  // js-yaml verified: only a `name` key whose value happens to contain the
+  // text "uses:" — as a violation.
+  assert.deepEqual(findUnpinnedUses('steps: [{name: "documentation, uses: owner/action@main"}]\n'), [],
+    'uses: text entirely inside an unrelated quoted value must not be flagged');
+  // Sanity: a real unpinned uses: key still gets flagged when quoted content
+  // precedes it on the same flow line.
+  assert.equal(findUnpinnedUses('steps: [{name: "documentation", uses: owner/action@main}]\n').length, 1,
+    'a real uses: key after quoted content is still flagged');
+  // The opposite mistake — checking at the bare `uses` word, skipping an
+  // optional LEADING quote the regex itself should attribute to the key
+  // candidate — is equally wrong: a quoted `uses` KEY (not a `uses:` token
+  // buried inside someone else's string) must still be flagged. Proves the
+  // fix doesn't just move the false negative from one shape to another.
+  assert.equal(findUnpinnedUses('- {"uses": actions/checkout@v6}\n').length, 1,
+    'a quoted uses key must still be flagged, not misread as "inside a string"');
+});
 test('findUnpinnedUses flags explicit alias keys in flow mappings (CodeRabbit #6YEoRA)', () => {
   // `name: &action_key uses` then `steps: [{? *action_key: ref}]` resolves
   // (Ruby Psych) to {uses: ref}. FLOW_ALIAS_KEY now permits the `?`

@@ -52,7 +52,7 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 // property cannot slip past — these forms are vanishingly rare in real
 // workflow YAML, so matching them is fail-closed: flag for manual review
 // rather than risk an unpinned-action bypass.
-const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*|,\s*)(?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:/g;
+const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*?|,\s*)((?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:)/g;
 const COMMENT_LINE = /^\s*#/;
 // Strip a trailing YAML comment (` #...` or `#...` at line start) from a line,
 // respecting single- and double-quoted scalars. YAML requires a `#` to be at
@@ -557,7 +557,34 @@ const findUnpinnedUses = (content) => {
       // one lacked the apostrophe-in-plain-scalar fix), which is exactly the
       // kind of divergence a single shared implementation prevents
       // (CodeRabbit #6YSoOn).
-      if (!isInsideQuotedScalar(stripped, suspiciousMatch.index)) {
+      //
+      // Check quote context at the START OF THE KEY CANDIDATE (group 1:
+      // optional anchor/tag, then optional quote, then `uses`, then optional
+      // quote, then colon) — not at suspiciousMatch.index (CodeRabbit PR7
+      // #6YYcNX). The `[{[][^}]*` branch starts its OVERALL match at the
+      // `{`/`[` boundary, well before the actual key candidate — e.g.
+      // `steps: [{name: "text, uses: real@main"}]` matches starting at `[`,
+      // which is never inside the later quoted scalar even though the
+      // `uses:` text it precedes IS; checking the match start reported a
+      // safe, quoted `uses:` as "outside quotes" and rejected valid
+      // workflows. Checking at the literal `uses` word instead (skipping an
+      // optional LEADING quote) is ALSO wrong: for
+      // `{"uses": actions/checkout@main}`, the `"` opening the quoted KEY
+      // must be attributed to the key candidate, not swallowed by `[^}]*`'s
+      // greedy match — a GREEDY `[^}]*` prefers consuming that quote itself
+      // (backtracking finds success sooner that way), which then makes a
+      // legitimate quoted `uses` key look "inside a string" and suppresses a
+      // real violation. Changed `[^}]*` to LAZY (`[^}]*?`) so it consumes as
+      // LITTLE as possible, leaving any immediately-adjacent quote for
+      // group 1's own `['"]?` to capture — this also naturally finds the
+      // EARLIEST valid `uses:` candidate first, which is what "iterate every
+      // match" below relies on. Checking at the key candidate's own start —
+      // right where its OWN optional quote would be, if the regex captured
+      // one — correctly distinguishes "this whole key: construct is
+      // quoted content inside someone else's string" from "this key's own
+      // quote marks are the only quoting present".
+      const keyCandidateIndex = suspiciousMatch.index + suspiciousMatch[0].length - suspiciousMatch[1].length;
+      if (!isInsideQuotedScalar(stripped, keyCandidateIndex)) {
         violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
         break; // one violation per line is enough
       }
