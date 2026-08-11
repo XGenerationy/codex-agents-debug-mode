@@ -70,7 +70,19 @@ runs:
       run: node "${{ github.action_path }}/support.js" run
 
     - name: Upload evidence artifact
-      if: always()
+      # runSubcommand ('run') always returns exit 0 for a legitimate gate
+      # verdict, even BLOCKED/FAIL — the job's own pass/fail is decided later,
+      # by "Apply gate verdict". The "gate" step only fails (outcome: failure)
+      # when run() THREW: an invalid output-dir (e.g. inside the workspace,
+      # rejected by assertOutputOutsideWorkspace before anything is written),
+      # bad inputs, or another validation error. In exactly that case,
+      # `inputs.output-dir` may resolve to a path the gate refused to write
+      # to at all — e.g. the repository workspace itself — so uploading it
+      # unconditionally would publish the checkout (and any secrets a prior
+      # step left there) as if it were evidence. Skip the upload when the
+      # gate step threw; on every legitimate verdict (including BLOCKED/FAIL)
+      # it still runs via always() (CodeRabbit #6YT0J3).
+      if: ${{ always() && steps.gate.outcome != 'failure' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}

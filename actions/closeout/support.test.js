@@ -2,7 +2,15 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { mkdtempSync, mkdirSync, readFileSync: readFs, symlinkSync, writeFileSync: writeFs } = require('node:fs');
+const {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync: readFs,
+  symlinkSync,
+  writeFileSync: writeFs,
+  chmodSync,
+  lstatSync,
+} = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -406,6 +414,25 @@ test('writeEvidenceFile fails closed when an unsafe target cannot be unlinked (C
   );
 });
 
+test('writeEvidenceFile tightens a pre-existing regular file\'s mode before overwriting it (CodeRabbit #6YT0Jx)', () => {
+  if (process.platform === 'win32') return; // POSIX file modes are meaningless on NTFS
+  // A regular, single-link file (nlink === 1) is NOT unlinked by the
+  // symlink/hardlink guard — it is opened and truncated in place. writeFileSync's
+  // `mode` option only applies when the OPEN call CREATES the file; a
+  // pre-existing regular file (left over from a prior invocation of a reused
+  // output-dir) keeps whatever permissive mode it already had, e.g. 0o644.
+  const evidenceDir = makeTempDir();
+  const target = path.join(evidenceDir, 'plan.json');
+  writeFs(target, '{"stale":true}\n');
+  chmodSync(target, 0o644);
+  const { lstatSync } = require('node:fs');
+  assert.equal(lstatSync(target).mode & 0o777, 0o644, 'precondition: pre-existing file is 0o644');
+  writeEvidenceFile(evidenceDir, 'plan.json', '{"fresh":true}\n');
+  const info = lstatSync(target);
+  assert.equal(info.mode & 0o777, 0o600, 'the reused file is tightened to 0o600 even though it was not recreated');
+  assert.equal(readFs(target, 'utf8'), '{"fresh":true}\n');
+});
+
 test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
@@ -436,6 +463,77 @@ test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outp
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.tier, 'plan');
   assert.equal(state.decision.success, true);
+});
+
+test('runSubcommand reports admission-status PASS for a fully-ready plan (CodeRabbit #6YT0J4)', async () => {
+  // resolvePlanAdmission uses a DIFFERENT vocabulary for the attestation probe
+  // (present | weakened | absent | unavailable) than cleanTree/preflight
+  // (PASS | FAIL | BLOCKED) — 'present' is the attestation probe's PASSING
+  // state, but it never literally equals 'PASS'. Requiring every probe to
+  // equal 'PASS' meant a fully-ready plan could never aggregate to PASS.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const outputFile = path.join(dir, 'output');
+  const plan = { planStatus: 'PASS', mode: 'strict', configDigest: 'd', errors: [], checks: [],
+    admission: { attestation: { status: 'present', evidence: 'ok' }, cleanTree: { status: 'PASS', evidence: 'clean' }, preflight: { status: 'PASS' } } };
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify(plan)}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^admission-status=PASS$/m,
+    'a present attestation plus clean tree and passing preflight aggregates to PASS, not BLOCKED');
+});
+
+test('runSubcommand reports admission-status FAIL for a weakened attestation (CodeRabbit #6YT0J4)', async () => {
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const outputFile = path.join(dir, 'output');
+  const plan = { planStatus: 'FAIL', mode: 'strict', configDigest: 'd', errors: [], checks: [],
+    admission: { attestation: { status: 'weakened', evidence: 'stale' }, cleanTree: { status: 'PASS', evidence: 'clean' }, preflight: { status: 'PASS' } } };
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 2, stdout: `${JSON.stringify(plan)}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^admission-status=FAIL$/m,
+    'a weakened attestation is an active negative finding, distinct from a merely-BLOCKED (not-yet-satisfied) probe');
+});
+
+test('runSubcommand clears stale plan.json/report.json/report.md from a reused outputDir before a run that fails early (CodeRabbit #6YT0KA)', async () => {
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  mkdirSync(outputDir, { recursive: true });
+  // Evidence left behind by a PRIOR successful invocation of this same
+  // (reused) output-dir.
+  writeFs(path.join(outputDir, 'plan.json'), '{"planStatus":"PASS","stale":true}\n');
+  writeFs(path.join(outputDir, 'report.json'), '{"overallStatus":"PASS","stale":true}\n');
+  writeFs(path.join(outputDir, 'report.md'), '# stale prior report\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    // The CURRENT invocation fails before producing any parseable output —
+    // exactly the scenario where stale evidence would otherwise survive.
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0, 'run never fails the job for gate outcomes');
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(path.join(outputDir, 'plan.json')), false,
+    'stale plan.json from a prior invocation must not survive a failed current run');
+  assert.equal(existsSync(path.join(outputDir, 'report.json')), false,
+    'stale report.json from a prior invocation must not survive a failed current run');
+  assert.equal(existsSync(path.join(outputDir, 'report.md')), false,
+    'stale report.md from a prior invocation must not survive a failed current run');
 });
 
 test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {
@@ -469,7 +567,7 @@ test('runSubcommand fails the run when a stale action-state.json cannot be remov
   );
 });
 
-test('runSubcommand restores a caller-owned outputDir original mode before the CLI takes over (CodeRabbit #6YFOVK)', async () => {
+test('runSubcommand keeps a caller-owned outputDir secured through the CLI, then restores its original mode after (CodeRabbit #6YFOVK/#6YT0Jo)', async () => {
   if (process.platform === 'win32') {
     // POSIX directory modes are meaningless on NTFS; the restore is a no-op
     // there. Assert the behavior on Linux/macCI where the mode round-trips.
@@ -492,14 +590,63 @@ test('runSubcommand restores a caller-owned outputDir original mode before the C
     event: {},
     spawnCli: () => {
       modeAtSpawn = lstatSync(outputDir).mode & 0o7777;
+      // Mirror the real CLI's writeEvidenceReport, which re-chmods the
+      // directory to 0o700 of its own accord while writing evidence. This is
+      // exactly the window CodeRabbit #6YT0Jo flagged: restoring BEFORE
+      // spawnCli (the old behavior) meant nothing ever restored the caller's
+      // mode again once the CLI (re-)applied 0o700 during its own run.
+      chmodSync(outputDir, 0o700);
       return { status: 0, stdout: '{}\n', stderr: '' };
     },
   });
   assert.equal(exit, 0);
-  assert.equal(modeAtSpawn, 0o1777,
-    'caller-owned directory mode (incl. sticky bit) is restored before spawnCli (#6YFOVK/#6YTfjs)');
+  assert.equal(modeAtSpawn, 0o700,
+    'the directory stays secured (0o700) through the CLI invocation — restoration happens after, not before (#6YT0Jo)');
   const after = lstatSync(outputDir).mode & 0o7777;
-  assert.equal(after, 0o1777, 'the caller-owned directory mode stays 0o1777 after the run');
+  assert.equal(after, 0o1777,
+    'the caller-owned directory mode (incl. sticky bit) is restored to its original value once the full run — including the CLI\'s own 0o700 rechmod — has finished (#6YFOVK/#6YT0Jo)');
+});
+test('runSubcommand restores the original mode even when the run step throws after acquiring the directory (CodeRabbit #6YT0Jo)', async () => {
+  if (process.platform === 'win32') return;
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  mkdirSync(outputDir, { recursive: true, mode: 0o1777 });
+  chmodSync(outputDir, 0o1777);
+  await assert.rejects(
+    () => runSubcommand({
+      inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+      inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+      env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+      event: {},
+      spawnCli: () => { throw new Error('boom'); },
+    }),
+    /boom/,
+  );
+  const after = lstatSync(outputDir).mode & 0o7777;
+  assert.equal(after, 0o1777, 'the finally block restores the original mode even when spawnCli throws');
+});
+test('runSubcommand captures the TARGET directory mode for a symlinked outputDir, not the link\'s own mode (CodeRabbit #6YT0Js)', async () => {
+  if (process.platform === 'win32') return;
+  const dir = makeTempDir();
+  const realTarget = path.join(dir, 'real-evidence');
+  const outputDir = path.join(dir, 'evidence-link');
+  mkdirSync(realTarget, { recursive: true, mode: 0o700 });
+  chmodSync(realTarget, 0o700);
+  symlinkSync(realTarget, outputDir, 'dir');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: '{}\n', stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  // statSync follows the symlink to the target's real mode (0o700). Using
+  // lstatSync instead would have captured the LINK's own mode (typically
+  // 0o777 on most platforms) and restored the target to that broader mode —
+  // exposing or making writable a directory that started at 0o700.
+  const after = lstatSync(realTarget).mode & 0o7777;
+  assert.equal(after, 0o700, 'the symlink target is restored to its own real mode, not broadened to the link\'s mode');
 });
 
 test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {

@@ -97,22 +97,45 @@ const stripTrailingYamlComment = (text) => {
 // state when it matches the currently-open quote type (or opens a new context
 // when none is open). Backslash escapes inside double quotes are respected;
 // YAML single-quoted strings escape a quote by doubling it ('').
+//
+// A bare `'` does NOT always open a quoted scalar: YAML plain (unquoted)
+// scalars may contain an apostrophe anywhere except as their first character
+// — `name: don't` is a valid plain scalar equal to the string "don't", not a
+// quote delimiter. Treating every `'` as toggling quote state means a plain
+// scalar's apostrophe swallows the rest of the line into a phantom "string",
+// hiding a REAL later match (e.g. an escape-obfuscated flow `uses:` key) and
+// causing a fail-OPEN bypass (CodeRabbit #6YSoOn). A `'` only opens a quoted
+// scalar when it is the first non-whitespace character at a value/key
+// position — i.e. immediately (modulo whitespace) after start-of-line, `:`,
+// `-`, `{`, `[`, `,`, or `?` (the explicit-key indicator). Track the last
+// significant (non-whitespace, non-quote-toggling) character seen to decide.
+const QUOTE_OPEN_CONTEXT = new Set([':', '-', '{', '[', ',', '?']);
 const isInsideQuotedScalar = (text, matchIndex) => {
   const beforeMatch = String(text).substring(0, matchIndex);
   let inDouble = false;
   let inSingle = false;
+  let lastSignificant = null; // null == start-of-string context
   for (let i = 0; i < beforeMatch.length; i += 1) {
     const ch = beforeMatch[i];
     if (inDouble) {
       if (ch === '\\') { i += 1; } // skip the escaped char
-      else if (ch === '"') inDouble = false;
-    } else if (inSingle) {
+      else if (ch === '"') { inDouble = false; lastSignificant = '"'; }
+      continue;
+    }
+    if (inSingle) {
       if (ch === "'") {
-        if (beforeMatch[i + 1] === "'") i += 1; // escaped '' — stay in string
-        else inSingle = false;
+        if (beforeMatch[i + 1] === "'") { i += 1; } // escaped '' — stay in string
+        else { inSingle = false; lastSignificant = "'"; }
       }
-    } else if (ch === '"') inDouble = true;
-    else if (ch === "'") inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+    } else if (ch === "'" && (lastSignificant === null || QUOTE_OPEN_CONTEXT.has(lastSignificant))) {
+      inSingle = true;
+    } else if (!/\s/.test(ch)) {
+      lastSignificant = ch;
+    }
   }
   return inDouble || inSingle;
 };
@@ -229,6 +252,13 @@ const findUnpinnedUses = (content) => {
   // leading whitespace removed, repeating until the quote closes. This cannot
   // affect `run: |` block scalars (which don't open an explicit-key quoted
   // marker).
+  //
+  // The opener may sit at block-style line start (`- ? "...`) OR right after a
+  // flow boundary (`steps: [{? "u\<NL>ses": ref}]` — js-yaml verified to
+  // resolve identically). The original opener only matched line start, so a
+  // flow-embedded continuation was never folded and its resolved `uses` key
+  // slipped past the scanner entirely (CodeRabbit #6YSx9t).
+  const EXPLICIT_KEY_QUOTE_OPEN = /(?:^\s*(?:-\s*)?|[{[,]\s*)(?:!\S*\s+|&\S+\s+)*\?\s*"[^"]*\\$/;
   const lines = [];
   // Record any explicit-key fold that overflowed the safety cap. The cap
   // exists to stop a never-closing quoted key from eating the whole file; when
@@ -241,9 +271,10 @@ const findUnpinnedUses = (content) => {
     let line = rawLines[i];
     let folds = 0;
     const openedAt = i + 1; // 1-based source line index where the marker opened
-    // Match an explicit-key marker opening a double-quoted scalar whose quote
-    // is unclosed and whose last non-whitespace char is a backslash.
-    while (/^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*"[^"]*\\$/.test(line)) {
+    // Match an explicit-key marker (block-start or flow-boundary) opening a
+    // double-quoted scalar whose quote is unclosed and whose last
+    // non-whitespace char is a backslash.
+    while (EXPLICIT_KEY_QUOTE_OPEN.test(line)) {
       const next = rawLines[i + 1] ?? '';
       // Drop the trailing `\`, append the next line's leading-whitespace-stripped
       // content. Re-check (the continuation may itself end with `\`).
@@ -460,34 +491,13 @@ const findUnpinnedUses = (content) => {
     // string so discarded by the quote walker) followed by a real unquoted
     // `uses:` — single-match would miss the real one (CodeRabbit #6X9422).
     for (const suspiciousMatch of stripped.matchAll(SUSPICIOUS_USES)) {
-      // Determine whether the match sits inside a quoted YAML scalar. A naive
-      // per-character quote COUNT is wrong when one quote type appears inside a
-      // value quoted with the OTHER type — e.g. `name: "can't"` has an apostrophe
-      // inside a double-quoted string, and counting it as an unmatched single
-      // quote would falsely mark a later `{uses: ...}` as "inside a string"
-      // (Codex 3745211657). Walk the prefix tracking the active quote context:
-      // a quote char only toggles state when it matches the currently-open
-      // quote type (or opens a new context when none is open). Backslash escapes
-      // inside double quotes are respected.
-      const beforeMatch = stripped.substring(0, suspiciousMatch.index);
-      let inDouble = false;
-      let inSingle = false;
-      for (let i = 0; i < beforeMatch.length; i += 1) {
-        const ch = beforeMatch[i];
-        if (inDouble) {
-          if (ch === '\\') { i += 1; } // skip the escaped char
-          else if (ch === '"') inDouble = false;
-        } else if (inSingle) {
-          // YAML single-quoted strings escape a quote by doubling it (''); a
-          // lone ' closes, '' is an escaped literal quote.
-          if (ch === "'") {
-            if (beforeMatch[i + 1] === "'") i += 1; // escaped '' — stay in string
-            else inSingle = false;
-          }
-        } else if (ch === '"') inDouble = true;
-        else if (ch === "'") inSingle = true;
-      }
-      if (!inDouble && !inSingle) {
+      // Determine whether the match sits inside a quoted YAML scalar. Shares
+      // isInsideQuotedScalar with the flow-boundary scanners above instead of
+      // re-implementing the walker — the two copies previously drifted (this
+      // one lacked the apostrophe-in-plain-scalar fix), which is exactly the
+      // kind of divergence a single shared implementation prevents
+      // (CodeRabbit #6YSoOn).
+      if (!isInsideQuotedScalar(stripped, suspiciousMatch.index)) {
         violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
         break; // one violation per line is enough
       }

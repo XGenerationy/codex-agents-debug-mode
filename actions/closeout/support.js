@@ -5,7 +5,7 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } = require('node:fs');
+const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -556,10 +556,22 @@ const runSubcommand = async ({
   // unlink failure (EACCES/EPERM, or the path being a directory/symlink the
   // safety checks did not catch) must FAIL the run step rather than silently
   // leave the old state in place for the comment step to post (Qodo #13).
-  try {
-    unlinkSync(path.join(outputDir, STATE_FILE));
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+  //
+  // action-state.json alone is not enough when output-dir is REUSED across
+  // invocations (CodeRabbit #6YT0KA): if THIS invocation fails before
+  // regenerating its own evidence — e.g. a plan run returns no parseable
+  // JSON, so plan.json below is never rewritten — a prior invocation's
+  // plan.json / report.json / report.md (the full tier's files, written by
+  // the spawned CLI) stay on disk and the composite's unconditional artifact
+  // upload publishes them alongside the new failure state, presenting stale
+  // results as current evidence for a run that never produced them. Clear
+  // every known evidence filename up front, same ENOENT-only discipline.
+  for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
+    try {
+      unlinkSync(path.join(outputDir, staleName));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   }
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
@@ -584,7 +596,15 @@ const runSubcommand = async ({
   // Capture the FULL mode including special bits (sticky/setgid/setuid) so
   // restore is faithful: a caller-supplied /tmp (01777) must be restored to
   // 01777, not 0777 (CodeRabbit #6YTfjs). Mask 0o7777, not 0o777.
-  const priorMode = (() => { try { return lstatSync(outputDir).mode & 0o7777; } catch { return null; } })();
+  //
+  // Use statSync (follows symlinks), NOT lstatSync, so a symlinked outputDir
+  // captures the TARGET directory's real mode. lstatSync would capture the
+  // symlink's OWN mode instead — typically 0777, since most platforms ignore
+  // permission bits on the link itself — and both chmodSync calls below
+  // follow the link to the target. Restoring a 0700 target to a captured
+  // 0777 would broaden it, exposing or making writable whatever else lives
+  // there (CodeRabbit #6YT0Js).
+  const priorMode = (() => { try { return statSync(outputDir).mode & 0o7777; } catch { return null; } })();
  const restorePriorMode = () => {
    if (priorMode === null || process.platform === 'win32') return;
    try { chmodSync(outputDir, priorMode); } catch { /* best-effort restore */ }
@@ -607,11 +627,16 @@ const runSubcommand = async ({
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);
   if (run === 'plan') args.push('--plan');
-  // Restore the caller-owned directory's original mode before handing off to
-  // the CLI (CodeRabbit #6YFOVK): the wrapper needed 0o700 only for the window
-  // in which IT wrote state/plan files; the CLI re-applies its own owner-only
-  // perms to the files it writes, so the caller's directory mode can return.
-  restorePriorMode();
+  // Restore the caller-owned directory's original mode only AFTER every write
+  // to it has finished, not before handing off to the CLI (CodeRabbit
+  // #6YT0Jo). The spawned CLI itself re-chmods the directory to 0o700 while
+  // writing evidence (writeEvidenceReport, scripts/pr_closeout_report.js),
+  // and the wrapper's OWN writes below (plan.json, action-state.json) all
+  // happen AFTER spawnCli returns — restoring before spawnCli left the
+  // directory at the CLI's 0o700 rather than the caller's original mode once
+  // the full run actually finished. The try/finally covers every exit path,
+  // including a thrown error.
+  try {
   const result = spawnCli(args, { env });
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);
@@ -757,8 +782,18 @@ const runSubcommand = async ({
       ? [parsed.admission.attestation, parsed.admission.cleanTree, parsed.admission.preflight]
         .filter((probe) => probe && typeof probe.status === 'string')
       : [];
+    // resolvePlanAdmission (scripts/pr_closeout_workflow.js) uses a DIFFERENT
+    // status vocabulary for the attestation probe (present | weakened | absent
+    // | unavailable) than cleanTree/preflight (PASS | FAIL | BLOCKED) — 'PASS'
+    // never appears for attestation, so requiring every probe to literally
+    // equal 'PASS' meant a fully-ready plan (attestation present, tree clean,
+    // preflight passing) could never aggregate to PASS; it always fell to
+    // BLOCKED (CodeRabbit #6YT0J4). Map the passing/failing attestation
+    // states onto the PASS/FAIL vocabulary before reducing.
+    const probePasses = (probe) => probe.status === 'PASS' || probe.status === 'present';
+    const probeFails = (probe) => probe.status === 'FAIL' || probe.status === 'weakened';
     const admissionStatus = admissionProbes.length
-      ? admissionProbes.every((probe) => probe.status === 'PASS') ? 'PASS' : admissionProbes.find((probe) => probe.status === 'FAIL') ? 'FAIL' : 'BLOCKED'
+      ? admissionProbes.every(probePasses) ? 'PASS' : admissionProbes.some(probeFails) ? 'FAIL' : 'BLOCKED'
       : (run === 'plan' ? 'unavailable' : '');
     writeOutputs(env.GITHUB_OUTPUT, {
       status, mode: reportMode, attestation, 'report-path': reportJsonPath,
@@ -770,6 +805,9 @@ const runSubcommand = async ({
   })}\n`);
   process.stdout.write(`closeout-action: ${redactSecrets(decision.reason)}\n`);
   return 0;
+  } finally {
+    restorePriorMode();
+  }
 };
 
 /**
@@ -823,6 +861,14 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // to its original broader mode before this write, the file content (which can
   // hold unredacted runner paths / base refs / error text) is still owner-only.
   writeFileSync(target, content, { mode: 0o600 });
+  // writeFileSync's `mode` option only applies when the OPEN call CREATES the
+  // file — an ordinary pre-existing regular single-link file (the guard above
+  // only unlinks a symlink/non-file/hardlink, not a plain reused file) is
+  // opened with O_TRUNC and keeps whatever permissive mode it already had,
+  // e.g. 0o644 from a prior invocation of a reused output-dir. chmodSync
+  // unconditionally afterward closes that gap; it is a cheap no-op when the
+  // file was freshly created at 0o600 already (CodeRabbit #6YT0Jx).
+  chmodSync(target, 0o600);
 };
 
 const readState = (outputDir) => {

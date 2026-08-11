@@ -560,6 +560,26 @@ they are roadmap items, not accepted risk:
   style). The one accepted residual: a `uses:`-like token inside a `run: |`
   block-scalar continuation line could theoretically false-positive; this is
   vanishingly rare in real workflows. A real YAML parser is the long-term fix.
+- **Plan-mode preflight probes can forward a config-named secret to
+  PR-controlled code before attestation.** `buildPlanPreflightEnvironment`
+  (the gate CLI) denies a hard-coded set of credential-SHAPED env var name
+  patterns before honoring `config.safeEnv`/`config.requiredEnv` for the
+  untrusted plan preview, but the denylist is a heuristic over name spelling,
+  not a guarantee — a job secret named outside that pattern (for example
+  `DEPLOY_CRED`, which does not match the `CREDENTIAL(S)` token the pattern
+  checks for) can still be listed in `config.safeEnv` by the PR itself and
+  reach a plan-tier preflight probe that executes repository-controlled
+  content (e.g. a required tool's `--version` probe resolving to a
+  PR-committed `node_modules/.bin/<tool>`), before any human review or
+  attestation. Fixing this fully means either a base-trusted (not
+  PR-controlled) environment allowlist or dropping config-selected variables
+  from plan admission entirely — both are gate CLI changes
+  (`scripts/pr_closeout_workflow.js`), out of this sub-project's scope.
+  Interim control: do not grant a workflow job that runs `run: plan` access
+  to any secret whose value must stay confidential from arbitrary PR
+  content — treat the plan/preview job's secret scope as equivalent to
+  running untrusted code, and reserve high-value secrets for a `run: full`
+  job (post-attestation) or a separate job that does not share them.
 - **Reviewer permission checks are N+1.** The gate's `readLivePrState` fetches
   each matching review's collaborator-permission record individually via `gh`,
   and the two-snapshot stability check repeats this up to four times. On PRs

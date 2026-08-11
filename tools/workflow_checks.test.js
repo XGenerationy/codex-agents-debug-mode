@@ -421,6 +421,44 @@ test('findUnpinnedUses rejects continued quoted explicit uses keys (CodeRabbit #
   assert.equal(r[0].line, 1);
   assert.match(r[0].ref, /\(explicit \? uses mapping key/);
 });
+test('findUnpinnedUses does not let a plain-scalar apostrophe hide a later flow key (CodeRabbit #6YSoOn)', () => {
+  // A bare apostrophe in an UNQUOTED plain scalar (`don't`) is ordinary scalar
+  // content, not a quote delimiter — YAML plain scalars may contain `'`
+  // anywhere except as the first character. The quote-context walker
+  // previously treated every `'` as toggling single-quote state, so this
+  // apostrophe opened a phantom quoted string that swallowed the real,
+  // escape-obfuscated flow uses key that followed, suppressing the violation
+  // (a fail-OPEN bypass). Both the escape-obfuscated-quoted-key and
+  // alias-key scanners share the fix (isInsideQuotedScalar).
+  const escaped = findUnpinnedUses('steps: [{name: don\'t, "u\\u0073es": owner/action@main}]\n');
+  assert.equal(escaped.length, 1, 'an apostrophe before an escaped flow key must not hide it');
+  assert.match(escaped[0].ref, /quoted uses: key resolves to uses/);
+  const alias = findUnpinnedUses('steps: [{name: don\'t, *action_key: owner/action@main}]\n');
+  assert.equal(alias.length, 1, 'an apostrophe before an alias flow key must not hide it');
+  assert.match(alias[0].ref, /\(\*alias: flow mapping key/);
+  // The literal-uses SUSPICIOUS_USES scanner (previously a duplicated, now
+  // shared, walker) has the identical failure mode: confirm it too.
+  const literal = findUnpinnedUses('steps: [{name: don\'t, uses: owner/action@main}]\n');
+  assert.equal(literal.length, 1, 'an apostrophe before a literal uses: key must not hide it');
+  // A real single-quoted scalar must still suppress a uses-shaped token
+  // inside it — the fix must not turn every apostrophe into a non-quote.
+  assert.equal(findUnpinnedUses("name: 'a {uses: fake}'\n").length, 0,
+    'a uses-shaped token inside a real single-quoted scalar is still suppressed');
+});
+test('findUnpinnedUses folds continued explicit keys inside flow mappings (CodeRabbit #6YSx9t)', () => {
+  // The block-style pre-fold only recognized an explicit-key marker at
+  // absolute line start; a flow-embedded one (`steps: [{? "u\<NL>ses": ref}]`,
+  // js-yaml verified to resolve identically to the block form) was never
+  // folded, so its resolved `uses` key slipped past every downstream scanner.
+  // Once folded to `{? "uses": ref}`, the literal (non-escaped) quoted key
+  // falls through FLOW_QUOTED_USES_KEY (which only flags escape-obfuscated
+  // keys) to the general SUSPICIOUS_USES scanner, same as any other clean
+  // flow-style `uses:` — still flagged, just via the generic message.
+  const r = findUnpinnedUses('steps: [{? "u\\\n  ses": owner/action@main}]\n');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].line, 1);
+  assert.match(r[0].ref, /uses: in non-block-style or unparseable form/);
+});
 test('findUnpinnedUses strips trailing YAML comments before SUSPICIOUS_USES (CodeRabbit #6X7tKy)', () => {
   assert.equal(findUnpinnedUses('name: build # see {uses: owner/action@main}\n').length, 0,
     'a {uses:} token inside a trailing comment is not flagged');

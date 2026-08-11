@@ -316,6 +316,18 @@ sub-project consumes as-is and does not modify:
   `readLivePrState`. Interim control: do not make the `Closeout gate` check a required
   merge gate — require the attestation-bearing review instead, which the gate
   re-verifies independently.
+- **Plan-mode preflight can forward a config-named secret to PR-controlled code
+  before attestation (CodeRabbit PR7 #6X9429):** `buildPlanPreflightEnvironment`
+  denies a hard-coded set of credential-shaped env var NAME patterns before
+  honoring `config.safeEnv`/`config.requiredEnv` for the untrusted plan preview,
+  but a real secret named outside that pattern (e.g. `DEPLOY_CRED`) can still be
+  listed in `safeEnv` by the PR and reach a plan-tier preflight probe that runs
+  repository-controlled content, before any human review. A full fix needs a
+  base-trusted (not PR-controlled) environment allowlist for plan admission, or
+  dropping config-selected variables from it entirely — a gate CLI change
+  (`scripts/pr_closeout_workflow.js`), out of this sub-project's scope. Interim
+  control: do not grant a `run: plan` job access to any secret that must stay
+  confidential from arbitrary PR content.
 
 ## Success criteria
 
