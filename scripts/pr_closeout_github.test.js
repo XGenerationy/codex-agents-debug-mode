@@ -481,10 +481,13 @@ test('selfJobDisplayName excludes a matrixed/named job that GITHUB_JOB alone cou
 });
 
 test('resolveCurrentJobDisplayName resolves the current job\'s true displayed name by matching RUNNER_NAME (CodeRabbit PR7 #6YXkRF)', async () => {
-  const jobsResponse = { jobs: [
+  // --slurp wraps every page into one outer array, even when there is only
+  // one page (gh api --help: "wrap all pages ... into an outer JSON
+  // array") — the mock mirrors that shape, not a bare {jobs: [...]} object.
+  const jobsResponse = [{ jobs: [
     { name: 'preview', runner_name: 'other-runner-1' },
     { name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' },
-  ] };
+  ] }];
   let capturedArgs;
   const runGh = async (args) => { capturedArgs = args; return jobsResponse; };
   const resolved = await resolveCurrentJobDisplayName({
@@ -493,19 +496,23 @@ test('resolveCurrentJobDisplayName resolves the current job\'s true displayed na
     env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
   });
   assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'matches the job entry whose runner_name equals RUNNER_NAME');
-  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs', '--paginate'],
-    'queries the Jobs API for this specific run, across all pages');
+  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs', '--paginate', '--slurp'],
+    'queries the Jobs API for this specific run, across all pages, wrapped so JSON.parse can handle it');
 });
 
-test('resolveCurrentJobDisplayName paginates so a runner match on a later API page is still found (CodeRabbit PR7 #6YZkoF)', async () => {
+test('resolveCurrentJobDisplayName paginates so a runner match on a later API page is still found (CodeRabbit PR7 #6YZkoF, qodo PR7 pagination-unparsable follow-up)', async () => {
   let capturedArgs;
   const runGh = async (args) => {
     capturedArgs = args;
-    // Simulates what gh api --paginate hands back: the `jobs` array already
-    // merged across pages by the CLI, well past the API's 30-per-page
-    // default. The match is deliberately not on a first-30-jobs prefix.
-    const filler = Array.from({ length: 40 }, (_, i) => ({ name: `filler-${i}`, runner_name: `other-runner-${i}` }));
-    return { jobs: [...filler, { name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] };
+    // Simulates the real --paginate --slurp shape: an array of separate
+    // page OBJECTS (gh api --help: "Each page is a separate JSON array or
+    // object... --slurp to wrap all pages... into an outer JSON array") —
+    // NOT one response object with an already-merged jobs array. The match
+    // is deliberately on the second page, past the API's 30-per-page
+    // default.
+    const page1 = { jobs: Array.from({ length: 30 }, (_, i) => ({ name: `filler-${i}`, runner_name: `other-runner-${i}` })) };
+    const page2 = { jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] };
+    return [page1, page2];
   };
   const resolved = await resolveCurrentJobDisplayName({
     repository: 'owner/repo',
@@ -513,14 +520,15 @@ test('resolveCurrentJobDisplayName paginates so a runner match on a later API pa
     env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
   });
   assert.ok(capturedArgs.includes('--paginate'), 'must request every page, not just the default 30-job first page');
-  assert.equal(resolved, 'gate (ubuntu-latest, 20)');
+  assert.ok(capturedArgs.includes('--slurp'), 'must wrap multi-page output so a single JSON.parse(stdout) can parse it (qodo PR7)');
+  assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'a match on the second page is still found once pages are flattened');
 });
 
 test('resolveCurrentJobDisplayName resolves uniquely when a reused self-hosted runner shares runner_name with an earlier completed job (CodeRabbit PR7 #6YZkoJ)', async () => {
-  const runGh = async () => ({ jobs: [
+  const runGh = async () => [{ jobs: [
     { name: 'earlier-job', runner_name: 'shared-runner', status: 'completed', conclusion: 'success' },
     { name: 'current-job', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
-  ] });
+  ] }];
   const resolved = await resolveCurrentJobDisplayName({
     repository: 'owner/repo',
     runGh,
@@ -530,10 +538,10 @@ test('resolveCurrentJobDisplayName resolves uniquely when a reused self-hosted r
 });
 
 test('resolveCurrentJobDisplayName refuses to guess when multiple non-completed jobs share runner_name (CodeRabbit PR7 #6YZkoJ)', async () => {
-  const runGh = async () => ({ jobs: [
+  const runGh = async () => [{ jobs: [
     { name: 'queued-1', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
     { name: 'queued-2', runner_name: 'shared-runner', status: 'queued', conclusion: null },
-  ] });
+  ] }];
   const resolved = await resolveCurrentJobDisplayName({
     repository: 'owner/repo',
     runGh,
@@ -562,7 +570,7 @@ test('resolveCurrentJobDisplayName is best-effort: null on missing env, API fail
     'an API failure (rate limit, network) falls back to null, never throws',
   );
 
-  const noMatchRunGh = async () => ({ jobs: [{ name: 'preview', runner_name: 'someone-else' }] });
+  const noMatchRunGh = async () => [{ jobs: [{ name: 'preview', runner_name: 'someone-else' }] }];
   assert.equal(
     await resolveCurrentJobDisplayName({
       repository: 'owner/repo', runGh: noMatchRunGh,
@@ -572,6 +580,9 @@ test('resolveCurrentJobDisplayName is best-effort: null on missing env, API fail
     'no job entry matches this runner falls back to null',
   );
 
+  // A bare (unwrapped) object, as if --slurp's outer array were missing —
+  // the real gh --slurp output is always an array (per --help), so this is
+  // the "malformed" shape here.
   const malformedRunGh = async () => ({ not: 'the expected shape' });
   assert.equal(
     await resolveCurrentJobDisplayName({
@@ -579,7 +590,18 @@ test('resolveCurrentJobDisplayName is best-effort: null on missing env, API fail
       env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
     }),
     null,
-    'a malformed response (no jobs array) falls back to null rather than throwing',
+    'a malformed (non-array) response falls back to null rather than throwing',
+  );
+
+  // A well-formed page array whose page object has no `jobs` array.
+  const missingJobsRunGh = async () => [{ not: 'the expected shape' }];
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: missingJobsRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'a page object with no jobs array falls back to null rather than throwing',
   );
 });
 
@@ -782,7 +804,7 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
       if (args[0] === 'pr') return matrixedPr;
       if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
         jobsApiCalled = true;
-        return { jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] };
+        return [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] }];
       }
       if (args.includes('--paginate')) return [[approvedReview()]];
       return {

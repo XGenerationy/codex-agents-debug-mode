@@ -299,11 +299,21 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
   try {
     // --paginate: the Jobs API returns 30 jobs per page by default, and a
     // matrix or multi-job workflow can easily exceed that (CodeRabbit PR7
-    // #6YZkoF). gh api's --paginate merges the `jobs` array across pages
-    // into a single response object here, same as any other object-shaped
-    // (non-bare-array) paginated endpoint.
-    const jobs = await runGh(['api', `repos/${repository}/actions/runs/${runId}/jobs`, '--paginate'], { repo });
-    const list = Array.isArray(jobs?.jobs) ? jobs.jobs : [];
+    // #6YZkoF). --paginate ALONE does not merge pages into one JSON
+    // document — gh's own help text is explicit: "Each page is a separate
+    // JSON array or object. Pass --slurp to wrap all pages ... into an
+    // outer JSON array." Without --slurp, multiple pages print as multiple
+    // concatenated JSON documents, which runGh's single JSON.parse(stdout)
+    // cannot parse — the call would throw and this resolver would silently
+    // fall back to null on any run with more than one page of jobs, the
+    // opposite of what --paginate was added for (qodo PR7, "Jobs api
+    // pagination unparsable"). --slurp (already the established pattern
+    // for a paginated `gh api` call elsewhere in this file) wraps every
+    // page into one outer array; each element here is a whole page OBJECT
+    // (`{jobs: [...], total_count}`, not a bare array like the reviews
+    // endpoint), so each page's own `.jobs` is extracted and concatenated.
+    const pages = await runGh(['api', `repos/${repository}/actions/runs/${runId}/jobs`, '--paginate', '--slurp'], { repo });
+    const list = (Array.isArray(pages) ? pages : []).flatMap((page) => (Array.isArray(page?.jobs) ? page.jobs : []));
     // A reused self-hosted runner can carry the same runner_name across
     // sequential jobs within one run, so the first match by name alone
     // could be an earlier, already-COMPLETED job rather than this one
