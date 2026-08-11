@@ -320,14 +320,16 @@ test('classifies failed checks as FAIL and skipped checks as BLOCKED', () => {
 });
 
 test('excludes only the currently-running self-workflow check from the rollup (CodeRabbit #6X_pwH)', () => {
-  // At the moment classifyLivePrState runs INSIDE the Closeout gate workflow,
-  // its own check is IN_PROGRESS and cannot see its own result. The targeted
-  // exclusion omits ONLY the running instance (workflowName matches AND status
-  // is not COMPLETED); prior COMPLETED runs (SUCCESS or FAILURE) at the same
-  // head are STILL classified, so a prior real FAILURE continues to block.
+  // At the moment classifyLivePrState runs INSIDE the Closeout gate job, its
+  // own check is IN_PROGRESS and cannot see its own result. The exclusion omits
+  // ONLY the current job's non-COMPLETED check (workflowName AND name AND
+  // !COMPLETED); prior COMPLETED runs and SIBLING jobs in the same workflow are
+  // STILL classified (#6X_pwH refined by #6YSx9w).
   const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
   try {
     process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
     // Running self (IN_PROGRESS) + prior self FAILURE + legitimate external CI.
     const priorFailure = classifyLivePrState({
       repository: 'owner/repo',
@@ -373,9 +375,36 @@ test('excludes only the currently-running self-workflow check from the rollup (C
       0,
       'the running self-check is omitted from the returned rollup',
     );
+
+    // #6YSx9w: a SIBLING job in the same workflow must NOT be excluded. If the
+    // workflow runs gate + preview, and preview is still IN_PROGRESS, the gate
+    // must see preview as a blocker (not omit it). Only the gate's OWN
+    // IN_PROGRESS check (name === GITHUB_JOB) is omitted.
+    const sibling = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'preview', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(sibling.status, 'BLOCKED', 'sibling preview IN_PROGRESS still BLOCKS (not excluded by #6YSx9w)');
+    const siblingPreview = sibling.checks.find((c) => c.name === 'preview' && c.workflowName === 'Closeout gate');
+    assert.ok(siblingPreview, 'the sibling preview check is RETAINED in the rollup');
+    assert.equal(sibling.checks.filter((c) => c.name === 'gate' && c.status === 'IN_PROGRESS').length, 0,
+      'only the gate OWN IN_PROGRESS check is omitted');
   } finally {
     if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
     else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
   }
 });
 

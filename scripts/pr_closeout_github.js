@@ -281,20 +281,29 @@ const classifyLivePrState = ({
   expectedBaseSha,
   gateAttestation,
 } = {}) => {
-  // Exclude the CURRENTLY-RUNNING instance of this gate workflow from the
-  // rollup classification (CodeRabbit #6X_pwH): at the moment the gate
-  // classifies live state, its own check is IN_PROGRESS and cannot see its own
-  // result, so classifying it would always block PASS. Narrowly scoped: only
-  // checks from THIS workflow whose status is not yet COMPLETED are omitted.
-  // Prior COMPLETED runs (SUCCESS or FAILURE) at the same head are STILL
-  // classified — a prior FAILURE is real evidence and must keep blocking.
-  // Cannot mask a failure: omits only the one check that physically cannot
-  // have a result yet (the running instance). Opt-in via GITHUB_WORKFLOW;
-  // local/CI invocations without that env var classify all checks as before.
+  // Exclude only the CURRENTLY-RUNNING gate JOB from the rollup classification
+  // (CodeRabbit #6X_pwH, refined by #6YSx9w): at the moment the gate classifies
+  // live state, its own check is IN_PROGRESS and cannot see its own result, so
+  // counting it would always block PASS. The exclusion is scoped to the SINGLE
+  // current job — NOT the whole workflow. Earlier versions matched on
+  // workflowName alone, which incorrectly excluded sibling jobs in the same
+  // workflow (e.g. a preview job) and could let the gate PASS before a sibling
+  // finished (#6YSx9w). Now the match requires BOTH:
+  //   - workflowName === GITHUB_WORKFLOW (this workflow)
+  //   - check.name === GITHUB_JOB (this specific job)
+  // Only a non-COMPLETED check matching BOTH is omitted. Prior COMPLETED runs
+  // at the same head are still classified (a prior FAILURE keeps blocking), and
+  // a sibling job's check is never excluded. Opt-in via both env vars; local/CI
+  // invocations without them classify all checks as before (backward-compatible).
   const selfWorkflowName = process.env.GITHUB_WORKFLOW || null;
+  const selfJobName = process.env.GITHUB_JOB || null;
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
-  if (selfWorkflowName) {
-    const filtered = checks.filter((check) => !(check.workflowName === selfWorkflowName && check.status !== 'COMPLETED'));
+  if (selfWorkflowName && selfJobName) {
+    const filtered = checks.filter((check) => !(
+      check.workflowName === selfWorkflowName
+      && check.name === selfJobName
+      && check.status !== 'COMPLETED'
+    ));
     checks.length = 0;
     checks.push(...filtered);
   }
