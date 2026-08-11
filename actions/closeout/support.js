@@ -5,10 +5,11 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } = require('node:fs');
+const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 
 // Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
 // git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
@@ -538,8 +539,24 @@ const defaultSpawnCli = (args, { env }) => spawnSync(process.execPath, [GATE_CLI
  */
 const runSubcommand = async ({
   inputs, inputBaseRef = '', config = '', outputDir, artifactName,
-  env = process.env, event = null, spawnCli = defaultSpawnCli,
+  env = process.env, event = null, spawnCli = defaultSpawnCli, nonce = randomUUID(),
 }) => {
+  // Bind this invocation's eventual finish verdict to THIS run, not whatever
+  // action-state.json happens to contain when finish reads it (CodeRabbit
+  // #6YW9UL): when a plan and full invocation share an output-dir (already a
+  // documented limitation — the composite cannot compute a unique per-step
+  // default path) and overlap, the plan's decision is intentionally recorded
+  // with success:true even for a non-PASS planStatus (a preview must never
+  // fail its own job). If the plan overwrites action-state.json after the
+  // full run recorded a FAILING decision but before the full invocation's
+  // "finish" step reads it, finish would apply the plan's success — the
+  // enforcing full job could go green on a gate that actually failed. The
+  // nonce is exported via GITHUB_ENV (persists to later steps in the SAME
+  // job only — a different job's parallel invocation never sees it, and a
+  // later invocation in the SAME job overwrites it before its own finish
+  // step runs) and written into the state file; finish rejects a state
+  // record whose nonce does not match its own job's current value.
+  if (env.GITHUB_ENV) writeOutputs(env.GITHUB_ENV, { CLOSEOUT_INVOCATION_NONCE: nonce });
   // Stale-state cleanup must run BEFORE input validation (CodeRabbit #6XsD7s):
   // if an allowed pre-existing external output-dir carries action-state.json
   // from a PRIOR run and the current `run`/`mode`/`pr-comment` value is
@@ -572,6 +589,30 @@ const runSubcommand = async ({
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
+  }
+  // The gate CLI's full tier also populates outputDir/logs (a DIRECTORY of
+  // per-check probe log files, scripts/pr_closeout_process.js), which the
+  // file-by-file cleanup above cannot reach. If this invocation is blocked
+  // before the CLI regenerates its own logs, a prior invocation's stale log
+  // files stay behind and the composite's unconditional artifact upload
+  // presents them as evidence for the new, unrelated run (CodeRabbit
+  // #6YXkRN). Same ENOENT-only-swallow discipline as the loop above.
+  //
+  // lstat FIRST, never trust a recursive remove to be symlink-safe on its
+  // own: if a check plants outputDir/logs as a symlink to an unrelated
+  // directory, unlink only the link entry (mirrors writeEvidenceFile's
+  // symlink discipline elsewhere in this file) — a recursive rm must only
+  // ever run against a confirmed real, non-symlinked directory.
+  try {
+    const logsPath = path.join(outputDir, 'logs');
+    const logsInfo = lstatSync(logsPath);
+    if (logsInfo.isDirectory()) {
+      rmSync(logsPath, { recursive: true });
+    } else {
+      unlinkSync(logsPath);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
   }
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
@@ -801,7 +842,7 @@ const runSubcommand = async ({
     });
   }
   writeEvidenceFile(outputDir, STATE_FILE, `${JSON.stringify({
-    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath,
+    tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath, nonce,
   })}\n`);
   process.stdout.write(`closeout-action: ${redactSecrets(decision.reason)}\n`);
   return 0;
@@ -885,10 +926,22 @@ const readState = (outputDir) => {
  * have already surfaced the evidence. Missing state fails closed.
  * @returns {number} process exit code.
  */
-const finishSubcommand = ({ outputDir }) => {
+const finishSubcommand = ({ outputDir, env = process.env }) => {
   const state = readState(outputDir);
   if (!state?.decision) {
     process.stderr.write('closeout-action: no recorded state; the run step never completed.\n');
+    return 3;
+  }
+  // Reject a state record that does not belong to THIS job's invocation
+  // (CodeRabbit #6YW9UL): a shared output-dir can be overwritten by a
+  // different (e.g. plan-tier) invocation between this job's "run" and
+  // "finish" steps. GITHUB_ENV persists CLOSEOUT_INVOCATION_NONCE within this
+  // job only, so only check when both this job's own nonce and a nonce on
+  // the state record are present — a mismatch means the record was replaced
+  // by a foreign invocation and must not be trusted, regardless of what it
+  // claims.
+  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
+    process.stderr.write('closeout-action: recorded state belongs to a different invocation (output-dir was overwritten by a concurrent run); refusing to trust it.\n');
     return 3;
   }
   process.stdout.write(`closeout-action: ${redactSecrets(state.decision.reason)}\n`);

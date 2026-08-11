@@ -308,14 +308,13 @@ sub-project consumes as-is and does not modify:
   a tag are unaffected; only this repository's `uses: ./` dogfood is. Interim control:
   a PR touching the action or gate scripts requires a maintainer to re-run the gate
   from the base branch after review.
-- **Self-observation:** the running gate reads the live PR `statusCheckRollup` and
-  treats every non-PASS check as a blocker; its own `Closeout gate` check is still
-  `IN_PROGRESS` at that point, so it blocks itself and cannot reach PASS while it is a
-  required check. `classifyLivePrState` has no self-exclusion today. A proper fix
-  threads a self-exclusion signal (the running check's name or run id) through
-  `readLivePrState`. Interim control: do not make the `Closeout gate` check a required
-  merge gate — require the attestation-bearing review instead, which the gate
-  re-verifies independently.
+- ~~**Self-observation**~~ **Resolved:** `classifyLivePrState` (scripts/pr_closeout_github.js)
+  excludes the currently-running gate check from the live `statusCheckRollup` before
+  classifying it — a check matching both the running workflow (`GITHUB_WORKFLOW`) and
+  job (`GITHUB_JOB`) name is omitted while non-`COMPLETED`; a sibling job's check is
+  never excluded, and a prior completed failure still blocks. The `Closeout gate`
+  check can safely be a required merge gate (CodeRabbit PR7 #6X_pwH, refined by
+  #6YSx9w; this bullet corrected per #6YW9UF).
 - **Plan-mode preflight can forward a config-named secret to PR-controlled code
   before attestation (CodeRabbit PR7 #6X9429):** `buildPlanPreflightEnvironment`
   denies a hard-coded set of credential-shaped env var NAME patterns before

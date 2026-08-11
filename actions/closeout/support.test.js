@@ -536,6 +536,29 @@ test('runSubcommand clears stale plan.json/report.json/report.md from a reused o
     'stale report.md from a prior invocation must not survive a failed current run');
 });
 
+test('runSubcommand clears a stale outputDir/logs directory from a reused outputDir (CodeRabbit #6YXkRN)', async () => {
+  // The gate CLI's full tier populates outputDir/logs (a DIRECTORY of
+  // per-check probe log files), which the file-by-file stale-evidence
+  // cleanup cannot reach. Left behind, a prior invocation's log files would
+  // be presented as evidence for a new, unrelated (and possibly blocked)
+  // invocation.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const logsDir = path.join(outputDir, 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  writeFs(path.join(logsDir, 'qualification.probe.attempt-001.log'), 'stale log output\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0);
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(logsDir), false, 'a stale logs directory from a prior invocation must not survive');
+});
+
 test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {
   // The stale-state cleanup must only swallow the benign ENOENT ("no previous
   // state") case. Any other unlink failure (here: action-state.json exists as
@@ -881,6 +904,65 @@ test('finishSubcommand exits with the recorded decision', () => {
   assert.equal(finishSubcommand({ outputDir: dir }), 0);
   // Missing state means run never completed: fail closed.
   assert.equal(finishSubcommand({ outputDir: makeTempDir() }), 3);
+});
+
+test('finishSubcommand rejects a state record left by a different invocation (CodeRabbit #6YW9UL)', () => {
+  // Simulates the race: this job's own run() wrote nonce 'job-own-nonce' via
+  // GITHUB_ENV, but by the time finish() runs, action-state.json has been
+  // overwritten by a DIFFERENT (e.g. plan-tier) invocation sharing the same
+  // output-dir — recorded with its own foreign nonce and success:true (a plan
+  // decision is always success:true regardless of planStatus). Trusting it
+  // would let an enforcing full job go green on a gate that actually failed.
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    decision: { success: true, exitCode: 0, reason: 'plan captured (planStatus=BLOCKED)' },
+    nonce: 'foreign-invocation-nonce',
+  }));
+  assert.equal(
+    finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'job-own-nonce' } }),
+    3,
+    'a state record with a mismatched nonce must not be trusted, even though it claims success',
+  );
+});
+
+test('finishSubcommand trusts a state record whose nonce matches this job\'s own', () => {
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' },
+    nonce: 'this-job-nonce',
+  }));
+  assert.equal(finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }), 2);
+});
+
+test('finishSubcommand skips the nonce check when either side lacks one (backward compatible)', () => {
+  const dir = makeTempDir();
+  // No nonce on the state record (e.g. an older run, or GITHUB_ENV was
+  // unavailable when it was written): the check does not apply.
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
+  assert.equal(finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }), 0);
+  // No nonce in this job's own env (GITHUB_ENV unavailable): the check does
+  // not apply either — this only tightens behavior in real GH Actions jobs,
+  // where GITHUB_ENV is always present.
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'x' }));
+  assert.equal(finishSubcommand({ outputDir: dir, env: {} }), 0);
+});
+
+test('runSubcommand writes its nonce to both the state file and GITHUB_ENV (CodeRabbit #6YW9UL)', async () => {
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const envFile = path.join(dir, 'env');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's'), GITHUB_ENV: envFile },
+    event: {},
+    nonce: 'fixed-test-nonce',
+    spawnCli: () => ({ status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  assert.equal(state.nonce, 'fixed-test-nonce');
+  assert.match(readFs(envFile, 'utf8'), /^CLOSEOUT_INVOCATION_NONCE=fixed-test-nonce$/m);
 });
 
 test('assertOutputOutsideWorkspace rejects inside-workspace paths before any write', () => {

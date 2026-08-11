@@ -474,6 +474,55 @@ test('findUnpinnedUses does not let a plain-scalar double-quote hide a later flo
   const realQuoted = findUnpinnedUses('steps: [{name: "a b", uses: owner/action@main}]\n');
   assert.equal(realQuoted.length, 1, 'the real uses: after a properly double-quoted name is still flagged (not suppressed twice-over)');
 });
+test('findUnpinnedUses does not let a plain-scalar question mark extend quote-open context (Qodo #1)', () => {
+  // `?` only belongs in the quote-open context when it is ITSELF validly
+  // positioned (immediately after start-of-line, :, -, {, [, or ,) — e.g. the
+  // explicit-key marker in `{? "uses": ref}`. A bare `?` as ordinary
+  // plain-scalar content (`ok? "x` — preceded by `k`, not a boundary) must
+  // NOT re-open quote context for what follows: doing so would misclassify
+  // the flow boundary before a later real `uses:` key as "inside a string",
+  // suppressing the violation (fail-OPEN bypass).
+  const bypassAttempt = findUnpinnedUses('steps: [{name: ok? "x", uses: owner/action@main}]\n');
+  assert.equal(bypassAttempt.length, 1, 'a plain-scalar ? must not extend quote-open context to a later real uses: key');
+  // Sanity: a genuinely valid explicit-key ? (right after a flow boundary)
+  // must still open context for the quote it introduces.
+  const legitExplicitKey = findUnpinnedUses('steps: [{? "u\\u0073es": owner/action@main}]\n');
+  assert.equal(legitExplicitKey.length, 1, 'a validly-positioned explicit-key ? still opens context for its quote');
+  assert.match(legitExplicitKey[0].ref, /quoted uses: key resolves to uses/);
+});
+test('findUnpinnedUses does not let a plain-scalar hyphen extend quote-open context (CodeRabbit #6YXkRo)', () => {
+  // Same transitivity requirement as `?` above, for `-`: a hyphen only
+  // belongs in quote-open context when it is ITSELF validly positioned (a
+  // genuine sequence-entry dash, `- 'value'`). `name: abc-'def` (js-yaml
+  // verified: a valid plain scalar equal to the literal string "abc-'def")
+  // has the hyphen mid-word, preceded by `c` — it must not re-open context
+  // for the apostrophe after it, or the walker misclassifies the flow
+  // boundary before a later real `uses:` key as "inside a string".
+  const bypassAttempt = findUnpinnedUses("steps: [{name: abc-'def, with: {}, uses: owner/action@main}]\n");
+  assert.equal(bypassAttempt.length, 1, 'a plain-scalar hyphen must not extend quote-open context to a later real uses: key');
+  // Sanity: a genuine sequence-entry dash at line start still opens context
+  // for the quote that follows it.
+  assert.deepEqual(findUnpinnedUses("- 'owner/action@df4cb1c069e1874edd31b4311f1884172cec0e10'\n"), [],
+    'a genuine sequence dash still opens context for a real single-quoted pinned ref');
+});
+test('findUnpinnedUses rejects an explicit key spelled as a block scalar (CodeRabbit #6YW9UB)', () => {
+  // `- ? |-` opens a literal block scalar whose resolved content becomes the
+  // mapping KEY (not a value) — `- ? |-` / `    uses` / `  : owner/action@main`
+  // resolves (js-yaml verified) to {uses: "owner/action@main"}. Neither
+  // BLOCK_SCALAR_HEADER (requires a preceding `:`, targets `key: |` VALUES)
+  // nor any explicit-key scanner recognized this form.
+  const literal = findUnpinnedUses('steps:\n  - ? |-\n    uses\n  : owner/action@main\n');
+  assert.equal(literal.length, 1);
+  assert.equal(literal[0].line, 2);
+  assert.match(literal[0].ref, /\(explicit \? block-scalar mapping key/);
+  const folded = findUnpinnedUses('steps:\n  - ? >\n    uses\n  : owner/action@main\n');
+  assert.equal(folded.length, 1);
+  assert.equal(folded[0].line, 2);
+  // A genuine `run: |` block-scalar VALUE (not an explicit key) must still
+  // be tracked and skipped normally — this fix must not touch that path.
+  assert.deepEqual(findUnpinnedUses('steps:\n  - run: |\n      echo "{uses: foo@bar}"\n'), [],
+    'an ordinary block-scalar value is unaffected');
+});
 test('findUnpinnedUses folds continued explicit keys inside flow mappings (CodeRabbit #6YSx9t)', () => {
   // The block-style pre-fold only recognized an explicit-key marker at
   // absolute line start; a flow-embedded one (`steps: [{? "u\<NL>ses": ref}]`,

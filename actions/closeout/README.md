@@ -495,17 +495,34 @@ they are roadmap items, not accepted risk:
   `statusCheckRollup` and attestation re-verification still catch every other class of
   PR. Consumers who pin the action to a tag (`uses: owner/repo/actions/closeout@<ref>`)
   are not affected — only this repository's own `uses: ./actions/closeout` dogfood is.
-- **The running gate observes its own in-progress check as unresolved.** Near the end
-  of a full run, the gate reads the live PR's `statusCheckRollup` and treats every
-  non-PASS check as a blocker; its own `Closeout gate` check is still `IN_PROGRESS`
-  at that moment, so it blocks itself and can never reach PASS while it is a required
-  check. The CLI's `classifyLivePrState` has no self-exclusion today. The practical
-  workaround while this remains: do not make the `Closeout gate` check a **required**
-  merge gate (require the attestation-bearing review instead, which the gate already
-  re-verifies independently), or run the gate via `workflow_dispatch` after the check
-  has a settled state. A proper fix threads a self-exclusion signal (the running
-  check's name or run id) through `readLivePrState` so the live-state classifier omits
-  the gate's own in-progress check.
+- ~~The running gate observes its own in-progress check as unresolved.~~ **Resolved.**
+  `classifyLivePrState` (scripts/pr_closeout_github.js) now excludes the currently-
+  running gate check from the live `statusCheckRollup` before classifying it: it
+  omits a check matching both the running workflow (`GITHUB_WORKFLOW`) and job
+  (`GITHUB_JOB`) name while that check is not yet `COMPLETED`. The exclusion is
+  scoped to the single current job — a sibling job's check (e.g. `preview`) is
+  never excluded, and a PRIOR completed run of the same check still blocks on a
+  real failure. Making the `Closeout gate` check a required merge gate is
+  therefore safe; it can reach PASS on its own run (CodeRabbit PR7 #6X_pwH,
+  refined by #6YSx9w — landed before this bullet was corrected, CodeRabbit
+  #6YW9UF).
+- **A verdict recorded while a sibling check is still pending goes stale once
+  that check settles.** If an approval is submitted (re-running the gate)
+  while another required check (e.g. the Node validation matrix, or
+  `preview`) is still queued or in progress, `classifyLivePrState` correctly
+  classifies that check as a blocker and the gate reports BLOCKED — but once
+  the sibling check later completes, nothing re-triggers the gate to
+  re-evaluate: `closeout-gate.yml` subscribes to PR, review, and manual-
+  dispatch activity, none of which GitHub fires for another workflow's check
+  completion. A fix needs either a `check_run`/`workflow_run`-completion
+  trigger (real infinite-retrigger and CI-cost risk if not carefully scoped —
+  the gate's own completion is itself a check completion — so this needs
+  design review before landing) or gate-CLI polling for pending checks to
+  settle within one run (a `scripts/pr_closeout_*` change, out of this
+  sub-project's scope). Interim control: re-run the gate via
+  `workflow_dispatch`, or wait for the next naturally covered event (a head
+  push or a new/edited review) once all sibling checks have settled
+  (CodeRabbit PR7 #6YW9UP).
 - **Event triggers do not cover a base-branch advance.** The attestation is
   base-SHA-bound, so if the base branch receives a new commit while a PR's head is
   unchanged, the prior attestation no longer matches and the gate should re-run.
@@ -532,6 +549,26 @@ they are roadmap items, not accepted risk:
   now BLOCK on the unresolved thread. Interim control: a head push, a new/edited
   review, or a manual `workflow_dispatch` re-runs the gate and catches the
   reopened thread. A scheduled re-validation sweep is the long-term fix.
+- **Self-exclusion can misidentify the current check for a named or matrixed
+  job.** `classifyLivePrState` (scripts/pr_closeout_github.js) excludes the
+  currently-running gate check by matching `check.name === GITHUB_JOB`, but
+  `GITHUB_JOB` is the YAML job **id**, while `statusCheckRollup[].name` is the
+  displayed check name — which differs whenever the consuming workflow gives
+  the job a `name:` override or runs it in a `strategy.matrix` (where the
+  displayed name gets a `(value, value)` suffix). In either configuration the
+  equality never matches, self-exclusion silently no-ops, and every otherwise-
+  clean full run reports BLOCKED on its own in-progress check. This fails
+  closed (never a false PASS) but breaks availability for those consumers. A
+  correct fix needs the Checks/Jobs API (matching this run's job by
+  `RUNNER_NAME`/`RUNNER_TRACKING_ID` against `GET
+  /repos/{owner}/{repo}/actions/runs/{GITHUB_RUN_ID}/jobs` to resolve this
+  job's true displayed name) — a new API dependency and failure-mode surface
+  in the gate CLI (`scripts/pr_closeout_*`), which is out of this sub-
+  project's scope and warrants its own design review rather than a reactive
+  patch. Interim control: consumers who name the job or run it in a matrix
+  should not rely on self-exclusion — invoke the gate from a dedicated,
+  unnamed, non-matrixed job (as this repo's own dogfood workflow does) until
+  a Jobs-API-based fix lands (CodeRabbit PR7 #6YXkRF).
 - **Manual dispatch runs have no PR context.** On `workflow_dispatch`,
   `github.event.pull_request.head.sha` is empty, so the checkout falls back to
   `github.ref` (the branch the dispatch ran on, typically the base branch), and

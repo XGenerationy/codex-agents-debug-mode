@@ -105,40 +105,61 @@ const stripTrailingYamlComment = (text) => {
 // means a plain scalar's embedded quote swallows the rest of the line into a
 // phantom "string", hiding a REAL later match (e.g. an escape-obfuscated flow
 // `uses:` key) and causing a fail-OPEN bypass. Originally fixed for `'` only
-// (CodeRabbit #6YSoOn); `"` had the identical gap; a plain scalar containing
-// `"` before a real flow key still slipped past (CodeRabbit #6YW1O6). Both
-// quote types now share the same gate: a quote char only opens a quoted
-// scalar when it is the first non-whitespace character at a value/key
-// position — i.e. immediately (modulo whitespace) after start-of-line, `:`,
-// `-`, `{`, `[`, `,`, or `?` (the explicit-key indicator). Track the last
-// significant (non-whitespace, non-quote-toggling) character seen to decide.
-const QUOTE_OPEN_CONTEXT = new Set([':', '-', '{', '[', ',', '?']);
+// (CodeRabbit #6YSoOn); `"` had the identical gap (CodeRabbit #6YW1O6). Both
+// quote types share one gate: a quote char only opens a quoted scalar when it
+// is the first non-whitespace character at a value/key position — i.e.
+// immediately (modulo whitespace) after start-of-line, `:`, `-`, `{`, `[`,
+// `,`, or `?` (the explicit-key indicator).
+//
+// `?` and `-` are TRANSITIVE, not a flat membership test (Qodo #1,
+// question-mark quote bypass; CodeRabbit #6YXkRo, hyphen in a plain scalar):
+// each only extends valid quote-open context to what follows it when the
+// character ITSELF sat at a valid position. `name: ok? "x` has `?` as
+// ordinary plain-scalar content (preceded by `k`, not a real boundary), and
+// `name: abc-'def` has `-` the same way (preceded by `c`, not a sequence
+// dash) — neither may re-open context for the quote after it, or the walker
+// misclassifies the rest of the line as string content and hides a real key
+// that follows. `{? "uses": ref}` (a genuine explicit-key marker right after
+// `{`) and `- 'value'` (a genuine sequence dash at line start) correctly
+// preserve context, because in both cases it was already valid when the
+// character was reached. `:`, `{`, `[`, and `,` do NOT need this treatment:
+// YAML forbids `:` followed by whitespace inside a plain scalar (it would be
+// ambiguous with a key separator) and forbids `{`/`[`/`,` inside a flow-
+// context plain scalar entirely, so unlike `?`/`-` they can never appear as
+// ambiguous literal content in the position that matters here — a flat
+// membership check for them is safe. A single boolean tracks "currently at a
+// valid quote-open position" instead of a raw last-character lookup, so this
+// transitivity falls out naturally for the two characters that need it.
+const QUOTE_OPEN_CONTEXT = new Set([':', '{', '[', ',']);
+const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
 const isInsideQuotedScalar = (text, matchIndex) => {
   const beforeMatch = String(text).substring(0, matchIndex);
   let inDouble = false;
   let inSingle = false;
-  let lastSignificant = null; // null == start-of-string context
+  let atQuoteOpenContext = true; // start-of-string is always a valid quote-open context
   for (let i = 0; i < beforeMatch.length; i += 1) {
     const ch = beforeMatch[i];
     if (inDouble) {
       if (ch === '\\') { i += 1; } // skip the escaped char
-      else if (ch === '"') { inDouble = false; lastSignificant = '"'; }
+      else if (ch === '"') { inDouble = false; atQuoteOpenContext = false; }
       continue;
     }
     if (inSingle) {
       if (ch === "'") {
         if (beforeMatch[i + 1] === "'") { i += 1; } // escaped '' — stay in string
-        else { inSingle = false; lastSignificant = "'"; }
+        else { inSingle = false; atQuoteOpenContext = false; }
       }
       continue;
     }
-    const atQuoteOpenContext = lastSignificant === null || QUOTE_OPEN_CONTEXT.has(lastSignificant);
     if (ch === '"' && atQuoteOpenContext) {
       inDouble = true;
     } else if (ch === "'" && atQuoteOpenContext) {
       inSingle = true;
+    } else if (TRANSITIVE_QUOTE_OPEN_CONTEXT.has(ch)) {
+      // Preserve the current context as-is: valid stays valid (the marker
+      // introduces the next token), invalid stays invalid (it's just content).
     } else if (!/\s/.test(ch)) {
-      lastSignificant = ch;
+      atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
     }
   }
   return inDouble || inSingle;
@@ -202,6 +223,13 @@ const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(
 // rare in real workflow YAML, so this cannot cause false positives on clean
 // pinned actions.
 const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?::[^#]*)?(?:#.*)?$/;
+// An explicit mapping key whose VALUE is a block scalar (`? |`, `? >`, with
+// optional chomping `-`/`+` and explicit indent-indicator digit): `? |-`
+// opens a literal scalar body on following indented lines, and the RESOLVED
+// scalar text becomes the key. `- ? |-` / `    uses` / `  : owner/action@main`
+// resolves (js-yaml verified) to {uses: "owner/action@main"} (CodeRabbit
+// #6YW9UB). Mirrors BLOCK_SCALAR_HEADER's trailing indicator syntax.
+const EXPLICIT_BLOCK_SCALAR_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*(?:#.*)?$/;
 // An alias used as an IMPLICIT block-style mapping key — `- *action_key : ref`
 // (with optional whitespace around the colon). When the anchor names `uses`
 // (`name: &action_key uses`), js-yaml resolves this to {uses: ref}. The scanner
@@ -445,6 +473,21 @@ const findUnpinnedUses = (content) => {
     // matched — the alias must precede the colon to be a key (Codex 3745389802).
     if (ALIAS_IMPLICIT_KEY.test(text)) {
       violations.push({ line: index + 1, ref: '(*alias: implicit mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      return;
+    }
+    // An explicit mapping key whose VALUE is itself a block scalar (`? |`,
+    // `? >`, with optional chomping/indent modifiers): `- ? |-` then an
+    // indented `uses` then `: owner/action@main` resolves (js-yaml verified)
+    // to {uses: "owner/action@main"}. BLOCK_SCALAR_HEADER cannot match this —
+    // it requires a preceding `:` (it targets `key: |` mapping VALUES, not
+    // explicit KEYS) — and no explicit-key scanner recognizes a block-scalar
+    // key either, so the resolved `uses` key slips past every check below
+    // (CodeRabbit #6YW9UB). The scalar's content also spans multiple physical
+    // lines, which a line-oriented regex cannot rejoin to verify. Fail-closed
+    // unconditionally: any explicit key spelled as a block scalar is
+    // unresolvable here, mirroring EXPLICIT_ALIAS_KEY's posture.
+    if (EXPLICIT_BLOCK_SCALAR_KEY.test(text)) {
+      violations.push({ line: index + 1, ref: '(explicit ? block-scalar mapping key — rewrite in clean block style or review manually)' });
       return;
     }
     // Any key line that opens a block scalar: start tracking its body so a
