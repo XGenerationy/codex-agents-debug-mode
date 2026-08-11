@@ -188,8 +188,15 @@ const readActionsPrNumber = ({ env }) => {
   if (env.GITHUB_EVENT_PATH) {
     try {
       const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
-      const n = Number(event?.pull_request?.number);
-      if (Number.isFinite(n) && n > 0) return n;
+      const direct = Number(event?.pull_request?.number);
+      if (Number.isFinite(direct) && direct > 0) return direct;
+      // workflow_run events carry no top-level pull_request; a same-repo
+      // PR's number instead lives at workflow_run.pull_requests[0].number
+      // (CodeRabbit PR7 #6YW9UP). Empty for a fork PR — GitHub does not
+      // populate this array for forks — in which case this falls through
+      // to null, same as no resolvable PR context at all.
+      const viaWorkflowRun = Number(event?.workflow_run?.pull_requests?.[0]?.number);
+      if (Number.isFinite(viaWorkflowRun) && viaWorkflowRun > 0) return viaWorkflowRun;
     } catch {
       /* fall through */
     }
@@ -251,6 +258,50 @@ const normalizeCheck = (value) => {
 };
 
 /**
+ * Resolve the CURRENT job's true displayed check name — the value that
+ * shows up in `statusCheckRollup[].name` — rather than assuming it equals
+ * `GITHUB_JOB` (the YAML job id). The two diverge whenever the consuming
+ * workflow gives the job a `name:` override or runs it in a
+ * `strategy.matrix` (the displayed name then carries a `(value, value)`
+ * suffix); `classifyLivePrState`'s self-exclusion match on `GITHUB_JOB`
+ * alone silently no-ops in either configuration (CodeRabbit PR7 #6YXkRF).
+ *
+ * `RUNNER_NAME` uniquely identifies the runner executing THIS job within
+ * the current workflow run (GitHub Actions provisions a distinct runner
+ * instance per job), so matching the Jobs API's `runner_name` field against
+ * it — rather than trying to match on job id/name, which is exactly the
+ * ambiguous data this function exists to resolve — reliably finds this
+ * job's own entry and its true `name`.
+ *
+ * Deliberately best-effort: returns `null` on any missing env var, API
+ * failure, malformed response, or no matching job found, so the caller can
+ * fall back to the existing `GITHUB_JOB` behavior exactly as before this
+ * function existed. A transient API failure or rate limit here must never
+ * turn into a hard failure of the whole live-state read — self-exclusion is
+ * an optimization (avoid the gate blocking on its own in-progress check),
+ * not a correctness requirement of live-state classification itself.
+ * @param {object} options
+ * @param {string} options.repository - "owner/name".
+ * @param {Function} options.runGh - injectable `gh` invoker, same contract as elsewhere in this file.
+ * @param {string} [options.repo] - repo checkout path, forwarded to runGh like every other call site.
+ * @param {object} [options.env] - defaults to process.env.
+ * @returns {Promise<string|null>}
+ */
+const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = process.env } = {}) => {
+  const runId = env.GITHUB_RUN_ID;
+  const runnerName = env.RUNNER_NAME;
+  if (!repository || typeof runGh !== 'function' || !runId || !runnerName) return null;
+  try {
+    const jobs = await runGh(['api', `repos/${repository}/actions/runs/${runId}/jobs`], { repo });
+    const list = Array.isArray(jobs?.jobs) ? jobs.jobs : [];
+    const ownJob = list.find((job) => job && job.runner_name === runnerName);
+    return typeof ownJob?.name === 'string' && ownJob.name ? ownJob.name : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
  * Reduce one already-fetched snapshot of live GitHub PR state (metadata,
  * status checks, unresolved review threads, gate attestation) to a single
  * PASS/BLOCKED/FAIL verdict plus the evidence lines that justify it. A
@@ -280,6 +331,7 @@ const classifyLivePrState = ({
   expectedHeadSha,
   expectedBaseSha,
   gateAttestation,
+  selfJobDisplayName,
 } = {}) => {
   // Exclude only the CURRENTLY-RUNNING gate JOB from the rollup classification
   // (CodeRabbit #6X_pwH, refined by #6YSx9w): at the moment the gate classifies
@@ -290,13 +342,24 @@ const classifyLivePrState = ({
   // workflow (e.g. a preview job) and could let the gate PASS before a sibling
   // finished (#6YSx9w). Now the match requires BOTH:
   //   - workflowName === GITHUB_WORKFLOW (this workflow)
-  //   - check.name === GITHUB_JOB (this specific job)
+  //   - check.name === the current job's DISPLAYED name
   // Only a non-COMPLETED check matching BOTH is omitted. Prior COMPLETED runs
   // at the same head are still classified (a prior FAILURE keeps blocking), and
   // a sibling job's check is never excluded. Opt-in via both env vars; local/CI
   // invocations without them classify all checks as before (backward-compatible).
+  //
+  // `check.name` is the check's DISPLAYED name, which is NOT always
+  // `GITHUB_JOB` (the YAML job id): a consumer that gives the job a `name:`
+  // override or runs it in a `strategy.matrix` gets a displayed name that
+  // diverges from the id, and the equality below would then never match,
+  // silently defeating self-exclusion (CodeRabbit PR7 #6YXkRF). The caller
+  // (readLivePrState) resolves the TRUE displayed name via the Jobs API
+  // (resolveCurrentJobDisplayName) and passes it as selfJobDisplayName when
+  // available; fall back to GITHUB_JOB — the exact prior behavior — when it
+  // is not (API unavailable, older/local invocation, or dispatch without a
+  // resolvable run id).
   const selfWorkflowName = process.env.GITHUB_WORKFLOW || null;
-  const selfJobName = process.env.GITHUB_JOB || null;
+  const selfJobName = selfJobDisplayName || process.env.GITHUB_JOB || null;
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
   if (selfWorkflowName && selfJobName) {
     const filtered = checks.filter((check) => !(
@@ -898,6 +961,13 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: postThreadGateSnapshot.attestation,
       };
     }
+    // Best-effort: resolves to null (falling back to GITHUB_JOB inside
+    // classifyLivePrState, the exact prior behavior) on any failure — see
+    // resolveCurrentJobDisplayName. Deliberately resolved last, right before
+    // the single classifyLivePrState call site, so it never participates in
+    // the stability-tuple checks above (it is not part of the live PR/review
+    // state those checks protect).
+    const selfJobDisplayName = await resolveCurrentJobDisplayName({ repository, runGh, repo });
     return classifyLivePrState({
       repository,
       pr: postThreadPr,
@@ -905,6 +975,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: postThreadGateSnapshot.attestation,
+      selfJobDisplayName,
     });
   } catch (error) {
     return {
@@ -925,4 +996,5 @@ module.exports = {
   readLiveGateAttestation,
   readLivePrState,
   readReviewerPermissions,
+  resolveCurrentJobDisplayName,
 };

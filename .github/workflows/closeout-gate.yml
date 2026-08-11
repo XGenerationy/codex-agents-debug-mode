@@ -17,6 +17,20 @@ on:
       base-ref:
         description: "Live PR base ref (dispatch runs have no PR context)"
         default: origin/main
+  # Re-run once a sibling check that was still pending when the gate last
+  # ran has settled (CodeRabbit PR7 #6YW9UP): an approval submitted while
+  # "Validate" or "Closeout preview" is still queued/in-progress makes
+  # readLivePrState correctly BLOCK on that pending check, but nothing else
+  # re-triggers the gate once it later completes — none of the pull_request/
+  # pull_request_review activity above fires for another workflow's check
+  # completion. Deliberately named-scoped to ONLY these two sibling
+  # workflows, NOT "Closeout gate" itself: neither of them has a
+  # workflow_run trigger watching for "Closeout gate" completions, so the
+  # gate's own run can never re-trigger itself through this path — there is
+  # no retrigger loop to guard against here, by construction.
+  workflow_run:
+    workflows: ["Validate", "Closeout preview"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -40,8 +54,17 @@ permissions:
 # cancelled gate result is a missing gate result; a superseded run invalidates
 # itself anyway because the attestation is head-bound. The preview workflow
 # keeps newest-wins cancellation, where it is correct.
+#
+# github.event.pull_request.number covers pull_request/pull_request_review
+# events; workflow_run events carry no top-level pull_request, so a
+# same-repo PR's number instead comes from
+# workflow_run.pull_requests[0].number (empty for fork PRs — see the
+# workflow_run trigger comment above and the checkout step below). Without
+# this fallback, EVERY workflow_run-triggered gate run across every PR would
+# share one concurrency group keyed on github.ref (the base branch), each
+# needlessly queuing behind or cancelling unrelated PRs' runs.
 concurrency:
-  group: closeout-gate-${{ github.event.pull_request.number || github.ref }}
+  group: closeout-gate-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -60,8 +83,12 @@ jobs:
     # gate result rather than leaving the prior PASS live), and a
     # newly-submitted COMMENT review (inline comments open unresolved
     # threads that readLivePrState would block, so a prior PASS must not
-    # survive a comment review attached to the unchanged head).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
+    # survive a comment review attached to the unchanged head), and a
+    # COMPLETED run of a sibling workflow this PR's gate result may have
+    # been waiting on (CodeRabbit PR7 #6YW9UP) — the sibling's own
+    # conclusion (success/failure/etc.) does not matter here; only that it
+    # finished, so the gate can re-evaluate the live rollup.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') || github.event_name == 'workflow_run' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -71,10 +98,14 @@ jobs:
           # branch, which is absent from the base repo and would fail checkout
           # for fork PRs). The gate's argument-less `gh pr view` resolves the
           # PR from the Actions event context even though HEAD is detached, so
-          # detached HEAD is not a problem here. The gate independently
+          # detached HEAD is not a problem here. workflow_run events carry no
+          # pull_request context; head_sha there is the sha of whatever
+          # commit the completed sibling workflow itself ran against — falls
+          # back further to github.ref (workflow_dispatch with no PR context)
+          # only when neither is present. The gate independently
           # re-verifies the live head via gh and BLOCKS stale snapshots.
           # workflow_dispatch falls back to github.ref.
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.ref }}
           fetch-depth: 0
           # Do NOT persist the checkout's extra git credentials into the
           # local config: the full engine matrix then executes PR-controlled

@@ -13,6 +13,7 @@ const {
   readLiveGateAttestation,
   readLivePrState,
   readReviewerPermissions,
+  resolveCurrentJobDisplayName,
 } = require('./pr_closeout_github');
 
 const cleanAttestation = (extra = {}) => ({
@@ -408,6 +409,126 @@ test('excludes only the currently-running self-workflow check from the rollup (C
   }
 });
 
+test('selfJobDisplayName excludes a matrixed/named job that GITHUB_JOB alone could never match (CodeRabbit PR7 #6YXkRF)', () => {
+  // GITHUB_JOB is the YAML job id ("gate"); a consumer that runs the job in
+  // a matrix gets a DISPLAYED check name like "gate (ubuntu-latest, 20)",
+  // which never equals GITHUB_JOB. Without a resolved selfJobDisplayName,
+  // self-exclusion silently no-ops and the gate can never see its own
+  // in-progress check as excluded. Passing the caller-resolved true
+  // displayed name closes that gap.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const withoutResolvedName = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+    });
+    assert.equal(withoutResolvedName.status, 'BLOCKED',
+      'GITHUB_JOB alone never matches a matrix-suffixed displayed name, so self-exclusion silently no-ops');
+
+    const withResolvedName = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: 'gate (ubuntu-latest, 20)',
+    });
+    assert.equal(withResolvedName.status, 'PASS', 'the resolved true displayed name correctly excludes the running self-check');
+
+    // #6YSx9w must still hold with a resolved name: a sibling job is never excluded.
+    const siblingStillBlocks = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'preview (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: 'gate (ubuntu-latest, 20)',
+    });
+    assert.equal(siblingStillBlocks.status, 'BLOCKED', 'a sibling job with a similarly-shaped name is still not excluded');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
+test('resolveCurrentJobDisplayName resolves the current job\'s true displayed name by matching RUNNER_NAME (CodeRabbit PR7 #6YXkRF)', async () => {
+  const jobsResponse = { jobs: [
+    { name: 'preview', runner_name: 'other-runner-1' },
+    { name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' },
+  ] };
+  let capturedArgs;
+  const runGh = async (args) => { capturedArgs = args; return jobsResponse; };
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+  });
+  assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'matches the job entry whose runner_name equals RUNNER_NAME');
+  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs'],
+    'queries the Jobs API for this specific run');
+});
+
+test('resolveCurrentJobDisplayName is best-effort: null on missing env, API failure, or no match (CodeRabbit PR7 #6YXkRF)', async () => {
+  const alwaysCalled = { called: false };
+  const failingRunGh = async () => { alwaysCalled.called = true; throw new Error('API rate limited'); };
+
+  assert.equal(
+    await resolveCurrentJobDisplayName({ repository: 'owner/repo', runGh: failingRunGh, env: {} }),
+    null,
+    'missing GITHUB_RUN_ID/RUNNER_NAME short-circuits to null without calling the API',
+  );
+  assert.equal(alwaysCalled.called, false, 'the API must not be called when required env vars are absent');
+
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: failingRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'r' },
+    }),
+    null,
+    'an API failure (rate limit, network) falls back to null, never throws',
+  );
+
+  const noMatchRunGh = async () => ({ jobs: [{ name: 'preview', runner_name: 'someone-else' }] });
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: noMatchRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'no job entry matches this runner falls back to null',
+  );
+
+  const malformedRunGh = async () => ({ not: 'the expected shape' });
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: malformedRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'a malformed response (no jobs array) falls back to null rather than throwing',
+  );
+});
+
 test('classifies legacy StatusContext checks from state only', () => {
   const outcomes = new Map([
     ['SUCCESS', 'PASS'],
@@ -524,41 +645,118 @@ test('blocks when review-thread pagination repeats a cursor', async () => {
 });
 
 test('queries live PR metadata and paginates unresolved review threads', async () => {
-  const calls = [];
-  const runGh = async (args) => {
-    calls.push(args);
-    if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
-    if (args[0] === 'pr') return cleanPr();
-    if (args.includes('--paginate')) return [[approvedReview()]];
-    const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
-    if (!cursorArgument) {
+  // GITHUB_RUN_ID/RUNNER_NAME are ambient ONLY when this test itself happens
+  // to run inside a real GitHub Actions job (as it does in this repo's own
+  // CI matrix) — present there, absent on a local dev machine. Left
+  // uncontrolled, resolveCurrentJobDisplayName's conditional extra `api`
+  // call would make the exact call-count assertion below pass locally and
+  // fail in CI (or vice versa). Clear both so the call count is
+  // deterministic regardless of where the test runs.
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  delete process.env.GITHUB_RUN_ID;
+  delete process.env.RUNNER_NAME;
+  try {
+    const calls = [];
+    const runGh = async (args) => {
+      calls.push(args);
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes: [{ isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
+            pageInfo: { hasNextPage: true, endCursor: 'next-page' },
+          } } } },
+        };
+      }
       return {
         data: { repository: { pullRequest: { reviewThreads: {
-          nodes: [{ isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
-          pageInfo: { hasNextPage: true, endCursor: 'next-page' },
+          nodes: [{ isResolved: true, path: 'src/b.ts', line: 2, comments: { nodes: [] } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
         } } } },
       };
-    }
-    return {
-      data: { repository: { pullRequest: { reviewThreads: {
-        nodes: [{ isResolved: true, path: 'src/b.ts', line: 2, comments: { nodes: [] } }],
-        pageInfo: { hasNextPage: false, endCursor: null },
-      } } } },
     };
-  };
-  const result = await readLivePrState({
-    repo: 'C:/repo',
-    expectedHeadSha: 'head123',
-    expectedBaseSha: 'base123',
-    expectedConfigDigest: 'cfg123',
-    runGh,
-  });
-  assert.equal(result.status, 'BLOCKED');
-  assert.equal(result.unresolvedThreads.length, 1);
-  // Stable path: four gate-attestation snapshots (first, final, terminal,
-  // post-thread) + three review-thread walks (2 pages each with this mock) =
-  // 4 snapshots (mix of paginate + graphql) + 6 thread pages → 10 api calls.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 10);
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(result.status, 'BLOCKED');
+    assert.equal(result.unresolvedThreads.length, 1);
+    // Stable path: four gate-attestation snapshots (first, final, terminal,
+    // post-thread) + three review-thread walks (2 pages each with this mock) =
+    // 4 snapshots (mix of paginate + graphql) + 6 thread pages → 10 api calls.
+    // resolveCurrentJobDisplayName makes no additional call here because
+    // GITHUB_RUN_ID/RUNNER_NAME are absent (cleared above).
+    assert.equal(calls.filter(([command]) => command === 'api').length, 10);
+  } finally {
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
+});
+
+test('readLivePrState resolves the current job\'s displayed name via the Jobs API and reaches PASS for a matrixed self-check (CodeRabbit PR7 #6YXkRF)', async () => {
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  process.env.GITHUB_WORKFLOW = 'Closeout gate';
+  process.env.GITHUB_JOB = 'gate';
+  process.env.GITHUB_RUN_ID = '999';
+  process.env.RUNNER_NAME = 'this-runner';
+  try {
+    // Matrix-expanded displayed name — never equal to GITHUB_JOB ("gate")
+    // alone, so PASS is reachable here ONLY if readLivePrState actually
+    // resolved and threaded the true displayed name through.
+    const matrixedPr = {
+      ...cleanPr(),
+      statusCheckRollup: [
+        { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+      ],
+    };
+    let jobsApiCalled = false;
+    const runGh = async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return matrixedPr;
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
+        jobsApiCalled = true;
+        return { jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] };
+      }
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    };
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(jobsApiCalled, true, 'the Jobs API must actually be queried');
+    assert.equal(result.status, 'PASS', 'the resolved true displayed name lets the matrixed self-check be excluded, reaching PASS');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
 });
 
 test('re-reads review threads after the terminal snapshot and requires stability', async () => {
@@ -898,6 +1096,56 @@ test('buildGhArgs pr view falls back to GITHUB_EVENT_PATH for PR number', () => 
     assert.deepStrictEqual(result, ['pr', 'view', '42', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildGhArgs pr view falls back to workflow_run.pull_requests[0].number for a same-repo PR (CodeRabbit PR7 #6YW9UP)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-'));
+  try {
+    // workflow_run events carry no top-level pull_request — only
+    // workflow_run.pull_requests[0], populated for a same-repo PR.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [{ number: 42 }] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const result = buildGhArgs(['pr', 'view', '--json', 'number']);
+    assert.deepStrictEqual(result, ['pr', 'view', '42', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view has no PR number for a fork PR via workflow_run (empty pull_requests array)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-fork-'));
+  try {
+    // GitHub does not populate workflow_run.pull_requests for fork PRs.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    // No PR number resolvable: buildGhArgs passes the args through unchanged.
+    assert.deepStrictEqual(buildGhArgs(args), args);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
   }
 });
 

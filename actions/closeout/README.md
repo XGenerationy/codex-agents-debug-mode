@@ -202,6 +202,7 @@ run that fails input validation never reaches it, so all four stay empty in that
 | `mode` | The gate-reported mode of the run; empty until the gate step has run. |
 | `attestation` | Plan runs: the four-state `admission.attestation.status` (`present` \| `weakened` \| `absent` \| `unavailable`). Full runs: empty. Empty until the gate step has run. |
 | `report-path` | Absolute path of `report.json` (full runs) or the captured plan JSON (plan runs); empty until the gate step has run. |
+| `admission-status` | Plan runs: `PASS` \| `FAIL` \| `BLOCKED` \| `unavailable` — the aggregate of the admission sub-probes (`attestation`, `cleanTree`, `preflight`). This is the readiness signal to key automation on: `planStatus`/`status` alone reflects only whether the check MATRIX resolved, not whether the plan is actually admissible — a resolved matrix with a failed or blocked preflight/clean-tree probe still reports `status: PASS`, but `admission-status` correctly reports `BLOCKED`/`FAIL`. Full runs: empty. Empty until the gate step has run. |
 
 ## Permissions
 
@@ -270,7 +271,13 @@ design spec, restated for consumers:
 
 The readiness signal for `run: plan` lives in the Step Summary and in the `status` /
 `attestation` outputs — never in the job's pass/fail color, which stays green for
-every honest not-ready state.
+every honest not-ready state. `status`/`attestation` alone can still read as ready
+when it is not: `status: PASS` only means the check matrix resolved, and
+`attestation: present` only means a matching review exists — neither reflects a
+failed or blocked clean-tree/preflight probe. **`admission-status` is the single
+aggregate field to key automation on** — it is `PASS` only when every admission
+sub-probe (attestation, clean tree, preflight) is itself `PASS` (Codex PR7 review,
+"Document the aggregate readiness output").
 
 ## Attestation model
 
@@ -506,22 +513,26 @@ they are roadmap items, not accepted risk:
   therefore safe; it can reach PASS on its own run (CodeRabbit PR7 #6X_pwH,
   refined by #6YSx9w — landed before this bullet was corrected, CodeRabbit
   #6YW9UF).
-- **A verdict recorded while a sibling check is still pending goes stale once
-  that check settles.** If an approval is submitted (re-running the gate)
-  while another required check (e.g. the Node validation matrix, or
-  `preview`) is still queued or in progress, `classifyLivePrState` correctly
-  classifies that check as a blocker and the gate reports BLOCKED — but once
-  the sibling check later completes, nothing re-triggers the gate to
-  re-evaluate: `closeout-gate.yml` subscribes to PR, review, and manual-
-  dispatch activity, none of which GitHub fires for another workflow's check
-  completion. A fix needs either a `check_run`/`workflow_run`-completion
-  trigger (real infinite-retrigger and CI-cost risk if not carefully scoped —
-  the gate's own completion is itself a check completion — so this needs
-  design review before landing) or gate-CLI polling for pending checks to
-  settle within one run (a `scripts/pr_closeout_*` change, out of this
-  sub-project's scope). Interim control: re-run the gate via
-  `workflow_dispatch`, or wait for the next naturally covered event (a head
-  push or a new/edited review) once all sibling checks have settled
+- ~~**A verdict recorded while a sibling check is still pending goes stale
+  once that check settles.**~~ **Resolved for same-repo PRs.** If an
+  approval is submitted (re-running the gate) while another check (e.g. the
+  Node validation matrix, or `preview`) is still queued or in progress,
+  `classifyLivePrState` correctly classifies that check as a blocker and the
+  gate reports BLOCKED. `closeout-gate.yml` now also subscribes to
+  `workflow_run` (`types: [completed]`), scoped by name to exactly the two
+  sibling workflows (`Validate`, `Closeout preview`) — deliberately NOT
+  `Closeout gate` itself, so the gate's own completion can never retrigger
+  this path; there is no retrigger loop to guard against, by construction.
+  `readActionsPrNumber` and `resolveBaseRef` both gained a
+  `workflow_run.pull_requests[0]` fallback (populated for a same-repo PR) so
+  the triggered run can still identify and diff against the correct PR.
+  **Residual gap for fork PRs:** GitHub does not populate
+  `workflow_run.pull_requests` for a fork PR's associated workflow runs, so
+  a `workflow_run`-triggered gate run for a fork PR cannot resolve the PR
+  number and reports BLOCKED (safe — never a false PASS) rather than
+  re-evaluating. Interim control for fork PRs specifically: re-run the gate
+  via `workflow_dispatch`, or wait for the next naturally covered event (a
+  head push or a new/edited review) once all sibling checks have settled
   (CodeRabbit PR7 #6YW9UP).
 - **Event triggers do not cover a base-branch advance.** The attestation is
   base-SHA-bound, so if the base branch receives a new commit while a PR's head is

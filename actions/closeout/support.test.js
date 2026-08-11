@@ -36,6 +36,36 @@ const {
   writeOutputs,
 } = require('./support');
 
+// Return "ok" only when `filePath` has a protected (inheritance-broken) DACL
+// consisting of exactly one current-user FullControl allow rule. Kept as a
+// local copy consistent with the same helper in pr_closeout_report.test.js,
+// pr_closeout_process.test.js, and debug_server.test.js so the ACL invariant
+// is asserted identically across every security-critical write path.
+const windowsAclIsCurrentUserOnly = (filePath) => {
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
+  const script = [
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    'if ($acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Value -eq $sid.Value -and $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { [Console]::Out.Write("ok") } else { [Console]::Out.Write("not-owner-only"); exit 1 }',
+  ].join('; ');
+  return spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { encoding: 'utf8', windowsHide: true, timeout: 15000 },
+  );
+};
+
+// Grant BUILTIN\Users (SID S-1-5-32-545) inheritable read on `dir` so files
+// created inside it would inherit an ACE readable by other local users unless
+// explicitly stripped. (OI)(CI) = object+container inherit; (R) = read.
+const grantInheritedReadToUsers = (dir) => spawnSync(
+  'icacls',
+  [dir, '/grant', '*S-1-5-32-545:(OI)(CI)(R)'],
+  { encoding: 'utf8', windowsHide: true, timeout: 15000 },
+);
+
 test('validateActionInputs applies defaults and rejects unknown values fail-closed', () => {
   const defaults = validateActionInputs({});
   assert.deepEqual(defaults, { run: 'plan', mode: 'strict', prComment: false });
@@ -63,6 +93,38 @@ test('resolveBaseRef walks the ladder: input, GITHUB_BASE_REF, event payload, th
   assert.equal(
     resolveBaseRef({ inputBaseRef: '', env: { GITHUB_BASE_REF: 'main' }, event: { pull_request: { base: { ref: 'other' } } } }),
     'origin/main',
+  );
+});
+
+test('resolveBaseRef falls back to the workflow_run event payload\'s associated PR base (CodeRabbit PR7 #6YW9UP)', () => {
+  // workflow_run events have no GITHUB_BASE_REF and no top-level
+  // pull_request — only workflow_run.pull_requests[0], populated for a
+  // same-repo PR.
+  assert.equal(
+    resolveBaseRef({
+      inputBaseRef: '', env: {},
+      event: { workflow_run: { pull_requests: [{ base: { ref: 'release/7' } }] } },
+    }),
+    'origin/release/7',
+  );
+  // Empty pull_requests (a fork PR — GitHub does not populate this array
+  // for forks) falls through to null, same as no event context at all.
+  assert.equal(
+    resolveBaseRef({ inputBaseRef: '', env: {}, event: { workflow_run: { pull_requests: [] } } }),
+    null,
+  );
+  // The plain pull_request.base.ref rung still wins over workflow_run's when
+  // both are somehow present (should never co-occur in a real event, but
+  // the ladder order must stay deterministic).
+  assert.equal(
+    resolveBaseRef({
+      inputBaseRef: '', env: {},
+      event: {
+        pull_request: { base: { ref: 'direct' } },
+        workflow_run: { pull_requests: [{ base: { ref: 'nested' } }] },
+      },
+    }),
+    'origin/direct',
   );
 });
 
@@ -433,6 +495,32 @@ test('writeEvidenceFile tightens a pre-existing regular file\'s mode before over
   assert.equal(readFs(target, 'utf8'), '{"fresh":true}\n');
 });
 
+test(
+  'writeEvidenceFile protects its output with a current-user-only Windows ACL (Codex PR7, Windows DACL)',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  () => {
+    // chmodSync(0o600) only clears Windows' read-only attribute bit; it does
+    // NOT remove an inherited DACL, so plan.json/action-state.json written
+    // into a directory whose inherited ACL grants other local users access
+    // would otherwise stay readable (and action-state.json writable) by
+    // them. writeEvidenceFile must establish and verify the same
+    // current-user-only ACL invariant already covered for the gate CLI's own
+    // evidence writes (pr_closeout_report.test.js, pr_closeout_process.test.js).
+    const evidenceDir = makeTempDir();
+    // Give evidenceDir an explicit, inheritable ACE for BUILTIN\Users (read).
+    // Absent the fix, a file created here inherits it and stays readable by
+    // other local users; the fix must strip it.
+    const granted = grantInheritedReadToUsers(evidenceDir);
+    assert.equal(granted.status, 0, `icacls setup failed: ${granted.stdout}\n${granted.stderr}`);
+
+    writeEvidenceFile(evidenceDir, 'action-state.json', '{"safe":true}\n');
+    const target = path.join(evidenceDir, 'action-state.json');
+    const acl = windowsAclIsCurrentUserOnly(target);
+    assert.equal(acl.status, 0, `${target}: ${acl.stdout}\n${acl.stderr}`);
+    assert.equal(acl.stdout.trim(), 'ok', `${target} must be current-user-only`);
+  },
+);
+
 test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outputs, and state', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
@@ -536,17 +624,20 @@ test('runSubcommand clears stale plan.json/report.json/report.md from a reused o
     'stale report.md from a prior invocation must not survive a failed current run');
 });
 
-test('runSubcommand clears a stale outputDir/logs directory from a reused outputDir (CodeRabbit #6YXkRN)', async () => {
+test('runSubcommand clears a stale outputDir/logs directory from a reused outputDir that shows a prior invocation (CodeRabbit #6YXkRN)', async () => {
   // The gate CLI's full tier populates outputDir/logs (a DIRECTORY of
   // per-check probe log files), which the file-by-file stale-evidence
   // cleanup cannot reach. Left behind, a prior invocation's log files would
   // be presented as evidence for a new, unrelated (and possibly blocked)
-  // invocation.
+  // invocation. A stale report.json alongside it is the ownership marker
+  // (CodeRabbit PR7 #6YYcNT) proving this directory has genuinely hosted
+  // this action before, so the purge below is expected to run.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
   const logsDir = path.join(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'qualification.probe.attempt-001.log'), 'stale log output\n');
+  writeFs(path.join(outputDir, 'report.json'), '{"overallStatus":"PASS","stale":true}\n');
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -557,6 +648,33 @@ test('runSubcommand clears a stale outputDir/logs directory from a reused output
   assert.equal(exit, 0);
   const { existsSync } = require('node:fs');
   assert.equal(existsSync(logsDir), false, 'a stale logs directory from a prior invocation must not survive');
+});
+test('runSubcommand leaves outputDir/logs alone when nothing else signals a prior invocation of this action (CodeRabbit PR7 #6YYcNT)', async () => {
+  // A caller-supplied broad output-dir (e.g. /tmp, ${{ runner.temp }}) may
+  // have never hosted this action before, and the wrapper has no lock or
+  // ownership signal over it at this point in the flow (mkdir/chmod happens
+  // later). "logs" is a generic directory name likely to collide with
+  // something unrelated a caller or another tool placed there. Without any
+  // of the action's own well-known evidence filenames (action-state.json,
+  // plan.json, report.json, report.md) present, this logs/ directory must
+  // NOT be treated as this action's stale evidence.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const logsDir = path.join(outputDir, 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0);
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(logsDir), true, 'a logs directory with no other ownership marker must not be deleted');
+  assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
+    'unrelated content inside it must survive untouched');
 });
 
 test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {

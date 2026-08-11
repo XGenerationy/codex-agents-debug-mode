@@ -10,6 +10,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
+// protectWindowsPrivateFile is a UTILITY the gate CLI already exports and
+// uses on its own evidence writes (report.json/report.md in
+// pr_closeout_report.js, evidence logs in pr_closeout_process.js) — reusing
+// it here is not a modification to scripts/pr_closeout_* (still consumed as
+// merged), just consuming its existing public surface the same way the
+// CLI's own code does (Codex PR7 review, "Protect wrapper evidence with a
+// Windows DACL").
+const { protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
 
 // Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
 // git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
@@ -97,8 +105,13 @@ const validateActionInputs = ({ run = '', mode = '', prComment = '' } = {}) => {
 /**
  * Resolves the live PR base ref down the spec's fail-closed ladder:
  * explicit input, then GITHUB_BASE_REF (set on pull_request events), then the
- * event payload's pull_request.base.ref (pull_request_review events), else
- * null — in which case the CLI's own config.baseRef-or-error contract
+ * event payload's pull_request.base.ref (pull_request_review events), then
+ * (CodeRabbit PR7 #6YW9UP) the same field nested under workflow_run's own
+ * associated-PR shape — GITHUB_BASE_REF is not set for workflow_run events,
+ * and their payload has no top-level pull_request, only
+ * workflow_run.pull_requests[0] (populated for a same-repo PR; empty for a
+ * fork PR, in which case this rung is skipped and the ladder falls through)
+ * — else null, in which case the CLI's own config.baseRef-or-error contract
  * applies and the failure is the gate's honest named error, not a guess.
  * @param {{inputBaseRef?: string, env: object, event: object}} options
  * @returns {string|null}
@@ -108,6 +121,8 @@ const resolveBaseRef = ({ inputBaseRef = '', env = {}, event = {} } = {}) => {
   if (env.GITHUB_BASE_REF) return `origin/${env.GITHUB_BASE_REF}`;
   const eventBase = event?.pull_request?.base?.ref;
   if (typeof eventBase === 'string' && eventBase) return `origin/${eventBase}`;
+  const workflowRunBase = event?.workflow_run?.pull_requests?.[0]?.base?.ref;
+  if (typeof workflowRunBase === 'string' && workflowRunBase) return `origin/${workflowRunBase}`;
   return null;
 };
 
@@ -583,6 +598,29 @@ const runSubcommand = async ({
   // upload publishes them alongside the new failure state, presenting stale
   // results as current evidence for a run that never produced them. Clear
   // every known evidence filename up front, same ENOENT-only discipline.
+  //
+  // Snapshot whether ANY known evidence marker already exists BEFORE this
+  // loop deletes them (CodeRabbit PR7 #6YYcNT): a caller-supplied broad
+  // output-dir (e.g. /tmp, ${{ runner.temp }}) may have NEVER hosted this
+  // action before, and the wrapper has no lock/ownership signal over it at
+  // this point in the flow (mkdir/chmod happens later). None of these
+  // well-known, action-specific filenames are likely to collide with
+  // unrelated content, so unconditionally clearing them (the existing,
+  // previously-reviewed #6YT0KA behavior) is left unchanged. The directory-
+  // wide logs/ purge below is a different risk class — "logs" is a generic
+  // name likely to collide with something unrelated — so it is additionally
+  // gated on this snapshot: only run it when at least one of these markers
+  // was ALREADY present, i.e. this directory has hosted a genuine prior
+  // invocation of this action.
+  const hadPriorEvidence = [STATE_FILE, 'plan.json', 'report.json', 'report.md'].some((staleName) => {
+    try {
+      lstatSync(path.join(outputDir, staleName));
+      return true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      return false;
+    }
+  });
   for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
     try {
       unlinkSync(path.join(outputDir, staleName));
@@ -596,7 +634,11 @@ const runSubcommand = async ({
   // before the CLI regenerates its own logs, a prior invocation's stale log
   // files stay behind and the composite's unconditional artifact upload
   // presents them as evidence for the new, unrelated run (CodeRabbit
-  // #6YXkRN). Same ENOENT-only-swallow discipline as the loop above.
+  // #6YXkRN). Same ENOENT-only-swallow discipline as the loop above. Gated
+  // on hadPriorEvidence (see above, CodeRabbit PR7 #6YYcNT): this directory
+  // must already show signs of a prior invocation of THIS action before its
+  // logs/ subdirectory is treated as stale evidence rather than unrelated
+  // caller content.
   //
   // lstat FIRST, never trust a recursive remove to be symlink-safe on its
   // own: if a check plants outputDir/logs as a symlink to an unrelated
@@ -606,7 +648,10 @@ const runSubcommand = async ({
   try {
     const logsPath = path.join(outputDir, 'logs');
     const logsInfo = lstatSync(logsPath);
-    if (logsInfo.isDirectory()) {
+    if (!hadPriorEvidence) {
+      // logs/ exists but nothing else here looks like this action's own
+      // output — do not touch a directory we have no ownership signal over.
+    } else if (logsInfo.isDirectory()) {
       rmSync(logsPath, { recursive: true });
     } else {
       unlinkSync(logsPath);
@@ -910,6 +955,24 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // unconditionally afterward closes that gap; it is a cheap no-op when the
   // file was freshly created at 0o600 already (CodeRabbit #6YT0Jx).
   chmodSync(target, 0o600);
+  // chmodSync(0o600) only clears Windows' read-only attribute bit — it does
+  // NOT establish real access control there, so plan.json/action-state.json
+  // (which can hold the invocation nonce, exit decision, and unredacted
+  // runner paths/error text) would still inherit whatever DACL the
+  // surrounding --output-dir has on a multi-user Windows runner, readable
+  // (and, for action-state.json, writable) by any other local account. The
+  // gate CLI already solves exactly this for its own evidence writes —
+  // report.json/report.md (pr_closeout_report.js) and evidence logs
+  // (pr_closeout_process.js) — via protectWindowsPrivateFile: a verified,
+  // owner-only Windows DACL, no-op on non-Windows. Apply the same guard here
+  // so the wrapper's OWN evidence files get the identical protection,
+  // fail-closed on any failure to establish it (Codex PR7 review, "Protect
+  // wrapper evidence with a Windows DACL").
+  try {
+    protectWindowsPrivateFile(target);
+  } catch (error) {
+    throw new Error(`failed to protect evidence file with an owner-only ACL: ${target}`, { cause: error });
+  }
 };
 
 const readState = (outputDir) => {
