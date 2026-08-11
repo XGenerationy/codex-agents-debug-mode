@@ -98,13 +98,16 @@ const stripTrailingYamlComment = (text) => {
 // when none is open). Backslash escapes inside double quotes are respected;
 // YAML single-quoted strings escape a quote by doubling it ('').
 //
-// A bare `'` does NOT always open a quoted scalar: YAML plain (unquoted)
-// scalars may contain an apostrophe anywhere except as their first character
-// — `name: don't` is a valid plain scalar equal to the string "don't", not a
-// quote delimiter. Treating every `'` as toggling quote state means a plain
-// scalar's apostrophe swallows the rest of the line into a phantom "string",
-// hiding a REAL later match (e.g. an escape-obfuscated flow `uses:` key) and
-// causing a fail-OPEN bypass (CodeRabbit #6YSoOn). A `'` only opens a quoted
+// A bare `'` or `"` does NOT always open a quoted scalar: YAML plain
+// (unquoted) scalars may contain either character anywhere except as their
+// first character — `name: don't` and `name: a"b` are both valid plain
+// scalars, not quote delimiters. Treating every quote char as toggling state
+// means a plain scalar's embedded quote swallows the rest of the line into a
+// phantom "string", hiding a REAL later match (e.g. an escape-obfuscated flow
+// `uses:` key) and causing a fail-OPEN bypass. Originally fixed for `'` only
+// (CodeRabbit #6YSoOn); `"` had the identical gap; a plain scalar containing
+// `"` before a real flow key still slipped past (CodeRabbit #6YW1O6). Both
+// quote types now share the same gate: a quote char only opens a quoted
 // scalar when it is the first non-whitespace character at a value/key
 // position — i.e. immediately (modulo whitespace) after start-of-line, `:`,
 // `-`, `{`, `[`, `,`, or `?` (the explicit-key indicator). Track the last
@@ -129,9 +132,10 @@ const isInsideQuotedScalar = (text, matchIndex) => {
       }
       continue;
     }
-    if (ch === '"') {
+    const atQuoteOpenContext = lastSignificant === null || QUOTE_OPEN_CONTEXT.has(lastSignificant);
+    if (ch === '"' && atQuoteOpenContext) {
       inDouble = true;
-    } else if (ch === "'" && (lastSignificant === null || QUOTE_OPEN_CONTEXT.has(lastSignificant))) {
+    } else if (ch === "'" && atQuoteOpenContext) {
       inSingle = true;
     } else if (!/\s/.test(ch)) {
       lastSignificant = ch;

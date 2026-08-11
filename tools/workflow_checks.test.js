@@ -105,14 +105,19 @@ test('findUnpinnedUses skips block-scalar bodies (run: | and shell: >)', () => {
   // lines as raw string content — {uses:...} in the body is script text, not a
   // YAML key. The scanner must track the scalar's indentation and skip body
   // lines until indentation drops back.
-  const blockLiteral = 'steps:\n  - run: |\n    echo "{uses: foo@bar}"\n    echo done\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n';
+  // Body lines are indented DEEPER than the header's key column (6, vs. the
+  // "- run:" key at column 4) — a body at the SAME column as the key is an
+  // EMPTY scalar whose next line is a sibling key, not body (YAML semantics;
+  // see "flags a sibling uses key after an empty block scalar" below), so
+  // these fixtures must genuinely out-indent the key to exercise body-skip.
+  const blockLiteral = 'steps:\n  - run: |\n      echo "{uses: foo@bar}"\n      echo done\n  - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n';
   assert.deepEqual(findUnpinnedUses(blockLiteral), [],
     'block-literal body with {uses:...} must not false-positive');
   const foldedScalar = '  shell: >-\n    printf "{uses: foo@bar}"\n  - uses: ./local\n';
   assert.deepEqual(findUnpinnedUses(foldedScalar), [],
     'folded-scalar body with {uses:...} must not false-positive');
   // After the scalar ends (indentation drops), scanning resumes normally.
-  const resume = '  - run: |\n    echo "{uses: x}"\n  - uses: someone/thing@main\n';
+  const resume = '  - run: |\n      echo "{uses: x}"\n  - uses: someone/thing@main\n';
   const v = findUnpinnedUses(resume);
   assert.equal(v.length, 1, 'a real uses: after the scalar body IS caught');
   assert.equal(v[0].line, 3);
@@ -121,14 +126,17 @@ test('findUnpinnedUses skips block-scalar bodies (run: | and shell: >)', () => {
 test('findUnpinnedUses handles block-scalar header variants (comment, indent indicator)', () => {
   // YAML allows a comment after the scalar indicator (run: | # cmt) and an
   // explicit indentation indicator (run: |2). Both must open a scalar whose
-  // body is skipped — otherwise the body's {uses:...} false-positives.
-  const withComment = '  - run: | # build\n    echo "{uses: foo@bar}"\n';
+  // body is skipped — otherwise the body's {uses:...} false-positives. Body
+  // lines are indented deeper than the key column for the same reason as
+  // above (same-column is an empty scalar, not body).
+  const withComment = '  - run: | # build\n      echo "{uses: foo@bar}"\n';
   assert.deepEqual(findUnpinnedUses(withComment), [],
     'scalar header with trailing comment must skip body');
-  const withIndent = '  - run: |2\n    echo "{uses: foo@bar}"\n';
+  // |2 means "body indented 2 past the key column" (4 + 2 = column 6).
+  const withIndent = '  - run: |2\n      echo "{uses: foo@bar}"\n';
   assert.deepEqual(findUnpinnedUses(withIndent), [],
     'scalar header with indent indicator must skip body');
-  const withIndentChomp = '  - run: |2-\n    echo "{uses: foo@bar}"\n';
+  const withIndentChomp = '  - run: |2-\n      echo "{uses: foo@bar}"\n';
   assert.deepEqual(findUnpinnedUses(withIndentChomp), [],
     'scalar header with indent+chomp indicator must skip body');
   // YAML allows an anchor on the scalar value (key: &name |).
@@ -444,6 +452,27 @@ test('findUnpinnedUses does not let a plain-scalar apostrophe hide a later flow 
   // inside it — the fix must not turn every apostrophe into a non-quote.
   assert.equal(findUnpinnedUses("name: 'a {uses: fake}'\n").length, 0,
     'a uses-shaped token inside a real single-quoted scalar is still suppressed');
+});
+test('findUnpinnedUses does not let a plain-scalar double-quote hide a later flow key (CodeRabbit #6YW1O6)', () => {
+  // The #6YSoOn fix gated ONLY the single-quote branch on "did this quote
+  // char immediately follow a real quote-open context (line start, :, -, {,
+  // [, ,, ?)". The double-quote branch still opened unconditionally on any
+  // `"`, so a plain scalar containing a bare double quote (`a"b`, valid
+  // unquoted YAML — `"` is not special mid-scalar) had the identical
+  // fail-OPEN failure mode: it opened a phantom quoted string that swallowed
+  // a real, later flow uses key. Both quote types now share the same gate.
+  const literal = findUnpinnedUses('steps: [{name: a"b, uses: owner/action@main}]\n');
+  assert.equal(literal.length, 1, 'a plain-scalar double-quote before a literal uses: key must not hide it');
+  const escaped = findUnpinnedUses('steps: [{name: a"b, "u\\u0073es": owner/action@main}]\n');
+  assert.equal(escaped.length, 1, 'a plain-scalar double-quote before an escaped flow key must not hide it');
+  assert.match(escaped[0].ref, /quoted uses: key resolves to uses/);
+  const alias = findUnpinnedUses('steps: [{name: 5" nail, *action_key: owner/action@main}]\n');
+  assert.equal(alias.length, 1, 'a plain-scalar double-quote before an alias flow key must not hide it');
+  assert.match(alias[0].ref, /\(\*alias: flow mapping key/);
+  // A real double-quoted scalar must still suppress a real uses: that follows
+  // it on the same line — the fix must not turn every `"` into a non-quote.
+  const realQuoted = findUnpinnedUses('steps: [{name: "a b", uses: owner/action@main}]\n');
+  assert.equal(realQuoted.length, 1, 'the real uses: after a properly double-quoted name is still flagged (not suppressed twice-over)');
 });
 test('findUnpinnedUses folds continued explicit keys inside flow mappings (CodeRabbit #6YSx9t)', () => {
   // The block-style pre-fold only recognized an explicit-key marker at
