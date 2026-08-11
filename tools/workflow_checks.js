@@ -122,18 +122,28 @@ const stripTrailingYamlComment = (text) => {
 // that follows. `{? "uses": ref}` (a genuine explicit-key marker right after
 // `{`) and `- 'value'` (a genuine sequence dash at line start) correctly
 // preserve context, because in both cases it was already valid when the
-// character was reached. `:`, `{`, `[`, and `,` do NOT need this treatment:
-// YAML forbids `:` followed by whitespace inside a plain scalar (it would be
-// ambiguous with a key separator) and forbids `{`/`[`/`,` inside a flow-
-// context plain scalar entirely, so unlike `?`/`-` they can never appear as
-// ambiguous literal content in the position that matters here — a flat
-// membership check for them is safe. A single boolean tracks "currently at a
-// valid quote-open position" instead of a raw last-character lookup, so this
-// transitivity falls out naturally for the two characters that need it.
-const QUOTE_OPEN_CONTEXT = new Set([':', '{', '[', ',']);
+// character was reached. `{`, `[`, and `,` do NOT need this treatment: YAML
+// forbids them inside a flow-context plain scalar entirely, so unlike
+// `?`/`-` they can never appear as ambiguous literal content in the position
+// that matters here — a flat membership check for them is safe.
+//
+// `:` needs its OWN check, not membership at all (CodeRabbit #6YXkRy, Qodo
+// #2, colon quote-context bypass): YAML only treats `:` as a real key/value
+// separator when it is followed by whitespace or end-of-line; `a:"b` is
+// valid plain-scalar CONTENT (colon with no following space), not a
+// boundary. A flat membership check granted quote-open context after any
+// `:` regardless of what followed it, so `name: a:"b, uses: owner/action@main`
+// let the `"` after the content-only colon forge a phantom quoted scalar
+// that swallowed the real `uses:` key past the comma. Only a `:` actually
+// followed by whitespace/EOL may grant context; a content-only `:` must
+// behave like ordinary content (in particular it must NOT be treated as
+// transitive either — YAML's rule depends on what follows it, not on
+// whatever context preceded it).
+const QUOTE_OPEN_CONTEXT = new Set(['{', '[', ',']);
 const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
 const isInsideQuotedScalar = (text, matchIndex) => {
-  const beforeMatch = String(text).substring(0, matchIndex);
+  const str = String(text);
+  const beforeMatch = str.substring(0, matchIndex);
   let inDouble = false;
   let inSingle = false;
   let atQuoteOpenContext = true; // start-of-string is always a valid quote-open context
@@ -155,6 +165,9 @@ const isInsideQuotedScalar = (text, matchIndex) => {
       inDouble = true;
     } else if (ch === "'" && atQuoteOpenContext) {
       inSingle = true;
+    } else if (ch === ':') {
+      const next = str[i + 1];
+      atQuoteOpenContext = next === undefined || /\s/.test(next);
     } else if (TRANSITIVE_QUOTE_OPEN_CONTEXT.has(ch)) {
       // Preserve the current context as-is: valid stays valid (the marker
       // introduces the next token), invalid stays invalid (it's just content).

@@ -501,9 +501,32 @@ test('findUnpinnedUses does not let a plain-scalar hyphen extend quote-open cont
   const bypassAttempt = findUnpinnedUses("steps: [{name: abc-'def, with: {}, uses: owner/action@main}]\n");
   assert.equal(bypassAttempt.length, 1, 'a plain-scalar hyphen must not extend quote-open context to a later real uses: key');
   // Sanity: a genuine sequence-entry dash at line start still opens context
-  // for the quote that follows it.
-  assert.deepEqual(findUnpinnedUses("- 'owner/action@df4cb1c069e1874edd31b4311f1884172cec0e10'\n"), [],
-    'a genuine sequence dash still opens context for a real single-quoted pinned ref');
+  // for the quote that follows it — proven by a fixture whose result
+  // actually DEPENDS on that (CodeRabbit #6YXkRy): if the dash failed to
+  // open context, the quote would never open and the uses: text inside it
+  // would be scanned as real YAML and flagged; only a correctly-opened
+  // quoted scalar suppresses it.
+  assert.deepEqual(findUnpinnedUses("- 'name, uses: owner/action@main'\n"), [],
+    'a genuine sequence dash opens context, so the quoted scalar suppresses its uses: text');
+});
+test('findUnpinnedUses does not let a content-only colon extend quote-open context (CodeRabbit/Qodo colon bypass)', () => {
+  // `:` was a flat QUOTE_OPEN_CONTEXT member, granting quote-open context
+  // after ANY colon regardless of what followed it. YAML only treats `:` as
+  // a real key/value separator when it is followed by whitespace or EOL;
+  // `a:"b` (js-yaml verified: a valid plain scalar equal to the literal
+  // string 'a:"b') has a colon immediately followed by `"` — ordinary
+  // content, not a boundary. That content-only colon must not grant quote-
+  // open context to the `"` right after it, or the walker misclassifies the
+  // flow boundary before a later real `uses:` key as "inside a string".
+  const bypassAttempt = findUnpinnedUses('steps: [{name: a:"b, uses: owner/action@main}]\n');
+  assert.equal(bypassAttempt.length, 1, 'a content-only colon must not extend quote-open context to a later real uses: key');
+  // Sanity: a genuine key-separator colon (followed by whitespace) still
+  // opens context for the quote it introduces — proven by a fixture whose
+  // result DEPENDS on that: if the separator colon failed to grant context,
+  // the quote around "a, uses: fake" would never open and that fake inner
+  // uses: text would ALSO be scanned as real YAML.
+  assert.equal(findUnpinnedUses('steps: [{name: "a, uses: fake", uses: owner/action@main}]\n').length, 1,
+    'a validly-positioned key-separator colon still opens context, suppressing the quoted fake uses: text');
 });
 test('findUnpinnedUses rejects an explicit key spelled as a block scalar (CodeRabbit #6YW9UB)', () => {
   // `- ? |-` opens a literal block scalar whose resolved content becomes the
