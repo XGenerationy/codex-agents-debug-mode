@@ -431,6 +431,8 @@ test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outp
   const outputs = readFs(outputFile, 'utf8');
   assert.match(outputs, /^status=FAIL$/m);
   assert.match(outputs, /^attestation=absent$/m);
+  assert.match(outputs, /^admission-status=BLOCKED$/m, 
+    'admission-status output is BLOCKED when attestation is absent (CodeRabbit #6X_pwM)');
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.tier, 'plan');
   assert.equal(state.decision.success, true);

@@ -740,8 +740,22 @@ const runSubcommand = async ({
 
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderedSummary}\n`);
   if (env.GITHUB_OUTPUT) {
+    // Aggregate admission status (CodeRabbit #6X_pwM): planStatus can read PASS
+    // (the engine matrix resolved) while admission is actually blocked (missing
+    // required tool, preflight failure, dirty tree). Compute a dedicated output
+    // so consumers can distinguish matrix-resolution PASS from fully-admissible
+    // PASS without parsing the Step Summary. The aggregate is the WORST of the
+    // admission sub-probes; if any is non-PASS the aggregate mirrors it.
+    const admissionProbes = parsed?.admission
+      ? [parsed.admission.attestation, parsed.admission.cleanTree, parsed.admission.preflight]
+        .filter((probe) => probe && typeof probe.status === 'string')
+      : [];
+    const admissionStatus = admissionProbes.length
+      ? admissionProbes.every((probe) => probe.status === 'PASS') ? 'PASS' : admissionProbes.find((probe) => probe.status === 'FAIL') ? 'FAIL' : 'BLOCKED'
+      : (run === 'plan' ? 'unavailable' : '');
     writeOutputs(env.GITHUB_OUTPUT, {
       status, mode: reportMode, attestation, 'report-path': reportJsonPath,
+      ...(admissionStatus ? { 'admission-status': admissionStatus } : {}),
     });
   }
   writeEvidenceFile(outputDir, STATE_FILE, `${JSON.stringify({
