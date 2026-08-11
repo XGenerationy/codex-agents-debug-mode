@@ -319,6 +319,66 @@ test('classifies failed checks as FAIL and skipped checks as BLOCKED', () => {
   assert.match(pending.evidence, /unresolved review thread/i);
 });
 
+test('excludes only the currently-running self-workflow check from the rollup (CodeRabbit #6X_pwH)', () => {
+  // At the moment classifyLivePrState runs INSIDE the Closeout gate workflow,
+  // its own check is IN_PROGRESS and cannot see its own result. The targeted
+  // exclusion omits ONLY the running instance (workflowName matches AND status
+  // is not COMPLETED); prior COMPLETED runs (SUCCESS or FAILURE) at the same
+  // head are STILL classified, so a prior real FAILURE continues to block.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    // Running self (IN_PROGRESS) + prior self FAILURE + legitimate external CI.
+    const priorFailure = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    // The prior gate FAILURE still classifies as FAIL — the targeted exclusion
+    // does NOT mask it. Only the IN_PROGRESS instance is omitted.
+    assert.equal(priorFailure.status, 'FAIL', 'a prior FAILED self-workflow run still FAILS (not masked)');
+    assert.match(priorFailure.evidence, /Check gate concluded FAILURE/, 'the prior FAILURE evidence is preserved');
+    const priorGateChecks = priorFailure.checks.filter((c) => c.workflowName === 'Closeout gate');
+    assert.equal(priorGateChecks.length, 1, 'only the prior COMPLETED gate check remains (IN_PROGRESS instance omitted)');
+    assert.equal(priorGateChecks[0].status, 'COMPLETED', 'the remaining gate check is the prior COMPLETED one');
+
+    // Now verify the pure running-self case (no prior failure): PASS is reachable.
+    const clean = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(clean.status, 'PASS', 'with only the running self-check omitted, PASS is reachable');
+    assert.equal(
+      clean.checks.filter((c) => c.workflowName === 'Closeout gate').length,
+      0,
+      'the running self-check is omitted from the returned rollup',
+    );
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+  }
+});
+
 test('classifies legacy StatusContext checks from state only', () => {
   const outcomes = new Map([
     ['SUCCESS', 'PASS'],

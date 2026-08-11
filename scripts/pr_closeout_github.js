@@ -281,7 +281,23 @@ const classifyLivePrState = ({
   expectedBaseSha,
   gateAttestation,
 } = {}) => {
+  // Exclude the CURRENTLY-RUNNING instance of this gate workflow from the
+  // rollup classification (CodeRabbit #6X_pwH): at the moment the gate
+  // classifies live state, its own check is IN_PROGRESS and cannot see its own
+  // result, so classifying it would always block PASS. Narrowly scoped: only
+  // checks from THIS workflow whose status is not yet COMPLETED are omitted.
+  // Prior COMPLETED runs (SUCCESS or FAILURE) at the same head are STILL
+  // classified — a prior FAILURE is real evidence and must keep blocking.
+  // Cannot mask a failure: omits only the one check that physically cannot
+  // have a result yet (the running instance). Opt-in via GITHUB_WORKFLOW;
+  // local/CI invocations without that env var classify all checks as before.
+  const selfWorkflowName = process.env.GITHUB_WORKFLOW || null;
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
+  if (selfWorkflowName) {
+    const filtered = checks.filter((check) => !(check.workflowName === selfWorkflowName && check.status !== 'COMPLETED'));
+    checks.length = 0;
+    checks.push(...filtered);
+  }
   const threads = Array.isArray(unresolvedThreads) ? unresolvedThreads : [];
   const failures = [];
   const blockers = [];
