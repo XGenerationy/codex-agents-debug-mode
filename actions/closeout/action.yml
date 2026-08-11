@@ -43,6 +43,9 @@ outputs:
   report-path:
     description: "Path of report.json (full) or the captured plan JSON (plan); empty until the gate step has run"
     value: ${{ steps.gate.outputs.report-path }}
+  admission-status:
+    description: "Plan runs: PASS | FAIL | BLOCKED | unavailable. Aggregate of the admission sub-probes (attestation, cleanTree, preflight); distinguishes a matrix-resolution PASS from a fully-admissible PASS. Empty on full runs and until the gate step has run."
+    value: ${{ steps.gate.outputs.admission-status }}
 
 runs:
   using: composite

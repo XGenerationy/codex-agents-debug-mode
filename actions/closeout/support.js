@@ -567,27 +567,26 @@ const runSubcommand = async ({
   // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
   // discipline: the evidence dir can hold unredacted runner paths / base refs
   // before the CLI's own redaction runs, and on a multi-user self-hosted
-  // runner the default umask (typically 0755) would expose them. The CLI
-  // re-applies its own owner-only perms when it takes the directory.
+  // runner the default umask (typically 0755) would expose them.
   //
   // FIX (Qodo #6): mkdirSync's `mode` only applies when the directory is
-  // CREATED — a pre-existing permissive outputDir (plausible on self-hosted
-  // runners where runner.temp is a stable path) would keep its old mode and
-  // expose unredacted evidence. Follow with an explicit chmod so the owner-
-  // only guarantee holds regardless of prior state. Mirrors ensureLogsDirSecured
-  // in pr_closeout_process.js. chmodSync is best-effort: some platforms
-  // (Windows) ignore POSIX directory modes, and a failure to tighten an
-  // existing dir must not crash the run; the CLI re-applies 0o700 downstream.
-  mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  // Fail closed on chmodSync failure (CodeRabbit #6X72Z2): a caller-selected
-  // permissive pre-existing outputDir whose chmod fails or is ineffective
-  // (ACL-based/shared runners) would leave plan.json and action-state.json
-  // writable with inherited permissions, exposing unredacted runner paths
-  // and base refs. On POSIX, fail the run step rather than silently continue
-  // with a permissive directory. Windows is excluded: NTFS ignores POSIX
-  // directory modes entirely, so a chmodSync failure there carries no
-  // security signal and the CLI's owner-only discipline still applies to the
-  // files it writes.
+  // CREATED — a pre-existing permissive outputDir would keep its old mode.
+  // FIX (CodeRabbit #6X72Z2): fail closed on POSIX when chmod is ineffective.
+  //
+  // FIX (CodeRabbit #6YFOVK): chmodding a caller-supplied PRE-EXISTING broad
+  // directory (e.g. /tmp, runner.temp) mutates a directory this invocation
+  // may not own and can break later steps on a self-hosted runner. When the
+  // directory pre-existed, capture its original mode and RESTORE it in the
+  // finally block below once the CLI has taken over (the CLI re-applies its
+  // own owner-only perms to the files it writes). This keeps the Qodo #6
+  // owner-only guarantee during the window the wrapper writes, without
+  // permanently changing a caller-owned directory's mode.
+ const priorMode = (() => { try { return lstatSync(outputDir).mode & 0o777; } catch { return null; } })();
+ const restorePriorMode = () => {
+   if (priorMode === null || process.platform === 'win32') return;
+   try { chmodSync(outputDir, priorMode); } catch { /* best-effort restore */ }
+ };
+ mkdirSync(outputDir, { recursive: true, mode: 0o700 });
   if (process.platform !== 'win32') {
     try {
       chmodSync(outputDir, 0o700);
@@ -605,6 +604,11 @@ const runSubcommand = async ({
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);
   if (run === 'plan') args.push('--plan');
+  // Restore the caller-owned directory's original mode before handing off to
+  // the CLI (CodeRabbit #6YFOVK): the wrapper needed 0o700 only for the window
+  // in which IT wrote state/plan files; the CLI re-applies its own owner-only
+  // perms to the files it writes, so the caller's directory mode can return.
+  restorePriorMode();
   const result = spawnCli(args, { env });
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);

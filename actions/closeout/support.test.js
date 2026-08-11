@@ -469,6 +469,36 @@ test('runSubcommand fails the run when a stale action-state.json cannot be remov
   );
 });
 
+test('runSubcommand restores a caller-owned outputDir original mode before the CLI takes over (CodeRabbit #6YFOVK)', async () => {
+  if (process.platform === 'win32') {
+    // POSIX directory modes are meaningless on NTFS; the restore is a no-op
+    // there. Assert the behavior on Linux/macCI where the mode round-trips.
+    return;
+  }
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  mkdirSync(outputDir, { recursive: true, mode: 0o755 });
+  chmodSync(outputDir, 0o755);
+  const before = lstatSync(outputDir).mode & 0o777;
+  assert.equal(before, 0o755, 'precondition: caller dir starts at 0o755');
+  let modeAtSpawn;
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => {
+      modeAtSpawn = lstatSync(outputDir).mode & 0o777;
+      return { status: 0, stdout: '{}\n', stderr: '' };
+    },
+  });
+  assert.equal(exit, 0);
+  assert.equal(modeAtSpawn, 0o755,
+    'caller-owned directory mode is restored to 0o755 before spawnCli (CodeRabbit #6YFOVK)');
+  const after = lstatSync(outputDir).mode & 0o777;
+  assert.equal(after, 0o755, 'the caller-owned directory mode stays 0o755 after the run');
+});
+
 test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
