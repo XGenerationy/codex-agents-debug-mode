@@ -603,6 +603,47 @@ const EVIDENCE_SUBDIR = 'closeout-action-evidence';
 const resolveEvidenceDir = (outputDir) => path.join(outputDir, EVIDENCE_SUBDIR);
 
 /**
+ * Resolves a report path taken from the spawned CLI's stdout record to a real
+ * path inside `evidenceDir`, or returns null when it does not stay there
+ * (Qodo PR7 #6YscaZ, High).
+ *
+ * The surrounding code already treats the parsed record as possibly
+ * "incomplete or hostile" (see the report-absent branch below) — but the
+ * report PATHS out of that same record were previously used as-is: an
+ * absolute path was taken verbatim, and a relative one was joined without
+ * checking where it landed, so a traversal (`../../../etc/passwd`) or an
+ * absolute path to a runner credential file would be read and its contents
+ * rendered into the Step Summary (and from there into the uploaded evidence
+ * and, when enabled, the PR comment). That turns a stdout record into an
+ * arbitrary-file-read primitive. In the local
+ * dogfood wiring (`uses: ./actions/closeout`) the CLI is the PR's own code,
+ * so this is reachable, not merely theoretical.
+ *
+ * Containment is checked on the RESOLVED path with a trailing-separator
+ * boundary, so a sibling directory sharing a name prefix
+ * (`<evidence>-elsewhere`) cannot pass a naive startsWith. The final path is
+ * additionally required not to be a symlink: `readFileSync` follows links, so
+ * a link written INSIDE the evidence directory by the same untrusted CLI
+ * would otherwise escape a purely lexical check — the same no-follow
+ * discipline writeEvidenceFile already applies on the write side.
+ * @param {string} evidenceDir
+ * @param {unknown} candidate raw value from the CLI's stdout record.
+ * @returns {string|null} the contained absolute path, or null if unusable.
+ */
+const resolveContainedEvidencePath = (evidenceDir, candidate) => {
+  if (typeof candidate !== 'string' || !candidate) return null;
+  const base = path.resolve(evidenceDir);
+  const resolved = path.resolve(base, candidate);
+  if (resolved !== base && !resolved.startsWith(base + path.sep)) return null;
+  try {
+    if (lstatSync(resolved).isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  return resolved;
+};
+
+/**
  * Creates and verifies the private evidence child directory under the
  * caller's `output-dir` (chatgpt-codex-connector PR7 #6Yd4Qx, P2). Evidence
  * is written HERE, never directly into the caller's directory, so a
@@ -999,21 +1040,39 @@ const runSubcommand = async ({
     let reportMarkdown = '';
     let reportUnreadable = false;
     if (parsed?.report?.json) {
-      // A relative report path from the CLI resolves against the directory
-      // the CLI was actually given — the evidence child, not the caller dir.
-      reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(evidenceDir, parsed.report.json);
-      try {
-        report = JSON.parse(readFileSync(reportJsonPath, 'utf8'));
-        // A record that parses but is not a gate report (e.g. `{}`) is not
-        // valid evidence — the success record claimed a report was written, so
-        // a missing overallStatus means the report is schema-invalid.
-        if (!report || typeof report !== 'object' || Array.isArray(report)
-          || typeof report.overallStatus !== 'string') {
-          report = {}; reportUnreadable = true;
-        }
-      } catch { report = {}; reportUnreadable = true; }
-      const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(evidenceDir, parsed.report.markdown || 'report.md');
-      try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
+      // A report path from the CLI is resolved against the directory the CLI
+      // was actually given — the evidence child, not the caller dir — and
+      // must STAY there: a path escaping it (absolute, or `../`) is refused
+      // rather than read, since its contents would flow into the Step
+      // Summary, the uploaded evidence, and any PR comment (Qodo PR7
+      // #6YscaZ). Refusal lands on the existing reportUnreadable path, which
+      // already fails the decision closed and forces status to BLOCKED — the
+      // correct outcome for a record that named a report the gate cannot
+      // legitimately have written.
+      // Keep the '' initial value (not null) when the path is refused, so the
+      // report-path output and the state record keep their documented
+      // "empty when there is no report" shape rather than emitting null.
+      reportJsonPath = resolveContainedEvidencePath(evidenceDir, parsed.report.json) || '';
+      if (!reportJsonPath) {
+        report = {}; reportUnreadable = true;
+      } else {
+        try {
+          report = JSON.parse(readFileSync(reportJsonPath, 'utf8'));
+          // A record that parses but is not a gate report (e.g. `{}`) is not
+          // valid evidence — the success record claimed a report was written, so
+          // a missing overallStatus means the report is schema-invalid.
+          if (!report || typeof report !== 'object' || Array.isArray(report)
+            || typeof report.overallStatus !== 'string') {
+            report = {}; reportUnreadable = true;
+          }
+        } catch { report = {}; reportUnreadable = true; }
+      }
+      const markdownPath = resolveContainedEvidencePath(evidenceDir, parsed.report.markdown || 'report.md');
+      if (markdownPath) {
+        try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
+      } else {
+        reportMarkdown = '(report.md could not be read)';
+      }
     } else {
       // A full-tier success record that omits the report.json path entirely is
       // not valid evidence — the gate always writes a report on a real run, so
@@ -1544,6 +1603,7 @@ module.exports = {
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  resolveContainedEvidencePath,
   resolveEvidenceDir,
   runSubcommand,
   stageTokenSubcommand,

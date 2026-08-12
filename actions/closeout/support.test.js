@@ -31,6 +31,7 @@ const {
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  resolveContainedEvidencePath,
   resolveEvidenceDir,
   runSubcommand,
   stageTokenSubcommand,
@@ -1185,11 +1186,14 @@ test('runSubcommand end-to-end (full tier): reads report.json/report.md and reco
   const outputDir = path.join(dir, 'evidence');
   const summaryFile = path.join(dir, 'summary');
   const outputFile = path.join(dir, 'output');
-  const reportDir = makeTempDir();
-  const reportJson = path.join(reportDir, 'report.json');
-  const reportMd = path.join(reportDir, 'report.md');
-  writeFs(reportJson, JSON.stringify({ overallStatus: 'FAIL', mode: 'engine', configDigest: 'd9', matrixSource: { checkCount: 1 } }));
-  writeFs(reportMd, '# PR Closeout Evidence\n\n> **ENGINE MODE** banner\n');
+  // The report is planted where the real CLI writes it — inside the evidence
+  // directory it receives as --output-dir. A path OUTSIDE that directory is
+  // refused rather than read (Qodo PR7 #6YscaZ), so a test planting it in an
+  // unrelated temp dir would be asserting the traversal this now blocks.
+  plantEvidence(outputDir, 'report.json', JSON.stringify({ overallStatus: 'FAIL', mode: 'engine', configDigest: 'd9', matrixSource: { checkCount: 1 } }));
+  plantEvidence(outputDir, 'report.md', '# PR Closeout Evidence\n\n> **ENGINE MODE** banner\n');
+  const reportJson = evidencePath(outputDir, 'report.json');
+  const reportMd = evidencePath(outputDir, 'report.md');
   const exit = await runSubcommand({
     inputs: { run: 'full', mode: 'engine', prComment: 'false' },
     inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
@@ -1299,9 +1303,12 @@ test('runSubcommand (full tier) forces BLOCKED when CLI exits non-zero but repor
   // PASS against a failing exit code.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const reportDir = makeTempDir();
-  const passReport = path.join(reportDir, 'report.json');
-  writeFs(passReport, JSON.stringify({ overallStatus: 'PASS', mode: 'strict', configDigest: 'd1' }));
+  // Planted inside the evidence directory, where the CLI actually writes it:
+  // a path outside it is now refused rather than read (Qodo PR7 #6YscaZ),
+  // which would make this exercise the missing-report guard instead of the
+  // exit-vs-report integrity mismatch it is meant to cover.
+  plantEvidence(outputDir, 'report.json', JSON.stringify({ overallStatus: 'PASS', mode: 'strict', configDigest: 'd1' }));
+  const passReport = evidencePath(outputDir, 'report.json');
   const exit = await runSubcommand({
     inputs: { run: 'full', mode: 'strict', prComment: 'false' },
     inputBaseRef: 'origin/main', config: '', outputDir, artifactName: 'ev',
@@ -1968,4 +1975,70 @@ test('cleanupDelegatedTokenFile is ENOENT-tolerant and a no-op without a configu
   assert.doesNotThrow(() => cleanupDelegatedTokenFile({ CLOSEOUT_GH_TOKEN_FILE: path.join(dir, 'gone') }));
   // No file configured: no throw.
   assert.doesNotThrow(() => cleanupDelegatedTokenFile({}));
+});
+
+test('resolveContainedEvidencePath refuses paths that escape the evidence directory (Qodo PR7 #6YscaZ)', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'closeout-contained-'));
+  try {
+    const evidenceDir = resolveEvidenceDir(dir);
+    mkdirSync(evidenceDir, { recursive: true });
+    writeFs(path.join(evidenceDir, 'report.json'), '{}');
+
+    // The legitimate case: a relative name inside the evidence dir resolves.
+    assert.equal(
+      resolveContainedEvidencePath(evidenceDir, 'report.json'),
+      path.resolve(evidenceDir, 'report.json'),
+    );
+
+    // Traversal out of the evidence dir must be refused, not read. Before
+    // this guard these were taken verbatim and their contents rendered into
+    // the Step Summary, the uploaded evidence, and any PR comment.
+    assert.equal(resolveContainedEvidencePath(evidenceDir, '../../escape.json'), null);
+    assert.equal(resolveContainedEvidencePath(evidenceDir, '..'), null);
+
+    // An absolute path outside the evidence dir must be refused too.
+    const outside = path.join(dir, 'outside.json');
+    writeFs(outside, '{"overallStatus":"PASS"}');
+    assert.equal(resolveContainedEvidencePath(evidenceDir, outside), null);
+
+    // A sibling sharing a name prefix must not pass a naive startsWith.
+    const sibling = `${evidenceDir}-elsewhere`;
+    mkdirSync(sibling, { recursive: true });
+    writeFs(path.join(sibling, 'report.json'), '{}');
+    assert.equal(resolveContainedEvidencePath(evidenceDir, path.join(sibling, 'report.json')), null);
+
+    // Non-string / empty values are refused rather than coerced.
+    assert.equal(resolveContainedEvidencePath(evidenceDir, ''), null);
+    assert.equal(resolveContainedEvidencePath(evidenceDir, undefined), null);
+    assert.equal(resolveContainedEvidencePath(evidenceDir, 42), null);
+
+    // A path that does not exist is refused (lstat fails) rather than read.
+    assert.equal(resolveContainedEvidencePath(evidenceDir, 'never-written.json'), null);
+  } finally {
+    require('node:fs').rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveContainedEvidencePath refuses a symlink planted inside the evidence directory (Qodo PR7 #6YscaZ)', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'closeout-contained-link-'));
+  try {
+    const evidenceDir = resolveEvidenceDir(dir);
+    mkdirSync(evidenceDir, { recursive: true });
+    const secret = path.join(dir, 'secret.json');
+    writeFs(secret, '{"overallStatus":"PASS","stolen":true}');
+    const link = path.join(evidenceDir, 'report.json');
+    try {
+      symlinkSync(secret, link);
+    } catch {
+      // Windows without the symlink privilege: the lexical containment above
+      // is still asserted by the sibling test; skip only the link case.
+      t.skip('symlink creation requires elevated privileges on this platform');
+      return;
+    }
+    // readFileSync would FOLLOW this link straight out of the evidence dir,
+    // so a lexical-only containment check is not sufficient.
+    assert.equal(resolveContainedEvidencePath(evidenceDir, 'report.json'), null);
+  } finally {
+    require('node:fs').rmSync(dir, { recursive: true, force: true });
+  }
 });
