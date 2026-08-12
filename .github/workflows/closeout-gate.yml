@@ -17,6 +17,15 @@ on:
       base-ref:
         description: "Live PR base ref (dispatch runs have no PR context)"
         default: origin/main
+      pr-number:
+        description: >-
+          PR number to gate (required for a fork PR, or when dispatching from
+          a ref other than the PR's own branch — without this, `gh pr view`
+          falls back to guessing from the checked-out branch, which is wrong
+          or fails outright in those cases; chatgpt-codex-connector PR7
+          #6Yd4Qs). Leave empty when manually dispatching against a same-repo
+          branch you have already selected as the run's ref above.
+        default: ""
   # Re-run once a sibling check that was still pending when the gate last
   # ran has settled (CodeRabbit PR7 #6YW9UP): an approval submitted while
   # "Validate" or "Closeout preview" is still queued/in-progress makes
@@ -151,6 +160,27 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
+      # Resolves an explicit workflow_dispatch `pr-number` input to its
+      # current head SHA BEFORE checkout, so a manual dispatch can target a
+      # fork PR (not selectable in the dispatch UI's own ref picker at all)
+      # or a same-repo PR without the operator first switching to its branch
+      # (chatgpt-codex-connector PR7 #6Yd4Qs). No PR-controlled checkout has
+      # happened yet at this point in the job — this is a plain `gh pr view`
+      # against the number the operator typed in, using only the read-only
+      # pull-requests: read scope already granted above.
+      - name: Resolve workflow_dispatch PR head
+        id: resolve-dispatch-pr
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr-number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh pr view "${{ github.event.inputs.pr-number }}" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          if [ -z "$sha" ]; then
+            echo "::error::Could not resolve a head SHA for PR #${{ github.event.inputs.pr-number }} in ${{ github.repository }}."
+            exit 1
+          fi
+          echo "head-sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Check out reviewed head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -158,17 +188,23 @@ jobs:
           # branch, which is absent from the base repo and would fail checkout
           # for fork PRs). The gate's argument-less `gh pr view` resolves the
           # PR from the Actions event context even though HEAD is detached, so
-          # detached HEAD is not a problem here.
+          # detached HEAD is not a problem here — readActionsPrNumber
+          # (scripts/pr_closeout_github.js) now also reads the `pr-number`
+          # dispatch input (via event.inputs) as an explicit fallback for
+          # exactly this detached-HEAD-with-no-branch-name case.
           #
           # This job's `if:` above no longer admits workflow_run or push
           # events (chatgpt-codex-connector PR7 #6YaxWe / #6YbMwY — see the
           # `on:` trigger comments and the retry-forwarder/base-drift-
           # forwarder jobs below), so github.event.pull_request.head.sha is
           # always present when this step runs except for workflow_dispatch,
-          # which carries no PR context — github.ref covers that case. The
-          # gate independently re-verifies the live head via gh and BLOCKS
-          # stale snapshots regardless.
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          # which carries no PR context of its own — the step above resolves
+          # an explicit `pr-number` input to a head SHA when given; github.ref
+          # (whatever ref the operator picked in the dispatch UI) is the last
+          # resort for a same-repo dispatch with no pr-number input. The gate
+          # independently re-verifies the live head via gh and BLOCKS stale
+          # snapshots regardless.
+          ref: ${{ github.event.pull_request.head.sha || steps.resolve-dispatch-pr.outputs.head-sha || github.ref }}
           fetch-depth: 0
           # Do NOT persist the checkout's extra git credentials into the
           # local config: the full engine matrix then executes PR-controlled

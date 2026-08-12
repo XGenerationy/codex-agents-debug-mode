@@ -202,6 +202,18 @@ const readActionsPrNumber = ({ env }) => {
         const viaWorkflowRun = Number(workflowRunPrs[0]?.number);
         if (Number.isFinite(viaWorkflowRun) && viaWorkflowRun > 0) return viaWorkflowRun;
       }
+      // workflow_dispatch carries neither pull_request nor workflow_run —
+      // `gh pr view` (bare) falls back to "the PR for the current branch",
+      // which is wrong (or fails outright) for a fork PR — not selectable in
+      // the dispatch UI's branch dropdown at all — or a dispatch launched
+      // from the default branch (chatgpt-codex-connector PR7 #6Yd4Qs). The
+      // workflow's `pr-number` dispatch input (see closeout-gate.yml) is the
+      // explicit escape hatch: GitHub places declared workflow_dispatch
+      // inputs verbatim under event.inputs, keyed by their declared
+      // (hyphenated) name, same as base-ref is already read at the YAML
+      // level elsewhere in this workflow.
+      const viaDispatchInput = Number(event?.inputs?.['pr-number']);
+      if (Number.isFinite(viaDispatchInput) && viaDispatchInput > 0) return viaDispatchInput;
     } catch {
       /* fall through */
     }

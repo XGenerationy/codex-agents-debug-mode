@@ -1814,6 +1814,56 @@ test('buildGhArgs pr view fails closed when workflow_run reports more than one a
   }
 });
 
+test('buildGhArgs pr view falls back to a workflow_dispatch pr-number input (chatgpt-codex-connector PR7 #6Yd4Qs)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-'));
+  try {
+    // workflow_dispatch carries neither pull_request nor workflow_run — only
+    // the declared inputs, keyed by their hyphenated YAML name.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': '99' } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const result = buildGhArgs(['pr', 'view', '--json', 'number']);
+    assert.deepStrictEqual(result, ['pr', 'view', '99', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view ignores an empty/absent workflow_dispatch pr-number input', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-empty-'));
+  try {
+    // The workflow declares pr-number with default: "" — an operator who
+    // leaves it blank must not accidentally resolve to PR "0" or similar.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': '' } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(args), args);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
 test('readReviewerPermissions resolves unique reviewers with bounded concurrency and dedup', async () => {
   // GitHub's collaborators/permission endpoint is per-user, so the prior loop
   // awaited one gh api call per reviewer sequentially (N+1). The lookup now
