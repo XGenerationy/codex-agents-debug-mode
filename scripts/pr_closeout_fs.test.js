@@ -233,3 +233,30 @@ test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () 
   ]);
   assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0), [flags]);
 });
+
+test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lacks NOFOLLOW (CodeRabbit PR7 #6Yb1dD)', () => {
+  // A destructive, truncating write cannot safely fall back to a
+  // link-following open the way a read can (a read's result can simply be
+  // discarded; a truncating write destroys its target the instant open
+  // succeeds). requireNoFollow removes the NONBLOCK-only and fully-bare
+  // fallback attempts, so the retry loop can never land on a combo that
+  // omits real NOFOLLOW protection when the platform actually has it.
+  const flags = 0;
+  const noFollow = 0x100;
+  const nonBlock = 0x800;
+  assert.deepEqual(openNoFollowFlagAttempts(flags, noFollow, nonBlock, true), [
+    flags | noFollow | nonBlock,
+    flags | noFollow,
+  ], 'both remaining attempts must carry NOFOLLOW; NONBLOCK-only and bare flags are both dropped');
+  // On a platform where O_NOFOLLOW is entirely unavailable (noFollow === 0,
+  // e.g. Windows), OR'ing it into every attempt is already a no-op -- there
+  // is no attempt that COULD carry real protection either way, so this must
+  // NOT throw or produce an empty list; it degrades to whatever nonBlock
+  // alone provides, identical to what already happens today on those
+  // platforms (their real protection is the caller's own lstat guard, not
+  // this function).
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, nonBlock, true), [flags | nonBlock],
+    'a platform with no O_NOFOLLOW constant must still get a usable attempt list, not an empty one');
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0, true), [flags],
+    'a platform with neither extra flag must still get the plain attempt');
+});

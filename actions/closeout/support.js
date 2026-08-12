@@ -1014,7 +1014,16 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // PR7 #6Yawd4). Where O_NOFOLLOW is unavailable (some Windows builds
   // report it as 0), the lstatSync guard above remains the primary defense,
   // matching openNoFollow's own documented contract for its async callers.
-  const fd = openNoFollowSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600);
+  //
+  // requireNoFollow: true (chatgpt-codex-connector PR7 #6Yb1dD): this is a
+  // destructive O_TRUNC write, so if the platform DOES claim real O_NOFOLLOW
+  // support but the OS rejects every attempt that carries it, this must fail
+  // closed rather than silently fall through to a fully bare, link-following
+  // open — unlike a read, a truncating write cannot be undone after the fact
+  // once the open succeeds. Harmless on platforms where O_NOFOLLOW is
+  // entirely unavailable (e.g. Windows): the lstatSync guard above is
+  // already documented as the primary defense there, unaffected by this.
+  const fd = openNoFollowSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600, true);
   try {
     const preInfo = fstatSync(fd);
     // fchmodSync's mode argument on open only applies when the OPEN call

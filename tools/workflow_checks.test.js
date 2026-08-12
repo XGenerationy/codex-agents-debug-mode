@@ -761,6 +761,25 @@ test('findUnpinnedUses updates carried quote state on a comment-shaped line that
     'a real standalone comment line must still be ignored entirely');
 });
 
+test('findUnpinnedUses does not open block-scalar tracking from a key:-shaped line inside a carried-open scalar (CodeRabbit PR7 #6Yb1dD)', () => {
+  // js-yaml verified: `name: "foo\n  run: |\n    text"\nsteps: [{uses: owner/action@main}]`
+  // resolves to {name: "foo run: | text", steps: [{uses: "owner/action@main"}]}
+  // -- line 2's "run: |" is scalar CONTENT, not a real block-scalar header.
+  // BLOCK_SCALAR_HEADER was previously tested against every line
+  // unconditionally, so it wrongly started tracking a scalar body on line 2,
+  // which then swallowed line 3 (where the carried quote actually closes)
+  // as fake scalar content and hid the real unpinned uses: on line 4.
+  assert.deepEqual(
+    findUnpinnedUses('name: "foo\n  run: |\n    text"\nsteps: [{uses: owner/action@main}]\n'),
+    [{ line: 4, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' }],
+    'a key:-shaped line inside a carried-open scalar must not open fake block-scalar tracking that hides a later real uses:',
+  );
+  // Sanity: a genuine block-scalar header (not inside any carried-open
+  // scalar) must still correctly start body tracking.
+  assert.deepEqual(findUnpinnedUses('with:\n  script: |\n    const x = {uses: owner/action@main};\n'), [],
+    'a real block-scalar header outside any carried quote must still be recognized');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);
@@ -802,6 +821,19 @@ test('hasTopLevelPermissions does not mistake column-zero scalar content for a r
     true,
     'a real top-level permissions: key after a scalar closes must still be found',
   );
+});
+
+test('hasTopLevelPermissions splits on \\r\\n and lone \\r, not only \\n (CodeRabbit PR7 #6Yb1dF)', () => {
+  // Splitting on '\n' alone left every physical line of a CR-only
+  // (old-Mac-style line ending) file joined into a single string, so a
+  // real top-level permissions: key later in the file was never reached
+  // on its own line and went undetected.
+  assert.equal(hasTopLevelPermissions('name: x\rpermissions:\r  contents: read\r'), true,
+    'a CR-only workflow with a real top-level permissions: key must be detected');
+  assert.equal(hasTopLevelPermissions('name: x\r\npermissions:\r\n  contents: read\r\n'), true,
+    'a CRLF workflow with a real top-level permissions: key must be detected');
+  assert.equal(hasTopLevelPermissions('name: x\r'), false,
+    'a CR-only workflow with no permissions: key must still report false');
 });
 
 test('the real validator passes on this repository (integration)', () => {

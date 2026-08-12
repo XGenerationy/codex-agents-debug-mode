@@ -602,7 +602,20 @@ const findUnpinnedUses = (content) => {
     // Scoped to this one test only — every OTHER check in this function already
     // has its own `(?:#.*)?$` handling built into its own pattern and operates
     // on `text` unchanged, so stripping here does not touch their behavior.
-    const scalarHeaderMatch = BLOCK_SCALAR_HEADER.exec(stripTrailingYamlComment(text));
+    //
+    // Skipped entirely (not even attempted) when the line begins inside a
+    // carried-open scalar (CodeRabbit #6Yb1dD, mirroring the #6YbMwS fix for
+    // USES_LINE above): a `key: |`-shaped fragment that is really CONTENT of
+    // an already-open quoted scalar (e.g. the middle line of `name: "foo\n
+    // run: |\n text"`) must not be mistaken for a real block-scalar header —
+    // doing so wrongly starts tracking a scalar body that swallows the real
+    // line where the carried quote actually closes, hiding whatever real
+    // YAML (including an unpinned `uses:`) follows it. Also seed
+    // stripTrailingYamlComment with lineStartQuoteState so a `#` genuinely
+    // inside a still-open scalar on this line is not mistaken for a comment.
+    const scalarHeaderMatch = (lineStartQuoteState.inDouble || lineStartQuoteState.inSingle)
+      ? null
+      : BLOCK_SCALAR_HEADER.exec(stripTrailingYamlComment(text, lineStartQuoteState));
     if (scalarHeaderMatch) {
       scalarPending = true;
       scalarExplicitIndent = Number(scalarHeaderMatch[1] || scalarHeaderMatch[2]) || 0;
@@ -705,8 +718,12 @@ const hasTopLevelPermissions = (content) => {
   // would match that line's raw text as if it were a real key, wrongly
   // reporting the file as having declared its permissions scope. Skip the
   // regex test entirely for a line that BEGINS inside a scalar carried
-  // open from an earlier line.
-  const lines = text.split('\n');
+  // open from an earlier line. Split on the same \r\n|\r|\n pattern
+  // findUnpinnedUses uses (CodeRabbit #6Yb1dF) — splitting on '\n' alone
+  // left every physical line of a CR-only (old-Mac-style) file joined into
+  // one string, so a real top-level permissions: key later in such a file
+  // was never reached as its own line and went undetected.
+  const lines = text.split(/\r\n|\r|\n/);
   let carryover = { inDouble: false, inSingle: false };
   for (const line of lines) {
     const lineStartState = carryover;
