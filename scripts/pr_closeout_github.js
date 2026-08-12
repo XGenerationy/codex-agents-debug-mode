@@ -459,6 +459,12 @@ const classifyLivePrState = ({
     ? null
     : (selfJobDisplayName || process.env.GITHUB_JOB || null);
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
+  // Recorded BEFORE self-exclusion so a rollup that legitimately contained
+  // ONLY this job's own check (chatgpt-codex-connector PR7 #6Yb3lX, P2) can be
+  // told apart from GitHub genuinely returning no live check data at all — see
+  // the `!liveCheckCount` guard below, which reads this instead of the
+  // post-exclusion `checks.length`.
+  const liveCheckCount = checks.length;
   if (selfWorkflowName && selfJobName) {
     const filtered = checks.filter((check) => !(
       check.workflowName === selfWorkflowName
@@ -482,7 +488,15 @@ const classifyLivePrState = ({
   }
   if (pr.reviewDecision === 'CHANGES_REQUESTED') failures.push('Latest review decision requests changes.');
   else if (pr.reviewDecision !== 'APPROVED') blockers.push(`Review decision is ${pr.reviewDecision || 'not approved'}.`);
-  if (!checks.length) blockers.push('No live GitHub check results were returned.');
+  // liveCheckCount (pre-self-exclusion), not checks.length: a consumer that
+  // installs ONLY this gate as their CI has a rollup that legitimately
+  // contains nothing but this job's own (always in-progress, always
+  // excluded) check — checks.length would then be 0 forever and this
+  // BLOCKED reason could never clear, even though GitHub genuinely returned
+  // live data (chatgpt-codex-connector PR7 #6Yb3lX). This still blocks
+  // fail-closed on a truly empty/malformed rollup: liveCheckCount is 0 in
+  // that case too, since it is captured before self-exclusion ever runs.
+  if (!liveCheckCount) blockers.push('No live GitHub check results were returned.');
   for (const check of checks) {
     if (check.classification === 'FAIL') failures.push(`Check ${check.name} concluded ${check.conclusion || check.status}.`);
     else if (check.classification !== 'PASS') blockers.push(`Check ${check.name} is ${check.status || check.conclusion || 'unresolved'}.`);
@@ -1072,17 +1086,66 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: postThreadGateSnapshot.attestation,
       };
     }
+    // postThreadUnresolvedThreads is itself another paginated network window
+    // (chatgpt-codex-connector PR7 #Yb3lQ, review 4912448810). Everything
+    // above re-verifies PR/review/attestation stability across every window
+    // BEFORE this final thread request, but nothing yet re-checks them across
+    // this request's OWN window — an attesting reviewer's repository
+    // permission revoked while it was in flight would leave postThreadGateSnapshot
+    // (captured before it started) still holding the earlier authoritative
+    // permission, with no event here to ever invalidate that stale PASS. Take
+    // one more PR + attestation snapshot and require it to match
+    // postThreadGateSnapshot before publishing the verdict.
+    const verifiedPr = await runGh([
+      'pr',
+      'view',
+      '--json',
+      PR_VIEW_FIELDS,
+    ], { repo });
+    if (!Number.isInteger(verifiedPr.number)) throw new Error('GitHub did not return a verified pull request number.');
+    if (typeof verifiedPr.author?.login !== 'string' || !verifiedPr.author.login.trim()) {
+      throw new Error('GitHub did not return a verified pull request author identity.');
+    }
+    const verifiedGateSnapshot = await readGateAttestationSnapshotForPr({
+      repo,
+      repository,
+      pr: verifiedPr,
+      expectedBaseSha,
+      expectedHeadSha,
+      expectedConfigDigest,
+      runGh,
+    });
+    const verifiedPrStable = stabilityTuplesMatch(
+      capturePrStabilityTuple(postThreadPr),
+      capturePrStabilityTuple(verifiedPr),
+    );
+    const verifiedReviewsStable = stabilityTuplesMatch(
+      postThreadGateSnapshot.stabilityTuple,
+      verifiedGateSnapshot.stabilityTuple,
+    );
+    if (!verifiedPrStable || !verifiedReviewsStable) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub PR or review/attestation state changed during the final thread-request verification window; rerun against a stable remote snapshot.',
+        repository,
+        number: verifiedPr.number,
+        checks: [],
+        unresolvedThreads: postThreadUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: verifiedGateSnapshot.attestation,
+      };
+    }
     // selfJobDisplayName was resolved near the top of this function (see the
     // comment there) — best-effort: resolves to null (falling back to
     // GITHUB_JOB inside classifyLivePrState, the exact prior behavior) on
     // any failure.
     return classifyLivePrState({
       repository,
-      pr: postThreadPr,
+      pr: verifiedPr,
       unresolvedThreads: postThreadUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
-      gateAttestation: postThreadGateSnapshot.attestation,
+      gateAttestation: verifiedGateSnapshot.attestation,
       selfJobDisplayName,
     });
   } catch (error) {

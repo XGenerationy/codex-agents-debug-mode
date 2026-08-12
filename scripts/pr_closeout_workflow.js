@@ -766,11 +766,23 @@ const buildWorkflowEnvironment = (env, config) => {
   }));
 };
 
-// Plan-preflight environment: same as full-run, PLUS the sensitive-name pattern
-// is hard-denied. Plan admission runs BEFORE attestation on PR-controlled code,
-// so a PR cannot exfiltrate credentials via repository-local preflight probes
-// by listing them in safeEnv. Once a run is attested, buildWorkflowEnvironment
-// (above) restores the explicit-allowlist behavior for legitimate credentials.
+// Plan-preflight environment: ESSENTIAL_ENV only — config.requiredEnv/safeEnv
+// are NOT honored here (chatgpt-codex-connector PR7 #6Yb3lZ, P1). Plan
+// admission runs BEFORE attestation on PR-controlled code, and `config` ITSELF
+// is read from the checked-out (therefore PR-controlled) config path: a PR can
+// add an existing job secret's NAME to safeEnv — however innocuously chosen,
+// e.g. DEPLOY_CRED rather than DEPLOY_CREDENTIAL — and have it forwarded to a
+// repository-local preflight probe it also controls (e.g. a `prisma`
+// preflight), before any independent review ever runs. An earlier version of
+// this function reused buildWorkflowEnvironment's explicit allowlist (which
+// DOES honor config.requiredEnv/safeEnv, correct for the FULL attested run)
+// and only additionally stripped names matching SENSITIVE_ENV_PATTERN — a
+// finite, name-shape heuristic that a secret under an unrecognized name
+// (DEPLOY_CRED does not match ACCESS_KEY/CREDENTIAL/SECRET/TOKEN/etc.) simply
+// walks around. The PR-controlled allowlist itself was the hole, not the
+// heuristic that tried to patch it after the fact. Once a run is attested,
+// buildWorkflowEnvironment (above) is what legitimately restores the
+// explicit-allowlist behavior for the full run's own credential needs.
 //
 // KNOWN RESIDUAL LIMITATION (chatgpt-codex-connector PR7 #6YaZ5K, not fixed —
 // see the PR review thread for the full analysis): filtering the probe's OWN
@@ -797,8 +809,15 @@ const buildWorkflowEnvironment = (env, config) => {
 // block (contents/pull-requests/checks/statuses/actions — no repo-write,
 // no org-admin), which bounds the practical impact of a leak even if this
 // gap is exploited.
-const buildPlanPreflightEnvironment = (env, config) => {
-  const filtered = buildWorkflowEnvironment(env, config);
+const buildPlanPreflightEnvironment = (env) => {
+  const filtered = Object.fromEntries(Object.entries(env).filter(([name]) => {
+    const upper = name.toUpperCase();
+    if (DENYLISTED_ENV_NAMES.has(upper)) return false;
+    return ESSENTIAL_ENV.has(upper);
+  }));
+  // Belt-and-suspenders only at this point: no PR-controlled name can reach
+  // `filtered` above, so this can only ever fire against a future accidental
+  // credential-shaped addition to the fixed ESSENTIAL_ENV list itself.
   return Object.fromEntries(Object.entries(filtered).filter(([name]) => (
     !SENSITIVE_ENV_PATTERN.test(name)
   )));
@@ -1072,7 +1091,7 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       // job secrets to PR-controlled code in a preview advertised as
       // read-only. The parent gh lookups do not use this env — they read
       // GH_TOKEN from process.env through their own execFile call.
-      preflight = await d.runPreflight({ repo, config, env: buildPlanPreflightEnvironment(process.env, config), toolProbes });
+      preflight = await d.runPreflight({ repo, config, env: buildPlanPreflightEnvironment(process.env), toolProbes });
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
     }

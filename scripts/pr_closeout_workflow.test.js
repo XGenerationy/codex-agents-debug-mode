@@ -1735,18 +1735,28 @@ test('resolvePlanAdmission blocks when a gitignored path is mutated by the probe
   assert.match(result.preflight.evidence, /fingerprint changed during preflight/);
 });
 
-test('resolvePlanAdmission passes the allowlisted env to preflight, not raw process.env', async () => {
+test('resolvePlanAdmission passes only ESSENTIAL_ENV to preflight, not raw process.env or config.safeEnv (chatgpt-codex-connector PR7 #6Yb3lZ)', async () => {
   // The plan-path preflight spawns repository-controlled binaries, so it must
-  // receive the same allowlisted child environment as the full gate (Codex:
-  // runner command files and non-credential secrets must not leak into a
-  // preview advertised as read-only).
+  // receive a fixed, code-defined environment (Codex: runner command files
+  // and secrets must not leak into a preview advertised as read-only).
+  //
+  // config.safeEnv must NOT reach plan preflight at all: `config` is itself
+  // read from the checked-out (PR-controlled) config path, so honoring it
+  // here would let a PR add an existing job secret's NAME to safeEnv and have
+  // it forwarded to a repository-local probe it also controls, before any
+  // independent review runs. An earlier version of this function DID forward
+  // safeEnv-listed names (stripping only names matching a credential-name
+  // heuristic) -- this test used to assert that forwarding as correct
+  // behavior; it now asserts the opposite, since that forwarding was exactly
+  // the round-20 finding's exploit path (a secret under an unrecognized name,
+  // e.g. DEPLOY_CRED, walked straight around the heuristic).
   const secretName = 'PR_CLOSEOUT_PLAN_AMBIENT_TEST';
   const safeName = 'PR_CLOSEOUT_PLAN_SAFE_TEST';
   const previous = Object.fromEntries(
     [secretName, safeName].map((name) => [name, process.env[name]]),
   );
   process.env[secretName] = 'must-not-reach-probes';
-  process.env[safeName] = 'allowed-value';
+  process.env[safeName] = 'must-also-not-reach-probes';
   let preflightEnv;
   try {
     await resolvePlanAdmission({
@@ -1766,7 +1776,37 @@ test('resolvePlanAdmission passes the allowlisted env to preflight, not raw proc
     }
   }
   assert.equal(preflightEnv[secretName], undefined, 'ambient env must not reach plan preflight');
-  assert.equal(preflightEnv[safeName], 'allowed-value', 'config safeEnv must reach plan preflight');
+  assert.equal(preflightEnv[safeName], undefined, 'config safeEnv must NOT reach plan preflight, even when explicitly opted in');
+  assert.ok(preflightEnv.PATH || preflightEnv.Path, 'ESSENTIAL_ENV names must still reach preflight');
+});
+
+test('resolvePlanAdmission does not let PR-controlled safeEnv select a secret by an unrecognized name (chatgpt-codex-connector PR7 #6Yb3lZ)', async () => {
+  // The exact scenario named in the finding: a real secret set under a name
+  // the credential-shape heuristic (SENSITIVE_ENV_PATTERN) does not
+  // recognize. Before the fix, this reached the probe because the OLD
+  // buildPlanPreflightEnvironment only stripped pattern-matching names —
+  // DEPLOY_CRED (not DEPLOY_CREDENTIAL) does not match ACCESS_KEY, API_KEY,
+  // CREDENTIAL(S), SECRET, TOKEN, or any other alternative in the pattern.
+  const secretName = 'DEPLOY_CRED';
+  const previous = process.env[secretName];
+  process.env[secretName] = 'super-secret-deploy-value';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: { safeEnv: [secretName] },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    if (previous === undefined) delete process.env[secretName];
+    else process.env[secretName] = previous;
+  }
+  assert.equal(preflightEnv[secretName], undefined, 'a secret under a heuristic-evading name must still never reach plan preflight');
 });
 
 test('resolvePlanAdmission hard-denies credential-named vars even when safeEnv opts in (Codex #7, CodeRabbit #16)', async () => {

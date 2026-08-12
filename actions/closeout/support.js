@@ -7,7 +7,7 @@
 
 const {
   appendFileSync, chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync,
-  readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
+  readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
 } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -140,9 +140,27 @@ const resolveBaseRef = ({ inputBaseRef = '', env = {}, event = {} } = {}) => {
  * resolved path and the symlink-resolved physical path are compared against
  * the workspace root, mirroring the CLI's own symlink defense; a realpath
  * failure fails closed (the path cannot be proven safe).
+ *
+ * Also rejects an embedded CR or LF in `outputDir` before any of that
+ * (chatgpt-codex-connector PR7 #Yb3lN): this same string flows unmodified
+ * into action.yml's own `Upload evidence artifact` step as
+ * `actions/upload-artifact`'s `path:` input, which (via @actions/glob)
+ * treats a multi-line value as SEPARATE search patterns, one per line, not
+ * as one literal path. Node's fs calls (mkdirSync/writeFileSync here) have
+ * no such convention — a newline is just an ordinary path-segment
+ * character to them — so `output-dir: "/tmp/closeout-evidence\n."` passes
+ * every check below as one literal outside-workspace path, the gate writes
+ * evidence there successfully, and the step exits 0; the uploader then
+ * reads the SAME string as two patterns, the second (`.`) resolving inside
+ * GITHUB_WORKSPACE, and publishes the checkout (and anything earlier steps
+ * left there) as if it were evidence. Verified against
+ * @actions/glob's own newline-splitting `getSearchPaths`/create() contract.
  * @param {{outputDir: string, workspace?: string}} options
  */
 const assertOutputOutsideWorkspace = ({ outputDir, workspace = '' }) => {
+  if (/[\r\n]/.test(String(outputDir ?? ''))) {
+    throw new Error(`Evidence output directory must not contain a CR or LF (upload-artifact reads a multi-line path as multiple patterns): ${JSON.stringify(outputDir)}`);
+  }
   const root = workspace || process.cwd();
   const rootResolved = path.resolve(root);
   // Relative output paths resolve against the workspace root (on the runner
@@ -369,6 +387,35 @@ const renderPlanSummary = (plan, { baseRef = null, artifactName = 'plan.json' } 
     `| preflight | ${escapeActionText(admission.preflight?.status || 'unknown')} | ${escapeActionText(admission.preflight?.evidence || '')} |`,
   ];
   lines.push('', `- Attestation detail: ${label}`);
+  // Surface the exact marker a reviewer must paste into an APPROVED review
+  // body (chatgpt-codex-connector PR7 #6Yb3lW, P2): the plan record always
+  // carries it at gateIntegrityAttestationRequired.marker, but until now
+  // this summary never printed it, so the reviewer had to separately
+  // discover and download plan.json from the artifact just to get a
+  // copy-pasteable string, even though the README documents the Step
+  // Summary as the primary place to check attestation readiness. Rendered
+  // in a fenced code block, NOT through escapeActionText: the marker's `=`
+  // characters would become HTML entities under that allowlist, corrupting
+  // the exact byte sequence classifyGateAttestation compares against — and
+  // there is nothing here to defend against in the first place, since the
+  // marker is this action's OWN fixed-template output over base/head SHAs
+  // and a config digest, never free-form PR-controlled text. Shown whenever
+  // a matching attestation is not already in place (absent/weakened/
+  // unavailable) — a 'present' status means one already satisfies this
+  // snapshot, so showing "paste this" again would be confusing noise.
+  const requiredMarker = record.gateIntegrityAttestationRequired?.marker;
+  if (attestation.status !== 'present' && typeof requiredMarker === 'string' && requiredMarker) {
+    lines.push(
+      '',
+      '### Required attestation marker',
+      '',
+      'Paste this line verbatim into an APPROVED review body to satisfy admission:',
+      '',
+      '```',
+      requiredMarker,
+      '```',
+    );
+  }
   const preflightChecks = Array.isArray(admission.preflight?.checks) ? admission.preflight.checks : [];
   const failingProbes = preflightChecks.filter((entry) => entry.status !== 'PASS');
   for (const check of failingProbes.slice(0, 20)) {
@@ -938,103 +985,73 @@ const runSubcommand = async ({
 };
 
 /**
- * Writes a file in the evidence dir without ever following an existing symlink
- * at the destination. A repository-defined check that predicts the output dir
- * could plant action-state.json (or plan.json) as a symlink to a tracked
- * workspace file; a plain writeFileSync would follow it and overwrite the
- * workspace file. lstat first: if the destination exists as a symlink (or
- * anything that is not a regular file), unlink it — unlinking removes the link
- * itself, never the target. The fresh write then creates a regular file. The
- * output dir is owner-only (0o700), so nothing else can re-plant the link in
- * the unlink/write window.
+ * Writes a file in the evidence dir without ever writing THROUGH an existing
+ * or raced-in symlink/hard link at the destination. Stages content to an
+ * exclusively-created temp file in the same directory, then atomically
+ * renames it into place — mirroring writeNoFollow/writeEvidenceReport's
+ * identical pattern in pr_closeout_report.js, ported synchronously.
+ *
+ * Earlier rounds of this function opened `target` directly (after an lstat +
+ * conditional-unlink guard, then O_NOFOLLOW). That closed the SYMLINK case,
+ * but O_NOFOLLOW does not reject a HARD LINK — a hard link is a second
+ * directory entry for an existing inode, not a link that gets "followed", so
+ * opening one with O_TRUNC truncates whatever regular file it points to
+ * immediately, before any post-open identity check can react (chatgpt-codex-
+ * connector PR7 #6Yb1dK). O_EXCL closes this differently and completely: it
+ * refuses to open ANY pre-existing path (hard link, symlink, regular file,
+ * whatever) — the call either creates a brand-new, guaranteed-fresh, nlink=1
+ * inode, or fails with EEXIST. A predictable temp name (pid + timestamp) is
+ * therefore still safe: an attacker who pre-plants a hard link at that exact
+ * path only turns our create into a clean, fail-closed EEXIST, never a
+ * truncating open through it.
+ *
+ * The final rename() is also safe regardless of what currently occupies
+ * `target`: POSIX rename() replaces the destination's directory ENTRY
+ * atomically — for a destination that is a symlink, "the link will be
+ * removed" (POSIX rename(2)), not followed — so it can never write through
+ * an existing link at `target`, unlike a direct open ever could. This makes
+ * the earlier lstat/unlink pre-check on `target` itself obsolete; it has
+ * been removed rather than kept as no-op residual complexity.
  * @param {string} outputDir
  * @param {string} name - file name inside the evidence dir
  * @param {string} content
  */
 const writeEvidenceFile = (outputDir, name, content) => {
   const target = path.join(outputDir, name);
-  // A hard link (nlink > 1) to a tracked workspace file reports as a regular
-  // file but shares an inode — a write through it would mutate the workspace
-  // file after the CLI's final seal. Replace it (unlinking removes THIS
-  // directory entry, not the linked target) so the fresh write creates a new
-  // inode owned only by the evidence dir.
-  //
-  // The catch is scoped to ENOENT ONLY: lstatSync throws ENOENT when nothing
-  // exists at the destination (the normal case — the write creates it fresh).
-  // If an unsafe entry IS present, lstatSync succeeds and the conditional
-  // unlinkSync runs; an unlink FAILURE here (EPERM/EACCES/EBUSY, or the entry
-  // being a directory) must NOT be swallowed, because the code would then
-  // fall through to writeFileSync(target) and write THROUGH the still-linked
-  // target — exactly the workspace mutation this function exists to prevent.
-  // Any non-ENOENT error propagates and fails the run step fail-closed.
+  const tempPath = path.join(outputDir, `.${name}.${process.pid}.${Date.now()}.tmp`);
+  // requireNoFollow: true (chatgpt-codex-connector PR7 #6Yb1dD): this is a
+  // destructive write, so if the platform DOES claim real O_NOFOLLOW support
+  // but the OS rejects every attempt that carries it, fail closed rather
+  // than silently degrade. O_EXCL is the primary defense here regardless
+  // (see above); O_NOFOLLOW is defense-in-depth on top of it.
+  let fd;
+  try {
+    fd = openNoFollowSync(
+      tempPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+      true,
+    );
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Refusing to write evidence file through an existing symlink: ${tempPath}`);
+    }
+    if (error?.code === 'EEXIST') {
+      throw new Error(`Refusing to write evidence file through a pre-existing path: ${tempPath}`);
+    }
+    throw error;
+  }
   let info;
   try {
-    info = lstatSync(target);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-    info = null;
-  }
-  if (info && (info.isSymbolicLink() || !info.isFile() || info.nlink > 1)) {
-    try {
-      unlinkSync(target);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-  }
-  // Owner-only mode (0o600) on the evidence files themselves, so the wrapper's
-  // writes are confidential regardless of the surrounding directory's mode.
-  // This decouples file confidentiality from the directory-mode restore window
-  // (CodeRabbit #6YTfjs): even if the caller-owned outputDir has been restored
-  // to its original broader mode before this write, the file content (which can
-  // hold unredacted runner paths / base refs / error text) is still owner-only.
-  //
-  // Open ONE descriptor and hold it through ACL setup and the content write,
-  // rather than two separate path-based writeFileSync calls (chatgpt-codex-
-  // connector PR7 #6YaIaZ, following writeNoFollow's identical pattern in
-  // pr_closeout_report.js): protectWindowsPrivateFile is an EXTERNAL
-  // PowerShell process operating on `target` BY PATH, so between it starting
-  // and returning, another account on a multi-user Windows runner could
-  // replace the path with a symlink or a different file. A subsequent
-  // path-based write would then write THROUGH that replacement instead of
-  // the file whose DACL was actually verified. Writing through the SAME fd
-  // opened here — before the ACL call, established as a regular single-link
-  // file by the symlink/hardlink guard above — is immune to that: even if
-  // the path is later swapped, this descriptor still refers to the original
-  // on-disk file. The identity recheck below is an additional fail-closed
-  // net: it detects a swap during the ACL call and refuses rather than
-  // leave a case where the file at the PATH other tooling would read is
-  // unprotected while the KNOWN-good original silently isn't the one still
-  // reachable there.
-  //
-  // openNoFollowSync (not a plain openSync) closes the remaining gap between
-  // the lstatSync guard above and this open call: on platforms with
-  // O_NOFOLLOW, the OPEN itself refuses to follow a symlink an attacker
-  // replanted at `target` in that window, instead of only detecting one
-  // after the fact via the identity recheck below (chatgpt-codex-connector
-  // PR7 #6Yawd4). Where O_NOFOLLOW is unavailable (some Windows builds
-  // report it as 0), the lstatSync guard above remains the primary defense,
-  // matching openNoFollow's own documented contract for its async callers.
-  //
-  // requireNoFollow: true (chatgpt-codex-connector PR7 #6Yb1dD): this is a
-  // destructive O_TRUNC write, so if the platform DOES claim real O_NOFOLLOW
-  // support but the OS rejects every attempt that carries it, this must fail
-  // closed rather than silently fall through to a fully bare, link-following
-  // open — unlike a read, a truncating write cannot be undone after the fact
-  // once the open succeeds. Harmless on platforms where O_NOFOLLOW is
-  // entirely unavailable (e.g. Windows): the lstatSync guard above is
-  // already documented as the primary defense there, unaffected by this.
-  const fd = openNoFollowSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600, true);
-  try {
-    const preInfo = fstatSync(fd);
-    // fchmodSync's mode argument on open only applies when the OPEN call
-    // CREATES the file — an ordinary pre-existing regular single-link file
-    // (the guard above only unlinks a symlink/non-file/hardlink, not a plain
-    // reused file) is opened with O_TRUNC and keeps whatever permissive mode
-    // it already had, e.g. 0o644 from a prior invocation of a reused
-    // output-dir. fchmodSync unconditionally closes that gap before
-    // anything is written; it is a cheap no-op when the file was freshly
-    // created at 0o600 already (CodeRabbit #6YT0Jx).
+    // fchmodSync is a cheap no-op here (O_CREAT|O_EXCL always CREATES the
+    // file at the requested mode already) — kept for the same defense-in-
+    // depth reasoning as the prior direct-open version, cheap insurance
+    // against a platform ignoring the open-time mode argument.
     fchmodSync(fd, 0o600);
+    info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1) {
+      throw new Error(`Refusing to stage evidence file through a non-private file (nlink=${info.nlink}): ${tempPath}`);
+    }
     // chmodSync/fchmodSync(0o600) only clears Windows' read-only attribute
     // bit — it does NOT establish real access control there, so this file
     // would still inherit whatever DACL the surrounding --output-dir has on
@@ -1042,29 +1059,73 @@ const writeEvidenceFile = (outputDir, name, content) => {
     // local account. The gate CLI already solves exactly this for its own
     // evidence writes — report.json/report.md (pr_closeout_report.js) and
     // evidence logs (pr_closeout_process.js) — via protectWindowsPrivateFile:
-    // a verified, owner-only Windows DACL, no-op on non-Windows. Apply the
-    // same guard here, fail-closed on any failure to establish it, and
-    // BEFORE any content is written (Codex PR7 review, "Protect wrapper
-    // evidence with a Windows DACL"; chatgpt-codex-connector PR7 #6YZpcv).
+    // a verified, owner-only Windows DACL, no-op on non-Windows. Apply it to
+    // the STAGED file (a same-volume rename preserves NTFS security
+    // descriptors, so this DACL travels with it to `target`), fail-closed
+    // on any failure to establish it, and BEFORE any content is written
+    // (Codex PR7 review, "Protect wrapper evidence with a Windows DACL";
+    // chatgpt-codex-connector PR7 #6YZpcv).
     try {
-      protectWindowsPrivateFile(target);
+      protectWindowsPrivateFile(tempPath);
     } catch (error) {
-      throw new Error(`failed to protect evidence file with an owner-only ACL: ${target}`, { cause: error });
+      throw new Error(`failed to protect evidence file with an owner-only ACL: ${tempPath}`, { cause: error });
     }
     if (process.platform === 'win32') {
+      // protectWindowsPrivateFile re-resolves tempPath by name in a separate
+      // PowerShell process; re-verify identity immediately after, same
+      // reasoning as the prior direct-open version (CodeRabbit #6YaIaZ).
       let postInfo;
       try {
-        postInfo = lstatSync(target);
+        postInfo = lstatSync(tempPath);
       } catch {
-        throw new Error(`Refusing to write evidence file with an unverifiable identity: ${target}`);
+        throw new Error(`Refusing to write evidence file with an unverifiable identity: ${tempPath}`);
       }
-      if (!isSameFileIdentity(preInfo, postInfo)) {
-        throw new Error(`Refusing to write evidence file through a path swapped during ACL protection: ${target}`);
+      if (!isSameFileIdentity(info, postInfo)) {
+        throw new Error(`Refusing to write evidence file through a path swapped during ACL protection: ${tempPath}`);
       }
     }
     writeSync(fd, content, null, 'utf8');
+  } catch (error) {
+    try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+    throw error;
   } finally {
     closeSync(fd);
+  }
+  try {
+    // Re-verify the staged file's identity immediately before rename: the
+    // fd closed above, and the temp name is predictable, so a concurrent
+    // writer with outputDir access could in principle replace it in this
+    // gap (mirrors assertStagedIdentity in pr_closeout_report.js).
+    let stagedInfo;
+    try {
+      stagedInfo = lstatSync(tempPath);
+    } catch {
+      throw new Error(`Refusing to write evidence file with an unverifiable staged identity: ${tempPath}`);
+    }
+    if (!isSameFileIdentity(info, stagedInfo)) {
+      throw new Error(`Refusing to write evidence file through a staged path swapped before rename: ${tempPath}`);
+    }
+    renameSync(tempPath, target);
+    // rename() is path-based, not bound to the identity just checked: a
+    // concurrent writer could still swap tempPath for a replacement in the
+    // instant between that check and this rename call, in which case
+    // rename() commits the replacement — never the validated content — as
+    // `target`. Re-verify the destination's identity right after commit and
+    // remove it if it doesn't match, rather than trust a possible swap
+    // (mirrors assertCommittedIdentity in pr_closeout_report.js).
+    let committedInfo;
+    try {
+      committedInfo = lstatSync(target);
+    } catch {
+      throw new Error(`Refusing to trust evidence file with an unverifiable post-rename identity: ${target}`);
+    }
+    if (!isSameFileIdentity(info, committedInfo)) {
+      try { unlinkSync(target); } catch { /* best-effort cleanup */ }
+      throw new Error(`Refusing to trust evidence file through a path swapped during its rename into place: ${target}`);
+    }
+  } catch (error) {
+    try { unlinkSync(tempPath); } catch { /* best-effort cleanup; no-op once renamed */ }
+    throw error;
   }
 };
 

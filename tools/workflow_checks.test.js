@@ -355,6 +355,30 @@ test('findUnpinnedUses flags an explicit ? uses mapping key (Codex #20)', () => 
   assert.equal(findUnpinnedUses('env:\n  url: *checkout\n').length, 0,
     'an alias used as a value for a non-uses key is not flagged here');
 });
+
+test('findUnpinnedUses flags a tag or anchor placed AFTER the explicit-key ? marker (chatgpt-codex-connector PR7 #6Yb1dJ)', () => {
+  // A tag or anchor attaches to the key NODE itself and can legally sit on
+  // either side of `?` -- js-yaml verified: `- ? !!str uses` and
+  // `- ? &anchorx uses` both resolve the key to the literal string "uses"
+  // (the tag/anchor is metadata, not part of the value), same as the
+  // already-covered before-`?` form. Only allowing it before `?` let either
+  // after-`?` form bypass pin enforcement entirely.
+  assert.equal(findUnpinnedUses('steps:\n  - ? !!str uses\n    : owner/action@main\n').length, 1,
+    'a tag placed after the ? marker must still be flagged');
+  assert.equal(findUnpinnedUses('steps:\n  - ? &anchorx uses\n    : owner/action@main\n').length, 1,
+    'an anchor placed after the ? marker must still be flagged');
+  // The quoted, escape-obfuscated variant with a tag after ?: js-yaml
+  // verified `- ? !!str "uses"` also resolves to {uses: ...}.
+  assert.equal(findUnpinnedUses('steps:\n  - ? !!str "u\\u0073es"\n    : owner/action@main\n').length, 1,
+    'a quoted, escape-obfuscated key with a tag after the ? marker must still be flagged');
+  // The block-scalar explicit-key form with a tag after ?: js-yaml verified
+  // `? !!str |` is valid and still opens a block-scalar key body.
+  assert.equal(findUnpinnedUses('steps:\n  - ? !!str |\n      uses\n    : owner/action@main\n').length, 1,
+    'a block-scalar explicit key with a tag after the ? marker must still be flagged');
+  // Sanity: a tag after ? for a genuinely non-uses key must not be flagged.
+  assert.equal(findUnpinnedUses('steps:\n  - ? !!str name\n    : build\n').length, 0,
+    'a tag after the ? marker for a non-uses property is not flagged');
+});
 // Regression coverage for inline-value, flow, and continued-key explicit
 // bypasses (CodeRabbit PR7 threads 6X7tKr / 6X72Zm / 6X942y / 6X9422 / 6XsD7p).
 test('findUnpinnedUses flags inline-value explicit-key uses forms (CodeRabbit #6X7tKr)', () => {

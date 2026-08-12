@@ -238,6 +238,37 @@ test('renderPlanSummary renders all four attestation states distinctly and escap
   }
 });
 
+test('renderPlanSummary prints the exact required attestation marker verbatim, not escaped, when one is still needed (chatgpt-codex-connector PR7 #6Yb3lW)', () => {
+  // Before this fix, a reviewer had to separately discover and download
+  // plan.json to get the copy-pasteable marker line; the plan record always
+  // carried it at gateIntegrityAttestationRequired.marker, but the summary
+  // never printed it.
+  const marker = 'PR-CLOSEOUT-ATTESTATION v1 base=abc123 head=def456 config=digest789 decision=not-weakened';
+  const plan = {
+    ...hostilePlan(),
+    admission: { ...hostilePlan().admission, attestation: { status: 'absent', evidence: 'no matching review yet' } },
+    gateIntegrityAttestationRequired: { marker },
+  };
+  const markdown = renderPlanSummary(plan, {});
+  assert.match(markdown, /Required attestation marker/);
+  // Verbatim, byte-for-byte: escapeActionText would turn every `=` and `/`
+  // into a numeric HTML entity, which is EXACTLY what classifyGateAttestation
+  // does NOT compare against — a corrupted marker would be pasted into a
+  // review and still never match.
+  assert.ok(markdown.includes(marker), 'the marker must appear completely unescaped');
+  assert.equal(markdown.includes('&#61;'), false, 'the marker\'s "=" characters must never be HTML-entity-escaped');
+
+  // A 'present' status means a matching attestation already exists — the
+  // "paste this" instruction would be confusing noise, so it must not render.
+  const satisfiedPlan = {
+    ...plan,
+    admission: { ...plan.admission, attestation: { status: 'present', evidence: 'covers this snapshot' } },
+  };
+  const satisfiedMarkdown = renderPlanSummary(satisfiedPlan, {});
+  assert.doesNotMatch(satisfiedMarkdown, /Required attestation marker/);
+  assert.equal(satisfiedMarkdown.includes(marker), false);
+});
+
 test('renderFullSummary embeds the gate report verbatim and caps with an in-band notice', () => {
   const report = { overallStatus: 'FAIL', mode: 'engine', configDigest: 'd1' };
   const small = renderFullSummary(report, '## Gate Report\n\n> **ENGINE MODE** banner line\n', { artifactName: 'closeout-evidence' });
@@ -474,6 +505,44 @@ test('writeEvidenceFile refuses a hard-linked destination (shared inode)', () =>
   const info = lstatSync(statePath);
   assert.equal(info.nlink, 1, 'destination must be a fresh regular file');
   assert.equal(readFs(statePath, 'utf8'), '{"safe":true}\n');
+});
+
+test('writeEvidenceFile does not clobber an outside hard-linked file via its staging path (chatgpt-codex-connector PR7 #6Yb1dK)', () => {
+  // The staging name is predictable (pid + ms). Pre-link an OUTSIDE file
+  // across a window of consecutive stamps so the real call's O_EXCL create
+  // either lands on a still-free stamp (write succeeds normally) or an
+  // already-linked one (must fail closed via EEXIST) -- either way the
+  // outside file's content must never be truncated through the link.
+  const evidenceDir = makeTempDir();
+  const outsideDir = makeTempDir();
+  const outsideTarget = path.join(outsideDir, 'clobber-me.json');
+  writeFs(outsideTarget, 'do not overwrite this\n');
+  const { linkSync } = require('node:fs');
+  const now = Date.now();
+  let linked = 0;
+  for (let i = 0; i < 50; i += 1) {
+    try {
+      linkSync(outsideTarget, path.join(evidenceDir, `.action-state.json.${process.pid}.${now + i}.tmp`));
+      linked += 1;
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') break; // no hard-link privilege on this host
+      throw error;
+    }
+  }
+  if (linked === 0) return; // platform lacks hard-link support
+  let wrote = false;
+  try {
+    writeEvidenceFile(evidenceDir, 'action-state.json', '{"safe":true}\n');
+    wrote = true;
+  } catch (error) {
+    assert.match(String(error?.message || error), /pre-existing path/i);
+  }
+  // The outside file must be untouched regardless of which branch ran: O_EXCL
+  // never truncates a pre-existing inode, only ever creates a fresh one.
+  assert.equal(readFs(outsideTarget, 'utf8'), 'do not overwrite this\n');
+  if (wrote) {
+    assert.equal(readFs(path.join(evidenceDir, 'action-state.json'), 'utf8'), '{"safe":true}\n');
+  }
 });
 
 test('writeEvidenceFile fails closed when an unsafe target cannot be unlinked (Codex #3)', () => {
@@ -1237,6 +1306,62 @@ test('runSubcommand writes its nonce to both the state file and GITHUB_ENV (Code
   const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.nonce, 'fixed-test-nonce');
   assert.match(readFs(envFile, 'utf8'), /^CLOSEOUT_INVOCATION_NONCE=fixed-test-nonce$/m);
+});
+
+test('assertOutputOutsideWorkspace rejects an embedded CR or LF (chatgpt-codex-connector PR7 #Yb3lN)', () => {
+  // actions/upload-artifact's `path:` input (@actions/glob) treats a
+  // multi-line value as SEPARATE search patterns, one per line -- not as one
+  // literal path the way Node's fs calls do. "/tmp/evidence\n." passes every
+  // OTHER check below as one literal outside-workspace path (the whole
+  // string, embedded newline included, is just one path segment to fs), but
+  // the uploader would read it as two patterns, the second ('.') resolving
+  // inside the workspace and publishing the checkout as "evidence". This
+  // must be rejected before any of the other logic even runs.
+  const workspace = makeTempDir();
+  const outside = makeTempDir();
+  for (const outputDir of [
+    `${outside}\n.`,
+    `${outside}\r.`,
+    `${outside}\r\n.`,
+    `${outside}/evidence\n${workspace}`,
+  ]) {
+    assert.throws(
+      () => assertOutputOutsideWorkspace({ outputDir, workspace }),
+      /must not contain a CR or LF/,
+      `rejected: ${JSON.stringify(outputDir)}`,
+    );
+  }
+  // A genuinely single-line outside path is unaffected by this check.
+  assert.doesNotThrow(() => assertOutputOutsideWorkspace({ outputDir: outside, workspace }));
+});
+
+test('action.yml uploads only this action\'s well-known evidence filenames, never the bare output-dir (chatgpt-codex-connector PR7 #6Yb3lY)', () => {
+  // A caller-overridden output-dir can point at a broad shared directory
+  // (${{ runner.temp }}, /tmp). Uploading that directory wholesale (a bare
+  // `path: <dir>`) publishes every unrelated file already there as if it
+  // were this gate's own evidence. The fix enumerates the exact filenames
+  // support.js/the spawned CLI can produce; this test reads action.yml as
+  // plain text (no YAML-parser dependency, matching this repo's existing
+  // regex-only approach to workflow-file checks) to catch a regression back
+  // to a bare-directory `path:` without re-parsing YAML.
+  const actionYml = readFs(path.join(__dirname, 'action.yml'), 'utf8');
+  const uploadStepIndex = actionYml.indexOf('Upload evidence artifact');
+  assert.notEqual(uploadStepIndex, -1, 'the upload step must exist');
+  const afterStep = actionYml.slice(uploadStepIndex);
+  const pathBlockMatch = /path:\s*\|\r?\n((?:[ \t]+\S.*\r?\n?)+)/.exec(afterStep);
+  assert.ok(pathBlockMatch, 'path: must be a multi-line block scalar, not a bare directory');
+  const lines = pathBlockMatch[1].split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const suffix of ['/plan.json', '/report.json', '/report.md', '/action-state.json', '/logs']) {
+    assert.ok(
+      lines.some((line) => line.endsWith(suffix)),
+      `path: must enumerate a line ending in ${suffix}`,
+    );
+  }
+  // No line may be the bare output-dir expression itself (no filename
+  // suffix) -- that would be the pre-fix bare-directory upload again.
+  for (const line of lines) {
+    assert.notEqual(line, "${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}");
+  }
 });
 
 test('assertOutputOutsideWorkspace rejects inside-workspace paths before any write', () => {

@@ -433,6 +433,67 @@ test('excludes every self-workflow check from the rollup, including a prior comp
   }
 });
 
+test('a rollup that legitimately contains only this job\'s own check can still reach PASS (chatgpt-codex-connector PR7 #6Yb3lX)', () => {
+  // A consumer that installs ONLY this gate as their CI (no separate lint/
+  // test/build workflow) has a rollup that, at the moment this job classifies
+  // itself, contains nothing but this job's own (always in-progress, always
+  // self-excluded) check. Before the fix, `!checks.length` read the
+  // POST-exclusion array, so this case was indistinguishable from GitHub
+  // genuinely returning no check data at all -- the gate could never PASS
+  // standalone, forever blocked on "No live GitHub check results were
+  // returned." even though every other signal was clean.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const standalone = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(standalone.status, 'PASS', 'a self-only rollup must not permanently block a standalone installation');
+    assert.equal(standalone.checks.length, 0, 'the self check is still excluded from the returned rollup');
+
+    // A genuinely empty/malformed rollup must still fail-closed: this is NOT
+    // the same case, and the fix must not have widened it.
+    const genuinelyEmpty = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: { ...cleanPr(), statusCheckRollup: [] },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(genuinelyEmpty.status, 'BLOCKED');
+    assert.match(genuinelyEmpty.evidence, /No live GitHub check results were returned/);
+
+    const malformed = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: { ...cleanPr(), statusCheckRollup: null },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(malformed.status, 'BLOCKED');
+    assert.match(malformed.evidence, /No live GitHub check results were returned/);
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
 test('selfJobDisplayName excludes a matrixed/named job that GITHUB_JOB alone could never match (CodeRabbit PR7 #6YXkRF)', () => {
   // GITHUB_JOB is the YAML job id ("gate"); a consumer that runs the job in
   // a matrix gets a DISPLAYED check name like "gate (ubuntu-latest, 20)",
@@ -843,12 +904,14 @@ test('queries live PR metadata and paginates unresolved review threads', async (
     });
     assert.equal(result.status, 'BLOCKED');
     assert.equal(result.unresolvedThreads.length, 1);
-    // Stable path: four gate-attestation snapshots (first, final, terminal,
-    // post-thread) + three review-thread walks (2 pages each with this mock) =
-    // 4 snapshots (mix of paginate + graphql) + 6 thread pages → 10 api calls.
+    // Stable path: five gate-attestation snapshots (first, final, terminal,
+    // post-thread, verified — the last re-checking PR/attestation stability
+    // across the post-thread review-thread walk's own window, chatgpt-codex-
+    // connector PR7 #Yb3lQ) + three review-thread walks (2 pages each with
+    // this mock) = 5 snapshots + 6 thread pages → 11 api calls.
     // resolveCurrentJobDisplayName makes no additional call here because
     // GITHUB_RUN_ID/RUNNER_NAME are absent (cleared above).
-    assert.equal(calls.filter(([command]) => command === 'api').length, 10);
+    assert.equal(calls.filter(([command]) => command === 'api').length, 11);
   } finally {
     if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
     else process.env.GITHUB_RUN_ID = savedRunId;
@@ -1134,6 +1197,41 @@ test('blocks when a reviewer permission downgrades from write to read between st
   assert.equal(permissionReads, 2, 'permissions must be re-fetched independently for each stability snapshot, never cached across them');
   assert.equal(result.status, 'BLOCKED');
   assert.match(result.evidence, /changed during verification/i);
+});
+
+test('blocks when a reviewer permission is revoked during the final post-thread request window (chatgpt-codex-connector PR7 #Yb3lQ)', async () => {
+  // The first four gate-attestation snapshots (first, final, terminal, post-
+  // thread) all agree — only the fifth (verified, taken after the LAST
+  // paginated thread request) sees the revoked permission. This isolates the
+  // new round added for this finding: without it, nothing re-checks
+  // attestation stability across postThreadUnresolvedThreads's own network
+  // window, so a revocation timed to land exactly there would attest a stale
+  // PASS forever (no workflow event exists to ever invalidate it).
+  let permissionReads = 0;
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview({ author_association: 'CONTRIBUTOR' })]];
+      if (args[1]?.endsWith('/permission')) {
+        permissionReads += 1;
+        return { permission: permissionReads <= 4 ? 'write' : 'read' };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(permissionReads, 5, 'all five gate-attestation snapshots must fetch permissions independently');
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /final thread-request verification window/i);
 });
 
 test('reads the independent attestation from paginated GitHub review data', async () => {

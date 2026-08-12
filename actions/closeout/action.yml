@@ -88,11 +88,36 @@ runs:
       # evidence. Require the gate step to have actually run and exited 0;
       # on every legitimate verdict (including BLOCKED/FAIL) it still runs
       # via always() (CodeRabbit #6YT0J3).
+      #
+      # `path:` enumerates this action's own well-known evidence filenames
+      # instead of the whole output-dir (chatgpt-codex-connector PR7 #6Yb3lY,
+      # P1, following the README's already-documented "future hardening"
+      # note for #6YYcNT): uploading the bare directory means a caller who
+      # points `output-dir` at an existing broad path (`${{ runner.temp }}`,
+      # `/tmp`) has EVERY file already there — including logs or credential
+      # material left by an earlier step — published as if it were this
+      # gate's own evidence. `actions/upload-artifact`'s `path:` treats a
+      # multi-line value as separate search patterns (the same convention
+      # #6Yb3lN's CR/LF rejection in support.js guards against for a
+      # caller-supplied value; here the multi-line value is ours, not
+      # caller-controlled, so it is exactly the intended use), so this now
+      # only ever globs the exact names support.js/the spawned CLI can
+      # produce. `if-no-files-found: ignore` already tolerates whichever of
+      # these a given tier does not write (e.g. plan.json on a full run).
+      # Residual risk, unchanged from before and already documented in the
+      # README: an unrelated tool coincidentally using one of these same
+      # generic names in that same shared directory would still be picked
+      # up — narrower than uploading the directory wholesale, but not zero.
       if: ${{ always() && steps.gate.outcome == 'success' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}
-        path: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        path: |
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/plan.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/report.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/report.md
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/action-state.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/logs
         if-no-files-found: ignore
 
     - name: Upsert PR comment

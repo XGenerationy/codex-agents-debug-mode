@@ -261,23 +261,38 @@ const decodeDoubleQuotedEscapes = (raw) => String(raw)
 // verified to resolve to {uses: ...}) — so EXPLICIT_QUOTED_KEY captures the
 // raw quoted text for the same decode check QUOTED_USES_KEY applies. (Single
 // quotes are excluded: no escape processing in YAML single-quoted scalars.)
-const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+['"]?uses['"]?\s*(?::[^#]*)?(?:#.*)?$/;
-const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+"([^"]*)"\s*(?::[^#]*)?(?:#.*)?$/;
+// The tag/anchor prefix group also appears AFTER `?` below (chatgpt-codex-
+// connector PR7 #6Yb1dJ): YAML allows a tag or anchor to attach to the key
+// NODE itself, which can sit either before or after the `?` marker —
+// allowing it only before missed `- ? !!str uses` / `- ? &anchor uses`
+// (js-yaml verified: both resolve the key to the literal string "uses",
+// the tag/anchor is metadata on the node, not part of its value), letting
+// either form bypass pin enforcement entirely.
+const EXPLICIT_USES_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+(?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*(?::[^#]*)?(?:#.*)?$/;
+const EXPLICIT_QUOTED_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+(?:!\S*\s+|&\S+\s+)*"([^"]*)"\s*(?::[^#]*)?(?:#.*)?$/;
 // An explicit mapping key that is a YAML ALIAS (`? *action_key`). The scanner
 // is line-oriented and cannot resolve aliases, but an alias CAN name `uses`
 // (verified: `name: &action_key uses` then `- ? *action_key` resolves via
 // js-yaml to {uses: ...}). Fail-closed: flag ANY alias explicit key, since the
 // resolver cannot confirm it is NOT `uses`. Alias explicit keys are vanishingly
 // rare in real workflow YAML, so this cannot cause false positives on clean
-// pinned actions.
+// pinned actions. No tag/anchor-after-`?` variant to account for here: YAML
+// alias nodes cannot themselves carry a tag or anchor property (js-yaml
+// verified: `? !!str *alias` is a parse error, "alias node should not have
+// any properties") — only the pre-`?` prefix form is syntactically possible.
 const EXPLICIT_ALIAS_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s+\*\S+\s*(?::[^#]*)?(?:#.*)?$/;
 // An explicit mapping key whose VALUE is a block scalar (`? |`, `? >`, with
 // optional chomping `-`/`+` and explicit indent-indicator digit): `? |-`
 // opens a literal scalar body on following indented lines, and the RESOLVED
 // scalar text becomes the key. `- ? |-` / `    uses` / `  : owner/action@main`
 // resolves (js-yaml verified) to {uses: "owner/action@main"} (CodeRabbit
-// #6YW9UB). Mirrors BLOCK_SCALAR_HEADER's trailing indicator syntax.
-const EXPLICIT_BLOCK_SCALAR_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*(?:#.*)?$/;
+// #6YW9UB). Mirrors BLOCK_SCALAR_HEADER's trailing indicator syntax. Same
+// tag/anchor-after-`?` allowance as EXPLICIT_USES_KEY above (js-yaml
+// verified: `? !!str |` is valid and still resolves via its block-scalar
+// body) — this check flags ANY explicit block-scalar key unconditionally
+// regardless of tag, so a tagged form matching neither side previously slid
+// through unflagged entirely, defeating its own documented fail-closed intent.
+const EXPLICIT_BLOCK_SCALAR_KEY = /^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*\?\s*(?:!\S*\s+|&\S+\s+)*[|>](?:[1-9][-+]?|[-+]?[1-9]?)\s*(?:#.*)?$/;
 // An alias used as an IMPLICIT block-style mapping key — `- *action_key : ref`
 // (with optional whitespace around the colon). When the anchor names `uses`
 // (`name: &action_key uses`), js-yaml resolves this to {uses: ref}. The scanner
