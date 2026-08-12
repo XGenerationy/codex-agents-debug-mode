@@ -711,6 +711,56 @@ test('findUnpinnedUses strips a trailing comment before testing BLOCK_SCALAR_HEA
   assert.deepEqual(findUnpinnedUses(genuine), [], 'a real block-scalar header is unaffected');
 });
 
+test('findUnpinnedUses does not let a quote inside a trailing comment corrupt carryover to the next line (CodeRabbit #6YbIQU / chatgpt-codex-connector PR7 #6YbKFc)', () => {
+  // quoteCarryover was previously computed from the RAW line, including its
+  // own trailing comment text. An unclosed quote inside that comment (a
+  // single or double quote with no matching close before end-of-line) was
+  // wrongly treated as opening a real scalar that carries into the NEXT
+  // line, suppressing that line's genuine unpinned flow-style uses: (fail-
+  // open). js-yaml verified: both documents resolve to a real, unpinned
+  // `uses: owner/action@main` on line 2 — the comment's stray quote has no
+  // bearing on line 2's own YAML structure at all.
+  assert.equal(findUnpinnedUses("name: build # ok, 'quoted\nsteps: [{uses: owner/action@main}]\n").length, 1,
+    'an unmatched single quote inside a trailing comment must not suppress the next line\'s real uses:');
+  assert.equal(findUnpinnedUses('name: build # ok, "quoted\nsteps: [{uses: owner/action@main}]\n').length, 1,
+    'an unmatched double quote inside a trailing comment must not suppress the next line\'s real uses:');
+  // Sanity: a GENUINE open scalar (no comment involved) must still carry
+  // over correctly — this fix must not blind the carryover to real cases.
+  assert.equal(findUnpinnedUses('steps: [{name: "a # b\n  c", uses: owner/action@main}]\n').length, 1,
+    'a real multiline quoted scalar (unrelated to a comment) must still carry over and still catch the real uses: after it closes');
+});
+
+test('findUnpinnedUses does not treat a block-style uses:-shaped continuation of a carried-open scalar as a real key (chatgpt-codex-connector PR7 #6YbMwS)', () => {
+  // js-yaml verified: `name: "foo\n  uses: owner/action@main\n  bar"` resolves
+  // to one folded scalar value ("foo uses: owner/action@main bar"), not a
+  // real `uses` key — USES_LINE's block-style match previously ignored
+  // lineStartQuoteState entirely and flagged line 2 as an unpinned action.
+  assert.deepEqual(findUnpinnedUses('name: "foo\n  uses: owner/action@main\n  bar"\nsteps: []\n'), [],
+    'a uses:-shaped line that is scalar CONTENT of a carried-open quote must not be treated as a real key');
+  // Sanity: an actual top-level block-style uses: (not inside any scalar)
+  // must still be caught.
+  assert.deepEqual(findUnpinnedUses('steps:\n  - uses: owner/action@main\n'), [{ line: 2, ref: 'owner/action@main' }],
+    'a genuine, unquoted block-style uses: line must still be flagged');
+});
+
+test('findUnpinnedUses updates carried quote state on a comment-shaped line that actually closes an open scalar (chatgpt-codex-connector PR7 #6YbMwW)', () => {
+  // js-yaml verified: `name: "foo\n  # bar"` resolves to the scalar
+  // "foo # bar" — the `#` on line 2 is INSIDE the still-open double-quoted
+  // scalar from line 1, not a real YAML comment. The old unconditional
+  // `COMMENT_LINE.test(text)` early return treated line 2 as a pure comment
+  // and skipped updating quoteCarryover entirely, so the scalar looked
+  // permanently open and the real uses: on line 3 was wrongly suppressed.
+  assert.deepEqual(
+    findUnpinnedUses('name: "foo\n  # bar"\nsteps: [{uses: owner/action@main}]\n'),
+    [{ line: 3, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' }],
+    'a comment-shaped line that actually closes a carried-open scalar must still let the next real uses: be caught',
+  );
+  // Sanity: a genuine standalone comment line (no open scalar at all) is
+  // still skipped and does not itself produce a violation.
+  assert.deepEqual(findUnpinnedUses('# just a comment: uses: owner/action@main\nsteps: []\n'), [],
+    'a real standalone comment line must still be ignored entirely');
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

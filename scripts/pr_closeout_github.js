@@ -285,12 +285,25 @@ const normalizeCheck = (value) => {
  * turn into a hard failure of the whole live-state read — self-exclusion is
  * an optimization (avoid the gate blocking on its own in-progress check),
  * not a correctness requirement of live-state classification itself.
+ *
+ * Returns `false` — NOT `null` — specifically when a genuine name collision
+ * is detected (another job in this run shares this job's resolved displayed
+ * name): `null` means "could not determine a name, use the legacy
+ * `GITHUB_JOB` fallback", but that fallback is exactly as unsafe as the
+ * collision itself whenever this job has no `name:` override, since
+ * `GITHUB_JOB` (the YAML job id) then equals the very displayed name found
+ * to be ambiguous, and `classifyLivePrState` would recreate the identical
+ * false match `GITHUB_JOB` was meant to disambiguate (chatgpt-codex-
+ * connector PR7 #6YbMwM). `false` tells the caller to skip self-exclusion
+ * entirely rather than fall back — a failed sibling sharing this job's name
+ * must stay visible in the rollup rather than be silently excluded alongside
+ * this job's own in-progress check.
  * @param {object} options
  * @param {string} options.repository - "owner/name".
  * @param {Function} options.runGh - injectable `gh` invoker, same contract as elsewhere in this file.
  * @param {string} [options.repo] - repo checkout path, forwarded to runGh like every other call site.
  * @param {object} [options.env] - defaults to process.env.
- * @returns {Promise<string|null>}
+ * @returns {Promise<string|false|null>}
  */
 const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = process.env } = {}) => {
   const runId = env.GITHUB_RUN_ID;
@@ -336,12 +349,18 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
     // genuinely failed sibling could then go undetected and the gate could
     // wrongly reach PASS (chatgpt-codex-connector PR7 #6Yap8W). This SAME
     // Jobs API response already reveals such a collision directly: if more
-    // than one job in this run carries this name, resolving to it is unsafe
-    // here — return null instead, and classifyLivePrState falls back to its
-    // prior GITHUB_JOB-only matching (the same protection level as before
-    // this resolver existed), same as any other best-effort failure.
+    // than one job in this run carries this name, resolving to it is unsafe.
+    //
+    // Return `false` here, NOT `null` (chatgpt-codex-connector PR7 #6YbMwM):
+    // `null` means "use the legacy GITHUB_JOB fallback", but when this job
+    // has no `name:` override, GITHUB_JOB literally EQUALS `ownName` — the
+    // very name just found to be ambiguous — so falling back would recreate
+    // the identical collision `classifyLivePrState` matches on, excluding
+    // the sibling's genuinely-failed check right alongside this job's own.
+    // `false` is a distinct sentinel the caller must treat as "do not
+    // self-exclude at all", not as "resolution failed, try the old way".
     const sameNameJobCount = list.filter((job) => job?.name === ownName).length;
-    if (sameNameJobCount > 1) return null;
+    if (sameNameJobCount > 1) return false;
     return ownName;
   } catch {
     return null;
@@ -425,8 +444,20 @@ const classifyLivePrState = ({
   // available; fall back to GITHUB_JOB — the exact prior behavior — when it
   // is not (API unavailable, older/local invocation, or dispatch without a
   // resolvable run id).
+  //
+  // `selfJobDisplayName === false` is a DISTINCT sentinel from `null`
+  // (chatgpt-codex-connector PR7 #6YbMwM): the resolver returns it
+  // specifically when it detected another job sharing this job's own
+  // displayed name, and in that exact scenario GITHUB_JOB can itself equal
+  // that same ambiguous name — falling back to it here would recreate the
+  // very collision the resolver just rejected, excluding a genuinely-failed
+  // sibling's check right alongside this job's own. Force selfJobName to
+  // null in that case so the exclusion below is skipped entirely, rather
+  // than silently falling back to an equally-unsafe match.
   const selfWorkflowName = process.env.GITHUB_WORKFLOW || null;
-  const selfJobName = selfJobDisplayName || process.env.GITHUB_JOB || null;
+  const selfJobName = selfJobDisplayName === false
+    ? null
+    : (selfJobDisplayName || process.env.GITHUB_JOB || null);
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
   if (selfWorkflowName && selfJobName) {
     const filtered = checks.filter((check) => !(

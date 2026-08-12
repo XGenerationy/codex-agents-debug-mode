@@ -775,14 +775,18 @@ const buildWorkflowEnvironment = (env, config) => {
 // KNOWN RESIDUAL LIMITATION (chatgpt-codex-connector PR7 #6YaZ5K, not fixed —
 // see the PR review thread for the full analysis): filtering the probe's OWN
 // spawn env does not stop it from reading an ANCESTOR process's environment.
-// On Linux, /proc/<pid>/environ is readable by any process sharing that
-// process's UID — not only its children — and reflects a process's env as of
-// its OWN execve(), unaffected by any later env filtering an ancestor
-// performs on ITS OWN process.env. Every process in this job's tree (the
-// runner's shell, this Node process, the spawned CLI, and the probe itself)
-// shares one UID, and GH_TOKEN reaches that tree via the WORKFLOW YAML's
-// `env:` on the very first step, before this file's own code ever runs — so
-// a sufficiently sophisticated probe can walk its parent chain and read
+// On Linux, another process sharing the UID may read /proc/<pid>/environ when
+// the runner's ptrace policy permits it — not only a child (access is gated
+// by a PTRACE_MODE_READ_FSCREDS check; the classic same-UID case allows it,
+// but a stricter Yama ptrace_scope, a non-dumpable target, or a missing
+// CAP_SYS_PTRACE/CAP_PERFMON can each independently deny it — CodeRabbit PR7
+// #6YbIQJ) — and reflects a process's env as of its OWN execve(), unaffected
+// by any later env filtering an ancestor performs on ITS OWN process.env.
+// Every process in this job's tree (the runner's shell, this Node process,
+// the spawned CLI, and the probe itself) shares one UID, and GH_TOKEN reaches
+// that tree via the WORKFLOW YAML's `env:` on the very first step, before
+// this file's own code ever runs — so if the runner's ptrace policy permits
+// it, a sufficiently sophisticated probe can walk its parent chain and read
 // GH_TOKEN (and the denylisted runner command-file paths) directly from
 // procfs, bypassing this allowlist/denylist entirely. A real fix requires an
 // OS-level process/privilege boundary (a container, a different UID, or

@@ -6,8 +6,8 @@
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
 const {
-  appendFileSync, chmodSync, closeSync, fchmodSync, fstatSync, lstatSync, mkdirSync,
-  openSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
+  appendFileSync, chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync,
+  readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
 } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -20,7 +20,7 @@ const { randomUUID } = require('node:crypto');
 // consumed as merged), just consuming their existing public surface the same
 // way the CLI's own code does (Codex PR7 review, "Protect wrapper evidence
 // with a Windows DACL"; chatgpt-codex-connector PR7 #6YaIaZ).
-const { isSameFileIdentity, protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
+const { isSameFileIdentity, openNoFollowSync, protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
 
 // Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
 // git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
@@ -889,9 +889,25 @@ const runSubcommand = async ({
     // so consumers can distinguish matrix-resolution PASS from fully-admissible
     // PASS without parsing the Step Summary. The aggregate is the WORST of the
     // admission sub-probes; if any is non-PASS the aggregate mirrors it.
+    // Every probe key is REQUIRED once `admission` is present at all — a
+    // record silently missing cleanTree/preflight (a malformed or truncated
+    // CLI report) must not just vanish from the reduction. The prior
+    // `.filter(probe => probe && ...)` dropped absent/malformed probes before
+    // aggregating, so a record containing only `attestation: {status:
+    // "present"}` made `every(probePasses)` vacuously true over a
+    // single-element array and published PASS despite cleanTree/preflight
+    // never having run (chatgpt-codex-connector PR7 #6YaxWb). Mapping every
+    // required key — substituting a non-passing, non-failing 'missing'
+    // placeholder status for anything absent or malformed — keeps the
+    // reduction below fail-closed: 'missing' satisfies neither probePasses
+    // nor probeFails, so it forces the aggregate to BLOCKED rather than
+    // letting the incomplete record dodge the check entirely.
+    const ADMISSION_PROBE_KEYS = ['attestation', 'cleanTree', 'preflight'];
     const admissionProbes = parsed?.admission
-      ? [parsed.admission.attestation, parsed.admission.cleanTree, parsed.admission.preflight]
-        .filter((probe) => probe && typeof probe.status === 'string')
+      ? ADMISSION_PROBE_KEYS.map((key) => {
+        const probe = parsed.admission[key];
+        return (probe && typeof probe.status === 'string') ? probe : { status: 'missing' };
+      })
       : [];
     // resolvePlanAdmission (scripts/pr_closeout_workflow.js) uses a DIFFERENT
     // status vocabulary for the attestation probe (present | weakened | absent
@@ -989,7 +1005,16 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // leave a case where the file at the PATH other tooling would read is
   // unprotected while the KNOWN-good original silently isn't the one still
   // reachable there.
-  const fd = openSync(target, 'w', 0o600);
+  //
+  // openNoFollowSync (not a plain openSync) closes the remaining gap between
+  // the lstatSync guard above and this open call: on platforms with
+  // O_NOFOLLOW, the OPEN itself refuses to follow a symlink an attacker
+  // replanted at `target` in that window, instead of only detecting one
+  // after the fact via the identity recheck below (chatgpt-codex-connector
+  // PR7 #6Yawd4). Where O_NOFOLLOW is unavailable (some Windows builds
+  // report it as 0), the lstatSync guard above remains the primary defense,
+  // matching openNoFollow's own documented contract for its async callers.
+  const fd = openNoFollowSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600);
   try {
     const preInfo = fstatSync(fd);
     // fchmodSync's mode argument on open only applies when the OPEN call

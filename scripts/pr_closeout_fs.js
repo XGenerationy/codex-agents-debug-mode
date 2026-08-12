@@ -1,5 +1,5 @@
 const { execFile, execFileSync } = require('node:child_process');
-const { constants, existsSync } = require('node:fs');
+const { constants, existsSync, openSync } = require('node:fs');
 const { lstat, open } = require('node:fs/promises');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -101,6 +101,40 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
   for (let i = 0; i < attempts.length; i += 1) {
     try {
       return await open(target, attempts[i], mode);
+    } catch (error) {
+      lastError = error;
+      const canRetry = i < attempts.length - 1 && unsupported(error?.code);
+      if (!canRetry) throw error;
+    }
+  }
+  throw lastError;
+};
+
+/**
+ * Synchronous counterpart to openNoFollow, for callers (like the closeout
+ * action's support.js) that are fully sync throughout and cannot take on an
+ * async conversion just for this one open call. Identical flag-selection and
+ * unsupported-flag-recovery behavior — same openNoFollowFlagAttempts,
+ * fs.openSync in place of fs.promises.open. Returns a numeric file
+ * descriptor (not a FileHandle); callers are responsible for fs.closeSync.
+ * @param {string} target
+ * @param {number} [flags=constants.O_RDONLY]
+ * @param {number} [mode=0o666]
+ * @returns {number} file descriptor
+ */
+const openNoFollowSync = (target, flags = constants.O_RDONLY, mode = 0o666) => {
+  if (!Number.isInteger(flags)) {
+    throw new TypeError('openNoFollowSync requires numeric fs.constants flags.');
+  }
+  const noFollow = constants.O_NOFOLLOW || 0;
+  const nonBlock = constants.O_NONBLOCK || 0;
+  const attempts = openNoFollowFlagAttempts(flags, noFollow, nonBlock);
+  const unsupported = (code) => ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(code);
+
+  let lastError;
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      return openSync(target, attempts[i], mode);
     } catch (error) {
       lastError = error;
       const canRetry = i < attempts.length - 1 && unsupported(error?.code);
@@ -337,6 +371,7 @@ module.exports = {
   looksLikeWindowsRoot,
   openNoFollow,
   openNoFollowFlagAttempts,
+  openNoFollowSync,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,

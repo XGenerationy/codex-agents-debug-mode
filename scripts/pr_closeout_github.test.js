@@ -495,6 +495,44 @@ test('selfJobDisplayName excludes a matrixed/named job that GITHUB_JOB alone cou
   }
 });
 
+test('selfJobDisplayName === false disables self-exclusion entirely instead of falling back to GITHUB_JOB (chatgpt-codex-connector PR7 #6YbMwM)', () => {
+  // This job has NO name: override, so GITHUB_JOB ('gate') literally equals
+  // its own displayed check name — the exact scenario the finding describes.
+  // A sibling job independently ALSO displays as 'gate' (its own name:
+  // override) and has FAILED. Before this fix, resolveCurrentJobDisplayName
+  // detecting that collision returned null, classifyLivePrState fell back to
+  // `selfJobDisplayName || GITHUB_JOB || null` = 'gate', and the filter
+  // `check.name === 'gate'` matched and excluded BOTH checks — this job's own
+  // in-progress one AND the sibling's genuine failure — letting an otherwise
+  // clean PR wrongly reach PASS.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const result = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: false,
+    });
+    assert.equal(result.status, 'FAIL', 'the sibling FAILURE sharing this job\'s own name must stay visible, not be excluded alongside it');
+    assert.equal(result.checks.filter((c) => c.name === 'gate').length, 2,
+      'false must skip self-exclusion entirely — BOTH same-named checks remain in the rollup');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
 test('resolveCurrentJobDisplayName resolves the current job\'s true displayed name by matching RUNNER_NAME (CodeRabbit PR7 #6YXkRF)', async () => {
   // --slurp wraps every page into one outer array, even when there is only
   // one page (gh api --help: "wrap all pages ... into an outer JSON
@@ -565,15 +603,20 @@ test('resolveCurrentJobDisplayName refuses to guess when multiple non-completed 
   assert.equal(resolved, null, 'an ambiguous non-completed match is not trustworthy — best-effort null, not a guess');
 });
 
-test('resolveCurrentJobDisplayName refuses a name shared with a genuinely different sibling job (chatgpt-codex-connector PR7 #6Yap8W)', async () => {
+test('resolveCurrentJobDisplayName refuses a name shared with a genuinely different sibling job (chatgpt-codex-connector PR7 #6Yap8W / #6YbMwM)', async () => {
   // Two DIFFERENT jobs (different runner_name, so uniquely resolvable on
   // their own) happen to share the exact same displayed name. Returning
   // that name would make classifyLivePrState's name-based self-exclusion
   // ALSO exclude the sibling's own check entry, hiding a genuine sibling
   // failure. The collision is visible directly in this same Jobs API
-  // response (both entries have name: 'gate'), so it must resolve to null
-  // rather than an ambiguous name — even though the CURRENT job's OWN
-  // active-match resolution (by runner_name) is perfectly unambiguous.
+  // response (both entries have name: 'gate').
+  //
+  // Resolves to `false`, NOT `null` (#6YbMwM): `null` tells the caller to
+  // fall back to the legacy GITHUB_JOB matching, but that fallback is EQUALLY
+  // unsafe whenever this job has no `name:` override (GITHUB_JOB then equals
+  // the very 'gate' name just found ambiguous) — `false` instead tells the
+  // caller to skip self-exclusion entirely, which classifyLivePrState's own
+  // test below verifies.
   const runGh = async () => [{ jobs: [
     { name: 'gate', runner_name: 'this-runner', status: 'in_progress', conclusion: null },
     { name: 'gate', runner_name: 'other-runner', status: 'in_progress', conclusion: null },
@@ -583,7 +626,7 @@ test('resolveCurrentJobDisplayName refuses a name shared with a genuinely differ
     runGh,
     env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
   });
-  assert.equal(resolved, null, 'a name shared with a different job in this run must not be trusted for self-exclusion');
+  assert.equal(resolved, false, 'a name shared with a different job in this run must resolve to the no-exclusion sentinel, not null');
 });
 
 test('resolveCurrentJobDisplayName is best-effort: null on missing env, API failure, or no match (CodeRabbit PR7 #6YXkRF)', async () => {

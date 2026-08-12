@@ -55,69 +55,31 @@ const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*
 const SUSPICIOUS_USES = /(?:^\s*(?:-\s*)?(?:!\S*\s+|&\S+\s+)*|[{[][^}]*?|,\s*)((?:!\S*\s+|&\S+\s+)*['"]?uses['"]?\s*:)/g;
 const COMMENT_LINE = /^\s*#/;
 // Strip a trailing YAML comment (` #...` or `#...` at line start) from a line,
-// respecting single- and double-quoted scalars. YAML requires a `#` to be at
-// the start of a line OR preceded by whitespace to begin a comment, so
-// `key:value#foo` is NOT a comment. Quote tracking mirrors the SUSPICIOUS_USES
-// quote walker: backslash escapes inside double quotes, `''` inside single.
-// Without this, an apostrophe inside a comment (`# don't use {uses: ...}`)
-// confuses the quote-context walker and either suppresses a real violation or
-// flags comment text as a key — both wrong. The truncation happens before the
-// SUSPICIOUS_USES check; the anchored block/flow regexes above do not need it
-// because they require a key-position start.
+// respecting single- and double-quoted scalars — including one carried open
+// from a PREVIOUS physical line via `startState` (a `#` genuinely INSIDE an
+// open multiline quoted scalar is scalar content, not a comment-start, and
+// must not be treated as one just because this call assumed a fresh line;
+// CodeRabbit #6YbIQU / chatgpt-codex-connector PR7 #6YbKFc). YAML requires a
+// `#` to be at the start of a line OR preceded by whitespace to begin a
+// comment, so `key:value#foo` is NOT a comment.
 //
-// The quote walker below is position-aware (a bare `'`/`"` only OPENS a quoted
-// scalar at a genuine quote-open position — start-of-line, after `:`/`{`/`[`/
-// `,` or transitively after `-`/`?`), mirroring isInsideQuotedScalar below.
-// This function originally used a NAIVE walker where every quote char toggled
-// state unconditionally, so a PLAIN scalar's own embedded apostrophe (`don't`)
-// was wrongly treated as opening a single-quoted string — the walker then
-// thought it was still "inside a string" through the rest of the line,
-// including its `#`, so the real trailing comment was never recognized and
-// stripped. The unstripped comment text then reached the SUSPICIOUS_USES scan
-// and could be flagged as a fake `uses:` key — `name: don't # {uses: ...}` is
-// safe workflow YAML falsely rejected (chatgpt-codex-connector PR7 #6Yap8e).
-// isInsideQuotedScalar had already been fixed for exactly this class of bug
-// (CodeRabbit #6YSoOn / #6YW1O6); this function had its own separate,
-// unfixed copy of the same defect — now ported to match.
-const stripTrailingYamlComment = (text) => {
+// Delegates entirely to walkQuoteState's `stopAtComment` mode (CodeRabbit
+// #6YbIQS) instead of maintaining its own separate quote-tracking loop. This
+// function used to carry its OWN copy of the position-aware quote-open-
+// context walk, which had already drifted from isInsideQuotedScalar's copy
+// once and reintroduced a bug fixed there first (chatgpt-codex-connector PR7
+// #6Yap8e — a plain scalar's own embedded apostrophe, e.g. `don't`, was
+// wrongly treated as opening a string, hiding the real trailing comment and
+// letting comment text reach the SUSPICIOUS_USES scan as if it were a key;
+// originally fixed in isInsideQuotedScalar under CodeRabbit #6YSoOn/#6YW1O6).
+// A second, independently-maintained copy here can only drift the same way
+// again through a different door — sharing one walker (the same one
+// isInsideQuotedScalar uses) is the fix this file's own policy already
+// commits to after that incident.
+const stripTrailingYamlComment = (text, startState = { inDouble: false, inSingle: false }) => {
   const str = String(text);
-  let inDouble = false;
-  let inSingle = false;
-  let atQuoteOpenContext = true; // start-of-string is always a valid quote-open context
-  for (let i = 0; i < str.length; i += 1) {
-    const ch = str[i];
-    if (inDouble) {
-      if (ch === '\\') { i += 1; } // skip the escaped char
-      else if (ch === '"') { inDouble = false; atQuoteOpenContext = false; }
-      continue;
-    }
-    if (inSingle) {
-      if (ch === "'") {
-        if (str[i + 1] === "'") { i += 1; } // escaped '' — stay in string
-        else { inSingle = false; atQuoteOpenContext = false; }
-      }
-      continue;
-    }
-    if (ch === '#' && (i === 0 || /\s/.test(str[i - 1]))) {
-      return str.substring(0, i);
-    }
-    if (ch === '"' && atQuoteOpenContext) {
-      inDouble = true;
-    } else if (ch === "'" && atQuoteOpenContext) {
-      inSingle = true;
-    } else if (ch === ':') {
-      const next = str[i + 1];
-      atQuoteOpenContext = next === undefined || /\s/.test(next);
-    } else if (TRANSITIVE_QUOTE_OPEN_CONTEXT.has(ch)) {
-      // Same rule as isInsideQuotedScalar: preserve context only when this
-      // marker is followed by whitespace/EOL (chatgpt-codex-connector PR7 #6Yap8Z).
-      const next = str[i + 1];
-      atQuoteOpenContext = atQuoteOpenContext && (next === undefined || /\s/.test(next));
-    } else if (!/\s/.test(ch)) {
-      atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
-    }
-  }
-  return str;
+  const { commentIndex } = walkQuoteState(str, str.length, startState, true);
+  return commentIndex >= 0 ? str.substring(0, commentIndex) : str;
 };
 // True when the character at `matchIndex` in `text` sits inside a YAML quoted
 // scalar (single- or double-quoted). Used by the flow-boundary scanners
@@ -185,10 +147,23 @@ const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
 // per-line call passes `{inDouble: false, inSingle: false}`, matching the
 // original always-fresh behavior exactly (a quote can never be open at the
 // very start, so atQuoteOpenContext derives to `true`, same as before).
-const walkQuoteState = (str, endIndex, startState) => {
+//
+// `stopAtComment` (default false, CodeRabbit #6YbIQS): when true, the walk
+// stops at the first `#` that opens a real YAML comment (outside any quote,
+// at line-start or preceded by whitespace) and reports its index as
+// `commentIndex` instead of walking the comment text itself — comment
+// content must never influence quote state (a stray quote inside a comment
+// must not corrupt what carries to the next line) nor be scanned for keys.
+// The check runs AFTER the inDouble/inSingle branches' own `continue`s, so a
+// `#` that is genuinely INSIDE an open quote (including one carried over
+// from a previous line) is left alone as ordinary content, not mistaken for
+// a comment-start. isInsideQuotedScalar's positional lookups leave this
+// false: they want the state at one specific index, not early termination.
+const walkQuoteState = (str, endIndex, startState, stopAtComment = false) => {
   let inDouble = startState.inDouble;
   let inSingle = startState.inSingle;
   let atQuoteOpenContext = !inDouble && !inSingle;
+  let commentIndex = -1;
   for (let i = 0; i < endIndex; i += 1) {
     const ch = str[i];
     if (inDouble) {
@@ -202,6 +177,10 @@ const walkQuoteState = (str, endIndex, startState) => {
         else { inSingle = false; atQuoteOpenContext = false; }
       }
       continue;
+    }
+    if (stopAtComment && ch === '#' && (i === 0 || /\s/.test(str[i - 1]))) {
+      commentIndex = i;
+      break;
     }
     if (ch === '"' && atQuoteOpenContext) {
       inDouble = true;
@@ -224,7 +203,7 @@ const walkQuoteState = (str, endIndex, startState) => {
       atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
     }
   }
-  return { inDouble, inSingle };
+  return { inDouble, inSingle, commentIndex };
 };
 // True when the character at `matchIndex` sits inside a YAML quoted scalar.
 // `startState` (default: not in a quote) seeds a scalar carried over from a
@@ -463,19 +442,41 @@ const findUnpinnedUses = (content) => {
         return; // this line is body
       }
     }
-    // Comment lines never carry a YAML key.
-    if (COMMENT_LINE.test(text)) return;
     // Seed this line's quote-context walk with whatever the PREVIOUS line's
     // raw text left open (chatgpt-codex-connector PR7 #6YaZ5F), then
     // immediately compute this line's own end-of-line state for the NEXT
     // line — independent of which branch below this line ultimately takes,
     // since it depends only on this line's raw content and its own start
-    // state, not on how the rest of this callback processes it.
+    // state, not on how the rest of this callback processes it. `stopAtComment`
+    // (true) makes this walk itself comment-aware: a quote character INSIDE a
+    // real trailing comment no longer corrupts the carried state for the next
+    // line (CodeRabbit #6YbIQU / chatgpt-codex-connector PR7 #6YbKFc) — and
+    // because the in-quote branches run BEFORE the stopAtComment check, a `#`
+    // that is actually CONTENT of an already-open carried scalar (not a real
+    // comment) is walked through correctly instead of stopping the walk
+    // early, so this line's own closing quote is still found (chatgpt-codex-
+    // connector PR7 #6YbMwW).
     const lineStartQuoteState = quoteCarryover;
-    quoteCarryover = walkQuoteState(text, text.length, lineStartQuoteState);
+    quoteCarryover = walkQuoteState(text, text.length, lineStartQuoteState, true);
+    // Comment lines never carry a YAML key — but this only applies when the
+    // line did NOT begin inside a carried-open scalar: the state update above
+    // already handles a comment-shaped CONTINUATION of an open scalar
+    // (including finding its closing quote, if any) correctly, so early-
+    // returning unconditionally here (as before) would skip that update
+    // entirely and leave a since-closed scalar looking permanently open to
+    // every later line (chatgpt-codex-connector PR7 #6YbMwW).
+    if (!lineStartQuoteState.inDouble && !lineStartQuoteState.inSingle && COMMENT_LINE.test(text)) return;
     // A clean block-style uses: is parsed first — it is the one form whose ref
-    // we can extract and pin-check.
-    const match = USES_LINE.exec(text);
+    // we can extract and pin-check. Skipped entirely when the line begins
+    // inside a carried-open scalar (chatgpt-codex-connector PR7 #6YbMwS):
+    // such a line is STRING CONTENT of a multi-line scalar, not a real
+    // mapping key, even when its own text happens to look exactly like
+    // `uses: owner/action@main` — e.g. the middle line of
+    // `name: "foo\n  uses: owner/action@main\n  bar"` (js-yaml verified to
+    // resolve to one scalar value, not a real `uses` key).
+    const match = (lineStartQuoteState.inDouble || lineStartQuoteState.inSingle)
+      ? null
+      : USES_LINE.exec(text);
     if (match) {
       const ref = match[3];
       if (ref.startsWith('./')) return;
@@ -632,8 +633,11 @@ const findUnpinnedUses = (content) => {
     // `# don't use {uses: ...}` trailing comment is comment text, not a key,
     // and the apostrophe inside it would otherwise corrupt the quote-context
     // walker below (Codex #1659). Strip at the first `#` outside a quoted
-    // scalar so the walker sees only real YAML tokens.
-    const stripped = stripTrailingYamlComment(text);
+    // scalar so the walker sees only real YAML tokens. Seeded with
+    // lineStartQuoteState (CodeRabbit #6YbIQU) so a `#` that is genuinely
+    // CONTENT of a scalar carried open from a previous line is not mistaken
+    // for this line's own comment-start.
+    const stripped = stripTrailingYamlComment(text, lineStartQuoteState);
     // Iterate EVERY match, not just the first (`.exec` returns only the first).
     // A flow line can contain a quoted `uses:` (matched first, but inside a
     // string so discarded by the quote walker) followed by a real unquoted

@@ -623,6 +623,60 @@ test('runSubcommand reports admission-status FAIL for a weakened attestation (Co
     'a weakened attestation is an active negative finding, distinct from a merely-BLOCKED (not-yet-satisfied) probe');
 });
 
+test('runSubcommand reports admission-status BLOCKED, not PASS, when the plan record is missing probes (chatgpt-codex-connector PR7 #6YaxWb)', async () => {
+  // A truncated or malformed CLI report can carry `admission` with only SOME
+  // of the three required probe keys -- here cleanTree/preflight are absent
+  // entirely, not merely present-with-a-non-passing-status. Before this fix,
+  // the aggregation filtered absent/malformed probes OUT before reducing, so
+  // a single passing probe (attestation) made `every(probePasses)` vacuously
+  // true over a one-element array and published PASS even though two of the
+  // three admission checks never ran.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const outputFile = path.join(dir, 'output');
+  const plan = { planStatus: 'PASS', mode: 'strict', configDigest: 'd', errors: [], checks: [],
+    admission: { attestation: { status: 'present', evidence: 'ok' } } };
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify(plan)}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^admission-status=BLOCKED$/m,
+    'missing cleanTree/preflight probes must block the aggregate, not silently drop out of it');
+});
+
+test('runSubcommand reports admission-status BLOCKED when a probe entry is malformed (no string status)', async () => {
+  // Distinct from the fully-absent-key case above: here every key is
+  // PRESENT but one probe's value itself is malformed (missing `status`
+  // entirely). The prior `.filter(probe => probe && typeof probe.status ===
+  // 'string')` treated this identically to an absent key -- dropped, not
+  // counted -- which this fix also closes.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const outputFile = path.join(dir, 'output');
+  const plan = { planStatus: 'PASS', mode: 'strict', configDigest: 'd', errors: [], checks: [],
+    admission: {
+      attestation: { status: 'present', evidence: 'ok' },
+      cleanTree: { evidence: 'no status field' },
+      preflight: { status: 'PASS' },
+    } };
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: `${JSON.stringify(plan)}\n`, stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const outputs = readFs(outputFile, 'utf8');
+  assert.match(outputs, /^admission-status=BLOCKED$/m,
+    'a malformed probe entry (no string status) must block the aggregate, not be silently filtered out');
+});
+
 test('runSubcommand clears stale plan.json/report.json/report.md from a reused outputDir before a run that fails early (CodeRabbit #6YT0KA)', async () => {
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');

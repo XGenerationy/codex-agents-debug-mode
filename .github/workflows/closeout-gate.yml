@@ -28,10 +28,71 @@ on:
   # workflow_run trigger watching for "Closeout gate" completions, so the
   # gate's own run can never re-trigger itself through this path — there is
   # no retrigger loop to guard against here, by construction.
+  # KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6YaxWe,
+  # P1, investigated but left for an owner decision): a workflow_run-
+  # triggered run's own implicit GitHub Actions check-run is associated with
+  # GITHUB_SHA/github.sha for THIS run's trigger context -- which for
+  # workflow_run defaults to the latest commit on the DEFAULT branch, not the
+  # completed sibling's PR head -- regardless of what ref the checkout step
+  # below actually checks out. Checking out
+  # workflow_run.pull_requests[0].head.sha (the Yap8b fix) makes this run
+  # TEST the right code; it does not retarget which commit's status-check
+  # rollup the run's check-run appears under. Practical effect: even a fully
+  # internal PASS from this retry is invisible to `gh pr view
+  # --json statusCheckRollup` for the PR and to branch protection's required
+  # checks -- verified empirically against this repo's own Actions history
+  # (`gh api repos/.../actions/runs?event=workflow_run` returned zero runs
+  # ever, out of the last 100 runs across all trigger types, at the time this
+  # was written) rather than assumed from docs alone, though the SHA-
+  # association behavior itself is standard, widely-documented GitHub Actions
+  # semantics independent of that. The retry's Step Summary, evidence
+  # artifact, and (if enabled) PR comment still get written either way, since
+  # none of those depend on check-run/SHA association.
+  #
+  # A complete fix means explicitly calling the Checks API (`POST`/`PATCH
+  # /repos/{owner}/{repo}/check-runs` with `head_sha` set to the PR's real
+  # head) instead of relying on the implicit per-job check-run, which needs a
+  # new `checks: write` permission (a meaningfully bigger grant than this
+  # workflow's current all-read set) and a design decision on identity: does
+  # the new check-run replace the pull_request-triggered gate's own check (by
+  # matching `name`), or does it publish as a visibly distinct check that
+  # branch protection would need to additionally require? Left for the
+  # maintainer to choose rather than guessed at here.
   workflow_run:
     workflows: ["Validate", "Closeout preview"]
     types: [completed]
 
+# KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6YbMwY, P1,
+# investigated but left for an owner decision): none of the triggers above
+# fire from a PUSH to the BASE branch itself (e.g. another PR merging into
+# main) when this PR's own head and review state are unchanged. The gate's
+# admission attestation is base-OID-bound, so a PASS minted against the old
+# base can remain the PR's live, branch-protection-visible result even after
+# the real merge candidate (this head + the NEW base tip) was never verified.
+#
+# Verified this is a trigger-coverage gap, not a detection gap: the
+# admission check in scripts/pr_closeout_github.js (readLiveGateAttestation,
+# `pr.baseRefOid !== expectedBaseSha`) already compares the attestation's
+# recorded base SHA against a FRESH live read on every actual invocation and
+# correctly BLOCKs/FAILs a stale-base attestation with "admission
+# attestation is bound to the wrong snapshot" -- so the moment this gate
+# runs again for ANY reason, it self-corrects. The gap is purely that
+# nothing re-triggers it for a base-only push.
+#
+# A complete fix needs a genuinely new capability, not a narrow change: a
+# `push`-triggered path that DISCOVERS every open PR targeting the pushed
+# branch (there is no event payload naming them -- a `gh pr list --base
+# <branch> --state open`-shaped query, or the GraphQL search API, would be
+# needed) and re-triggers the gate for EACH one. That raises design
+# questions with real cost/security tradeoffs a maintainer should decide,
+# not infer: how to re-trigger per-PR (a new workflow_dispatch PR-number
+# input plus `actions: write` to fire it, vs. restructuring to classify all
+# affected PRs in one job), how to bound the cost of re-running the `full`
+# engine matrix once per open PR on every base push in a repo with many open
+# PRs, and -- since a re-run for a PR whose head was not this run's own
+# trigger context risks the SAME check-run/head-SHA-association problem
+# documented above for #6YaxWe -- how results get published back onto each
+# affected PR's own head SHA.
 permissions:
   contents: read
   pull-requests: read
@@ -144,6 +205,42 @@ jobs:
           # use the saved credential helper to push as the workflow token.
           persist-credentials: false
 
+      # KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6YaxWT,
+      # P1, investigated but left for an owner decision): `./actions/closeout`
+      # resolves action.yml + support.js from the working tree just checked
+      # out above -- which for pull_request-triggered runs IS the PR's own,
+      # potentially untrusted, commit. A PR that edits those files controls
+      # what this step executes, with whatever `github.token` this job holds.
+      #
+      # Two structural facts bound the actual blast radius today, verified
+      # against this repo's current state rather than assumed:
+      #   1. The permissions: block above is entirely READ-only (contents,
+      #      pull-requests, checks, statuses, actions) -- no write scope is
+      #      requested, so even fully hostile injected code cannot use this
+      #      token to push, comment, or modify anything. For fork PRs, GitHub
+      #      additionally hard-caps the token to read-only server-side
+      #      regardless of what a fork-supplied workflow file requests, which
+      #      is the actual threat model this trigger runs under.
+      #   2. Neither sibling workflow (validate.yml, closeout-preview.yml)
+      #      references any secret beyond the implicit GITHUB_TOKEN, and
+      #      neither uploads an artifact -- checked directly (`grep -n
+      #      'secrets\.' .github/workflows/*.yml`) rather than assumed, so
+      #      `actions: read` in a compromised run cannot currently reach any
+      #      OTHER workflow's secret or artifact in this repo. It can still
+      #      list/read this workflow's OWN past runs' evidence artifacts
+      #      (chatgpt-codex-connector's stated concern) via the Actions API.
+      #
+      # A COMPLETE fix means never executing PR-controlled code with any live
+      # token -- e.g. referencing this action by a pinned, trusted remote ref
+      # (owner/repo/actions/closeout@<sha-on-the-base-branch>) instead of the
+      # local `./actions/closeout` path, or splitting into a trusted outer
+      # workflow plus an isolated, tokenless inner job with an artifact-based
+      # handoff. Either one is a genuine trust-model tradeoff: pinning to a
+      # base-branch ref means a PR that is ITSELF changing this action (like
+      # the PR that introduced this comment) can no longer gate itself with
+      # its own in-flight changes until merged, which is a deliberate
+      # decision about how this repo bootstraps its own gating action, not a
+      # narrow code fix -- left for the maintainer to choose.
       - name: Closeout gate
         uses: ./actions/closeout
         with:
