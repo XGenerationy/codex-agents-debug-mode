@@ -102,6 +102,30 @@ test('describeError normalizes a non-Error throw instead of yielding undefined',
   assert.notEqual(describeError({ code: 'ENOENT' }), 'undefined');
 });
 
+test('describeError never throws on a non-serializable thrown value (CodeRabbit PR7 #6Ys0fU)', () => {
+  // Every caller is on a "report the failure, never raise" path, so a throw
+  // here would turn a described skipped result back into a rejected promise
+  // and abort a whole multi-PR batch.
+  const circular = { code: 'ELOOP' };
+  circular.self = circular;
+  const throwingToJson = { toJSON() { throw new Error('nope'); } };
+  const throwingToString = { toString() { throw new Error('nope'); }, toJSON() { throw new Error('nope'); } };
+  for (const value of [circular, 1n, Symbol('boom'), throwingToJson, throwingToString]) {
+    let described;
+    assert.doesNotThrow(() => { described = describeError(value); }, `describeError must not throw for ${String(typeof value)}`);
+    assert.equal(typeof described, 'string');
+  }
+});
+
+test('forwardGateRetry still returns a skipped result when the thrown value is non-serializable (CodeRabbit PR7 #6Ys0fU)', async () => {
+  const circular = { code: 'ELOOP' };
+  circular.self = circular;
+  const runGh = async () => { throw circular; };
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped', 'a non-serializable throw must not reject out of forwardGateRetry');
+  assert.match(result.reason, /Could not list Actions runs:/);
+});
+
 test('findMostRecentGateRun returns null when no run matches the workflow path', async () => {
   const runGh = async () => ({ workflow_runs: [{ id: 1, path: '.github/workflows/validate.yml', status: 'completed', conclusion: 'success' }] });
   assert.equal(await findMostRecentGateRun({ repository: 'owner/repo', headSha: 'abc', runGh, repo: 'C:/repo' }), null);

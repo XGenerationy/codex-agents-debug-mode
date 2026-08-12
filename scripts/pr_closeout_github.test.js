@@ -1856,7 +1856,11 @@ test('buildGhArgs pr view rejects a non-decimal workflow_dispatch pr-number (Cod
     // A workflow_dispatch input is free-typed text. Bare Number() would
     // resolve each of these to a DIFFERENT PR than the operator named, so a
     // malformed value must fail closed to no resolvable number instead.
-    for (const bogus of ['1e2', '0x2a', ' 7 ', '7.0', '-7', '+7', '7abc', 'abc', '9007199254740993']) {
+    // '0' is digit-only, so it passes the /^\d+$/ shape check and is rejected
+    // only by the `> 0` guard — including it here pins that guard, which a
+    // regex-only regression would otherwise silently drop (CodeRabbit PR7
+    // #6Ys0fO). PR numbers start at 1.
+    for (const bogus of ['0', '00', '1e2', '0x2a', ' 7 ', '7.0', '-7', '+7', '7abc', 'abc', '9007199254740993']) {
       writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': bogus } }));
       process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
       const args = ['pr', 'view', '--json', 'number'];

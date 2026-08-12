@@ -17,14 +17,32 @@ const { redactSecrets } = require('./pr_closeout_process');
  * Also normalizes a non-Error throw (a rejected string, a thrown object) to
  * a useful string instead of `undefined`, which is what reading `.message`
  * off a non-Error would otherwise produce.
+ *
+ * This function must NEVER throw, because every caller is on a path whose
+ * whole contract is "report the failure, do not raise" — a throw here would
+ * turn a described `skipped` result back into a rejected promise and abort a
+ * multi-PR batch (CodeRabbit PR7 #6Ys0fU). Both remaining hazards are handled
+ * explicitly: `JSON.stringify` throws on a circular object, and `String()`
+ * throws on a Symbol while `JSON.stringify` returns undefined for a BigInt.
+ * Each falls back to a fixed, non-informative label rather than propagating.
  * @param {unknown} error
  * @returns {string}
  */
 const describeError = (error) => {
-  const message = error instanceof Error
-    ? error.message
-    : (typeof error === 'string' ? error : JSON.stringify(error) ?? String(error));
-  return redactSecrets(String(message ?? ''));
+  let message;
+  try {
+    if (error instanceof Error) message = error.message;
+    else if (typeof error === 'string') message = error;
+    else message = JSON.stringify(error) ?? String(error);
+  } catch {
+    // Circular structure, a BigInt, a Symbol, or a throwing toString/toJSON.
+    message = '(unserializable error value)';
+  }
+  try {
+    return redactSecrets(String(message ?? ''));
+  } catch {
+    return '(unserializable error value)';
+  }
 };
 
 // The gate workflow's own file PATH, not its displayed name — matching by
