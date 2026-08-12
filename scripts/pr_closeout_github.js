@@ -362,20 +362,40 @@ const classifyLivePrState = ({
   gateAttestation,
   selfJobDisplayName,
 } = {}) => {
-  // Exclude only the CURRENTLY-RUNNING gate JOB from the rollup classification
-  // (CodeRabbit #6X_pwH, refined by #6YSx9w): at the moment the gate classifies
+  // Exclude the gate JOB's OWN checks from the rollup classification
+  // (CodeRabbit #6X_pwH, refined by #6YSx9w and — for retries — by
+  // chatgpt-codex-connector PR7 #6YaIaU): at the moment the gate classifies
   // live state, its own check is IN_PROGRESS and cannot see its own result, so
   // counting it would always block PASS. The exclusion is scoped to the SINGLE
   // current job — NOT the whole workflow. Earlier versions matched on
   // workflowName alone, which incorrectly excluded sibling jobs in the same
   // workflow (e.g. a preview job) and could let the gate PASS before a sibling
-  // finished (#6YSx9w). Now the match requires BOTH:
+  // finished (#6YSx9w). The match requires BOTH:
   //   - workflowName === GITHUB_WORKFLOW (this workflow)
   //   - check.name === the current job's DISPLAYED name
-  // Only a non-COMPLETED check matching BOTH is omitted. Prior COMPLETED runs
-  // at the same head are still classified (a prior FAILURE keeps blocking), and
-  // a sibling job's check is never excluded. Opt-in via both env vars; local/CI
-  // invocations without them classify all checks as before (backward-compatible).
+  // A sibling job's check (different name) is never excluded, still matching
+  // #6YSx9w.
+  //
+  // ALL checks matching both — completed or not — are now excluded, not only
+  // the currently-in-progress one. #6X_pwH/#6YSx9w originally kept a prior
+  // COMPLETED run of this same job classified ("a prior FAILURE keeps
+  // blocking"), written before the workflow_run retry trigger existed
+  // (#6YW9UP): back then, every gate invocation was triggered by a
+  // meaningfully new PR/review event, so a leftover FAILURE from an earlier
+  // run at the same head was a plausible still-relevant signal. The retry
+  // trigger broke that assumption — it exists specifically to re-run the
+  // gate after a run that correctly BLOCKED on a still-pending sibling check
+  // (an entirely routine, non-error outcome, but one GitHub Actions can only
+  // record as a job "failure" conclusion, since jobs have no native
+  // "blocked" state). Keeping that stale FAILURE classified would make the
+  // retry re-derive FAIL from its own earlier blocked attempt on every
+  // re-run, forever, for the one scenario the retry exists to recover from.
+  // This is safe to remove: every OTHER failure/blocker signal below
+  // (mergeability, review decision, unresolved threads, gate attestation,
+  // and every check that is NOT this job) is independently re-derived from
+  // LIVE state on each call — nothing here depends on trusting a past
+  // verdict from this same job, so a stale self check-run is redundant
+  // information, not additional protection.
   //
   // `check.name` is the check's DISPLAYED name, which is NOT always
   // `GITHUB_JOB` (the YAML job id): a consumer that gives the job a `name:`
@@ -394,7 +414,6 @@ const classifyLivePrState = ({
     const filtered = checks.filter((check) => !(
       check.workflowName === selfWorkflowName
       && check.name === selfJobName
-      && check.status !== 'COMPLETED'
     ));
     checks.length = 0;
     checks.push(...filtered);
@@ -802,6 +821,20 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     const repositoryResult = await runGh(['repo', 'view', '--json', 'nameWithOwner'], { repo });
     const repository = repositoryResult.nameWithOwner;
     if (!repository || !repository.includes('/')) throw new Error('GitHub repository identity was not returned.');
+    // Resolved here, BEFORE any PR/review/thread snapshot is taken — not
+    // right before the final classifyLivePrState call (chatgpt-codex-
+    // connector PR7 #6YaIas). This call has its own network latency (up to
+    // the gh timeout) and depends only on `repository`, not on any PR
+    // state, so placing it before every stability-tuple round below means
+    // its latency is already covered by the SAME re-verification chain that
+    // protects every other network round-trip in this function — a PR/
+    // review/thread/check change during this call is caught exactly like a
+    // change during the thread walk or any other read. Placed after it
+    // (the original position, right before classifyLivePrState), its
+    // latency opened the one window in this function with NO subsequent
+    // stability recheck: `postThreadPr` could go stale while this call was
+    // in flight and still be classified as current.
+    const selfJobDisplayName = await resolveCurrentJobDisplayName({ repository, runGh, repo });
     const pr = await runGh([
       'pr',
       'view',
@@ -990,13 +1023,10 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: postThreadGateSnapshot.attestation,
       };
     }
-    // Best-effort: resolves to null (falling back to GITHUB_JOB inside
-    // classifyLivePrState, the exact prior behavior) on any failure — see
-    // resolveCurrentJobDisplayName. Deliberately resolved last, right before
-    // the single classifyLivePrState call site, so it never participates in
-    // the stability-tuple checks above (it is not part of the live PR/review
-    // state those checks protect).
-    const selfJobDisplayName = await resolveCurrentJobDisplayName({ repository, runGh, repo });
+    // selfJobDisplayName was resolved near the top of this function (see the
+    // comment there) — best-effort: resolves to null (falling back to
+    // GITHUB_JOB inside classifyLivePrState, the exact prior behavior) on
+    // any failure.
     return classifyLivePrState({
       repository,
       pr: postThreadPr,

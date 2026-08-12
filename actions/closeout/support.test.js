@@ -628,7 +628,11 @@ test('runSubcommand clears stale plan.json/report.json/report.md from a reused o
   const outputDir = path.join(dir, 'evidence');
   mkdirSync(outputDir, { recursive: true });
   // Evidence left behind by a PRIOR successful invocation of this same
-  // (reused) output-dir.
+  // (reused) output-dir. action-state.json with this action's own
+  // authenticated shape is the ownership marker (chatgpt-codex-connector
+  // PR7 #6YaIal) proving this directory has genuinely hosted this action
+  // before, so the cleanup below is expected to run.
+  writeFs(path.join(outputDir, 'action-state.json'), `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
   writeFs(path.join(outputDir, 'plan.json'), '{"planStatus":"PASS","stale":true}\n');
   writeFs(path.join(outputDir, 'report.json'), '{"overallStatus":"PASS","stale":true}\n');
   writeFs(path.join(outputDir, 'report.md'), '# stale prior report\n');
@@ -730,6 +734,11 @@ test('runSubcommand leaves outputDir/logs alone when only a generic, unauthentic
   assert.equal(existsSync(logsDir), true, 'a generic plan.json/report.json alone is not an authenticated ownership marker');
   assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
     'unrelated content inside it must survive untouched');
+  // The file-deletion loop is gated on the same authenticated marker
+  // (chatgpt-codex-connector PR7 #6YaIal) — an unrelated tool's own
+  // plan.json/report.json must survive, not just outputDir/logs.
+  assert.equal(existsSync(path.join(outputDir, 'plan.json')), true, 'an unauthenticated plan.json must not be deleted');
+  assert.equal(existsSync(path.join(outputDir, 'report.json')), true, 'an unauthenticated report.json must not be deleted');
 });
 test('runSubcommand leaves outputDir/logs alone when action-state.json exists but does not match this action\'s own shape (chatgpt-codex-connector PR7 #6YZpcz)', async () => {
   // An unrelated tool could coincidentally also name a file
@@ -1129,16 +1138,32 @@ test('finishSubcommand trusts a state record whose nonce matches this job\'s own
   assert.equal(finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }), 2);
 });
 
-test('finishSubcommand skips the nonce check when either side lacks one (backward compatible)', () => {
+test('finishSubcommand rejects a state record with no nonce when this job has its own (chatgpt-codex-connector PR7 #6YaIao)', () => {
+  // "run" exports its nonce to GITHUB_ENV as its very first action, before
+  // assertOutputOutsideWorkspace or input validation — so if either then
+  // rejects the invocation and throws, THIS run never overwrites
+  // action-state.json at all. A pre-existing (or, for an inside-workspace
+  // output-dir, attacker-plantable) record with NO nonce field must not be
+  // trusted just because it happens to claim success — that was the exact
+  // gap: a genuinely-rejected invocation could read as green.
   const dir = makeTempDir();
-  // No nonce on the state record (e.g. an older run, or GITHUB_ENV was
-  // unavailable when it was written): the check does not apply.
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
-  assert.equal(finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }), 0);
-  // No nonce in this job's own env (GITHUB_ENV unavailable): the check does
-  // not apply either — this only tightens behavior in real GH Actions jobs,
-  // where GITHUB_ENV is always present.
+  assert.equal(
+    finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }),
+    3,
+    'a state record with no nonce at all must not be trusted when this job has its own nonce',
+  );
+});
+
+test('finishSubcommand skips the nonce check only when THIS job itself lacks a nonce (backward compatible)', () => {
+  const dir = makeTempDir();
+  // No nonce in this job's own env (GITHUB_ENV unavailable, e.g. a local or
+  // pre-nonce-feature invocation): the check does not apply — this only
+  // tightens behavior in real GH Actions jobs, where GITHUB_ENV is always
+  // present and "run" always exports a nonce as its first action.
   writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'x' }));
+  assert.equal(finishSubcommand({ outputDir: dir, env: {} }), 0);
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
   assert.equal(finishSubcommand({ outputDir: dir, env: {} }), 0);
 });
 
@@ -1275,6 +1300,24 @@ test('commentSubcommand rejects a state record left by a different invocation (c
     runGh: async () => { throw new Error('must not be called — the mismatched state must never reach the API'); },
   });
   assert.equal(code, 3, 'a state record with a mismatched nonce must not be commented with, even in PR context');
+});
+
+test('commentSubcommand rejects a state record with no nonce when this job has its own (chatgpt-codex-connector PR7 #6YaIao)', async () => {
+  // Mirrors the same finishSubcommand fix: a pre-existing (or, for an
+  // inside-workspace output-dir, attacker-plantable) record with no nonce
+  // field at all must not be trusted just because it claims a tier/summary,
+  // since "run" never got to overwrite it with this job's own state.
+  const dir = makeTempDir();
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    tier: 'plan', artifactName: 'ev', renderedSummary: 'stale summary', decision: { success: true, exitCode: 0 },
+  }));
+  const code = await commentSubcommand({
+    outputDir: dir,
+    env: { GITHUB_REPOSITORY: 'o/r', CLOSEOUT_INVOCATION_NONCE: 'job-own-nonce' },
+    event: { pull_request: { number: 3 } },
+    runGh: async () => { throw new Error('must not be called — the nonce-less state must never reach the API'); },
+  });
+  assert.equal(code, 3, 'a state record with no nonce at all must not be commented with when this job has its own nonce');
 });
 
 test('full tier with lost stdout fails closed and still renders a summary', async () => {

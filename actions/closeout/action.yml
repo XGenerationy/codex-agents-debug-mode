@@ -72,17 +72,23 @@ runs:
     - name: Upload evidence artifact
       # runSubcommand ('run') always returns exit 0 for a legitimate gate
       # verdict, even BLOCKED/FAIL — the job's own pass/fail is decided later,
-      # by "Apply gate verdict". The "gate" step only fails (outcome: failure)
-      # when run() THREW: an invalid output-dir (e.g. inside the workspace,
-      # rejected by assertOutputOutsideWorkspace before anything is written),
-      # bad inputs, or another validation error. In exactly that case,
-      # `inputs.output-dir` may resolve to a path the gate refused to write
-      # to at all — e.g. the repository workspace itself — so uploading it
-      # unconditionally would publish the checkout (and any secrets a prior
-      # step left there) as if it were evidence. Skip the upload when the
-      # gate step threw; on every legitimate verdict (including BLOCKED/FAIL)
-      # it still runs via always() (CodeRabbit #6YT0J3).
-      if: ${{ always() && steps.gate.outcome != 'failure' }}
+      # by "Apply gate verdict". The "gate" step's outcome is 'success' for
+      # EVERY legitimate verdict path (BLOCKED/FAIL/PASS all exit 0), and
+      # anything else means run() never validated inputs.output-dir at all:
+      # 'failure' means run() THREW (an invalid output-dir — e.g. inside the
+      # workspace, rejected by assertOutputOutsideWorkspace before anything
+      # is written — bad inputs, or another validation error); 'skipped'
+      # means an EARLIER step (e.g. Set up Node.js) failed, so "Run closeout
+      # gate" never executed at all (chatgpt-codex-connector PR7 #6YaIav) —
+      # `steps.gate.outcome != 'failure'` alone left this case uncaught,
+      # since 'skipped' != 'failure' too. In either non-success case,
+      # `inputs.output-dir` may resolve to a path never checked against the
+      # workspace — e.g. the repository root — so uploading it would publish
+      # the checkout (and any secrets a prior step left there) as if it were
+      # evidence. Require the gate step to have actually run and exited 0;
+      # on every legitimate verdict (including BLOCKED/FAIL) it still runs
+      # via always() (CodeRabbit #6YT0J3).
+      if: ${{ always() && steps.gate.outcome == 'success' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}

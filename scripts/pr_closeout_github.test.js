@@ -329,18 +329,29 @@ test('classifies failed checks as FAIL and skipped checks as BLOCKED', () => {
   assert.match(pending.evidence, /unresolved review thread/i);
 });
 
-test('excludes only the currently-running self-workflow check from the rollup (CodeRabbit #6X_pwH)', () => {
+test('excludes every self-workflow check from the rollup, including a prior completed run (CodeRabbit #6X_pwH, broadened by chatgpt-codex-connector PR7 #6YaIaU)', () => {
   // At the moment classifyLivePrState runs INSIDE the Closeout gate job, its
   // own check is IN_PROGRESS and cannot see its own result. The exclusion omits
-  // ONLY the current job's non-COMPLETED check (workflowName AND name AND
-  // !COMPLETED); prior COMPLETED runs and SIBLING jobs in the same workflow are
-  // STILL classified (#6X_pwH refined by #6YSx9w).
+  // EVERY check matching (workflowName AND name) — not only the currently
+  // non-COMPLETED one; SIBLING jobs in the same workflow are still classified
+  // (#6X_pwH refined by #6YSx9w).
+  //
+  // #6X_pwH originally kept a prior COMPLETED run of this same job classified
+  // (a stale FAILURE "kept blocking"), written before the workflow_run retry
+  // trigger existed (#6YW9UP). That trigger specifically re-runs the gate
+  // after a run that correctly BLOCKED on a still-pending sibling check (an
+  // entirely routine outcome that GitHub Actions can only record as a job
+  // "failure" conclusion). Keeping that stale entry classified would make
+  // every retry re-derive FAIL from its own earlier blocked attempt forever —
+  // defeating the one scenario the retry exists to recover from — so a prior
+  // completed run of THIS SAME job is now excluded too (#6YaIaU).
   const savedWorkflow = process.env.GITHUB_WORKFLOW;
   const savedJob = process.env.GITHUB_JOB;
   try {
     process.env.GITHUB_WORKFLOW = 'Closeout gate';
     process.env.GITHUB_JOB = 'gate';
-    // Running self (IN_PROGRESS) + prior self FAILURE + legitimate external CI.
+    // Running self (IN_PROGRESS) + a prior self FAILURE from an earlier
+    // BLOCKED attempt at this same head + legitimate external CI.
     const priorFailure = classifyLivePrState({
       repository: 'owner/repo',
       pr: {
@@ -356,13 +367,17 @@ test('excludes only the currently-running self-workflow check from the rollup (C
       expectedBaseSha: 'base123',
       gateAttestation: cleanAttestation(),
     });
-    // The prior gate FAILURE still classifies as FAIL — the targeted exclusion
-    // does NOT mask it. Only the IN_PROGRESS instance is omitted.
-    assert.equal(priorFailure.status, 'FAIL', 'a prior FAILED self-workflow run still FAILS (not masked)');
-    assert.match(priorFailure.evidence, /Check gate concluded FAILURE/, 'the prior FAILURE evidence is preserved');
-    const priorGateChecks = priorFailure.checks.filter((c) => c.workflowName === 'Closeout gate');
-    assert.equal(priorGateChecks.length, 1, 'only the prior COMPLETED gate check remains (IN_PROGRESS instance omitted)');
-    assert.equal(priorGateChecks[0].status, 'COMPLETED', 'the remaining gate check is the prior COMPLETED one');
+    // Neither self instance blocks a retry from reaching PASS on its own
+    // merits — every other signal (mergeability, review decision, unresolved
+    // threads, gate attestation, and this legitimate external CI check) is
+    // independently re-derived from live state and still fully classified.
+    assert.equal(priorFailure.status, 'PASS', 'a prior FAILED self-workflow run at this head no longer sticks — a retry can recover');
+    assert.equal(
+      priorFailure.checks.filter((c) => c.workflowName === 'Closeout gate').length,
+      0,
+      'both the IN_PROGRESS and the prior COMPLETED self-workflow checks are omitted',
+    );
+    assert.equal(priorFailure.checks.filter((c) => c.name === 'ci').length, 1, 'a genuinely unrelated check is still classified');
 
     // Now verify the pure running-self case (no prior failure): PASS is reachable.
     const clean = classifyLivePrState({
@@ -799,14 +814,17 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
       ],
     };
     let jobsApiCalled = false;
+    const callOrder = [];
     const runGh = async (args) => {
-      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
-      if (args[0] === 'pr') return matrixedPr;
+      if (args[0] === 'repo') { callOrder.push('repo'); return { nameWithOwner: 'owner/repo' }; }
+      if (args[0] === 'pr') { callOrder.push('pr'); return matrixedPr; }
       if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
         jobsApiCalled = true;
+        callOrder.push('jobs');
         return [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] }];
       }
-      if (args.includes('--paginate')) return [[approvedReview()]];
+      if (args.includes('--paginate')) { callOrder.push('reviews'); return [[approvedReview()]]; }
+      callOrder.push('threads');
       return {
         data: { repository: { pullRequest: { reviewThreads: {
           nodes: [],
@@ -823,6 +841,15 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
     });
     assert.equal(jobsApiCalled, true, 'the Jobs API must actually be queried');
     assert.equal(result.status, 'PASS', 'the resolved true displayed name lets the matrixed self-check be excluded, reaching PASS');
+    // chatgpt-codex-connector PR7 #6YaIas: the Jobs API call must happen
+    // BEFORE any PR snapshot is taken, so its own latency is covered by the
+    // SAME stability-tuple re-verification chain that protects every other
+    // network round-trip in readLivePrState — not after the terminal
+    // snapshot sequence, where a change during this call would never be
+    // rechecked.
+    assert.equal(callOrder[0], 'repo', 'repo identity is resolved first');
+    assert.equal(callOrder[1], 'jobs', 'the Jobs API is queried before any PR snapshot is taken');
+    assert.ok(callOrder.slice(2).includes('pr'), 'a PR snapshot is still taken afterward');
   } finally {
     if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
     else process.env.GITHUB_WORKFLOW = savedWorkflow;

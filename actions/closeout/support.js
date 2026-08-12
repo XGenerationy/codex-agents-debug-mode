@@ -620,10 +620,7 @@ const runSubcommand = async ({
   // itself, unlike plan.json/report.json/report.md), with a shape no other
   // tool would coincidentally produce. Require it to both exist AND parse
   // as that authenticated shape (a known `tier` value plus a `nonce`
-  // string) before trusting this directory as this action's own. The
-  // file-loop cleanup below is unchanged (previously reviewed under
-  // #6YT0KA) — this snapshot only gates the higher-risk directory-wide
-  // logs/ purge further down.
+  // string) before trusting this directory as this action's own.
   const hadPriorEvidence = (() => {
     let state;
     try {
@@ -634,11 +631,23 @@ const runSubcommand = async ({
     }
     return Boolean(state) && typeof state === 'object' && RUN_VALUES.has(state.tier) && typeof state.nonce === 'string' && state.nonce !== '';
   })();
-  for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
-    try {
-      unlinkSync(path.join(outputDir, staleName));
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
+  // The file-loop cleanup itself is now ALSO gated on hadPriorEvidence
+  // (chatgpt-codex-connector PR7 #6YaIal): it previously ran unconditionally
+  // — the round-9 ownership-marker fix (#6YYcNT) only gated the logs/ purge
+  // below, leaving the SAME "unrelated tool's same-named file gets deleted"
+  // risk this snapshot exists to rule out. Every scenario the loop was
+  // originally built for (CodeRabbit #6YT0KA: a REUSED output-dir where a
+  // prior invocation of THIS action left stale plan.json/report.json/
+  // report.md) already implies a genuine prior action-state.json, so
+  // gating here does not narrow that case at all — it only stops deleting
+  // when there is no real evidence this directory is this action's own.
+  if (hadPriorEvidence) {
+    for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
+      try {
+        unlinkSync(path.join(outputDir, staleName));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
     }
   }
   // The gate CLI's full tier also populates outputDir/logs (a DIRECTORY of
@@ -1021,12 +1030,22 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
   // (CodeRabbit #6YW9UL): a shared output-dir can be overwritten by a
   // different (e.g. plan-tier) invocation between this job's "run" and
   // "finish" steps. GITHUB_ENV persists CLOSEOUT_INVOCATION_NONCE within this
-  // job only, so only check when both this job's own nonce and a nonce on
-  // the state record are present — a mismatch means the record was replaced
-  // by a foreign invocation and must not be trusted, regardless of what it
-  // claims.
-  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
-    process.stderr.write('closeout-action: recorded state belongs to a different invocation (output-dir was overwritten by a concurrent run); refusing to trust it.\n');
+  // job only, so only check when this job has its own nonce — but a MISSING
+  // nonce on the state record is now rejected too, not just a mismatched one
+  // (chatgpt-codex-connector PR7 #6YaIao): "run" exports its nonce to
+  // GITHUB_ENV as its very first action, before assertOutputOutsideWorkspace
+  // or input validation, so if either of those then rejects the invocation
+  // and throws, THIS run never reaches its own writeEvidenceFile(STATE_FILE)
+  // call — action-state.json is left exactly as it was found. A pre-existing
+  // (or, for an inside-workspace output-dir, attacker-plantable) state
+  // record with no nonce field — e.g. one committed to the repository at the
+  // exact path an attacker points output-dir to — would previously bypass
+  // this check entirely (the `state.nonce &&` short-circuited to false) and
+  // could carry a fabricated `decision.success: true`, turning a genuinely
+  // rejected invocation green. A state record is now trusted only when it
+  // carries a nonce that EXACTLY matches this job's own.
+  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
+    process.stderr.write('closeout-action: recorded state does not carry this invocation\'s nonce (output-dir was overwritten by a concurrent run, or never written by this run at all); refusing to trust it.\n');
     return 3;
   }
   process.stdout.write(`closeout-action: ${redactSecrets(state.decision.reason)}\n`);
@@ -1062,15 +1081,17 @@ const commentSubcommand = async ({ outputDir, env = process.env, event = null, r
     process.stderr.write('closeout-action: no recorded state; skipping comment.\n');
     return 0;
   }
-  // Same nonce check finishSubcommand already applies (CodeRabbit #6YW9UL):
-  // a shared output-dir can be overwritten by a different (e.g. plan-tier)
-  // invocation between this job's "run" and "comment" steps. Without this
+  // Same nonce check finishSubcommand applies, including the missing-nonce
+  // case (CodeRabbit #6YW9UL, chatgpt-codex-connector PR7 #6YaIao): a shared
+  // output-dir can be overwritten by a different (e.g. plan-tier) invocation
+  // between this job's "run" and "comment" steps, or contain a pre-existing
+  // record this run's own "run" step never got to overwrite. Without this
   // check here too, the comment step would upsert the PR comment with the
-  // FOREIGN invocation's tier/status/artifact pointer — an externally
-  // visible side effect that finishSubcommand's own later nonce check
-  // cannot undo after the fact (chatgpt-codex-connector PR7 #6YZpc6).
-  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
-    process.stderr.write('closeout-action: recorded state belongs to a different invocation (output-dir was overwritten by a concurrent run); refusing to comment with it.\n');
+  // FOREIGN or stale invocation's tier/status/artifact pointer — an
+  // externally visible side effect that finishSubcommand's own later nonce
+  // check cannot undo after the fact (chatgpt-codex-connector PR7 #6YZpc6).
+  if (env.CLOSEOUT_INVOCATION_NONCE && state.nonce !== env.CLOSEOUT_INVOCATION_NONCE) {
+    process.stderr.write('closeout-action: recorded state does not carry this invocation\'s nonce (output-dir was overwritten by a concurrent run, or never written by this run at all); refusing to comment with it.\n');
     return 3;
   }
   const eventPayload = event ?? readEventPayload(env);
