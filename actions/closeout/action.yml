@@ -84,14 +84,27 @@ runs:
     - name: Run closeout gate
       id: gate
       shell: bash
-      # No GH_TOKEN here by design (chatgpt-codex-connector PR7 #6Yd4Qv): this
-      # step spawns the untrusted plan-preflight probe, so it must never carry
-      # the workflow token in its exec-time environment. It receives the token
-      # off-environment via CLOSEOUT_GH_TOKEN_FILE (exported to GITHUB_ENV by
-      # "Stage workflow token" above), which the gate CLI reads only to feed the
-      # `gh` leaf and revokes before the probe. Re-adding GH_TOKEN to this
-      # step's env would reopen the procfs ancestor-read hole this split closes.
+      # No workflow token here by design (chatgpt-codex-connector PR7
+      # #6Yd4Qv): this step spawns the untrusted plan-preflight probe, so it
+      # must never carry the token in its exec-time environment. It receives
+      # the token off-environment via CLOSEOUT_GH_TOKEN_FILE (exported to
+      # GITHUB_ENV by "Stage workflow token" above), which the gate CLI reads
+      # only to feed the `gh` leaf and revokes before the probe.
+      #
+      # GH_TOKEN/GITHUB_TOKEN are set to the EMPTY STRING rather than merely
+      # omitted (CodeRabbit PR7 #6YrX05): a composite action's steps inherit
+      # the consuming workflow's workflow-level and job-level `env:`, so
+      # omission alone does not clear a token a caller set at either scope —
+      # it would flow straight into this step and back into the probe's
+      # ancestor environ, silently reopening the hole this split closes.
+      # Assigning empty overrides any inherited value. acquireDelegatedGhToken
+      # treats an empty GH_TOKEN as absent (falsy), so delegation still
+      # engages normally. Consumers must still not place EQUIVALENT
+      # credentials (a PAT under another name) at workflow or job scope — this
+      # action can only clear the two names it knows; see the README.
       env:
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
         CLOSEOUT_RUN: ${{ inputs.run }}
         CLOSEOUT_MODE: ${{ inputs.mode }}
         CLOSEOUT_BASE_REF: ${{ inputs.base-ref }}

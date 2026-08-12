@@ -1843,6 +1843,34 @@ test('buildGhArgs pr view falls back to a workflow_dispatch pr-number input (cha
   }
 });
 
+test('buildGhArgs pr view rejects a non-decimal workflow_dispatch pr-number (CodeRabbit PR7 #6YqAg0)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-strict-'));
+  try {
+    // A workflow_dispatch input is free-typed text. Bare Number() would
+    // resolve each of these to a DIFFERENT PR than the operator named, so a
+    // malformed value must fail closed to no resolvable number instead.
+    for (const bogus of ['1e2', '0x2a', ' 7 ', '7.0', '-7', '+7', '7abc', 'abc', '9007199254740993']) {
+      writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': bogus } }));
+      process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+      const args = ['pr', 'view', '--json', 'number'];
+      assert.deepStrictEqual(buildGhArgs(args), args, `pr-number ${JSON.stringify(bogus)} must not resolve to a PR`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
 test('buildGhArgs pr view ignores an empty/absent workflow_dispatch pr-number input', () => {
   const savedActions = process.env.GITHUB_ACTIONS;
   const savedRepository = process.env.GITHUB_REPOSITORY;
@@ -2047,4 +2075,25 @@ test('revokeDelegatedGhToken deletes the delegation file and is idempotent', () 
 
 test('revokeDelegatedGhToken is a no-op when no delegation file is configured', () => {
   assert.doesNotThrow(() => withTokenEnv({}, () => revokeDelegatedGhToken(process.env)));
+});
+
+test('revokeDelegatedGhToken preserves the file when an ambient token made delegation inactive (CodeRabbit PR7 #6YrX0k)', () => {
+  // acquireDelegatedGhToken never READS the delegation file when an ambient
+  // GH_TOKEN/GITHUB_TOKEN is present, so revoke must not DELETE it either —
+  // the file is not this path's to destroy, and unlinking a caller's
+  // unrelated file would be a surprising side effect outside the documented
+  // contract.
+  for (const ambient of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+    const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-ambient-'));
+    try {
+      const file = join(dir, 'tok');
+      writeFileSync(file, 'ghs_notOursToDelete');
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file, [ambient]: 'ghs_ambient' }, () => {
+        revokeDelegatedGhToken(process.env);
+      });
+      assert.equal(existsSync(file), true, `${ambient} present: the delegation file must survive revoke`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });

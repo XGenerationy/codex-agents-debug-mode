@@ -111,9 +111,25 @@ const acquireDelegatedGhToken = (env = process.env) => {
  * than one that runs an untrusted probe while the token file still exists. A
  * no-op when delegation is not in use (no CLOSEOUT_GH_TOKEN_FILE, or a token
  * was supplied through the ambient environment instead).
+ *
+ * The ambient-token branch mirrors acquireDelegatedGhToken's own precedence
+ * check exactly, and the symmetry is the point (CodeRabbit PR7 #6YrX0k):
+ * when an ambient GH_TOKEN/GITHUB_TOKEN is present, acquire never READS the
+ * delegation file, so revoke must not DELETE it either — the file is not
+ * this code path's to destroy. Without this branch a caller who supplies
+ * their own token while some unrelated CLOSEOUT_GH_TOKEN_FILE happens to be
+ * set in the environment would have that file silently unlinked, which is
+ * both surprising and outside the contract this function documents. Skipping
+ * the unlink is safe for the #6Yd4Qv guarantee too: that guarantee is about
+ * the token the ACTION staged, and in the ambient case the action staged
+ * nothing — an ambient token is already in this process's exec-time environ,
+ * a situation revoking a file cannot improve and which action.yml prevents
+ * for the action's own path by clearing both names on the gate step
+ * (CodeRabbit PR7 #6YrX05).
  * @param {NodeJS.ProcessEnv} [env]
  */
 const revokeDelegatedGhToken = (env = process.env) => {
+  if (env.GH_TOKEN || env.GITHUB_TOKEN) return;
   const file = env.CLOSEOUT_GH_TOKEN_FILE;
   if (!file) return;
   try {
@@ -331,8 +347,20 @@ const readActionsPrNumber = ({ env }) => {
       // inputs verbatim under event.inputs, keyed by their declared
       // (hyphenated) name, same as base-ref is already read at the YAML
       // level elsewhere in this workflow.
-      const viaDispatchInput = Number(event?.inputs?.['pr-number']);
-      if (Number.isFinite(viaDispatchInput) && viaDispatchInput > 0) return viaDispatchInput;
+      //
+      // Parsed strictly as a decimal integer, NOT via bare Number()
+      // (CodeRabbit PR7 #6YqAg0): a workflow_dispatch input is free-typed
+      // text, and Number() happily accepts '1e2' (-> 100), '0x2a' (-> 42),
+      // ' 7 ', and '7.0' — each resolving to a PR the operator did not name.
+      // This value selects which PR gets gated, so a typo must fail closed to
+      // null (dispatch then behaves as it did before the input existed)
+      // rather than silently gate a different PR. Number.isSafeInteger also
+      // rejects a digit string past 2^53 that would otherwise round.
+      const rawDispatchInput = event?.inputs?.['pr-number'];
+      if (typeof rawDispatchInput === 'string' && /^\d+$/.test(rawDispatchInput)) {
+        const viaDispatchInput = Number(rawDispatchInput);
+        if (Number.isSafeInteger(viaDispatchInput) && viaDispatchInput > 0) return viaDispatchInput;
+      }
     } catch {
       /* fall through */
     }

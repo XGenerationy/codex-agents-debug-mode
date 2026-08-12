@@ -179,10 +179,22 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr-number != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # Event-derived values go through env, never into the script body:
+          # a ${{ }} expression is substituted into the shell source TEXT
+          # before bash parses it, so a crafted value could close the quote
+          # and append commands.
+          PR_NUMBER: ${{ github.event.inputs.pr-number }}
         run: |
-          sha=$(gh pr view "${{ github.event.inputs.pr-number }}" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          set -euo pipefail
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "::error::pr-number must be a plain decimal PR number; got '$PR_NUMBER'."
+              exit 1
+              ;;
+          esac
+          sha=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
           if [ -z "$sha" ]; then
-            echo "::error::Could not resolve a head SHA for PR #${{ github.event.inputs.pr-number }} in ${{ github.repository }}."
+            echo "::error::Could not resolve a head SHA for PR #${PR_NUMBER} in ${GITHUB_REPOSITORY}."
             exit 1
           fi
           echo "head-sha=$sha" >> "$GITHUB_OUTPUT"
@@ -233,10 +245,12 @@ jobs:
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.pull_requests[0].head.sha }}
         run: |
+          set -euo pipefail
           node scripts/gate_retry_cli.js single \
-            --repository "${{ github.repository }}" \
-            --head-sha "${{ github.event.workflow_run.pull_requests[0].head.sha }}"
+            --repository "$GITHUB_REPOSITORY" \
+            --head-sha "$HEAD_SHA"
 
   # Re-runs the gate for every open PR targeting a branch that was just
   # pushed to, closing the base-branch-drift gap (see the KNOWN LIMITATION
@@ -247,6 +261,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # A job-level permissions: block REPLACES the workflow-level one rather
+      # than merging with it, so pull-requests: read must be repeated here —
+      # this job's `gh pr list` discovery silently finds zero PRs without it.
+      pull-requests: read
       actions: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -254,10 +272,15 @@ jobs:
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          # Via env, not interpolated: git ref names permit `$`, backticks
+          # and `;`, so a branch name substituted into the script text could
+          # append commands.
+          BASE_REF: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           node scripts/gate_retry_cli.js base \
-            --repository "${{ github.repository }}" \
-            --base-ref "${{ github.ref_name }}"
+            --repository "$GITHUB_REPOSITORY" \
+            --base-ref "$BASE_REF"
 ```
 
 The `workflow_run`/`push` triggers and their forwarder jobs above are optional

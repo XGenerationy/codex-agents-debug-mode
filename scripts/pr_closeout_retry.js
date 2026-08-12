@@ -1,10 +1,64 @@
 const { defaultRunGh } = require('./pr_closeout_github');
+const { redactSecrets } = require('./pr_closeout_process');
+
+/**
+ * Renders a caught error's message for inclusion in a returned result.
+ *
+ * Every `reason`/`error` string this module produces is JSON-serialized to
+ * stdout by scripts/gate_retry_cli.js, i.e. straight into the workflow log,
+ * which is world-readable for a public repository. A `gh` failure message is
+ * not a controlled string: it can echo the request URL (a token-bearing
+ * remote, a credential-embedded proxy URL) or a raw API error body. Passing
+ * it through the gate's own redactor before it can reach a log closes that
+ * path (CodeRabbit PR7 #6YjkMb) — the same discipline
+ * scripts/pr_closeout_process.js already applies to every command's captured
+ * output, reused here rather than reinvented.
+ *
+ * Also normalizes a non-Error throw (a rejected string, a thrown object) to
+ * a useful string instead of `undefined`, which is what reading `.message`
+ * off a non-Error would otherwise produce.
+ * @param {unknown} error
+ * @returns {string}
+ */
+const describeError = (error) => {
+  const message = error instanceof Error
+    ? error.message
+    : (typeof error === 'string' ? error : JSON.stringify(error) ?? String(error));
+  return redactSecrets(String(message ?? ''));
+};
 
 // The gate workflow's own file PATH, not its displayed name — matching by
 // path (like resolveWorkflowRunPath/detectCrossWorkflowSelfExclusionCollision
 // elsewhere in this action) avoids the exact class of display-name-collision
 // bug this session repeatedly found and fixed in scripts/pr_closeout_github.js.
 const GATE_WORKFLOW_PATH = '.github/workflows/closeout-gate.yml';
+
+/**
+ * True when an Actions run's reported `path` names this workflow file.
+ *
+ * A run's `path` is normally the bare in-repo file path, but GitHub also
+ * reports the `<path>@<ref>` form (the shape used for a workflow referenced
+ * at a specific ref) — a strict `===` misses those runs entirely and the
+ * caller then reports "no prior run" and skips a retry that existed
+ * (CodeRabbit PR7 #6YjkMO). Matching the bare path OR the `path@ref` prefix
+ * covers both without loosening into a substring match: the `@` boundary is
+ * required, so `.github/workflows/closeout-gate.yml.bak` and
+ * `other/closeout-gate.yml` still do not match.
+ *
+ * Honest scope note: this is defensive normalization. The `@ref` form is
+ * documented for referenced/reusable workflows; whether the plain
+ * `GET /repos/{repo}/actions/runs` listing this module uses ever emits it
+ * for a repository's own workflow could not be confirmed from here. The
+ * handling is strictly more permissive along one exact axis, so it cannot
+ * break the bare-path case that is known to work.
+ * @param {unknown} runPath
+ * @param {string} workflowPath
+ * @returns {boolean}
+ */
+const matchesWorkflowPath = (runPath, workflowPath) => {
+  if (typeof runPath !== 'string' || !workflowPath) return false;
+  return runPath === workflowPath || runPath.startsWith(`${workflowPath}@`);
+};
 
 /**
  * Find the most recent Actions run of the closeout gate workflow at a given
@@ -34,9 +88,20 @@ const findMostRecentGateRun = async ({
   workflowPath = GATE_WORKFLOW_PATH,
 } = {}) => {
   if (!repository || !headSha || typeof runGh !== 'function') return null;
-  const response = await runGh(['api', `repos/${repository}/actions/runs?head_sha=${headSha}&per_page=50`], { repo });
-  const runs = Array.isArray(response?.workflow_runs) ? response.workflow_runs : [];
-  const matching = runs.filter((run) => run?.path === workflowPath);
+  // --paginate follows Link headers to the end rather than silently stopping
+  // at the first page (CodeRabbit PR7 #6YjkMG): a busy PR head can carry more
+  // than one page of runs across all workflows, and the gate's own run is not
+  // guaranteed to be among the newest — a truncated list would make this
+  // return null and skip a retry that was in fact available. `gh api
+  // --paginate --slurp` returns an ARRAY of page objects, so the pages are
+  // flattened back into one run list here.
+  const response = await runGh([
+    'api', '--paginate', '--slurp',
+    `repos/${repository}/actions/runs?head_sha=${encodeURIComponent(headSha)}&per_page=100`,
+  ], { repo });
+  const pages = Array.isArray(response) ? response : [response];
+  const runs = pages.flatMap((page) => (Array.isArray(page?.workflow_runs) ? page.workflow_runs : []));
+  const matching = runs.filter((run) => matchesWorkflowPath(run?.path, workflowPath));
   if (!matching.length) return null;
   // Highest run_number is the most recent — GitHub assigns these
   // monotonically per workflow, unlike `id` (global, not workflow-scoped,
@@ -74,7 +139,7 @@ const rerunGateRun = async ({ repository, runId, runGh = defaultRunGh, repo } = 
     await runGh(['api', '--method', 'POST', `repos/${repository}/actions/runs/${runId}/rerun`], { repo });
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: error.message };
+    return { ok: false, error: describeError(error) };
   }
 };
 
@@ -117,7 +182,7 @@ const forwardGateRetry = async ({
   try {
     run = await findMostRecentGateRun({ repository, headSha, runGh, repo, workflowPath });
   } catch (error) {
-    return { action: 'skipped', reason: `Could not list Actions runs: ${error.message}` };
+    return { action: 'skipped', reason: `Could not list Actions runs: ${describeError(error)}` };
   }
   if (!run) {
     return { action: 'skipped', reason: `No prior ${workflowPath} run found at head ${headSha}.` };
@@ -156,14 +221,28 @@ const forwardGateRetry = async ({
  * base-branch-drift path (chatgpt-codex-connector PR7 #6YbMwY): nothing in
  * this repository's triggers fires from a push to the base branch alone, so
  * this discovers the affected PRs a `push` event's own payload never names.
+ *
+ * `gh pr list` caps at `--limit` and pages internally up to it, exposing no
+ * total — so a cap silently TRUNCATES on a busy base branch, and the PRs
+ * dropped are exactly the ones that would go un-re-verified, the failure this
+ * whole mechanism exists to prevent (CodeRabbit PR7 #6YjkMG). The limit is
+ * therefore raised well past any plausible open-PR count against one branch,
+ * and — because a silent cap is the actual hazard — hitting it is REPORTED by
+ * the caller rather than passing unnoticed (see forwardGateRetriesForBase),
+ * per this repo's "no silent truncation" rule.
  * @param {object} options
  * @param {string} [options.repository]
  * @param {string} [options.baseRef] - branch name (no `refs/heads/` prefix).
  * @param {Function} [options.runGh]
  * @param {string} [options.repo]
+ * @param {number} [options.limit]
  * @returns {Promise<Array<{number: number, headRefOid: string}>>}
  */
-const discoverOpenPullRequests = async ({ repository, baseRef, runGh = defaultRunGh, repo } = {}) => {
+const PR_DISCOVERY_LIMIT = 1000;
+
+const discoverOpenPullRequests = async ({
+  repository, baseRef, runGh = defaultRunGh, repo, limit = PR_DISCOVERY_LIMIT,
+} = {}) => {
   if (!repository || !baseRef || typeof runGh !== 'function') return [];
   const response = await runGh([
     'pr', 'list',
@@ -171,7 +250,7 @@ const discoverOpenPullRequests = async ({ repository, baseRef, runGh = defaultRu
     '--base', baseRef,
     '--state', 'open',
     '--json', 'number,headRefOid',
-    '--limit', '100',
+    '--limit', String(limit),
   ], { repo });
   return Array.isArray(response)
     ? response.filter((pr) => Number.isInteger(pr?.number) && typeof pr?.headRefOid === 'string' && pr.headRefOid)
@@ -211,15 +290,27 @@ const forwardGateRetriesForBase = async ({
   try {
     pullRequests = await discoverOpenPullRequests({ repository, baseRef, runGh, repo });
   } catch (error) {
-    return [{ number: null, headRefOid: null, action: 'skipped', reason: `Could not list open pull requests targeting ${baseRef}: ${error.message}` }];
+    return [{ number: null, headRefOid: null, action: 'skipped', reason: `Could not list open pull requests targeting ${baseRef}: ${describeError(error)}` }];
   }
   const results = [];
+  // A full page means discovery may have TRUNCATED, and the PRs it dropped
+  // are precisely the ones that would silently go un-re-verified. Surface it
+  // as a result entry rather than letting a capped list read as "these are
+  // all the affected PRs" (CodeRabbit PR7 #6YjkMG).
+  if (pullRequests.length >= PR_DISCOVERY_LIMIT) {
+    results.push({
+      number: null,
+      headRefOid: null,
+      action: 'skipped',
+      reason: `Open-PR discovery for ${baseRef} returned the full limit of ${PR_DISCOVERY_LIMIT}; some open PRs targeting this branch may not have been re-verified.`,
+    });
+  }
   for (const pr of pullRequests) {
     let outcome;
     try {
       outcome = await forwardGateRetry({ repository, headSha: pr.headRefOid, runGh, repo, workflowPath });
     } catch (error) {
-      outcome = { action: 'skipped', reason: `Unexpected error: ${error.message}` };
+      outcome = { action: 'skipped', reason: `Unexpected error: ${describeError(error)}` };
     }
     results.push({ number: pr.number, headRefOid: pr.headRefOid, ...outcome });
   }
@@ -228,9 +319,12 @@ const forwardGateRetriesForBase = async ({
 
 module.exports = {
   GATE_WORKFLOW_PATH,
+  PR_DISCOVERY_LIMIT,
+  describeError,
   discoverOpenPullRequests,
   findMostRecentGateRun,
   forwardGateRetriesForBase,
   forwardGateRetry,
+  matchesWorkflowPath,
   rerunGateRun,
 };
