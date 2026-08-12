@@ -368,6 +368,93 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
 };
 
 /**
+ * Resolve the workflow FILE path (e.g. `.github/workflows/closeout-gate.yml`)
+ * that produced a given run id, via `repos/{repo}/actions/runs/{runId}` — a
+ * distinct endpoint/field from resolveCurrentJobDisplayName's Jobs API call.
+ * Best-effort: any failure (bad runId, API error, missing field) resolves to
+ * null, exactly like resolveCurrentJobDisplayName's own failure contract.
+ * @param {object} options
+ * @param {string} [options.repository]
+ * @param {Function} [options.runGh]
+ * @param {string} [options.repo]
+ * @param {string} [options.runId]
+ * @returns {Promise<string|null>}
+ */
+const resolveWorkflowRunPath = async ({ repository, runGh, repo, runId } = {}) => {
+  if (!repository || typeof runGh !== 'function' || !runId) return null;
+  try {
+    const run = await runGh(['api', `repos/${repository}/actions/runs/${runId}`], { repo });
+    return typeof run?.path === 'string' && run.path ? run.path : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Close the cross-workflow self-exclusion collision documented as a KNOWN
+ * LIMITATION inside classifyLivePrState (chatgpt-codex-connector PR7
+ * #6Yb44Si): that function's self-exclusion filter matches purely on
+ * DISPLAYED workflow name + job name, so a second, unrelated workflow FILE
+ * that happens to render the identical display names would have its checks
+ * — including a genuine failure — silently excluded too.
+ *
+ * This runs entirely in the caller (readLivePrState), which already has
+ * `runGh`/`repo` access, rather than making classifyLivePrState itself async
+ * — the complete fix scoped in that function's own comment, implemented here
+ * to avoid the signature change rippling through every call site/test there.
+ *
+ * Cheap in the common case: GitHub's statusCheckRollup normally carries at
+ * most ONE entry per distinct check name at a time (a rerun supersedes the
+ * prior entry in place), so finding a SECOND, distinct run id sharing this
+ * job's exact displayed name is itself already an unusual signal — the loop
+ * below only makes extra `gh api` calls when that signal is present, zero
+ * otherwise. When it fires, this fails SAFE: an unresolvable or mismatched
+ * path disables self-exclusion (returns `false`, the existing tested
+ * sentinel), which can only make the gate MORE conservative (BLOCKED on a
+ * check that turns out to be this run's own), never less — it can never turn
+ * a real failure into a false PASS.
+ * @param {object} options
+ * @param {object} [options.pr] - a `gh pr view` JSON object with statusCheckRollup.
+ * @param {string|null} [options.selfWorkflowName]
+ * @param {string|null} [options.selfJobName]
+ * @param {string|null} [options.selfWorkflowPath]
+ * @param {string} [options.repository]
+ * @param {Function} [options.runGh]
+ * @param {string} [options.repo]
+ * @param {object} [options.env]
+ * @returns {Promise<boolean>} true when self-exclusion must be disabled.
+ */
+const detectCrossWorkflowSelfExclusionCollision = async ({
+  pr,
+  selfWorkflowName,
+  selfJobName,
+  selfWorkflowPath,
+  repository,
+  runGh,
+  repo,
+  env = process.env,
+} = {}) => {
+  if (!selfWorkflowName || !selfJobName || !selfWorkflowPath) return false;
+  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const selfRunId = env.GITHUB_RUN_ID ? String(env.GITHUB_RUN_ID) : null;
+  const otherRunIds = new Set();
+  for (const entry of rollup) {
+    const normalized = normalizeCheck(entry);
+    if (normalized.workflowName !== selfWorkflowName || normalized.name !== selfJobName) continue;
+    const detailsUrl = typeof entry?.detailsUrl === 'string' ? entry.detailsUrl : '';
+    const match = detailsUrl.match(/\/actions\/runs\/(\d+)\//);
+    const runId = match ? match[1] : null;
+    if (runId && runId !== selfRunId) otherRunIds.add(runId);
+  }
+  if (!otherRunIds.size) return false;
+  for (const runId of otherRunIds) {
+    const otherPath = await resolveWorkflowRunPath({ repository, runGh, repo, runId });
+    if (!otherPath || otherPath !== selfWorkflowPath) return true;
+  }
+  return false;
+};
+
+/**
  * Reduce one already-fetched snapshot of live GitHub PR state (metadata,
  * status checks, unresolved review threads, gate attestation) to a single
  * PASS/BLOCKED/FAIL verdict plus the evidence lines that justify it. A
@@ -466,34 +553,28 @@ const classifyLivePrState = ({
   // post-exclusion `checks.length`.
   const liveCheckCount = checks.length;
   if (selfWorkflowName && selfJobName) {
-    // KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6Yb44Si,
-    // P2, investigated but left for an owner decision): this match is on the
-    // DISPLAYED workflow name and job name only — the same two strings
-    // GITHUB_WORKFLOW/the resolved display name always were. If this
-    // repository has a SECOND, unrelated workflow FILE whose top-level
-    // `name:` happens to equal GITHUB_WORKFLOW and whose job happens to
-    // resolve to the identical displayed name, every check that OTHER
-    // workflow ever produces — including a genuine completed FAILURE —
-    // would also match and be silently excluded here, exactly like this
-    // job's own checks are meant to be.
+    // This match is on the DISPLAYED workflow name and job name only — the
+    // same two strings GITHUB_WORKFLOW/the resolved display name always
+    // were. In isolation, a repository with a SECOND, unrelated workflow
+    // FILE whose top-level `name:` happens to equal GITHUB_WORKFLOW and
+    // whose job happens to resolve to the identical displayed name would
+    // have every check that OTHER workflow ever produces — including a
+    // genuine completed FAILURE — also match and be silently excluded here.
     //
-    // A complete fix exists and was scoped, not just guessed at: `gh pr view
-    // --json statusCheckRollup` DOES expose enough to disambiguate —
-    // verified empirically against this PR's own live rollup, each
-    // CheckRun entry carries a `detailsUrl` of the shape
-    // `.../actions/runs/<runId>/job/<jobId>`, and `repos/{repo}/actions/
-    // runs/{runId}` (already the exact endpoint resolveCurrentJobDisplayName
-    // above calls) returns a `path` field naming the WORKFLOW FILE itself
-    // (e.g. `.github/workflows/closeout-gate.yml`), which is what actually
-    // identifies "the same job definition" — display names are not
-    // guaranteed unique, file paths are. Comparing THIS run's own resolved
-    // path against each matching check's run's path would close this
-    // exactly. It is not done here because it requires classifyLivePrState
-    // itself to become async and gain its own `runGh`/`repo` access (an
-    // extra `gh api` round-trip per distinct matching run ID) — a real
-    // signature change rippling through every call site and test in this
-    // file, not a narrow same-shape edit, so it is left for a maintainer to
-    // decide rather than folded in silently here.
+    // Closed by the caller, not by widening this filter (chatgpt-codex-
+    // connector PR7 #6Yb44Si, complete fix): readLivePrState resolves this
+    // run's own workflow FILE path (`repos/{repo}/actions/runs/{runId}`'s
+    // `path` field — a different endpoint/field from the Jobs API call
+    // resolveCurrentJobDisplayName makes) and, via
+    // detectCrossWorkflowSelfExclusionCollision, checks whether any OTHER
+    // run id sharing this exact displayed name resolves to a different
+    // path. On a confirmed or unresolvable mismatch it passes
+    // `selfJobDisplayName: false` into this function — the same tested
+    // sentinel `resolveCurrentJobDisplayName` already returns for an
+    // in-run collision — disabling self-exclusion entirely for that call.
+    // This filter itself stays purely name-based and synchronous; a caller
+    // that skips the collision check (a direct unit test, or a future
+    // caller) still has the raw limitation described above.
     //
     // Practical bound on the actual risk in the meantime: creating that
     // colliding workflow file requires the SAME same-repo write-level trust
@@ -936,6 +1017,13 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     // stability recheck: `postThreadPr` could go stale while this call was
     // in flight and still be classified as current.
     const selfJobDisplayName = await resolveCurrentJobDisplayName({ repository, runGh, repo });
+    // Resolved here too (best-effort, alongside selfJobDisplayName) so its
+    // own network latency is likewise covered by the stability re-checks
+    // below rather than opening a fresh unverified window right before
+    // classification — see detectCrossWorkflowSelfExclusionCollision.
+    const selfWorkflowPath = await resolveWorkflowRunPath({
+      repository, runGh, repo, runId: process.env.GITHUB_RUN_ID,
+    });
     const pr = await runGh([
       'pr',
       'view',
@@ -1197,7 +1285,21 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     // selfJobDisplayName was resolved near the top of this function (see the
     // comment there) — best-effort: resolves to null (falling back to
     // GITHUB_JOB inside classifyLivePrState, the exact prior behavior) on
-    // any failure.
+    // any failure. Checked once more, right here against the final verified
+    // rollup, for a genuine cross-workflow collision (#6Yb44Si) — a second
+    // workflow file rendering this job's exact displayed name. Detecting one
+    // overrides to `false`, the existing tested sentinel that disables
+    // self-exclusion entirely inside classifyLivePrState, without changing
+    // that function at all.
+    const selfExclusionCollision = await detectCrossWorkflowSelfExclusionCollision({
+      pr: verifiedPr,
+      selfWorkflowName: process.env.GITHUB_WORKFLOW || null,
+      selfJobName: selfJobDisplayName === false ? null : (selfJobDisplayName || process.env.GITHUB_JOB || null),
+      selfWorkflowPath,
+      repository,
+      runGh,
+      repo,
+    });
     return classifyLivePrState({
       repository,
       pr: verifiedPr,
@@ -1205,7 +1307,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: verifiedGateSnapshot.attestation,
-      selfJobDisplayName,
+      selfJobDisplayName: selfExclusionCollision ? false : selfJobDisplayName,
     });
   } catch (error) {
     return {
@@ -1222,9 +1324,11 @@ module.exports = {
   buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
+  detectCrossWorkflowSelfExclusionCollision,
   gateAttestationMarker,
   readLiveGateAttestation,
   readLivePrState,
   readReviewerPermissions,
   resolveCurrentJobDisplayName,
+  resolveWorkflowRunPath,
 };
