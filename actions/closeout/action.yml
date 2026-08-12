@@ -55,9 +55,42 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
 
+    - name: Stage workflow token
+      # Isolate the workflow token from the untrusted plan-preflight probe
+      # (chatgpt-codex-connector PR7 #6Yd4Qv, P1). GH_TOKEN is set ONLY on this
+      # step — deliberately NOT on "Run closeout gate" below. A process's
+      # /proc/<pid>/environ is the environment captured at its OWN exec() and,
+      # where the runner's ptrace policy permits same-UID reads, is readable by
+      # any same-UID process including a descendant. If GH_TOKEN were on the
+      # gate step it would live in the exec-time environ of the gate shell, the
+      # support.js process, and the spawned gate CLI — every one an ANCESTOR of
+      # the repository-controlled preflight probe, which could read it straight
+      # out of procfs even though its own spawn env is scrubbed. So instead this
+      # separate step (which carries the token but spawns NO untrusted probe,
+      # and has fully exited before the gate step even starts, so it is never
+      # in the probe's process ancestry) writes the token to an owner-only file
+      # and hands the gate step only that file's PATH via GITHUB_ENV
+      # (CLOSEOUT_GH_TOKEN_FILE) — never the token value itself. The gate CLI
+      # reads the file solely to pass the token to the short-lived `gh` leaf
+      # process (which has no descendants, so it is not a probe ancestor) and
+      # REVOKES the file before any probe runs. If this step is skipped or
+      # fails, the gate simply runs unauthenticated (an honest "attestation
+      # unavailable" preview), never with the token back in the probe's tree.
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/support.js" stage-token
+
     - name: Run closeout gate
       id: gate
       shell: bash
+      # No GH_TOKEN here by design (chatgpt-codex-connector PR7 #6Yd4Qv): this
+      # step spawns the untrusted plan-preflight probe, so it must never carry
+      # the workflow token in its exec-time environment. It receives the token
+      # off-environment via CLOSEOUT_GH_TOKEN_FILE (exported to GITHUB_ENV by
+      # "Stage workflow token" above), which the gate CLI reads only to feed the
+      # `gh` leaf and revokes before the probe. Re-adding GH_TOKEN to this
+      # step's env would reopen the procfs ancestor-read hole this split closes.
       env:
         CLOSEOUT_RUN: ${{ inputs.run }}
         CLOSEOUT_MODE: ${{ inputs.mode }}
@@ -66,7 +99,6 @@ runs:
         CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
         CLOSEOUT_PR_COMMENT: ${{ inputs.pr-comment }}
         CLOSEOUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
-        GH_TOKEN: ${{ github.token }}
       run: node "${{ github.action_path }}/support.js" run
 
     - name: Upload evidence artifact
@@ -78,8 +110,9 @@ runs:
       # 'failure' means run() THREW (an invalid output-dir — e.g. inside the
       # workspace, rejected by assertOutputOutsideWorkspace before anything
       # is written — bad inputs, or another validation error); 'skipped'
-      # means an EARLIER step (e.g. Set up Node.js) failed, so "Run closeout
-      # gate" never executed at all (chatgpt-codex-connector PR7 #6YaIav) —
+      # means an EARLIER step (e.g. Set up Node.js or Stage workflow token)
+      # failed, so "Run closeout gate" never executed at all (chatgpt-codex-
+      # connector PR7 #6YaIav) —
       # `steps.gate.outcome != 'failure'` alone left this case uncaught,
       # since 'skipped' != 'failure' too. In either non-success case,
       # `inputs.output-dir` may resolve to a path never checked against the
@@ -122,7 +155,8 @@ runs:
 
     - name: Upsert PR comment
       # steps.gate.outcome != 'skipped': when an EARLIER step (e.g. Set up
-      # Node.js) fails, "Run closeout gate" never executes at all — it never
+      # Node.js or Stage workflow token) fails, "Run closeout gate" never
+      # executes at all — it never
       # exported this invocation's CLOSEOUT_INVOCATION_NONCE to GITHUB_ENV
       # (the very first thing it does), so commentSubcommand's own nonce
       # check (chatgpt-codex-connector PR7 #6YaIao) treats that as "this job

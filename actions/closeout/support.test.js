@@ -20,6 +20,7 @@ const {
   assertOutputOutsideWorkspace,
   buildCommentBody,
   capText,
+  cleanupDelegatedTokenFile,
   commentSubcommand,
   decideExit,
   escapeActionText,
@@ -30,6 +31,7 @@ const {
   renderPlanSummary,
   resolveBaseRef,
   runSubcommand,
+  stageTokenSubcommand,
   upsertPrComment,
   validateActionInputs,
   writeEvidenceFile,
@@ -1745,4 +1747,79 @@ test('the terminal main() catch redacts a PEM block with a hyphenated label (Cod
     'a PEM block with a hyphenated label is redacted as a single unit');
   assert.doesNotMatch(hyphenStderr, /MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAqIBA/,
     'no PEM body line leaks into stderr');
+});
+
+// ---------------------------------------------------------------------------
+// Off-environment workflow-token staging (chatgpt-codex-connector PR7
+// #6Yd4Qv, P1): the "Stage workflow token" step writes the token to an
+// owner-only file OUTSIDE the evidence dir and hands the gate step only the
+// PATH — never the token value — so GH_TOKEN never enters the tokenless gate
+// step's (probe-ancestor) environment.
+// ---------------------------------------------------------------------------
+
+test('stageTokenSubcommand writes the token to a file and exports only its PATH to GITHUB_ENV', () => {
+  const { existsSync, readFileSync, statSync } = require('node:fs');
+  const runnerTemp = makeTempDir();
+  const envFile = path.join(runnerTemp, 'github-env');
+  writeFs(envFile, '');
+  const secret = 'ghs_stagedSecret42';
+  const code = stageTokenSubcommand({
+    env: { GH_TOKEN: secret, RUNNER_TEMP: runnerTemp, GITHUB_ENV: envFile },
+  });
+  assert.equal(code, 0);
+  const envContent = readFileSync(envFile, 'utf8');
+  const match = envContent.match(/^CLOSEOUT_GH_TOKEN_FILE=(.+)$/m);
+  assert.ok(match, 'GITHUB_ENV must receive CLOSEOUT_GH_TOKEN_FILE');
+  const tokenPath = match[1].trim();
+  // The exported handoff is a PATH, and the SECRET itself must never appear in
+  // GITHUB_ENV (which is not secret-masked and is inherited by later steps).
+  assert.doesNotMatch(envContent, /ghs_stagedSecret42/, 'the token value must never be written to GITHUB_ENV');
+  assert.equal(existsSync(tokenPath), true, 'the token file must exist on disk');
+  assert.equal(readFileSync(tokenPath, 'utf8'), secret, 'the token file must contain the token');
+  // Written outside the evidence output-dir so the artifact upload never
+  // captures it, and owner-only on POSIX.
+  assert.equal(path.dirname(tokenPath), path.resolve(runnerTemp));
+  if (process.platform !== 'win32') {
+    assert.equal(statSync(tokenPath).mode & 0o777, 0o600, 'the token file must be owner-only (0600) on POSIX');
+  }
+});
+
+test('stageTokenSubcommand is a no-op when there is no token to stage', () => {
+  const runnerTemp = makeTempDir();
+  const envFile = path.join(runnerTemp, 'github-env');
+  writeFs(envFile, '');
+  assert.equal(stageTokenSubcommand({ env: { RUNNER_TEMP: runnerTemp, GITHUB_ENV: envFile } }), 0);
+  assert.equal(readFs(envFile, 'utf8'), '', 'nothing must be exported when there is no token');
+});
+
+test('stageTokenSubcommand is a no-op when there is no GITHUB_ENV to hand off through', () => {
+  const { readdirSync } = require('node:fs');
+  const runnerTemp = makeTempDir();
+  // No GITHUB_ENV: staging a file would leave an unreferenced secret on disk.
+  assert.equal(stageTokenSubcommand({ env: { GH_TOKEN: 'ghs_x', RUNNER_TEMP: runnerTemp } }), 0);
+  assert.deepEqual(readdirSync(runnerTemp), [], 'no token file may be written when it cannot be handed off');
+});
+
+test('finishSubcommand sweeps the delegated token file (chatgpt-codex-connector PR7 #6Yd4Qv)', () => {
+  const { existsSync } = require('node:fs');
+  const dir = makeTempDir();
+  const tokenFile = path.join(makeTempDir(), 'gh-token');
+  writeFs(tokenFile, 'ghs_leftoverToken');
+  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+    decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'n1',
+  }));
+  const code = finishSubcommand({
+    outputDir: dir,
+    env: { CLOSEOUT_INVOCATION_NONCE: 'n1', CLOSEOUT_GH_TOKEN_FILE: tokenFile },
+  });
+  assert.equal(code, 0, 'finish still returns the recorded verdict');
+  assert.equal(existsSync(tokenFile), false, 'finish must remove the delegated token file');
+});
+
+test('cleanupDelegatedTokenFile is ENOENT-tolerant and a no-op without a configured file', () => {
+  const dir = makeTempDir();
+  // Already-absent file: no throw.
+  assert.doesNotThrow(() => cleanupDelegatedTokenFile({ CLOSEOUT_GH_TOKEN_FILE: path.join(dir, 'gone') }));
+  // No file configured: no throw.
+  assert.doesNotThrow(() => cleanupDelegatedTokenFile({}));
 });

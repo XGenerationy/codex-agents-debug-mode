@@ -21,7 +21,9 @@ const {
   verifyBaseline,
   verifyGeneratorReproducibility,
 } = require('./pr_closeout_git');
-const { gateAttestationMarker, readLiveGateAttestation, readLivePrState } = require('./pr_closeout_github');
+const {
+  gateAttestationMarker, readLiveGateAttestation, readLivePrState, revokeDelegatedGhToken,
+} = require('./pr_closeout_github');
 const { createCommandExecutor, redactStructure, runPreflight, TOOL_PROBES } = require('./pr_closeout_process');
 const { writeEvidenceReport } = require('./pr_closeout_report');
 const {
@@ -786,31 +788,43 @@ const buildWorkflowEnvironment = (env, config) => {
 // buildWorkflowEnvironment (above) is what legitimately restores the
 // explicit-allowlist behavior for the full run's own credential needs.
 //
-// KNOWN RESIDUAL LIMITATION (chatgpt-codex-connector PR7 #6YaZ5K, not fixed —
-// see the PR review thread for the full analysis): filtering the probe's OWN
-// spawn env does not stop it from reading an ANCESTOR process's environment.
-// On Linux, another process sharing the UID may read /proc/<pid>/environ when
-// the runner's ptrace policy permits it — not only a child (access is gated
-// by a PTRACE_MODE_READ_FSCREDS check; the classic same-UID case allows it,
-// but a stricter Yama ptrace_scope, a non-dumpable target, or a missing
-// CAP_SYS_PTRACE/CAP_PERFMON can each independently deny it — CodeRabbit PR7
-// #6YbIQJ) — and reflects a process's env as of its OWN execve(), unaffected
-// by any later env filtering an ancestor performs on ITS OWN process.env.
-// Every process in this job's tree (the runner's shell, this Node process,
-// the spawned CLI, and the probe itself) shares one UID, and GH_TOKEN reaches
-// that tree via the WORKFLOW YAML's `env:` on the very first step, before
-// this file's own code ever runs — so if the runner's ptrace policy permits
-// it, a sufficiently sophisticated probe can walk its parent chain and read
-// GH_TOKEN (and the denylisted runner command-file paths) directly from
-// procfs, bypassing this allowlist/denylist entirely. A real fix requires an
-// OS-level process/privilege boundary (a container, a different UID, or
-// restructuring which process ever holds the token) — out of scope for a
-// targeted change here. This defense still meaningfully raises the bar
-// against the more common case (a probe naively reading process.env
-// directly), and the token itself is scoped to this job's `permissions:`
-// block (contents/pull-requests/checks/statuses/actions — no repo-write,
-// no org-admin), which bounds the practical impact of a leak even if this
-// gap is exploited.
+// ANCESTOR-PROCFS EXPOSURE (chatgpt-codex-connector PR7 #6YaZ5K, and its P1
+// follow-up #6Yd4Qv): filtering the probe's OWN spawn env does not stop it
+// from reading an ANCESTOR process's environment. On Linux, another process
+// sharing the UID may read /proc/<pid>/environ when the runner's ptrace policy
+// permits it — not only a child (access is gated by a PTRACE_MODE_READ_FSCREDS
+// check; the classic same-UID case allows it, but a stricter Yama
+// ptrace_scope, a non-dumpable target, or a missing CAP_SYS_PTRACE/CAP_PERFMON
+// can each independently deny it — CodeRabbit PR7 #6YbIQJ) — and reflects a
+// process's env as of its OWN execve(), unaffected by any later env filtering
+// an ancestor performs on ITS OWN process.env. Every process in this job's
+// tree (the runner's shell, this Node process, the spawned CLI, and the probe
+// itself) shares one UID.
+//
+// FIXED for GH_TOKEN in the plan tier (#6Yd4Qv): the GH_TOKEN that once
+// reached this whole tree via the WORKFLOW/action `env:` on the gate step is
+// no longer set there at all. It is staged into an owner-only FILE by a
+// separate earlier step and handed only to the short-lived `gh` LEAF process
+// via that leaf's own spawn env (pr_closeout_github.js
+// acquireDelegatedGhToken), and resolvePlanAdmission REVOKES that file (see
+// revokeDelegatedGhToken, called just above the runPreflight probe below)
+// before any repository-controlled code runs. So for a plan preview no probe
+// ancestor has ever held GH_TOKEN in its exec-time environ, and the token file
+// is gone before the probe spawns — the /proc/<pid>/environ read no longer
+// yields the token.
+//
+// STILL a residual, deliberately not chased further here: (1) the denylisted
+// runner command-file PATHS (GITHUB_ENV/GITHUB_OUTPUT/…) are still present in
+// ancestor environs, though they are not credentials; (2) in the FULL,
+// attested tier the token file necessarily outlives the preflight probe
+// (authenticated reads follow it), so a full-tier probe — which runs only
+// after a WRITE-access reviewer attested this exact snapshot — could still
+// read the token file by path; (3) a same-UID ptrace attach could read this
+// CLI's heap where the runner's ptrace_scope permits attaching to an ancestor.
+// A complete fix for those requires an OS-level process/privilege boundary (a
+// container, a different UID) — out of scope for a targeted change here. The
+// token itself is scoped to the consuming job's `permissions:` grant, which
+// bounds the practical impact of any residual leak.
 //
 // EXPLORED, deliberately NOT implemented (owner-approved investigation, this
 // PR): wrapping the plan-mode probe spawn in `unshare --user --map-root-user
@@ -1171,8 +1185,11 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       // --version`), and forwarding the full step env would expose runner
       // command files (GITHUB_ENV/GITHUB_OUTPUT) and job secrets to
       // PR-controlled code in a preview advertised as read-only. The parent
-      // gh lookups do not use this env — they read GH_TOKEN from
-      // process.env through their own execFile call.
+      // gh lookups do not use this env — they authenticate via the delegated
+      // token file (pr_closeout_github.js acquireDelegatedGhToken), which is
+      // handed only to the `gh` leaf process and has been revoked just above
+      // this point so it is no longer readable by the probe about to spawn
+      // (chatgpt-codex-connector PR7 #6Yd4Qv).
       //
       // `config` itself is passed with requiredEnv/safeEnv cleared
       // (CodeRabbit PR7 #6Yb44Sc): runPreflight (scripts/pr_closeout_process.js)
@@ -1197,6 +1214,22 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       // lookup resolves to nothing. Removed in the finally below regardless
       // of how the probe call ends, including a throw.
       const planPreflightConfig = { ...config, requiredEnv: [], safeEnv: [] };
+      // Revoke the delegated workflow token BEFORE spawning the first (and, in
+      // the plan tier, only) repository-controlled probe (chatgpt-codex-
+      // connector PR7 #6Yd4Qv, P1). The attestation read above is the sole
+      // authenticated GitHub call in this tier and has already completed, so
+      // the off-environment token file staged for it is no longer needed. The
+      // token never sat in this process's (or any ancestor's) exec-time
+      // environ — action.yml keeps GH_TOKEN out of the gate step entirely — so
+      // the file was the only remaining path by which a same-UID probe could
+      // reach the token; deleting it here removes that too. A no-op unless the
+      // hardened action path is in use (CLOSEOUT_GH_TOKEN_FILE set); it throws
+      // only if the file is present but cannot be removed, in which case the
+      // outer catch turns preflight into a BLOCKED preview rather than run an
+      // untrusted probe while the token file still exists. Called as the
+      // module import (not through `d`) so revocation can never be silently
+      // dropped by a caller that supplies a partial dependency object.
+      revokeDelegatedGhToken(process.env);
       let isolatedHomeDir;
       try {
         isolatedHomeDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-plan-home-'));

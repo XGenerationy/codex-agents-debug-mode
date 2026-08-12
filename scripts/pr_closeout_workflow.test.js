@@ -1809,6 +1809,58 @@ test('resolvePlanAdmission does not let PR-controlled safeEnv select a secret by
   assert.equal(preflightEnv[secretName], undefined, 'a secret under a heuristic-evading name must still never reach plan preflight');
 });
 
+test('resolvePlanAdmission revokes the delegated token file BEFORE the untrusted preflight probe runs (chatgpt-codex-connector PR7 #6Yd4Qv)', async () => {
+  // The core security property of the fix: by the time the repository-
+  // controlled preflight probe executes, the off-environment workflow-token
+  // file must already be deleted, so a probe that walks its process ancestry
+  // (or simply reads the file by path) finds nothing. The attestation read
+  // above it — the sole authenticated GitHub call in the plan tier — has
+  // already consumed the token, so revocation here loses nothing.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'closeout-plan-tok-'));
+  const tokenFile = nodePath.join(dir, 'gh-token');
+  fs.writeFileSync(tokenFile, 'ghs_planTierSecret');
+  const priorEnv = process.env.CLOSEOUT_GH_TOKEN_FILE;
+  process.env.CLOSEOUT_GH_TOKEN_FILE = tokenFile;
+  let tokenFileExistedAtProbeTime = null;
+  let attestationSawTokenFile = null;
+  try {
+    // Sanity: the file exists before the admission run.
+    assert.equal(fs.existsSync(tokenFile), true, 'token file must exist before resolvePlanAdmission');
+    const admission = await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        // The attestation phase is where the token is legitimately consumed;
+        // assert the file is still present there (it must NOT be revoked
+        // before authentication completes).
+        readLiveGateAttestation: async () => {
+          attestationSawTokenFile = fs.existsSync(tokenFile);
+          return { status: 'PASS', evidence: 'attested' };
+        },
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        // The probe stands in for repository-controlled code. It must observe
+        // the token file already gone.
+        runPreflight: async () => {
+          tokenFileExistedAtProbeTime = fs.existsSync(tokenFile);
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+    assert.equal(attestationSawTokenFile, true, 'authenticated attestation read must happen while the token file still exists');
+    assert.equal(tokenFileExistedAtProbeTime, false, 'the delegated token file MUST be revoked before the untrusted probe runs');
+    assert.equal(fs.existsSync(tokenFile), false, 'the token file must remain gone after admission');
+    assert.equal(admission.preflight.status, 'PASS');
+  } finally {
+    if (priorEnv === undefined) delete process.env.CLOSEOUT_GH_TOKEN_FILE;
+    else process.env.CLOSEOUT_GH_TOKEN_FILE = priorEnv;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('resolvePlanAdmission clears requiredEnv/safeEnv from the config it hands to preflight, not just the env (CodeRabbit PR7 #6Yb44Sc)', async () => {
   // scripts/pr_closeout_process.js's runPreflight separately checks EVERY
   // config.requiredEnv name for presence in the given env and reports each

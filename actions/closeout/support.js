@@ -1177,6 +1177,12 @@ const readState = (outputDir) => {
  * @returns {number} process exit code.
  */
 const finishSubcommand = ({ outputDir, env = process.env }) => {
+  // End-of-job sweep of the delegated token file (chatgpt-codex-connector PR7
+  // #6Yd4Qv). Runs unconditionally, before any early return, so the staged
+  // secret is removed whichever verdict path finish takes. In the plan tier
+  // the file is normally already gone (revoked before its probe); this covers
+  // the full tier and any run that failed before the CLI consumed it.
+  cleanupDelegatedTokenFile(env);
   const state = readState(outputDir);
   if (!state?.decision) {
     process.stderr.write('closeout-action: no recorded state; the run step never completed.\n');
@@ -1206,6 +1212,89 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
   }
   process.stdout.write(`closeout-action: ${redactSecrets(state.decision.reason)}\n`);
   return state.decision.success ? 0 : (Number.isInteger(state.decision.exitCode) ? state.decision.exitCode : 3);
+};
+
+// Prefix of the delegated-token filename (chatgpt-codex-connector PR7
+// #6Yd4Qv). A per-invocation random suffix makes the path unpredictable, and
+// the file is written OUTSIDE the evidence output-dir so it is never captured
+// by the artifact upload.
+const TOKEN_FILE_PREFIX = 'closeout-gh-token-';
+
+/**
+ * Best-effort removal of the delegated-token file named by
+ * CLOSEOUT_GH_TOKEN_FILE. Used by `finish` as the end-of-job sweep. Non-fatal:
+ * a token file that cannot be removed here must not change the gate verdict
+ * `finish` exists to report (unlike the mid-run revoke in resolvePlanAdmission,
+ * which gates untrusted execution and therefore fails closed). ENOENT is the
+ * normal case — the plan tier already revoked the file before its probe ran.
+ * @param {NodeJS.ProcessEnv} env
+ */
+const cleanupDelegatedTokenFile = (env) => {
+  const file = env.CLOSEOUT_GH_TOKEN_FILE;
+  if (!file) return;
+  try {
+    unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      // Do not leak the path shape or fail the verdict; just note it. On a
+      // hosted runner RUNNER_TEMP is torn down per job; a self-hosted operator
+      // owns runner hygiene (README), so this is a diagnostic, not an error.
+      process.stderr.write('closeout-action: could not remove the delegated token file during finish; relying on runner temp cleanup.\n');
+    }
+  }
+};
+
+/**
+ * The `stage-token` step: runs in a SEPARATE, earlier composite step that (and
+ * only that step) carries GH_TOKEN in its environment, and hands the token to
+ * the tokenless gate step OFF-ENVIRONMENT (chatgpt-codex-connector PR7
+ * #6Yd4Qv, P1). It writes the workflow token to an owner-only file outside the
+ * evidence directory and exports only that file's PATH (never the token
+ * itself) to GITHUB_ENV as CLOSEOUT_GH_TOKEN_FILE, so later steps in this job
+ * inherit the path but not the secret.
+ *
+ * Why a whole separate step, not just a different env on the gate step: a
+ * process's /proc/<pid>/environ is the snapshot captured at its OWN execve()
+ * and is readable by any same-UID process (subject to ptrace policy),
+ * including a descendant. If GH_TOKEN were in the gate step's env it would sit
+ * in the exec-time environ of the gate shell, this support.js process, and the
+ * spawned gate CLI — every one of which is an ANCESTOR of the repository-
+ * controlled plan-preflight probe, which could then read it from procfs even
+ * though its own spawn env is scrubbed. This step's process DOES hold the token
+ * in its environ, but it spawns no untrusted probe and has fully exited before
+ * the gate step starts, so it is never in the probe's ancestry.
+ *
+ * A no-op (exit 0) when there is no token to stage or nowhere to hand off the
+ * path — the gate step then simply runs unauthenticated and the plan reports
+ * an honest "attestation unavailable" rather than failing the preview.
+ * @returns {number} process exit code.
+ */
+const stageTokenSubcommand = ({ env = process.env } = {}) => {
+  const token = String(env.GH_TOKEN || env.GITHUB_TOKEN || '').trim();
+  if (!token) {
+    process.stdout.write('closeout-action: no workflow token to stage; the gate will run unauthenticated.\n');
+    return 0;
+  }
+  if (!env.GITHUB_ENV) {
+    // Without GITHUB_ENV there is no channel to hand the path to the gate step,
+    // so staging a file would only leave an unreferenced secret on disk. Skip.
+    process.stderr.write('closeout-action: GITHUB_ENV is unset; cannot hand off a staged token, skipping.\n');
+    return 0;
+  }
+  const tokenDir = env.RUNNER_TEMP || os.tmpdir();
+  const tokenName = `${TOKEN_FILE_PREFIX}${randomUUID()}`;
+  const tokenPath = path.join(tokenDir, tokenName);
+  // Reuse the wrapper's hardened writer: owner-only mode, no-follow O_EXCL
+  // staging, hard-link/symlink refusal, and a verified Windows owner-only DACL
+  // — the same discipline every evidence write uses, here applied to a secret.
+  writeEvidenceFile(tokenDir, tokenName, token);
+  // Export only the PATH (not the token) so later steps in THIS job inherit
+  // the location. The path is not a secret; the file it names is owner-only
+  // and is revoked before any untrusted probe (resolvePlanAdmission) and swept
+  // by `finish`.
+  writeOutputs(env.GITHUB_ENV, { CLOSEOUT_GH_TOKEN_FILE: tokenPath });
+  process.stdout.write('closeout-action: workflow token staged off-environment for the gate step.\n');
+  return 0;
 };
 
 // Bounded timeout for gh API calls so a hung GitHub API request fails the
@@ -1286,8 +1375,12 @@ const main = async () => {
       process.exitCode = finishSubcommand(common);
     } else if (subcommand === 'comment') {
       process.exitCode = await commentSubcommand(common);
+    } else if (subcommand === 'stage-token') {
+      // No output-dir needed — the token file lives outside it (see
+      // stageTokenSubcommand). chatgpt-codex-connector PR7 #6Yd4Qv.
+      process.exitCode = stageTokenSubcommand({ env });
     } else {
-      throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use run, comment, or finish.`);
+      throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use run, stage-token, comment, or finish.`);
     }
   } catch (error) {
     // The thrown message can carry credential-shaped values that bypassed
@@ -1323,10 +1416,12 @@ module.exports = {
   finishSubcommand,
   parseLastJsonLine,
   readPrContext,
+  cleanupDelegatedTokenFile,
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
   runSubcommand,
+  stageTokenSubcommand,
   upsertPrComment,
   validateActionInputs,
   writeEvidenceFile,

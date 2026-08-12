@@ -5,7 +5,10 @@ const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 
+const { existsSync } = require('node:fs');
+
 const {
+  acquireDelegatedGhToken,
   buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
@@ -16,6 +19,7 @@ const {
   readReviewerPermissions,
   resolveCurrentJobDisplayName,
   resolveWorkflowRunPath,
+  revokeDelegatedGhToken,
 } = require('./pr_closeout_github');
 
 const cleanAttestation = (extra = {}) => ({
@@ -1914,4 +1918,133 @@ test('readReviewerPermissions resolves unique reviewers with bounded concurrency
   assert.equal(maxInFlight, 4, `lookups must run in batches of four (got maxInFlight=${maxInFlight})`);
   // Each resolved permission is recorded.
   assert.equal(permissions.get('alice').permission, 'write');
+});
+
+// ---------------------------------------------------------------------------
+// Off-environment workflow-token delegation (chatgpt-codex-connector PR7
+// #6Yd4Qv, P1). These prove the token-acquisition and token-revocation halves
+// of the fix that keeps GH_TOKEN out of the untrusted plan-preflight probe's
+// process ancestry.
+// ---------------------------------------------------------------------------
+
+const withTokenEnv = (overrides, run) => {
+  const keys = ['GH_TOKEN', 'GITHUB_TOKEN', 'CLOSEOUT_GH_TOKEN_FILE'];
+  const previous = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, overrides);
+  try {
+    return run();
+  } finally {
+    for (const k of keys) {
+      if (previous[k] === undefined) delete process.env[k];
+      else process.env[k] = previous[k];
+    }
+  }
+};
+
+test('acquireDelegatedGhToken reads the trimmed token from the delegation file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, '  ghs_delegatedSecret123  \n');
+    const token = withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env));
+    assert.equal(token, 'ghs_delegatedSecret123');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('acquireDelegatedGhToken defers to an environment token (backward compatible)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, 'file-token');
+    // GH_TOKEN present in env -> null (let gh inherit the env), file ignored.
+    assert.equal(
+      withTokenEnv({ GH_TOKEN: 'env-token', CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // GITHUB_TOKEN present -> also null.
+    assert.equal(
+      withTokenEnv({ GITHUB_TOKEN: 'env-token', CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('acquireDelegatedGhToken returns null when no delegation file is configured', () => {
+  assert.equal(withTokenEnv({}, () => acquireDelegatedGhToken(process.env)), null);
+});
+
+test('acquireDelegatedGhToken returns null for a missing, empty, or oversize file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    // Missing.
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: join(dir, 'nope') }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // Empty / whitespace-only.
+    const empty = join(dir, 'empty');
+    writeFileSync(empty, '   \n');
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: empty }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // Oversize (> 64 KiB) is refused rather than read into memory.
+    const big = join(dir, 'big');
+    writeFileSync(big, 'x'.repeat(64 * 1024 + 1));
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: big }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('acquireDelegatedGhToken refuses to follow a symlinked delegation file', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  const { symlinkSync } = require('node:fs');
+  try {
+    const real = join(dir, 'real-token');
+    writeFileSync(real, 'ghs_throughSymlink');
+    const link = join(dir, 'link-token');
+    try {
+      symlinkSync(real, link);
+    } catch (error) {
+      // Windows without symlink privilege: skip, the lstat guard is platform-independent.
+      t.skip(`symlink unsupported: ${error.code}`);
+      return;
+    }
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: link }, () => acquireDelegatedGhToken(process.env)),
+      null,
+      'a symlinked token file must be refused, not followed',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('revokeDelegatedGhToken deletes the delegation file and is idempotent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, 'ghs_toBeRevoked');
+    withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file }, () => {
+      revokeDelegatedGhToken(process.env);
+      assert.equal(existsSync(file), false, 'token file must be gone after revoke');
+      // A second revoke (ENOENT) must not throw.
+      assert.doesNotThrow(() => revokeDelegatedGhToken(process.env));
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('revokeDelegatedGhToken is a no-op when no delegation file is configured', () => {
+  assert.doesNotThrow(() => withTokenEnv({}, () => revokeDelegatedGhToken(process.env)));
 });

@@ -1,8 +1,127 @@
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
-const { readFileSync } = require('node:fs');
+const {
+  closeSync, constants: fsConstants, fstatSync, lstatSync, readFileSync, unlinkSync,
+} = require('node:fs');
+const { openNoFollowSync } = require('./pr_closeout_fs');
 
 const execFileAsync = promisify(execFile);
+
+// Off-environment workflow-token delegation (chatgpt-codex-connector PR7
+// #6Yd4Qv, P1). Background: on a Linux/self-hosted runner whose procfs ptrace
+// policy permits same-UID reads, a repository-controlled plan-preflight probe
+// can walk its process ancestry and read GH_TOKEN out of any ancestor's
+// /proc/<pid>/environ. `/proc/<pid>/environ` is the environment block CAPTURED
+// AT THAT PROCESS'S OWN execve(2) and is NOT updated by later in-process
+// setenv()/putenv() (verified empirically on Linux: a variable present in a
+// process's exec-time env appears in its own /proc/self/environ and is
+// readable by a scrubbed-env child through /proc/<ppid>/environ, while a
+// variable added by an in-process assignment after exec never appears there;
+// and against proc(5): "environ — the initial environment set when the program
+// was started via execve(2)"). Filtering the probe's OWN spawn env therefore
+// does nothing about the token still sitting in an ancestor's exec-time
+// environ. The action.yml wiring now keeps GH_TOKEN out of the env of every
+// process that is an ancestor of the probe (the gate step no longer sets it),
+// and instead a separate, earlier step stages the token into an owner-only
+// FILE named by CLOSEOUT_GH_TOKEN_FILE. This module reads that file only when
+// it actually needs to authenticate a `gh` call, and hands the token to the
+// `gh` LEAF process via that child's OWN spawn env — the leaf has no
+// descendants, so it never becomes a probe ancestor. The token thus lives only
+// in (a) an owner-only file that resolvePlanAdmission REVOKES before any
+// untrusted probe runs, (b) the short-lived `gh` leaf's environ, and (c) this
+// process's JS heap — never in any probe-ancestor's exec-time environ.
+//
+// GUARANTEED: for the plan tier, no process in the untrusted preflight probe's
+// ancestry (the runner step shell, this Node CLI, or its children) has ever
+// held GH_TOKEN in its exec-time environment, and the delegated-token file is
+// deleted before the probe is spawned — closing the /proc/<pid>/environ
+// exfiltration vector for the pre-attestation preview.
+// NOT GUARANTEED: this does not create an OS-level process/UID boundary. A
+// same-UID process could still read this CLI's heap via a ptrace attach where
+// the runner's ptrace_scope permits attaching to an ancestor (scope 0), and in
+// the FULL (attested) tier the delegated-token file necessarily persists across
+// the run because authenticated reads follow the preflight probe — so a
+// full-tier probe (which only runs after a WRITE-access reviewer has attested
+// this exact snapshot) can still read the token file by path. Those residuals
+// are the same class the #6YaZ5K KNOWN LIMITATION documents and are out of
+// scope for a targeted change; the token remains bounded by the consuming
+// workflow's own `permissions:` grant regardless.
+
+// A workflow token is a compact opaque string; 64 KiB is orders of magnitude
+// beyond any legitimate one and bounds a hostile/oversized file read.
+const DELEGATED_TOKEN_MAX_BYTES = 64 * 1024;
+
+/**
+ * Reads the delegated workflow token from the owner-only file named by
+ * CLOSEOUT_GH_TOKEN_FILE, or returns null when the caller should fall back to
+ * the ambient `gh` behavior (a token already present in the process
+ * environment, or no delegation file configured). Returning null — never
+ * throwing — keeps a delegation misconfiguration from turning every gh call
+ * into a hard crash; the gh call then simply runs unauthenticated and the
+ * attestation reader reports its own honest "unavailable" state.
+ *
+ * The file is opened no-follow after an lstat regular-file gate (mirroring the
+ * symlink discipline used for every other sensitive read in this codebase) so
+ * a symlink planted at the path cannot redirect the read, and is size-bounded
+ * before any byte is consumed. The value is trimmed of surrounding whitespace
+ * so a trailing newline written by the stager does not corrupt the token.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string|null}
+ */
+const acquireDelegatedGhToken = (env = process.env) => {
+  // An explicit token already in the environment wins — this preserves the
+  // pre-existing behavior for direct CLI users and any caller that still sets
+  // GH_TOKEN/GITHUB_TOKEN itself. Delegation is only for the hardened action
+  // path where the gate step deliberately carries no token env.
+  if (env.GH_TOKEN || env.GITHUB_TOKEN) return null;
+  const file = env.CLOSEOUT_GH_TOKEN_FILE;
+  if (!file) return null;
+  let info;
+  try {
+    info = lstatSync(file);
+  } catch {
+    return null;
+  }
+  if (!info.isFile()) return null;
+  let fd;
+  try {
+    fd = openNoFollowSync(file, fsConstants.O_RDONLY, 0o666, true);
+  } catch {
+    return null;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.size > DELEGATED_TOKEN_MAX_BYTES) return null;
+    const token = readFileSync(fd, 'utf8').trim();
+    return token || null;
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * Deletes the delegated-token file so no untrusted process spawned afterwards
+ * can read it by path. Called by resolvePlanAdmission immediately before the
+ * plan-preflight probe (the first and only point in the plan tier where
+ * repository-controlled code executes). Throws on any failure OTHER than the
+ * file already being absent (ENOENT): a token file that could not be proven
+ * gone must fail the caller closed — a preview that BLOCKS is strictly better
+ * than one that runs an untrusted probe while the token file still exists. A
+ * no-op when delegation is not in use (no CLOSEOUT_GH_TOKEN_FILE, or a token
+ * was supplied through the ambient environment instead).
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+const revokeDelegatedGhToken = (env = process.env) => {
+  const file = env.CLOSEOUT_GH_TOKEN_FILE;
+  if (!file) return;
+  try {
+    unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+};
 
 // True functional/infra failures. SKIPPED is intentionally absent: docs say a
 // skipped applicable check is not PASS and must be run or marked BLOCKED, not
@@ -242,12 +361,23 @@ const buildGhArgs = (args, { repo } = {}) => {
 };
 const defaultRunGh = async (args, { repo } = {}) => {
   const finalArgs = buildGhArgs(args, { repo });
+  // Hand the delegated workflow token (when one is configured off-environment,
+  // chatgpt-codex-connector PR7 #6Yd4Qv) to the `gh` LEAF process through its
+  // OWN spawn env, so authentication works without this CLI — a probe ancestor
+  // — ever carrying GH_TOKEN in its exec-time environ. When no delegated token
+  // is in use (a token already in process.env, or no delegation file),
+  // acquireDelegatedGhToken returns null and gh inherits the ambient
+  // environment exactly as before. `gh` reads GH_TOKEN ahead of GITHUB_TOKEN,
+  // so setting GH_TOKEN alone is sufficient.
+  const delegatedToken = acquireDelegatedGhToken();
+  const childEnv = delegatedToken ? { ...process.env, GH_TOKEN: delegatedToken } : undefined;
   const { stdout } = await execFileAsync('gh', finalArgs, {
     cwd: repo,
     encoding: 'utf8',
     maxBuffer: 20_000_000,
     timeout: 60_000,
     windowsHide: true,
+    ...(childEnv ? { env: childEnv } : {}),
   });
   // A handful of `gh api` endpoints (e.g. POST .../rerun) return 204 No
   // Content on success — empty stdout, not empty JSON. Every existing
@@ -1475,10 +1605,12 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
 };
 
 module.exports = {
+  acquireDelegatedGhToken,
   buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
   defaultRunGh,
+  revokeDelegatedGhToken,
   detectCrossWorkflowSelfExclusionCollision,
   gateAttestationMarker,
   readActionsPrNumber,
