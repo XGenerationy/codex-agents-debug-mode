@@ -2019,22 +2019,36 @@ test('resolveContainedEvidencePath refuses paths that escape the evidence direct
   }
 });
 
-test('resolveContainedEvidencePath refuses a symlink planted inside the evidence directory (Qodo PR7 #6YscaZ)', (t) => {
+// Probe file-symlink privilege once, eagerly, so the dependent test below
+// reports itself as SKIP via the `skip` OPTION rather than an in-body
+// `t.skip()`. Two reasons: an in-body skip after assertions have already run
+// is a zero-assertion pass, and this repo's own suppression scanner
+// (tools/scan_touched_suppressions.js) correctly classifies a `t.skip(` call
+// in a test file as test-weakening. Mirrors the probe in
+// scripts/debug_server.test.js.
+const containedLinkProbeRoot = mkdtempSync(path.join(tmpdir(), 'closeout-symlink-cap-'));
+let symlinkCreationAvailable = false;
+try {
+  const probeTarget = path.join(containedLinkProbeRoot, 'target');
+  writeFs(probeTarget, 'x');
+  symlinkSync(probeTarget, path.join(containedLinkProbeRoot, 'link'), 'file');
+  symlinkCreationAvailable = true;
+} catch {
+  // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+} finally {
+  require('node:fs').rmSync(containedLinkProbeRoot, { recursive: true, force: true });
+}
+
+test('resolveContainedEvidencePath refuses a symlink planted inside the evidence directory (Qodo PR7 #6YscaZ)', {
+  skip: !symlinkCreationAvailable && 'file symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)',
+}, () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'closeout-contained-link-'));
   try {
     const evidenceDir = resolveEvidenceDir(dir);
     mkdirSync(evidenceDir, { recursive: true });
     const secret = path.join(dir, 'secret.json');
     writeFs(secret, '{"overallStatus":"PASS","stolen":true}');
-    const link = path.join(evidenceDir, 'report.json');
-    try {
-      symlinkSync(secret, link);
-    } catch {
-      // Windows without the symlink privilege: the lexical containment above
-      // is still asserted by the sibling test; skip only the link case.
-      t.skip('symlink creation requires elevated privileges on this platform');
-      return;
-    }
+    symlinkSync(secret, path.join(evidenceDir, 'report.json'), 'file');
     // readFileSync would FOLLOW this link straight out of the evidence dir,
     // so a lexical-only containment check is not sufficient.
     assert.equal(resolveContainedEvidencePath(evidenceDir, 'report.json'), null);

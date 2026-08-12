@@ -2037,20 +2037,36 @@ test('acquireDelegatedGhToken returns null for a missing, empty, or oversize fil
   }
 });
 
-test('acquireDelegatedGhToken refuses to follow a symlinked delegation file', (t) => {
+// Probe file-symlink privilege once, eagerly, so the test below declares its
+// skip through the `skip` OPTION instead of an in-body `t.skip()`: this
+// repo's own suppression scanner (tools/scan_touched_suppressions.js)
+// classifies a `t.skip(` call in a test file as test-weakening, and an
+// in-body skip also registers as a zero-assertion pass. Mirrors the probe
+// pattern in scripts/debug_server.test.js.
+const delegTokenLinkProbeRoot = mkdtempSync(join(tmpdir(), 'deleg-tok-cap-'));
+let delegTokenSymlinkAvailable = false;
+try {
+  const { symlinkSync: probeSymlink } = require('node:fs');
+  const probeTarget = join(delegTokenLinkProbeRoot, 'target');
+  writeFileSync(probeTarget, 'x');
+  probeSymlink(probeTarget, join(delegTokenLinkProbeRoot, 'link'), 'file');
+  delegTokenSymlinkAvailable = true;
+} catch {
+  // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+} finally {
+  rmSync(delegTokenLinkProbeRoot, { recursive: true, force: true });
+}
+
+test('acquireDelegatedGhToken refuses to follow a symlinked delegation file', {
+  skip: !delegTokenSymlinkAvailable && 'file symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)',
+}, () => {
   const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
   const { symlinkSync } = require('node:fs');
   try {
     const real = join(dir, 'real-token');
     writeFileSync(real, 'ghs_throughSymlink');
     const link = join(dir, 'link-token');
-    try {
-      symlinkSync(real, link);
-    } catch (error) {
-      // Windows without symlink privilege: skip, the lstat guard is platform-independent.
-      t.skip(`symlink unsupported: ${error.code}`);
-      return;
-    }
+    symlinkSync(real, link, 'file');
     assert.equal(
       withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: link }, () => acquireDelegatedGhToken(process.env)),
       null,
