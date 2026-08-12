@@ -324,7 +324,25 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
       (job) => job && job.runner_name === runnerName && String(job.status || '').toUpperCase() !== 'COMPLETED',
     );
     const ownJob = activeMatches.length === 1 ? activeMatches[0] : null;
-    return typeof ownJob?.name === 'string' && ownJob.name ? ownJob.name : null;
+    const ownName = typeof ownJob?.name === 'string' && ownJob.name ? ownJob.name : null;
+    if (!ownName) return null;
+    // classifyLivePrState's self-exclusion matches purely on displayed name
+    // (workflowName + name), since that is all statusCheckRollup exposes —
+    // it has no notion of "the exact same job instance" versus "a different
+    // job that happens to render an identical name". If a consumer's
+    // workflow has TWO DIFFERENT jobs sharing this exact displayed name
+    // (e.g. both given the same `name:` override), returning this name would
+    // make self-exclusion ALSO exclude the sibling's check entirely — a
+    // genuinely failed sibling could then go undetected and the gate could
+    // wrongly reach PASS (chatgpt-codex-connector PR7 #6Yap8W). This SAME
+    // Jobs API response already reveals such a collision directly: if more
+    // than one job in this run carries this name, resolving to it is unsafe
+    // here — return null instead, and classifyLivePrState falls back to its
+    // prior GITHUB_JOB-only matching (the same protection level as before
+    // this resolver existed), same as any other best-effort failure.
+    const sameNameJobCount = list.filter((job) => job?.name === ownName).length;
+    if (sameNameJobCount > 1) return null;
+    return ownName;
   } catch {
     return null;
   }

@@ -116,14 +116,27 @@ jobs:
           # branch, which is absent from the base repo and would fail checkout
           # for fork PRs). The gate's argument-less `gh pr view` resolves the
           # PR from the Actions event context even though HEAD is detached, so
-          # detached HEAD is not a problem here. workflow_run events carry no
-          # pull_request context; head_sha there is the sha of whatever
-          # commit the completed sibling workflow itself ran against — falls
-          # back further to github.ref (workflow_dispatch with no PR context)
-          # only when neither is present. The gate independently
-          # re-verifies the live head via gh and BLOCKS stale snapshots.
-          # workflow_dispatch falls back to github.ref.
-          ref: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.ref }}
+          # detached HEAD is not a problem here.
+          #
+          # workflow_run events carry no top-level pull_request. Prefer
+          # workflow_run.pull_requests[0].head.sha (the PR's actual head
+          # commit, populated for a same-repo PR) over workflow_run.head_sha
+          # (chatgpt-codex-connector PR7 #6Yap8b): workflow_run.head_sha is
+          # whatever SHA the upstream workflow itself ran against, and
+          # .github/workflows/validate.yml's checkout uses actions/checkout's
+          # DEFAULT ref — which for a pull_request-triggered run resolves to
+          # the synthetic test-merge commit, not the PR's real head branch
+          # commit. Checking that out here would make readLivePrState's
+          # expectedHeadSha systematically mismatch the PR's live headRefOid,
+          # so a workflow_run-triggered retry could never reach PASS. Keep
+          # workflow_run.head_sha as a final fallback for a fork PR (whose
+          # pull_requests[] is separately empty — the gate cannot resolve PR
+          # context there regardless of which SHA is checked out, so this
+          # fallback is inert rather than wrong in that case), then
+          # github.ref (workflow_dispatch with no PR context). The gate
+          # independently re-verifies the live head via gh and BLOCKS stale
+          # snapshots regardless.
+          ref: ${{ github.event.pull_request.head.sha || github.event.workflow_run.pull_requests[0].head.sha || github.event.workflow_run.head_sha || github.ref }}
           fetch-depth: 0
           # Do NOT persist the checkout's extra git credentials into the
           # local config: the full engine matrix then executes PR-controlled

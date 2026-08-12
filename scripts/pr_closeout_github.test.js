@@ -565,6 +565,27 @@ test('resolveCurrentJobDisplayName refuses to guess when multiple non-completed 
   assert.equal(resolved, null, 'an ambiguous non-completed match is not trustworthy — best-effort null, not a guess');
 });
 
+test('resolveCurrentJobDisplayName refuses a name shared with a genuinely different sibling job (chatgpt-codex-connector PR7 #6Yap8W)', async () => {
+  // Two DIFFERENT jobs (different runner_name, so uniquely resolvable on
+  // their own) happen to share the exact same displayed name. Returning
+  // that name would make classifyLivePrState's name-based self-exclusion
+  // ALSO exclude the sibling's own check entry, hiding a genuine sibling
+  // failure. The collision is visible directly in this same Jobs API
+  // response (both entries have name: 'gate'), so it must resolve to null
+  // rather than an ambiguous name — even though the CURRENT job's OWN
+  // active-match resolution (by runner_name) is perfectly unambiguous.
+  const runGh = async () => [{ jobs: [
+    { name: 'gate', runner_name: 'this-runner', status: 'in_progress', conclusion: null },
+    { name: 'gate', runner_name: 'other-runner', status: 'in_progress', conclusion: null },
+  ] }];
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+  });
+  assert.equal(resolved, null, 'a name shared with a different job in this run must not be trusted for self-exclusion');
+});
+
 test('resolveCurrentJobDisplayName is best-effort: null on missing env, API failure, or no match (CodeRabbit PR7 #6YXkRF)', async () => {
   const alwaysCalled = { called: false };
   const failingRunGh = async () => { alwaysCalled.called = true; throw new Error('API rate limited'); };

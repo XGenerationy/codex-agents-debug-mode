@@ -771,6 +771,28 @@ const buildWorkflowEnvironment = (env, config) => {
 // so a PR cannot exfiltrate credentials via repository-local preflight probes
 // by listing them in safeEnv. Once a run is attested, buildWorkflowEnvironment
 // (above) restores the explicit-allowlist behavior for legitimate credentials.
+//
+// KNOWN RESIDUAL LIMITATION (chatgpt-codex-connector PR7 #6YaZ5K, not fixed —
+// see the PR review thread for the full analysis): filtering the probe's OWN
+// spawn env does not stop it from reading an ANCESTOR process's environment.
+// On Linux, /proc/<pid>/environ is readable by any process sharing that
+// process's UID — not only its children — and reflects a process's env as of
+// its OWN execve(), unaffected by any later env filtering an ancestor
+// performs on ITS OWN process.env. Every process in this job's tree (the
+// runner's shell, this Node process, the spawned CLI, and the probe itself)
+// shares one UID, and GH_TOKEN reaches that tree via the WORKFLOW YAML's
+// `env:` on the very first step, before this file's own code ever runs — so
+// a sufficiently sophisticated probe can walk its parent chain and read
+// GH_TOKEN (and the denylisted runner command-file paths) directly from
+// procfs, bypassing this allowlist/denylist entirely. A real fix requires an
+// OS-level process/privilege boundary (a container, a different UID, or
+// restructuring which process ever holds the token) — out of scope for a
+// targeted change here. This defense still meaningfully raises the bar
+// against the more common case (a probe naively reading process.env
+// directly), and the token itself is scoped to this job's `permissions:`
+// block (contents/pull-requests/checks/statuses/actions — no repo-write,
+// no org-admin), which bounds the practical impact of a leak even if this
+// gap is exploited.
 const buildPlanPreflightEnvironment = (env, config) => {
   const filtered = buildWorkflowEnvironment(env, config);
   return Object.fromEntries(Object.entries(filtered).filter(([name]) => (

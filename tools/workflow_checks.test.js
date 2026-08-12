@@ -599,6 +599,22 @@ test('findUnpinnedUses strips trailing YAML comments before SUSPICIOUS_USES (Cod
   assert.equal(findUnpinnedUses('steps: [{uses: owner/action@main}]\n').length, 1,
     'a real flow uses: outside any comment is still flagged');
 });
+test('findUnpinnedUses keeps a plain-scalar apostrophe BEFORE the # from hiding the comment start (chatgpt-codex-connector PR7 #6Yap8e)', () => {
+  // Distinct from the #6X7tKy case above: there the apostrophe sits INSIDE
+  // the comment (after #), so a naive walker already reaches the real # while
+  // still un-quoted. Here the apostrophe sits in the PLAIN SCALAR CONTENT
+  // BEFORE the #, so a walker that treats every quote char as toggling state
+  // unconditionally (stripTrailingYamlComment's original bug — the position-
+  // aware fix already applied to isInsideQuotedScalar under #6YSoOn/#6YW1O6
+  // had never been ported to this function) wrongly opens a single-quoted
+  // string at "don't" and is still "inside" it when it reaches #, so the
+  // comment is never recognized — the unstripped comment text then reaches
+  // SUSPICIOUS_USES and gets flagged as a fake key.
+  assert.equal(findUnpinnedUses("name: don't # {uses: owner/action@main}\n").length, 0,
+    'a plain-scalar apostrophe before the # must not hide the trailing comment');
+  assert.equal(findUnpinnedUses('name: say "hi" # {uses: owner/action@main}\n').length, 0,
+    'a plain-scalar double-quote before the # must not hide the trailing comment either');
+});
 test('findUnpinnedUses handles mirrored single-quote cases in flow values (CodeRabbit #6X7tLA)', () => {
   assert.equal(findUnpinnedUses('steps: [{name: \'say "hi"\'}, {uses: owner/action@main}]\n').length, 1,
     'a double quote inside a single-quoted value must not suppress a later flow uses');
@@ -636,6 +652,63 @@ test('findUnpinnedUses flags flow uses after an apostrophe in a quoted value (Co
   // A uses genuinely inside a quoted value is still correctly suppressed.
   assert.equal(findUnpinnedUses('name: "steps: [{uses: owner/action@main}]"\n').length, 0,
     'a uses inside a complete double-quoted value is still not flagged');
+});
+
+test('findUnpinnedUses tracks a quoted scalar across physical lines (chatgpt-codex-connector PR7 #6YaZ5F)', () => {
+  // A double-quoted flow value can legally span physical lines (YAML folds
+  // the embedded newline to a space) with no trailing backslash needed. Each
+  // line was previously scanned with quote state reset fresh, so the scalar's
+  // CLOSING quote on a later line was mistaken for a NEW opener, hiding a
+  // real uses: key right after it on that same line (js-yaml verified:
+  // resolves to {name: "foo bar ", uses: "owner/action@main"}).
+  assert.equal(findUnpinnedUses('steps: [{name: "foo\n  bar\n  ", uses: owner/action@main}]\n').length, 1,
+    'a uses: key right after a multiline double-quoted scalar closes must still be flagged');
+  // Single-quoted scalars fold the same way and must be tracked identically.
+  assert.equal(findUnpinnedUses("steps: [{name: 'foo\n  bar\n  ', uses: owner/action@main}]\n").length, 1,
+    'a uses: key right after a multiline single-quoted scalar closes must still be flagged');
+  // Sanity, both directions at once: a uses:-shaped SUSPICIOUS_USES candidate
+  // (after a `,` flow boundary) on the MIDDLE continuation line, genuinely
+  // inside the still-open multiline string, must be suppressed by the
+  // carryover — while the REAL uses: key once the string actually closes on
+  // the next line must still be caught (js-yaml verified: resolves to
+  // {name: "foo x, uses: bar baz", uses: "owner/action@main"} — one real
+  // uses: key, not two).
+  assert.deepEqual(
+    findUnpinnedUses('steps: [{name: "foo\n  x, uses: bar\n  baz", uses: owner/action@main}]\n'),
+    [{ line: 3, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' }],
+    'a uses:-shaped fragment still inside the open string is suppressed; the real uses: key after it closes is still caught',
+  );
+});
+
+test('findUnpinnedUses requires trailing separation for a dash/question-mark quote-open marker (chatgpt-codex-connector PR7 #6Yap8Z)', () => {
+  // A real YAML sequence dash or explicit-key marker requires whitespace (or
+  // EOL) right after it to introduce the next token. `-"def`/`?"def` (no
+  // space) is ordinary plain-scalar CONTENT, not a marker — js-yaml verified:
+  // both resolve to the literal plain scalar (e.g. `-"def`), and the quote
+  // character is part of that scalar's text, not a real quote-open.
+  assert.equal(findUnpinnedUses('steps: [{name: -"def, uses: owner/action@main}]\n').length, 1,
+    'a dash immediately followed by a quote (no space) must not open a phantom quoted scalar');
+  assert.equal(findUnpinnedUses('steps: [{name: ?"def, uses: owner/action@main}]\n').length, 1,
+    'a question mark immediately followed by a quote (no space) must not open a phantom quoted scalar');
+  // Sanity: a genuine sequence dash / explicit-key marker (WITH separation)
+  // still correctly preserves quote-open context.
+  assert.equal(findUnpinnedUses('steps:\n  - "foo, uses: owner/action@main"\n').length, 0,
+    'a real sequence dash followed by whitespace still opens a genuine quoted scalar');
+});
+
+test('findUnpinnedUses strips a trailing comment before testing BLOCK_SCALAR_HEADER (chatgpt-codex-connector PR7 #6Yap8d)', () => {
+  // BLOCK_SCALAR_HEADER's own `\S.*:` prefix is greedy and, on a line whose
+  // trailing COMMENT itself contains a `key: |`-shaped fragment, can swallow
+  // past the real comment-start `#` and match the comment's own colon plus
+  // chomping indicator as if it were a genuine block-scalar header — falsely
+  // treating the line as opening a scalar and silently skipping its real
+  // (more-indented) body, which can contain a genuine unpinned uses:.
+  const doc = 'jobs: # bogus: |\n  build:\n    steps:\n      - uses: owner/action@main\n';
+  assert.deepEqual(findUnpinnedUses(doc), [{ line: 4, ref: 'owner/action@main' }],
+    'a block-scalar-shaped fragment inside a trailing comment must not hide the real, more-indented uses: below it');
+  // Sanity: a genuine block scalar header (no comment involved) still works.
+  const genuine = 'with:\n  script: |\n    const x = {uses: owner/action@main};\n';
+  assert.deepEqual(findUnpinnedUses(genuine), [], 'a real block-scalar header is unaffected');
 });
 
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {

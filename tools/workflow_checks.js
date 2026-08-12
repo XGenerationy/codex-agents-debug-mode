@@ -64,26 +64,60 @@ const COMMENT_LINE = /^\s*#/;
 // flags comment text as a key — both wrong. The truncation happens before the
 // SUSPICIOUS_USES check; the anchored block/flow regexes above do not need it
 // because they require a key-position start.
+//
+// The quote walker below is position-aware (a bare `'`/`"` only OPENS a quoted
+// scalar at a genuine quote-open position — start-of-line, after `:`/`{`/`[`/
+// `,` or transitively after `-`/`?`), mirroring isInsideQuotedScalar below.
+// This function originally used a NAIVE walker where every quote char toggled
+// state unconditionally, so a PLAIN scalar's own embedded apostrophe (`don't`)
+// was wrongly treated as opening a single-quoted string — the walker then
+// thought it was still "inside a string" through the rest of the line,
+// including its `#`, so the real trailing comment was never recognized and
+// stripped. The unstripped comment text then reached the SUSPICIOUS_USES scan
+// and could be flagged as a fake `uses:` key — `name: don't # {uses: ...}` is
+// safe workflow YAML falsely rejected (chatgpt-codex-connector PR7 #6Yap8e).
+// isInsideQuotedScalar had already been fixed for exactly this class of bug
+// (CodeRabbit #6YSoOn / #6YW1O6); this function had its own separate,
+// unfixed copy of the same defect — now ported to match.
 const stripTrailingYamlComment = (text) => {
+  const str = String(text);
   let inDouble = false;
   let inSingle = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
+  let atQuoteOpenContext = true; // start-of-string is always a valid quote-open context
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str[i];
     if (inDouble) {
-      if (ch === '\\') { i += 1; }
-      else if (ch === '"') inDouble = false;
-    } else if (inSingle) {
+      if (ch === '\\') { i += 1; } // skip the escaped char
+      else if (ch === '"') { inDouble = false; atQuoteOpenContext = false; }
+      continue;
+    }
+    if (inSingle) {
       if (ch === "'") {
-        if (text[i + 1] === "'") i += 1;
-        else inSingle = false;
+        if (str[i + 1] === "'") { i += 1; } // escaped '' — stay in string
+        else { inSingle = false; atQuoteOpenContext = false; }
       }
-    } else if (ch === '"') inDouble = true;
-    else if (ch === "'") inSingle = true;
-    else if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]))) {
-      return text.substring(0, i);
+      continue;
+    }
+    if (ch === '#' && (i === 0 || /\s/.test(str[i - 1]))) {
+      return str.substring(0, i);
+    }
+    if (ch === '"' && atQuoteOpenContext) {
+      inDouble = true;
+    } else if (ch === "'" && atQuoteOpenContext) {
+      inSingle = true;
+    } else if (ch === ':') {
+      const next = str[i + 1];
+      atQuoteOpenContext = next === undefined || /\s/.test(next);
+    } else if (TRANSITIVE_QUOTE_OPEN_CONTEXT.has(ch)) {
+      // Same rule as isInsideQuotedScalar: preserve context only when this
+      // marker is followed by whitespace/EOL (chatgpt-codex-connector PR7 #6Yap8Z).
+      const next = str[i + 1];
+      atQuoteOpenContext = atQuoteOpenContext && (next === undefined || /\s/.test(next));
+    } else if (!/\s/.test(ch)) {
+      atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
     }
   }
-  return text;
+  return str;
 };
 // True when the character at `matchIndex` in `text` sits inside a YAML quoted
 // scalar (single- or double-quoted). Used by the flow-boundary scanners
@@ -141,14 +175,22 @@ const stripTrailingYamlComment = (text) => {
 // whatever context preceded it).
 const QUOTE_OPEN_CONTEXT = new Set(['{', '[', ',']);
 const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
-const isInsideQuotedScalar = (text, matchIndex) => {
-  const str = String(text);
-  const beforeMatch = str.substring(0, matchIndex);
-  let inDouble = false;
-  let inSingle = false;
-  let atQuoteOpenContext = true; // start-of-string is always a valid quote-open context
-  for (let i = 0; i < beforeMatch.length; i += 1) {
-    const ch = beforeMatch[i];
+// Walks `str` from index 0 up to (not including) `endIndex`, applying the
+// same quote-open-context rules isInsideQuotedScalar and the cross-line
+// carryover computation both need — a single shared implementation so the
+// two cannot drift (matching this file's own stated policy after the
+// SUSPICIOUS_USES/isInsideQuotedScalar drift under CodeRabbit #6YSoOn).
+// `startState.inDouble`/`inSingle` seed an ALREADY-OPEN scalar carried over
+// from a previous line (chatgpt-codex-connector PR7 #6YaZ5F) — a fresh
+// per-line call passes `{inDouble: false, inSingle: false}`, matching the
+// original always-fresh behavior exactly (a quote can never be open at the
+// very start, so atQuoteOpenContext derives to `true`, same as before).
+const walkQuoteState = (str, endIndex, startState) => {
+  let inDouble = startState.inDouble;
+  let inSingle = startState.inSingle;
+  let atQuoteOpenContext = !inDouble && !inSingle;
+  for (let i = 0; i < endIndex; i += 1) {
+    const ch = str[i];
     if (inDouble) {
       if (ch === '\\') { i += 1; } // skip the escaped char
       else if (ch === '"') { inDouble = false; atQuoteOpenContext = false; }
@@ -156,7 +198,7 @@ const isInsideQuotedScalar = (text, matchIndex) => {
     }
     if (inSingle) {
       if (ch === "'") {
-        if (beforeMatch[i + 1] === "'") { i += 1; } // escaped '' — stay in string
+        if (str[i + 1] === "'") { i += 1; } // escaped '' — stay in string
         else { inSingle = false; atQuoteOpenContext = false; }
       }
       continue;
@@ -169,12 +211,26 @@ const isInsideQuotedScalar = (text, matchIndex) => {
       const next = str[i + 1];
       atQuoteOpenContext = next === undefined || /\s/.test(next);
     } else if (TRANSITIVE_QUOTE_OPEN_CONTEXT.has(ch)) {
-      // Preserve the current context as-is: valid stays valid (the marker
-      // introduces the next token), invalid stays invalid (it's just content).
+      // Preserve the current context, but ONLY when this marker is actually
+      // followed by whitespace/EOL: a real YAML sequence dash or explicit-key
+      // marker requires trailing separation to introduce the next token —
+      // `-"def` / `?"def` (no space) is ordinary plain-scalar content, not a
+      // marker, and the quote right after it is NOT a real quote-open
+      // (chatgpt-codex-connector PR7 #6Yap8Z). Valid stays valid only when
+      // separation follows; invalid always stays invalid either way.
+      const next = str[i + 1];
+      atQuoteOpenContext = atQuoteOpenContext && (next === undefined || /\s/.test(next));
     } else if (!/\s/.test(ch)) {
       atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
     }
   }
+  return { inDouble, inSingle };
+};
+// True when the character at `matchIndex` sits inside a YAML quoted scalar.
+// `startState` (default: not in a quote) seeds a scalar carried over from a
+// previous line — see walkQuoteState and findUnpinnedUses' per-line loop.
+const isInsideQuotedScalar = (text, matchIndex, startState = { inDouble: false, inSingle: false }) => {
+  const { inDouble, inSingle } = walkQuoteState(String(text), matchIndex, startState);
   return inDouble || inSingle;
 };
 // A double-quoted YAML mapping key at a block-style key position, capturing the
@@ -356,6 +412,18 @@ const findUnpinnedUses = (content) => {
   // the leading-whitespace `indent`, which is a different unit for seq items.
   let scalarHeaderKeyColumn = -1;
   let scalarExplicitIndent = 0;  // explicit block-scalar indent indicator (e.g. |2)
+  // Cross-line quote-scalar carryover: a double/single-quoted scalar INSIDE a
+  // flow mapping/sequence can legally continue across physical lines (YAML
+  // folds an embedded newline to a space in a double-quoted scalar, keeps it
+  // literal in a single-quoted one) — no trailing backslash is needed, unlike
+  // the explicit-key continuation folded above. isInsideQuotedScalar resets
+  // its quote state fresh at the start of every line, so a scalar's CLOSING
+  // quote on a later line was mistaken for a NEW opener, and a real `uses:`
+  // key right after it on that same line was hidden as if still inside a
+  // string (chatgpt-codex-connector PR7 #6YaZ5F). Tracks the state left open
+  // at the end of the previous line's raw text and seeds it into this line's
+  // isInsideQuotedScalar calls.
+  let quoteCarryover = { inDouble: false, inSingle: false };
   // Report any fold-overflow violations (CodeRabbit #6YEr9d): an explicit-key
   // quoted marker whose continuation exceeded the 16-line safety cap. The
   // partial line cannot be parsed by any downstream pattern, so without this
@@ -397,6 +465,14 @@ const findUnpinnedUses = (content) => {
     }
     // Comment lines never carry a YAML key.
     if (COMMENT_LINE.test(text)) return;
+    // Seed this line's quote-context walk with whatever the PREVIOUS line's
+    // raw text left open (chatgpt-codex-connector PR7 #6YaZ5F), then
+    // immediately compute this line's own end-of-line state for the NEXT
+    // line — independent of which branch below this line ultimately takes,
+    // since it depends only on this line's raw content and its own start
+    // state, not on how the rest of this callback processes it.
+    const lineStartQuoteState = quoteCarryover;
+    quoteCarryover = walkQuoteState(text, text.length, lineStartQuoteState);
     // A clean block-style uses: is parsed first — it is the one form whose ref
     // we can extract and pin-check.
     const match = USES_LINE.exec(text);
@@ -436,7 +512,7 @@ const findUnpinnedUses = (content) => {
       // (e.g. `name: "a, {\"u\\u0073es\": b}"` — the inner `{` is string
       // content, not a flow boundary). Mirrors the SUSPICIOUS_USES walker
       // (CodeRabbit #6YEr9a).
-      if (isInsideQuotedScalar(text, flowMatch.index)) continue;
+      if (isInsideQuotedScalar(text, flowMatch.index, lineStartQuoteState)) continue;
      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
        violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
        return;
@@ -450,7 +526,7 @@ const findUnpinnedUses = (content) => {
     // quoted scalar (e.g. `name: "a, *k: b"`) does not false-positive
     // (CodeRabbit #6YEr9a).
     for (const aliasMatch of text.matchAll(FLOW_ALIAS_KEY)) {
-      if (isInsideQuotedScalar(text, aliasMatch.index)) continue;
+      if (isInsideQuotedScalar(text, aliasMatch.index, lineStartQuoteState)) continue;
       violations.push({ line: index + 1, ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
@@ -513,7 +589,19 @@ const findUnpinnedUses = (content) => {
     // measured from the matched prefix so any post-dash whitespace is handled.
     // The empty-scalar sibling decision compares the next line's column against
     // the KEY column, never against the leading-whitespace indent (Qodo #10).
-    const scalarHeaderMatch = BLOCK_SCALAR_HEADER.exec(text);
+    //
+    // Tested against the COMMENT-STRIPPED line, not `text` — BLOCK_SCALAR_HEADER's
+    // own `\S.*:` prefix is greedy and, on a line whose trailing COMMENT itself
+    // contains a `key: |`-shaped fragment (`jobs: # bogus: |`), can swallow past
+    // the real comment-start `#` and match the comment's OWN colon+chomping
+    // indicator as if it were a genuine block-scalar header. That falsely marks
+    // this line as opening a scalar, and the block's real (more-indented) body —
+    // which can contain a genuine unpinned `uses:` — is then silently skipped as
+    // scalar content instead of scanned (chatgpt-codex-connector PR7 #6Yap8d).
+    // Scoped to this one test only — every OTHER check in this function already
+    // has its own `(?:#.*)?$` handling built into its own pattern and operates
+    // on `text` unchanged, so stripping here does not touch their behavior.
+    const scalarHeaderMatch = BLOCK_SCALAR_HEADER.exec(stripTrailingYamlComment(text));
     if (scalarHeaderMatch) {
       scalarPending = true;
       scalarExplicitIndent = Number(scalarHeaderMatch[1] || scalarHeaderMatch[2]) || 0;
@@ -584,7 +672,7 @@ const findUnpinnedUses = (content) => {
       // quoted content inside someone else's string" from "this key's own
       // quote marks are the only quoting present".
       const keyCandidateIndex = suspiciousMatch.index + suspiciousMatch[0].length - suspiciousMatch[1].length;
-      if (!isInsideQuotedScalar(stripped, keyCandidateIndex)) {
+      if (!isInsideQuotedScalar(stripped, keyCandidateIndex, lineStartQuoteState)) {
         violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
         break; // one violation per line is enough
       }

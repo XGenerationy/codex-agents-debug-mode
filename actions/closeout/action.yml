@@ -96,7 +96,20 @@ runs:
         if-no-files-found: ignore
 
     - name: Upsert PR comment
-      if: ${{ always() && inputs.pr-comment == 'true' }}
+      # steps.gate.outcome != 'skipped': when an EARLIER step (e.g. Set up
+      # Node.js) fails, "Run closeout gate" never executes at all — it never
+      # exported this invocation's CLOSEOUT_INVOCATION_NONCE to GITHUB_ENV
+      # (the very first thing it does), so commentSubcommand's own nonce
+      # check (chatgpt-codex-connector PR7 #6YaIao) treats that as "this job
+      # has no nonce" and its intentional backward-compat exemption skips the
+      # check entirely — a reused output-dir's PRE-EXISTING (unrelated,
+      # stale) action-state.json would then be accepted and posted to THIS
+      # PR as if it were this run's result (chatgpt-codex-connector PR7
+      # #6YaZ5H). 'failure' is deliberately still allowed through: when the
+      # gate step itself threw, its nonce WAS exported first, so the same
+      # nonce check correctly rejects any stale state on its own — no
+      # separate guard needed for that case.
+      if: ${{ always() && steps.gate.outcome != 'skipped' && inputs.pr-comment == 'true' }}
       shell: bash
       env:
         CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
@@ -104,7 +117,14 @@ runs:
       run: node "${{ github.action_path }}/support.js" comment
 
     - name: Apply gate verdict
-      if: always()
+      # Same reasoning as "Upsert PR comment" above: when the gate step never
+      # ran at all (outcome 'skipped'), finishSubcommand's nonce check has
+      # the identical backward-compat exemption and could apply a stale,
+      # unrelated verdict to this job. Skipping this step in that case does
+      # not let the job go green — GitHub Actions already marks the overall
+      # job's conclusion as failure because of the EARLIER step that failed
+      # and caused the skip, independent of what any later step does.
+      if: ${{ always() && steps.gate.outcome != 'skipped' }}
       shell: bash
       env:
         CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
