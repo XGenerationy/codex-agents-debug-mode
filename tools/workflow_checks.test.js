@@ -929,8 +929,12 @@ test('findUnpinnedUses does not flag flow-shaped keys inside a trailing YAML com
     [],
     'an alias-shaped token inside a trailing comment must not be flagged',
   );
+  // NOTE the DOUBLE backslash: a single `\u0073` is decoded by JavaScript
+  // itself, so the fixture would contain a plain `"uses"` key and would never
+  // reach the escape-decoding branch this case exists to cover. The YAML text
+  // must literally contain the six characters `\u0073` (CodeRabbit #6YvCPC).
   assert.deepEqual(
-    findUnpinnedUses('jobs:\n  a:\n    steps:\n      - name: build # {"u\u0073es": owner/action@main}\n'),
+    findUnpinnedUses('jobs:\n  a:\n    steps:\n      - name: build # {"u\\u0073es": owner/action@main}\n'),
     [],
     'an obfuscated quoted uses key inside a trailing comment must not be flagged',
   );
@@ -944,10 +948,18 @@ test('findUnpinnedUses still flags real flow-mapping keys after the comment-stri
     1,
     'a real flow alias key must still be flagged',
   );
-  assert.equal(
-    findUnpinnedUses('jobs:\n  a:\n    steps: [{"u\u0073es": owner/action@main}]\n').length,
-    1,
-    'a real obfuscated flow uses key must still be flagged',
+  // Double backslash again, for the same reason as above: this case must
+  // reach FLOW_QUOTED_USES_KEY's escape-decoding branch, not pass through
+  // SUSPICIOUS_USES on a plain `"uses"` key (CodeRabbit #6YvCPC). Assert the
+  // escape-branch MESSAGE, not just a non-zero count: both branches flag this
+  // input, so a count-only assertion would still pass if the flow scan broke
+  // and the generic fail-closed branch caught it instead.
+  const escaped = findUnpinnedUses('jobs:\n  a:\n    steps: [{"u\\u0073es": owner/action@main}]\n');
+  assert.equal(escaped.length, 1, 'a real obfuscated flow uses key must still be flagged');
+  assert.match(
+    escaped[0].ref,
+    /escape sequences/,
+    'the flow escape-decoding branch must be what catches it, not the generic non-block-style fallback',
   );
   // A `#` inside a carried-open quoted scalar is not a comment start, so a
   // real flow key on a LATER line is still reached and flagged.

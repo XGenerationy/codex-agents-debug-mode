@@ -385,7 +385,12 @@ const buildGhArgs = (args, { repo } = {}) => {
   if (sub === 'repo' && action === 'view') {
     const rest = [];
     for (let index = 2; index < args.length; index += 1) {
+      // Both spellings must go: `--repo <value>` (two tokens) and
+      // `--repo=<value>` (one token). Dropping only the separated form left
+      // the equals form in place, still producing an invalid
+      // `gh repo view --repo=owner/repo` (CodeRabbit #6YvCO6).
       if (args[index] === '--repo') { index += 1; continue; }
+      if (typeof args[index] === 'string' && args[index].startsWith('--repo=')) continue;
       rest.push(args[index]);
     }
     return ['repo', 'view', repository, ...rest];

@@ -1718,6 +1718,18 @@ test('buildGhArgs normalizes repo view even when --repo is supplied (CodeRabbit 
       ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner'],
       'flags after the dropped --repo pair must be preserved',
     );
+    // The equals spelling is a SINGLE token, so the two-token skip above does
+    // not catch it; it must be dropped on its own (CodeRabbit #6YvCO6).
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo=other/repo']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode'],
+      '--repo=<value> must be dropped too, not just --repo <value>',
+    );
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo=other/repo', '--json', 'nameWithOwner']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner'],
+      'flags after a dropped --repo=<value> token must be preserved',
+    );
     // pr view keeps its existing passthrough behaviour when --repo is present.
     const prArgs = ['pr', 'view', '--repo', 'other/repo', '--json', 'number'];
     assert.deepStrictEqual(buildGhArgs(prArgs), prArgs, 'pr view with an explicit --repo is unchanged');
