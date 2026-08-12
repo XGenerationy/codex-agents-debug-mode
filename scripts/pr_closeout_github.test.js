@@ -1699,6 +1699,34 @@ test('buildGhArgs passes through when --repo is already present', () => {
   assert.strictEqual(result, args);
 });
 
+test('buildGhArgs normalizes repo view even when --repo is supplied (CodeRabbit outside-diff)', () => {
+  // `gh repo view` takes its repository POSITIONALLY and rejects --repo as an
+  // unknown flag. The generic `--repo` passthrough used to short-circuit
+  // before the repo view branch, producing a command that always fails.
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  try {
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo', 'other/repo']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode'],
+      'a supplied --repo pair must be dropped in favour of the positional form',
+    );
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo', 'other/repo', '--json', 'nameWithOwner']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner'],
+      'flags after the dropped --repo pair must be preserved',
+    );
+    // pr view keeps its existing passthrough behaviour when --repo is present.
+    const prArgs = ['pr', 'view', '--repo', 'other/repo', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(prArgs), prArgs, 'pr view with an explicit --repo is unchanged');
+  } finally {
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+  }
+});
+
 test('buildGhArgs injects repository positionally for repo view under GITHUB_ACTIONS', () => {
   process.env.GITHUB_ACTIONS = 'true';
   process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';

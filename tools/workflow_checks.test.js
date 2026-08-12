@@ -917,3 +917,43 @@ test('the real validator passes on this repository (integration)', () => {
   assert.equal(result.status, 0, `validator failed:\n${result.stderr}`);
   assert.match(result.stdout, /"status":"PASS"/);
 });
+
+test('findUnpinnedUses does not flag flow-shaped keys inside a trailing YAML comment (CodeRabbit outside-diff)', () => {
+  // A trailing `#` comment is not YAML content, so a flow-mapping token inside
+  // one is not a key. The isInsideQuotedScalar walker does not suppress these
+  // (a comment is not a quoted scalar), so the flow scans must run against the
+  // comment-stripped line. The alias form below produced a spurious violation
+  // before this fix.
+  assert.deepEqual(
+    findUnpinnedUses('jobs:\n  a:\n    steps:\n      - name: build # {*key: ref}\n'),
+    [],
+    'an alias-shaped token inside a trailing comment must not be flagged',
+  );
+  assert.deepEqual(
+    findUnpinnedUses('jobs:\n  a:\n    steps:\n      - name: build # {"u\u0073es": owner/action@main}\n'),
+    [],
+    'an obfuscated quoted uses key inside a trailing comment must not be flagged',
+  );
+});
+
+test('findUnpinnedUses still flags real flow-mapping keys after the comment-strip change (CodeRabbit outside-diff)', () => {
+  // Guard against the fix over-suppressing: the same tokens in real flow
+  // position must still be caught.
+  assert.equal(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [{*key: ref}]\n').length,
+    1,
+    'a real flow alias key must still be flagged',
+  );
+  assert.equal(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [{"u\u0073es": owner/action@main}]\n').length,
+    1,
+    'a real obfuscated flow uses key must still be flagged',
+  );
+  // A `#` inside a carried-open quoted scalar is not a comment start, so a
+  // real flow key on a LATER line is still reached and flagged.
+  assert.equal(
+    findUnpinnedUses('jobs:\n  a:\n    name: "foo\n      # {*key: ref}"\n    steps: [{*k2: r}]\n').length,
+    1,
+    'a `#` inside a carried scalar must not swallow a later real flow key',
+  );
+});

@@ -1,7 +1,12 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { createStreamingSignalScanner, redactCredentialPatterns } = require('./pr_closeout_stream');
+const {
+  createProcessOutputRedactor,
+  createStreamingPatternRedactor,
+  createStreamingSignalScanner,
+  redactCredentialPatterns,
+} = require('./pr_closeout_stream');
 
 // A unique, self-contained marker whose prefix/suffix are not themselves
 // signals under `findMarker`, so a torn marker cannot be "detected" by
@@ -220,4 +225,138 @@ test('redactCredentialPatterns strips credentials embedded in git/gh diagnostics
   // Non-string / empty input is coerced safely.
   assert.equal(redactCredentialPatterns(undefined), '', 'undefined coerces to empty');
   assert.equal(redactCredentialPatterns(null), '', 'null coerces to empty');
+});
+
+// --- createStreamingPatternRedactor (CodeRabbit outside-diff
+// (pr_closeout_stream.js:23-69)): chunk-aware application of
+// CREDENTIAL_PATTERNS to live process output. The core property under test is
+// that a credential SPLIT ACROSS push() calls is still redacted exactly as
+// the one-shot helper would redact the whole stream.
+
+test('streaming pattern redactor matches one-shot output for every pathological chunk size', () => {
+  // A composite stream exercising every pattern family: a keyed and an
+  // unkeyed multi-line PEM block, a bare gh token, a URL credential, a
+  // standalone Bearer token, a key=value credential line, benign lines, and
+  // a trailing line with no terminator. Feeding it 1 char at a time is the
+  // torture case: every credential is guaranteed to straddle many chunk
+  // boundaries. Token literals are built by concatenation so the repo's own
+  // suppression scanner does not flag the fixture.
+  const ghpToken = ['ghp', '_', 'AbCdEf0123456789Zabcdefghij0123'].join('');
+  const composite = [
+    'plain diagnostic line',
+    `deploy used ${ghpToken} here`,
+    'curl: Bearer eyJ.SENTINEL-NOT-A-REAL-TOKEN acknowledged',
+    'fetch https://user:SENTINEL-NOT-A-REAL@host/path finished',
+    'error: private_key=-----BEGIN PLACEHOLDER KEY-----',
+    'SENTINELPEMBODYLINEONE==',
+    '-----END PLACEHOLDER KEY-----',
+    'stdout: -----BEGIN X509 CRL-----',
+    'SENTINELPEMBODYLINETWO',
+    '-----END X509 CRL-----',
+    'api_key=SENTINEL-NOT-A-REAL-KEY trailing-words',
+    'closing line with no terminator',
+  ].join('\n');
+  const expected = redactCredentialPatterns(composite);
+  // Sanity: the one-shot reference itself must not carry any sentinel.
+  assert.doesNotMatch(expected, /SENTINEL/, 'one-shot reference is fully redacted');
+  for (const chunkSize of [1, 2, 3, 5, 7, 64]) {
+    const redactor = createStreamingPatternRedactor();
+    let output = '';
+    for (let offset = 0; offset < composite.length; offset += chunkSize) {
+      output += redactor.push(composite.slice(offset, offset + chunkSize));
+    }
+    output += redactor.flush();
+    assert.equal(output, expected, `chunk size ${chunkSize} must reproduce the one-shot redaction`);
+  }
+});
+
+test('streaming pattern redactor bridges a Bearer token wrapped onto the next line', () => {
+  // The one-shot Bearer pattern crosses the newline (`\bBearer\s+<token>`),
+  // so the streaming stage must hold a line-final `Bearer` keyword back until
+  // the (possible) token arrives rather than emitting the keyword and later
+  // leaking the bare token with no recognizable prefix.
+  const redactor = createStreamingPatternRedactor();
+  let output = redactor.push('log: Bearer');
+  output += redactor.push('\n');
+  output += redactor.push('SENTINEL-NOT-A-REAL-TOKEN.abc\n');
+  output += redactor.flush();
+  assert.equal(output, redactCredentialPatterns('log: Bearer\nSENTINEL-NOT-A-REAL-TOKEN.abc\n'));
+  assert.doesNotMatch(output, /SENTINEL/, 'the wrapped token must not leak');
+});
+
+test('streaming pattern redactor caps an unclosed PEM block and fails safe, then resynchronizes', () => {
+  // A child that emits `-----BEGIN ...-----` and never (or only much later)
+  // an END must not grow the buffer without bound. At the cap the held block
+  // becomes its marker and input is DISCARDED until the closer — the body is
+  // never emitted to escape the cap. The closer is deliberately split across
+  // two pushes to prove the resync window survives chunk boundaries.
+  const redactor = createStreamingPatternRedactor({ maxPending: 256 });
+  let output = redactor.push('stdout: -----BEGIN PLACEHOLDER KEY-----\n');
+  for (let line = 0; line < 10; line += 1) {
+    output += redactor.push(`${'A'.repeat(64)}\n`); // > maxPending in total
+  }
+  output += redactor.push('-----END PLACEHO');
+  output += redactor.push('LDER KEY-----\nafter\n');
+  output += redactor.flush();
+  assert.equal(output, 'stdout: [REDACTED:pem-block]\nafter\n');
+  assert.doesNotMatch(output, /AAAA/, 'no PEM body byte may be emitted, even past the cap');
+});
+
+test('streaming pattern redactor redacts a PEM block left unclosed at end of stream', () => {
+  // Deliberate safe-side divergence from the one-shot helper: with no END
+  // fence redactCredentialPatterns leaves the partial block raw (its PEM
+  // patterns require the closer). A child killed mid-dump must not leak the
+  // body it managed to write, so flush() replaces opener-to-end with the
+  // marker instead.
+  const redactor = createStreamingPatternRedactor();
+  let output = redactor.push('x: -----BEGIN PLACEHOLDER KEY-----\nSENTINELPEMBODY==\n');
+  output += redactor.flush();
+  assert.equal(output, 'x: [REDACTED:pem-block]');
+});
+
+test('streaming pattern redactor caps an unterminated credential line without leaking its tail', () => {
+  // `token=<endless value>` with no newline: at the cap the generic key=value
+  // match touches the window edge, so its unseen continuation is part of the
+  // credential. The window is emitted redacted and the REST OF THE LINE is
+  // discarded — emitting it raw later (once the `token=` context was gone)
+  // would leak the value's tail.
+  const redactor = createStreamingPatternRedactor({ maxPending: 128 });
+  let output = redactor.push(`token=${'a'.repeat(400)}`);
+  output += redactor.push('a'.repeat(100));
+  output += redactor.push('\nnext line\n');
+  output += redactor.flush();
+  assert.equal(output, 'token=[REDACTED]\nnext line\n');
+  assert.doesNotMatch(output, /aaaa/, 'no fragment of the over-cap value may be emitted');
+});
+
+test('streaming pattern redactor preserves a benign over-cap line instead of dropping it', () => {
+  // The cap must be a memory bound, not a data destroyer: a giant single-line
+  // output with no credential in it (minified JSON, progress dumps) flows
+  // through the overflow path unchanged, emitted incrementally.
+  const redactor = createStreamingPatternRedactor({ maxPending: 128 });
+  const line = 'y'.repeat(1000);
+  let output = '';
+  for (let offset = 0; offset < line.length; offset += 300) {
+    output += redactor.push(line.slice(offset, offset + 300));
+  }
+  output += redactor.push('\n');
+  output += redactor.flush();
+  assert.equal(output, `${line}\n`);
+});
+
+test('process-output redactor layers env-value and pattern redaction over raw Buffer chunks', () => {
+  // The composed stack used by spawnCaptured: UTF-8 decode → env-value
+  // replacements → pattern redaction. Fed 3-byte Buffer slices so the
+  // multi-byte character is split mid-code-point AND both credentials are
+  // split across pushes.
+  const secret = 'env-secret-value-123';
+  const redactor = createProcessOutputRedactor({ MY_TOKEN: secret }, ['MY_TOKEN']);
+  const text = `naïve val=${secret} Bearer SENTINEL-NOT-A-REAL-TOKEN done\n`;
+  const bytes = Buffer.from(text, 'utf8');
+  let output = '';
+  for (let offset = 0; offset < bytes.length; offset += 3) {
+    output += redactor.push(bytes.subarray(offset, offset + 3));
+  }
+  output += redactor.flush();
+  assert.equal(output, 'naïve val=[REDACTED] Bearer [REDACTED:token] done\n');
 });

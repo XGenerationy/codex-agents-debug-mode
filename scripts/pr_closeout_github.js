@@ -373,17 +373,29 @@ const buildGhArgs = (args, { repo } = {}) => {
   if (process.env.GITHUB_ACTIONS !== 'true') return args;
   const repository = process.env.GITHUB_REPOSITORY || '';
   if (!repository.includes('/')) return args;
-  if (args.includes('--repo')) return args;
 
   const [sub, action] = args;
+  // `repo view` is normalized BEFORE the generic `--repo` passthrough below
+  // (CodeRabbit outside-diff finding on this function). `gh repo view` takes
+  // its repository POSITIONALLY and rejects `--repo` as an unknown flag, so
+  // letting a caller-supplied `--repo` short-circuit out of here produced a
+  // command that always fails. Any supplied `--repo <value>` pair is dropped
+  // and replaced by the positional form; the value is redundant, since
+  // GITHUB_REPOSITORY is the repository this run belongs to.
+  if (sub === 'repo' && action === 'view') {
+    const rest = [];
+    for (let index = 2; index < args.length; index += 1) {
+      if (args[index] === '--repo') { index += 1; continue; }
+      rest.push(args[index]);
+    }
+    return ['repo', 'view', repository, ...rest];
+  }
+  if (args.includes('--repo')) return args;
+
   if (sub === 'pr' && action === 'view') {
     const number = readActionsPrNumber({ env: process.env });
     if (!number) return args;
     return ['pr', 'view', String(number), ...args.slice(2), '--repo', repository];
-  }
-  if (sub === 'repo' && action === 'view') {
-    // gh repo view takes the repository positionally; --repo is not a valid flag
-    return ['repo', 'view', repository, ...args.slice(2)];
   }
   return args;
 };

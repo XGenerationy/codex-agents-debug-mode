@@ -27,10 +27,14 @@ const isSensitiveEnvName = (name) => {
 // (e.g. a git remote URL embedding x-access-token:TOKEN, a gh error echoing an
 // Authorization header, or a literal ghp_ token in a URL). Applied at the CLI's
 // top-level error emission so neither stderr nor the machine-readable BLOCKED
-// JSON record carries a raw credential. A false positive (redacting a non-secret
-// token-shaped string) is harmless; a miss is a credential exposure, so the set
-// is deliberately broad. Mirrors actions/closeout/support.js's REDACT_PATTERNS
-// so the action layer and the gate CLI agree on what a credential looks like.
+// JSON record carries a raw credential, AND — via
+// createStreamingPatternRedactor below — to live child-process output, where
+// a chunk-aware stage is required because a credential can straddle a chunk
+// boundary (CodeRabbit outside-diff (pr_closeout_stream.js:23-69)). A false
+// positive (redacting a non-secret token-shaped string) is harmless; a miss is
+// a credential exposure, so the set is deliberately broad. Mirrors
+// actions/closeout/support.js's REDACT_PATTERNS so the action layer and the
+// gate CLI agree on what a credential looks like.
 const CREDENTIAL_PATTERNS = [
   // PEM-encoded secrets that span multiple physical lines (a private_key /
   // signing_key value is commonly a `-----BEGIN <TYPE>-----` ... `-----END
@@ -389,6 +393,375 @@ const createDecodedRedactor = (env = process.env, names = []) => {
   };
 };
 
+// ---------------------------------------------------------------------------
+// Chunk-aware application of CREDENTIAL_PATTERNS to live process output.
+//
+// CodeRabbit outside-diff (pr_closeout_stream.js:23-69): the live
+// child-process output path applied ONLY the env-value replacements
+// (createStreamingRedactor); CREDENTIAL_PATTERNS was used nowhere on that
+// path, so a standalone Bearer token or PEM block that is not a known env
+// value reached emitSafe unredacted. redactCredentialPatterns cannot simply
+// be applied to each chunk independently because a credential can straddle a
+// chunk boundary; createStreamingPatternRedactor below buffers just enough
+// input that every emitted span carries the same redactions the one-shot
+// helper would produce over the whole stream, within the bounded-memory
+// limits documented on the factory.
+// ---------------------------------------------------------------------------
+
+// PEM framing used for hold/resync decisions. Must stay in sync with the two
+// PEM entries in CREDENTIAL_PATTERNS above (same `-{5}` fence and label
+// charset). An opener/closer never contains a line terminator, so each is
+// always fully contained in one physical line.
+const PEM_OPENER = /-{5}BEGIN [A-Z0-9 -]+-{5}/g;
+const PEM_CLOSER = /-{5}END [A-Z0-9 -]+-{5}/g;
+// Left-hand side of the KEYED PEM pattern (`private_key=-----BEGIN...`),
+// anchored to end-of-prefix. When an unclosed opener is held back, the key
+// name and separator immediately before it must be held with it so the keyed
+// pattern later consumes them exactly like the one-shot reduce does. `\s`
+// deliberately crosses newlines, mirroring `\s*[:=]\s*` in the keyed pattern.
+const PEM_KEYED_PREFIX_TAIL = /\b(?:private[_-]?key|signing[_-]?key|client[_-]?secret|certificate|cert)\s*[:=]\s*$/;
+// A `Bearer` keyword whose token may not have arrived yet. The one-shot
+// pattern bridges ANY run of whitespace (`\bBearer\s+<token>`); bridging
+// unbounded whitespace in a streaming hold would let a hostile stream pin the
+// buffer, so only up to 16 whitespace characters are bridged — enough for the
+// realistic `Bearer<space>` and `Bearer\n<indent>` log-wrapping shapes. A
+// keyword separated from its token by more whitespace than that is NOT
+// bridged (named residual gap; the bare token may then miss redaction unless
+// another pattern — e.g. the gh-token shape — still matches it).
+const BEARER_TAIL = /\bBearer\s{0,16}$/i;
+// Union of the value character classes of the single-line credential
+// patterns (gh tokens use [A-Za-z0-9_]; bare Bearer tokens use
+// [A-Za-z0-9._~+/=-]). The overflow path refuses to cut inside a contiguous
+// run of these characters (up to a bound) so it cannot strand a
+// too-short-to-match prefix — e.g. `ghp_` plus 18 of its 20+ required
+// trailing characters — on the emitted side of the cut.
+const TOKEN_RUN_CHAR = /[A-Za-z0-9._~+/=-]/;
+// While resynchronizing after an over-cap PEM block was replaced with its
+// marker, this much tail is retained so a `-----END <TYPE>-----` closer is
+// still recognized when it arrives split across chunk boundaries. A closer
+// whose type label exceeds this window is not detected — discard then
+// continues indefinitely, which fails SAFE (output suppression, never
+// credential leakage).
+const PEM_DISCARD_RETAIN = 512;
+
+/**
+ * Index of the first complete PEM opener in `text` that has no complete
+ * closer after it, or -1. Closed BEGIN..END pairs are skipped the same way
+ * the lazy `[\s\S]*?` in CREDENTIAL_PATTERNS pairs each opener with the
+ * earliest following closer.
+ * @param {string} text
+ * @returns {number}
+ */
+const findUnclosedPemOpener = (text) => {
+  let from = 0;
+  for (;;) {
+    PEM_OPENER.lastIndex = from;
+    const opener = PEM_OPENER.exec(text);
+    PEM_OPENER.lastIndex = 0;
+    if (!opener) return -1;
+    PEM_CLOSER.lastIndex = opener.index + opener[0].length;
+    const closer = PEM_CLOSER.exec(text);
+    PEM_CLOSER.lastIndex = 0;
+    if (!closer) return opener.index;
+    from = closer.index + closer[0].length;
+  }
+};
+
+/**
+ * Where the hold for an unclosed PEM opener must start: the beginning of a
+ * keyed `private_key=`-style prefix immediately before the opener when one is
+ * present (so the keyed CREDENTIAL_PATTERNS entry can consume it whole,
+ * matching one-shot semantics), otherwise the opener itself.
+ * @param {string} text
+ * @param {number} openerIndex
+ * @returns {number}
+ */
+const pemHoldStart = (text, openerIndex) => {
+  const keyed = text.slice(0, openerIndex).search(PEM_KEYED_PREFIX_TAIL);
+  return keyed >= 0 ? keyed : openerIndex;
+};
+
+/**
+ * Every CREDENTIAL_PATTERNS match in `text` as [start, end) spans. Used only
+ * by the overflow path to decide whether a suspected credential touches the
+ * end of an over-cap window (and may therefore continue into unseen input)
+ * and to keep a cut from tearing a complete match in two.
+ * @param {string} text
+ * @returns {[number, number][]}
+ */
+const collectCredentialSpans = (text) => {
+  const spans = [];
+  for (const [pattern] of CREDENTIAL_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match = pattern.exec(text);
+    while (match) {
+      if (match[0].length === 0) {
+        pattern.lastIndex += 1; // zero-width safety; no current pattern can match empty
+      } else {
+        spans.push([match.index, match.index + match[0].length]);
+      }
+      match = pattern.exec(text);
+    }
+    pattern.lastIndex = 0;
+  }
+  return spans;
+};
+
+/**
+ * Incremental, chunk-boundary-safe application of CREDENTIAL_PATTERNS
+ * (CodeRabbit outside-diff (pr_closeout_stream.js:23-69)). `push(chunk)`
+ * returns the redacted text that is safe to emit so far; `flush()` must be
+ * called once the source is exhausted to drain and redact the held tail.
+ *
+ * Boundary strategy — the fixed-length hold-back used by
+ * createStreamingReplacer does not transfer to regex patterns (matches are
+ * unbounded and a PEM block spans many lines), so this stage holds back, on
+ * every push:
+ *  1. the trailing line with no terminator yet — every non-PEM pattern match
+ *     is contained in one physical line (their value charsets exclude
+ *     terminators and the generic key=value pattern is `$`-anchored per
+ *     line), so completed lines are safe to emit;
+ *  2. everything from an unclosed `-----BEGIN ...-----` opener (plus a keyed
+ *     `private_key=`-style prefix directly before it) — a PEM match needs its
+ *     closer, so emitting any part of the block early would tear it;
+ *  3. a trailing `Bearer` keyword bridged by at most 16 whitespace chars,
+ *     whose token may still be in flight across a line wrap.
+ * Each emitted segment is then redacted with the same one-shot reduce, so for
+ * input within the buffer cap the concatenated output is byte-identical to
+ * `redactCredentialPatterns(wholeStream)` — verified by the chunk-size sweep
+ * in pr_closeout_stream.test.js — with one deliberate safe-side divergence:
+ * an unclosed PEM opener still pending at flush() (or past the cap) becomes
+ * `[REDACTED:pem-block]` even though the one-shot helper, lacking a closer,
+ * would have emitted the block body raw.
+ *
+ * Bounded buffer: the held tail never exceeds `maxPending`. At the cap the
+ * stage FAILS SAFE — a suspected credential span is never emitted unredacted
+ * to reclaim memory:
+ *  - unclosed PEM past the cap: the held region is replaced with
+ *    `[REDACTED:pem-block]` and input is DISCARDED until a closer arrives
+ *    (a stream that opens a block and never closes it therefore has its
+ *    subsequent output suppressed, not leaked);
+ *  - an unterminated over-cap line whose window ends inside a pattern match
+ *    (e.g. `token=<endless value>`): the window is emitted redacted and the
+ *    rest of that line is DISCARDED, because the match's continuation is by
+ *    definition part of the suspected credential;
+ *  - otherwise (no suspect at the window edge) the window is emitted
+ *    redacted, cutting only at a point that no complete match straddles and
+ *    that does not split a contiguous token-shaped run (bounded look-back),
+ *    and the small tail is retained — benign over-cap lines (e.g. giant
+ *    single-line JSON) are preserved, not dropped.
+ *
+ * NOT guaranteed (named residual gaps, all cap- or bound-scoped):
+ *  - a `Bearer` keyword separated from its token by more than 16 whitespace
+ *    characters is not bridged across an emit boundary;
+ *  - in the over-cap window path, a contiguous token-shaped run longer than
+ *    the look-back bound (1024 chars at the default cap) can still be torn,
+ *    stranding an unmatched prefix on the emitted side, and a PEM opener
+ *    straddling the overflow cut itself is not recognized;
+ *  - after an over-cap PEM replacement, a closer whose type label exceeds
+ *    PEM_DISCARD_RETAIN is not recognized (discard continues — fail-safe);
+ *  - patterns added to CREDENTIAL_PATTERNS later must keep the invariants
+ *    above (single-line, or PEM-framed) or extend the hold rules.
+ * @param {{maxPending?: number}} [options]
+ * @returns {{push: (chunk: unknown) => string, flush: () => string}}
+ */
+const createStreamingPatternRedactor = ({ maxPending = 65_536 } = {}) => {
+  // Overflow-cut guards scale down for test-sized caps; at the production
+  // default they are 256 (blind guard) and 1024 (token-run look-back).
+  const overflowGuard = Math.max(16, Math.min(256, maxPending >> 2));
+  const runBound = Math.max(overflowGuard, Math.min(1024, maxPending >> 1));
+  let pending = '';
+  // 'normal' | 'pem-discard' (over-cap PEM replaced by its marker; drop input
+  // until its closer) | 'line-discard' (over-cap unterminated line ending in
+  // a suspected credential; drop input until a line terminator).
+  let mode = 'normal';
+  const drain = () => {
+    let output = '';
+    for (;;) {
+      if (mode === 'pem-discard') {
+        PEM_CLOSER.lastIndex = 0;
+        const closer = PEM_CLOSER.exec(pending);
+        PEM_CLOSER.lastIndex = 0;
+        if (!closer) {
+          // Keep only enough tail to recognize a closer split across chunks.
+          if (pending.length > PEM_DISCARD_RETAIN) pending = pending.slice(-PEM_DISCARD_RETAIN);
+          return output;
+        }
+        pending = pending.slice(closer.index + closer[0].length);
+        mode = 'normal';
+        continue;
+      }
+      if (mode === 'line-discard') {
+        const terminator = pending.search(/[\r\n]/);
+        if (terminator < 0) {
+          pending = '';
+          return output;
+        }
+        // Keep the terminator itself so downstream line structure survives.
+        pending = pending.slice(terminator);
+        mode = 'normal';
+        continue;
+      }
+      // Normal mode. Everything up to (and including) the last line
+      // terminator is the emit candidate; the trailing unterminated line is
+      // held (hold rule 1). `\r` counts as a terminator because the
+      // m-flagged `$` in the generic key=value pattern anchors there too.
+      let boundary = Math.max(pending.lastIndexOf('\n'), pending.lastIndexOf('\r')) + 1;
+      // Hold rule 2 must be evaluated on the CANDIDATE, not all of pending: a
+      // block whose closer sits in the unterminated trailing line is closed
+      // in `pending` but would still be torn if the candidate (which stops at
+      // the last terminator, BEFORE that closer) were emitted.
+      const candidate = pending.slice(0, boundary);
+      const opener = findUnclosedPemOpener(candidate);
+      if (opener >= 0) {
+        boundary = Math.min(boundary, pemHoldStart(candidate, opener));
+      } else {
+        // Hold rule 3. Only when no PEM hold applies: the one-shot reduce
+        // consumes a PEM block before the Bearer pattern can see it, so the
+        // PEM hold subsumes any Bearer bridging into the block.
+        const bearerIndex = candidate.search(BEARER_TAIL);
+        if (bearerIndex >= 0) boundary = bearerIndex;
+      }
+      if (pending.length - boundary <= maxPending) {
+        output += redactCredentialPatterns(pending.slice(0, boundary));
+        pending = pending.slice(boundary);
+        return output;
+      }
+      // Held tail exceeds the cap. Emit the safe prefix, then fail SAFE on
+      // the held region (see the factory doc for the exact contract).
+      output += redactCredentialPatterns(pending.slice(0, boundary));
+      const held = pending.slice(boundary);
+      pending = '';
+      if (opener >= 0) {
+        // The held region is an unclosed PEM block (opener + body so far).
+        // Its body is credential material: replace it with the marker and
+        // discard until the closer. Never emit it raw to escape the cap.
+        output += '[REDACTED:pem-block]';
+        mode = 'pem-discard';
+        return output;
+      }
+      const spans = collectCredentialSpans(held);
+      if (spans.some(([, end]) => end === held.length)) {
+        // A pattern match runs to the very edge of the window — its value may
+        // continue in unseen input (`token=<endless>`: the m-flagged `$`
+        // matches at end-of-string, so an unterminated key=value always lands
+        // here). Emit the window redacted (the match becomes its replacement,
+        // standing in for the unseen continuation too) and drop the rest of
+        // the line.
+        output += redactCredentialPatterns(held);
+        mode = 'line-discard';
+        return output;
+      }
+      // No suspect at the window edge: emit most of the window and RETAIN a
+      // small tail (no data loss for benign over-cap lines). Walk the cut
+      // back so it neither splits a contiguous token-shaped run (which could
+      // strand an unmatched credential prefix on the emitted side) nor tears
+      // a complete match, nor strands a trailing `Bearer`.
+      let cut = held.length - overflowGuard;
+      for (let steps = 0; cut > 0 && steps < runBound && TOKEN_RUN_CHAR.test(held[cut - 1]); steps += 1) {
+        cut -= 1;
+      }
+      const bearerCut = held.slice(0, cut).search(BEARER_TAIL);
+      if (bearerCut >= 0) cut = bearerCut;
+      for (let moved = true; moved;) {
+        moved = false;
+        for (const [start, end] of spans) {
+          if (start < cut && end > cut) {
+            cut = start;
+            moved = true;
+          }
+        }
+      }
+      if (cut <= 0) {
+        // Degenerate: the whole window is one un-cuttable suspect region.
+        // Same fail-safe treatment as a window-edge match.
+        output += redactCredentialPatterns(held);
+        mode = 'line-discard';
+        return output;
+      }
+      output += redactCredentialPatterns(held.slice(0, cut));
+      pending = held.slice(cut);
+      return output;
+    }
+  };
+  return {
+    push(chunk) {
+      pending += String(chunk ?? '');
+      return drain();
+    },
+    flush() {
+      const remainder = pending;
+      pending = '';
+      if (mode !== 'normal') {
+        // pem-discard: the block's marker was already emitted and its closer
+        // never arrived; line-discard: the redacted stand-in for the
+        // over-cap line was already emitted. The retained resync tail can
+        // only contain suspect bytes — dropping it is the fail-safe choice.
+        mode = 'normal';
+        return '';
+      }
+      const opener = findUnclosedPemOpener(remainder);
+      if (opener >= 0) {
+        // Deliberate safe-side divergence from the one-shot helper: with no
+        // closer, redactCredentialPatterns would emit the partial block RAW
+        // (its PEM patterns require the END fence). A child killed mid-dump
+        // must not leak the body it managed to write, so the partial block
+        // becomes the marker instead.
+        const cut = pemHoldStart(remainder, opener);
+        return redactCredentialPatterns(remainder.slice(0, cut)) + '[REDACTED:pem-block]';
+      }
+      return redactCredentialPatterns(remainder);
+    },
+  };
+};
+
+/**
+ * The full redaction stack for live child-process output: UTF-8 decoding
+ * (Buffer chunks split inside a multi-byte character are completed first),
+ * then env-VALUE replacements (createStreamingRedactor), then chunk-aware
+ * CREDENTIAL_PATTERNS redaction (createStreamingPatternRedactor). This is
+ * what spawnCaptured wires into emitSafe, closing CodeRabbit outside-diff
+ * (pr_closeout_stream.js:23-69): before this, a standalone Bearer token or
+ * PEM block that was not a known env value flowed to the captured
+ * stdout/stderr and the evidence log unredacted.
+ *
+ * Ordering — value replacement runs BEFORE pattern redaction, deliberately:
+ *  1. the value replacer's needles are literal secret strings, so its
+ *     correctness is only provable against the byte stream exactly as the
+ *     child emitted it — running it first means no reasoning is needed about
+ *     whether a pattern rewrite could alter or split a needle occurrence
+ *     before the value layer sees it;
+ *  2. defense in depth: the value layer is the precise, high-confidence
+ *     redactor (exact known secrets including encoded variants); the pattern
+ *     layer is the heuristic net. If one of the pattern stage's documented
+ *     residual gaps lets a span through, known env secrets are already gone
+ *     from it;
+ *  3. the reverse order gains nothing: pattern replacements insert only
+ *     literal `[REDACTED...]` markers, which contain no secret material and
+ *     match no credential pattern, so value-first loses no pattern coverage.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string[]} names explicit secret env-var names, forwarded to `createStreamingRedactor`.
+ * @param {{maxPatternPending?: number}} [options] test hook for the pattern stage's buffer cap.
+ * @returns {{push: (chunk: Buffer|string) => string, flush: () => string}}
+ */
+const createProcessOutputRedactor = (env = process.env, names = [], { maxPatternPending } = {}) => {
+  const decoder = new StringDecoder('utf8');
+  const valueRedactor = createStreamingRedactor(env, names);
+  const patternRedactor = createStreamingPatternRedactor(
+    maxPatternPending === undefined ? {} : { maxPending: maxPatternPending },
+  );
+  return {
+    push(chunk) {
+      const decoded = Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk ?? '');
+      return patternRedactor.push(valueRedactor.push(decoded));
+    },
+    flush() {
+      const tail = valueRedactor.push(decoder.end()) + valueRedactor.flush();
+      return patternRedactor.push(tail) + patternRedactor.flush();
+    },
+  };
+};
+
 /**
  * Streaming line-buffered scanner: `findSignals` only ever sees complete
  * lines (a partial trailing line is buffered until its newline arrives), and
@@ -462,6 +835,8 @@ module.exports = {
   buildChildEnvironment,
   buildSecretReplacements,
   createDecodedRedactor,
+  createProcessOutputRedactor,
+  createStreamingPatternRedactor,
   createStreamingRedactor,
   createStreamingReplacer,
   createStreamingSignalScanner,

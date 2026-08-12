@@ -556,13 +556,29 @@ const findUnpinnedUses = (content) => {
     // (CodeRabbit 3745322365) — `.exec` returns only the first. Same
     // raw !== decoded guard so a plain flow `{"uses": ref}` falls through to
     // SUSPICIOUS_USES.
-   for (const flowMatch of text.matchAll(FLOW_QUOTED_USES_KEY)) {
+    // Both flow scans below run against the COMMENT-STRIPPED line, not the
+    // raw one (CodeRabbit outside-diff finding on this function). A trailing
+    // YAML comment is not YAML content, so a flow-shaped token inside one is
+    // not a key: `- name: build # {*key: ref}` was reported as an alias-key
+    // violation, and `# {"uses": ref}` sits in the same position. The
+    // isInsideQuotedScalar walker below does not suppress these, because a
+    // comment is not a quoted scalar. Verified empirically before and after:
+    // the alias form produced a spurious violation and now produces none,
+    // while a real `steps: [{*key: ref}]` still flags.
+    //
+    // stripTrailingYamlComment takes lineStartQuoteState so a `#` INSIDE a
+    // carried-open scalar is not mistaken for a comment start. Indices from
+    // matchAll then refer to the stripped string, so the same stripped string
+    // is what gets handed to isInsideQuotedScalar — mixing the two would
+    // misalign the offsets.
+    const flowScanText = stripTrailingYamlComment(text, lineStartQuoteState);
+   for (const flowMatch of flowScanText.matchAll(FLOW_QUOTED_USES_KEY)) {
      const raw = flowMatch[1];
       // Suppress matches whose boundary character sits inside a quoted scalar
       // (e.g. `name: "a, {\"u\\u0073es\": b}"` — the inner `{` is string
       // content, not a flow boundary). Mirrors the SUSPICIOUS_USES walker
       // (CodeRabbit #6YEr9a).
-      if (isInsideQuotedScalar(text, flowMatch.index, lineStartQuoteState)) continue;
+      if (isInsideQuotedScalar(flowScanText, flowMatch.index, lineStartQuoteState)) continue;
      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
        violations.push({ line: lineNumbers[index], ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
        return;
@@ -575,8 +591,8 @@ const findUnpinnedUses = (content) => {
     // and apply the quote-context walker so an alias-shaped token inside a
     // quoted scalar (e.g. `name: "a, *k: b"`) does not false-positive
     // (CodeRabbit #6YEr9a).
-    for (const aliasMatch of text.matchAll(FLOW_ALIAS_KEY)) {
-      if (isInsideQuotedScalar(text, aliasMatch.index, lineStartQuoteState)) continue;
+    for (const aliasMatch of flowScanText.matchAll(FLOW_ALIAS_KEY)) {
+      if (isInsideQuotedScalar(flowScanText, aliasMatch.index, lineStartQuoteState)) continue;
       violations.push({ line: lineNumbers[index], ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
