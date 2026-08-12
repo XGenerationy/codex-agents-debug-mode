@@ -134,10 +134,20 @@ const stripTrailingYamlComment = (text, startState = { inDouble: false, inSingle
 // that follows. `{? "uses": ref}` (a genuine explicit-key marker right after
 // `{`) and `- 'value'` (a genuine sequence dash at line start) correctly
 // preserve context, because in both cases it was already valid when the
-// character was reached. `{`, `[`, and `,` do NOT need this treatment: YAML
-// forbids them inside a flow-context plain scalar entirely, so unlike
-// `?`/`-` they can never appear as ambiguous literal content in the position
-// that matters here — a flat membership check for them is safe.
+// character was reached. `{`, `[`, and `,` need the same treatment for the
+// same reason, tracked with an explicit flow-depth counter. YAML forbids them
+// inside a plain scalar only in FLOW context; in BLOCK context they are
+// ordinary content, so `name: a,"b`, `name: a["b` and `name: a{"b` are all
+// valid plain scalars whose quote is content, not a delimiter. A flat
+// membership check granted quote-open context after any of them, letting the
+// following quote forge a phantom scalar that carried to the next line and hid
+// a real `uses:` key — a fail-OPEN bypass of the same class as the `'`/`"`/
+// `-`/`:`/`?` fixes above. So `[`/`{` open a flow collection (and keep
+// quote-open context) only where a NODE may start — i.e. only when context was
+// already valid; otherwise they are content and context stays false. `]`/`}`
+// close one, and `,` may grant context only while genuinely inside a flow
+// collection. The depth carries across lines so multi-line flow collections
+// still resolve their quotes correctly.
 //
 // `:` needs its OWN check, not membership at all (CodeRabbit #6YXkRy, Qodo
 // #2, colon quote-context bypass): YAML only treats `:` as a real key/value
@@ -151,7 +161,8 @@ const stripTrailingYamlComment = (text, startState = { inDouble: false, inSingle
 // behave like ordinary content (in particular it must NOT be treated as
 // transitive either — YAML's rule depends on what follows it, not on
 // whatever context preceded it).
-const QUOTE_OPEN_CONTEXT = new Set(['{', '[', ',']);
+const FLOW_OPEN = new Set(['{', '[']);
+const FLOW_CLOSE = new Set(['}', ']']);
 const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
 // Walks `str` from index 0 up to (not including) `endIndex`, applying the
 // same quote-open-context rules isInsideQuotedScalar and the cross-line
@@ -178,6 +189,7 @@ const TRANSITIVE_QUOTE_OPEN_CONTEXT = new Set(['-', '?']);
 const walkQuoteState = (str, endIndex, startState, stopAtComment = false) => {
   let inDouble = startState.inDouble;
   let inSingle = startState.inSingle;
+  let flowDepth = startState.flowDepth || 0;
   let atQuoteOpenContext = !inDouble && !inSingle;
   let commentIndex = -1;
   for (let i = 0; i < endIndex; i += 1) {
@@ -215,11 +227,22 @@ const walkQuoteState = (str, endIndex, startState, stopAtComment = false) => {
       // separation follows; invalid always stays invalid either way.
       const next = str[i + 1];
       atQuoteOpenContext = atQuoteOpenContext && (next === undefined || /\s/.test(next));
+    } else if (FLOW_OPEN.has(ch)) {
+      // Only a bracket sitting where a NODE may start actually opens a flow
+      // collection; anywhere else it is plain-scalar content. Context is left
+      // exactly as it was, so a real flow open keeps it valid for the quote
+      // that follows and a content bracket keeps it invalid.
+      if (atQuoteOpenContext) flowDepth += 1;
+    } else if (FLOW_CLOSE.has(ch)) {
+      if (flowDepth > 0) flowDepth -= 1;
+      atQuoteOpenContext = false;
+    } else if (ch === ',') {
+      atQuoteOpenContext = flowDepth > 0;
     } else if (!/\s/.test(ch)) {
-      atQuoteOpenContext = QUOTE_OPEN_CONTEXT.has(ch);
+      atQuoteOpenContext = false;
     }
   }
-  return { inDouble, inSingle, commentIndex };
+  return { inDouble, inSingle, flowDepth, commentIndex };
 };
 // True when the character at `matchIndex` sits inside a YAML quoted scalar.
 // `startState` (default: not in a quote) seeds a scalar carried over from a

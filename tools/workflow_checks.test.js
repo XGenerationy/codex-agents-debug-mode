@@ -969,3 +969,57 @@ test('findUnpinnedUses still flags real flow-mapping keys after the comment-stri
     'a `#` inside a carried scalar must not swallow a later real flow key',
   );
 });
+
+test('a plain scalar containing , [ or { must not forge a quote-open context (gate bypass)', () => {
+  // In BLOCK context `,`, `[` and `{` are ordinary plain-scalar content, so a
+  // quote right after one is content too. Treating them as flow indicators
+  // unconditionally let that quote open a phantom scalar that carried to the
+  // next line and swallowed a real `uses:` key — findUnpinnedUses returned []
+  // for a workflow with an unpinned action. js-yaml parses every fixture below
+  // to a genuine `uses` mapping key, so a miss here is a fail-OPEN gate bypass.
+  for (const prefix of ['a,"b', "a,'b", 'a["b', 'a{"b', 'a}"b', 'a]"b']) {
+    const yamlText = `name: ${prefix}\nuses: owner/action@main\n`;
+    assert.deepEqual(
+      findUnpinnedUses(yamlText),
+      [{ line: 2, ref: 'owner/action@main' }],
+      `an unpinned uses: after the plain scalar \`${prefix}\` must still be flagged`,
+    );
+  }
+  // The realistic shape: a step name that merely contains a comma and a quote.
+  const workflow = 'name: CI\npermissions:\n  contents: read\non: [push]\n'
+    + 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n'
+    + '      - name: prep, "partial\n        uses: actions/checkout@v4\n';
+  assert.deepEqual(
+    findUnpinnedUses(workflow),
+    [{ line: 10, ref: 'actions/checkout@v4' }],
+    'a step name containing `, "` must not hide the unpinned uses: on the next line',
+  );
+});
+
+test('genuine flow context still opens quoted scalars after , [ and {', () => {
+  // Guard against the fix over-correcting into false positives, which would
+  // block legitimate merges: inside a REAL flow collection these characters do
+  // introduce a node, so a following quote is a genuine delimiter.
+  assert.deepEqual(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [{name: "x, uses: owner/action@main"}]\n'),
+    [],
+    'a uses:-shaped token inside a genuinely quoted flow scalar is string content',
+  );
+  assert.equal(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [{"uses": owner/action@main}]\n').length,
+    1,
+    'a quote opened directly by a real flow `{` must still be parsed as a key',
+  );
+  assert.equal(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [{k: v}, {"uses": owner/action@main}]\n').length,
+    1,
+    'a quote opened after a real in-flow `,` must still be parsed as a key',
+  );
+  // Flow depth carries across lines, so a multi-line flow collection still
+  // resolves its quotes rather than falling back to block-context rules.
+  assert.deepEqual(
+    findUnpinnedUses('jobs:\n  a:\n    steps: [\n      {name: "x, uses: owner/action@main"}\n    ]\n'),
+    [],
+    'a multi-line flow collection must keep flow context on continuation lines',
+  );
+});

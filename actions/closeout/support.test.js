@@ -2056,3 +2056,51 @@ test('resolveContainedEvidencePath refuses a symlink planted inside the evidence
     require('node:fs').rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Directory links use a separate probe: on Windows a junction needs no special
+// privilege even when file symlinks are unavailable, so this case can run in
+// strictly more environments than the file-symlink test above.
+const dirLinkProbeRoot = mkdtempSync(path.join(tmpdir(), 'closeout-dirlink-cap-'));
+let dirLinkKind = null;
+for (const kind of ['junction', 'dir']) {
+  try {
+    const target = path.join(dirLinkProbeRoot, `t-${kind}`);
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, path.join(dirLinkProbeRoot, `l-${kind}`), kind);
+    dirLinkKind = kind;
+    break;
+  } catch { /* try the next kind */ }
+}
+require('node:fs').rmSync(dirLinkProbeRoot, { recursive: true, force: true });
+
+test('resolveContainedEvidencePath refuses an INTERMEDIATE directory link out of the evidence directory', {
+  skip: !dirLinkKind && 'directory links unavailable in this environment',
+}, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'closeout-contained-dirlink-'));
+  try {
+    const evidenceDir = resolveEvidenceDir(dir);
+    mkdirSync(evidenceDir, { recursive: true });
+    const outside = path.join(dir, 'outside-store');
+    mkdirSync(outside, { recursive: true });
+    writeFs(path.join(outside, 'report.json'), '{"overallStatus":"PASS","stolen":true}');
+    // `sub` is a DIRECTORY link, so `sub/report.json` is lexically contained
+    // and its final component is a regular file — a lexical check plus a
+    // final-component lstat both pass, yet readFileSync resolves `sub` and
+    // reads outside the evidence dir. Only a physical (realpath) containment
+    // check catches this.
+    symlinkSync(outside, path.join(evidenceDir, 'sub'), dirLinkKind);
+    assert.equal(resolveContainedEvidencePath(evidenceDir, 'sub/report.json'), null);
+    assert.equal(resolveContainedEvidencePath(evidenceDir, path.join('sub', 'report.json')), null);
+    // A genuine nested directory inside the evidence dir must still resolve.
+    const realNested = path.join(evidenceDir, 'nested');
+    mkdirSync(realNested, { recursive: true });
+    writeFs(path.join(realNested, 'report.json'), '{"overallStatus":"PASS"}');
+    assert.equal(
+      resolveContainedEvidencePath(evidenceDir, 'nested/report.json'),
+      require('node:fs').realpathSync(path.join(realNested, 'report.json')),
+      'a real nested path inside the evidence dir must still be accepted',
+    );
+  } finally {
+    require('node:fs').rmSync(dir, { recursive: true, force: true });
+  }
+});

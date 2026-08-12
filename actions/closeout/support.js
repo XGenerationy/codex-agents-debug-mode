@@ -626,6 +626,15 @@ const resolveEvidenceDir = (outputDir) => path.join(outputDir, EVIDENCE_SUBDIR);
  * a link written INSIDE the evidence directory by the same untrusted CLI
  * would otherwise escape a purely lexical check — the same no-follow
  * discipline writeEvidenceFile already applies on the write side.
+ *
+ * A lexical check plus a FINAL-component lstat is still not enough, because
+ * `readFileSync` resolves every component of the path: with `sub` planted as a
+ * directory symlink inside the evidence dir, `sub/report.json` is lexically
+ * contained and its last component is a regular file, yet the read lands
+ * outside. So containment is confirmed a second time on the PHYSICAL path —
+ * the same realpath discipline assertOutputOutsideWorkspace already uses — and
+ * the realpath is what gets returned, so the caller reads the path that was
+ * actually verified rather than re-resolving the links a second time.
  * @param {string} evidenceDir
  * @param {unknown} candidate raw value from the CLI's stdout record.
  * @returns {string|null} the contained absolute path, or null if unusable.
@@ -637,10 +646,13 @@ const resolveContainedEvidencePath = (evidenceDir, candidate) => {
   if (resolved !== base && !resolved.startsWith(base + path.sep)) return null;
   try {
     if (lstatSync(resolved).isSymbolicLink()) return null;
+    const realBase = realpathSync(base);
+    const realResolved = realpathSync(resolved);
+    if (realResolved !== realBase && !realResolved.startsWith(realBase + path.sep)) return null;
+    return realResolved;
   } catch {
     return null;
   }
-  return resolved;
 };
 
 /**
