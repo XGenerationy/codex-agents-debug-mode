@@ -96,6 +96,12 @@ runs:
         CLOSEOUT_MODE: ${{ inputs.mode }}
         CLOSEOUT_BASE_REF: ${{ inputs.base-ref }}
         CLOSEOUT_CONFIG: ${{ inputs.config }}
+        # CLOSEOUT_OUTPUT_DIR is always the CALLER-facing directory; every
+        # support.js subcommand derives the actual evidence location — the
+        # fixed `closeout-action-evidence` child — from it itself
+        # (resolveEvidenceDir, chatgpt-codex-connector PR7 #6Yd4Qx). Do not
+        # point this at the child: support.js would nest a second child
+        # under it and the upload globs below would miss the evidence.
         CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
         CLOSEOUT_PR_COMMENT: ${{ inputs.pr-comment }}
         CLOSEOUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
@@ -137,20 +143,32 @@ runs:
       # only ever globs the exact names support.js/the spawned CLI can
       # produce. `if-no-files-found: ignore` already tolerates whichever of
       # these a given tier does not write (e.g. plan.json on a full run).
-      # Residual risk, unchanged from before and already documented in the
-      # README: an unrelated tool coincidentally using one of these same
-      # generic names in that same shared directory would still be picked
-      # up — narrower than uploading the directory wholesale, but not zero.
+      #
+      # Every glob points one level BELOW the caller's output-dir, into the
+      # fixed `closeout-action-evidence` child (EVIDENCE_SUBDIR in
+      # support.js — support.test.js pins these lines to that constant):
+      # support.js writes ALL evidence there, and hands the same child to the
+      # gate CLI as its --output-dir, so the caller's own directory is never
+      # chmodded by the wrapper or the CLI (chatgpt-codex-connector PR7
+      # #6Yd4Qx). The child segment must stay a literal here — a composite's
+      # expressions cannot embed a per-invocation value, which is also why
+      # the child name is fixed rather than unique. Because all five lines
+      # share `<output-dir>/closeout-action-evidence` as their least common
+      # ancestor, the DOWNLOADED artifact layout is unchanged: plan.json/
+      # report.json/report.md/action-state.json/logs still sit at the
+      # artifact root. This also narrows the #6YYcNT residual: an unrelated
+      # tool's same-named file directly in a broad shared output-dir is no
+      # longer globbed — only files inside the action-owned child are.
       if: ${{ always() && steps.gate.outcome == 'success' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}
         path: |
-          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/plan.json
-          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/report.json
-          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/report.md
-          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/action-state.json
-          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/logs
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/plan.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/report.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/report.md
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/action-state.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/logs
         if-no-files-found: ignore
 
     - name: Upsert PR comment

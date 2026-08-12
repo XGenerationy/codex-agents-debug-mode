@@ -7,7 +7,7 @@
 
 const {
   appendFileSync, chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync,
-  readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
+  readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync,
 } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -133,13 +133,17 @@ const resolveBaseRef = ({ inputBaseRef = '', env = {}, event = {} } = {}) => {
  * Rejects an evidence output directory that resolves inside the repository
  * being validated, BEFORE any mkdir or state write. The gate CLI has its own
  * `assertOutputOutsideRepository` check, but the plan tier returns before
- * the CLI reaches it, and the wrapper itself calls `mkdirSync(outputDir)`
- * and writes `plan.json`/`action-state.json` there — so a caller that sets
+ * the CLI reaches it, and the wrapper itself mkdirs the evidence child under
+ * outputDir (recursively creating outputDir too when absent) and writes
+ * `plan.json`/`action-state.json` inside that child — so a caller that sets
  * `output-dir` to `.` or any workspace-relative path would dirty the
- * checkout and have those files uploaded as evidence. Both the plain
- * resolved path and the symlink-resolved physical path are compared against
- * the workspace root, mirroring the CLI's own symlink defense; a realpath
- * failure fails closed (the path cannot be proven safe).
+ * checkout and have those files uploaded as evidence. The check runs on the
+ * CALLER's value: the fixed child segment cannot escape a contained parent,
+ * so parent-outside implies child-outside (a symlink planted AT the child
+ * name is refused separately by prepareEvidenceDirectory's lstat). Both the
+ * plain resolved path and the symlink-resolved physical path are compared
+ * against the workspace root, mirroring the CLI's own symlink defense; a
+ * realpath failure fails closed (the path cannot be proven safe).
  *
  * Also rejects an embedded CR or LF in `outputDir` before any of that
  * (chatgpt-codex-connector PR7 #Yb3lN): this same string flows unmodified
@@ -573,6 +577,141 @@ const upsertPrComment = async ({ context, body, runGh }) => {
 const GATE_CLI = path.join(__dirname, '..', '..', 'scripts', 'pr_closeout.js');
 const STATE_FILE = 'action-state.json';
 
+// Name of the action-created private child directory, under the caller's
+// `output-dir`, that ALL evidence lives in — both the wrapper's own files
+// (plan.json, action-state.json) and everything the spawned gate CLI writes
+// (report.json, report.md, logs/), because the CLI receives this child as
+// its --output-dir (chatgpt-codex-connector PR7 #6Yd4Qx). The name is FIXED,
+// not per-invocation: action.yml's "Upload evidence artifact" step must glob
+// it with static YAML (a composite action's expressions cannot embed a
+// per-invocation value — the same limitation that already prevents a unique
+// output-dir default, see README), and the `comment`/`finish` subcommands run
+// as SEPARATE PROCESSES that must re-derive the evidence location from
+// CLOSEOUT_OUTPUT_DIR alone. Consequence, unchanged from before this child
+// existed: two invocations that share an output-dir also share this child —
+// the README's "distinct output-dir per invocation" requirement stands.
+const EVIDENCE_SUBDIR = 'closeout-action-evidence';
+
+/**
+ * The single mapping from the caller-facing `output-dir` to the directory
+ * evidence actually lives in. `run`, `comment`, and `finish` each execute as
+ * a separate process receiving only CLOSEOUT_OUTPUT_DIR, so this must stay a
+ * pure function of that value — no state, no filesystem probing.
+ * @param {string} outputDir
+ * @returns {string}
+ */
+const resolveEvidenceDir = (outputDir) => path.join(outputDir, EVIDENCE_SUBDIR);
+
+/**
+ * Creates and verifies the private evidence child directory under the
+ * caller's `output-dir` (chatgpt-codex-connector PR7 #6Yd4Qx, P2). Evidence
+ * is written HERE, never directly into the caller's directory, so a
+ * PRE-EXISTING caller directory's mode is NEVER modified: no chmod, no
+ * temporary narrowing — and therefore no window (previously the gate's
+ * whole run, up to the configured timeout) during which a shared caller
+ * directory such as /tmp (01777) or ${{ runner.temp }} is unreadable to
+ * concurrent jobs, and no restore step whose failure could leave it
+ * narrowed. (A caller directory that does not exist yet is CREATED
+ * owner-only — see the mkdir note below — which mutates nothing anyone
+ * could already be using.) This retires the
+ * entire capture/restore chain that guarded the old in-place chmod —
+ * #6YFOVK (restore the pre-existing mode), #6YTfjs (capture the FULL 0o7777
+ * mode so /tmp's sticky bit restores faithfully), #6YT0Js (statSync, not
+ * lstatSync, so a symlinked outputDir captured the TARGET's mode and the
+ * restore could not broaden a 0700 target), and #6YT0Jo (restore only after
+ * the final write) — deleted rather than kept as dead code: with no
+ * modification there is nothing to capture or restore, and a symlinked
+ * outputDir's target mode is simply never touched at all.
+ *
+ * The owner-only requirement itself is unchanged and now applies to the
+ * child: evidence can hold unredacted runner paths and base refs before the
+ * CLI's redaction runs, so on a multi-user runner the directory must not be
+ * default-umask readable. mkdirSync's `mode` only applies when the directory
+ * is CREATED (Qodo #6), so a pre-existing child — an output-dir reused
+ * across invocations — is explicitly re-chmodded to 0o700, and on POSIX a
+ * chmod failure fails closed (CodeRabbit #6X72Z2). Both invariants are the
+ * same ones the old in-place code enforced, retargeted.
+ *
+ * Because the child's NAME is fixed and its parent may be a shared,
+ * world-writable directory, the path is verified before any use — including
+ * before the stale-evidence probe/cleanup in runSubcommand, which reads and
+ * deletes through it: a hostile local user could pre-plant
+ * `<output-dir>/closeout-action-evidence` as a symlink (redirecting every
+ * later read, delete, and write to a directory of their choosing — the same
+ * attack class #6Yb44Sj closed for the state file itself) or as their OWN
+ * real directory (which a root runner's chmod would "secure" without
+ * changing its ownership, leaving it readable by the planter). lstatSync
+ * (never following a link) must see a real directory, and on POSIX it must
+ * be owned by this process's own uid.
+ *
+ * What IS guaranteed: a pre-existing caller directory's mode is never
+ * modified by this action or by the CLI it spawns (an absent one is created
+ * owner-only, once, and never re-chmodded), and on POSIX the evidence directory is a
+ * real, caller-uid-owned, mode-0o700 directory at the moment this returns —
+ * in a sticky-bit parent (/tmp) other users cannot subsequently rename or
+ * remove that entry, so the verification holds for the run. What is NOT
+ * guaranteed: a world-writable NON-sticky parent lets any local user swap
+ * the entry after verification (file-level defenses — writeEvidenceFile's
+ * O_EXCL staging and identity re-checks, and the CLI's equivalents — still
+ * apply, but directory-level trust does not survive such a parent); and on
+ * Windows the child directory itself carries no verified DACL (unchanged
+ * from the old in-place scheme — the chmod stays best-effort there), each
+ * evidence FILE being individually protected instead
+ * (protectWindowsPrivateFile in writeEvidenceFile and in the CLI).
+ * @param {string} outputDir caller-facing output directory.
+ * @returns {string} the verified evidence directory (resolveEvidenceDir(outputDir)).
+ */
+const prepareEvidenceDirectory = (outputDir) => {
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  // recursive: also creates the caller's output-dir itself when it does not
+  // exist yet (the default `${{ runner.temp }}/closeout-evidence` case).
+  // Node's recursive mkdir applies `mode` to EVERY component it creates, so
+  // a freshly-created output-dir starts owner-only too (umask-masked) — the
+  // conservative default, and NOT a #6Yd4Qx violation: that finding is about
+  // mutating a PRE-EXISTING caller-owned directory out from under concurrent
+  // users, and a directory that did not exist has no users to break. The
+  // precise contract: an output-dir that already exists is never chmodded,
+  // in no branch, ever (mkdirSync's mode has no effect on existing
+  // directories — the Qodo #6 limitation, load-bearing here in reverse);
+  // one this call creates starts at 0o700 and is likewise never re-chmodded
+  // afterwards, so a caller who later loosens their own directory keeps
+  // whatever mode they set.
+  mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  let info;
+  try {
+    info = lstatSync(evidenceDir);
+  } catch (error) {
+    throw new Error(`failed to verify evidence directory ${evidenceDir}: ${error.message}`);
+  }
+  // lstat never follows: a pre-planted symlink at the well-known child name
+  // (which recursive mkdirSync silently accepts when it points at a
+  // directory) is refused here, closing the mkdir-swallowed-EEXIST gap.
+  if (!info.isDirectory()) {
+    throw new Error(`Refusing to use a pre-existing non-directory (symlink or file) as the evidence directory: ${evidenceDir}`);
+  }
+  // Ownership, not just mode: chmod succeeding is NOT proof the directory is
+  // ours — a runner executing as root chmods anyone's directory without
+  // error, so a pre-planted directory owned by another local user would pass
+  // the fail-closed chmod below while staying readable by its planter.
+  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+    throw new Error(`Refusing to use an evidence directory owned by another user (uid ${info.uid}): ${evidenceDir}`);
+  }
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(evidenceDir, 0o700);
+    } catch (error) {
+      throw new Error(`failed to secure evidence directory ${evidenceDir} (mode 0o700): ${error.message}`);
+    }
+  } else {
+    try {
+      chmodSync(evidenceDir, 0o700);
+    } catch {
+      // Windows ignores POSIX directory modes; the failure carries no signal.
+    }
+  }
+  return evidenceDir;
+};
+
 /**
  * Sanitizes one output value to a single line (newlines/CR collapse to a
  * space) and appends plain name=value lines to the GITHUB_OUTPUT file — no
@@ -608,7 +747,12 @@ const defaultSpawnCli = (args, { env }) => spawnSync(process.execPath, [GATE_CLI
  * the action outputs, and records the exit decision in the state file for
  * `finish`. Returns 0 for every GATE outcome — the job's failure is applied
  * by `finish` AFTER the artifact upload and optional comment steps have run.
- * Only input-validation errors throw out of here (fail before spawning).
+ * Only validation errors — bad inputs, an inside-workspace output-dir, or an
+ * unverifiable evidence child directory — throw out of here (fail before
+ * spawning). `outputDir` is the CALLER-facing directory; every evidence file
+ * is written to its private child, resolveEvidenceDir(outputDir), and the
+ * caller directory itself is never chmodded (chatgpt-codex-connector PR7
+ * #6Yd4Qx; see prepareEvidenceDirectory).
  * @returns {Promise<number>} process exit code for this step.
  */
 const runSubcommand = async ({
@@ -641,8 +785,23 @@ const runSubcommand = async ({
   //
   // The output-directory containment check still runs FIRST of all: an inside-
   // workspace output-dir must fail without touching the checkout, not delete a
-  // tracked action-state.json first.
+  // tracked action-state.json first. It runs against the CALLER's directory —
+  // the fixed child segment appended below cannot escape it, and the caller
+  // value is also what flows into action.yml's upload `path:` lines, so the
+  // CR/LF rejection (#Yb3lN) must apply to it, not to the joined path.
   assertOutputOutsideWorkspace({ outputDir, workspace: env.GITHUB_WORKSPACE });
+  // ALL evidence lives in a private, action-created child of the caller's
+  // output-dir (chatgpt-codex-connector PR7 #6Yd4Qx; see
+  // prepareEvidenceDirectory for the full contract). Created and VERIFIED
+  // before the ownership probe and stale-evidence cleanup below, because both
+  // read and delete THROUGH this path — with a fixed, well-known child name
+  // inside a possibly shared parent, a pre-planted symlink at it could
+  // otherwise aim the cleanup at a directory this action never wrote (the
+  // same class #6Yb44Sj closed for the state file itself). Creating an
+  // (empty, owner-only) directory before input validation is side-effect-
+  // harmless; the #6XsD7s ordering requirement — stale-state cleanup before
+  // validateActionInputs — is preserved below.
+  const evidenceDir = prepareEvidenceDirectory(outputDir);
   // Only the benign "no previous state" (ENOENT) case is ignored: any other
   // unlink failure (EACCES/EPERM, or the path being a directory/symlink the
   // safety checks did not catch) must FAIL the run step rather than silently
@@ -688,7 +847,7 @@ const runSubcommand = async ({
   // result can simply be discarded" does not apply here the way it does for
   // an ordinary read.
   const hadPriorEvidence = (() => {
-    const statePath = path.join(outputDir, STATE_FILE);
+    const statePath = path.join(evidenceDir, STATE_FILE);
     let preInfo;
     try {
       preInfo = lstatSync(statePath);
@@ -727,14 +886,16 @@ const runSubcommand = async ({
   if (hadPriorEvidence) {
     for (const staleName of [STATE_FILE, 'plan.json', 'report.json', 'report.md']) {
       try {
-        unlinkSync(path.join(outputDir, staleName));
+        unlinkSync(path.join(evidenceDir, staleName));
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
       }
     }
   }
-  // The gate CLI's full tier also populates outputDir/logs (a DIRECTORY of
-  // per-check probe log files, scripts/pr_closeout_process.js), which the
+  // The gate CLI's full tier also populates the evidence dir's logs/ (a
+  // DIRECTORY of per-check probe log files, scripts/pr_closeout_process.js
+  // — under evidenceDir, since that is the --output-dir the CLI is given),
+  // which the
   // file-by-file cleanup above cannot reach. If this invocation is blocked
   // before the CLI regenerates its own logs, a prior invocation's stale log
   // files stay behind and the composite's unconditional artifact upload
@@ -746,12 +907,12 @@ const runSubcommand = async ({
   // caller content.
   //
   // lstat FIRST, never trust a recursive remove to be symlink-safe on its
-  // own: if a check plants outputDir/logs as a symlink to an unrelated
-  // directory, unlink only the link entry (mirrors writeEvidenceFile's
+  // own: if a check plants the evidence dir's logs/ as a symlink to an
+  // unrelated directory, unlink only the link entry (mirrors writeEvidenceFile's
   // symlink discipline elsewhere in this file) — a recursive rm must only
   // ever run against a confirmed real, non-symlinked directory.
   try {
-    const logsPath = path.join(outputDir, 'logs');
+    const logsPath = path.join(evidenceDir, 'logs');
     const logsInfo = lstatSync(logsPath);
     if (!hadPriorEvidence) {
       // logs/ exists but nothing else here looks like this action's own
@@ -767,67 +928,21 @@ const runSubcommand = async ({
   const { run, mode } = validateActionInputs(inputs);
   const eventPayload = event ?? readEventPayload(env);
   const baseRef = resolveBaseRef({ inputBaseRef, env, event: eventPayload });
-  // Owner-only mode (0o700) matches the gate CLI's prepareOutputDirectory
-  // discipline: the evidence dir can hold unredacted runner paths / base refs
-  // before the CLI's own redaction runs, and on a multi-user self-hosted
-  // runner the default umask (typically 0755) would expose them.
-  //
-  // FIX (Qodo #6): mkdirSync's `mode` only applies when the directory is
-  // CREATED — a pre-existing permissive outputDir would keep its old mode.
-  // FIX (CodeRabbit #6X72Z2): fail closed on POSIX when chmod is ineffective.
-  //
-  // FIX (CodeRabbit #6YFOVK): chmodding a caller-supplied PRE-EXISTING broad
-  // directory (e.g. /tmp, runner.temp) mutates a directory this invocation
-  // may not own and can break later steps on a self-hosted runner. When the
-  // directory pre-existed, capture its original mode and RESTORE it in the
-  // finally block below once the CLI has taken over (the CLI re-applies its
-  // own owner-only perms to the files it writes). This keeps the Qodo #6
-  // owner-only guarantee during the window the wrapper writes, without
-  // permanently changing a caller-owned directory's mode.
-  // Capture the FULL mode including special bits (sticky/setgid/setuid) so
-  // restore is faithful: a caller-supplied /tmp (01777) must be restored to
-  // 01777, not 0777 (CodeRabbit #6YTfjs). Mask 0o7777, not 0o777.
-  //
-  // Use statSync (follows symlinks), NOT lstatSync, so a symlinked outputDir
-  // captures the TARGET directory's real mode. lstatSync would capture the
-  // symlink's OWN mode instead — typically 0777, since most platforms ignore
-  // permission bits on the link itself — and both chmodSync calls below
-  // follow the link to the target. Restoring a 0700 target to a captured
-  // 0777 would broaden it, exposing or making writable whatever else lives
-  // there (CodeRabbit #6YT0Js).
-  const priorMode = (() => { try { return statSync(outputDir).mode & 0o7777; } catch { return null; } })();
- const restorePriorMode = () => {
-   if (priorMode === null || process.platform === 'win32') return;
-   try { chmodSync(outputDir, priorMode); } catch { /* best-effort restore */ }
- };
- mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== 'win32') {
-    try {
-      chmodSync(outputDir, 0o700);
-    } catch (error) {
-      throw new Error(`failed to secure evidence directory ${outputDir} (mode 0o700): ${error.message}`);
-    }
-  } else {
-    try {
-      chmodSync(outputDir, 0o700);
-    } catch {
-      // Windows ignores POSIX directory modes; the failure carries no signal.
-    }
-  }
-  const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', outputDir];
+  // The spawned CLI receives the private CHILD as its --output-dir, never the
+  // caller's own directory (chatgpt-codex-connector PR7 #6Yd4Qx): the CLI's
+  // own prepareOutputDirectory/writeEvidenceReport chmod their --output-dir
+  // to 0o700 for the duration of the run, so handing it the caller's
+  // directory would narrow a shared /tmp-style path for up to the gate's
+  // whole run no matter what the wrapper did. With the child, both the
+  // wrapper's writes and the CLI's land in the action-owned directory
+  // prepareEvidenceDirectory verified above, and the caller's directory mode
+  // is never modified by anything in this process tree. The old capture/
+  // restore chain (#6YFOVK/#6YTfjs/#6YT0Js/#6YT0Jo) is retired with it —
+  // see prepareEvidenceDirectory.
+  const args = ['--repo', env.GITHUB_WORKSPACE || process.cwd(), '--mode', mode, '--output-dir', evidenceDir];
   if (baseRef) args.push('--base-ref', baseRef);
   if (config) args.push('--config', config);
   if (run === 'plan') args.push('--plan');
-  // Restore the caller-owned directory's original mode only AFTER every write
-  // to it has finished, not before handing off to the CLI (CodeRabbit
-  // #6YT0Jo). The spawned CLI itself re-chmods the directory to 0o700 while
-  // writing evidence (writeEvidenceReport, scripts/pr_closeout_report.js),
-  // and the wrapper's OWN writes below (plan.json, action-state.json) all
-  // happen AFTER spawnCli returns — restoring before spawnCli left the
-  // directory at the CLI's 0o700 rather than the caller's original mode once
-  // the full run actually finished. The try/finally covers every exit path,
-  // including a thrown error.
-  try {
   const result = spawnCli(args, { env });
   const cliExitCode = result.status;
   const parsed = parseLastJsonLine(result.stdout);
@@ -851,8 +966,8 @@ const runSubcommand = async ({
       status = parsed.planStatus;
       reportMode = parsed.mode || '';
       attestation = parsed.admission?.attestation?.status || '';
-      const planPath = path.join(outputDir, 'plan.json');
-      writeEvidenceFile(outputDir, 'plan.json', `${JSON.stringify(parsed)}\n`);
+      const planPath = path.join(evidenceDir, 'plan.json');
+      writeEvidenceFile(evidenceDir, 'plan.json', `${JSON.stringify(parsed)}\n`);
       reportJsonPath = planPath;
     } else {
       renderedSummary = [
@@ -884,7 +999,9 @@ const runSubcommand = async ({
     let reportMarkdown = '';
     let reportUnreadable = false;
     if (parsed?.report?.json) {
-      reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(outputDir, parsed.report.json);
+      // A relative report path from the CLI resolves against the directory
+      // the CLI was actually given — the evidence child, not the caller dir.
+      reportJsonPath = path.isAbsolute(parsed.report.json) ? parsed.report.json : path.join(evidenceDir, parsed.report.json);
       try {
         report = JSON.parse(readFileSync(reportJsonPath, 'utf8'));
         // A record that parses but is not a gate report (e.g. `{}`) is not
@@ -895,7 +1012,7 @@ const runSubcommand = async ({
           report = {}; reportUnreadable = true;
         }
       } catch { report = {}; reportUnreadable = true; }
-      const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(outputDir, parsed.report.markdown || 'report.md');
+      const markdownPath = path.isAbsolute(parsed.report.markdown || '') ? parsed.report.markdown : path.join(evidenceDir, parsed.report.markdown || 'report.md');
       try { reportMarkdown = readFileSync(markdownPath, 'utf8'); } catch { reportMarkdown = '(report.md could not be read)'; }
     } else {
       // A full-tier success record that omits the report.json path entirely is
@@ -1007,14 +1124,11 @@ const runSubcommand = async ({
       ...(admissionStatus ? { 'admission-status': admissionStatus } : {}),
     });
   }
-  writeEvidenceFile(outputDir, STATE_FILE, `${JSON.stringify({
+  writeEvidenceFile(evidenceDir, STATE_FILE, `${JSON.stringify({
     tier: run, mode: reportMode, baseRef, cliExitCode, decision, artifactName, renderedSummary, renderedComment, reportJsonPath, nonce,
   })}\n`);
   process.stdout.write(`closeout-action: ${redactSecrets(decision.reason)}\n`);
   return 0;
-  } finally {
-    restorePriorMode();
-  }
 };
 
 /**
@@ -1162,9 +1276,11 @@ const writeEvidenceFile = (outputDir, name, content) => {
   }
 };
 
-const readState = (outputDir) => {
+// Takes the EVIDENCE directory (resolveEvidenceDir of the caller-facing
+// output-dir) — callers derive it, keeping this a dumb read.
+const readState = (evidenceDir) => {
   try {
-    return JSON.parse(readFileSync(path.join(outputDir, STATE_FILE), 'utf8'));
+    return JSON.parse(readFileSync(path.join(evidenceDir, STATE_FILE), 'utf8'));
   } catch {
     return null;
   }
@@ -1183,7 +1299,11 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
   // the file is normally already gone (revoked before its probe); this covers
   // the full tier and any run that failed before the CLI consumed it.
   cleanupDelegatedTokenFile(env);
-  const state = readState(outputDir);
+  // `outputDir` is the caller-facing CLOSEOUT_OUTPUT_DIR; the state file
+  // lives in the action's private evidence child of it (chatgpt-codex-
+  // connector PR7 #6Yd4Qx), re-derived here because finish runs as a
+  // separate process from `run`.
+  const state = readState(resolveEvidenceDir(outputDir));
   if (!state?.decision) {
     process.stderr.write('closeout-action: no recorded state; the run step never completed.\n');
     return 3;
@@ -1321,7 +1441,10 @@ const defaultRunGh = async (args) => {
  * @returns {Promise<number>} process exit code.
  */
 const commentSubcommand = async ({ outputDir, env = process.env, event = null, runGh = defaultRunGh }) => {
-  const state = readState(outputDir);
+  // Same evidence-child derivation as finishSubcommand (chatgpt-codex-
+  // connector PR7 #6Yd4Qx): `run` wrote the state file into
+  // resolveEvidenceDir(outputDir), and this separate process must look there.
+  const state = readState(resolveEvidenceDir(outputDir));
   if (!state) {
     process.stderr.write('closeout-action: no recorded state; skipping comment.\n');
     return 0;
@@ -1407,6 +1530,7 @@ if (require.main === module) void main();
 
 module.exports = {
   ACTION_MARKER,
+  EVIDENCE_SUBDIR,
   assertOutputOutsideWorkspace,
   buildCommentBody,
   capText,
@@ -1420,6 +1544,7 @@ module.exports = {
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  resolveEvidenceDir,
   runSubcommand,
   stageTokenSubcommand,
   upsertPrComment,

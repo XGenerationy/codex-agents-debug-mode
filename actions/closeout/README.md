@@ -300,7 +300,7 @@ silently coerced to the default.
 | `mode` | `strict` \| `engine` | `strict` | `strict` (19-check gate) or `engine` (`config.engineChecks`). |
 | `base-ref` | ref | *(empty)* | Live PR base ref; empty resolves via `GITHUB_BASE_REF` or the event payload. See [Checkout requirements](#checkout-requirements). |
 | `config` | path | *(empty)* | Path to a closeout config JSON. |
-| `output-dir` | path | *(empty)* | Evidence directory (must be outside the repository). When empty, the composite step falls back to `${{ runner.temp }}/closeout-evidence`. |
+| `output-dir` | path | *(empty)* | Caller-facing evidence location (must be outside the repository). When empty, the composite step falls back to `${{ runner.temp }}/closeout-evidence`. Evidence files are NOT written directly into this directory: they live in a private, action-created `closeout-action-evidence/` child of it, and this directory's own permissions are never modified — see [Evidence directory layout](#evidence-directory-layout). |
 | `node-version` | version spec | `24` | Node.js version for the gate. |
 | `pr-comment` | `true` \| `false` | `false` | `true` to upsert a marker-tagged PR comment (needs `pull-requests: write`). |
 | `artifact-name` | string | `closeout-evidence` | Evidence artifact name. See [Artifact-name uniqueness and concurrency](#artifact-name-uniqueness-and-concurrency). |
@@ -317,6 +317,66 @@ run that fails input validation never reaches it, so all four stay empty in that
 | `attestation` | Plan runs: the four-state `admission.attestation.status` (`present` \| `weakened` \| `absent` \| `unavailable`). Full runs: empty. Empty until the gate step has run. |
 | `report-path` | Absolute path of `report.json` (full runs) or the captured plan JSON (plan runs); empty until the gate step has run. |
 | `admission-status` | Plan runs: `PASS` \| `FAIL` \| `BLOCKED` \| `unavailable` — the aggregate of the admission sub-probes (`attestation`, `cleanTree`, `preflight`). This is the readiness signal to key automation on: `planStatus`/`status` alone reflects only whether the check MATRIX resolved, not whether the plan is actually admissible — a resolved matrix with a failed or blocked preflight/clean-tree probe still reports `status: PASS`, but `admission-status` correctly reports `BLOCKED`/`FAIL`. Full runs: empty. Empty until the gate step has run. |
+
+## Evidence directory layout
+
+Evidence is written into a **private, action-created child directory** of
+`output-dir`, never into `output-dir` itself (chatgpt-codex-connector PR7
+#6Yd4Qx):
+
+```
+<output-dir>/                          # caller-owned; a pre-existing directory is never chmodded
+└── closeout-action-evidence/          # action-created; owner-only (0700) on POSIX
+    ├── plan.json                      # plan runs
+    ├── report.json                    # full runs
+    ├── report.md                      # full runs
+    ├── action-state.json              # the run's recorded exit decision
+    └── logs/                          # full runs: per-check probe logs
+```
+
+(If `output-dir` does not exist yet — the default case — the action creates
+it owner-only as a conservative starting point, and never re-chmods it on any
+later run: only a directory the action itself just created gets a mode from
+it, never one that already existed.)
+
+Why the child exists: the evidence files can carry unredacted runner paths and
+base refs before the gate CLI's redaction runs, so on a multi-user runner the
+directory that holds them must be owner-only (`0700`). Earlier versions
+enforced that by chmodding `output-dir` itself and restoring its mode
+afterwards — which meant a caller pointing `output-dir` at a shared directory
+(`${{ runner.temp }}`, `/tmp` at `01777`) had that directory narrowed to
+`0700` for the entire gate run, up to the configured timeout, breaking
+concurrent users of it. Now the action creates, verifies (refusing a
+pre-planted symlink or another user's directory at that fixed name), and
+secures only its own child; a pre-existing caller directory's mode is never
+touched by the action or by the gate CLI it spawns (the CLI is handed the
+child as its `--output-dir`, so its own `0700` chmod lands there too).
+
+What this changes for consumers:
+
+- **The downloaded evidence artifact is unchanged.** The upload globs all
+  point inside the child, and it is their common ancestor, so
+  `plan.json`/`report.json`/`report.md`/`action-state.json`/`logs/` still sit
+  at the artifact root exactly as before.
+- **The `report-path` output is unchanged in meaning.** It has always been
+  the absolute path of the report file, and it now points inside the child —
+  consumers using the output need no changes.
+- **Breaking change for hardcoded local paths:** a workflow step that set
+  `output-dir: /some/path` and then read `/some/path/report.json` directly
+  from the runner's filesystem will no longer find it — the file is at
+  `/some/path/closeout-action-evidence/report.json`. Use the `report-path`
+  output instead of hardcoding, or add the `closeout-action-evidence/`
+  segment.
+- The child's name is fixed (a composite action's static YAML must be able to
+  glob it, and the separate comment/verdict steps must re-derive it from
+  `output-dir` alone), so two invocations sharing an `output-dir` still
+  collide inside the shared child — the requirement to give each invocation a
+  distinct `output-dir` (see
+  [Artifact-name uniqueness and concurrency](#artifact-name-uniqueness-and-concurrency))
+  is unchanged.
+- On Windows, POSIX modes are advisory: the child directory itself carries no
+  verified DACL (same as `output-dir` itself did before this layout), but
+  every evidence file is individually protected with an owner-only DACL.
 
 ## Permissions
 
@@ -598,7 +658,11 @@ trouble rather than anything this action or the gate did.
 
 The same caveat applies to `output-dir`, and it is the more dangerous of the two:
 two invocations in the same job that both omit `output-dir` share
-`${{ runner.temp }}/closeout-evidence`, so the second run's `action-state.json`
+`${{ runner.temp }}/closeout-evidence` — and with it the
+`closeout-action-evidence/` child where evidence actually lives (see
+[Evidence directory layout](#evidence-directory-layout); the child's name is
+fixed for the same no-expressions-in-defaults reason, so it provides no
+per-invocation isolation) — so the second run's `action-state.json`
 overwrites the first's, and the first's evidence is uploaded before the
 overwrite only by step ordering. The composite action's input defaults cannot
 embed expressions (no `${{ matrix.os }}`, no step name), so it cannot compute a
@@ -761,26 +825,39 @@ they are roadmap items, not accepted risk:
   same-repo dispatch already run from the PR's own branch.
 - **A broad, caller-overridden `output-dir` can still leak an unrelated
   file that happens to share one of this action's evidence filenames
-  (CodeRabbit PR7 #6YYcNT).** Two safeguards already exist here:
-  stale-evidence cleanup only removes prior files once an authenticated
-  `action-state.json` marker proves THIS action wrote them (`hadPriorEvidence`
-  in `support.js`, chatgpt-codex-connector PR7 #6YaIal), and the "Upload
-  evidence artifact" step (chatgpt-codex-connector PR7 #6Yb3lY) uploads only
-  the exact well-known names (`plan.json`, `report.json`, `report.md`,
-  `action-state.json`, `logs/`) rather than the whole `output-dir` — so a
-  caller pointing `output-dir` at a broad shared path (`${{ runner.temp }}`,
-  `/tmp`) no longer has every unrelated file there deleted or published as
-  evidence. The one residual gap neither safeguard closes: an unrelated tool
-  that happens to write a file under one of those SAME generic names, in
-  that SAME shared directory, would still be picked up by the upload (mere
-  filename match, not proof of ownership, is all `if-no-files-found: ignore`
-  can check). The default (`${{ runner.temp }}/closeout-evidence`, paired
-  with **a distinct `output-dir` per invocation** as required above) is
-  action-owned and not exposed to this at all; the risk exists only when a
-  caller overrides `output-dir` to a pre-existing broad path shared with
-  other tools or steps. Interim control: point `output-dir` at an
-  action-owned leaf directory (the default, or a dedicated subdirectory you
-  don't share with any other step) rather than a broad shared path.
+  (CodeRabbit PR7 #6YYcNT) — now only via the evidence child, which
+  narrows the gap substantially but does not close it.** Three safeguards
+  exist here: stale-evidence cleanup only removes prior files once an
+  authenticated `action-state.json` marker proves THIS action wrote them
+  (`hadPriorEvidence` in `support.js`, chatgpt-codex-connector PR7 #6YaIal);
+  the "Upload evidence artifact" step (chatgpt-codex-connector PR7 #6Yb3lY)
+  uploads only the exact well-known names (`plan.json`, `report.json`,
+  `report.md`, `action-state.json`, `logs/`) rather than a whole directory;
+  and since chatgpt-codex-connector PR7 #6Yd4Qx those names are globbed (and
+  cleaned) only inside the action-created `closeout-action-evidence/` child
+  (see [Evidence directory layout](#evidence-directory-layout)) — an
+  unrelated tool's same-named file sitting directly in a broad shared
+  `output-dir` (`${{ runner.temp }}`, `/tmp`) is therefore no longer
+  deleted or published at all. The residual gap that remains: an unrelated
+  tool that writes one of those same generic names INSIDE
+  `<output-dir>/closeout-action-evidence/` would still be picked up by the
+  upload (mere filename match, not proof of ownership, is all
+  `if-no-files-found: ignore` can check) — far less plausible by accident
+  than a bare `/tmp/plan.json`, but not impossible; and on POSIX a
+  pre-planted symlink or foreign-owned directory at that child name is
+  refused fail-closed, whereas a world-writable NON-sticky shared parent
+  still lets a local attacker swap the verified child after the check
+  (sticky `/tmp` prevents this; file-level no-follow/`O_EXCL` defenses still
+  apply either way). The default (`${{ runner.temp }}/closeout-evidence`,
+  paired with **a distinct `output-dir` per invocation** as required above)
+  is action-owned and not exposed to any of this; the risk exists only when
+  a caller overrides `output-dir` to a pre-existing broad path shared with
+  other tools or steps. Recommended: point `output-dir` at an action-owned
+  leaf directory (the default, or a dedicated subdirectory you don't share
+  with any other step) rather than a broad shared path. What #6Yd4Qx also
+  removed outright: the action no longer chmods a caller-owned `output-dir`
+  at any point, so pointing it at a shared directory can no longer make that
+  directory owner-only for the duration of the gate run.
 - **Regex-based `uses:` validation cannot parse all YAML.** The
   `tools/workflow_checks.js` SHA-pin check is deliberately regex-based (no YAML
   parser in a zero-dependency repo). It is conservatively fail-closed: any

@@ -17,6 +17,7 @@ const path = require('node:path');
 
 const {
   ACTION_MARKER,
+  EVIDENCE_SUBDIR,
   assertOutputOutsideWorkspace,
   buildCommentBody,
   capText,
@@ -30,6 +31,7 @@ const {
   renderFullSummary,
   renderPlanSummary,
   resolveBaseRef,
+  resolveEvidenceDir,
   runSubcommand,
   stageTokenSubcommand,
   upsertPrComment,
@@ -37,6 +39,16 @@ const {
   writeEvidenceFile,
   writeOutputs,
 } = require('./support');
+
+// Evidence written by `run` — and read back by `comment`/`finish` — lives in
+// the fixed private child of the caller-facing output-dir, never in that
+// directory itself (chatgpt-codex-connector PR7 #6Yd4Qx). These helpers keep
+// every test honest about that layout instead of hand-joining the segment.
+const evidencePath = (outputDir, name) => path.join(resolveEvidenceDir(outputDir), name);
+const plantEvidence = (outputDir, name, content) => {
+  mkdirSync(resolveEvidenceDir(outputDir), { recursive: true });
+  writeFs(evidencePath(outputDir, name), content);
+};
 
 // Return "ok" only when `filePath` has a protected (inheritance-broken) DACL
 // consisting of exactly one current-user FullControl allow rule. Kept as a
@@ -646,7 +658,7 @@ test('runSubcommand end-to-end (plan tier): spawns the CLI, writes summary, outp
   assert.match(outputs, /^attestation=absent$/m);
   assert.match(outputs, /^admission-status=BLOCKED$/m, 
     'admission-status output is BLOCKED when attestation is absent (CodeRabbit #6X_pwM)');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.tier, 'plan');
   assert.equal(state.decision.success, true);
 });
@@ -753,14 +765,16 @@ test('runSubcommand clears stale plan.json/report.json/report.md from a reused o
   const outputDir = path.join(dir, 'evidence');
   mkdirSync(outputDir, { recursive: true });
   // Evidence left behind by a PRIOR successful invocation of this same
-  // (reused) output-dir. action-state.json with this action's own
-  // authenticated shape is the ownership marker (chatgpt-codex-connector
-  // PR7 #6YaIal) proving this directory has genuinely hosted this action
-  // before, so the cleanup below is expected to run.
-  writeFs(path.join(outputDir, 'action-state.json'), `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
-  writeFs(path.join(outputDir, 'plan.json'), '{"planStatus":"PASS","stale":true}\n');
-  writeFs(path.join(outputDir, 'report.json'), '{"overallStatus":"PASS","stale":true}\n');
-  writeFs(path.join(outputDir, 'report.md'), '# stale prior report\n');
+  // (reused) output-dir — inside its evidence child, where a prior run of
+  // this action would have written it (#6Yd4Qx). action-state.json with this
+  // action's own authenticated shape is the ownership marker
+  // (chatgpt-codex-connector PR7 #6YaIal) proving this directory has
+  // genuinely hosted this action before, so the cleanup below is expected
+  // to run.
+  plantEvidence(outputDir, 'action-state.json', `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
+  plantEvidence(outputDir, 'plan.json', '{"planStatus":"PASS","stale":true}\n');
+  plantEvidence(outputDir, 'report.json', '{"overallStatus":"PASS","stale":true}\n');
+  plantEvidence(outputDir, 'report.md', '# stale prior report\n');
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -772,11 +786,11 @@ test('runSubcommand clears stale plan.json/report.json/report.md from a reused o
   });
   assert.equal(exit, 0, 'run never fails the job for gate outcomes');
   const { existsSync } = require('node:fs');
-  assert.equal(existsSync(path.join(outputDir, 'plan.json')), false,
+  assert.equal(existsSync(evidencePath(outputDir, 'plan.json')), false,
     'stale plan.json from a prior invocation must not survive a failed current run');
-  assert.equal(existsSync(path.join(outputDir, 'report.json')), false,
+  assert.equal(existsSync(evidencePath(outputDir, 'report.json')), false,
     'stale report.json from a prior invocation must not survive a failed current run');
-  assert.equal(existsSync(path.join(outputDir, 'report.md')), false,
+  assert.equal(existsSync(evidencePath(outputDir, 'report.md')), false,
     'stale report.md from a prior invocation must not survive a failed current run');
 });
 
@@ -792,10 +806,10 @@ test('runSubcommand clears a stale outputDir/logs directory from a reused output
   // before, so the purge below is expected to run.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const logsDir = path.join(outputDir, 'logs');
+  const logsDir = evidencePath(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'qualification.probe.attempt-001.log'), 'stale log output\n');
-  writeFs(path.join(outputDir, 'action-state.json'), `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
+  plantEvidence(outputDir, 'action-state.json', `${JSON.stringify({ tier: 'plan', nonce: 'stale-nonce-1' })}\n`);
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -809,15 +823,15 @@ test('runSubcommand clears a stale outputDir/logs directory from a reused output
 });
 test('runSubcommand leaves outputDir/logs alone when nothing else signals a prior invocation of this action (CodeRabbit PR7 #6YYcNT)', async () => {
   // A caller-supplied broad output-dir (e.g. /tmp, ${{ runner.temp }}) may
-  // have never hosted this action before, and the wrapper has no lock or
-  // ownership signal over it at this point in the flow (mkdir/chmod happens
-  // later). "logs" is a generic directory name likely to collide with
-  // something unrelated a caller or another tool placed there. Without a
-  // genuine action-state.json present, this logs/ directory must NOT be
-  // treated as this action's stale evidence.
+  // have never hosted this action before, and the wrapper has no ownership
+  // signal over pre-existing content there. "logs" is a generic directory
+  // name likely to collide with something unrelated a caller or another
+  // tool placed there — even at the evidence-child path, where the cleanup
+  // now looks (#6Yd4Qx). Without a genuine action-state.json present, this
+  // logs/ directory must NOT be treated as this action's stale evidence.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const logsDir = path.join(outputDir, 'logs');
+  const logsDir = evidencePath(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
   const exit = await runSubcommand({
@@ -842,11 +856,11 @@ test('runSubcommand leaves outputDir/logs alone when only a generic, unauthentic
   // coincidentally reproduce) counts as real ownership evidence.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const logsDir = path.join(outputDir, 'logs');
+  const logsDir = evidencePath(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
-  writeFs(path.join(outputDir, 'plan.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
-  writeFs(path.join(outputDir, 'report.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  plantEvidence(outputDir, 'plan.json', '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  plantEvidence(outputDir, 'report.json', '{"someOtherToolsOwnUnrelatedShape":true}\n');
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -862,8 +876,8 @@ test('runSubcommand leaves outputDir/logs alone when only a generic, unauthentic
   // The file-deletion loop is gated on the same authenticated marker
   // (chatgpt-codex-connector PR7 #6YaIal) — an unrelated tool's own
   // plan.json/report.json must survive, not just outputDir/logs.
-  assert.equal(existsSync(path.join(outputDir, 'plan.json')), true, 'an unauthenticated plan.json must not be deleted');
-  assert.equal(existsSync(path.join(outputDir, 'report.json')), true, 'an unauthenticated report.json must not be deleted');
+  assert.equal(existsSync(evidencePath(outputDir, 'plan.json')), true, 'an unauthenticated plan.json must not be deleted');
+  assert.equal(existsSync(evidencePath(outputDir, 'report.json')), true, 'an unauthenticated report.json must not be deleted');
 });
 test('runSubcommand leaves outputDir/logs alone when action-state.json exists but does not match this action\'s own shape (chatgpt-codex-connector PR7 #6YZpcz)', async () => {
   // An unrelated tool could coincidentally also name a file
@@ -872,10 +886,10 @@ test('runSubcommand leaves outputDir/logs alone when action-state.json exists bu
   // tier value and a nonce string).
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const logsDir = path.join(outputDir, 'logs');
+  const logsDir = evidencePath(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
-  writeFs(path.join(outputDir, 'action-state.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  plantEvidence(outputDir, 'action-state.json', '{"someOtherToolsOwnUnrelatedShape":true}\n');
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
@@ -898,15 +912,15 @@ test('runSubcommand does not trust action-state.json as ownership evidence when 
   // read, so none of that cleanup ever runs.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  const logsDir = path.join(outputDir, 'logs');
+  const logsDir = evidencePath(outputDir, 'logs');
   mkdirSync(logsDir, { recursive: true });
   writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
-  writeFs(path.join(outputDir, 'plan.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  plantEvidence(outputDir, 'plan.json', '{"someOtherToolsOwnUnrelatedShape":true}\n');
   const forgedTarget = path.join(dir, 'attacker-controlled.json');
   const forgedContent = `${JSON.stringify({ tier: 'plan', nonce: 'forged' })}\n`;
   writeFs(forgedTarget, forgedContent);
   try {
-    symlinkSync(forgedTarget, path.join(outputDir, 'action-state.json'), 'file');
+    symlinkSync(forgedTarget, evidencePath(outputDir, 'action-state.json'), 'file');
   } catch (error) {
     if (error.code === 'EPERM' || error.code === 'EACCES') return; // no symlink privilege on this host
     throw error;
@@ -923,7 +937,7 @@ test('runSubcommand does not trust action-state.json as ownership evidence when 
   assert.equal(existsSync(logsDir), true, 'a forged symlinked marker must not authorize the logs/ removal');
   assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
     'unrelated content inside it must survive untouched');
-  assert.equal(existsSync(path.join(outputDir, 'plan.json')), true, 'a forged symlinked marker must not authorize deleting plan.json');
+  assert.equal(existsSync(evidencePath(outputDir, 'plan.json')), true, 'a forged symlinked marker must not authorize deleting plan.json');
   // The forged marker's OWN target file (outside outputDir entirely) must
   // also be left completely untouched -- confirming the read never followed
   // the link into any destructive operation on it either.
@@ -944,9 +958,9 @@ test('runSubcommand fails the run when a stale action-state.json cannot be remov
   // always()-gated comment step to post as the current run's decision.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  mkdirSync(outputDir, { recursive: true });
-  // Plant a hostile action-state.json that is a directory.
-  mkdirSync(path.join(outputDir, 'action-state.json'));
+  // Plant a hostile action-state.json that is a directory — at the evidence
+  // child path, where this action actually reads and writes it (#6Yd4Qx).
+  mkdirSync(evidencePath(outputDir, 'action-state.json'), { recursive: true });
   await assert.rejects(
     runSubcommand({
       inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
@@ -967,46 +981,56 @@ test('runSubcommand fails the run when a stale action-state.json cannot be remov
   );
 });
 
-test('runSubcommand keeps a caller-owned outputDir secured through the CLI, then restores its original mode after (CodeRabbit #6YFOVK/#6YT0Jo)', async () => {
+test('runSubcommand never modifies the caller output directory mode; evidence lives in an owner-only child (chatgpt-codex-connector PR7 #6Yd4Qx)', async () => {
   if (process.platform === 'win32') {
-    // POSIX directory modes are meaningless on NTFS; the restore is a no-op
-    // there. Assert the behavior on Linux/macCI where the mode round-trips.
+    // POSIX directory modes are meaningless on NTFS; assert the property on
+    // Linux/macOS CI where the mode bits are real.
     return;
   }
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
-  // Use a mode WITH the sticky bit (01777, like /tmp) to verify special bits
-  // are preserved across the restore (CodeRabbit #6YTfjs: prior code masked
-  // with 0o777 and would have restored this as 0777, dropping the sticky bit).
+  // A shared-style caller directory: 01777 like /tmp — sticky bit included,
+  // so the assertions would catch a narrowing OR a special-bit drop. Under
+  // the retired capture/restore scheme (#6YFOVK/#6YTfjs/#6YT0Jo) this
+  // directory spent the entire gate run at 0o700, breaking concurrent users
+  // of a shared path for up to the configured timeout; now it must never
+  // change AT ALL, at any point — there is no restore because there is no
+  // modification.
   mkdirSync(outputDir, { recursive: true, mode: 0o1777 });
   chmodSync(outputDir, 0o1777);
-  const before = lstatSync(outputDir).mode & 0o7777;
-  assert.equal(before, 0o1777, 'precondition: caller dir starts at 0o1777 (sticky)');
-  let modeAtSpawn;
+  assert.equal(lstatSync(outputDir).mode & 0o7777, 0o1777, 'precondition: caller dir starts at 0o1777 (sticky)');
+  let callerModeAtSpawn;
+  let cliOutputDirArg;
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
     env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
     event: {},
-    spawnCli: () => {
-      modeAtSpawn = lstatSync(outputDir).mode & 0o7777;
-      // Mirror the real CLI's writeEvidenceReport, which re-chmods the
-      // directory to 0o700 of its own accord while writing evidence. This is
-      // exactly the window CodeRabbit #6YT0Jo flagged: restoring BEFORE
-      // spawnCli (the old behavior) meant nothing ever restored the caller's
-      // mode again once the CLI (re-)applied 0o700 during its own run.
-      chmodSync(outputDir, 0o700);
-      return { status: 0, stdout: '{}\n', stderr: '' };
+    spawnCli: (args) => {
+      callerModeAtSpawn = lstatSync(outputDir).mode & 0o7777;
+      cliOutputDirArg = args[args.indexOf('--output-dir') + 1];
+      // Mirror the real CLI's writeEvidenceReport, which chmods ITS
+      // --output-dir to 0o700 of its own accord while writing evidence.
+      // Handing the CLI the caller's directory would therefore narrow it no
+      // matter what the wrapper did — the fix only holds because the CLI
+      // receives the action-owned child instead.
+      chmodSync(cliOutputDirArg, 0o700);
+      return { status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' };
     },
   });
   assert.equal(exit, 0);
-  assert.equal(modeAtSpawn, 0o700,
-    'the directory stays secured (0o700) through the CLI invocation — restoration happens after, not before (#6YT0Jo)');
-  const after = lstatSync(outputDir).mode & 0o7777;
-  assert.equal(after, 0o1777,
-    'the caller-owned directory mode (incl. sticky bit) is restored to its original value once the full run — including the CLI\'s own 0o700 rechmod — has finished (#6YFOVK/#6YT0Jo)');
+  assert.equal(cliOutputDirArg, resolveEvidenceDir(outputDir),
+    'the CLI must be handed the private evidence child, never the caller directory');
+  assert.equal(callerModeAtSpawn, 0o1777,
+    'the caller directory is not narrowed even DURING the gate run — concurrent users of a shared path stay unaffected (#6Yd4Qx)');
+  assert.equal(lstatSync(outputDir).mode & 0o7777, 0o1777,
+    'the caller directory mode (incl. sticky bit) is untouched after the run');
+  assert.equal(lstatSync(resolveEvidenceDir(outputDir)).mode & 0o7777, 0o700,
+    'the child that actually holds evidence is owner-only (0o700)');
+  assert.equal(JSON.parse(readFs(evidencePath(outputDir, 'plan.json'), 'utf8')).planStatus, 'PASS',
+    'evidence is genuinely written inside the child');
 });
-test('runSubcommand restores the original mode even when the run step throws after acquiring the directory (CodeRabbit #6YT0Jo)', async () => {
+test('runSubcommand leaves the caller directory mode untouched on a throwing exit path too (#6Yd4Qx, retiring #6YT0Jo\'s finally-restore)', async () => {
   if (process.platform === 'win32') return;
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
@@ -1022,31 +1046,138 @@ test('runSubcommand restores the original mode even when the run step throws aft
     }),
     /boom/,
   );
-  const after = lstatSync(outputDir).mode & 0o7777;
-  assert.equal(after, 0o1777, 'the finally block restores the original mode even when spawnCli throws');
+  assert.equal(lstatSync(outputDir).mode & 0o7777, 0o1777,
+    'no capture/restore is needed on ANY exit path — the caller mode was never modified in the first place');
 });
-test('runSubcommand captures the TARGET directory mode for a symlinked outputDir, not the link\'s own mode (CodeRabbit #6YT0Js)', async () => {
+test('a symlinked outputDir\'s TARGET directory keeps its own mode — never narrowed during the run, never broadened after (#6Yd4Qx, retiring CodeRabbit #6YT0Js)', async () => {
   if (process.platform === 'win32') return;
   const dir = makeTempDir();
   const realTarget = path.join(dir, 'real-evidence');
   const outputDir = path.join(dir, 'evidence-link');
-  mkdirSync(realTarget, { recursive: true, mode: 0o700 });
-  chmodSync(realTarget, 0o700);
-  symlinkSync(realTarget, outputDir, 'dir');
+  // 0o755: distinguishable from BOTH failure directions the old scheme had —
+  // a narrowing chmod to 0o700 during the run (#6Yd4Qx's complaint) and a
+  // broadening restore to the link's own 0o777 lstat mode (#6YT0Js's
+  // complaint). Neither can happen now: the target is simply never chmodded.
+  mkdirSync(realTarget, { recursive: true, mode: 0o755 });
+  chmodSync(realTarget, 0o755);
+  try {
+    symlinkSync(realTarget, outputDir, 'dir');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return; // no symlink privilege on this host
+    throw error;
+  }
   const exit = await runSubcommand({
     inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
     inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
     env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
     event: {},
-    spawnCli: () => ({ status: 0, stdout: '{}\n', stderr: '' }),
+    spawnCli: () => ({ status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }),
   });
   assert.equal(exit, 0);
-  // statSync follows the symlink to the target's real mode (0o700). Using
-  // lstatSync instead would have captured the LINK's own mode (typically
-  // 0o777 on most platforms) and restored the target to that broader mode —
-  // exposing or making writable a directory that started at 0o700.
-  const after = lstatSync(realTarget).mode & 0o7777;
-  assert.equal(after, 0o700, 'the symlink target is restored to its own real mode, not broadened to the link\'s mode');
+  assert.equal(lstatSync(realTarget).mode & 0o7777, 0o755,
+    'the symlink target\'s mode is never touched — neither narrowed to 0o700 nor broadened to the link\'s 0o777');
+  // The evidence child is created THROUGH the caller's link (the parent link
+  // is the caller's own, legitimate arrangement — only a link at the child's
+  // fixed name is hostile), so it physically lives under the target.
+  assert.equal(lstatSync(path.join(realTarget, EVIDENCE_SUBDIR)).mode & 0o7777, 0o700,
+    'the evidence child under the target is owner-only');
+});
+test('runSubcommand refuses a pre-planted symlink at the fixed evidence-child name (chatgpt-codex-connector PR7 #6Yd4Qx)', async () => {
+  // The child's name is fixed and its parent may be a shared world-writable
+  // directory (/tmp): a hostile local user can create
+  // <output-dir>/closeout-action-evidence AHEAD of the run as a symlink to a
+  // victim directory, aiming every later read, delete (stale-evidence
+  // cleanup), and write there — the directory-level analogue of the
+  // state-file symlink #6Yb44Sj closed. prepareEvidenceDirectory's
+  // post-mkdir lstat must refuse it before the ownership probe, the cleanup,
+  // the CLI spawn, or any write runs.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  mkdirSync(outputDir, { recursive: true });
+  const victim = path.join(dir, 'victim');
+  mkdirSync(victim, { recursive: true });
+  // A forged authenticated-shape marker INSIDE the victim: if the planted
+  // link were followed, hadPriorEvidence would read this and authorize the
+  // destructive cleanup against the victim's own files.
+  writeFs(path.join(victim, 'action-state.json'), `${JSON.stringify({ tier: 'plan', nonce: 'forged' })}\n`);
+  writeFs(path.join(victim, 'plan.json'), '{"victim":true}\n');
+  try {
+    symlinkSync(victim, resolveEvidenceDir(outputDir), 'dir');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return; // no symlink privilege on this host
+    throw error;
+  }
+  let spawned = false;
+  await assert.rejects(
+    () => runSubcommand({
+      inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+      inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+      env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+      event: {},
+      spawnCli: () => { spawned = true; return { status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }; },
+    }),
+    /Refusing to use a pre-existing non-directory/,
+  );
+  assert.equal(spawned, false, 'the CLI must never be spawned against a symlinked evidence path');
+  const { existsSync } = require('node:fs');
+  assert.equal(readFs(path.join(victim, 'plan.json'), 'utf8'), '{"victim":true}\n',
+    'nothing behind the planted link is deleted or overwritten');
+  assert.equal(existsSync(path.join(victim, 'action-state.json')), true,
+    'the forged marker must not authorize cleanup through the link');
+});
+test('a pre-existing evidence child from a reused output-dir is re-tightened to 0o700 (Qodo #6 / CodeRabbit #6X72Z2, retargeted to the child)', async () => {
+  if (process.platform === 'win32') return;
+  // mkdirSync's `mode` only applies when the directory is CREATED (Qodo #6),
+  // so a child left loosened between runs of a reused output-dir would keep
+  // its broad mode without the explicit chmod — the same pair of invariants
+  // the old in-place code enforced on the caller directory, now enforced on
+  // the child that actually holds the evidence.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const child = resolveEvidenceDir(outputDir);
+  mkdirSync(child, { recursive: true });
+  chmodSync(child, 0o755);
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  assert.equal(lstatSync(child).mode & 0o7777, 0o700,
+    'a reused, loosened child must be explicitly re-tightened — mkdir mode alone cannot do it');
+});
+test('finish and comment locate the state that run wrote, given only the caller output-dir (chatgpt-codex-connector PR7 #6Yd4Qx)', async () => {
+  // `comment` and `finish` execute as SEPARATE processes receiving only
+  // CLOSEOUT_OUTPUT_DIR (the caller-facing directory). The evidence child
+  // must be re-derivable from that value alone, or the composite's later
+  // steps would go state-blind and fail closed on every run.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    nonce: 'cross-step-nonce',
+    spawnCli: () => ({ status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }),
+  });
+  assert.equal(exit, 0);
+  const calls = [];
+  const commentCode = await commentSubcommand({
+    outputDir,
+    env: { GITHUB_REPOSITORY: 'o/r', CLOSEOUT_INVOCATION_NONCE: 'cross-step-nonce' },
+    event: { pull_request: { number: 7 } },
+    runGh: async (args) => { calls.push(args); return args.includes('POST') ? { id: 1 } : [[]]; },
+  });
+  assert.equal(commentCode, 0, 'comment must find the state run wrote under the evidence child');
+  assert.equal(calls.length, 2, 'comment must actually reach the API, not skip on missing state');
+  assert.equal(
+    finishSubcommand({ outputDir, env: { CLOSEOUT_INVOCATION_NONCE: 'cross-step-nonce' } }),
+    0,
+    'finish must find and apply the recorded decision from the evidence child',
+  );
 });
 
 test('runSubcommand end-to-end (full tier): reads report.json/report.md and records the failing decision', async () => {
@@ -1073,7 +1204,7 @@ test('runSubcommand end-to-end (full tier): reads report.json/report.md and reco
   const outputs = readFs(outputFile, 'utf8');
   assert.match(outputs, /^status=FAIL$/m);
   assert.match(outputs, /^mode=engine$/m);
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 2]);
   // Spec: full-tier COMMENTS carry key fields + an artifact pointer, never
   // the embedded report.md — the summary keeps the embed, the comment
@@ -1103,7 +1234,7 @@ test('runSubcommand (full tier) fails closed when report.json is missing despite
     spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h', report: { json: bogusReport, markdown: 'report.md' } })}\n`, stderr: '' }),
   });
   assert.equal(exit, 0, 'run never fails the job; finish decides');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.decision.success, false, 'an unverifiable success record must not PASS');
   assert.equal(state.decision.exitCode, 3);
   assert.match(state.decision.reason, /report\.json was missing, malformed, or schema-invalid/);
@@ -1129,7 +1260,7 @@ test('runSubcommand (full tier) fails closed when a success record omits the rep
     spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h' })}\n`, stderr: '' }),
   });
   assert.equal(exit, 0, 'run never fails the job; finish decides');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.decision.success, false, 'a success record with no report path must not PASS');
   assert.equal(state.decision.exitCode, 3);
   const outputs = readFs(path.join(dir, 'o'), 'utf8');
@@ -1154,7 +1285,7 @@ test('runSubcommand (full tier) fails closed when report.json parses but is sche
     spawnCli: () => ({ status: 0, stdout: `${JSON.stringify({ status: 'PASS', headSha: 'h', report: { json: bogusReport, markdown: 'report.md' } })}\n`, stderr: '' }),
   });
   assert.equal(exit, 0, 'run never fails the job; finish decides');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.decision.success, false, 'a schema-invalid report must not PASS');
   assert.equal(state.decision.exitCode, 3);
   assert.match(state.decision.reason, /schema-invalid/);
@@ -1180,7 +1311,7 @@ test('runSubcommand (full tier) forces BLOCKED when CLI exits non-zero but repor
     spawnCli: () => ({ status: 2, stdout: `${JSON.stringify({ status: 'BLOCKED', headSha: 'h', report: { json: passReport, markdown: 'report.md' } })}\n`, stderr: 'gate failed' }),
   });
   assert.equal(exit, 0, 'run never fails the job; finish decides');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.decision.success, false, 'a failing CLI exit must not be treated as success');
   assert.match(state.decision.reason, /integrity mismatch/, 'the reason cites the integrity mismatch');
   const outputs = readFs(path.join(dir, 'o'), 'utf8');
@@ -1189,7 +1320,7 @@ test('runSubcommand (full tier) forces BLOCKED when CLI exits non-zero but repor
 
 test('the comment step sends the comment rendering, not the summary embed', async () => {
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     tier: 'full', artifactName: 'ev',
     renderedSummary: '## Closeout gate result\nfields\n\n---\n\nHUGE EMBEDDED REPORT BODY',
     renderedComment: '## Closeout gate result\nfields\n\nSee report.md in the evidence artifact named above.',
@@ -1231,7 +1362,7 @@ test('a broken preview comments only a pointer — gate error text stays in summ
     'credential-shaped stderr must be redacted from the Step Summary');
   assert.match(readFs(path.join(dir, 's'), 'utf8'), /REDACTED/,
     'the redaction marker must appear in place of the scrubbed credential');
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.doesNotMatch(state.renderedComment, /ghpabcdefghijklmnopqrstuvwxyz0123456789AB/);
   assert.match(state.renderedComment, /preview itself failed/i);
   assert.match(state.renderedComment, /Step Summary and run log/);
@@ -1257,7 +1388,7 @@ test('a degraded engine run never labels itself strict', async () => {
   const summary = readFs(path.join(dir, 's'), 'utf8');
   assert.match(summary, /- Mode: engine/);
   assert.doesNotMatch(summary, /- Mode: strict/);
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.match(state.renderedComment, /- Mode: engine/);
 });
 
@@ -1275,9 +1406,9 @@ test('a spawn failure is named in the summary, not just "no JSON"', async () => 
 
 test('finishSubcommand exits with the recorded decision', () => {
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' } }));
+  plantEvidence(dir, 'action-state.json', JSON.stringify({ decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' } }));
   assert.equal(finishSubcommand({ outputDir: dir }), 2);
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
+  plantEvidence(dir, 'action-state.json', JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
   assert.equal(finishSubcommand({ outputDir: dir }), 0);
   // Missing state means run never completed: fail closed.
   assert.equal(finishSubcommand({ outputDir: makeTempDir() }), 3);
@@ -1291,7 +1422,7 @@ test('finishSubcommand rejects a state record left by a different invocation (Co
   // decision is always success:true regardless of planStatus). Trusting it
   // would let an enforcing full job go green on a gate that actually failed.
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     decision: { success: true, exitCode: 0, reason: 'plan captured (planStatus=BLOCKED)' },
     nonce: 'foreign-invocation-nonce',
   }));
@@ -1304,7 +1435,7 @@ test('finishSubcommand rejects a state record left by a different invocation (Co
 
 test('finishSubcommand trusts a state record whose nonce matches this job\'s own', () => {
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     decision: { success: false, exitCode: 2, reason: 'gate FAIL (exit 2)' },
     nonce: 'this-job-nonce',
   }));
@@ -1320,7 +1451,7 @@ test('finishSubcommand rejects a state record with no nonce when this job has it
   // trusted just because it happens to claim success — that was the exact
   // gap: a genuinely-rejected invocation could read as green.
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
+  plantEvidence(dir, 'action-state.json', JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
   assert.equal(
     finishSubcommand({ outputDir: dir, env: { CLOSEOUT_INVOCATION_NONCE: 'this-job-nonce' } }),
     3,
@@ -1334,9 +1465,9 @@ test('finishSubcommand skips the nonce check only when THIS job itself lacks a n
   // pre-nonce-feature invocation): the check does not apply — this only
   // tightens behavior in real GH Actions jobs, where GITHUB_ENV is always
   // present and "run" always exports a nonce as its first action.
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'x' }));
+  plantEvidence(dir, 'action-state.json', JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'x' }));
   assert.equal(finishSubcommand({ outputDir: dir, env: {} }), 0);
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
+  plantEvidence(dir, 'action-state.json', JSON.stringify({ decision: { success: true, exitCode: 0, reason: 'ok' } }));
   assert.equal(finishSubcommand({ outputDir: dir, env: {} }), 0);
 });
 
@@ -1353,7 +1484,7 @@ test('runSubcommand writes its nonce to both the state file and GITHUB_ENV (Code
     spawnCli: () => ({ status: 0, stdout: '{"planStatus":"PASS"}\n', stderr: '' }),
   });
   assert.equal(exit, 0);
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.equal(state.nonce, 'fixed-test-nonce');
   assert.match(readFs(envFile, 'utf8'), /^CLOSEOUT_INVOCATION_NONCE=fixed-test-nonce$/m);
 });
@@ -1401,16 +1532,31 @@ test('action.yml uploads only this action\'s well-known evidence filenames, neve
   const pathBlockMatch = /path:\s*\|\r?\n((?:[ \t]+\S.*\r?\n?)+)/.exec(afterStep);
   assert.ok(pathBlockMatch, 'path: must be a multi-line block scalar, not a bare directory');
   const lines = pathBlockMatch[1].split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const suffix of ['/plan.json', '/report.json', '/report.md', '/action-state.json', '/logs']) {
+  // Every well-known name must be globbed INSIDE the fixed evidence child
+  // (EVIDENCE_SUBDIR), where support.js and the spawned CLI actually write
+  // (chatgpt-codex-connector PR7 #6Yd4Qx) — a glob at the caller directory's
+  // top level would silently upload nothing (or, worse, an unrelated tool's
+  // same-named file in a shared caller dir, the #6YYcNT residual this
+  // narrows). This is the lockstep pin between action.yml's static YAML and
+  // support.js's EVIDENCE_SUBDIR constant: renaming either alone fails here.
+  for (const name of ['plan.json', 'report.json', 'report.md', 'action-state.json', 'logs']) {
+    const suffix = `/${EVIDENCE_SUBDIR}/${name}`;
     assert.ok(
       lines.some((line) => line.endsWith(suffix)),
       `path: must enumerate a line ending in ${suffix}`,
     );
   }
-  // No line may be the bare output-dir expression itself (no filename
-  // suffix) -- that would be the pre-fix bare-directory upload again.
+  // No line may be a bare directory expression (no filename suffix) -- that
+  // would be the pre-fix bare-directory upload again, for either the caller
+  // directory or the evidence child. The block-scalar regex above also
+  // captures the step's following `if-no-files-found:` line, so the
+  // inside-the-child requirement applies to the glob lines (the ones
+  // carrying the output-dir expression), not to that trailing option.
   for (const line of lines) {
     assert.notEqual(line, "${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}");
+    if (line.startsWith('${{')) {
+      assert.ok(line.includes(`/${EVIDENCE_SUBDIR}/`), `every upload glob must point inside the evidence child: ${line}`);
+    }
   }
 });
 
@@ -1494,7 +1640,7 @@ test('runSubcommand rejects an inside-workspace output dir before mkdir or any s
 
 test('commentSubcommand upserts in PR context and skips with a notice otherwise', async () => {
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     tier: 'plan', artifactName: 'ev', renderedSummary: '## Closeout plan preview\nbody', decision: { success: true, exitCode: 0 },
   }));
   const calls = [];
@@ -1518,7 +1664,7 @@ test('commentSubcommand rejects a state record left by a different invocation (c
   // pointer — a visible side effect finishSubcommand's own later nonce
   // check cannot undo after the fact.
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     tier: 'plan', artifactName: 'ev', renderedSummary: 'foreign summary', decision: { success: true, exitCode: 0 },
     nonce: 'foreign-invocation-nonce',
   }));
@@ -1537,7 +1683,7 @@ test('commentSubcommand rejects a state record with no nonce when this job has i
   // field at all must not be trusted just because it claims a tier/summary,
   // since "run" never got to overwrite it with this job's own state.
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     tier: 'plan', artifactName: 'ev', renderedSummary: 'stale summary', decision: { success: true, exitCode: 0 },
   }));
   const code = await commentSubcommand({
@@ -1562,7 +1708,7 @@ test('full tier with lost stdout fails closed and still renders a summary', asyn
     event: {},
     spawnCli: () => ({ status: 0, stdout: '', stderr: '' }),
   });
-  const state = JSON.parse(readFs(path.join(outputDir, 'action-state.json'), 'utf8'));
+  const state = JSON.parse(readFs(evidencePath(outputDir, 'action-state.json'), 'utf8'));
   assert.deepEqual([state.decision.success, state.decision.exitCode], [false, 3]);
   assert.match(state.decision.reason, /no JSON record/i);
   assert.match(readFs(path.join(dir, 's'), 'utf8'), /BLOCKED/);
@@ -1587,7 +1733,7 @@ test('a hostile base-ref stays one argv element — never a shell string', async
 
 test('a comment API failure propagates — the consumer opted in, silence would lie', async () => {
   const dir = makeTempDir();
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     tier: 'plan', artifactName: 'ev', renderedSummary: 'body', decision: { success: true, exitCode: 0 },
   }));
   await assert.rejects(
@@ -1805,7 +1951,7 @@ test('finishSubcommand sweeps the delegated token file (chatgpt-codex-connector 
   const dir = makeTempDir();
   const tokenFile = path.join(makeTempDir(), 'gh-token');
   writeFs(tokenFile, 'ghs_leftoverToken');
-  writeFs(path.join(dir, 'action-state.json'), JSON.stringify({
+  plantEvidence(dir, 'action-state.json', JSON.stringify({
     decision: { success: true, exitCode: 0, reason: 'ok' }, nonce: 'n1',
   }));
   const code = finishSubcommand({
