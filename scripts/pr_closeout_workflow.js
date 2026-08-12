@@ -843,10 +843,16 @@ const buildPlanPreflightEnvironment = (env, isolatedHomeDir = null) => {
   if (isolatedHomeDir) {
     for (const name of HOME_ENV_NAMES) {
       // Preserve the ambient casing (env.HOME vs env.Home never both exist on
-      // one platform) rather than assuming one; only override a name that was
-      // actually present in the sanitized set to begin with.
-      const actualName = Object.keys(sanitized).find((key) => key.toUpperCase() === name);
-      if (actualName) sanitized[actualName] = isolatedHomeDir;
+      // one platform) when the name was already present; otherwise set the
+      // canonical (already-uppercase) name outright. A name absent from the
+      // ambient env must still be forced to the isolated directory, not left
+      // unset — Node's os.homedir() (and other profile-resolving platform
+      // APIs) falls back to OS-level lookups (getpwuid on POSIX, the
+      // Windows profile API) when its env var is undefined, which would
+      // silently resolve to the REAL home directory and defeat the
+      // isolation this function exists to provide (CodeRabbit PR7 #6Yb44Sl).
+      const actualName = Object.keys(sanitized).find((key) => key.toUpperCase() === name) || name;
+      sanitized[actualName] = isolatedHomeDir;
     }
   }
   return sanitized;
@@ -1154,9 +1160,13 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
           toolProbes,
         });
       } finally {
-        if (isolatedHomeDir) {
-          try { await rm(isolatedHomeDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
-        }
+        // Not best-effort (CodeRabbit PR7 #6Yb44Sp): a cleanup failure here
+        // means the isolated profile directory a repository-controlled probe
+        // may have written into was NOT removed. Letting the error propagate
+        // (rather than swallowing it) reaches the outer catch below, which
+        // forces preflight to BLOCKED instead of returning a PASS/FAIL result
+        // computed while that leftover data still exists.
+        if (isolatedHomeDir) await rm(isolatedHomeDir, { recursive: true, force: true });
       }
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };

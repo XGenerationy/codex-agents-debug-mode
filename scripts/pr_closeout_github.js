@@ -408,11 +408,35 @@ const resolveWorkflowRunPath = async ({ repository, runGh, repo, runId } = {}) =
  * prior entry in place), so finding a SECOND, distinct run id sharing this
  * job's exact displayed name is itself already an unusual signal — the loop
  * below only makes extra `gh api` calls when that signal is present, zero
- * otherwise. When it fires, this fails SAFE: an unresolvable or mismatched
- * path disables self-exclusion (returns `false`, the existing tested
- * sentinel), which can only make the gate MORE conservative (BLOCKED on a
- * check that turns out to be this run's own), never less — it can never turn
- * a real failure into a false PASS.
+ * otherwise. When it fires, this fails SAFE: an unresolvable run identity or
+ * mismatched path disables self-exclusion (`collision: true`, which maps to
+ * the existing tested `false` sentinel by the caller), which can only make
+ * the gate MORE conservative (BLOCKED on a check that turns out to be this
+ * run's own), never less — it can never turn a real failure into a false
+ * PASS.
+ *
+ * Returns `networkCallsMade` alongside the verdict (CodeRabbit PR7 #6Yb44So)
+ * so the caller knows whether it must re-verify PR/attestation/thread
+ * stability afterward: a live `resolveWorkflowRunPath` request reopens the
+ * same kind of unverified window every other network call in readLivePrState
+ * is already re-checked for. `networkCallsMade` is `false` whenever the
+ * verdict was reached WITHOUT any request — the common zero-collision case,
+ * and the unidentified-run-id fail-safe path, which returns immediately
+ * without calling `resolveWorkflowRunPath` at all.
+ *
+ * An unresolvable `selfWorkflowPath` (this run's OWN path, not another
+ * run's) also fails safe to `collision: true` (cubic P1, following up on
+ * #6Yb44Si): without a baseline to compare against, whether a name-matching
+ * check belongs to a different workflow simply cannot be determined, so
+ * self-exclusion must not be allowed to silently continue on the strength of
+ * the name match alone — that is precisely the collision this function
+ * exists to catch. In real GitHub Actions runs GITHUB_RUN_ID (this call's
+ * only precondition, alongside the name/job values) is always present, so
+ * this path is reached only on a genuine transient failure of the
+ * `repos/{repo}/actions/runs/{runId}` request itself — rare, and no worse
+ * than the pre-#6YXkRF self-exclusion gap this whole feature improves on:
+ * worst case the gate BLOCKS on its own pending check for one evaluation,
+ * never a false PASS.
  * @param {object} options
  * @param {object} [options.pr] - a `gh pr view` JSON object with statusCheckRollup.
  * @param {string|null} [options.selfWorkflowName]
@@ -422,7 +446,7 @@ const resolveWorkflowRunPath = async ({ repository, runGh, repo, runId } = {}) =
  * @param {Function} [options.runGh]
  * @param {string} [options.repo]
  * @param {object} [options.env]
- * @returns {Promise<boolean>} true when self-exclusion must be disabled.
+ * @returns {Promise<{collision: boolean, networkCallsMade: boolean}>}
  */
 const detectCrossWorkflowSelfExclusionCollision = async ({
   pr,
@@ -434,7 +458,8 @@ const detectCrossWorkflowSelfExclusionCollision = async ({
   repo,
   env = process.env,
 } = {}) => {
-  if (!selfWorkflowName || !selfJobName || !selfWorkflowPath) return false;
+  if (!selfWorkflowName || !selfJobName) return { collision: false, networkCallsMade: false };
+  if (!selfWorkflowPath) return { collision: true, networkCallsMade: false };
   const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const selfRunId = env.GITHUB_RUN_ID ? String(env.GITHUB_RUN_ID) : null;
   const otherRunIds = new Set();
@@ -444,15 +469,45 @@ const detectCrossWorkflowSelfExclusionCollision = async ({
     const detailsUrl = typeof entry?.detailsUrl === 'string' ? entry.detailsUrl : '';
     const match = detailsUrl.match(/\/actions\/runs\/(\d+)\//);
     const runId = match ? match[1] : null;
-    if (runId && runId !== selfRunId) otherRunIds.add(runId);
+    // A name-matching entry whose run id cannot be extracted (missing,
+    // empty, or unexpectedly shaped detailsUrl) cannot be PROVEN to be this
+    // run's own check either — treat it the same as an unresolvable path
+    // below (CodeRabbit PR7 #6Yb44Sm): fail safe rather than silently let
+    // classifyLivePrState exclude an unverified check. No request is made to
+    // reach this verdict, so networkCallsMade stays false.
+    if (!runId) return { collision: true, networkCallsMade: false };
+    if (runId !== selfRunId) otherRunIds.add(runId);
   }
-  if (!otherRunIds.size) return false;
+  if (!otherRunIds.size) return { collision: false, networkCallsMade: false };
   for (const runId of otherRunIds) {
     const otherPath = await resolveWorkflowRunPath({ repository, runGh, repo, runId });
-    if (!otherPath || otherPath !== selfWorkflowPath) return true;
+    if (!otherPath || otherPath !== selfWorkflowPath) return { collision: true, networkCallsMade: true };
   }
-  return false;
+  return { collision: false, networkCallsMade: true };
 };
+
+/**
+ * Resolve the self job's DISPLAYED name to match against `statusCheckRollup`
+ * entries, from resolveCurrentJobDisplayName's result. `selfJobDisplayName
+ * === false` is a DISTINCT sentinel from `null`/absent (chatgpt-codex-
+ * connector PR7 #6YbMwM): the resolver returns it specifically when it
+ * detected another job sharing this job's own displayed name, and in that
+ * exact scenario GITHUB_JOB can itself equal that same ambiguous name —
+ * falling back to it would recreate the very collision the resolver just
+ * rejected. Resolves to `null` in that case so self-exclusion is skipped
+ * entirely, rather than silently falling back to an equally-unsafe match.
+ * Shared by classifyLivePrState's own self-exclusion filter and
+ * readLivePrState's cross-workflow collision pre-check so the two copies of
+ * this sentinel rule cannot independently drift (CodeRabbit PR7 #6Yb44Sn).
+ * @param {string|false|null|undefined} selfJobDisplayName
+ * @param {object} [env]
+ * @returns {string|null}
+ */
+const resolveSelfJobName = (selfJobDisplayName, env = process.env) => (
+  selfJobDisplayName === false
+    ? null
+    : (selfJobDisplayName || env.GITHUB_JOB || null)
+);
 
 /**
  * Reduce one already-fetched snapshot of live GitHub PR state (metadata,
@@ -532,19 +587,11 @@ const classifyLivePrState = ({
   // is not (API unavailable, older/local invocation, or dispatch without a
   // resolvable run id).
   //
-  // `selfJobDisplayName === false` is a DISTINCT sentinel from `null`
-  // (chatgpt-codex-connector PR7 #6YbMwM): the resolver returns it
-  // specifically when it detected another job sharing this job's own
-  // displayed name, and in that exact scenario GITHUB_JOB can itself equal
-  // that same ambiguous name — falling back to it here would recreate the
-  // very collision the resolver just rejected, excluding a genuinely-failed
-  // sibling's check right alongside this job's own. Force selfJobName to
-  // null in that case so the exclusion below is skipped entirely, rather
-  // than silently falling back to an equally-unsafe match.
+  // The `selfJobDisplayName === false` sentinel (a detected in-run name
+  // collision) is resolved via the shared resolveSelfJobName helper — see
+  // its own doc comment above for why it must not fall back to GITHUB_JOB.
   const selfWorkflowName = process.env.GITHUB_WORKFLOW || null;
-  const selfJobName = selfJobDisplayName === false
-    ? null
-    : (selfJobDisplayName || process.env.GITHUB_JOB || null);
+  const selfJobName = resolveSelfJobName(selfJobDisplayName);
   const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.map(normalizeCheck) : [];
   // Recorded BEFORE self-exclusion so a rollup that legitimately contained
   // ONLY this job's own check (chatgpt-codex-connector PR7 #6Yb3lX, P2) can be
@@ -846,7 +893,7 @@ const readLiveGateAttestation = async ({
         evidence: `Live PR base ${pr.baseRefOid.substring(0, 7)} does not match expected base ${expectedBaseSha?.substring(0, 7)}; admission attestation is bound to the wrong snapshot.`,
       };
     }
-    return await readGateAttestationForPr({
+    const attestation = await readGateAttestationForPr({
       repo,
       repository,
       pr,
@@ -855,6 +902,31 @@ const readLiveGateAttestation = async ({
       expectedConfigDigest,
       runGh,
     });
+    // readGateAttestationForPr's own reviews + reviewer-permission requests
+    // (paginated, potentially several round-trips) run AFTER the head/base
+    // check above, with no recheck afterward — a push, force-push, or rebase
+    // landing while those requests are in flight would leave `attestation`
+    // computed from the now-stale `pr` snapshot, and this function would
+    // still return it as current (chatgpt-codex-connector PR7 #6Yb44Ss).
+    // Unlike readLivePrState's live-state path, this function's callers
+    // (plan-mode admission, and the full run's early pre-check) treat this
+    // result as authoritative on its own within their own scope, so the
+    // same re-verification discipline applies here too. Re-read only the
+    // cheap head/base identity, not the full review/permission set again —
+    // an attestation computed against a snapshot that has since moved is
+    // unsafe regardless of what it concluded.
+    const revalidated = await runGh(['pr', 'view', '--json', 'headRefOid,baseRefOid'], { repo });
+    if (revalidated.headRefOid !== pr.headRefOid || revalidated.baseRefOid !== pr.baseRefOid) {
+      return {
+        provider: 'github-pull-request-review',
+        status: 'BLOCKED',
+        baseSha: expectedBaseSha,
+        headSha: expectedHeadSha,
+        configDigest: expectedConfigDigest,
+        evidence: 'Live GitHub PR head or base changed while reading reviews and reviewer permissions; admission attestation is bound to a snapshot that is no longer current.',
+      };
+    }
+    return attestation;
   } catch (error) {
     return {
       provider: 'github-pull-request-review',
@@ -1291,22 +1363,84 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     // overrides to `false`, the existing tested sentinel that disables
     // self-exclusion entirely inside classifyLivePrState, without changing
     // that function at all.
-    const selfExclusionCollision = await detectCrossWorkflowSelfExclusionCollision({
-      pr: verifiedPr,
-      selfWorkflowName: process.env.GITHUB_WORKFLOW || null,
-      selfJobName: selfJobDisplayName === false ? null : (selfJobDisplayName || process.env.GITHUB_JOB || null),
-      selfWorkflowPath,
-      repository,
-      runGh,
-      repo,
-    });
+    const { collision: selfExclusionCollision, networkCallsMade: collisionCheckMadeNetworkCalls } = (
+      await detectCrossWorkflowSelfExclusionCollision({
+        pr: verifiedPr,
+        selfWorkflowName: process.env.GITHUB_WORKFLOW || null,
+        selfJobName: resolveSelfJobName(selfJobDisplayName),
+        selfWorkflowPath,
+        repository,
+        runGh,
+        repo,
+      })
+    );
+    let classifiedPr = verifiedPr;
+    let classifiedGateSnapshot = verifiedGateSnapshot;
+    let classifiedUnresolvedThreads = verifiedUnresolvedThreads;
+    if (collisionCheckMadeNetworkCalls) {
+      // detectCrossWorkflowSelfExclusionCollision's own resolveWorkflowRunPath
+      // request(s) are live `gh api` calls made AFTER verifiedPr/
+      // verifiedGateSnapshot/verifiedUnresolvedThreads were captured, with no
+      // subsequent stability recheck — the same class of window every other
+      // network round-trip in this function is already re-verified for
+      // (CodeRabbit PR7 #6Yb44So). Only paid for when it actually fired
+      // (networkCallsMade), which is rare — see detectCrossWorkflowSelfExclusionCollision's
+      // own doc comment on why the common case makes zero requests.
+      const postCollisionCheckPr = await runGh(['pr', 'view', '--json', PR_VIEW_FIELDS], { repo });
+      const postCollisionCheckGateSnapshot = await readGateAttestationSnapshotForPr({
+        repo,
+        repository,
+        pr: postCollisionCheckPr,
+        expectedBaseSha,
+        expectedHeadSha,
+        expectedConfigDigest,
+        runGh,
+      });
+      const postCollisionCheckStable = stabilityTuplesMatch(
+        capturePrStabilityTuple(verifiedPr),
+        capturePrStabilityTuple(postCollisionCheckPr),
+      ) && stabilityTuplesMatch(
+        verifiedGateSnapshot.stabilityTuple,
+        postCollisionCheckGateSnapshot.stabilityTuple,
+      );
+      if (!postCollisionCheckStable) {
+        return {
+          status: 'BLOCKED',
+          evidence: 'Live GitHub PR or review/attestation state changed during the cross-workflow collision verification window; rerun against a stable remote snapshot.',
+          repository,
+          number: postCollisionCheckPr.number,
+          checks: [],
+          unresolvedThreads: verifiedUnresolvedThreads,
+          externalServices: [],
+          gateAttestation: postCollisionCheckGateSnapshot.attestation,
+        };
+      }
+      const postCollisionCheckUnresolvedThreads = await readUnresolvedReviewThreads({
+        repo, owner, name, number: postCollisionCheckPr.number, runGh,
+      });
+      if (threadTuple(verifiedUnresolvedThreads) !== threadTuple(postCollisionCheckUnresolvedThreads)) {
+        return {
+          status: 'BLOCKED',
+          evidence: 'Live GitHub review threads changed during the cross-workflow collision verification window; rerun against a stable remote snapshot.',
+          repository,
+          number: postCollisionCheckPr.number,
+          checks: [],
+          unresolvedThreads: postCollisionCheckUnresolvedThreads,
+          externalServices: [],
+          gateAttestation: postCollisionCheckGateSnapshot.attestation,
+        };
+      }
+      classifiedPr = postCollisionCheckPr;
+      classifiedGateSnapshot = postCollisionCheckGateSnapshot;
+      classifiedUnresolvedThreads = postCollisionCheckUnresolvedThreads;
+    }
     return classifyLivePrState({
       repository,
-      pr: verifiedPr,
-      unresolvedThreads: verifiedUnresolvedThreads,
+      pr: classifiedPr,
+      unresolvedThreads: classifiedUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
-      gateAttestation: verifiedGateSnapshot.attestation,
+      gateAttestation: classifiedGateSnapshot.attestation,
       selfJobDisplayName: selfExclusionCollision ? false : selfJobDisplayName,
     });
   } catch (error) {

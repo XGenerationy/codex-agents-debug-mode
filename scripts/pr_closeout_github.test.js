@@ -774,7 +774,7 @@ test('resolveWorkflowRunPath is best-effort: null on missing args, API failure, 
   );
 });
 
-test('detectCrossWorkflowSelfExclusionCollision returns false without any API call when no other run id shares this displayed name (the common case)', async () => {
+test('detectCrossWorkflowSelfExclusionCollision returns no collision and no network calls when no other run id shares this displayed name (the common case)', async () => {
   let calls = 0;
   const runGh = async () => { calls += 1; return { path: 'irrelevant' }; };
   const pr = {
@@ -783,7 +783,7 @@ test('detectCrossWorkflowSelfExclusionCollision returns false without any API ca
       { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
     ],
   };
-  const collision = await detectCrossWorkflowSelfExclusionCollision({
+  const result = await detectCrossWorkflowSelfExclusionCollision({
     pr,
     selfWorkflowName: 'Closeout gate',
     selfJobName: 'gate',
@@ -793,11 +793,11 @@ test('detectCrossWorkflowSelfExclusionCollision returns false without any API ca
     repo: 'C:/repo',
     env: { GITHUB_RUN_ID: '999' },
   });
-  assert.equal(collision, false);
+  assert.deepEqual(result, { collision: false, networkCallsMade: false });
   assert.equal(calls, 0, 'no extra API call is made when every same-named check belongs to this run');
 });
 
-test('detectCrossWorkflowSelfExclusionCollision returns true when a same-named check belongs to a different workflow file (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
+test('detectCrossWorkflowSelfExclusionCollision reports a collision (with network calls made) when a same-named check belongs to a different workflow file (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
   const pr = {
     statusCheckRollup: [
       { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
@@ -808,7 +808,7 @@ test('detectCrossWorkflowSelfExclusionCollision returns true when a same-named c
     if (args[1] === 'repos/owner/repo/actions/runs/555') return { path: '.github/workflows/some-other-gate.yml' };
     throw new Error(`unexpected call: ${args.join(' ')}`);
   };
-  const collision = await detectCrossWorkflowSelfExclusionCollision({
+  const result = await detectCrossWorkflowSelfExclusionCollision({
     pr,
     selfWorkflowName: 'Closeout gate',
     selfJobName: 'gate',
@@ -818,10 +818,10 @@ test('detectCrossWorkflowSelfExclusionCollision returns true when a same-named c
     repo: 'C:/repo',
     env: { GITHUB_RUN_ID: '999' },
   });
-  assert.equal(collision, true);
+  assert.deepEqual(result, { collision: true, networkCallsMade: true });
 });
 
-test('detectCrossWorkflowSelfExclusionCollision returns false when the other run id genuinely resolves to the same workflow file', async () => {
+test('detectCrossWorkflowSelfExclusionCollision reports no collision (but network calls made) when the other run id genuinely resolves to the same workflow file', async () => {
   const pr = {
     statusCheckRollup: [
       { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
@@ -829,7 +829,7 @@ test('detectCrossWorkflowSelfExclusionCollision returns false when the other run
     ],
   };
   const runGh = async () => ({ path: '.github/workflows/closeout-gate.yml' });
-  const collision = await detectCrossWorkflowSelfExclusionCollision({
+  const result = await detectCrossWorkflowSelfExclusionCollision({
     pr,
     selfWorkflowName: 'Closeout gate',
     selfJobName: 'gate',
@@ -839,17 +839,17 @@ test('detectCrossWorkflowSelfExclusionCollision returns false when the other run
     repo: 'C:/repo',
     env: { GITHUB_RUN_ID: '999' },
   });
-  assert.equal(collision, false);
+  assert.deepEqual(result, { collision: false, networkCallsMade: true });
 });
 
-test('detectCrossWorkflowSelfExclusionCollision fails safe (true) when the other run\'s path cannot be resolved', async () => {
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true) when the other run\'s path cannot be resolved', async () => {
   const pr = {
     statusCheckRollup: [
       { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
     ],
   };
   const runGh = async () => { throw new Error('rate limited'); };
-  const collision = await detectCrossWorkflowSelfExclusionCollision({
+  const result = await detectCrossWorkflowSelfExclusionCollision({
     pr,
     selfWorkflowName: 'Closeout gate',
     selfJobName: 'gate',
@@ -859,10 +859,35 @@ test('detectCrossWorkflowSelfExclusionCollision fails safe (true) when the other
     repo: 'C:/repo',
     env: { GITHUB_RUN_ID: '999' },
   });
-  assert.equal(collision, true, 'an unresolvable other-run path must not be treated as safe to exclude');
+  assert.equal(result.collision, true, 'an unresolvable other-run path must not be treated as safe to exclude');
+  assert.equal(result.networkCallsMade, true);
 });
 
-test('detectCrossWorkflowSelfExclusionCollision is a no-op when this run\'s own path could not be resolved', async () => {
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true, no network calls) when a name-matching check has no resolvable run id (CodeRabbit PR7 #6Yb44Sm)', async () => {
+  let calls = 0;
+  const pr = {
+    statusCheckRollup: [
+      // Matches selfWorkflowName/selfJobName but carries no detailsUrl at all
+      // — cannot be proven to be this run's own check.
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+    ],
+  };
+  const runGh = async () => { calls += 1; return { path: '.github/workflows/closeout-gate.yml' }; };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: true, networkCallsMade: false }, 'an unidentifiable match fails safe immediately, without any request');
+  assert.equal(calls, 0);
+});
+
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true, no network calls) when this run\'s own path could not be resolved (cubic P1, follow-up to #6Yb44Si)', async () => {
   let calls = 0;
   const pr = {
     statusCheckRollup: [
@@ -870,7 +895,7 @@ test('detectCrossWorkflowSelfExclusionCollision is a no-op when this run\'s own 
     ],
   };
   const runGh = async () => { calls += 1; return { path: 'whatever' }; };
-  const collision = await detectCrossWorkflowSelfExclusionCollision({
+  const result = await detectCrossWorkflowSelfExclusionCollision({
     pr,
     selfWorkflowName: 'Closeout gate',
     selfJobName: 'gate',
@@ -880,8 +905,8 @@ test('detectCrossWorkflowSelfExclusionCollision is a no-op when this run\'s own 
     repo: 'C:/repo',
     env: { GITHUB_RUN_ID: '999' },
   });
-  assert.equal(collision, false, 'with no baseline to compare against, legacy name-based self-exclusion is preserved unchanged');
-  assert.equal(calls, 0);
+  assert.deepEqual(result, { collision: true, networkCallsMade: false }, 'with no baseline to compare against, self-exclusion must not silently continue on the name match alone');
+  assert.equal(calls, 0, 'no request is made — this is an immediate fail-safe short-circuit');
 });
 
 test('readLivePrState disables self-exclusion end-to-end when a same-named check belongs to a different workflow file, letting the sibling\'s FAILURE surface (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
@@ -927,6 +952,67 @@ test('readLivePrState disables self-exclusion end-to-end when a same-named check
       runGh,
     });
     assert.equal(result.status, 'FAIL', 'the colliding workflow\'s genuine FAILURE must surface, not be silently excluded');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
+});
+
+test('readLivePrState blocks when PR state changes during the collision check\'s own verification window (CodeRabbit PR7 #6Yb44So)', async () => {
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  process.env.GITHUB_WORKFLOW = 'Closeout gate';
+  process.env.GITHUB_JOB = 'gate';
+  process.env.GITHUB_RUN_ID = '999';
+  process.env.RUNNER_NAME = 'this-runner';
+  try {
+    const collidingPr = {
+      ...cleanPr(),
+      statusCheckRollup: [
+        { name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+        { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+      ],
+    };
+    // A same-shape PR whose merge state flips — simulating a live change that
+    // lands specifically during detectCrossWorkflowSelfExclusionCollision's
+    // own resolveWorkflowRunPath request, after every earlier snapshot in
+    // this function already agreed and was found stable.
+    const changedPr = { ...collidingPr, mergeStateStatus: 'DIRTY' };
+    let prCalls = 0;
+    const runGh = async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') { prCalls += 1; return prCalls <= 5 ? collidingPr : changedPr; }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
+        return [{ jobs: [{ name: 'gate', runner_name: 'this-runner' }] }];
+      }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999') return { path: '.github/workflows/closeout-gate.yml' };
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/555') return { path: '.github/workflows/some-other-gate.yml' };
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    };
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(result.status, 'BLOCKED');
+    assert.match(result.evidence, /cross-workflow collision verification window/i);
+    assert.equal(prCalls, 6, 'the collision check\'s own network call must trigger exactly one extra PR re-read');
   } finally {
     if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
     else process.env.GITHUB_WORKFLOW = savedWorkflow;
@@ -1104,8 +1190,12 @@ test('queries live PR metadata and paginates unresolved review threads', async (
     // connector PR7 #Yb3lQ) + four review-thread walks (2 pages each with
     // this mock; the fourth re-checks threads across the verified snapshot's
     // own window, CodeRabbit PR7 #6Yb44Se) = 5 snapshots + 8 thread pages
-    // → 13 api calls. resolveCurrentJobDisplayName makes no additional call
-    // here because GITHUB_RUN_ID/RUNNER_NAME are absent (cleared above).
+    // → 13 api calls. Neither resolveCurrentJobDisplayName nor
+    // resolveWorkflowRunPath (CodeRabbit PR7 #6Yb44Sk) makes an additional
+    // call here: both short-circuit on the absent GITHUB_RUN_ID (cleared
+    // above), and detectCrossWorkflowSelfExclusionCollision short-circuits in
+    // turn on the resulting null selfWorkflowPath. A future change to any of
+    // these three resolvers could affect this count.
     assert.equal(calls.filter(([command]) => command === 'api').length, 13);
   } finally {
     if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
@@ -1131,7 +1221,10 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
     const matrixedPr = {
       ...cleanPr(),
       statusCheckRollup: [
-        { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        // detailsUrl identifies this as run 999's OWN check (#6Yb44Sm/#6Yb44Si)
+        // -- without it, the unidentified-run-id fail-safe would disable
+        // self-exclusion regardless of what this test actually exercises.
+        { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
         { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
       ],
     };
@@ -1144,6 +1237,15 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
         jobsApiCalled = true;
         callOrder.push('jobs');
         return [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner' }] }];
+      }
+      // resolveWorkflowRunPath's own endpoint (#6Yb44Si/#6Yb44Sr): distinct
+      // from the Jobs API call above. Its own path resolving successfully
+      // means the checked-in fail-safe (an unresolvable OWN path disables
+      // self-exclusion entirely) does not fire, letting this test still
+      // isolate what it actually means to test — the Jobs API name
+      // resolution reaching PASS.
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999') {
+        return { path: '.github/workflows/closeout-gate.yml' };
       }
       if (args.includes('--paginate')) { callOrder.push('reviews'); return [[approvedReview()]]; }
       callOrder.push('threads');
@@ -1494,6 +1596,31 @@ test('reads the independent attestation from paginated GitHub review data', asyn
   });
   assert.equal(result.status, 'PASS');
   assert.equal(result.reviewer, 'reviewer');
+});
+
+test('readLiveGateAttestation blocks when the PR head changes while reading reviews and reviewer permissions (chatgpt-codex-connector PR7 #6Yb44Ss)', async () => {
+  let prCalls = 0;
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') {
+        prCalls += 1;
+        // First call (the head/base admission check) sees the expected head;
+        // the SECOND call (the new post-attestation revalidation) simulates a
+        // push landing while the paginated reviews/permissions requests were
+        // in flight.
+        return prCalls === 1 ? cleanPr() : { ...cleanPr(), headRefOid: 'head456' };
+      }
+      return [[approvedReview()]];
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /no longer current/i);
+  assert.equal(prCalls, 2, 'the revalidation must be a real second PR read, not reuse of the first');
 });
 
 test('returns BLOCKED instead of inventing live evidence when GitHub is unavailable', async () => {

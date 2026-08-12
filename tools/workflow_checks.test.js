@@ -490,6 +490,22 @@ test('findUnpinnedUses rejects a tagged or anchored continued quoted explicit ke
     assert.match(r[0].ref, /\(explicit \? uses mapping key/);
   }
 });
+test('findUnpinnedUses reports the correct PHYSICAL line number for a violation after a fold, not a compressed one (CodeRabbit PR7 #6Yb44Sk)', () => {
+  // A fold merges two rawLines entries into ONE `lines` entry, so
+  // `lines.length` ends up less than `rawLines.length` — reporting
+  // `index + 1` as the violation's line (as if `lines[k]` always sat at
+  // physical line k+1) silently compressed every violation after a fold by
+  // one line per fold. Four physical lines: (1) opens the fold, (2) closes
+  // it (consumed, no longer a separate `lines` entry), (3) the explicit
+  // key's own `: value` line (no violation), (4) a genuine separate unpinned
+  // uses: — physically line 4, but only the THIRD entry in the post-fold
+  // `lines` array (index 2), so the old `index + 1` math reported line 3.
+  const content = '- ? "u\\\n  ses"\n  : owner/action@main\n- uses: owner/action@main\n';
+  const r = findUnpinnedUses(content);
+  assert.equal(r.length, 2);
+  assert.equal(r[0].line, 1, 'the fold itself is still correctly attributed to its opening line');
+  assert.equal(r[1].line, 4, 'the later violation must report its true physical line, not the post-fold array index');
+});
 test('findUnpinnedUses does not let a plain-scalar apostrophe hide a later flow key (CodeRabbit #6YSoOn)', () => {
   // A bare apostrophe in an UNQUOTED plain scalar (`don't`) is ordinary scalar
   // content, not a quote delimiter — YAML plain scalars may contain `'`
@@ -660,6 +676,26 @@ test('findUnpinnedUses handles mirrored single-quote cases in flow values (CodeR
     'a double quote inside a single-quoted value must not suppress a later flow uses');
   assert.equal(findUnpinnedUses("steps: [{name: 'it''s'}, {uses: owner/action@main}]\n").length, 1,
     "a doubled '' escape inside a single-quoted value must not suppress a later flow uses");
+});
+
+test('findUnpinnedUses requires whitespace before a trailing # comment, not merely optional whitespace (chatgpt-codex-connector PR7 #6Yb44Sq)', () => {
+  // js-yaml verified: a `#` immediately adjacent to an unquoted value (no
+  // preceding whitespace) is ordinary scalar content, not a comment starter
+  // -- `uses: owner/action@<40-hex>#branch` resolves to the value
+  // `owner/action@<40-hex>#branch`, not `owner/action@<40-hex>` with a
+  // trailing comment. The original USES_LINE let its ref-capture stop at
+  // that adjacent `#` and treated the remainder as an optional comment,
+  // silently accepting a SHA-shaped prefix as a clean pin while the real,
+  // unparseable value went unflagged.
+  const adjacent = findUnpinnedUses('steps:\n  - uses: owner/action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#branch\n');
+  assert.equal(adjacent.length, 1, 'a # with no preceding whitespace must not be treated as a comment');
+  assert.match(adjacent[0].ref, /uses: in non-block-style or unparseable form/);
+  // A genuine, whitespace-separated trailing comment must still be accepted.
+  assert.equal(findUnpinnedUses('steps:\n  - uses: owner/action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa # branch note\n').length, 0,
+    'a real trailing comment (separated by whitespace) must still pass a clean pin');
+  // A clean pin with no trailing content at all must still pass.
+  assert.equal(findUnpinnedUses('steps:\n  - uses: owner/action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n').length, 0,
+    'a clean pin with nothing trailing must still pass');
 });
 
 test('findUnpinnedUses accepts uppercase and mixed-case hex commit pins (Codex #1652)', () => {

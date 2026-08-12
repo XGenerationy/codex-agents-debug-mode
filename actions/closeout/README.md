@@ -563,13 +563,24 @@ they are roadmap items, not accepted risk:
   PR. Consumers who pin the action to a tag (`uses: owner/repo/actions/closeout@<ref>`)
   are not affected — only this repository's own `uses: ./actions/closeout` dogfood is.
 - ~~The running gate observes its own in-progress check as unresolved.~~ **Resolved.**
-  `classifyLivePrState` (scripts/pr_closeout_github.js) now excludes the currently-
-  running gate check from the live `statusCheckRollup` before classifying it: it
-  omits a check matching both the running workflow (`GITHUB_WORKFLOW`) and job
-  (`GITHUB_JOB`) name while that check is not yet `COMPLETED`. The exclusion is
-  scoped to the single current job — a sibling job's check (e.g. `preview`) is
-  never excluded, and a PRIOR completed run of the same check still blocks on a
-  real failure. Making the `Closeout gate` check a required merge gate is
+  `classifyLivePrState` (scripts/pr_closeout_github.js) excludes the current job's
+  own checks from the live `statusCheckRollup` before classifying it: it omits
+  every check matching both the running workflow (`GITHUB_WORKFLOW`) and job's
+  DISPLAYED name — **regardless of status or conclusion**, including a PRIOR
+  COMPLETED run of the same job, even a FAILURE (chatgpt-codex-connector PR7
+  #6YaIaU, correcting this bullet — CodeRabbit PR7 #6Yb44Sl). This is broader
+  than it may first look, and deliberately so: the `workflow_run` retry trigger
+  (below) re-runs the gate specifically to recover from a run that correctly
+  BLOCKED on a still-pending sibling check — GitHub Actions has no native
+  "blocked" job conclusion, so that run's own check is recorded as a `FAILURE`.
+  Keeping that stale self-FAILURE classified would make every retry re-derive
+  FAIL from its own earlier blocked attempt, forever, for the exact scenario the
+  retry exists to recover from. This is safe: every OTHER blocker/failure signal
+  (mergeability, review decision, unresolved threads, gate attestation, and
+  every check that is NOT this job — including a genuinely different sibling
+  check, e.g. `preview`, which is never excluded) is independently re-derived
+  from LIVE state on each call, so a stale self check-run carries no additional
+  protection to lose. Making the `Closeout gate` check a required merge gate is
   therefore safe; it can reach PASS on its own run (CodeRabbit PR7 #6X_pwH,
   refined by #6YSx9w — landed before this bullet was corrected, CodeRabbit
   #6YW9UF).

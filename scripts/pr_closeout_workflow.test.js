@@ -1887,6 +1887,48 @@ test('resolvePlanAdmission isolates HOME/USERPROFILE/APPDATA/LOCALAPPDATA from p
   await assert.rejects(fs.stat(observedHomeDir), /ENOENT/);
 });
 
+test('resolvePlanAdmission isolates all four profile variables even when none are present in the ambient environment (CodeRabbit PR7 #6Yb44Sl)', async () => {
+  // buildPlanPreflightEnvironment previously only overrode a HOME_ENV_NAMES
+  // entry that was ALREADY present in the sanitized set -- an absent name
+  // (e.g. LOCALAPPDATA on a POSIX runner, or HOME on Windows) was never
+  // added at all, leaving that name unset for the probe. Node's os.homedir()
+  // (and other profile-resolving platform APIs) falls back to an OS-level
+  // lookup when its env var is undefined, which can silently resolve to the
+  // REAL home directory and defeat the isolation entirely.
+  const fs = require('node:fs/promises');
+  const names = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  let preflightEnv;
+  let observedHomeDir;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => {
+          preflightEnv = env;
+          observedHomeDir = env.HOME;
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.ok(observedHomeDir, 'the isolated directory must have been created and used even with no ambient profile vars');
+  for (const name of names) {
+    assert.equal(preflightEnv[name], observedHomeDir, `${name} must be forced to the isolated directory even though it was absent from the ambient env`);
+  }
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/, 'cleanup must still run');
+});
+
 test('resolvePlanAdmission cleans up the isolated home directory even when the probe throws', async () => {
   const fs = require('node:fs/promises');
   let observedHomeDir;

@@ -32,7 +32,23 @@
 // The value's opening/closing quote must match. An anchor (`&`) on the value
 // or any non-whitespace before the key (flow context) prevents a match, so
 // those lines fall through to the SUSPICIOUS_USES check below.
-const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2\s*(?:#.*)?$/;
+//
+// The trailing `#comment` requires its OWN preceding whitespace (`\s+#.*`),
+// not merely optional whitespace (`\s*(?:#.*)?`, the original form): YAML
+// only starts a comment at a `#` preceded by whitespace or line start — one
+// immediately adjacent to the value is ordinary scalar content (js-yaml
+// verified: `uses: owner/action@<40-hex>#branch` with no space resolves to
+// the value `owner/action@<40-hex>#branch`, and `uses: "..."#comment` with
+// no space is not even valid YAML). The original regex's optional `\s*`
+// let the ref-capture group stop at that adjacent `#` and treated the rest
+// as a comment, so a SHA-shaped prefix immediately followed by `#branch`
+// (or any suffix) was accepted as a clean 40-hex pin while the real,
+// unparseable value (SHA+suffix, not a valid ref) went unflagged — a
+// fail-OPEN bypass (chatgpt-codex-connector PR7 #6Yb44Sq). Requiring
+// whitespace before the comment makes such a line fail this pattern
+// entirely, falling through to SUSPICIOUS_USES's fail-closed "unparseable"
+// path instead of silently passing as pinned.
+const USES_LINE = /^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*(['"]?)([^\s&#]+)\2(?:\s*$|\s+#.*$)/;
 // A `uses` token that looks like a YAML key but is NOT a clean USES_LINE
 // match. This catches flow style (`- {uses: ...}`, `release: {uses: ...}`,
 // `[{uses: ...}]`), anchors (`uses: &name ref`), multi-entry flow sequences,
@@ -364,6 +380,14 @@ const findUnpinnedUses = (content) => {
   // "uses"), letting it bypass EXPLICIT_QUOTED_KEY entirely.
   const EXPLICIT_KEY_QUOTE_OPEN = /(?:^\s*(?:-\s*)?|[{[,]\s*)(?:!\S*\s+|&\S+\s+)*\?\s*(?:!\S*\s+|&\S+\s+)*"[^"]*\\$/;
   const lines = [];
+  // Parallel to `lines`: the 1-based PHYSICAL source line each entry in
+  // `lines` starts at. A fold consumes one or more extra `rawLines` entries
+  // into a single `lines` entry, so `lines.length` can be LESS than
+  // `rawLines.length` — using `index + 1` as the reported violation line
+  // (as if `lines[k]` always sat at physical line k+1) silently compresses
+  // every violation reported after a fold by one line per fold (CodeRabbit
+  // PR7 #6Yb44Sk). Reported alongside every violation below instead.
+  const lineNumbers = [];
   // Record any explicit-key fold that overflowed the safety cap. The cap
   // exists to stop a never-closing quoted key from eating the whole file; when
   // it fires, the partial line still ends inside an unterminated double-quoted
@@ -395,6 +419,7 @@ const findUnpinnedUses = (content) => {
       }
     }
     lines.push(line);
+    lineNumbers.push(openedAt);
   }
   // Block-scalar tracking: when a line opens a `|` or `>` scalar, enter a
   // "pending" state. The FIRST non-blank body line's indentation determines
@@ -504,7 +529,7 @@ const findUnpinnedUses = (content) => {
     if (match) {
       const ref = match[3];
       if (ref.startsWith('./')) return;
-      if (!PINNED_REF.test(ref)) violations.push({ line: index + 1, ref });
+      if (!PINNED_REF.test(ref)) violations.push({ line: lineNumbers[index], ref });
       return;
     }
     // An obfuscated `uses` key spelled with YAML double-quoted escapes that
@@ -520,7 +545,7 @@ const findUnpinnedUses = (content) => {
     // USES_LINE/SUSPICIOUS_USES, so let it fall through. The decode check
     // exists solely for escape-obfuscated keys (raw `u\u0073es` → `uses`).
     if (quotedMatch && quotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(quotedMatch[1]) === 'uses') {
-      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
       return;
     }
     // The flow-mapping variant: an escape-obfuscated quoted uses key inside
@@ -539,7 +564,7 @@ const findUnpinnedUses = (content) => {
       // (CodeRabbit #6YEr9a).
       if (isInsideQuotedScalar(text, flowMatch.index, lineStartQuoteState)) continue;
      if (raw !== 'uses' && decodeDoubleQuotedEscapes(raw) === 'uses') {
-       violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+       violations.push({ line: lineNumbers[index], ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
        return;
      }
    }
@@ -552,7 +577,7 @@ const findUnpinnedUses = (content) => {
     // (CodeRabbit #6YEr9a).
     for (const aliasMatch of text.matchAll(FLOW_ALIAS_KEY)) {
       if (isInsideQuotedScalar(text, aliasMatch.index, lineStartQuoteState)) continue;
-      violations.push({ line: index + 1, ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(*alias: flow mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
     // An explicit mapping key `? uses` (value on the following `:` line).
@@ -560,7 +585,7 @@ const findUnpinnedUses = (content) => {
     // alone proves a `uses` key exists whose ref cannot be pin-checked here —
     // flag fail-closed rather than let an unpinned reference pass unseen.
     if (EXPLICIT_USES_KEY.test(text)) {
-      violations.push({ line: index + 1, ref: '(explicit ? uses mapping key — rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(explicit ? uses mapping key — rewrite in clean block style or review manually)' });
       return;
     }
     // The escape-obfuscated explicit-key variant: `- ? "u\u0073es"` (js-yaml
@@ -569,7 +594,7 @@ const findUnpinnedUses = (content) => {
     // flag fail-closed when it resolves to `uses`.
     const explicitQuotedMatch = EXPLICIT_QUOTED_KEY.exec(text);
     if (explicitQuotedMatch && explicitQuotedMatch[1] !== 'uses' && decodeDoubleQuotedEscapes(explicitQuotedMatch[1]) === 'uses') {
-      violations.push({ line: index + 1, ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(quoted uses: key resolves to uses via escape sequences — rewrite in clean block style or review manually)' });
       return;
     }
     // An alias-backed explicit key: `- ? *action_key` (js-yaml verified to
@@ -577,7 +602,7 @@ const findUnpinnedUses = (content) => {
     // resolve aliases, so fail-closed: any alias in explicit-key position is
     // flagged for manual review (Codex 3745332784).
     if (EXPLICIT_ALIAS_KEY.test(text)) {
-      violations.push({ line: index + 1, ref: '(explicit ? *alias mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(explicit ? *alias mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
     // An alias used as an IMPLICIT block-style mapping key: `- *action_key : ref`
@@ -586,7 +611,7 @@ const findUnpinnedUses = (content) => {
     // key position is flagged. An alias that is a VALUE (`uses: *ref`) is NOT
     // matched — the alias must precede the colon to be a key (Codex 3745389802).
     if (ALIAS_IMPLICIT_KEY.test(text)) {
-      violations.push({ line: index + 1, ref: '(*alias: implicit mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(*alias: implicit mapping key — alias may resolve to uses; rewrite in clean block style or review manually)' });
       return;
     }
     // An explicit mapping key whose VALUE is itself a block scalar (`? |`,
@@ -601,7 +626,7 @@ const findUnpinnedUses = (content) => {
     // unconditionally: any explicit key spelled as a block scalar is
     // unresolvable here, mirroring EXPLICIT_ALIAS_KEY's posture.
     if (EXPLICIT_BLOCK_SCALAR_KEY.test(text)) {
-      violations.push({ line: index + 1, ref: '(explicit ? block-scalar mapping key — rewrite in clean block style or review manually)' });
+      violations.push({ line: lineNumbers[index], ref: '(explicit ? block-scalar mapping key — rewrite in clean block style or review manually)' });
       return;
     }
     // Any key line that opens a block scalar: start tracking its body so a
@@ -714,7 +739,7 @@ const findUnpinnedUses = (content) => {
       // quote marks are the only quoting present".
       const keyCandidateIndex = suspiciousMatch.index + suspiciousMatch[0].length - suspiciousMatch[1].length;
       if (!isInsideQuotedScalar(stripped, keyCandidateIndex, lineStartQuoteState)) {
-        violations.push({ line: index + 1, ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
+        violations.push({ line: lineNumbers[index], ref: '(uses: in non-block-style or unparseable form — rewrite in clean block style or review manually)' });
         break; // one violation per line is enough
       }
     }
