@@ -237,6 +237,14 @@ const defaultRunGh = async (args, { repo } = {}) => {
     timeout: 60_000,
     windowsHide: true,
   });
+  // A handful of `gh api` endpoints (e.g. POST .../rerun) return 204 No
+  // Content on success — empty stdout, not empty JSON. Every existing
+  // caller of this function only ever reads endpoints that return a real
+  // body, so this branch was previously unreachable; JSON.parse('') would
+  // throw SyntaxError and a genuinely successful call would be misreported
+  // as failed. Return null rather than guessing a shape — callers that
+  // expect a body already destructure defensively (`response?.field`).
+  if (!stdout.trim()) return null;
   return JSON.parse(stdout);
 };
 
@@ -1458,8 +1466,10 @@ module.exports = {
   buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
+  defaultRunGh,
   detectCrossWorkflowSelfExclusionCollision,
   gateAttestationMarker,
+  readActionsPrNumber,
   readLiveGateAttestation,
   readLivePrState,
   readReviewerPermissions,

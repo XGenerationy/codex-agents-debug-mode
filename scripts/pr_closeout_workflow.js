@@ -811,6 +811,53 @@ const buildWorkflowEnvironment = (env, config) => {
 // block (contents/pull-requests/checks/statuses/actions — no repo-write,
 // no org-admin), which bounds the practical impact of a leak even if this
 // gap is exploited.
+//
+// EXPLORED, deliberately NOT implemented (owner-approved investigation, this
+// PR): wrapping the plan-mode probe spawn in `unshare --user --map-root-user
+// --pid --mount-proc --fork -- <shell> ...` so the probe process gets its own
+// PID namespace with a freshly-mounted, namespace-scoped /proc — the standard
+// way to make a child unable to see (or read /proc/<pid>/environ for)
+// anything outside its own subtree, while the PARENT retains full visibility
+// (PID namespaces nest: an ancestor namespace always sees descendant-
+// namespace processes too, just under different numbering — verified against
+// util-linux's own unshare(1) documentation of `--mount-proc`/`--fork`).
+// runPreflight already accepts a `probeCommand` override and
+// probeCommandDefault a `spawnProcess` override, so wiring this in would not
+// have required touching either shared primitive.
+//
+// Two independent reasons this was not wired into the live spawn path:
+//   1. It may not even work on the actual target runner (GitHub-hosted
+//      ubuntu-latest). Recent Ubuntu releases ship an AppArmor
+//      `unprivileged_userns` restriction (a downstream hardening patch, ON
+//      BY DEFAULT specifically to reduce attack surface on hosts that run
+//      untrusted code — precisely this runner's own threat model) that can
+//      make unprivileged `unshare --user ...` fail with EPERM even when the
+//      `kernel.unprivileged_userns_clone` sysctl itself is 1. Whether
+//      GitHub's current runner image allows it is not something this
+//      repository controls or can assume, and could change on any future
+//      image update regardless. Any implementation MUST self-verify success
+//      (e.g. spawn `unshare --user --map-root-user --pid --mount-proc
+//      --fork -- sh -c 'echo $$'` once and confirm it prints `1`, proving a
+//      genuinely new PID namespace) and fall back to the unwrapped spawn on
+//      any failure — silently claiming isolation that did not actually take
+//      effect would be worse than the status quo.
+//   2. probeCommandDefaultInner's own orphan-sweep/termination path
+//      (terminateProcessTree) kills the POSIX process GROUP via
+//      `kill(-child.pid, signal)`, relying on every descendant remaining in
+//      the process group `detached: true` placed the spawned root in.
+//      `unshare --fork`'s forked child does not itself call `setsid`/
+//      `setpgid`, so group membership should be preserved through the extra
+//      layer — but this interaction between process-group signal delivery
+//      and PID-namespace nesting is exactly the kind of kernel behavior that
+//      needs verifying with a real spawn-and-kill integration test on actual
+//      Linux, which this development environment could not provide. Wiring
+//      an unverified extra process layer into the spawn path risks a
+//      regression in the existing, heavily-tested no-orphaned-process
+//      guarantee — a strictly worse outcome than leaving this gap as-is,
+//      for a mitigation whose own benefit is already bounded by the token's
+//      narrow read-only scope. Left for a maintainer with real Linux CI
+//      access to implement and verify, following the self-check-first
+//      design above.
 // HOME/USERPROFILE/APPDATA/LOCALAPPDATA are in ESSENTIAL_ENV because ordinary
 // tool invocation needs SOME profile directory to resolve against — but their
 // REAL values point at the runner's actual home/profile, where credential-

@@ -28,71 +28,60 @@ on:
   # workflow_run trigger watching for "Closeout gate" completions, so the
   # gate's own run can never re-trigger itself through this path — there is
   # no retrigger loop to guard against here, by construction.
-  # KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6YaxWe,
-  # P1, investigated but left for an owner decision): a workflow_run-
-  # triggered run's own implicit GitHub Actions check-run is associated with
-  # GITHUB_SHA/github.sha for THIS run's trigger context -- which for
-  # workflow_run defaults to the latest commit on the DEFAULT branch, not the
-  # completed sibling's PR head -- regardless of what ref the checkout step
-  # below actually checks out. Checking out
-  # workflow_run.pull_requests[0].head.sha (the Yap8b fix) makes this run
-  # TEST the right code; it does not retarget which commit's status-check
-  # rollup the run's check-run appears under. Practical effect: even a fully
-  # internal PASS from this retry is invisible to `gh pr view
-  # --json statusCheckRollup` for the PR and to branch protection's required
-  # checks -- verified empirically against this repo's own Actions history
-  # (`gh api repos/.../actions/runs?event=workflow_run` returned zero runs
-  # ever, out of the last 100 runs across all trigger types, at the time this
-  # was written) rather than assumed from docs alone, though the SHA-
-  # association behavior itself is standard, widely-documented GitHub Actions
-  # semantics independent of that. The retry's Step Summary, evidence
-  # artifact, and (if enabled) PR comment still get written either way, since
-  # none of those depend on check-run/SHA association.
+  # A workflow_run-triggered run's own implicit GitHub Actions check-run is
+  # associated with GITHUB_SHA/github.sha for THIS run's trigger context --
+  # which for workflow_run defaults to the latest commit on the DEFAULT
+  # branch, not the completed sibling's PR head -- regardless of what ref a
+  # checkout step actually checks out. A fully internal PASS from a
+  # workflow_run-triggered gate run is therefore invisible to `gh pr view
+  # --json statusCheckRollup` and to branch protection's required checks
+  # (chatgpt-codex-connector PR7 #6YaxWe; verified empirically against this
+  # repo's own Actions history, though the SHA-association behavior itself is
+  # standard, widely-documented GitHub Actions semantics independent of
+  # that).
   #
-  # A complete fix means explicitly calling the Checks API (`POST`/`PATCH
-  # /repos/{owner}/{repo}/check-runs` with `head_sha` set to the PR's real
-  # head) instead of relying on the implicit per-job check-run, which needs a
-  # new `checks: write` permission (a meaningfully bigger grant than this
-  # workflow's current all-read set) and a design decision on identity: does
-  # the new check-run replace the pull_request-triggered gate's own check (by
-  # matching `name`), or does it publish as a visibly distinct check that
-  # branch protection would need to additionally require? Left for the
-  # maintainer to choose rather than guessed at here.
+  # RESOLVED, not by having the `gate` job itself respond to workflow_run
+  # (removed from its own `if:` below) but by a separate, minimally-
+  # permissioned `retry-forwarder` job (below) that does not run the gate at
+  # all: it finds the PR's most recent completed `Closeout gate` run at its
+  # OWN head SHA (correctly SHA-associated already, since it was triggered by
+  # a real pull_request/pull_request_review event) and asks GitHub to RE-RUN
+  # that existing run. The re-run executes as a new attempt of the SAME run
+  # under its ORIGINAL trigger context, so its implicit check-run updates
+  # correctly on the PR head — the SHA-association problem does not arise in
+  # the first place, rather than being patched around with an explicit
+  # Checks API publish (which an independent design review recommended
+  # against: its correctness would depend on unverifiable branch-protection
+  # behavior — does a fresh API-created check-run sharing a name with a stale
+  # FAILURE implicit check-run actually win as "latest" — that could not be
+  # tested without live experimentation this repository is not positioned to
+  # do; the rerun approach depends only on already-established, already-
+  # working SHA-association for the pull_request_review trigger path).
   workflow_run:
     workflows: ["Validate", "Closeout preview"]
     types: [completed]
+  # Base-branch-drift discovery (chatgpt-codex-connector PR7 #6YbMwY):
+  # RESOLVED for the trigger-coverage gap where none of the events above
+  # fire from a PUSH to a branch that PRs target when those PRs' own head
+  # and review state are unchanged. The gate's admission attestation is
+  # base-OID-bound, so without this trigger a PASS minted against the OLD
+  # base could remain a PR's live, branch-protection-visible result even
+  # after the real merge candidate (that head + the NEW base tip) was never
+  # verified — a trigger-coverage gap, not a detection gap:
+  # readLiveGateAttestation's `pr.baseRefOid !== expectedBaseSha` check
+  # already re-derives this live on every actual invocation, so the moment
+  # the gate runs again for ANY reason it self-corrects; nothing previously
+  # re-triggered it for a base-only push. Handled by the separate,
+  # minimally-permissioned `base-drift-forwarder` job below, using the same
+  # rerun mechanism as `retry-forwarder` (restructured into one job that
+  # classifies every affected PR, per the repository owner's chosen design,
+  # rather than a per-PR workflow_dispatch): it discovers every open PR
+  # targeting the pushed branch (`gh pr list --base <branch> --state open`
+  # — no push event payload names them) and forwards a retry for each one's
+  # CURRENT head, sequentially, bounding worst-case Actions-API load on a
+  # branch with many open PRs against it.
+  push: {}
 
-# KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6YbMwY, P1,
-# investigated but left for an owner decision): none of the triggers above
-# fire from a PUSH to the BASE branch itself (e.g. another PR merging into
-# main) when this PR's own head and review state are unchanged. The gate's
-# admission attestation is base-OID-bound, so a PASS minted against the old
-# base can remain the PR's live, branch-protection-visible result even after
-# the real merge candidate (this head + the NEW base tip) was never verified.
-#
-# Verified this is a trigger-coverage gap, not a detection gap: the
-# admission check in scripts/pr_closeout_github.js (readLiveGateAttestation,
-# `pr.baseRefOid !== expectedBaseSha`) already compares the attestation's
-# recorded base SHA against a FRESH live read on every actual invocation and
-# correctly BLOCKs/FAILs a stale-base attestation with "admission
-# attestation is bound to the wrong snapshot" -- so the moment this gate
-# runs again for ANY reason, it self-corrects. The gap is purely that
-# nothing re-triggers it for a base-only push.
-#
-# A complete fix needs a genuinely new capability, not a narrow change: a
-# `push`-triggered path that DISCOVERS every open PR targeting the pushed
-# branch (there is no event payload naming them -- a `gh pr list --base
-# <branch> --state open`-shaped query, or the GraphQL search API, would be
-# needed) and re-triggers the gate for EACH one. That raises design
-# questions with real cost/security tradeoffs a maintainer should decide,
-# not infer: how to re-trigger per-PR (a new workflow_dispatch PR-number
-# input plus `actions: write` to fire it, vs. restructuring to classify all
-# affected PRs in one job), how to bound the cost of re-running the `full`
-# engine matrix once per open PR on every base push in a repo with many open
-# PRs, and -- since a re-run for a PR whose head was not this run's own
-# trigger context risks the SAME check-run/head-SHA-association problem
-# documented above for #6YaxWe -- how results get published back onto each
-# affected PR's own head SHA.
 permissions:
   contents: read
   pull-requests: read
@@ -153,21 +142,13 @@ jobs:
     # gate result rather than leaving the prior PASS live), and a
     # newly-submitted COMMENT review (inline comments open unresolved
     # threads that readLivePrState would block, so a prior PASS must not
-    # survive a comment review attached to the unchanged head), and a
-    # COMPLETED run of a sibling workflow this PR's gate result may have
-    # been waiting on (CodeRabbit PR7 #6YW9UP) — the sibling's own
-    # conclusion (success/failure/etc.) does not matter here; only that it
-    # finished, so the gate can re-evaluate the live rollup. Restricted to
-    # workflow_run events whose OWN trigger was pull_request (qodo PR7
-    # #6YZnHn): "Validate" also runs on push to main and workflow_dispatch,
-    # neither of which carries PR context, so an unguarded workflow_run
-    # condition would spend a full gate run on every mainline push only to
-    # land on an unresolvable-PR BLOCKED result. A fork PR's workflow_run
-    # still has event == 'pull_request' and is intentionally let through
-    # here even though its pull_requests[] array is separately empty (see
-    # the workflow_run trigger comment above) — that is a legitimate
-    # PR-associated completion, just one this gate cannot yet resolve.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') }}
+    # survive a comment review attached to the unchanged head). A COMPLETED
+    # sibling workflow run and a base-branch push (chatgpt-codex-connector
+    # PR7 #6YaxWe / #6YbMwY) do NOT run this job directly — the separate
+    # `retry-forwarder`/`base-drift-forwarder` jobs below handle those by
+    # re-running an EXISTING gate run instead, so this job's own `if:` no
+    # longer needs a workflow_run/push clause at all.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -179,25 +160,15 @@ jobs:
           # PR from the Actions event context even though HEAD is detached, so
           # detached HEAD is not a problem here.
           #
-          # workflow_run events carry no top-level pull_request. Prefer
-          # workflow_run.pull_requests[0].head.sha (the PR's actual head
-          # commit, populated for a same-repo PR) over workflow_run.head_sha
-          # (chatgpt-codex-connector PR7 #6Yap8b): workflow_run.head_sha is
-          # whatever SHA the upstream workflow itself ran against, and
-          # .github/workflows/validate.yml's checkout uses actions/checkout's
-          # DEFAULT ref — which for a pull_request-triggered run resolves to
-          # the synthetic test-merge commit, not the PR's real head branch
-          # commit. Checking that out here would make readLivePrState's
-          # expectedHeadSha systematically mismatch the PR's live headRefOid,
-          # so a workflow_run-triggered retry could never reach PASS. Keep
-          # workflow_run.head_sha as a final fallback for a fork PR (whose
-          # pull_requests[] is separately empty — the gate cannot resolve PR
-          # context there regardless of which SHA is checked out, so this
-          # fallback is inert rather than wrong in that case), then
-          # github.ref (workflow_dispatch with no PR context). The gate
-          # independently re-verifies the live head via gh and BLOCKS stale
-          # snapshots regardless.
-          ref: ${{ github.event.pull_request.head.sha || github.event.workflow_run.pull_requests[0].head.sha || github.event.workflow_run.head_sha || github.ref }}
+          # This job's `if:` above no longer admits workflow_run or push
+          # events (chatgpt-codex-connector PR7 #6YaxWe / #6YbMwY — see the
+          # `on:` trigger comments and the retry-forwarder/base-drift-
+          # forwarder jobs below), so github.event.pull_request.head.sha is
+          # always present when this step runs except for workflow_dispatch,
+          # which carries no PR context — github.ref covers that case. The
+          # gate independently re-verifies the live head via gh and BLOCKS
+          # stale snapshots regardless.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
           fetch-depth: 0
           # Do NOT persist the checkout's extra git credentials into the
           # local config: the full engine matrix then executes PR-controlled
@@ -239,8 +210,27 @@ jobs:
       # base-branch ref means a PR that is ITSELF changing this action (like
       # the PR that introduced this comment) can no longer gate itself with
       # its own in-flight changes until merged, which is a deliberate
-      # decision about how this repo bootstraps its own gating action, not a
-      # narrow code fix -- left for the maintainer to choose.
+      # decision about how this repo bootstraps its own gating action.
+      #
+      # TODO(post-merge, owner-approved direction -- do NOT attempt before
+      # this PR merges): pinning cannot be done from WITHIN this PR at all --
+      # verified empirically (`git show origin/<base>:actions/closeout/
+      # action.yml` fails) that `actions/closeout` does not exist on the base
+      # branch yet, since this PR is what FIRST introduces it. A pin can only
+      # ever reference a SHA this PR's own author controls (its own branch),
+      # which is not a real trust boundary -- an attacker able to modify the
+      # action could equally move the pin. Once this PR merges, open a
+      # follow-up PR that changes the line below to:
+      #
+      #   uses: XGenerationy/codex-agents-debug-mode/actions/closeout@<merge-commit-sha>
+      #
+      # (or a maintainer-cut release tag pointing at that same commit), and
+      # keep that pin current on subsequent merges that touch the action.
+      # Until that follow-up lands, this line stays local/unpinned -- the two
+      # structural mitigations documented above (read-only permissions;
+      # neither sibling workflow exposes a secret or artifact this token
+      # could reach) remain the operative bound on blast radius in the
+      # meantime.
       - name: Closeout gate
         uses: ./actions/closeout
         with:
@@ -255,3 +245,77 @@ jobs:
           mode: engine
           config: .github/closeout-engine.json
           base-ref: ${{ github.event.inputs.base-ref || '' }}
+
+  # Re-run the closeout gate's most recent EXISTING run at a PR's head once a
+  # sibling workflow (Validate / Closeout preview) completes, so a result
+  # that was blocked on that sibling gets a correctly SHA-associated re-run
+  # instead of being invisible to branch protection (chatgpt-codex-connector
+  # PR7 #6YaxWe — see the workflow_run trigger comment above for the full
+  # SHA-association problem and why re-running the EXISTING run, rather than
+  # having `gate` itself respond to workflow_run, is the fix).
+  #
+  # Deliberately a SEPARATE job from `gate`, not a branch inside it: calling
+  # the rerun API needs `actions: write`, and that scope must never reach
+  # `gate`, which executes arbitrary PR-controlled commands (npm test, etc.
+  # via the engine matrix) — see actions/closeout/README.md's Known
+  # Limitations for why `gate` stays permissions: read-only. This job checks
+  # out no PR-controlled ref (no `ref:` override, unlike `gate`'s step above)
+  # and runs no PR-controlled command, only this repo's own retry script
+  # against the workflow_run event's own payload.
+  #
+  # Safe to grant a write scope here specifically because workflow_run jobs
+  # execute using the workflow YAML as committed on the DEFAULT branch, never
+  # the PR's version — a PR cannot alter what this job does by editing this
+  # file, unlike `gate`'s job body which a PR's own pull_request-triggered
+  # run does interpret from the PR's ref for the `on: pull_request` paths.
+  retry-forwarder:
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0] != null }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Check out gate retry scripts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Forward a gate retry for this PR's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/gate_retry_cli.js single \
+            --repository "${{ github.repository }}" \
+            --head-sha "${{ github.event.workflow_run.pull_requests[0].head.sha }}"
+
+  # Re-run the closeout gate for every open PR targeting a branch that was
+  # just pushed to, so a PASS attested against the OLD base tip never
+  # outlives the merge candidate it no longer describes (chatgpt-codex-
+  # connector PR7 #6YbMwY — see the `push:` trigger comment above for the
+  # full base-drift gap this closes). Restricted to actual branch pushes
+  # (`github.ref_type == 'branch'`): a tag push has no meaningful "PRs
+  # targeting this ref" and would just cost an empty `gh pr list` call.
+  #
+  # Same job-isolation and trust rationale as retry-forwarder above: separate
+  # job so `actions: write` never reaches `gate`; safe because `push` jobs,
+  # like `workflow_run` jobs, execute the workflow YAML as committed on the
+  # DEFAULT branch, not whatever a PR's own branch contains.
+  base-drift-forwarder:
+    if: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Check out gate retry scripts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Forward gate retries for every PR targeting this branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/gate_retry_cli.js base \
+            --repository "${{ github.repository }}" \
+            --base-ref "${{ github.ref_name }}"

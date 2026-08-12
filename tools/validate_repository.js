@@ -109,8 +109,11 @@ const payloadFiles = payloadEntries.flatMap(walk).sort();
 // Keep this count in lockstep with the skill payload tree under scripts/,
 // agents/, assets/, references/, and SKILL.md (including new test modules).
 // 31 -> 37: evidence tools (debug_evidence/debug_viewer/debug_diff + tests).
-if (payloadFiles.length !== 37) {
-  failures.push(`Expected 37 skill payload files, found ${payloadFiles.length}`);
+// 37 -> 41: pr_closeout_retry.js + gate_retry_cli.js (workflow_run retry /
+// base-branch-drift gate re-verification, chatgpt-codex-connector PR7
+// #6YaxWe / #6YbMwY) plus their two test modules.
+if (payloadFiles.length !== 41) {
+  failures.push(`Expected 41 skill payload files, found ${payloadFiles.length}`);
 }
 
 try {

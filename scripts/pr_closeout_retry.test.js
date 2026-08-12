@@ -1,0 +1,209 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const {
+  GATE_WORKFLOW_PATH,
+  discoverOpenPullRequests,
+  findMostRecentGateRun,
+  forwardGateRetriesForBase,
+  forwardGateRetry,
+  rerunGateRun,
+} = require('./pr_closeout_retry');
+
+const gateRun = (extra = {}) => ({
+  id: 111,
+  run_number: 5,
+  path: GATE_WORKFLOW_PATH,
+  status: 'completed',
+  conclusion: 'failure',
+  ...extra,
+});
+
+test('findMostRecentGateRun returns null on missing inputs without calling runGh', async () => {
+  let calls = 0;
+  const runGh = async () => { calls += 1; return {}; };
+  assert.equal(await findMostRecentGateRun({ headSha: 'abc', runGh, repo: 'C:/repo' }), null, 'missing repository');
+  assert.equal(await findMostRecentGateRun({ repository: 'o/r', runGh, repo: 'C:/repo' }), null, 'missing headSha');
+  assert.equal(await findMostRecentGateRun({ repository: 'o/r', headSha: 'abc', runGh: null, repo: 'C:/repo' }), null, 'missing runGh');
+  assert.equal(calls, 0);
+});
+
+test('findMostRecentGateRun filters by workflow path and picks the highest run_number', async () => {
+  const calls = [];
+  const runGh = async (args) => {
+    calls.push(args);
+    return {
+      workflow_runs: [
+        gateRun({ id: 1, run_number: 3 }),
+        { id: 2, run_number: 9, path: '.github/workflows/validate.yml', status: 'completed', conclusion: 'success' },
+        gateRun({ id: 3, run_number: 7 }),
+      ],
+    };
+  };
+  const run = await findMostRecentGateRun({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(run.id, 3);
+  assert.equal(run.run_number, 7);
+  assert.deepEqual(calls, [['api', 'repos/owner/repo/actions/runs?head_sha=abc123&per_page=50']]);
+});
+
+test('findMostRecentGateRun returns null when no run matches the workflow path', async () => {
+  const runGh = async () => ({ workflow_runs: [{ id: 1, path: '.github/workflows/validate.yml', status: 'completed', conclusion: 'success' }] });
+  assert.equal(await findMostRecentGateRun({ repository: 'owner/repo', headSha: 'abc', runGh, repo: 'C:/repo' }), null);
+});
+
+test('findMostRecentGateRun tolerates a malformed (non-array) response', async () => {
+  const runGh = async () => ({ not: 'the expected shape' });
+  assert.equal(await findMostRecentGateRun({ repository: 'owner/repo', headSha: 'abc', runGh, repo: 'C:/repo' }), null);
+});
+
+test('rerunGateRun returns ok:false on missing inputs without calling runGh', async () => {
+  let calls = 0;
+  const runGh = async () => { calls += 1; };
+  assert.deepEqual(await rerunGateRun({ runId: 1, runGh, repo: 'C:/repo' }), { ok: false, error: 'Missing repository, run id, or GitHub client.' });
+  assert.deepEqual(await rerunGateRun({ repository: 'o/r', runGh, repo: 'C:/repo' }), { ok: false, error: 'Missing repository, run id, or GitHub client.' });
+  assert.equal(calls, 0);
+});
+
+test('rerunGateRun posts to the correct rerun endpoint and returns ok:true (tolerating a 204 empty response)', async () => {
+  const calls = [];
+  const runGh = async (args) => { calls.push(args); return null; };
+  const result = await rerunGateRun({ repository: 'owner/repo', runId: 456, runGh, repo: 'C:/repo' });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(calls, [['api', '--method', 'POST', 'repos/owner/repo/actions/runs/456/rerun']]);
+});
+
+test('rerunGateRun reports failure without throwing when the API call rejects', async () => {
+  const runGh = async () => { throw new Error('403: Resource not accessible'); };
+  const result = await rerunGateRun({ repository: 'owner/repo', runId: 456, runGh, repo: 'C:/repo' });
+  assert.deepEqual(result, { ok: false, error: '403: Resource not accessible' });
+});
+
+test('forwardGateRetry skips when no prior gate run exists at this head', async () => {
+  const runGh = async () => ({ workflow_runs: [] });
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.match(result.reason, /No prior .* run found/);
+});
+
+test('forwardGateRetry skips (does not rerun) when the most recent gate run is still in flight', async () => {
+  const runGh = async () => ({ workflow_runs: [gateRun({ status: 'in_progress', conclusion: null })] });
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.match(result.reason, /still "in_progress"/);
+  assert.equal(result.runId, 111);
+});
+
+test('forwardGateRetry skips when the most recent gate run already succeeded', async () => {
+  const runGh = async () => ({ workflow_runs: [gateRun({ conclusion: 'success' })] });
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.match(result.reason, /already succeeded/);
+});
+
+test('forwardGateRetry triggers a rerun when the most recent completed run did not succeed', async () => {
+  const calls = [];
+  const runGh = async (args) => {
+    calls.push(args);
+    if (args[0] === 'api' && args.includes('--method')) return null;
+    return { workflow_runs: [gateRun({ conclusion: 'failure' })] };
+  };
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'rerun-triggered');
+  assert.equal(result.runId, 111);
+  assert.match(result.reason, /Reran gate run #5.*"failure"/);
+  assert.deepEqual(calls[1], ['api', '--method', 'POST', 'repos/owner/repo/actions/runs/111/rerun']);
+});
+
+test('forwardGateRetry reports (does not throw) when the rerun request itself fails', async () => {
+  const runGh = async (args) => {
+    if (args[0] === 'api' && args.includes('--method')) throw new Error('rate limited');
+    return { workflow_runs: [gateRun({ conclusion: 'failure' })] };
+  };
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.match(result.reason, /Rerun request .* failed: rate limited/);
+  assert.equal(result.runId, 111);
+});
+
+test('forwardGateRetry reports (does not throw) when listing Actions runs itself fails', async () => {
+  const runGh = async () => { throw new Error('gh: not logged in'); };
+  const result = await forwardGateRetry({ repository: 'owner/repo', headSha: 'abc123', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.match(result.reason, /Could not list Actions runs: gh: not logged in/);
+});
+
+test('forwardGateRetry skips on missing inputs without calling runGh', async () => {
+  let calls = 0;
+  const runGh = async () => { calls += 1; };
+  const result = await forwardGateRetry({ repository: 'owner/repo', runGh, repo: 'C:/repo' });
+  assert.equal(result.action, 'skipped');
+  assert.equal(calls, 0);
+});
+
+test('discoverOpenPullRequests calls gh pr list with the expected arguments and filters malformed entries', async () => {
+  const calls = [];
+  const runGh = async (args) => {
+    calls.push(args);
+    return [
+      { number: 12, headRefOid: 'abc' },
+      { number: null, headRefOid: 'def' }, // malformed: no number
+      { number: 34, headRefOid: '' }, // malformed: empty headRefOid
+      { number: 56, headRefOid: 'ghi' },
+    ];
+  };
+  const result = await discoverOpenPullRequests({ repository: 'owner/repo', baseRef: 'main', runGh, repo: 'C:/repo' });
+  assert.deepEqual(result, [{ number: 12, headRefOid: 'abc' }, { number: 56, headRefOid: 'ghi' }]);
+  assert.deepEqual(calls, [[
+    'pr', 'list', '--repo', 'owner/repo', '--base', 'main', '--state', 'open', '--json', 'number,headRefOid', '--limit', '100',
+  ]]);
+});
+
+test('discoverOpenPullRequests returns [] on missing inputs or a malformed response', async () => {
+  assert.deepEqual(await discoverOpenPullRequests({ baseRef: 'main', runGh: async () => [], repo: 'C:/repo' }), []);
+  assert.deepEqual(await discoverOpenPullRequests({ repository: 'owner/repo', runGh: async () => [], repo: 'C:/repo' }), []);
+  assert.deepEqual(await discoverOpenPullRequests({ repository: 'owner/repo', baseRef: 'main', runGh: null, repo: 'C:/repo' }), []);
+  assert.deepEqual(await discoverOpenPullRequests({ repository: 'owner/repo', baseRef: 'main', runGh: async () => ({ not: 'an array' }), repo: 'C:/repo' }), []);
+});
+
+test('forwardGateRetriesForBase processes every discovered PR and aggregates results, one failure does not stop the batch', async () => {
+  const runGh = async (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') {
+      return [{ number: 1, headRefOid: 'head-1' }, { number: 2, headRefOid: 'head-2' }, { number: 3, headRefOid: 'head-3' }];
+    }
+    if (args[0] === 'api' && args[1].startsWith('repos/owner/repo/actions/runs?')) {
+      if (args[1].includes('head-1')) return { workflow_runs: [gateRun({ id: 1, conclusion: 'failure' })] };
+      if (args[1].includes('head-2')) throw new Error('transient list failure');
+      if (args[1].includes('head-3')) return { workflow_runs: [gateRun({ id: 3, conclusion: 'success' })] };
+    }
+    if (args[0] === 'api' && args.includes('--method')) return null;
+    throw new Error(`unexpected call: ${args.join(' ')}`);
+  };
+  const results = await forwardGateRetriesForBase({ repository: 'owner/repo', baseRef: 'main', runGh, repo: 'C:/repo' });
+  assert.equal(results.length, 3);
+  assert.deepEqual(
+    results.map((r) => ({ number: r.number, action: r.action })),
+    [{ number: 1, action: 'rerun-triggered' }, { number: 2, action: 'skipped' }, { number: 3, action: 'skipped' }],
+  );
+  assert.match(results[1].reason, /Could not list Actions runs: transient list failure/);
+  assert.match(results[2].reason, /already succeeded/);
+});
+
+test('forwardGateRetriesForBase returns a single skipped entry when discovery itself fails, rather than throwing', async () => {
+  const runGh = async (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') throw new Error('gh: not logged in');
+    throw new Error(`unexpected call: ${args.join(' ')}`);
+  };
+  const results = await forwardGateRetriesForBase({ repository: 'owner/repo', baseRef: 'main', runGh, repo: 'C:/repo' });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].action, 'skipped');
+  assert.match(results[0].reason, /Could not list open pull requests targeting main: gh: not logged in/);
+});
+
+test('forwardGateRetriesForBase returns [] on missing inputs without calling runGh', async () => {
+  let calls = 0;
+  const runGh = async () => { calls += 1; };
+  assert.deepEqual(await forwardGateRetriesForBase({ baseRef: 'main', runGh, repo: 'C:/repo' }), []);
+  assert.deepEqual(await forwardGateRetriesForBase({ repository: 'owner/repo', runGh, repo: 'C:/repo' }), []);
+  assert.deepEqual(await forwardGateRetriesForBase({ repository: 'owner/repo', baseRef: 'main', runGh: null, repo: 'C:/repo' }), []);
+  assert.equal(calls, 0);
+});
