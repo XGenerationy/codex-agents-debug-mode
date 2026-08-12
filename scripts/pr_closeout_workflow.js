@@ -8,7 +8,9 @@ const {
   readSync,
 } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { link, lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require('node:fs/promises');
+const {
+  link, lstat, mkdir, mkdtemp, open: openFile, realpath, rename, rm, stat, unlink,
+} = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -809,7 +811,24 @@ const buildWorkflowEnvironment = (env, config) => {
 // block (contents/pull-requests/checks/statuses/actions — no repo-write,
 // no org-admin), which bounds the practical impact of a leak even if this
 // gap is exploited.
-const buildPlanPreflightEnvironment = (env) => {
+// HOME/USERPROFILE/APPDATA/LOCALAPPDATA are in ESSENTIAL_ENV because ordinary
+// tool invocation needs SOME profile directory to resolve against — but their
+// REAL values point at the runner's actual home/profile, where credential-
+// bearing files live on disk regardless of what is or is not in process.env:
+// ~/.npmrc, ~/.netrc, ~/.gitconfig (credential helpers), ~/.config/gh
+// (the GitHub CLI's own token store), cloud CLI config directories, etc. A
+// repository-controlled preflight probe (an arbitrary command this same
+// config names) can read those files directly by path -- entirely bypassing
+// the env-NAME filtering above, which only ever controlled what appears as
+// an env VALUE (CodeRabbit PR7 #6Yb44Sd, following up on the earlier,
+// distinct #6YaZ5K procfs-ancestor finding). isolatedHomeDir (when provided
+// by the caller, which creates and cleans up a fresh empty temp directory
+// around the probe call) replaces all four names with that path, so any
+// profile-relative credential lookup resolves to an empty directory instead
+// of the real one.
+const HOME_ENV_NAMES = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+
+const buildPlanPreflightEnvironment = (env, isolatedHomeDir = null) => {
   const filtered = Object.fromEntries(Object.entries(env).filter(([name]) => {
     const upper = name.toUpperCase();
     if (DENYLISTED_ENV_NAMES.has(upper)) return false;
@@ -818,9 +837,19 @@ const buildPlanPreflightEnvironment = (env) => {
   // Belt-and-suspenders only at this point: no PR-controlled name can reach
   // `filtered` above, so this can only ever fire against a future accidental
   // credential-shaped addition to the fixed ESSENTIAL_ENV list itself.
-  return Object.fromEntries(Object.entries(filtered).filter(([name]) => (
+  const sanitized = Object.fromEntries(Object.entries(filtered).filter(([name]) => (
     !SENSITIVE_ENV_PATTERN.test(name)
   )));
+  if (isolatedHomeDir) {
+    for (const name of HOME_ENV_NAMES) {
+      // Preserve the ambient casing (env.HOME vs env.Home never both exist on
+      // one platform) rather than assuming one; only override a name that was
+      // actually present in the sanitized set to begin with.
+      const actualName = Object.keys(sanitized).find((key) => key.toUpperCase() === name);
+      if (actualName) sanitized[actualName] = isolatedHomeDir;
+    }
+  }
+  return sanitized;
 };
 
 /**
@@ -1083,15 +1112,52 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       return { attestation, cleanTree, preflight };
     }
     try {
-      // Plan probes get the same allowlisted child environment as the full
-      // gate (ESSENTIAL_ENV + requiredEnv + safeEnv), not raw process.env:
+      // Plan probes get a fixed, code-defined environment (ESSENTIAL_ENV
+      // only — see buildPlanPreflightEnvironment), not raw process.env:
       // preflight spawns repository-controlled binaries (e.g. `pnpm prisma
       // --version`), and forwarding the full step env would expose runner
-      // command files (GITHUB_ENV/GITHUB_OUTPUT) and non-credential-shaped
-      // job secrets to PR-controlled code in a preview advertised as
-      // read-only. The parent gh lookups do not use this env — they read
-      // GH_TOKEN from process.env through their own execFile call.
-      preflight = await d.runPreflight({ repo, config, env: buildPlanPreflightEnvironment(process.env), toolProbes });
+      // command files (GITHUB_ENV/GITHUB_OUTPUT) and job secrets to
+      // PR-controlled code in a preview advertised as read-only. The parent
+      // gh lookups do not use this env — they read GH_TOKEN from
+      // process.env through their own execFile call.
+      //
+      // `config` itself is passed with requiredEnv/safeEnv cleared
+      // (CodeRabbit PR7 #6Yb44Sc): runPreflight (scripts/pr_closeout_process.js)
+      // separately checks EVERY config.requiredEnv name for presence in the
+      // given env and reports each missing one as its own BLOCKED
+      // `env:<name>` check. Since the env above deliberately no longer
+      // carries config-named credentials at all, passing the untouched
+      // config through would report every configured requiredEnv name as
+      // missing on every plan preview -- a false BLOCKED for any repo that
+      // legitimately requires a credential for its ATTESTED full run,
+      // which plan preflight was never supposed to need in the first
+      // place. Every other config field (services, ports, requiredTools,
+      // reproducibilityPaths, minFreeDiskGb, etc.) is preserved unchanged.
+      //
+      // isolatedHomeDir (CodeRabbit PR7 #6Yb44Sd): HOME/USERPROFILE/APPDATA/
+      // LOCALAPPDATA in the env above still carry the runner's REAL profile
+      // paths, where credential-bearing files (~/.npmrc, ~/.netrc, the gh
+      // CLI's own token store, cloud CLI configs) live on disk regardless of
+      // what is or is not in process.env -- a repository-controlled probe
+      // can read those directly by path. A fresh, empty temp directory
+      // substituted for all four names means any such profile-relative
+      // lookup resolves to nothing. Removed in the finally below regardless
+      // of how the probe call ends, including a throw.
+      const planPreflightConfig = { ...config, requiredEnv: [], safeEnv: [] };
+      let isolatedHomeDir;
+      try {
+        isolatedHomeDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-plan-home-'));
+        preflight = await d.runPreflight({
+          repo,
+          config: planPreflightConfig,
+          env: buildPlanPreflightEnvironment(process.env, isolatedHomeDir),
+          toolProbes,
+        });
+      } finally {
+        if (isolatedHomeDir) {
+          try { await rm(isolatedHomeDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+        }
+      }
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
     }

@@ -48,8 +48,9 @@ const assertNotSymlink = async (target, message) => {
  * safely fall through to a link-following open: `O_TRUNC` destroys whatever
  * the open resolves to at open time, before any caller-side check can run.
  * If `noFollow` itself is 0 (the platform has no O_NOFOLLOW at all), there is
- * no attempt that can carry real link-following protection, so the caller
- * must reject before calling this at all — see openNoFollowSync.
+ * no attempt that can carry real link-following protection. A destructive
+ * caller must apply an independent symlink guard before calling this helper
+ * (writeEvidenceFile's lstat-based guard on Windows is exactly this).
  * @param {number} flags
  * @param {number} noFollow
  * @param {number} nonBlock

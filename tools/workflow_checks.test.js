@@ -474,6 +474,22 @@ test('findUnpinnedUses rejects continued quoted explicit uses keys (CodeRabbit #
   assert.equal(r[0].line, 1);
   assert.match(r[0].ref, /\(explicit \? uses mapping key/);
 });
+test('findUnpinnedUses rejects a tagged or anchored continued quoted explicit key (CodeRabbit PR7 #6Yb44Sf)', () => {
+  // EXPLICIT_KEY_QUOTE_OPEN (the fold-opener for a multi-line quoted explicit
+  // key) allowed the tag/anchor prefix only BEFORE `?`, unlike the sibling
+  // single-line detectors (EXPLICIT_USES_KEY etc., fixed for #6Yb1dJ). A
+  // tag/anchor placed AFTER `?` on a CONTINUED quoted key therefore never
+  // opened the fold at all -- js-yaml verified (nested under a mapping with
+  // matching indentation, both '- ? !!str "u\<NL>      ses"' and
+  // '- ? &anchorx "u\<NL>      ses"' resolve identically to the untagged
+  // base case: the key node is the literal string "uses").
+  for (const property of ['!!str', '&anchorx']) {
+    const r = findUnpinnedUses(`- ? ${property} "u\\\n  ses"\n  : owner/action@main\n`);
+    assert.equal(r.length, 1, `${property} continued key must be flagged`);
+    assert.equal(r[0].line, 1);
+    assert.match(r[0].ref, /\(explicit \? uses mapping key/);
+  }
+});
 test('findUnpinnedUses does not let a plain-scalar apostrophe hide a later flow key (CodeRabbit #6YSoOn)', () => {
   // A bare apostrophe in an UNQUOTED plain scalar (`don't`) is ordinary scalar
   // content, not a quote delimiter — YAML plain scalars may contain `'`

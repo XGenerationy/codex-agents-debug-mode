@@ -425,27 +425,37 @@ Point `config` at a JSON file, for example:
   mode as well as the matrix). The first post-upgrade run reads BLOCKED with a
   digest-mismatch admission error — that is the designed behavior, not a regression.
   Reviewers re-attest the current head and it clears.
-- **Engine-command environment allowlist:** engine check commands and plan-mode
-  preflight probes run under a filtered child environment (`ESSENTIAL_ENV` plus
-  your `requiredEnv` / `safeEnv` lists), not the full step environment. This
-  prevents PR-controlled commands from reaching runner command files
-  (`GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`,
-  `GITHUB_STATE` — these are hard-denied regardless of config).
-  **Two-tier credential policy:** in a full run (attested), credential-shaped
-  names listed in `safeEnv`/`requiredEnv` ARE passed through — your checks may
-  legitimately need `API_TOKEN`, `DATABASE_URL`, etc. **Exception:**
-  `GH_TOKEN` and `GITHUB_TOKEN` are ALWAYS stripped from the child
-  environment (even in full runs) to prevent engine checks from using the
-  workflow token for authenticated git/API operations; consumers needing
-  GitHub auth in checks must provide their own token via a separate
-  `safeEnv` entry. In a plan preview
-  (untrusted, pre-attestation), credential-shaped names matching the sensitive
-  pattern (`TOKEN`, `SECRET`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`, etc.)
-  are hard-denied even when listed in `safeEnv` — a PR cannot exfiltrate
-  credentials via repository-local preflight probes. To pass a secret into
+- **Engine-command environment allowlist, two different tiers:** engine check
+  commands (a `run: full`, attested run) and plan-mode preflight probes
+  (`run: plan`, untrusted PR-controlled code, pre-attestation) both run under a
+  filtered child environment, never the full step environment — runner command
+  files (`GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`,
+  `GITHUB_STATE`) are hard-denied regardless of config in either tier — but the
+  two tiers are NOT the same filter. **Full run:** `ESSENTIAL_ENV` plus your
+  `requiredEnv` / `safeEnv` lists — credential-shaped names ARE passed through,
+  since the run is attested and your checks may legitimately need `API_TOKEN`,
+  `DATABASE_URL`, etc. **Exception:** `GH_TOKEN` and `GITHUB_TOKEN` are ALWAYS
+  stripped (even in full runs) to prevent engine checks from using the workflow
+  token for authenticated git/API operations; provide your own token via a
+  separate `safeEnv` entry if a check needs GitHub auth. To pass a secret into
   your engine checks in a full run, list it in `safeEnv`; to require it, list
   it in `requiredEnv` (a missing `requiredEnv` var fails the run before checks
-  execute). The gate injects one trusted, non-secret, repo-derived variable:
+  execute). **Plan preview:** `ESSENTIAL_ENV` only — `config.requiredEnv` and
+  `config.safeEnv` are NOT honored here at all, regardless of what they name.
+  This is stricter than filtering by name pattern: `config` is itself read from
+  the checked-out (PR-controlled) config path, so a PR could otherwise add an
+  existing job secret's name to `safeEnv` under a name a pattern-based denylist
+  does not recognize. The consequence for `requiredEnv`: a plan preview never
+  fails preflight for a "missing" required variable — that check does not run
+  in plan mode at all, since plan mode was never meant to need a full run's
+  credentials, and the plan-specific config handed to preflight has
+  `requiredEnv`/`safeEnv` cleared. `HOME`, `USERPROFILE`, `APPDATA`, and
+  `LOCALAPPDATA` are additionally isolated for plan-mode preflight: each is
+  substituted with a fresh, empty temp directory created for that probe call
+  and removed afterward, so a probe cannot read credential-bearing files
+  (`.npmrc`, `.netrc`, the `gh` CLI's own token store) from the runner's real
+  profile by path, independent of what is or is not in the filtered env. The
+  gate injects one trusted, non-secret, repo-derived variable in BOTH tiers:
   `CLOSEOUT_RESOLVED_BASE_REF` (already rev-parsed to a stable SHA), so engine
   commands that need the PR base — for example
   `git diff --check "${CLOSEOUT_RESOLVED_BASE_REF:-origin/main}"...HEAD` —
@@ -564,25 +574,44 @@ they are roadmap items, not accepted risk:
   refined by #6YSx9w — landed before this bullet was corrected, CodeRabbit
   #6YW9UF).
 - ~~**A verdict recorded while a sibling check is still pending goes stale
-  once that check settles.**~~ **Resolved for same-repo PRs.** If an
-  approval is submitted (re-running the gate) while another check (e.g. the
-  Node validation matrix, or `preview`) is still queued or in progress,
-  `classifyLivePrState` correctly classifies that check as a blocker and the
-  gate reports BLOCKED. `closeout-gate.yml` now also subscribes to
-  `workflow_run` (`types: [completed]`), scoped by name to exactly the two
-  sibling workflows (`Validate`, `Closeout preview`) — deliberately NOT
-  `Closeout gate` itself, so the gate's own completion can never retrigger
-  this path; there is no retrigger loop to guard against, by construction.
-  `readActionsPrNumber` and `resolveBaseRef` both gained a
+  once that check settles.**~~ **The gate correctly RE-EVALUATES for
+  same-repo PRs; the required PR check itself is NOT resolved
+  (chatgpt-codex-connector PR7 #6Yb44Sh — this bullet previously overstated
+  the fix as "Resolved").** If an approval is submitted (re-running the gate)
+  while another check (e.g. the Node validation matrix, or `preview`) is
+  still queued or in progress, `classifyLivePrState` correctly classifies
+  that check as a blocker and the gate reports BLOCKED. `closeout-gate.yml`
+  now also subscribes to `workflow_run` (`types: [completed]`), scoped by
+  name to exactly the two sibling workflows (`Validate`, `Closeout preview`)
+  — deliberately NOT `Closeout gate` itself, so the gate's own completion can
+  never retrigger this path; there is no retrigger loop to guard against, by
+  construction. `readActionsPrNumber` and `resolveBaseRef` both gained a
   `workflow_run.pull_requests[0]` fallback (populated for a same-repo PR) so
-  the triggered run can still identify and diff against the correct PR.
-  **Residual gap for fork PRs:** GitHub does not populate
-  `workflow_run.pull_requests` for a fork PR's associated workflow runs, so
-  a `workflow_run`-triggered gate run for a fork PR cannot resolve the PR
-  number and reports BLOCKED (safe — never a false PASS) rather than
-  re-evaluating. Interim control for fork PRs specifically: re-run the gate
-  via `workflow_dispatch`, or wait for the next naturally covered event (a
-  head push or a new/edited review) once all sibling checks have settled
+  the triggered run can still identify, diff against, and internally
+  re-classify the correct PR. **What that internal re-evaluation does NOT
+  do:** a `workflow_run`-triggered run's own implicit GitHub Actions
+  check-run is associated with the SHA that triggered the `workflow_run`
+  event itself — the default branch's latest commit — never the PR head,
+  regardless of which ref the run actually checks out and tests (see the
+  `KNOWN LIMITATION #6YaxWe` comment on the `workflow_run:` block in
+  `.github/workflows/closeout-gate.yml` for the full analysis, including
+  empirical verification against this repo's own Actions history). So even
+  when the retry's internal verdict is PASS, branch protection and `gh pr
+  view --json statusCheckRollup` still show the ORIGINAL blocked/stuck
+  `Closeout gate` check on the PR — the retry's Step Summary, evidence
+  artifact, and (if enabled) PR comment are produced, but nothing about them
+  clears the required check the PR is actually stuck on. Consumers relying on
+  this retry to unstick a required check will find it does not. Interim
+  control: manually re-run the gate via `workflow_dispatch` (or push/re-approve
+  to fire a directly PR-bound event) once the sibling check has settled — a
+  complete fix needs the Checks API changes `#6YaxWe` describes.
+  **Residual gap for fork PRs (separate from the above):** GitHub does not
+  populate `workflow_run.pull_requests` for a fork PR's associated workflow
+  runs, so a `workflow_run`-triggered gate run for a fork PR cannot resolve
+  the PR number and reports BLOCKED (safe — never a false PASS) rather than
+  re-evaluating at all. Interim control for fork PRs specifically: re-run the
+  gate via `workflow_dispatch`, or wait for the next naturally covered event
+  (a head push or a new/edited review) once all sibling checks have settled
   (CodeRabbit PR7 #6YW9UP).
 - **Event triggers do not cover a base-branch advance.** The attestation is
   base-SHA-bound, so if the base branch receives a new commit while a PR's head is
@@ -649,26 +678,6 @@ they are roadmap items, not accepted risk:
   style). The one accepted residual: a `uses:`-like token inside a `run: |`
   block-scalar continuation line could theoretically false-positive; this is
   vanishingly rare in real workflows. A real YAML parser is the long-term fix.
-- **Plan-mode preflight probes can forward a config-named secret to
-  PR-controlled code before attestation.** `buildPlanPreflightEnvironment`
-  (the gate CLI) denies a hard-coded set of credential-SHAPED env var name
-  patterns before honoring `config.safeEnv`/`config.requiredEnv` for the
-  untrusted plan preview, but the denylist is a heuristic over name spelling,
-  not a guarantee — a job secret named outside that pattern (for example
-  `DEPLOY_CRED`, which does not match the `CREDENTIAL(S)` token the pattern
-  checks for) can still be listed in `config.safeEnv` by the PR itself and
-  reach a plan-tier preflight probe that executes repository-controlled
-  content (e.g. a required tool's `--version` probe resolving to a
-  PR-committed `node_modules/.bin/<tool>`), before any human review or
-  attestation. Fixing this fully means either a base-trusted (not
-  PR-controlled) environment allowlist or dropping config-selected variables
-  from plan admission entirely — both are gate CLI changes
-  (`scripts/pr_closeout_workflow.js`), out of this sub-project's scope.
-  Interim control: do not grant a workflow job that runs `run: plan` access
-  to any secret whose value must stay confidential from arbitrary PR
-  content — treat the plan/preview job's secret scope as equivalent to
-  running untrusted code, and reserve high-value secrets for a `run: full`
-  job (post-attestation) or a separate job that does not share them.
 - **Reviewer permission checks are N+1.** The gate's `readLivePrState` fetches
   each matching review's collaborator-permission record individually via `gh`,
   and the two-snapshot stability check repeats this up to four times. On PRs

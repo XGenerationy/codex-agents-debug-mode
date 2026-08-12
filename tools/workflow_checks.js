@@ -353,7 +353,16 @@ const findUnpinnedUses = (content) => {
   // resolve identically). The original opener only matched line start, so a
   // flow-embedded continuation was never folded and its resolved `uses` key
   // slipped past the scanner entirely (CodeRabbit #6YSx9t).
-  const EXPLICIT_KEY_QUOTE_OPEN = /(?:^\s*(?:-\s*)?|[{[,]\s*)(?:!\S*\s+|&\S+\s+)*\?\s*"[^"]*\\$/;
+  //
+  // The tag/anchor prefix group also appears AFTER `?` (CodeRabbit PR7
+  // #6Yb44Sf, following the same fix already applied to EXPLICIT_USES_KEY/
+  // EXPLICIT_QUOTED_KEY/EXPLICIT_BLOCK_SCALAR_KEY): without it, a tagged or
+  // anchored CONTINUED quoted key — `- ? !!str "u\<NL>  ses"` — never opened
+  // the fold at all, so the scanner saw two unrelated-looking lines instead
+  // of the resolved `? "uses"` key (js-yaml verified: both `!!str` and
+  // `&anchor` placed after `?` still resolve the key to the literal string
+  // "uses"), letting it bypass EXPLICIT_QUOTED_KEY entirely.
+  const EXPLICIT_KEY_QUOTE_OPEN = /(?:^\s*(?:-\s*)?|[{[,]\s*)(?:!\S*\s+|&\S+\s+)*\?\s*(?:!\S*\s+|&\S+\s+)*"[^"]*\\$/;
   const lines = [];
   // Record any explicit-key fold that overflowed the safety cap. The cap
   // exists to stop a never-closing quoted key from eating the whole file; when

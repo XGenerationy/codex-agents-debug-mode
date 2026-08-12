@@ -671,15 +671,48 @@ const runSubcommand = async ({
   // tool would coincidentally produce. Require it to both exist AND parse
   // as that authenticated shape (a known `tier` value plus a `nonce`
   // string) before trusting this directory as this action's own.
+  //
+  // No-follow, both layers (chatgpt-codex-connector PR7 #6Yb44Sj, P1): a
+  // plain `readFileSync` follows a symlink, so `action-state.json` planted
+  // as a symlink to an ATTACKER-CHOSEN file elsewhere — content entirely
+  // outside this directory — could forge this shape trivially and drive the
+  // recursive `logs/` removal and the plan.json/report.json/report.md
+  // unlinks below against a directory this run never actually populated.
+  // lstatSync first (the primary, platform-independent guard, matching every
+  // other symlink check in this file): a non-regular-file entry is refused
+  // outright, before any read. openNoFollowSync (requireNoFollow: true) is
+  // defense-in-depth on top of that against the lstat-to-open race itself —
+  // treated with the SAME fail-closed rigor as a destructive write, because
+  // although this call only READS, its result gates a destructive delete
+  // rather than being consumed and discarded on its own, so "a read's
+  // result can simply be discarded" does not apply here the way it does for
+  // an ordinary read.
   const hadPriorEvidence = (() => {
-    let state;
+    const statePath = path.join(outputDir, STATE_FILE);
+    let preInfo;
     try {
-      state = JSON.parse(readFileSync(path.join(outputDir, STATE_FILE), 'utf8'));
+      preInfo = lstatSync(statePath);
     } catch (error) {
-      if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+      if (error?.code !== 'ENOENT') throw error;
       return false;
     }
-    return Boolean(state) && typeof state === 'object' && RUN_VALUES.has(state.tier) && typeof state.nonce === 'string' && state.nonce !== '';
+    if (!preInfo.isFile()) return false;
+    let fd;
+    try {
+      fd = openNoFollowSync(statePath, constants.O_RDONLY, 0o666, true);
+    } catch {
+      return false;
+    }
+    try {
+      if (!fstatSync(fd).isFile()) return false;
+      const state = JSON.parse(readFileSync(fd, 'utf8'));
+      return Boolean(state) && typeof state === 'object' && RUN_VALUES.has(state.tier) && typeof state.nonce === 'string' && state.nonce !== '';
+    } catch (error) {
+      if (error instanceof SyntaxError) return false;
+      throw error;
+    } finally {
+      closeSync(fd);
+    }
   })();
   // The file-loop cleanup itself is now ALSO gated on hadPriorEvidence
   // (chatgpt-codex-connector PR7 #6YaIal): it previously ran unconditionally

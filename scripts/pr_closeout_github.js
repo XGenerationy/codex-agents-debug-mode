@@ -466,6 +466,44 @@ const classifyLivePrState = ({
   // post-exclusion `checks.length`.
   const liveCheckCount = checks.length;
   if (selfWorkflowName && selfJobName) {
+    // KNOWN LIMITATION, not fixed here (chatgpt-codex-connector PR7 #6Yb44Si,
+    // P2, investigated but left for an owner decision): this match is on the
+    // DISPLAYED workflow name and job name only — the same two strings
+    // GITHUB_WORKFLOW/the resolved display name always were. If this
+    // repository has a SECOND, unrelated workflow FILE whose top-level
+    // `name:` happens to equal GITHUB_WORKFLOW and whose job happens to
+    // resolve to the identical displayed name, every check that OTHER
+    // workflow ever produces — including a genuine completed FAILURE —
+    // would also match and be silently excluded here, exactly like this
+    // job's own checks are meant to be.
+    //
+    // A complete fix exists and was scoped, not just guessed at: `gh pr view
+    // --json statusCheckRollup` DOES expose enough to disambiguate —
+    // verified empirically against this PR's own live rollup, each
+    // CheckRun entry carries a `detailsUrl` of the shape
+    // `.../actions/runs/<runId>/job/<jobId>`, and `repos/{repo}/actions/
+    // runs/{runId}` (already the exact endpoint resolveCurrentJobDisplayName
+    // above calls) returns a `path` field naming the WORKFLOW FILE itself
+    // (e.g. `.github/workflows/closeout-gate.yml`), which is what actually
+    // identifies "the same job definition" — display names are not
+    // guaranteed unique, file paths are. Comparing THIS run's own resolved
+    // path against each matching check's run's path would close this
+    // exactly. It is not done here because it requires classifyLivePrState
+    // itself to become async and gain its own `runGh`/`repo` access (an
+    // extra `gh api` round-trip per distinct matching run ID) — a real
+    // signature change rippling through every call site and test in this
+    // file, not a narrow same-shape edit, so it is left for a maintainer to
+    // decide rather than folded in silently here.
+    //
+    // Practical bound on the actual risk in the meantime: creating that
+    // colliding workflow file requires the SAME same-repo write-level trust
+    // this gate already extensively documents and accepts elsewhere (see
+    // `KNOWN LIMITATION #6YaxWT` above `uses: ./actions/closeout` in
+    // closeout-gate.yml) — an untrusted fork PR cannot introduce a new
+    // workflow file that runs without maintainer approval first, and a
+    // repository that already has two identically-displayed-named gate
+    // workflows is a pre-existing, self-inflicted configuration choice, not
+    // something this finding alone lets a PR create from nothing.
     const filtered = checks.filter((check) => !(
       check.workflowName === selfWorkflowName
       && check.name === selfJobName
@@ -1135,6 +1173,27 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         gateAttestation: verifiedGateSnapshot.attestation,
       };
     }
+    // postThreadUnresolvedThreads was fetched BEFORE verifiedPr and
+    // verifiedGateSnapshot (CodeRabbit PR7 #6Yb44Se): a thread reopened
+    // during either of those two requests would leave classification below
+    // using a stale, already-resolved-looking thread list, letting a PASS
+    // publish even though a genuinely unresolved thread now exists. Re-read
+    // threads once more and require an identical set before publishing.
+    const verifiedUnresolvedThreads = await readUnresolvedReviewThreads({
+      repo, owner, name, number: verifiedPr.number, runGh,
+    });
+    if (threadTuple(postThreadUnresolvedThreads) !== threadTuple(verifiedUnresolvedThreads)) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub review threads changed during the final PR/attestation verification window; rerun against a stable remote snapshot.',
+        repository,
+        number: verifiedPr.number,
+        checks: [],
+        unresolvedThreads: verifiedUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: verifiedGateSnapshot.attestation,
+      };
+    }
     // selfJobDisplayName was resolved near the top of this function (see the
     // comment there) — best-effort: resolves to null (falling back to
     // GITHUB_JOB inside classifyLivePrState, the exact prior behavior) on
@@ -1142,7 +1201,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     return classifyLivePrState({
       repository,
       pr: verifiedPr,
-      unresolvedThreads: postThreadUnresolvedThreads,
+      unresolvedThreads: verifiedUnresolvedThreads,
       expectedHeadSha,
       expectedBaseSha,
       gateAttestation: verifiedGateSnapshot.attestation,

@@ -907,11 +907,12 @@ test('queries live PR metadata and paginates unresolved review threads', async (
     // Stable path: five gate-attestation snapshots (first, final, terminal,
     // post-thread, verified — the last re-checking PR/attestation stability
     // across the post-thread review-thread walk's own window, chatgpt-codex-
-    // connector PR7 #Yb3lQ) + three review-thread walks (2 pages each with
-    // this mock) = 5 snapshots + 6 thread pages → 11 api calls.
-    // resolveCurrentJobDisplayName makes no additional call here because
-    // GITHUB_RUN_ID/RUNNER_NAME are absent (cleared above).
-    assert.equal(calls.filter(([command]) => command === 'api').length, 11);
+    // connector PR7 #Yb3lQ) + four review-thread walks (2 pages each with
+    // this mock; the fourth re-checks threads across the verified snapshot's
+    // own window, CodeRabbit PR7 #6Yb44Se) = 5 snapshots + 8 thread pages
+    // → 13 api calls. resolveCurrentJobDisplayName makes no additional call
+    // here because GITHUB_RUN_ID/RUNNER_NAME are absent (cleared above).
+    assert.equal(calls.filter(([command]) => command === 'api').length, 13);
   } finally {
     if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
     else process.env.GITHUB_RUN_ID = savedRunId;
@@ -990,9 +991,10 @@ test('readLivePrState resolves the current job\'s displayed name via the Jobs AP
 });
 
 test('re-reads review threads after the terminal snapshot and requires stability', async () => {
-  // Stable path does three review-thread reads: after PR/review stability,
-  // after the terminal PR+attestation snapshot, and after the post-thread
-  // PR/gate re-fetch. All three must match.
+  // Stable path does four review-thread reads: after PR/review stability,
+  // after the terminal PR+attestation snapshot, after the post-thread
+  // PR/gate re-fetch, and after the final verified PR/attestation snapshot
+  // (CodeRabbit PR7 #6Yb44Se). All four must match.
   let threadReads = 0;
   const result = await readLivePrState({
     repo: 'C:/repo',
@@ -1021,7 +1023,7 @@ test('re-reads review threads after the terminal snapshot and requires stability
       };
     },
   });
-  assert.equal(threadReads, 3, 'stable path must re-read review threads after terminal and post-thread snapshots');
+  assert.equal(threadReads, 4, 'stable path must re-read review threads after terminal, post-thread, and verified snapshots');
   assert.equal(result.unresolvedThreads.length, 1);
 });
 
@@ -1068,6 +1070,56 @@ test('blocks when review threads change during the post-thread verification wind
   assert.match(result.evidence, /threads changed during post-thread/i);
   assert.equal(result.unresolvedThreads.length, 1);
   assert.equal(threadReads, 3);
+});
+
+test('blocks when review threads change during the final verified PR/attestation window (CodeRabbit PR7 #6Yb44Se)', async () => {
+  // postThreadUnresolvedThreads (the third walk) was fetched BEFORE
+  // verifiedPr/verifiedGateSnapshot -- a thread reopened during either of
+  // those two requests must still be caught by a FOURTH walk, not
+  // classified away using the now-stale third walk's empty result.
+  let threadReads = 0;
+  const openThread = {
+    isResolved: false,
+    isOutdated: false,
+    path: 'src/a.ts',
+    line: 4,
+    comments: { nodes: [{ url: 'https://github.example/comment/1' }] },
+  };
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        threadReads += 1;
+        // First three walks agree (empty). Fourth (verified) surfaces a new
+        // unresolved thread opened during the verifiedPr/verifiedGateSnapshot
+        // window.
+        const nodes = threadReads >= 4 ? [openThread] : [];
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes,
+            pageInfo: { hasNextPage: false, endCursor: null },
+          } } } },
+        };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /threads changed during the final PR\/attestation/i);
+  assert.equal(result.unresolvedThreads.length, 1);
+  assert.equal(threadReads, 4);
 });
 
 test('blocks when the PR head changes during live verification', async () => {

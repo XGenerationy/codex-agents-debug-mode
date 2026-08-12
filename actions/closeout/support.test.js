@@ -886,17 +886,64 @@ test('runSubcommand leaves outputDir/logs alone when action-state.json exists bu
   assert.equal(existsSync(logsDir), true, 'a same-named but wrongly-shaped action-state.json is not authenticated ownership evidence');
 });
 
+test('runSubcommand does not trust action-state.json as ownership evidence when it is a symlink to a forged marker (chatgpt-codex-connector PR7 #6Yb44Sj)', async () => {
+  // A plain readFileSync follows a symlink: action-state.json planted as a
+  // symlink to an ATTACKER-CHOSEN file elsewhere -- content entirely outside
+  // this directory -- could forge the {tier, nonce} shape trivially and
+  // drive the stale-evidence cleanup (plan.json/report.json/report.md
+  // unlinks, recursive logs/ removal) against a directory this run never
+  // actually populated. The symlink must be refused outright, before any
+  // read, so none of that cleanup ever runs.
+  const dir = makeTempDir();
+  const outputDir = path.join(dir, 'evidence');
+  const logsDir = path.join(outputDir, 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  writeFs(path.join(logsDir, 'unrelated-tool-output.log'), 'not ours\n');
+  writeFs(path.join(outputDir, 'plan.json'), '{"someOtherToolsOwnUnrelatedShape":true}\n');
+  const forgedTarget = path.join(dir, 'attacker-controlled.json');
+  const forgedContent = `${JSON.stringify({ tier: 'plan', nonce: 'forged' })}\n`;
+  writeFs(forgedTarget, forgedContent);
+  try {
+    symlinkSync(forgedTarget, path.join(outputDir, 'action-state.json'), 'file');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return; // no symlink privilege on this host
+    throw error;
+  }
+  const exit = await runSubcommand({
+    inputs: { run: 'plan', mode: 'strict', prComment: 'false' },
+    inputBaseRef: '', config: '', outputDir, artifactName: 'ev',
+    env: { GITHUB_BASE_REF: 'main', GITHUB_OUTPUT: path.join(dir, 'o'), GITHUB_STEP_SUMMARY: path.join(dir, 's') },
+    event: {},
+    spawnCli: () => ({ status: 1, stdout: 'not json\n', stderr: 'boom' }),
+  });
+  assert.equal(exit, 0);
+  const { existsSync } = require('node:fs');
+  assert.equal(existsSync(logsDir), true, 'a forged symlinked marker must not authorize the logs/ removal');
+  assert.equal(readFs(path.join(logsDir, 'unrelated-tool-output.log'), 'utf8'), 'not ours\n',
+    'unrelated content inside it must survive untouched');
+  assert.equal(existsSync(path.join(outputDir, 'plan.json')), true, 'a forged symlinked marker must not authorize deleting plan.json');
+  // The forged marker's OWN target file (outside outputDir entirely) must
+  // also be left completely untouched -- confirming the read never followed
+  // the link into any destructive operation on it either.
+  assert.equal(readFs(forgedTarget, 'utf8'), forgedContent);
+});
+
 test('runSubcommand fails the run when a stale action-state.json cannot be removed (Qodo #13)', async () => {
-  // The stale-state cleanup must only swallow the benign ENOENT ("no previous
-  // state") case. Any other unlink failure (here: action-state.json exists as
-  // a DIRECTORY, so unlink fails with EISDIR) must FAIL the run step rather
-  // than silently leave the old state for the always()-gated comment step to
-  // post as the current run's decision.
+  // A directory at action-state.json is refused two ways now, either of
+  // which must fail the run rather than silently succeed: hadPriorEvidence's
+  // own lstatSync guard (chatgpt-codex-connector PR7 #6Yb44Sj) sees a
+  // non-regular-file entry and returns false, so the stale-evidence cleanup
+  // loop never runs against it — but THIS invocation still needs to WRITE
+  // its own action-state.json at the end of the run, and writeEvidenceFile's
+  // renameSync into that same directory-occupied path fails closed
+  // (EISDIR/EPERM), exactly like the equivalent case already covered in
+  // support.test.js's own writeEvidenceFile tests. Either mechanism must
+  // reject rather than silently leave the old/foreign state in place for the
+  // always()-gated comment step to post as the current run's decision.
   const dir = makeTempDir();
   const outputDir = path.join(dir, 'evidence');
   mkdirSync(outputDir, { recursive: true });
-  // Plant a hostile action-state.json that is a directory: unlinkSync throws
-  // EISDIR (not ENOENT), which must propagate.
+  // Plant a hostile action-state.json that is a directory.
   mkdirSync(path.join(outputDir, 'action-state.json'));
   await assert.rejects(
     runSubcommand({
@@ -907,13 +954,14 @@ test('runSubcommand fails the run when a stale action-state.json cannot be remov
       spawnCli: () => ({ status: 0, stdout: '{}\n', stderr: '' }),
     }),
     (error) => {
-      // The unlink of a directory fails with EISDIR (POSIX) or EPERM (Windows);
-      // either way it is NOT the benign ENOENT the cleanup is allowed to swallow.
+      // A directory occupying action-state.json's path fails with EISDIR
+      // (POSIX), EPERM, or ENOTEMPTY (Windows renameSync onto a directory) —
+      // never the benign ENOENT the cleanup is allowed to swallow.
       assert.notEqual(error?.code, 'ENOENT', 'ENOENT must be the only swallowed unlink error');
-      assert.ok(['EISDIR', 'EPERM'].includes(error?.code), `expected a non-ENOENT unlink error, got ${error?.code}`);
+      assert.ok(['EISDIR', 'EPERM', 'ENOTEMPTY'].includes(error?.code), `expected a non-ENOENT filesystem error, got ${error?.code}`);
       return true;
     },
-    'a non-ENOENT unlink failure must fail the run step, not be masked',
+    'a directory occupying action-state.json must fail the run step, not be silently ignored',
   );
 });
 

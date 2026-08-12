@@ -1809,6 +1809,101 @@ test('resolvePlanAdmission does not let PR-controlled safeEnv select a secret by
   assert.equal(preflightEnv[secretName], undefined, 'a secret under a heuristic-evading name must still never reach plan preflight');
 });
 
+test('resolvePlanAdmission clears requiredEnv/safeEnv from the config it hands to preflight, not just the env (CodeRabbit PR7 #6Yb44Sc)', async () => {
+  // scripts/pr_closeout_process.js's runPreflight separately checks EVERY
+  // config.requiredEnv name for presence in the given env and reports each
+  // missing one as its own BLOCKED `env:<name>` check. Since
+  // buildPlanPreflightEnvironment (the #6Yb3lZ fix) deliberately no longer
+  // forwards config-named credentials into that env at all, passing the
+  // ORIGINAL config through unchanged would report every configured
+  // requiredEnv name as missing on every plan preview -- a false BLOCKED for
+  // a repo that legitimately requires a credential for its ATTESTED full
+  // run, which plan preflight never needed in the first place.
+  let capturedConfig;
+  await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    config: { requiredEnv: ['DEPLOY_TOKEN'], safeEnv: ['SOME_SAFE_VAR'], minFreeDiskGb: 5, services: ['redis'] },
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async ({ config }) => { capturedConfig = config; return { status: 'PASS', checks: [], toolVersions: {} }; },
+      workingTreeFingerprint: async () => 'fp-stable',
+    },
+  });
+  assert.deepEqual(capturedConfig.requiredEnv, [], 'requiredEnv must be cleared for the plan-preflight config');
+  assert.deepEqual(capturedConfig.safeEnv, [], 'safeEnv must be cleared for the plan-preflight config');
+  // Every OTHER config field must still reach preflight unchanged.
+  assert.equal(capturedConfig.minFreeDiskGb, 5);
+  assert.deepEqual(capturedConfig.services, ['redis']);
+});
+
+test('resolvePlanAdmission isolates HOME/USERPROFILE/APPDATA/LOCALAPPDATA from plan preflight and cleans up after (CodeRabbit PR7 #6Yb44Sd)', async () => {
+  // HOME/USERPROFILE/APPDATA/LOCALAPPDATA are in ESSENTIAL_ENV so ordinary
+  // tools have SOME profile directory to resolve against, but their real
+  // values point at credential-bearing files on disk (~/.npmrc, ~/.netrc,
+  // the gh CLI's own token store) regardless of what is in process.env -- a
+  // repository-controlled preflight probe can read those directly by path.
+  const fs = require('node:fs/promises');
+  const names = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) process.env[name] = `C:\\Users\\real-user\\${name.toLowerCase()}`;
+  let preflightEnv;
+  let observedHomeDir;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => {
+          preflightEnv = env;
+          observedHomeDir = env.HOME;
+          // The isolated directory must actually exist (and be empty) WHILE
+          // the probe is running.
+          const entries = await fs.readdir(observedHomeDir);
+          assert.deepEqual(entries, [], 'the isolated home directory must be empty');
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  for (const name of names) {
+    assert.notEqual(preflightEnv[name], process.env[name] ?? `C:\\Users\\real-user\\${name.toLowerCase()}`,
+      `${name} must not be the real runner profile path`);
+  }
+  // All four are substituted with the SAME isolated directory.
+  assert.equal(preflightEnv.HOME, observedHomeDir);
+  assert.equal(preflightEnv.USERPROFILE, observedHomeDir);
+  assert.equal(preflightEnv.APPDATA, observedHomeDir);
+  assert.equal(preflightEnv.LOCALAPPDATA, observedHomeDir);
+  // Cleaned up afterward: the directory must no longer exist.
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/);
+});
+
+test('resolvePlanAdmission cleans up the isolated home directory even when the probe throws', async () => {
+  const fs = require('node:fs/promises');
+  let observedHomeDir;
+  await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    config: {},
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async ({ env }) => { observedHomeDir = env.HOME; throw new Error('probe crashed'); },
+      workingTreeFingerprint: async () => 'fp-stable',
+    },
+  });
+  assert.ok(observedHomeDir, 'the isolated home directory must have been created before the throw');
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/, 'cleanup must still run when the probe throws');
+});
+
 test('resolvePlanAdmission hard-denies credential-named vars even when safeEnv opts in (Codex #7, CodeRabbit #16)', async () => {
   // Plan admission runs BEFORE attestation on PR-controlled code, so a
   // credential-shaped variable must be hard-denied from preflight EVEN IF an
