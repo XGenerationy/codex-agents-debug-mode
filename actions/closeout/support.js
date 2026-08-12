@@ -5,19 +5,22 @@
 // dependencies, same repo conventions as the gate scripts it wraps. The gate
 // CLI itself (scripts/pr_closeout.js) is consumed as-is, never modified.
 
-const { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } = require('node:fs');
+const {
+  appendFileSync, chmodSync, closeSync, fchmodSync, fstatSync, lstatSync, mkdirSync,
+  openSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync,
+} = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
-// protectWindowsPrivateFile is a UTILITY the gate CLI already exports and
-// uses on its own evidence writes (report.json/report.md in
-// pr_closeout_report.js, evidence logs in pr_closeout_process.js) — reusing
-// it here is not a modification to scripts/pr_closeout_* (still consumed as
-// merged), just consuming its existing public surface the same way the
-// CLI's own code does (Codex PR7 review, "Protect wrapper evidence with a
-// Windows DACL").
-const { protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
+// protectWindowsPrivateFile/isSameFileIdentity are UTILITIES the gate CLI
+// already exports and uses on its own evidence writes (report.json/report.md
+// in pr_closeout_report.js, evidence logs in pr_closeout_process.js) —
+// reusing them here is not a modification to scripts/pr_closeout_* (still
+// consumed as merged), just consuming their existing public surface the same
+// way the CLI's own code does (Codex PR7 review, "Protect wrapper evidence
+// with a Windows DACL"; chatgpt-codex-connector PR7 #6YaIaZ).
+const { isSameFileIdentity, protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
 
 // Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
 // git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
@@ -969,41 +972,66 @@ const writeEvidenceFile = (outputDir, name, content) => {
   // to its original broader mode before this write, the file content (which can
   // hold unredacted runner paths / base refs / error text) is still owner-only.
   //
-  // Create/truncate the target EMPTY first and lock down its access control
-  // while it holds no content yet — only THEN write the (possibly sensitive)
-  // bytes. Writing content and protecting the file afterward left a window
-  // where real evidence (the invocation nonce, exit decision, unredacted
-  // runner paths/error text) sat in a file that still carried the
-  // surrounding directory's inherited permissions/ACL; another account with
-  // access to a broadly-readable outputDir could read it inside that window
-  // (chatgpt-codex-connector PR7 #6YZpcv).
-  writeFileSync(target, '', { mode: 0o600 });
-  // writeFileSync's `mode` option only applies when the OPEN call CREATES the
-  // file — an ordinary pre-existing regular single-link file (the guard above
-  // only unlinks a symlink/non-file/hardlink, not a plain reused file) is
-  // opened with O_TRUNC and keeps whatever permissive mode it already had,
-  // e.g. 0o644 from a prior invocation of a reused output-dir. chmodSync
-  // unconditionally closes that gap before anything is written into it; it is
-  // a cheap no-op when the file was freshly created at 0o600 already
-  // (CodeRabbit #6YT0Jx).
-  chmodSync(target, 0o600);
-  // chmodSync(0o600) only clears Windows' read-only attribute bit — it does
-  // NOT establish real access control there, so this file would still
-  // inherit whatever DACL the surrounding --output-dir has on a multi-user
-  // Windows runner, readable (and writable) by any other local account. The
-  // gate CLI already solves exactly this for its own evidence writes —
-  // report.json/report.md (pr_closeout_report.js) and evidence logs
-  // (pr_closeout_process.js) — via protectWindowsPrivateFile: a verified,
-  // owner-only Windows DACL, no-op on non-Windows. Apply the same guard here,
-  // fail-closed on any failure to establish it, and BEFORE any content is
-  // written (Codex PR7 review, "Protect wrapper evidence with a Windows
-  // DACL"; chatgpt-codex-connector PR7 #6YZpcv).
+  // Open ONE descriptor and hold it through ACL setup and the content write,
+  // rather than two separate path-based writeFileSync calls (chatgpt-codex-
+  // connector PR7 #6YaIaZ, following writeNoFollow's identical pattern in
+  // pr_closeout_report.js): protectWindowsPrivateFile is an EXTERNAL
+  // PowerShell process operating on `target` BY PATH, so between it starting
+  // and returning, another account on a multi-user Windows runner could
+  // replace the path with a symlink or a different file. A subsequent
+  // path-based write would then write THROUGH that replacement instead of
+  // the file whose DACL was actually verified. Writing through the SAME fd
+  // opened here — before the ACL call, established as a regular single-link
+  // file by the symlink/hardlink guard above — is immune to that: even if
+  // the path is later swapped, this descriptor still refers to the original
+  // on-disk file. The identity recheck below is an additional fail-closed
+  // net: it detects a swap during the ACL call and refuses rather than
+  // leave a case where the file at the PATH other tooling would read is
+  // unprotected while the KNOWN-good original silently isn't the one still
+  // reachable there.
+  const fd = openSync(target, 'w', 0o600);
   try {
-    protectWindowsPrivateFile(target);
-  } catch (error) {
-    throw new Error(`failed to protect evidence file with an owner-only ACL: ${target}`, { cause: error });
+    const preInfo = fstatSync(fd);
+    // fchmodSync's mode argument on open only applies when the OPEN call
+    // CREATES the file — an ordinary pre-existing regular single-link file
+    // (the guard above only unlinks a symlink/non-file/hardlink, not a plain
+    // reused file) is opened with O_TRUNC and keeps whatever permissive mode
+    // it already had, e.g. 0o644 from a prior invocation of a reused
+    // output-dir. fchmodSync unconditionally closes that gap before
+    // anything is written; it is a cheap no-op when the file was freshly
+    // created at 0o600 already (CodeRabbit #6YT0Jx).
+    fchmodSync(fd, 0o600);
+    // chmodSync/fchmodSync(0o600) only clears Windows' read-only attribute
+    // bit — it does NOT establish real access control there, so this file
+    // would still inherit whatever DACL the surrounding --output-dir has on
+    // a multi-user Windows runner, readable (and writable) by any other
+    // local account. The gate CLI already solves exactly this for its own
+    // evidence writes — report.json/report.md (pr_closeout_report.js) and
+    // evidence logs (pr_closeout_process.js) — via protectWindowsPrivateFile:
+    // a verified, owner-only Windows DACL, no-op on non-Windows. Apply the
+    // same guard here, fail-closed on any failure to establish it, and
+    // BEFORE any content is written (Codex PR7 review, "Protect wrapper
+    // evidence with a Windows DACL"; chatgpt-codex-connector PR7 #6YZpcv).
+    try {
+      protectWindowsPrivateFile(target);
+    } catch (error) {
+      throw new Error(`failed to protect evidence file with an owner-only ACL: ${target}`, { cause: error });
+    }
+    if (process.platform === 'win32') {
+      let postInfo;
+      try {
+        postInfo = lstatSync(target);
+      } catch {
+        throw new Error(`Refusing to write evidence file with an unverifiable identity: ${target}`);
+      }
+      if (!isSameFileIdentity(preInfo, postInfo)) {
+        throw new Error(`Refusing to write evidence file through a path swapped during ACL protection: ${target}`);
+      }
+    }
+    writeSync(fd, content, null, 'utf8');
+  } finally {
+    closeSync(fd);
   }
-  writeFileSync(target, content, { mode: 0o600 });
 };
 
 const readState = (outputDir) => {
