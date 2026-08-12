@@ -779,6 +779,31 @@ test('hasTopLevelPermissions requires a column-zero permissions block', () => {
     'a BOM-prefixed permissions block is detected');
 });
 
+test('hasTopLevelPermissions does not mistake column-zero scalar content for a real key (chatgpt-codex-connector PR7 #6YblGF)', () => {
+  // js-yaml verified: a multiline double-quoted scalar can fold a physical
+  // line that LOOKS like a column-zero `permissions:` key into its plain
+  // string content -- `name: "foo\n  permissions:\n  bar"` resolves to
+  // {name: "foo permissions: bar"}, with no real permissions key anywhere.
+  // The reviewer's own literal example (`name: "foo\npermissions:\nbar"`,
+  // with the continuation lines at column 0) is not valid YAML at all --
+  // js-yaml rejects it with "deficient indentation" -- because YAML
+  // requires a folded scalar's continuation lines to be indented past
+  // their parent's own indentation; a properly-indented equivalent is used
+  // here since that is the form that actually parses.
+  assert.equal(
+    hasTopLevelPermissions('name: "foo\n  permissions:\n  bar"\n'),
+    false,
+    'a permissions:-shaped line inside a still-open multiline scalar must not count as a real top-level key',
+  );
+  // Sanity: a genuine top-level permissions: key on the line immediately
+  // after a completed (closed) multiline scalar must still be detected.
+  assert.equal(
+    hasTopLevelPermissions('name: "foo\n  bar"\npermissions:\n  contents: read\n'),
+    true,
+    'a real top-level permissions: key after a scalar closes must still be found',
+  );
+});
+
 test('the real validator passes on this repository (integration)', () => {
   const result = spawnSync(process.execPath, [path.join(__dirname, 'validate_repository.js')], { encoding: 'utf8' });
   assert.equal(result.status, 0, `validator failed:\n${result.stderr}`);

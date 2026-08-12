@@ -102,11 +102,30 @@ on:
       base-ref:
         description: "Live PR base ref (dispatch runs have no PR context)"
         default: origin/main
+  # Re-run once a sibling CI workflow that was still pending when the gate
+  # last ran has settled: an approval submitted while your own CI is still
+  # queued/in-progress makes the live-state check correctly BLOCK on that
+  # pending check, and nothing else re-triggers the gate once it later
+  # completes. List every workflow whose completion could unblock a prior
+  # BLOCKED gate result — substitute your own CI workflow name(s) for
+  # "Validate" below; "Closeout preview" is this action's own preview
+  # workflow above.
+  workflow_run:
+    workflows: ["Validate", "Closeout preview"]
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: read
   checks: read
+  # statuses: read covers legacy commit-status contexts (as opposed to
+  # check runs) that the live-state rollup can also return — needed if any
+  # of your CI publishes commit statuses instead of check runs.
+  statuses: read
+  # actions: read is required for the gate's own self-exclusion (finding
+  # its own displayed check name via the Jobs API) to work on a named or
+  # matrixed job; omitting it degrades self-exclusion, it does not error.
+  actions: read
 
 # cancel-in-progress is deliberately FALSE for the enforcing gate: workflow-level
 # concurrency is evaluated before the job-level if, so a comment-only review
@@ -115,8 +134,13 @@ permissions:
 # cancelled gate result is a missing gate result; a superseded run invalidates
 # itself anyway because the attestation is head-bound. The preview workflow
 # keeps newest-wins cancellation, where it is correct.
+#
+# workflow_run events carry no top-level pull_request, so the PR number for a
+# same-repo PR instead comes from workflow_run.pull_requests[0].number (empty
+# for a fork PR). Without this fallback, every workflow_run-triggered gate
+# run across every PR would share one concurrency group keyed on github.ref.
 concurrency:
-  group: closeout-gate-${{ github.event.pull_request.number || github.ref }}
+  group: closeout-gate-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -128,10 +152,11 @@ jobs:
     # CHANGES_REQUESTED, a submitted COMMENT review (inline review threads
     # with no approval — those threads can carry unresolved comments that
     # readLivePrState would block, so a stale PASS cannot survive them),
-    # any dismissed review, and an edited APPROVAL only (an edited
-    # non-approval is unchanged state). Each of these can invalidate a
-    # prior PASS, so they must produce a fresh gate result.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') }}
+    # any dismissed review, an edited APPROVAL only (an edited
+    # non-approval is unchanged state), and a COMPLETED run of a sibling
+    # workflow named above, restricted to one whose OWN trigger was
+    # pull_request (its conclusion doesn't matter — only that it finished).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.review.state == 'approved' || github.event.review.state == 'changes_requested' || github.event.review.state == 'commented' || github.event.action == 'dismissed' || (github.event.action == 'edited' && github.event.review.state == 'approved') || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out reviewed head
@@ -139,7 +164,13 @@ jobs:
         with:
           # The gate re-verifies the live head via gh and BLOCKS stale
           # snapshots; the checkout must present the head being attested.
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          # Prefer workflow_run.pull_requests[0].head.sha (the PR's actual
+          # head) over workflow_run.head_sha (whatever SHA the sibling
+          # workflow itself ran against, which can be a synthetic merge
+          # commit rather than the PR's real head) — fall back to
+          # workflow_run.head_sha only for a fork PR, whose pull_requests[]
+          # is empty and cannot resolve PR context regardless of the SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.event.workflow_run.pull_requests[0].head.sha || github.event.workflow_run.head_sha || github.ref }}
           fetch-depth: 0
           # Do not persist checkout credentials: the gate runs PR-controlled
           # validation commands that could otherwise use the saved git token.
@@ -155,6 +186,13 @@ jobs:
           config: .github/closeout-engine.json
           base-ref: ${{ github.event.inputs.base-ref || '' }}
 ```
+
+The `workflow_run` trigger and its checkout/concurrency fallbacks above are
+optional but recommended: without them, a gate run that BLOCKS on a still-
+pending sibling CI check is never automatically retried once that sibling
+completes, and stays stuck until unrelated PR or review activity happens to
+re-trigger the gate. See `.github/workflows/closeout-gate.yml` in this
+repository for the full version with its complete rationale comments.
 
 Both examples above use the **local dogfood form**, `uses: ./actions/closeout`,
 because they live in the same repository as the action. Consuming this action from
@@ -572,26 +610,6 @@ they are roadmap items, not accepted risk:
   now BLOCK on the unresolved thread. Interim control: a head push, a new/edited
   review, or a manual `workflow_dispatch` re-runs the gate and catches the
   reopened thread. A scheduled re-validation sweep is the long-term fix.
-- **Self-exclusion can misidentify the current check for a named or matrixed
-  job.** `classifyLivePrState` (scripts/pr_closeout_github.js) excludes the
-  currently-running gate check by matching `check.name === GITHUB_JOB`, but
-  `GITHUB_JOB` is the YAML job **id**, while `statusCheckRollup[].name` is the
-  displayed check name — which differs whenever the consuming workflow gives
-  the job a `name:` override or runs it in a `strategy.matrix` (where the
-  displayed name gets a `(value, value)` suffix). In either configuration the
-  equality never matches, self-exclusion silently no-ops, and every otherwise-
-  clean full run reports BLOCKED on its own in-progress check. This fails
-  closed (never a false PASS) but breaks availability for those consumers. A
-  correct fix needs the Checks/Jobs API (matching this run's job by
-  `RUNNER_NAME`/`RUNNER_TRACKING_ID` against `GET
-  /repos/{owner}/{repo}/actions/runs/{GITHUB_RUN_ID}/jobs` to resolve this
-  job's true displayed name) — a new API dependency and failure-mode surface
-  in the gate CLI (`scripts/pr_closeout_*`), which is out of this sub-
-  project's scope and warrants its own design review rather than a reactive
-  patch. Interim control: consumers who name the job or run it in a matrix
-  should not rely on self-exclusion — invoke the gate from a dedicated,
-  unnamed, non-matrixed job (as this repo's own dogfood workflow does) until
-  a Jobs-API-based fix lands (CodeRabbit PR7 #6YXkRF).
 - **Manual dispatch runs have no PR context.** On `workflow_dispatch`,
   `github.event.pull_request.head.sha` is empty, so the checkout falls back to
   `github.ref` (the branch the dispatch ran on, typically the base branch), and

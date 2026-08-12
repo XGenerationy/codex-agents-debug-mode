@@ -696,7 +696,25 @@ const hasTopLevelPermissions = (content) => {
   // Strip a leading UTF-8 BOM so a `permissions:` block at column zero is still
   // detected when the file is saved as UTF-8 with BOM (Codex #1658).
   const text = String(content ?? '').replace(/^\uFEFF/, '');
-  return /^(['"]?)permissions\1\s*:(\s|$)/m.test(text);
+  // Line-by-line with cross-line quote carryover (chatgpt-codex-connector PR7
+  // #6YblGF), mirroring findUnpinnedUses' own per-line loop: a multiline
+  // quoted scalar can legally contain a physical line that LOOKS like a
+  // column-zero `permissions:` key (e.g. `name: "foo\n  permissions:\n
+  // bar"`, which YAML folds into one plain string), and a single whole-text
+  // regex test (with no notion of "am I still inside an open scalar")
+  // would match that line's raw text as if it were a real key, wrongly
+  // reporting the file as having declared its permissions scope. Skip the
+  // regex test entirely for a line that BEGINS inside a scalar carried
+  // open from an earlier line.
+  const lines = text.split('\n');
+  let carryover = { inDouble: false, inSingle: false };
+  for (const line of lines) {
+    const lineStartState = carryover;
+    carryover = walkQuoteState(line, line.length, lineStartState, true);
+    if (lineStartState.inDouble || lineStartState.inSingle) continue;
+    if (/^(['"]?)permissions\1\s*:(\s|$)/.test(line)) return true;
+  }
+  return false;
 };
 
 module.exports = { findUnpinnedUses, hasTopLevelPermissions };
