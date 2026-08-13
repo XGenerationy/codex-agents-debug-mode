@@ -1168,6 +1168,16 @@ Files: `actions/debug-evidence/collector_boot.js`, `actions/debug-evidence/suppo
 Fix commit message:
 `fix(action): EPIPE-safe shim, orphan-proof start, real containment, exclusive state writes, redact-name split (Codex T3)`.
 
+**Fix round 2 (Codex re-review of `6fea3ba`):** the seven fixes hold; residuals ruled —
+untested shim EPIPE layer acceptable (simple, correctly placed, parent layer pinned),
+held scaffolding acceptable, empty-dir validation side effect acceptable. One remaining
+Important: `writeState`'s `writeSync()` return value is ignored, so a legal short write
+renames truncated JSON into place — `start` succeeds while `readState()` → null and
+teardown silently orphans the collector (seam-reproduced: 1 of 85 bytes). Decision:
+write via `writeFileSync(fd, payload)` (retries partial writes) on the O_EXCL fd, plus
+a seam test pinning that a short-write cannot produce a committed-but-unparsable state
+file. Commit: `fix(action): full-write state persistence (Codex T3 r2)`.
+
 ---
 
 ### Task 4: `run` — session mint, optional hypothesis OPEN, wrapped command execution
