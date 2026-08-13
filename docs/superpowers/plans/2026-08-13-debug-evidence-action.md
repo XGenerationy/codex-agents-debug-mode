@@ -1115,6 +1115,59 @@ git add actions/debug-evidence/collector_boot.js actions/debug-evidence/support.
 git commit -m "feat(action): debug-evidence foundation — boot shim, start/teardown, state + validation"
 ```
 
+#### Task 3 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex verdict on `5e3b69f`: Issues (Important ×5, Minor ×2), all with adversarial
+reproductions. All accepted. Ruled fine: hex/whitespace port strings (resolve to valid
+ports; contract says integer), the unreachable non-`started` branch, unbound
+`process.kill`, held Task-4/5 scaffolding.
+
+1. **EPIPE survival (Important).** The collector outlives the `start` step, so any
+   post-start diagnostic write to a dead pipe could kill it. Two layers: (a) in
+   `collector_boot.js`, after constructing the server, attach no-op `'error'` handlers
+   to `process.stdout` and `process.stderr` so EPIPE is swallowed for the collector's
+   lifetime; (b) in `startSubcommand`, release the pipes with
+   `removeAllListeners('data')` + `.resume()` + `.unref()` on both streams — never
+   `.destroy()` — then `child.unref()`.
+2. **No orphan on persistence failure (Important).** Reorder `startSubcommand`:
+   handshake → ready-probe → `writeState` (wrapped: on ANY throw, `process.kill(pid)`
+   best-effort, then rethrow) → release pipes → `unref`. Test: injected state-write
+   failure (unwritable outputDir) must record a kill.
+3. **Correct workspace containment (Important).** Replace the `startsWith('..')` logic:
+   inside-workspace iff `rel === ''` OR (`!rel.startsWith('..' + path.sep)` AND
+   `rel !== '..'` AND `!path.isAbsolute(rel)`) — fixes the `..cache` bypass. Layer 2:
+   in `startSubcommand` (before spawning), `mkdirSync(outputDir, {recursive: true})`
+   then re-check containment on `realpathSync(outputDir)` vs
+   `realpathSync(workspace)` (only when workspace is set and exists) — closes the
+   symlink route. Tests: `..cache`-style sibling passes validation; a symlink inside
+   the workspace pointing outside (and vice versa) is caught by the realpath layer
+   (skip the symlink test with the repo's standard symlink-privilege skip option on
+   Windows if needed).
+4. **Private, symlink-safe state writes (Important).** Replace bare `writeFileSync` in
+   `writeState` with the closeout discipline: `lstatSync` the target (existing symlink
+   or non-regular-file ⇒ throw, never follow); write a temp sibling
+   `.action-state.<pid>.<Date.now()>.tmp` opened `O_WRONLY|O_CREAT|O_EXCL` mode 0600;
+   `renameSync` over the target (on `EEXIST`/`EPERM` — Windows rename-over-existing —
+   `unlinkSync` target then rename; Linux runners take the atomic path). Windows DACL
+   limits stay documented via the spec's Linux-first posture (non-goal 6).
+5. **redact-names separator (Important).** The spec promises comma/space-separated;
+   the shim splits commas only. Fix in `collector_boot.js`: split on `/[\s,]+/`.
+   Pin: `'A B,C'` yields three names (test via a start with redactNames and asserting
+   the collector's snapshot redacts all three — or unit-level if simpler, but the split
+   itself must be pinned).
+6. **readShimStartLine robustness (Minor).** Add a `child.on('error', …)` rejection
+   (spawn failure must not become an uncaught exception) and use `'close'` (streams
+   drained) rather than `'exit'` for the failure path so a final structured stderr
+   line isn't lost to the generic message.
+7. **Test gaps (Minor).** The timeout test's fake `kill()` must record and assert the
+   kill happened; add the shim-error-line case (fake child emits a structured stderr
+   reason then closes → error message carries that reason).
+
+Files: `actions/debug-evidence/collector_boot.js`, `actions/debug-evidence/support.js`,
+`actions/debug-evidence/support.test.js`.
+Fix commit message:
+`fix(action): EPIPE-safe shim, orphan-proof start, real containment, exclusive state writes, redact-name split (Codex T3)`.
+
 ---
 
 ### Task 4: `run` — session mint, optional hypothesis OPEN, wrapped command execution
