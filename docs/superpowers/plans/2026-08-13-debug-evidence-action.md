@@ -1403,6 +1403,44 @@ git add actions/debug-evidence/support.js actions/debug-evidence/support.test.js
 git commit -m "feat(action): run subcommand — mint, optional OPEN hypothesis, injected env, exit-code capture"
 ```
 
+#### Task 4 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex verdict on `c415344`: Issues (Important ×5, reproductions for the first two).
+All accepted:
+
+1. **Mask tokens on the runner log channel.** `NODE_DEBUG=http` in the job env makes
+   Node print the full `Authorization` header into the step log (reproduced). Add a
+   `maskValue(env, value)` helper that writes `::add-mask::<value>\n` to stdout ONLY
+   when `env.GITHUB_ACTIONS === 'true'`; `start` masks the launch token immediately
+   after the shim handshake (before any state write), `run` masks the session token
+   immediately after mint (before hypothesis post / spawn). Tests: helper unit test
+   both gated states; integration pins via an injectable stdout seam or child capture.
+2. **Bounded, settle-guaranteed `httpRequestJson`.** Add: response `'aborted'`,
+   `'error'`, and premature-`'close'` rejection; a `RESPONSE_BYTE_CAP = 1 MiB` (reject
+   over-cap, destroy); a wall-clock deadline (10 s) covering the whole exchange,
+   cleared on settle — the existing 5 s inactivity timeout stays. Tests with a raw
+   `net`/`http` fake peer: lying Content-Length (headers + partial body + close) must
+   reject, trickle-forever must reject at the deadline.
+3. **Close the nonce lost-update race.** `run` re-reads state after the wrapped command
+   and compares nonces immediately before its final `writeState`; mismatch ⇒ stderr +
+   return 3 WITHOUT writing or emitting outputs (never restore a stale snapshot over a
+   newer invocation's state). Task 5's `report` must apply the same
+   re-read-before-write guard. Test: mutate the state file (new nonce) while the
+   wrapped command runs (seam command does the mutation) ⇒ 3, file untouched.
+4. **Authenticate the port occupant before sending the bearer token.** Before mint,
+   `run` calls `probeLaunchToken(state.port, state.launchToken)` (exported by
+   debug_server; non-mutating HMAC challenge — a rebound foreign process cannot answer
+   without the token). Injectable seam `probeToken = probeLaunchToken`; `false` ⇒
+   stderr `collector identity could not be verified` + return 3, no Authorization
+   header ever sent. Test: fake probe false ⇒ 3 and `request` never called.
+5. **Never inherit `DEBUG_HYPOTHESIS_ID`.** When `state.hypothesisId` is falsy,
+   explicitly `delete commandEnv.DEBUG_HYPOTHESIS_ID` (job-level values must not
+   attribute events to a hypothesis this action never posted). Collision test: caller
+   env pre-sets it, input unset ⇒ wrapped command sees it undefined.
+
+Fix commit message:
+`fix(action): token masking, bounded http, nonce CAS, port-occupant auth, env hygiene (Codex T4)`.
+
 ---
 
 ### Task 5: `report` + `finish` — capture, render, and the exit taxonomy
