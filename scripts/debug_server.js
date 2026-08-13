@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
+const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
 const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, unlinkSync, writeSync } = require('node:fs');
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
@@ -693,7 +693,12 @@ const appendSessionEvent = (session, serializedEvent) => {
     try {
       await verifyLogIdentity(session, await handle.stat());
       await handle.writeFile(serializedEvent, 'utf8');
+      // Byte count and digest advance together, and only after the write
+      // succeeded: a partial or failed append must leave both describing the
+      // window that is genuinely ours, or the next read would reject the
+      // server's own file.
       session.logFileIdentity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+      session.logFileIdentity.contentDigest.update(serializedEvent, 'utf8');
     } finally {
       await handle.close();
     }
@@ -1317,6 +1322,11 @@ const createDebugServer = ({
               ino: info.ino,
               birthtimeMs: info.birthtimeMs,
               bytesWritten: 0,
+              // Running SHA-256 of exactly the bytes this server has appended.
+              // It lives beside bytesWritten because the two describe the same
+              // window and must be updated together: the digest is only
+              // meaningful as "the hash of the first bytesWritten bytes".
+              contentDigest: createHash('sha256'),
               projectRootReal: resolvedRoot,
               logDirReal: resolvedLogDir,
             };
@@ -1621,6 +1631,19 @@ const createDebugServer = ({
               const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
               if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
               offset += bytesRead;
+            }
+            // CONTENT, not just metadata. dev, ino, birthtime and size are all
+            // preserved by a same-LENGTH in-place rewrite — a wrapped command
+            // that swaps 'honest event' for 'FORGED event' passes every check
+            // above while changing what the log says, and a caller reading
+            // back through this route would be handed the forgery as the
+            // server's own record. Comparing the bytes on disk against the
+            // running digest of the bytes this server appended is the only
+            // check that sees it. `copy()` snapshots the incremental hash so
+            // the session's own digest stays open for the next append.
+            if (createHash('sha256').update(buffer).digest('hex')
+              !== session.logFileIdentity.contentDigest.copy().digest('hex')) {
+              throw new RequestError('session_log_tampered', 409);
             }
             return buffer.toString('utf8');
           } finally {

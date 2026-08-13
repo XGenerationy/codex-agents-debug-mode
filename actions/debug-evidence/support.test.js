@@ -989,6 +989,33 @@ test('a wrapped command that forges its own session log cannot get the forgery i
   }
 });
 
+test('a same-length in-place rewrite of the session log is caught end to end, not just by the byte count', async () => {
+  const context = await fullLifecycle();
+  try {
+    const logPath = path.join(context.projectRoot, '.debug', `debug-${readState(context.outputDir).sessionId}.log`);
+    const original = readFileSync(logPath, 'utf8');
+    assert.ok(original.includes('demo event'));
+    // Ten characters for ten. Nothing about this file's metadata moves —
+    // dev, ino, birthtime and size are all identical afterwards — so every
+    // check the collector had before this round passes. Performed here rather
+    // than by the wrapped command only because the window is wider: any
+    // co-resident process can do this after the command exits.
+    const forged = original.replace('demo event', 'FAKE event');
+    assert.equal(Buffer.byteLength(forged, 'utf8'), Buffer.byteLength(original, 'utf8'));
+    writeFileSync(logPath, forged);
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    // Collector: content digest mismatch → 409 session_log_tampered.
+    // readSessionLive: 409 → live_read_log_replaced. report: no fallback → 3.
+    assert.equal(code, 3);
+    const state = readState(context.outputDir);
+    assert.equal(state.collectorAlive, true);
+    assert.equal(state.evidenceCopied, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')));
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
 test('with nothing able to prove it owns the port, a forged log is staged as labeled partial evidence and still cannot go green', async () => {
   const context = await forgedLifecycle();
   try {
@@ -1010,6 +1037,86 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
       'this really is the forged file — labeling it, not hiding it, is what makes this safe');
     assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3,
       'forged bytes can be inspected but can never ride a green run');
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+test('the wrapped command is handed no DEBUG_ACTION_* wiring — least of all the path to the launch token', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
+  let handed = null;
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    // A production-shaped job env: this is exactly what action.yml puts in
+    // front of the run step.
+    env: {
+      DEBUG_ACTION_OUTPUT_DIR: outputDir,
+      DEBUG_ACTION_INVOCATION_NONCE: 'n1',
+      DEBUG_ACTION_PORT: '8787',
+      DEBUG_ACTION_RUN: 'npm test',
+      UNRELATED_JOB_VAR: 'kept',
+    },
+    probeToken: async () => true,
+    request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
+    spawnCommand: (command, { env: commandEnv }) => { handed = commandEnv; return { status: 0 }; },
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(Object.keys(handed).filter((key) => key.startsWith('DEBUG_ACTION_')), [],
+    'DEBUG_ACTION_OUTPUT_DIR points at action-state.json, which carries the launch token');
+  assert.equal(handed.UNRELATED_JOB_VAR, 'kept', 'only the action\'s own wiring is stripped');
+  // The documented injected contract is untouched by the strip.
+  assert.equal(handed.DEBUG_SESSION_ID, 'ci-debug-abc');
+  assert.equal(handed.DEBUG_SESSION_TOKEN, 'z'.repeat(43));
+  assert.equal(handed.DEBUG_LOG_URL, 'http://127.0.0.1:1/log');
+});
+
+test('a stolen launch token buys nothing: a verdict forged through the real endpoint is refused at capture', async () => {
+  const context = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
+  try {
+    // The wrapped command does what any process running as the same OS user
+    // can do: find the state file (its default location is derivable — here
+    // the guess is handed over directly, so the test measures the DEFENCE and
+    // not the attacker's search), read the launch token out of it, and post a
+    // CONFIRMED verdict through the collector's real /hypothesis endpoint.
+    // The collector records it as faithfully as anything else — that is the
+    // point. Nothing before this round would have noticed.
+    const steal = 'node -e "' + [
+      'const fs = require(\'node:fs\');',
+      // First, prove the easy route is closed: production hands the run step
+      // DEBUG_ACTION_OUTPUT_DIR, and the wrapped command must not see it.
+      'if (process.env.DEBUG_ACTION_OUTPUT_DIR !== undefined) process.exit(92);',
+      'const stolen = JSON.parse(fs.readFileSync(process.env.GUESSED_STATE_PATH, \'utf8\')).launchToken;',
+      'fetch(process.env.DEBUG_LOG_URL.replace(\'/log\', \'/hypothesis\'), { method: \'POST\', headers: { \'content-type\': \'application/json\', Authorization: \'Bearer \' + stolen }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'forged with the stolen launch token\' }) }).then((r) => process.exit(r.status === 202 ? 0 : 93));',
+    ].join('') + '"';
+    const runCode = await runSubcommand({
+      inputs: { ...context.inputs, runCommand: steal },
+      outputDir: context.outputDir,
+      env: {
+        DEBUG_ACTION_OUTPUT_DIR: context.outputDir,
+        GUESSED_STATE_PATH: path.join(context.outputDir, 'action-state.json'),
+      },
+    });
+    assert.equal(runCode, 0);
+    const state = readState(context.outputDir);
+    assert.equal(state.commandExitCode, 0,
+      '92 would mean the env strip failed; 93 would mean the forgery never landed and this test proves nothing');
+    const onDisk = readFileSync(path.join(context.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
+    assert.ok(onDisk.includes('CONFIRMED'),
+      'the theft succeeded at the collector: a forged verdict is now authentically recorded');
+    // Authenticated capture alone would bless it — the collector's own log is
+    // intact and its identity checks all pass. Only the hypothesis-set
+    // contract can tell that the action never posted that line.
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    assert.equal(code, 3);
+    const after = readState(context.outputDir);
+    assert.equal(after.collectorAlive, true, 'the collector is healthy; the EVIDENCE is not');
+    assert.equal(after.evidenceCopied, false);
+    assert.equal(after.evidenceAuthentic, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')),
+      'a forged verdict never reaches the artifact');
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3);
   } finally {
     teardownSubcommand({ outputDir: context.outputDir, env: {} });
   }
@@ -1039,6 +1146,11 @@ test('report refuses a state carrying another invocation\'s nonce before it touc
   assert.equal(code, 3);
   assert.equal(probed, 0, 'the refusal is settled from state alone, before any network contact');
 });
+
+// readSessionLive resolves [{ raw, parsed }] — parsed being JSON.parse(raw).
+// Seams below build entries through this helper so a fixture can never drift
+// into a shape the real collector would not produce.
+const servedEntry = (line) => ({ raw: JSON.stringify(line), parsed: line });
 
 // A hand-written session log: the CAS path below has to be driven
 // deterministically, and a real collector's timing is not the thing under
@@ -1070,7 +1182,7 @@ test('report stages evidence outside the lock but refuses to commit over a newer
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
     probeToken: async () => true,
-    readLive: async () => [{ raw: JSON.stringify({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }) }],
+    readLive: async () => [servedEntry({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' })],
     // Rendering happens OUTSIDE the critical section by design — a holder
     // that spawned two child processes could sit in the section for seconds,
     // and the stale threshold is 30s (recorded T4 r2 requirement). The seam
@@ -1152,15 +1264,15 @@ test('the staged log is the collector\'s answer, not whatever is on disk under t
   const projectRoot = makeTempDir();
   const launchToken = 'x'.repeat(43);
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 4321, launchToken,
+    nonce: 'n1', pid: 1, port: 4321, launchToken, hypothesisId: 'H-demo',
     sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
   });
   // What a wrapped command left at the well-known path. A pathname copy would
   // stage this; the authenticated path never opens it.
   writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'FORGED disk line' }]);
   const served = [
-    { raw: JSON.stringify({ ts: '2026-08-13T00:00:01.000Z', msg: 'served by the collector' }) },
-    { raw: JSON.stringify({ ts: '2026-08-13T00:00:02.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN' }) },
+    servedEntry({ ts: '2026-08-13T00:00:01.000Z', msg: 'served by the collector' }),
+    servedEntry({ ts: '2026-08-13T00:00:02.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN' }),
   ];
   const reads = [];
   const code = await reportSubcommand({
@@ -1211,6 +1323,107 @@ test('a live read the collector refuses is an evidence-integrity failure, never 
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
 });
 
+test('every way a captured hypothesis set can deviate from the one this action posted is refused', async () => {
+  const openLine = { ts: '2026-08-13T00:00:01.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN', title: 'seeded demo' };
+  const event = { ts: '2026-08-13T00:00:00.000Z', msg: 'an ordinary event, always allowed' };
+  const cases = [
+    ['a verdict the action never records', { hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' },
+      [event, { ...openLine, status: 'CONFIRMED' }]],
+    ['a hypothesis id the action never opened', { hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' },
+      [event, { ...openLine, hypothesisId: 'H-other' }]],
+    ['a duplicate of the action\'s own line', { hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' },
+      [event, openLine, openLine]],
+    ['a title that is not the one posted', { hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' },
+      [event, { ...openLine, title: 'a different claim entirely' }]],
+    ['any hypothesis line at all when none was configured', {},
+      [event, { ...openLine, hypothesisId: 'H-uninvited' }]],
+  ];
+  for (const [label, hypothesisState, served] of cases) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+      projectRoot, commandExitCode: 0, failOnCommandFailure: 'true', ...hypothesisState,
+    });
+    const code = await reportSubcommand({
+      outputDir,
+      env: {},
+      probeToken: async () => true,
+      readLive: async () => served.map(servedEntry),
+      spawnReport: () => { throw new Error('forged evidence must never reach the renderer'); },
+    });
+    assert.equal(code, 3, label);
+    assert.equal(readState(outputDir).evidenceCopied, false, label);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')), `${label}: nothing is staged`);
+    assert.equal(finishSubcommand({ outputDir, env: {} }), 3, label);
+  }
+  // And the shape the action DID post is accepted, events and all — a check
+  // that refused everything would pass the cases above while breaking capture.
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+    hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
+  });
+  assert.equal(await reportSubcommand({
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    readLive: async () => [event, openLine].map(servedEntry),
+  }), 0, 'the action\'s own set is exactly what capture accepts');
+  assert.equal(readState(outputDir).evidenceAuthentic, true);
+});
+
+test('an entry the hypothesis check cannot inspect is refused rather than skipped', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  const code = await reportSubcommand({
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    // A line whose parsed form is missing or is not an object cannot be
+    // classified. Skipping it would let a forged hypothesis through any
+    // future path that produced this shape, so it fails closed instead.
+    readLive: async () => [{ raw: '{"type":"hypothesis","status":"CONFIRMED"}' }],
+    spawnReport: () => { throw new Error('an uninspectable capture must never reach the renderer'); },
+  });
+  assert.equal(code, 3);
+  assert.equal(readState(outputDir).evidenceCopied, false);
+});
+
+test('staging is invocation-scoped: a reused output-dir never ships a previous run\'s evidence as this one\'s', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  mkdirSync(evidenceDir, { recursive: true });
+  // What a previous invocation left behind. The upload step enumerates these
+  // three names, so leaving them is shipping last run's evidence under this
+  // run's artifact.
+  for (const [name, body] of [['session.log', '{"msg":"last run"}\n'], ['report.md', '## stale\n'], ['report.json', '{"schema":1}\n']]) {
+    writeFileSync(path.join(evidenceDir, name), body);
+  }
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  const code = await reportSubcommand({
+    outputDir,
+    env: {},
+    // This invocation captures nothing at all.
+    probeToken: async () => false,
+    spawnReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
+  });
+  assert.equal(code, 3);
+  for (const name of ['session.log', 'report.md', 'report.json']) {
+    assert.ok(!existsSync(path.join(evidenceDir, name)), `${name} from a previous invocation must not survive into this one`);
+  }
+});
+
 test('a renderer that exits 0 without printing a schema-1 report publishes nothing', async () => {
   const cases = [
     ['truncated JSON', '{"schema":1,"session":{"events":'],
@@ -1233,7 +1446,7 @@ test('a renderer that exits 0 without printing a schema-1 report publishes nothi
       outputDir,
       env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
       probeToken: async () => true,
-      readLive: async () => [{ raw: JSON.stringify({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }) }],
+      readLive: async () => [servedEntry({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' })],
       // Exit status 0 throughout: a healthy child that printed rubbish is the
       // whole point — status alone was never proof of a report (Codex T5 #2).
       spawnReport: (args) => (args.includes('--format=json')

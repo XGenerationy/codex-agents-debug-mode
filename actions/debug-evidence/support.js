@@ -675,6 +675,21 @@ const runSubcommand = async ({
     DEBUG_SESSION_ID: sessionId,
     DEBUG_SESSION_TOKEN: sessionToken,
   };
+  // The action's own wiring is not part of the contract the wrapped command
+  // is promised, and one of those variables is a loaded gun:
+  // DEBUG_ACTION_OUTPUT_DIR points straight at action-state.json, which
+  // carries the LAUNCH token — a credential that can post hypothesis verdicts
+  // the session token cannot. The wrapped command runs as the same OS user,
+  // so the file's 0600 mode is no boundary against it; handing over the path
+  // is (Codex T5 r2 #1). Stripping the whole prefix rather than that one name
+  // keeps the rule stable as more wiring vars appear.
+  //
+  // Not a fix on its own — the default output-dir is derivable — which is why
+  // report's hypothesis-set contract, not this loop, is the layer that
+  // actually closes the hole.
+  for (const key of Object.keys(commandEnv)) {
+    if (key.startsWith('DEBUG_ACTION_')) delete commandEnv[key];
+  }
   if (state.hypothesisId) {
     commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
   } else {
@@ -755,6 +770,63 @@ const parseRenderedReport = (text) => {
   return Number.isInteger(events) && events >= 0 ? report : null;
 };
 
+// Exactly what the upload step enumerates, and therefore exactly what has to
+// belong to THIS invocation.
+const EVIDENCE_FILES = ['session.log', 'report.md', 'report.json'];
+
+// The action is the ONLY legitimate holder of the launch token in the
+// wrap-one-command model, and POST /hypothesis is a launch-token capability
+// the wrapped command is never given. That makes a captured session's
+// hypothesis lines DECIDABLE: there must be exactly the line this action
+// posted — an OPEN for the configured hypothesis-id, carrying the title it
+// sent — or none at all when no hypothesis-id was configured. Any other
+// hypothesis line was forged, by definition.
+//
+// This is the layer that survives token theft. The wrapped command runs as
+// the same OS user and can read action-state.json out of an output-dir whose
+// default location is derivable, so it can take the launch token and post a
+// CONFIRMED verdict through the real endpoint — which the collector then
+// records as faithfully as anything else, and which authenticated capture
+// would otherwise bless as the run's official finding (Codex T5 r2 #1).
+// Stripping DEBUG_ACTION_* from the wrapped command's env raises the bar;
+// this check is what makes a stolen token worth nothing.
+//
+// EVENTS are deliberately not checked: they come from the instrumented
+// process and are attacker-authored by design — recording what that process
+// says is the entire point of the evidence.
+//
+// Returns null when the set is exactly right, or a short reason.
+const describeHypothesisDeviation = (entries, state) => {
+  const posted = [];
+  for (const entry of entries) {
+    const parsed = entry?.parsed;
+    // Served entries are {raw, parsed} by contract. A line this check cannot
+    // read is not evidence that there is nothing to find.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return 'the collector served an entry in a shape this check cannot inspect';
+    }
+    if (parsed.type === 'hypothesis') posted.push(parsed);
+  }
+  const expected = state.hypothesisId ? 1 : 0;
+  if (posted.length !== expected) {
+    return `expected exactly ${expected} hypothesis line${expected === 1 ? '' : 's'}, captured ${posted.length}`;
+  }
+  if (expected === 0) return null;
+  const [line] = posted;
+  // Values below are attacker-influenced; JSON.stringify neutralizes quotes
+  // and newlines before they reach a log line.
+  if (line.hypothesisId !== state.hypothesisId) {
+    return `hypothesis id ${JSON.stringify(line.hypothesisId)} is not the ${JSON.stringify(state.hypothesisId)} this action opened`;
+  }
+  if (line.status !== 'OPEN') {
+    return `status ${JSON.stringify(line.status)} — this action opens hypotheses and never records a verdict`;
+  }
+  if (state.hypothesisTitle && line.title !== state.hypothesisTitle) {
+    return `title ${JSON.stringify(line.title)} is not the one this action posted`;
+  }
+  return null;
+};
+
 // Ceiling on the authoritative read. A collector that accepts the connection
 // and then says nothing must not hold the capture step open for the rest of
 // the job; timing out here is an evidence-integrity failure like any other.
@@ -801,6 +873,23 @@ const reportSubcommand = async ({
   const state = readState(outputDir);
   if (!state) return 0; // start never completed; finish owns that failure
   if (rejectForeignNonce(state, env, 'report')) return 3;
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  mkdirSync(evidenceDir, { recursive: true });
+  // Staging is INVOCATION-SCOPED. An output-dir can be reused — across steps,
+  // across jobs on a self-hosted runner — and the upload step enumerates
+  // three fixed filenames, so a previous invocation's report left sitting
+  // there is a previous invocation's evidence shipped as this run's, under
+  // this run's artifact name (Codex T5 r2 #3). Clearing before capture makes
+  // the artifact either what this invocation produced or nothing at all.
+  // Anything other than "it was not there" is left to throw: a staging slot
+  // that cannot be cleared cannot be scoped either.
+  for (const name of EVIDENCE_FILES) {
+    try {
+      unlinkSync(path.join(evidenceDir, name));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
   if (!state.sessionId) {
     process.stderr.write('debug-evidence-action: report: the run step never completed; nothing to capture.\n');
     return 0; // finish fails on the missing commandExitCode
@@ -808,8 +897,6 @@ const reportSubcommand = async ({
   // AUTHENTICATED aliveness: this is both the liveness fact finish gates on
   // and the precondition for trusting anything the port says.
   const collectorAlive = (await probeToken(state.port, state.launchToken)) === true;
-  const evidenceDir = resolveEvidenceDir(outputDir);
-  mkdirSync(evidenceDir, { recursive: true });
   const sessionCopy = path.join(evidenceDir, 'session.log');
   let evidenceCopied = false;
   // Did the staged bytes come from the collector, or off a filesystem the
@@ -817,26 +904,37 @@ const reportSubcommand = async ({
   // provenance is a fact in the state file rather than an assumption.
   let evidenceAuthentic = false;
   if (collectorAlive) {
+    let entries = null;
     try {
-      const entries = await readLive({
+      entries = await readLive({
         port: state.port,
         token: state.launchToken,
         sessionId: state.sessionId,
         timeoutMs: LIVE_READ_TIMEOUT_MS,
       });
-      // The raw lines, verbatim and in order: `raw` is the byte-for-byte text
-      // the collector served, so the staged artifact is the collector's view
-      // rather than a re-serialization of it.
-      writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
-      evidenceCopied = true;
-      evidenceAuthentic = true;
     } catch (error) {
-      // live_read_log_replaced is the collector telling us the file it wrote
-      // is no longer the file on disk. Falling back to that file would stage
-      // precisely the forgery the check just caught, so an authenticated
-      // collector that cannot serve its own session is an evidence-integrity
-      // failure and nothing else.
+      // live_read_log_replaced (and its tampered sibling) is the collector
+      // telling us the file it wrote is no longer the file on disk. Falling
+      // back to that file would stage precisely the forgery the check just
+      // caught, so an authenticated collector that cannot serve its own
+      // session is an evidence-integrity failure and nothing else.
       process.stderr.write(oneLine(`debug-evidence-action: report: the collector could not serve session ${state.sessionId} (${error?.message ?? error}); the on-disk log is not a substitute for it.`) + '\n');
+    }
+    if (entries !== null) {
+      const deviation = describeHypothesisDeviation(entries, state);
+      if (deviation !== null) {
+        // Authentically recorded and still forged: the collector faithfully
+        // stored a line posted by whoever held the launch token, and that was
+        // not this action.
+        process.stderr.write(oneLine(`debug-evidence-action: report: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
+      } else {
+        // The raw lines, verbatim and in order: `raw` is the byte-for-byte
+        // text the collector served, so the staged artifact is the
+        // collector's view rather than a re-serialization of it.
+        writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
+        evidenceCopied = true;
+        evidenceAuthentic = true;
+      }
     }
   } else {
     process.stderr.write(oneLine(`debug-evidence-action: report: nothing on port ${state.port} could prove it holds this session's launch token; staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');

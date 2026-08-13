@@ -4737,3 +4737,64 @@ test('runId is stored trimmed on both routes and joins GET filters', async () =>
     assert.equal(res.text.split('\n').filter(Boolean).length, 2);
   });
 });
+
+test('GET /sessions/:id/logs refuses a same-length in-place rewrite that metadata alone cannot see', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'honest event' },
+    });
+    const logPath = path.join(projectRoot, session.log_file);
+    const before = await stat(logPath);
+    const original = await readFile(logPath, 'utf8');
+    const healthy = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(healthy.status, 200);
+    assert.equal(healthy.text.includes('honest event'), true);
+    // Rewrite in place, byte for byte the same length. writeFile truncates and
+    // refills the SAME inode, so dev, ino, birthtime and the final size are all
+    // unchanged — every field verifyLogIdentity compares still matches while
+    // the log now says something the collector never recorded.
+    const forged = original.replace('honest event', 'FORGED event');
+    assert.equal(Buffer.byteLength(forged, 'utf8'), Buffer.byteLength(original, 'utf8'),
+      'the whole point of this attack is that the byte count does not move');
+    await writeFile(logPath, forged);
+    const after = await stat(logPath);
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.equal(after.birthtimeMs, before.birthtimeMs);
+    // Only the content digest can tell. It answers in the existing
+    // replaced-class 409, which readSessionLive already surfaces to callers as
+    // live_read_log_replaced.
+    const tampered = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(tampered.status, 409);
+    assert.equal(JSON.parse(tampered.text).error, 'session_log_tampered');
+    assert.equal(tampered.text.includes('FORGED event'), false, 'the forgery is refused, never served');
+  });
+});
+
+test('the content digest keeps pace with ordinary appends: interleaved writes and reads stay served', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    for (const msg of ['first', 'second', 'third']) {
+      await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+      });
+      // Read after every append: a digest that fell out of step with
+      // bytesWritten by even one event would reject the server's OWN file here.
+      const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+      assert.equal(res.status, 200);
+      assert.equal(res.text.includes(msg), true);
+    }
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.split('\n').filter(Boolean).length, 4, 'hypothesis appends are digested too');
+    // The served bytes are still exactly the file the collector wrote.
+    assert.equal(res.text, await readFile(path.join(projectRoot, session.log_file), 'utf8'));
+  });
+});
