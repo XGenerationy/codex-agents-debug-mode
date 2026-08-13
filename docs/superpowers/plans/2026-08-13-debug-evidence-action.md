@@ -2140,6 +2140,15 @@ git commit -m "feat(dogfood): deterministic demo session workflow + gate retry-f
 - Modify: `README.md` (Evidence tools section + CI pointer)
 - Modify: `SKILL.md` (Analyze & Verify Tooling section)
 
+> **Queued README requirements (Task 5 spec-review dispositions):** the Exit semantics
+> section must document the three exit-code classes (mirrored code = your command
+> failed; 3 = the action detected a problem and refused; 1 = the action crashed —
+> lock/persistence/transport throws land here), the one-invocation-per-output-dir rule
+> (concurrent sharers are refused fail-closed at the state level, but staged file bytes
+> in the evidence child are not arbitrated), and the signal convention (a signal-killed
+> command surfaces as exit 128; the signal name is recorded in state only, which is
+> never uploaded).
+
 - [ ] **Step 1: Create `actions/debug-evidence/README.md`** covering, in this order (write complete prose for each — this list is the required table of contents, not placeholder text; every factual claim must match the shipped code):
 
 1. **What it does** — one action call wraps one command in an instrumented session; artifact + Step Summary; links to the skill's evidence-first workflow.
@@ -2197,6 +2206,10 @@ git commit -m "docs(action): debug-evidence consumer README + repo README/SKILL.
 ---
 
 ### Task 9: Full battery, scope proof, and handoff
+
+> **Queued test (Task 5 spec-review disposition):** add the missing teardown
+> non-ESRCH kill-failure → 3 pin (two lines with the existing `kill` seam: inject a
+> kill that throws `EPERM` → assert return 3 and the diagnostic stderr line).
 
 - [ ] **Step 1: Full test battery** (one invocation, foreground, no pipes)
 

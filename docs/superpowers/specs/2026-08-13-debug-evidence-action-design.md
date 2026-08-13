@@ -181,7 +181,7 @@ no token byte-sequence and that the upload path block never references
 |---|---|
 | start failure (spawn error, ready timeout, port busy) | fail, infra-error message; wrapped command never runs |
 | wrapped command non-zero, `fail-on-command-failure: true` | fail: `command exited <code>` |
-| wrapped command non-zero, `fail-on-command-failure: false` | succeed; exit code in output + summary |
+| wrapped command non-zero, `fail-on-command-failure: false` | succeed; exit code in the `command-exit-code` output and visible in the step log (the wrapped command runs with inherited stdio). *(Amended after Task 5 spec review: the summary carries evidence only — `report.md` stays a deterministic render of the session, and the exit code's surfaces are the output and the log.)* |
 | evidence capture/report failure | fail (evidence integrity is the product; fail-closed) |
 | collector died before capture | fail with diagnostic (partial evidence still staged if readable) |
 | teardown failure after otherwise-green run | fail with diagnostic (leaked process on self-hosted is a real defect) |
