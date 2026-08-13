@@ -16,7 +16,8 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { probeLaunchToken, probeReadyCollector, probeServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 
 const STATE_FILE = 'action-state.json';
 const EVIDENCE_SUBDIR = 'debug-evidence-files';
@@ -735,26 +736,67 @@ const defaultSpawnReport = (args) => spawnSync(process.execPath, [REPORT_CLI, ..
   maxBuffer: 64 * 1024 * 1024,
 });
 
+// A renderer that exited 0 has not thereby produced a report. Its stdout is
+// what report.json and the event-count output are made of, so it is parsed
+// and shape-checked BEFORE either is committed: a status-0 child that printed
+// truncated JSON, a report from some future schema, or a nonsense event count
+// would otherwise be published as authoritative evidence, and the old
+// `catch {}` around the count turned exactly that into a silently empty
+// output (Codex T5 #2). Returns the validated report, or null.
+const parseRenderedReport = (text) => {
+  let report;
+  try {
+    report = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!report || typeof report !== 'object' || Array.isArray(report) || report.schema !== 1) return null;
+  const events = report.session?.events;
+  return Number.isInteger(events) && events >= 0 ? report : null;
+};
+
+// Ceiling on the authoritative read. A collector that accepts the connection
+// and then says nothing must not hold the capture step open for the rest of
+// the job; timing out here is an evidence-integrity failure like any other.
+const LIVE_READ_TIMEOUT_MS = 5_000;
+
+// One diagnostic is one line. The values interpolated into report's stderr
+// come from a state file and from OS/collector errors quoting it, so a raw
+// newline in either would split one message into what reads as two — the same
+// discipline debug_report.js applies to its own error line.
+const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
+
 // Capture: stage the session log and both rendered surfaces into the evidence
 // child, record what actually happened, and leave every VERDICT to finish.
 //
-// Two orderings here are load-bearing:
+// Three decisions here are load-bearing:
 //
-// 1. The collector is probed, the log copied, and the renderer spawned BEFORE
-//    the lock is taken. Copying a session log and running two child processes
-//    can take seconds; the state lock's staleness threshold is 30s and its
-//    retry budget ~450ms, so a holder doing that work inside the critical
+// 1. Evidence is captured FROM THE COLLECTOR, never by pathname. The wrapped
+//    command is handed DEBUG_SESSION_ID and shares the filesystem, so it can
+//    overwrite .debug/debug-<id>.log with whatever NDJSON it likes — including
+//    hypothesis lines carrying a CONFIRMED verdict it has no credential to
+//    POST — and a copyFileSync would stage that forgery and render it as the
+//    run's official evidence (Codex T5 #1, Critical). Reading back through
+//    GET /sessions/:id/logs puts the collector's own log-identity check
+//    (dev/ino/birthtime/size vs the bytes it wrote) in the path, so a tampered
+//    log is a 409 rather than a report.
+// 2. Aliveness is proven, not observed. probeLaunchToken challenges the port
+//    occupant to demonstrate it holds the launch token; an unauthenticated
+//    /health answer only tells us SOMETHING is listening, which is exactly
+//    what a process that rebound the port would also produce.
+// 3. Probe, live read and renderer all run BEFORE the lock is taken. That
+//    work can take seconds; the state lock's staleness threshold is 30s and
+//    its retry budget ~450ms, so a holder doing it inside the critical
 //    section would make every concurrent invocation fail to acquire — and, at
 //    the tail, would itself risk being judged stale and reaped mid-flight
-//    (recorded T4 r2 requirement: no holder approaches the threshold).
-// 2. The state commit is a compare-and-set under that lock, exactly as run's
-//    is: re-read, compare nonces, and spread the CURRENT state rather than the
-//    snapshot this function opened with. A blind `{...state}` write would
-//    restore a stale pid, port and launch token over a newer invocation's and
-//    strand its live collector (Codex T4 #3/r2).
+//    (recorded T4 r2 requirement: no holder approaches the threshold). The
+//    commit is then a compare-and-set under that lock, exactly as run's is:
+//    re-read, compare nonces, and spread the CURRENT state rather than the
+//    snapshot this function opened with (Codex T4 #3/r2).
 const reportSubcommand = async ({
   outputDir, env = process.env,
-  spawnReport = defaultSpawnReport, probe = probeServer,
+  spawnReport = defaultSpawnReport,
+  probeToken = probeLaunchToken, readLive = readSessionLive,
 }) => {
   const state = readState(outputDir);
   if (!state) return 0; // start never completed; finish owns that failure
@@ -763,48 +805,80 @@ const reportSubcommand = async ({
     process.stderr.write('debug-evidence-action: report: the run step never completed; nothing to capture.\n');
     return 0; // finish fails on the missing commandExitCode
   }
-  // Liveness is RECORDED, never acted on: a collector that died mid-run still
-  // leaves a partial log worth staging, and whether that partial evidence is
-  // acceptable is finish's call, not this step's.
-  const identity = await probe(state.port, { deadlineMs: 2_000 });
-  // Positively true or nothing: an absent probe answer, a missing field, or a
-  // stranger on the port all read as "not alive", which finish treats as a
-  // failure rather than a pass.
-  const collectorAlive = identity?.ready === true;
+  // AUTHENTICATED aliveness: this is both the liveness fact finish gates on
+  // and the precondition for trusting anything the port says.
+  const collectorAlive = (await probeToken(state.port, state.launchToken)) === true;
   const evidenceDir = resolveEvidenceDir(outputDir);
   mkdirSync(evidenceDir, { recursive: true });
-  const sessionSource = path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`);
+  const sessionCopy = path.join(evidenceDir, 'session.log');
   let evidenceCopied = false;
-  try {
-    copyFileSync(sessionSource, path.join(evidenceDir, 'session.log'));
-    evidenceCopied = true;
-  } catch (error) {
-    process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
+  // Did the staged bytes come from the collector, or off a filesystem the
+  // wrapped command can write? Recorded either way, so the artifact's
+  // provenance is a fact in the state file rather than an assumption.
+  let evidenceAuthentic = false;
+  if (collectorAlive) {
+    try {
+      const entries = await readLive({
+        port: state.port,
+        token: state.launchToken,
+        sessionId: state.sessionId,
+        timeoutMs: LIVE_READ_TIMEOUT_MS,
+      });
+      // The raw lines, verbatim and in order: `raw` is the byte-for-byte text
+      // the collector served, so the staged artifact is the collector's view
+      // rather than a re-serialization of it.
+      writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
+      evidenceCopied = true;
+      evidenceAuthentic = true;
+    } catch (error) {
+      // live_read_log_replaced is the collector telling us the file it wrote
+      // is no longer the file on disk. Falling back to that file would stage
+      // precisely the forgery the check just caught, so an authenticated
+      // collector that cannot serve its own session is an evidence-integrity
+      // failure and nothing else.
+      process.stderr.write(oneLine(`debug-evidence-action: report: the collector could not serve session ${state.sessionId} (${error?.message ?? error}); the on-disk log is not a substitute for it.`) + '\n');
+    }
+  } else {
+    process.stderr.write(oneLine(`debug-evidence-action: report: nothing on port ${state.port} could prove it holds this session's launch token; staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
+    // Best effort, and labeled as such. Whatever is readable is still worth
+    // uploading for a human to look at, and finish refuses the run anyway on
+    // collectorAlive — so unverifiable bytes can be inspected but can never
+    // ride a green build.
+    try {
+      copyFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), sessionCopy);
+      evidenceCopied = true;
+    } catch (error) {
+      process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
+    }
   }
   let reportRendered = false;
   let markdownText = '';
   let eventCount = '';
   if (evidenceCopied) {
-    // Rendered from the COPY, never the live log: the original is still being
-    // appended to by a collector that outlives this step, so rendering it
-    // could read a torn tail the staged artifact does not contain.
-    const sessionCopy = path.join(evidenceDir, 'session.log');
+    // Rendered from the STAGED copy, never from the project's log: the
+    // artifact and the report a reader compares it against must be the same
+    // bytes, and on the authenticated path those bytes only exist here.
     const markdown = spawnReport([sessionCopy, '--format=md']);
     const json = spawnReport([sessionCopy, '--format=json']);
-    if (markdown.status === 0 && json.status === 0) {
-      writeFileSync(path.join(evidenceDir, 'report.md'), markdown.stdout);
-      writeFileSync(path.join(evidenceDir, 'report.json'), json.stdout);
-      reportRendered = true;
-      markdownText = markdown.stdout;
-      try { eventCount = String(JSON.parse(json.stdout).session.events); } catch { /* the count is a convenience, not the evidence */ }
-    } else {
+    if (markdown.status !== 0 || json.status !== 0) {
       process.stderr.write(`debug-evidence-action: report: renderer failed (md ${markdown.status}, json ${json.status}).\n`);
+    } else {
+      const rendered = parseRenderedReport(json.stdout);
+      if (rendered === null) {
+        process.stderr.write('debug-evidence-action: report: the renderer exited 0 but did not print a schema-1 report; refusing to publish it.\n');
+      } else {
+        writeFileSync(path.join(evidenceDir, 'report.md'), markdown.stdout);
+        writeFileSync(path.join(evidenceDir, 'report.json'), json.stdout);
+        reportRendered = true;
+        markdownText = markdown.stdout;
+        eventCount = String(rendered.session.events);
+      }
     }
   }
   const committed = await withStateLock(outputDir, () => {
     const current = readState(outputDir);
     if (!current || current.nonce !== state.nonce) return false;
-    writeState(outputDir, { ...current, collectorAlive, evidenceCopied, reportRendered });
+    writeState(outputDir, { ...current, collectorAlive, evidenceAuthentic, evidenceCopied, reportRendered });
     return true;
   });
   if (!committed) {
@@ -850,6 +924,16 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
   }
   if (state.evidenceCopied !== true || state.reportRendered !== true) {
     process.stderr.write('debug-evidence-action: finish: evidence capture or report rendering failed.\n');
+    return 3;
+  }
+  // Validated on EVERY run, green ones included. The toggle is read out of a
+  // state file, and a state file that carries a value validateActionInputs
+  // could never have produced is corrupt or forged — which says nothing good
+  // about the exit code sitting next to it. Deferring this check to the
+  // failure branch would let exactly that state pass as a success (Codex T5
+  // #3).
+  if (state.failOnCommandFailure !== 'true' && state.failOnCommandFailure !== 'false') {
+    process.stderr.write(`debug-evidence-action: finish: recorded fail-on-command-failure is neither 'true' nor 'false'; refusing to interpret this state.\n`);
     return 3;
   }
   if (state.commandExitCode !== 0) {

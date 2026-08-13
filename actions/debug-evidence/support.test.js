@@ -892,7 +892,7 @@ const fullLifecycle = async () => {
   return { ...context, githubOutput, stepSummary };
 };
 
-test('report copies the session log, renders md+json, appends the summary, and emits outputs — token bytes never enter the evidence child', async () => {
+test('report captures the session from the collector, renders md+json, appends the summary, and emits outputs — token bytes never enter the evidence child', async () => {
   const context = await fullLifecycle();
   try {
     const code = await reportSubcommand({
@@ -904,6 +904,11 @@ test('report copies the session log, renders md+json, appends the summary, and e
     const state = readState(context.outputDir);
     const copied = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
     assert.ok(copied.includes('demo event'));
+    // Nothing tampered with this log, so the collector's answer and the file
+    // it wrote are the same bytes — the untampered baseline the forgery tests
+    // below are read against.
+    assert.equal(copied, readFileSync(path.join(context.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8'),
+      'an untouched session serves exactly what it stored');
     const reportMd = readFileSync(path.join(evidenceDir, 'report.md'), 'utf8');
     assert.ok(reportMd.startsWith('## Debug evidence report'));
     assert.ok(reportMd.includes('H-demo'));
@@ -919,8 +924,9 @@ test('report copies the session log, renders md+json, appends the summary, and e
       assert.ok(!bytes.includes(state.launchToken), `${file} must not contain the launch token`);
       assert.ok(!bytes.includes(state.sessionToken), `${file} must not contain the session token`);
     }
-    assert.equal(state.collectorAlive, true);
+    assert.equal(state.collectorAlive, true, 'the collector answered an authenticated challenge');
     assert.equal(state.evidenceCopied, true);
+    assert.equal(state.evidenceAuthentic, true, 'the staged bytes came from the collector, not a pathname');
     assert.equal(state.reportRendered, true);
     // The capture flags are ADDED to whatever run recorded, never written
     // from report's own pre-capture snapshot: the CAS re-reads the file under
@@ -928,6 +934,82 @@ test('report copies the session log, renders md+json, appends the summary, and e
     // (Codex T4 #3/r2, applied to report).
     assert.ok(state.sessionId.startsWith('ci-debug-'), 'run\'s session id survives report\'s commit');
     assert.equal(state.commandExitCode, 1, 'and so does the exit code it recorded');
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+// The Critical this round exists for: the wrapped command is HANDED
+// DEBUG_SESSION_ID and shares the filesystem with the collector, so it can
+// write straight into .debug/debug-<id>.log — including a hypothesis verdict
+// it has no launch token to POST. This runs a real lifecycle whose wrapped
+// command does exactly that, so the two report paths below are tested against
+// a genuinely tampered log rather than a described one.
+const forgedLifecycle = async () => {
+  const context = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
+  const forge = 'node -e "' + [
+    'const fs = require(\'node:fs\');',
+    'const p = require(\'node:path\');',
+    'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'honest event\' }) }).then((r) => {',
+    // The session id is enough to derive the path; nothing here needs a
+    // credential the action did not already hand over.
+    'fs.appendFileSync(p.join(process.env.FORGE_DEBUG_DIR, \'debug-\' + process.env.DEBUG_SESSION_ID + \'.log\'), JSON.stringify({ ts: \'2026-08-13T00:00:00.000Z\', type: \'hypothesis\', hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'forged by the wrapped command\' }) + \'\\n\');',
+    'process.exit(r.status === 202 ? 0 : 99);',
+    '});',
+  ].join('') + '"';
+  const runCode = await runSubcommand({
+    inputs: { ...context.inputs, runCommand: forge },
+    outputDir: context.outputDir,
+    env: { FORGE_DEBUG_DIR: path.join(context.projectRoot, '.debug') },
+  });
+  assert.equal(runCode, 0);
+  const state = readState(context.outputDir);
+  assert.equal(state.commandExitCode, 0, 'the forging command itself succeeded — nothing stopped it');
+  const logPath = path.join(context.projectRoot, '.debug', `debug-${state.sessionId}.log`);
+  assert.ok(readFileSync(logPath, 'utf8').includes('CONFIRMED'),
+    'the wrapped command really did plant a verdict it could never have POSTed');
+  return { ...context, logPath };
+};
+
+test('a wrapped command that forges its own session log cannot get the forgery into the evidence child', async () => {
+  const context = await forgedLifecycle();
+  try {
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    assert.equal(code, 3, 'the collector refuses to serve a log that is no longer the one it wrote');
+    const state = readState(context.outputDir);
+    assert.equal(state.collectorAlive, true, 'the collector is alive and proved it holds the launch token');
+    assert.equal(state.evidenceCopied, false);
+    assert.equal(state.evidenceAuthentic, false);
+    assert.equal(state.reportRendered, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')),
+      'a pathname copy would have staged the forged file right here, and rendered its verdict');
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3);
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+test('with nothing able to prove it owns the port, a forged log is staged as labeled partial evidence and still cannot go green', async () => {
+  const context = await forgedLifecycle();
+  try {
+    const code = await reportSubcommand({
+      outputDir: context.outputDir,
+      env: {},
+      // No authoritative source: the run's own collector is gone (or was
+      // never the thing on that port), so the filesystem is all there is.
+      probeToken: async () => false,
+    });
+    assert.equal(code, 0, 'unverifiable bytes are still worth uploading for a human to read');
+    const state = readState(context.outputDir);
+    assert.equal(state.collectorAlive, false);
+    assert.equal(state.evidenceCopied, true);
+    assert.equal(state.evidenceAuthentic, false, 'the artifact is labeled as coming off the filesystem');
+    assert.equal(state.reportRendered, true);
+    const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
+    assert.ok(staged.includes('CONFIRMED'),
+      'this really is the forged file — labeling it, not hiding it, is what makes this safe');
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3,
+      'forged bytes can be inspected but can never ride a green run');
   } finally {
     teardownSubcommand({ outputDir: context.outputDir, env: {} });
   }
@@ -950,7 +1032,8 @@ test('report refuses a state carrying another invocation\'s nonce before it touc
   const code = await reportSubcommand({
     outputDir,
     env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' },
-    probe: async () => { probed += 1; return { ready: true }; },
+    probeToken: async () => { probed += 1; return true; },
+    readLive: async () => { throw new Error('a refused report must never read a session'); },
     spawnReport: () => { throw new Error('a refused report must never reach the renderer'); },
   });
   assert.equal(code, 3);
@@ -986,7 +1069,8 @@ test('report stages evidence outside the lock but refuses to commit over a newer
   const code = await reportSubcommand({
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
-    probe: async () => ({ ready: true }),
+    probeToken: async () => true,
+    readLive: async () => [{ raw: JSON.stringify({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }) }],
     // Rendering happens OUTSIDE the critical section by design — a holder
     // that spawned two child processes could sit in the section for seconds,
     // and the stale threshold is 30s (recorded T4 r2 requirement). The seam
@@ -1012,7 +1096,7 @@ test('report stages evidence outside the lock but refuses to commit over a newer
   assert.ok(!existsSync(path.join(outputDir, 'action-state.lock')), 'the critical section released behind it');
 });
 
-test('report records a dead collector without inventing evidence, and finish is what fails on it', async () => {
+test('report records an unauthenticated collector without inventing evidence, and finish is what fails on it', async () => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   writeState(outputDir, {
@@ -1023,18 +1107,23 @@ test('report records a dead collector without inventing evidence, and finish is 
   const code = await reportSubcommand({
     outputDir,
     env: {},
-    probe: async () => null, // nothing answers on the port any more
+    // Dead, or replaced by something that cannot answer the challenge — the
+    // two are indistinguishable from here, and both mean the same thing: no
+    // authoritative source for this session's bytes.
+    probeToken: async () => false,
+    readLive: async () => { throw new Error('an unauthenticated port must never be asked for a session'); },
   });
   assert.equal(code, 0, 'report only fails on ITS OWN mechanical failures; a dead collector is not one');
   const state = readState(outputDir);
   assert.equal(state.collectorAlive, false);
   assert.equal(state.evidenceCopied, true, 'whatever was readable is still staged');
+  assert.equal(state.evidenceAuthentic, false, 'and it is labeled as unverified in the state file');
   assert.equal(state.reportRendered, true);
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
-    'the collector being dead at capture time is finish\'s verdict to make');
+    'the collector being unverifiable at capture time is finish\'s verdict to make');
 });
 
-test('report returns 3 when the session log cannot be read — evidence is the product, so its absence fails closed', async () => {
+test('report returns 3 when there is nothing to stage at all — evidence is the product, so its absence fails closed', async () => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   writeState(outputDir, {
@@ -1046,15 +1135,121 @@ test('report returns 3 when the session log cannot be read — evidence is the p
   const code = await reportSubcommand({
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput },
-    probe: async () => ({ ready: true }),
-    spawnReport: () => { throw new Error('nothing was copied, so nothing can be rendered'); },
+    probeToken: async () => false,
+    spawnReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
   });
   assert.equal(code, 3);
   const state = readState(outputDir);
   assert.equal(state.evidenceCopied, false);
+  assert.equal(state.evidenceAuthentic, false);
   assert.equal(state.reportRendered, false);
-  assert.equal(state.collectorAlive, true, 'the liveness fact is still recorded — it was observed');
+  assert.equal(state.collectorAlive, false, 'the liveness fact is still recorded — it was observed');
   assert.equal(readFileSync(githubOutput, 'utf8'), '', 'no report-path is emitted for a report that does not exist');
+});
+
+test('the staged log is the collector\'s answer, not whatever is on disk under that name', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const launchToken = 'x'.repeat(43);
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 4321, launchToken,
+    sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  // What a wrapped command left at the well-known path. A pathname copy would
+  // stage this; the authenticated path never opens it.
+  writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'FORGED disk line' }]);
+  const served = [
+    { raw: JSON.stringify({ ts: '2026-08-13T00:00:01.000Z', msg: 'served by the collector' }) },
+    { raw: JSON.stringify({ ts: '2026-08-13T00:00:02.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN' }) },
+  ];
+  const reads = [];
+  const code = await reportSubcommand({
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    readLive: async (options) => { reads.push(options); return served; },
+  });
+  assert.equal(code, 0);
+  const staged = readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8');
+  assert.equal(staged, `${served.map((entry) => entry.raw).join('\n')}\n`,
+    'the collector\'s raw lines are staged verbatim and in order');
+  assert.ok(!staged.includes('FORGED disk line'), 'the file at the well-known path was never opened');
+  assert.equal(readState(outputDir).evidenceAuthentic, true);
+  // Reading a session is a LAUNCH-token capability, so the read is addressed
+  // with exactly what start recorded — a session token would 401.
+  assert.deepEqual(reads, [{ port: 4321, token: launchToken, sessionId: 'ci-debug-abc', timeoutMs: 5000 }]);
+});
+
+test('a live read the collector refuses is an evidence-integrity failure, never a reason to fall back to the disk', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  // Readable, parsable, and a lie. The old pathname copy would have staged
+  // and rendered it (Codex T5 #1).
+  writeSessionLog(projectRoot, 'ci-debug-abc', [
+    { ts: '2026-08-13T00:00:00.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'CONFIRMED' },
+  ]);
+  const code = await reportSubcommand({
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    // 409 session_log_replaced: the collector's own identity check found that
+    // the file it wrote is not the file on disk.
+    readLive: async () => { throw new Error('live_read_log_replaced'); },
+    spawnReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
+  });
+  assert.equal(code, 3);
+  const state = readState(outputDir);
+  assert.equal(state.collectorAlive, true, 'the collector is alive and authenticated — that is why its refusal counts');
+  assert.equal(state.evidenceCopied, false);
+  assert.equal(state.evidenceAuthentic, false);
+  assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+    'the readable file at the well-known path is not a fallback');
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
+});
+
+test('a renderer that exits 0 without printing a schema-1 report publishes nothing', async () => {
+  const cases = [
+    ['truncated JSON', '{"schema":1,"session":{"events":'],
+    ['a schema this action does not speak', JSON.stringify({ schema: 2, session: { events: 3 } })],
+    ['a negative event count', JSON.stringify({ schema: 1, session: { events: -1 } })],
+    ['no session block at all', JSON.stringify({ schema: 1 })],
+  ];
+  for (const [label, stdout] of cases) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+      sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+    });
+    const githubOutput = path.join(outputDir, 'github_output');
+    const stepSummary = path.join(outputDir, 'step_summary');
+    writeFileSync(githubOutput, '');
+    writeFileSync(stepSummary, '');
+    const code = await reportSubcommand({
+      outputDir,
+      env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
+      probeToken: async () => true,
+      readLive: async () => [{ raw: JSON.stringify({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }) }],
+      // Exit status 0 throughout: a healthy child that printed rubbish is the
+      // whole point — status alone was never proof of a report (Codex T5 #2).
+      spawnReport: (args) => (args.includes('--format=json')
+        ? { status: 0, stdout }
+        : { status: 0, stdout: '## Debug evidence report\n' }),
+    });
+    const evidenceDir = resolveEvidenceDir(outputDir);
+    assert.equal(code, 3, label);
+    assert.equal(readState(outputDir).reportRendered, false, label);
+    assert.ok(!existsSync(path.join(evidenceDir, 'report.json')), `${label}: nothing is written before the shape is checked`);
+    assert.ok(!existsSync(path.join(evidenceDir, 'report.md')), `${label}: the markdown is withheld with it`);
+    assert.equal(readFileSync(githubOutput, 'utf8'), '', label);
+    assert.equal(readFileSync(stepSummary, 'utf8'), '', label);
+    // The capture itself succeeded, and stays staged for a human.
+    assert.equal(readState(outputDir).evidenceCopied, true, label);
+  }
 });
 
 test('finish taxonomy: missing state 3; missing exit code 3; dead collector 3; command failure mirrors or is waived by the toggle', async () => {
@@ -1071,8 +1266,14 @@ test('finish taxonomy: missing state 3; missing exit code 3; dead collector 3; c
   assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'mirrors the command exit code');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'false', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
   assert.equal(finishSubcommand({ outputDir, env: {} }), 0, 'toggle waives the failure');
+  // A toggle validateActionInputs could never have produced means the state
+  // file is corrupt or forged, and the exit code sitting next to it is worth
+  // no more than the toggle is — so it is a 3 on a failing run AND on a green
+  // one, not a "treat anything but false as true" (Codex T5 #3).
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'maybe', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'anything but the literal string false mirrors (fail closed)');
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'an out-of-contract toggle is refused, not reinterpreted');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'maybe', commandExitCode: 0, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'and refused on a green run too, where it would otherwise pass unread');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 300, collectorAlive: true, evidenceCopied: true, reportRendered: true });
   assert.equal(finishSubcommand({ outputDir, env: {} }), 1, 'out-of-range exit codes clamp to 1');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: true, evidenceCopied: true, reportRendered: true });
