@@ -174,10 +174,18 @@ test('escapeMarkdownText escapes markdown punctuation, box-drawing pipes, and co
 test('escapeMarkdownText output is byte-identical to debug_diff\'s previous private escapeText for a hostile sample', () => {
   const { escapeMarkdownText } = require('./debug_evidence');
   const hostile = '│ **bold** [link](x) <img> & `tick` \n end';
-  const expected = require('./debug_evidence').escapeEvidenceText(hostile)
-    .replaceAll('│', '¦')
-    .replace(/[*_`\[\]()!<>&]/g, '\\$&');
-  assert.equal(escapeMarkdownText(hostile), expected);
+  // Golden bytes: the exact output debug_diff's private escapeText produced
+  // for this sample before the move — hardcoded, never recomputed from the
+  // same building blocks, so a change to the transform fails HERE.
+  assert.equal(escapeMarkdownText(hostile), '¦ \\*\\*bold\\*\\* \\[link\\]\\(x\\) \\<img\\> \\& \\`tick\\` \\n\\u2028end');
+});
+
+test('escapeMarkdownText pins exact bytes for empty, doubled pipes, a pre-escaped backslash, and an astral pair', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  assert.equal(escapeMarkdownText(''), '');
+  assert.equal(escapeMarkdownText('││'), '¦¦');
+  assert.equal(escapeMarkdownText('\\*'), '\\\\\\*');
+  assert.equal(escapeMarkdownText('\u{1F600}*'), '\u{1F600}\\*');
 });
 
 test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {
