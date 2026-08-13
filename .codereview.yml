@@ -98,6 +98,17 @@ pre_merge_checks:
       walks the payload tree without following symlinks, fails closed on
       missing entries, scans touched files for public-safety patterns, and
       runs node --check on every JavaScript file.
+      (The public-safety and syntax scans cover ALL tracked repository files
+      via `git ls-files`, not just PR-touched files — every shipped path is
+      vetted every run.)
+      It also enforces workflow hygiene: every `uses:` in
+      .github/workflows/*.yml and *.yaml, and in ANY tracked action.yml /
+      action.yaml (discovered via `git ls-files` at any path, not only under
+      actions/** or .github/actions/**), is pinned to a 40-hex commit SHA or is
+      a local ./path reference, and every workflow declares a top-level
+      `permissions:` block. Scanning action metadata at every tracked path — not
+      just the conventional roots — prevents an unpinned remote `uses:` from
+      hiding under ci/, tools/, or any other directory.
     mode: error
     run: npm run validate
     instructions: |
@@ -106,6 +117,23 @@ pre_merge_checks:
       missing, a payload entry is a symlink, a JSON file does not parse, a
       payload file exceeds the size bound, a public-safety pattern matches, or
       any JavaScript file fails node --check.
+      FAIL also when a workflow/action metadata file is a symlink or exceeds
+      the size bound, any `uses:` reference is not a 40-hex SHA pin or local
+      ./path, a `uses:` appears in YAML flow style (e.g. `- {uses: ...}` or
+      `steps: [{uses: ...}]`, which is rejected fail-closed because the ref
+      cannot be safely parsed without a YAML parser), or any workflow file is
+      missing a top-level `permissions:` block. Quoted-key (`- "uses": ...`)
+      and whitespace-variant block forms (`uses : ref`) ARE supported and
+      enforced like ordinary block `uses:` (must be `./...` or `@<40-hex>`).
+      The scanner also rejects, fail-closed, YAML forms that obscure the `uses`
+      key spelling — a tag (`- !!str uses: ref`), an anchor on the key
+      (`- &step uses: ref`, alone or combined with a tag), an escape-obfuscated
+      double-quoted key (`- "u\u0073es": ref`, which resolves to `uses`), and
+      the explicit mapping-key form (`- ? uses` / `: ref`). These are reported
+      as suspicious-uses violations (rewrite in clean block style or review
+      manually) because a regex cannot positively confirm the ref is pinned;
+      single-quoted escapes are not flagged (YAML single-quoted scalars have no
+      escape processing, so they cannot spell `uses` obliquely).
     issue_assessment:
       severity: error
 

@@ -215,6 +215,27 @@ let comparisonStyle = 'three-dot';
  * @returns {string}
  */
 const resolveBaseSha = (repoRoot = root) => {
+  // The closeout gate injects CLOSEOUT_RESOLVED_BASE_REF (already rev-parsed to
+  // a stable ref like origin/release/7) into engine child environments, since
+  // buildWorkflowEnvironment strips GITHUB_BASE_REF. Resolve it FIRST, before
+  // the GitHub-derived SHAs, so it takes precedence when present — the gate's
+  // resolved ref is authoritative for the PR base. If merge-base fails, fail
+  // CLOSED rather than silently falling back to an unrelated base.
+  const resolvedBaseRef = (process.env.CLOSEOUT_RESOLVED_BASE_REF || '').trim();
+  if (resolvedBaseRef) {
+    try {
+      const mb = gitScalar(['merge-base', 'HEAD', resolvedBaseRef], { cwd: repoRoot });
+      if (isUsableSha(mb)) {
+        comparisonStyle = 'three-dot';
+        return mb;
+      }
+    } catch (error) {
+      throw new Error(
+        `CLOSEOUT_RESOLVED_BASE_REF was set to "${resolvedBaseRef}" but merge-base failed: `
+        + `${error.message}. Refusing to fall back to an unrelated base for the suppression/gate scan.`,
+      );
+    }
+  }
   // Explicit operator override: default three-dot (PR-range semantics).
   if (isUsableSha(process.env.CLOSEOUT_BASE_SHA)) {
     comparisonStyle = 'three-dot';

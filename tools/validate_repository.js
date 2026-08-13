@@ -3,6 +3,7 @@
 const { readFileSync, readdirSync, lstatSync } = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { findUnpinnedUses, hasTopLevelPermissions } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 const payloadEntries = ['SKILL.md', 'agents', 'assets', 'references', 'scripts'];
@@ -108,8 +109,11 @@ const payloadFiles = payloadEntries.flatMap(walk).sort();
 // Keep this count in lockstep with the skill payload tree under scripts/,
 // agents/, assets/, references/, and SKILL.md (including new test modules).
 // 31 -> 37: evidence tools (debug_evidence/debug_viewer/debug_diff + tests).
-if (payloadFiles.length !== 37) {
-  failures.push(`Expected 37 skill payload files, found ${payloadFiles.length}`);
+// 37 -> 41: pr_closeout_retry.js + gate_retry_cli.js (workflow_run retry /
+// base-branch-drift gate re-verification, chatgpt-codex-connector PR7
+// #6YaxWe / #6YbMwY) plus their two test modules.
+if (payloadFiles.length !== 41) {
+  failures.push(`Expected 41 skill payload files, found ${payloadFiles.length}`);
 }
 
 try {
@@ -236,6 +240,69 @@ for (const file of javascriptFiles) {
   if (result.status !== 0) {
     const detail = stderr || stdout || `exit ${result.status ?? 'null'}`;
     failures.push(`JavaScript syntax failed for ${file}: ${detail}`);
+  }
+}
+
+// Workflow hygiene: every action reference is immutable (40-hex pin) and
+// every workflow declares its token scope. Shallow regex checks by design —
+// see tools/workflow_checks.js.
+const workflowFiles = safetyScanFiles.filter(
+  (name) => name.startsWith('.github/workflows/') && (name.endsWith('.yml') || name.endsWith('.yaml')),
+);
+// `.+` (not `[^/]+`): a nested action (actions/group/name/action.yml) is an
+// ordinary layout for a repo that grows a second action, and the day it
+// appears is exactly the day nobody re-reads this census (review, Task 6).
+// `.github/actions/**/action.yml` is a second conventional location for local
+// composite actions; without it, a wrapper under .github/actions/ whose own
+// `uses:` references an unpinned remote action escapes the pin check entirely
+// (the calling workflow's `uses: ./.github/actions/wrapper` is a local
+// reference, exempt by design — the wrapper's OWN uses must be checked).
+// Discover `action.yml`/`action.yaml` at ANY tracked path, not just
+// `actions/` and `.github/actions/`: a local reference like `uses: ./ci/wrapper`
+// is exempt by construction, and the wrapper's own `uses:` must be pin-checked
+// wherever it lives. Restricting to conventional roots would let an action
+// placed under `ci/` or `tools/` hide an unpinned remote `uses:`.
+const actionMetadataFiles = safetyScanFiles.filter(
+  (name) => /(?:^|\/)action\.ya?ml$/.test(name) && !name.startsWith('.github/workflows/'),
+);
+for (const file of [...workflowFiles, ...actionMetadataFiles]) {
+  // Guard against non-regular files (a tracked symlink here would otherwise be
+  // followed by readFileSync and could hang on a FIFO or read outside the
+  // repo) and oversize files, mirroring scanFileForPublicSafety's defenses.
+  // The safety scan above already records such a target as a failure; this
+  // guard ensures the hygiene loop fails deterministically instead of
+  // following the same problematic path that the safety scan refused.
+  let info;
+  try {
+    info = lstatSync(path.join(root, file));
+  } catch (error) {
+    failures.push(`Workflow hygiene target cannot be inspected: ${file}: ${error.message}`);
+    continue;
+  }
+  if (info.isSymbolicLink()) {
+    failures.push(`Workflow hygiene target must not be a symlink: ${file}`);
+    continue;
+  }
+  if (!info.isFile()) {
+    failures.push(`Workflow hygiene target is not a regular file: ${file}`);
+    continue;
+  }
+  if (info.size > MAX_PAYLOAD_FILE_BYTES) {
+    failures.push(`Workflow hygiene file exceeds validator size bound: ${file}`);
+    continue;
+  }
+  let content;
+  try {
+    content = readFileSync(path.join(root, file), 'utf8');
+  } catch (error) {
+    failures.push(`Workflow hygiene target cannot be read: ${file}: ${error.message}`);
+    continue;
+  }
+  for (const violation of findUnpinnedUses(content)) {
+    failures.push(`${file}:${violation.line} uses unpinned action reference: ${violation.ref}`);
+  }
+  if (workflowFiles.includes(file) && !hasTopLevelPermissions(content)) {
+    failures.push(`${file} is missing a top-level permissions block`);
   }
 }
 

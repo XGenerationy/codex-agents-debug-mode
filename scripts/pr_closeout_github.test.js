@@ -1,12 +1,25 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
+
+const { existsSync } = require('node:fs');
+
 const {
+  acquireDelegatedGhToken,
+  buildGhArgs,
   classifyGateAttestation,
   classifyLivePrState,
+  detectCrossWorkflowSelfExclusionCollision,
   gateAttestationMarker,
   readLiveGateAttestation,
   readLivePrState,
+  readReviewerPermissions,
+  resolveCurrentJobDisplayName,
+  resolveWorkflowRunPath,
+  revokeDelegatedGhToken,
 } = require('./pr_closeout_github');
 
 const cleanAttestation = (extra = {}) => ({
@@ -58,6 +71,28 @@ const classifyPr = (pr) => classifyLivePrState({
   expectedBaseSha: 'base123',
   gateAttestation: cleanAttestation(),
 });
+
+const ghEnvKeys = ['GITHUB_ACTIONS', 'GITHUB_REF_NAME', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_PATH', 'GITHUB_RUN_ID', 'RUNNER_NAME', 'GITHUB_WORKFLOW', 'GITHUB_JOB'];
+const ghEnvSaved = {};
+test.beforeEach(() => {
+  for (const key of ghEnvKeys) { ghEnvSaved[key] = process.env[key]; }
+  // GITHUB_RUN_ID/RUNNER_NAME are ambient when this suite runs inside this
+  // repo's own GitHub Actions CI, which would otherwise make
+  // resolveCurrentJobDisplayName's extra Jobs API call fire nondeterministically
+  // in tests whose runGh mock doesn't expect it. Clear them by default; tests
+  // that specifically exercise that path set them explicitly.
+  delete process.env.GITHUB_RUN_ID;
+  delete process.env.RUNNER_NAME;
+  // GITHUB_WORKFLOW/GITHUB_JOB are read DIRECTLY by classifyLivePrState's
+  // self-exclusion and by detectCrossWorkflowSelfExclusionCollision, so
+  // leaving them ambient let a test inherit the CI runner's own workflow and
+  // job names and silently exclude a fixture check — a test could then pass
+  // for a reason that has nothing to do with what it asserts, and would
+  // behave differently locally than in CI (CodeRabbit outside-diff).
+  delete process.env.GITHUB_WORKFLOW;
+  delete process.env.GITHUB_JOB;
+});
+test.afterEach(() => { for (const key of ghEnvKeys) { if (ghEnvSaved[key] === undefined) { delete process.env[key]; } else { process.env[key] = ghEnvSaved[key]; } } });
 
 test('accepts only an independent exact GitHub review attestation marker', () => {
   const expected = { expectedBaseSha: 'base123', expectedHeadSha: 'head123', expectedConfigDigest: 'cfg123', prAuthor: 'author' };
@@ -308,6 +343,711 @@ test('classifies failed checks as FAIL and skipped checks as BLOCKED', () => {
   assert.match(pending.evidence, /unresolved review thread/i);
 });
 
+test('excludes every self-workflow check from the rollup, including a prior completed run (CodeRabbit #6X_pwH, broadened by chatgpt-codex-connector PR7 #6YaIaU)', () => {
+  // At the moment classifyLivePrState runs INSIDE the Closeout gate job, its
+  // own check is IN_PROGRESS and cannot see its own result. The exclusion omits
+  // EVERY check matching (workflowName AND name) — not only the currently
+  // non-COMPLETED one; SIBLING jobs in the same workflow are still classified
+  // (#6X_pwH refined by #6YSx9w).
+  //
+  // #6X_pwH originally kept a prior COMPLETED run of this same job classified
+  // (a stale FAILURE "kept blocking"), written before the workflow_run retry
+  // trigger existed (#6YW9UP). That trigger specifically re-runs the gate
+  // after a run that correctly BLOCKED on a still-pending sibling check (an
+  // entirely routine outcome that GitHub Actions can only record as a job
+  // "failure" conclusion). Keeping that stale entry classified would make
+  // every retry re-derive FAIL from its own earlier blocked attempt forever —
+  // defeating the one scenario the retry exists to recover from — so a prior
+  // completed run of THIS SAME job is now excluded too (#6YaIaU).
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    // Running self (IN_PROGRESS) + a prior self FAILURE from an earlier
+    // BLOCKED attempt at this same head + legitimate external CI.
+    const priorFailure = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    // Neither self instance blocks a retry from reaching PASS on its own
+    // merits — every other signal (mergeability, review decision, unresolved
+    // threads, gate attestation, and this legitimate external CI check) is
+    // independently re-derived from live state and still fully classified.
+    assert.equal(priorFailure.status, 'PASS', 'a prior FAILED self-workflow run at this head no longer sticks — a retry can recover');
+    assert.equal(
+      priorFailure.checks.filter((c) => c.workflowName === 'Closeout gate').length,
+      0,
+      'both the IN_PROGRESS and the prior COMPLETED self-workflow checks are omitted',
+    );
+    assert.equal(priorFailure.checks.filter((c) => c.name === 'ci').length, 1, 'a genuinely unrelated check is still classified');
+
+    // Now verify the pure running-self case (no prior failure): PASS is reachable.
+    const clean = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(clean.status, 'PASS', 'with only the running self-check omitted, PASS is reachable');
+    assert.equal(
+      clean.checks.filter((c) => c.workflowName === 'Closeout gate').length,
+      0,
+      'the running self-check is omitted from the returned rollup',
+    );
+
+    // #6YSx9w: a SIBLING job in the same workflow must NOT be excluded. If the
+    // workflow runs gate + preview, and preview is still IN_PROGRESS, the gate
+    // must see preview as a blocker (not omit it). Only the gate's OWN
+    // IN_PROGRESS check (name === GITHUB_JOB) is omitted.
+    const sibling = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'preview', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(sibling.status, 'BLOCKED', 'sibling preview IN_PROGRESS still BLOCKS (not excluded by #6YSx9w)');
+    const siblingPreview = sibling.checks.find((c) => c.name === 'preview' && c.workflowName === 'Closeout gate');
+    assert.ok(siblingPreview, 'the sibling preview check is RETAINED in the rollup');
+    assert.equal(sibling.checks.filter((c) => c.name === 'gate' && c.status === 'IN_PROGRESS').length, 0,
+      'only the gate OWN IN_PROGRESS check is omitted');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
+test('a rollup that legitimately contains only this job\'s own check can still reach PASS (chatgpt-codex-connector PR7 #6Yb3lX)', () => {
+  // A consumer that installs ONLY this gate as their CI (no separate lint/
+  // test/build workflow) has a rollup that, at the moment this job classifies
+  // itself, contains nothing but this job's own (always in-progress, always
+  // self-excluded) check. Before the fix, `!checks.length` read the
+  // POST-exclusion array, so this case was indistinguishable from GitHub
+  // genuinely returning no check data at all -- the gate could never PASS
+  // standalone, forever blocked on "No live GitHub check results were
+  // returned." even though every other signal was clean.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const standalone = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(standalone.status, 'PASS', 'a self-only rollup must not permanently block a standalone installation');
+    assert.equal(standalone.checks.length, 0, 'the self check is still excluded from the returned rollup');
+
+    // A genuinely empty/malformed rollup must still fail-closed: this is NOT
+    // the same case, and the fix must not have widened it.
+    const genuinelyEmpty = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: { ...cleanPr(), statusCheckRollup: [] },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(genuinelyEmpty.status, 'BLOCKED');
+    assert.match(genuinelyEmpty.evidence, /No live GitHub check results were returned/);
+
+    const malformed = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: { ...cleanPr(), statusCheckRollup: null },
+      unresolvedThreads: [],
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      gateAttestation: cleanAttestation(),
+    });
+    assert.equal(malformed.status, 'BLOCKED');
+    assert.match(malformed.evidence, /No live GitHub check results were returned/);
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
+test('selfJobDisplayName excludes a matrixed/named job that GITHUB_JOB alone could never match (CodeRabbit PR7 #6YXkRF)', () => {
+  // GITHUB_JOB is the YAML job id ("gate"); a consumer that runs the job in
+  // a matrix gets a DISPLAYED check name like "gate (ubuntu-latest, 20)",
+  // which never equals GITHUB_JOB. Without a resolved selfJobDisplayName,
+  // self-exclusion silently no-ops and the gate can never see its own
+  // in-progress check as excluded. Passing the caller-resolved true
+  // displayed name closes that gap.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const withoutResolvedName = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+    });
+    assert.equal(withoutResolvedName.status, 'BLOCKED',
+      'GITHUB_JOB alone never matches a matrix-suffixed displayed name, so self-exclusion silently no-ops');
+
+    const withResolvedName = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: 'gate (ubuntu-latest, 20)',
+    });
+    assert.equal(withResolvedName.status, 'PASS', 'the resolved true displayed name correctly excludes the running self-check');
+
+    // #6YSx9w must still hold with a resolved name: a sibling job is never excluded.
+    const siblingStillBlocks = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'preview (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: 'gate (ubuntu-latest, 20)',
+    });
+    assert.equal(siblingStillBlocks.status, 'BLOCKED', 'a sibling job with a similarly-shaped name is still not excluded');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
+test('selfJobDisplayName === false disables self-exclusion entirely instead of falling back to GITHUB_JOB (chatgpt-codex-connector PR7 #6YbMwM)', () => {
+  // This job has NO name: override, so GITHUB_JOB ('gate') literally equals
+  // its own displayed check name — the exact scenario the finding describes.
+  // A sibling job independently ALSO displays as 'gate' (its own name:
+  // override) and has FAILED. Before this fix, resolveCurrentJobDisplayName
+  // detecting that collision returned null, classifyLivePrState fell back to
+  // `selfJobDisplayName || GITHUB_JOB || null` = 'gate', and the filter
+  // `check.name === 'gate'` matched and excluded BOTH checks — this job's own
+  // in-progress one AND the sibling's genuine failure — letting an otherwise
+  // clean PR wrongly reach PASS.
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  try {
+    process.env.GITHUB_WORKFLOW = 'Closeout gate';
+    process.env.GITHUB_JOB = 'gate';
+    const result = classifyLivePrState({
+      repository: 'owner/repo',
+      pr: {
+        ...cleanPr(),
+        statusCheckRollup: [
+          { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate' },
+          { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+        ],
+      },
+      unresolvedThreads: [], expectedHeadSha: 'head123', expectedBaseSha: 'base123', gateAttestation: cleanAttestation(),
+      selfJobDisplayName: false,
+    });
+    assert.equal(result.status, 'FAIL', 'the sibling FAILURE sharing this job\'s own name must stay visible, not be excluded alongside it');
+    assert.equal(result.checks.filter((c) => c.name === 'gate').length, 2,
+      'false must skip self-exclusion entirely — BOTH same-named checks remain in the rollup');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+  }
+});
+
+test('resolveCurrentJobDisplayName resolves the current job\'s true displayed name by matching RUNNER_NAME (CodeRabbit PR7 #6YXkRF)', async () => {
+  // --slurp wraps every page into one outer array, even when there is only
+  // one page (gh api --help: "wrap all pages ... into an outer JSON
+  // array") — the mock mirrors that shape, not a bare {jobs: [...]} object.
+  // Every entry carries a `status`, as the real Jobs API always does: the
+  // resolver requires a RECOGNISED non-completed status, so a fixture without
+  // one would not describe a response GitHub can actually return.
+  const jobsResponse = [{ jobs: [
+    { name: 'preview', runner_name: 'other-runner-1', status: 'completed' },
+    { name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner', status: 'in_progress' },
+  ] }];
+  let capturedArgs;
+  const runGh = async (args) => { capturedArgs = args; return jobsResponse; };
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+  });
+  assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'matches the job entry whose runner_name equals RUNNER_NAME');
+  assert.deepEqual(capturedArgs, ['api', 'repos/owner/repo/actions/runs/12345/jobs', '--paginate', '--slurp'],
+    'queries the Jobs API for this specific run, across all pages, wrapped so JSON.parse can handle it');
+});
+
+test('resolveCurrentJobDisplayName paginates so a runner match on a later API page is still found (CodeRabbit PR7 #6YZkoF, qodo PR7 pagination-unparsable follow-up)', async () => {
+  // The stub EMULATES the API rather than asserting which flags were sent
+  // (CodeRabbit outside-diff): it returns the later page only when the caller
+  // actually asked to paginate, and returns the raw single-page shape when it
+  // did not. The result therefore depends on real pagination behaviour, so
+  // this test fails if pagination is dropped — instead of passing merely
+  // because a flag string was present.
+  //
+  // The page shape mirrors `--paginate --slurp`: an array of separate page
+  // OBJECTS (gh api --help: "Each page is a separate JSON array or object...
+  // --slurp to wrap all pages... into an outer JSON array"), NOT one response
+  // with an already-merged jobs array. The match sits on the second page,
+  // past the API's 30-per-page default.
+  const page1 = { jobs: Array.from({ length: 30 }, (_, i) => ({ name: `filler-${i}`, runner_name: `other-runner-${i}`, status: 'completed' })) };
+  const page2 = { jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner', status: 'in_progress' }] };
+  const runGh = async (args) => {
+    const paginated = args.includes('--paginate');
+    const slurped = args.includes('--slurp');
+    if (!paginated) return page1; // only the first page is ever returned
+    // Without --slurp, gh streams concatenated documents that a single
+    // JSON.parse cannot handle — the real failure mode from qodo PR7.
+    if (!slurped) throw new SyntaxError('Unexpected non-whitespace character after JSON');
+    return [page1, page2];
+  };
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+  });
+  assert.equal(resolved, 'gate (ubuntu-latest, 20)', 'a match on the second page is still found once pages are flattened');
+});
+
+test('resolveCurrentJobDisplayName resolves uniquely when a reused self-hosted runner shares runner_name with an earlier completed job (CodeRabbit PR7 #6YZkoJ)', async () => {
+  const runGh = async () => [{ jobs: [
+    { name: 'earlier-job', runner_name: 'shared-runner', status: 'completed', conclusion: 'success' },
+    { name: 'current-job', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
+  ] }];
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'shared-runner' },
+  });
+  assert.equal(resolved, 'current-job', 'skips the earlier completed job sharing the same reused runner_name');
+});
+
+test('resolveCurrentJobDisplayName refuses to guess when multiple non-completed jobs share runner_name (CodeRabbit PR7 #6YZkoJ)', async () => {
+  const runGh = async () => [{ jobs: [
+    { name: 'queued-1', runner_name: 'shared-runner', status: 'in_progress', conclusion: null },
+    { name: 'queued-2', runner_name: 'shared-runner', status: 'queued', conclusion: null },
+  ] }];
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'shared-runner' },
+  });
+  assert.equal(resolved, null, 'an ambiguous non-completed match is not trustworthy — best-effort null, not a guess');
+});
+
+test('resolveCurrentJobDisplayName refuses a name shared with a genuinely different sibling job (chatgpt-codex-connector PR7 #6Yap8W / #6YbMwM)', async () => {
+  // Two DIFFERENT jobs (different runner_name, so uniquely resolvable on
+  // their own) happen to share the exact same displayed name. Returning
+  // that name would make classifyLivePrState's name-based self-exclusion
+  // ALSO exclude the sibling's own check entry, hiding a genuine sibling
+  // failure. The collision is visible directly in this same Jobs API
+  // response (both entries have name: 'gate').
+  //
+  // Resolves to `false`, NOT `null` (#6YbMwM): `null` tells the caller to
+  // fall back to the legacy GITHUB_JOB matching, but that fallback is EQUALLY
+  // unsafe whenever this job has no `name:` override (GITHUB_JOB then equals
+  // the very 'gate' name just found ambiguous) — `false` instead tells the
+  // caller to skip self-exclusion entirely, which classifyLivePrState's own
+  // test below verifies.
+  const runGh = async () => [{ jobs: [
+    { name: 'gate', runner_name: 'this-runner', status: 'in_progress', conclusion: null },
+    { name: 'gate', runner_name: 'other-runner', status: 'in_progress', conclusion: null },
+  ] }];
+  const resolved = await resolveCurrentJobDisplayName({
+    repository: 'owner/repo',
+    runGh,
+    env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+  });
+  assert.equal(resolved, false, 'a name shared with a different job in this run must resolve to the no-exclusion sentinel, not null');
+});
+
+test('resolveCurrentJobDisplayName is best-effort: null on missing env, API failure, or no match (CodeRabbit PR7 #6YXkRF)', async () => {
+  const alwaysCalled = { called: false };
+  const failingRunGh = async () => { alwaysCalled.called = true; throw new Error('API rate limited'); };
+
+  assert.equal(
+    await resolveCurrentJobDisplayName({ repository: 'owner/repo', runGh: failingRunGh, env: {} }),
+    null,
+    'missing GITHUB_RUN_ID/RUNNER_NAME short-circuits to null without calling the API',
+  );
+  assert.equal(alwaysCalled.called, false, 'the API must not be called when required env vars are absent');
+
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: failingRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'r' },
+    }),
+    null,
+    'an API failure (rate limit, network) falls back to null, never throws',
+  );
+
+  const noMatchRunGh = async () => [{ jobs: [{ name: 'preview', runner_name: 'someone-else' }] }];
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: noMatchRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'no job entry matches this runner falls back to null',
+  );
+
+  // A bare (unwrapped) object, as if --slurp's outer array were missing —
+  // the real gh --slurp output is always an array (per --help), so this is
+  // the "malformed" shape here.
+  const malformedRunGh = async () => ({ not: 'the expected shape' });
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: malformedRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'a malformed (non-array) response falls back to null rather than throwing',
+  );
+
+  // A well-formed page array whose page object has no `jobs` array.
+  const missingJobsRunGh = async () => [{ not: 'the expected shape' }];
+  assert.equal(
+    await resolveCurrentJobDisplayName({
+      repository: 'owner/repo', runGh: missingJobsRunGh,
+      env: { GITHUB_RUN_ID: '1', RUNNER_NAME: 'this-runner' },
+    }),
+    null,
+    'a page object with no jobs array falls back to null rather than throwing',
+  );
+});
+
+test('resolveWorkflowRunPath resolves the workflow file path from the run endpoint (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
+  const calls = [];
+  const runGh = async (args) => {
+    calls.push(args);
+    return { path: '.github/workflows/closeout-gate.yml' };
+  };
+  const path = await resolveWorkflowRunPath({ repository: 'owner/repo', runGh, repo: 'C:/repo', runId: '123' });
+  assert.equal(path, '.github/workflows/closeout-gate.yml');
+  assert.deepEqual(calls, [['api', 'repos/owner/repo/actions/runs/123']]);
+});
+
+test('resolveWorkflowRunPath is best-effort: null on missing args, API failure, or a missing path field', async () => {
+  assert.equal(await resolveWorkflowRunPath({ runGh: async () => ({ path: 'x' }), repo: 'C:/repo', runId: '1' }), null, 'missing repository short-circuits to null');
+  assert.equal(await resolveWorkflowRunPath({ repository: 'owner/repo', repo: 'C:/repo', runId: '1' }), null, 'missing runGh short-circuits to null');
+  assert.equal(await resolveWorkflowRunPath({ repository: 'owner/repo', runGh: async () => ({ path: 'x' }), repo: 'C:/repo' }), null, 'missing runId short-circuits to null');
+  assert.equal(
+    await resolveWorkflowRunPath({ repository: 'owner/repo', runGh: async () => { throw new Error('rate limited'); }, repo: 'C:/repo', runId: '1' }),
+    null,
+    'an API failure falls back to null, never throws',
+  );
+  assert.equal(
+    await resolveWorkflowRunPath({ repository: 'owner/repo', runGh: async () => ({ not: 'the expected shape' }), repo: 'C:/repo', runId: '1' }),
+    null,
+    'a response with no path field falls back to null',
+  );
+});
+
+test('detectCrossWorkflowSelfExclusionCollision returns no collision and no network calls when no other run id shares this displayed name (the common case)', async () => {
+  let calls = 0;
+  const runGh = async () => { calls += 1; return { path: 'irrelevant' }; };
+  const pr = {
+    statusCheckRollup: [
+      { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+      { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+    ],
+  };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: false, networkCallsMade: false });
+  assert.equal(calls, 0, 'no extra API call is made when every same-named check belongs to this run');
+});
+
+test('detectCrossWorkflowSelfExclusionCollision reports a collision (with network calls made) when a same-named check belongs to a different workflow file (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
+  const pr = {
+    statusCheckRollup: [
+      { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+    ],
+  };
+  const runGh = async (args) => {
+    if (args[1] === 'repos/owner/repo/actions/runs/555') return { path: '.github/workflows/some-other-gate.yml' };
+    throw new Error(`unexpected call: ${args.join(' ')}`);
+  };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: true, networkCallsMade: true });
+});
+
+test('detectCrossWorkflowSelfExclusionCollision reports no collision (but network calls made) when the other run id genuinely resolves to the same workflow file', async () => {
+  const pr = {
+    statusCheckRollup: [
+      { name: 'gate', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+    ],
+  };
+  const runGh = async () => ({ path: '.github/workflows/closeout-gate.yml' });
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: false, networkCallsMade: true });
+});
+
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true) when the other run\'s path cannot be resolved', async () => {
+  const pr = {
+    statusCheckRollup: [
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+    ],
+  };
+  const runGh = async () => { throw new Error('rate limited'); };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.equal(result.collision, true, 'an unresolvable other-run path must not be treated as safe to exclude');
+  assert.equal(result.networkCallsMade, true);
+});
+
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true, no network calls) when a name-matching check has no resolvable run id (CodeRabbit PR7 #6Yb44Sm)', async () => {
+  let calls = 0;
+  const pr = {
+    statusCheckRollup: [
+      // Matches selfWorkflowName/selfJobName but carries no detailsUrl at all
+      // — cannot be proven to be this run's own check.
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate' },
+    ],
+  };
+  const runGh = async () => { calls += 1; return { path: '.github/workflows/closeout-gate.yml' }; };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: '.github/workflows/closeout-gate.yml',
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: true, networkCallsMade: false }, 'an unidentifiable match fails safe immediately, without any request');
+  assert.equal(calls, 0);
+});
+
+test('detectCrossWorkflowSelfExclusionCollision fails safe (collision: true, no network calls) when this run\'s own path could not be resolved (cubic P1, follow-up to #6Yb44Si)', async () => {
+  let calls = 0;
+  const pr = {
+    statusCheckRollup: [
+      { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+    ],
+  };
+  const runGh = async () => { calls += 1; return { path: 'whatever' }; };
+  const result = await detectCrossWorkflowSelfExclusionCollision({
+    pr,
+    selfWorkflowName: 'Closeout gate',
+    selfJobName: 'gate',
+    selfWorkflowPath: null,
+    repository: 'owner/repo',
+    runGh,
+    repo: 'C:/repo',
+    env: { GITHUB_RUN_ID: '999' },
+  });
+  assert.deepEqual(result, { collision: true, networkCallsMade: false }, 'with no baseline to compare against, self-exclusion must not silently continue on the name match alone');
+  assert.equal(calls, 0, 'no request is made — this is an immediate fail-safe short-circuit');
+});
+
+test('readLivePrState disables self-exclusion end-to-end when a same-named check belongs to a different workflow file, letting the sibling\'s FAILURE surface (chatgpt-codex-connector PR7 #6Yb44Si)', async () => {
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  process.env.GITHUB_WORKFLOW = 'Closeout gate';
+  process.env.GITHUB_JOB = 'gate';
+  process.env.GITHUB_RUN_ID = '999';
+  process.env.RUNNER_NAME = 'this-runner';
+  try {
+    const collidingPr = {
+      ...cleanPr(),
+      statusCheckRollup: [
+        { name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+        // A DIFFERENT workflow file whose displayed workflow+job name happens
+        // to collide with this one, and whose check is a genuine FAILURE.
+        { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+      ],
+    };
+    const runGh = async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return collidingPr;
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
+        return [{ jobs: [{ name: 'gate', runner_name: 'this-runner' }] }];
+      }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999') return { path: '.github/workflows/closeout-gate.yml' };
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/555') return { path: '.github/workflows/some-other-gate.yml' };
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    };
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(result.status, 'FAIL', 'the colliding workflow\'s genuine FAILURE must surface, not be silently excluded');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
+});
+
+test('readLivePrState blocks when PR state changes during the collision check\'s own verification window (CodeRabbit PR7 #6Yb44So)', async () => {
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  process.env.GITHUB_WORKFLOW = 'Closeout gate';
+  process.env.GITHUB_JOB = 'gate';
+  process.env.GITHUB_RUN_ID = '999';
+  process.env.RUNNER_NAME = 'this-runner';
+  try {
+    const collidingPr = {
+      ...cleanPr(),
+      statusCheckRollup: [
+        { name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+        { name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE', workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/555/job/2' },
+      ],
+    };
+    // A same-shape PR whose merge state flips — simulating a live change that
+    // lands specifically during detectCrossWorkflowSelfExclusionCollision's
+    // own resolveWorkflowRunPath request, after every earlier snapshot in
+    // this function already agreed and was found stable.
+    const changedPr = { ...collidingPr, mergeStateStatus: 'DIRTY' };
+    let prCalls = 0;
+    const runGh = async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') { prCalls += 1; return prCalls <= 5 ? collidingPr : changedPr; }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
+        return [{ jobs: [{ name: 'gate', runner_name: 'this-runner' }] }];
+      }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999') return { path: '.github/workflows/closeout-gate.yml' };
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/555') return { path: '.github/workflows/some-other-gate.yml' };
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    };
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(result.status, 'BLOCKED');
+    assert.match(result.evidence, /cross-workflow collision verification window/i);
+    assert.equal(prCalls, 6, 'the collision check\'s own network call must trigger exactly one extra PR re-read');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
+});
+
 test('classifies legacy StatusContext checks from state only', () => {
   const outcomes = new Map([
     ['SUCCESS', 'PASS'],
@@ -424,47 +1164,160 @@ test('blocks when review-thread pagination repeats a cursor', async () => {
 });
 
 test('queries live PR metadata and paginates unresolved review threads', async () => {
-  const calls = [];
-  const runGh = async (args) => {
-    calls.push(args);
-    if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
-    if (args[0] === 'pr') return cleanPr();
-    if (args.includes('--paginate')) return [[approvedReview()]];
-    const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
-    if (!cursorArgument) {
+  // GITHUB_RUN_ID/RUNNER_NAME are ambient ONLY when this test itself happens
+  // to run inside a real GitHub Actions job (as it does in this repo's own
+  // CI matrix) — present there, absent on a local dev machine. Left
+  // uncontrolled, resolveCurrentJobDisplayName's conditional extra `api`
+  // call would make the exact call-count assertion below pass locally and
+  // fail in CI (or vice versa). Clear both so the call count is
+  // deterministic regardless of where the test runs.
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  delete process.env.GITHUB_RUN_ID;
+  delete process.env.RUNNER_NAME;
+  try {
+    const calls = [];
+    const runGh = async (args) => {
+      calls.push(args);
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes: [{ isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
+            pageInfo: { hasNextPage: true, endCursor: 'next-page' },
+          } } } },
+        };
+      }
       return {
         data: { repository: { pullRequest: { reviewThreads: {
-          nodes: [{ isResolved: false, isOutdated: false, path: 'src/a.ts', line: 4, comments: { nodes: [{ url: 'https://github.example/comment/1' }] } }],
-          pageInfo: { hasNextPage: true, endCursor: 'next-page' },
+          nodes: [{ isResolved: true, path: 'src/b.ts', line: 2, comments: { nodes: [] } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
         } } } },
       };
-    }
-    return {
-      data: { repository: { pullRequest: { reviewThreads: {
-        nodes: [{ isResolved: true, path: 'src/b.ts', line: 2, comments: { nodes: [] } }],
-        pageInfo: { hasNextPage: false, endCursor: null },
-      } } } },
     };
-  };
-  const result = await readLivePrState({
-    repo: 'C:/repo',
-    expectedHeadSha: 'head123',
-    expectedBaseSha: 'base123',
-    expectedConfigDigest: 'cfg123',
-    runGh,
-  });
-  assert.equal(result.status, 'BLOCKED');
-  assert.equal(result.unresolvedThreads.length, 1);
-  // Stable path: four gate-attestation snapshots (first, final, terminal,
-  // post-thread) + three review-thread walks (2 pages each with this mock) =
-  // 4 snapshots (mix of paginate + graphql) + 6 thread pages → 10 api calls.
-  assert.equal(calls.filter(([command]) => command === 'api').length, 10);
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(result.status, 'BLOCKED');
+    assert.equal(result.unresolvedThreads.length, 1);
+    // Stable path: six gate-attestation snapshots (first, final, terminal,
+    // post-thread, verified — the last re-checking PR/attestation stability
+    // across the post-thread review-thread walk's own window, chatgpt-codex-
+    // connector PR7 #Yb3lQ — and publish, which closes the mirror-image
+    // window by re-checking PR/attestation across the FINAL review-thread
+    // walk, CodeRabbit outside-diff) + four review-thread walks (2 pages each
+    // with this mock; the fourth re-checks threads across the verified
+    // snapshot's own window, CodeRabbit PR7 #6Yb44Se) = 6 snapshots + 8 thread
+    // pages → 14 api calls. Neither resolveCurrentJobDisplayName nor
+    // resolveWorkflowRunPath (CodeRabbit PR7 #6Yb44Sk) makes an additional
+    // call here: both short-circuit on the absent GITHUB_RUN_ID (cleared
+    // above), and detectCrossWorkflowSelfExclusionCollision short-circuits in
+    // turn on the resulting null selfWorkflowPath. A future change to any of
+    // these three resolvers could affect this count.
+    assert.equal(calls.filter(([command]) => command === 'api').length, 14);
+  } finally {
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
+});
+
+test('readLivePrState resolves the current job\'s displayed name via the Jobs API and reaches PASS for a matrixed self-check (CodeRabbit PR7 #6YXkRF)', async () => {
+  const savedWorkflow = process.env.GITHUB_WORKFLOW;
+  const savedJob = process.env.GITHUB_JOB;
+  const savedRunId = process.env.GITHUB_RUN_ID;
+  const savedRunnerName = process.env.RUNNER_NAME;
+  process.env.GITHUB_WORKFLOW = 'Closeout gate';
+  process.env.GITHUB_JOB = 'gate';
+  process.env.GITHUB_RUN_ID = '999';
+  process.env.RUNNER_NAME = 'this-runner';
+  try {
+    // Matrix-expanded displayed name — never equal to GITHUB_JOB ("gate")
+    // alone, so PASS is reachable here ONLY if readLivePrState actually
+    // resolved and threaded the true displayed name through.
+    const matrixedPr = {
+      ...cleanPr(),
+      statusCheckRollup: [
+        // detailsUrl identifies this as run 999's OWN check (#6Yb44Sm/#6Yb44Si)
+        // -- without it, the unidentified-run-id fail-safe would disable
+        // self-exclusion regardless of what this test actually exercises.
+        { name: 'gate (ubuntu-latest, 20)', status: 'IN_PROGRESS', conclusion: null, workflowName: 'Closeout gate', detailsUrl: 'https://github.example/owner/repo/actions/runs/999/job/1' },
+        { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI' },
+      ],
+    };
+    let jobsApiCalled = false;
+    const callOrder = [];
+    const runGh = async (args) => {
+      if (args[0] === 'repo') { callOrder.push('repo'); return { nameWithOwner: 'owner/repo' }; }
+      if (args[0] === 'pr') { callOrder.push('pr'); return matrixedPr; }
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999/jobs') {
+        jobsApiCalled = true;
+        callOrder.push('jobs');
+        // `status` is required, as the real Jobs API always supplies it: the
+        // resolver accepts only a recognised non-completed status.
+        return [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner', status: 'in_progress' }] }];
+      }
+      // resolveWorkflowRunPath's own endpoint (#6Yb44Si/#6Yb44Sr): distinct
+      // from the Jobs API call above. Its own path resolving successfully
+      // means the checked-in fail-safe (an unresolvable OWN path disables
+      // self-exclusion entirely) does not fire, letting this test still
+      // isolate what it actually means to test — the Jobs API name
+      // resolution reaching PASS.
+      if (args[0] === 'api' && args[1] === 'repos/owner/repo/actions/runs/999') {
+        return { path: '.github/workflows/closeout-gate.yml' };
+      }
+      if (args.includes('--paginate')) { callOrder.push('reviews'); return [[approvedReview()]]; }
+      callOrder.push('threads');
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    };
+    const result = await readLivePrState({
+      repo: 'C:/repo',
+      expectedHeadSha: 'head123',
+      expectedBaseSha: 'base123',
+      expectedConfigDigest: 'cfg123',
+      runGh,
+    });
+    assert.equal(jobsApiCalled, true, 'the Jobs API must actually be queried');
+    assert.equal(result.status, 'PASS', 'the resolved true displayed name lets the matrixed self-check be excluded, reaching PASS');
+    // chatgpt-codex-connector PR7 #6YaIas: the Jobs API call must happen
+    // BEFORE any PR snapshot is taken, so its own latency is covered by the
+    // SAME stability-tuple re-verification chain that protects every other
+    // network round-trip in readLivePrState — not after the terminal
+    // snapshot sequence, where a change during this call would never be
+    // rechecked.
+    assert.equal(callOrder[0], 'repo', 'repo identity is resolved first');
+    assert.equal(callOrder[1], 'jobs', 'the Jobs API is queried before any PR snapshot is taken');
+    assert.ok(callOrder.slice(2).includes('pr'), 'a PR snapshot is still taken afterward');
+  } finally {
+    if (savedWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+    else process.env.GITHUB_WORKFLOW = savedWorkflow;
+    if (savedJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = savedJob;
+    if (savedRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = savedRunId;
+    if (savedRunnerName === undefined) delete process.env.RUNNER_NAME;
+    else process.env.RUNNER_NAME = savedRunnerName;
+  }
 });
 
 test('re-reads review threads after the terminal snapshot and requires stability', async () => {
-  // Stable path does three review-thread reads: after PR/review stability,
-  // after the terminal PR+attestation snapshot, and after the post-thread
-  // PR/gate re-fetch. All three must match.
+  // Stable path does four review-thread reads: after PR/review stability,
+  // after the terminal PR+attestation snapshot, after the post-thread
+  // PR/gate re-fetch, and after the final verified PR/attestation snapshot
+  // (CodeRabbit PR7 #6Yb44Se). All four must match.
   let threadReads = 0;
   const result = await readLivePrState({
     repo: 'C:/repo',
@@ -493,7 +1346,7 @@ test('re-reads review threads after the terminal snapshot and requires stability
       };
     },
   });
-  assert.equal(threadReads, 3, 'stable path must re-read review threads after terminal and post-thread snapshots');
+  assert.equal(threadReads, 4, 'stable path must re-read review threads after terminal, post-thread, and verified snapshots');
   assert.equal(result.unresolvedThreads.length, 1);
 });
 
@@ -540,6 +1393,56 @@ test('blocks when review threads change during the post-thread verification wind
   assert.match(result.evidence, /threads changed during post-thread/i);
   assert.equal(result.unresolvedThreads.length, 1);
   assert.equal(threadReads, 3);
+});
+
+test('blocks when review threads change during the final verified PR/attestation window (CodeRabbit PR7 #6Yb44Se)', async () => {
+  // postThreadUnresolvedThreads (the third walk) was fetched BEFORE
+  // verifiedPr/verifiedGateSnapshot -- a thread reopened during either of
+  // those two requests must still be caught by a FOURTH walk, not
+  // classified away using the now-stale third walk's empty result.
+  let threadReads = 0;
+  const openThread = {
+    isResolved: false,
+    isOutdated: false,
+    path: 'src/a.ts',
+    line: 4,
+    comments: { nodes: [{ url: 'https://github.example/comment/1' }] },
+  };
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview()]];
+      const cursorArgument = args.find((value) => String(value).startsWith('cursor='));
+      if (!cursorArgument) {
+        threadReads += 1;
+        // First three walks agree (empty). Fourth (verified) surfaces a new
+        // unresolved thread opened during the verifiedPr/verifiedGateSnapshot
+        // window.
+        const nodes = threadReads >= 4 ? [openThread] : [];
+        return {
+          data: { repository: { pullRequest: { reviewThreads: {
+            nodes,
+            pageInfo: { hasNextPage: false, endCursor: null },
+          } } } },
+        };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /threads changed during the final PR\/attestation/i);
+  assert.equal(result.unresolvedThreads.length, 1);
+  assert.equal(threadReads, 4);
 });
 
 test('blocks when the PR head changes during live verification', async () => {
@@ -671,6 +1574,41 @@ test('blocks when a reviewer permission downgrades from write to read between st
   assert.match(result.evidence, /changed during verification/i);
 });
 
+test('blocks when a reviewer permission is revoked during the final post-thread request window (chatgpt-codex-connector PR7 #Yb3lQ)', async () => {
+  // The first four gate-attestation snapshots (first, final, terminal, post-
+  // thread) all agree — only the fifth (verified, taken after the LAST
+  // paginated thread request) sees the revoked permission. This isolates the
+  // new round added for this finding: without it, nothing re-checks
+  // attestation stability across postThreadUnresolvedThreads's own network
+  // window, so a revocation timed to land exactly there would attest a stale
+  // PASS forever (no workflow event exists to ever invalidate it).
+  let permissionReads = 0;
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') return cleanPr();
+      if (args.includes('--paginate')) return [[approvedReview({ author_association: 'CONTRIBUTOR' })]];
+      if (args[1]?.endsWith('/permission')) {
+        permissionReads += 1;
+        return { permission: permissionReads <= 4 ? 'write' : 'read' };
+      }
+      return {
+        data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } },
+      };
+    },
+  });
+  assert.equal(permissionReads, 5, 'all five gate-attestation snapshots must fetch permissions independently');
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /final thread-request verification window/i);
+});
+
 test('reads the independent attestation from paginated GitHub review data', async () => {
   const result = await readLiveGateAttestation({
     repo: 'C:/repo',
@@ -685,6 +1623,31 @@ test('reads the independent attestation from paginated GitHub review data', asyn
   });
   assert.equal(result.status, 'PASS');
   assert.equal(result.reviewer, 'reviewer');
+});
+
+test('readLiveGateAttestation blocks when the PR head changes while reading reviews and reviewer permissions (chatgpt-codex-connector PR7 #6Yb44Ss)', async () => {
+  let prCalls = 0;
+  const result = await readLiveGateAttestation({
+    repo: 'C:/repo',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+      if (args[0] === 'pr') {
+        prCalls += 1;
+        // First call (the head/base admission check) sees the expected head;
+        // the SECOND call (the new post-attestation revalidation) simulates a
+        // push landing while the paginated reviews/permissions requests were
+        // in flight.
+        return prCalls === 1 ? cleanPr() : { ...cleanPr(), headRefOid: 'head456' };
+      }
+      return [[approvedReview()]];
+    },
+  });
+  assert.equal(result.status, 'BLOCKED');
+  assert.match(result.evidence, /no longer current/i);
+  assert.equal(prCalls, 2, 'the revalidation must be a real second PR read, not reuse of the first');
 });
 
 test('returns BLOCKED instead of inventing live evidence when GitHub is unavailable', async () => {
@@ -725,4 +1688,684 @@ test('snapshot-mismatch BLOCKED attestations carry no unavailable reason', async
   });
   assert.equal(result.status, 'BLOCKED');
   assert.equal(result.reason, undefined);
+});
+
+test('buildGhArgs injects PR number and --repo for pr view under GITHUB_ACTIONS', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REF_NAME = '7/merge';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['pr', 'view', '7', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+});
+
+test('buildGhArgs passes through when GITHUB_ACTIONS is not set', () => {
+  delete process.env.GITHUB_ACTIONS;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs passes through when GITHUB_REPOSITORY is missing', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  delete process.env.GITHUB_REPOSITORY;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs passes through when --repo is already present', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['pr', 'view', '--repo', 'foo/bar'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs normalizes repo view even when --repo is supplied (CodeRabbit outside-diff)', () => {
+  // `gh repo view` takes its repository POSITIONALLY and rejects --repo as an
+  // unknown flag. The generic `--repo` passthrough used to short-circuit
+  // before the repo view branch, producing a command that always fails.
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  try {
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo', 'other/repo']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode'],
+      'a supplied --repo pair must be dropped in favour of the positional form',
+    );
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo', 'other/repo', '--json', 'nameWithOwner']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner'],
+      'flags after the dropped --repo pair must be preserved',
+    );
+    // The equals spelling is a SINGLE token, so the two-token skip above does
+    // not catch it; it must be dropped on its own (CodeRabbit #6YvCO6).
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo=other/repo']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode'],
+      '--repo=<value> must be dropped too, not just --repo <value>',
+    );
+    assert.deepStrictEqual(
+      buildGhArgs(['repo', 'view', '--repo=other/repo', '--json', 'nameWithOwner']),
+      ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner'],
+      'flags after a dropped --repo=<value> token must be preserved',
+    );
+    // pr view keeps its existing passthrough behaviour when --repo is present.
+    const prArgs = ['pr', 'view', '--repo', 'other/repo', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(prArgs), prArgs, 'pr view with an explicit --repo is unchanged');
+  } finally {
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+  }
+});
+
+test('buildGhArgs injects repository positionally for repo view under GITHUB_ACTIONS', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['repo', 'view'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['repo', 'view', 'XGenerationy/codex-agents-debug-mode']);
+});
+
+test('buildGhArgs injects repository positionally before flags for repo view --json', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  const args = ['repo', 'view', '--json', 'nameWithOwner'];
+  const result = buildGhArgs(args);
+  assert.deepStrictEqual(result, ['repo', 'view', 'XGenerationy/codex-agents-debug-mode', '--json', 'nameWithOwner']);
+});
+
+test('buildGhArgs pr view passes through when PR number is unresolvable', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REF_NAME = 'feat/closeout-action';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_EVENT_PATH;
+  const args = ['pr', 'view', '--json', 'number'];
+  const result = buildGhArgs(args);
+  assert.strictEqual(result, args);
+});
+
+test('buildGhArgs pr view falls back to GITHUB_EVENT_PATH for PR number', () => {
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-'));
+  try {
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ pull_request: { number: 42 } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    const result = buildGhArgs(args);
+    assert.deepStrictEqual(result, ['pr', 'view', '42', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildGhArgs pr view falls back to workflow_run.pull_requests[0].number for a same-repo PR (CodeRabbit PR7 #6YW9UP)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-'));
+  try {
+    // workflow_run events carry no top-level pull_request — only
+    // workflow_run.pull_requests[0], populated for a same-repo PR.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [{ number: 42 }] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const result = buildGhArgs(['pr', 'view', '--json', 'number']);
+    assert.deepStrictEqual(result, ['pr', 'view', '42', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view has no PR number for a fork PR via workflow_run (empty pull_requests array)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-fork-'));
+  try {
+    // GitHub does not populate workflow_run.pull_requests for fork PRs.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    // No PR number resolvable: buildGhArgs passes the args through unchanged.
+    assert.deepStrictEqual(buildGhArgs(args), args);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view fails closed when workflow_run reports more than one associated PR (CodeRabbit PR7 #6YZkn9)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-workflow-run-multi-'));
+  try {
+    // GitHub documents workflow_run.pull_requests as an array that can carry
+    // more than one entry. Picking [0] unconditionally risks validating the
+    // wrong PR, so this must fail closed to no resolvable number rather than
+    // guess (CodeRabbit PR7 #6YZkn9).
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ workflow_run: { pull_requests: [{ number: 42 }, { number: 43 }] } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(args), args, 'an ambiguous multi-PR payload must not be trusted for either number');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view falls back to a workflow_dispatch pr-number input (chatgpt-codex-connector PR7 #6Yd4Qs)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-'));
+  try {
+    // workflow_dispatch carries neither pull_request nor workflow_run — only
+    // the declared inputs, keyed by their hyphenated YAML name.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': '99' } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const result = buildGhArgs(['pr', 'view', '--json', 'number']);
+    assert.deepStrictEqual(result, ['pr', 'view', '99', '--json', 'number', '--repo', 'XGenerationy/codex-agents-debug-mode']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view rejects a non-decimal workflow_dispatch pr-number (CodeRabbit PR7 #6YqAg0)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-strict-'));
+  try {
+    // A workflow_dispatch input is free-typed text. Bare Number() would
+    // resolve each of these to a DIFFERENT PR than the operator named, so a
+    // malformed value must fail closed to no resolvable number instead.
+    // '0' is digit-only, so it passes the /^\d+$/ shape check and is rejected
+    // only by the `> 0` guard — including it here pins that guard, which a
+    // regex-only regression would otherwise silently drop (CodeRabbit PR7
+    // #6Ys0fO). PR numbers start at 1.
+    for (const bogus of ['0', '00', '1e2', '0x2a', ' 7 ', '7.0', '-7', '+7', '7abc', 'abc', '9007199254740993']) {
+      writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': bogus } }));
+      process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+      const args = ['pr', 'view', '--json', 'number'];
+      assert.deepStrictEqual(buildGhArgs(args), args, `pr-number ${JSON.stringify(bogus)} must not resolve to a PR`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('buildGhArgs pr view ignores an empty/absent workflow_dispatch pr-number input', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'XGenerationy/codex-agents-debug-mode';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-dispatch-pr-number-empty-'));
+  try {
+    // The workflow declares pr-number with default: "" — an operator who
+    // leaves it blank must not accidentally resolve to PR "0" or similar.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ inputs: { 'pr-number': '' } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    const args = ['pr', 'view', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(args), args);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('readReviewerPermissions resolves unique reviewers with bounded concurrency and dedup', async () => {
+  // GitHub's collaborators/permission endpoint is per-user, so the prior loop
+  // awaited one gh api call per reviewer sequentially (N+1). The lookup now
+  // resolves the unique reviewer set with bounded concurrency. This injects a
+  // runGh that records every call and tracks the maximum number in flight, then
+  // asserts: every distinct non-authoritative reviewer is queried exactly once
+  // (dedup), authoritative associations are skipped, and concurrency is capped.
+  const marker = gateAttestationMarker({ baseSha: 'base123', headSha: 'head123', configDigest: 'cfg123' });
+  const reviews = [
+    approvedReview({ user: { login: 'alice' }, author_association: 'CONTRIBUTOR', body: marker }),
+    // duplicate reviewer — must be queried once, not twice
+    approvedReview({ user: { login: 'alice' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'bob' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'carol' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'dave' }, author_association: 'CONTRIBUTOR', body: marker }),
+    approvedReview({ user: { login: 'eve' }, author_association: 'CONTRIBUTOR', body: marker }),
+    // OWNER association is authoritative — no permission lookup needed
+    approvedReview({ user: { login: 'frank' }, author_association: 'OWNER', body: marker }),
+  ];
+  const calls = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const permissions = await readReviewerPermissions({
+    repo: 'repo',
+    repository: 'owner/repo',
+    reviews,
+    prAuthor: 'pr-author',
+    expectedBaseSha: 'base123',
+    expectedHeadSha: 'head123',
+    expectedConfigDigest: 'cfg123',
+    runGh: async (args) => {
+      const reviewer = args[1].split('/').slice(-2)[0];
+      calls.push(reviewer);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      return { permission: 'write', user: { login: reviewer } };
+    },
+  });
+  // Each distinct non-authoritative reviewer queried exactly once (dedup).
+  assert.deepEqual([...calls].sort(), ['alice', 'bob', 'carol', 'dave', 'eve']);
+  // Authoritative (OWNER) frank was skipped.
+  assert.equal(permissions.has('frank'), false);
+  // Concurrency reached the configured batch cap (4): with 5 distinct eligible
+  // reviewers and a yielding runGh stub, a sequential loop (maxInFlight === 1)
+  // would reintroduce the N+1 — so assert the cap is actually exercised.
+  assert.equal(maxInFlight, 4, `lookups must run in batches of four (got maxInFlight=${maxInFlight})`);
+  // Each resolved permission is recorded.
+  assert.equal(permissions.get('alice').permission, 'write');
+});
+
+// ---------------------------------------------------------------------------
+// Off-environment workflow-token delegation (chatgpt-codex-connector PR7
+// #6Yd4Qv, P1). These prove the token-acquisition and token-revocation halves
+// of the fix that keeps GH_TOKEN out of the untrusted plan-preflight probe's
+// process ancestry.
+// ---------------------------------------------------------------------------
+
+const withTokenEnv = (overrides, run) => {
+  const keys = ['GH_TOKEN', 'GITHUB_TOKEN', 'CLOSEOUT_GH_TOKEN_FILE'];
+  const previous = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, overrides);
+  try {
+    return run();
+  } finally {
+    for (const k of keys) {
+      if (previous[k] === undefined) delete process.env[k];
+      else process.env[k] = previous[k];
+    }
+  }
+};
+
+test('acquireDelegatedGhToken reads the trimmed token from the delegation file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, '  ghs_delegatedSecret123  \n');
+    const token = withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env));
+    assert.equal(token, 'ghs_delegatedSecret123');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('acquireDelegatedGhToken defers to an environment token (backward compatible)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, 'file-token');
+    // GH_TOKEN present in env -> null (let gh inherit the env), file ignored.
+    assert.equal(
+      withTokenEnv({ GH_TOKEN: 'env-token', CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // GITHUB_TOKEN present -> also null.
+    assert.equal(
+      withTokenEnv({ GITHUB_TOKEN: 'env-token', CLOSEOUT_GH_TOKEN_FILE: file }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('acquireDelegatedGhToken returns null when no delegation file is configured', () => {
+  assert.equal(withTokenEnv({}, () => acquireDelegatedGhToken(process.env)), null);
+});
+
+test('acquireDelegatedGhToken returns null for a missing, empty, or oversize file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    // Missing.
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: join(dir, 'nope') }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // Empty / whitespace-only.
+    const empty = join(dir, 'empty');
+    writeFileSync(empty, '   \n');
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: empty }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+    // Oversize (> 64 KiB) is refused rather than read into memory.
+    const big = join(dir, 'big');
+    writeFileSync(big, 'x'.repeat(64 * 1024 + 1));
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: big }, () => acquireDelegatedGhToken(process.env)),
+      null,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Probe file-symlink privilege once, eagerly, so the test below declares its
+// skip through the `skip` OPTION instead of an in-body `t.skip()`: this
+// repo's own suppression scanner (tools/scan_touched_suppressions.js)
+// classifies a `t.skip(` call in a test file as test-weakening, and an
+// in-body skip also registers as a zero-assertion pass. Mirrors the probe
+// pattern in scripts/debug_server.test.js.
+const delegTokenLinkProbeRoot = mkdtempSync(join(tmpdir(), 'deleg-tok-cap-'));
+let delegTokenSymlinkAvailable = false;
+try {
+  const { symlinkSync: probeSymlink } = require('node:fs');
+  const probeTarget = join(delegTokenLinkProbeRoot, 'target');
+  writeFileSync(probeTarget, 'x');
+  probeSymlink(probeTarget, join(delegTokenLinkProbeRoot, 'link'), 'file');
+  delegTokenSymlinkAvailable = true;
+} catch {
+  // File symlinks need SeCreateSymbolicLinkPrivilege on Windows.
+} finally {
+  rmSync(delegTokenLinkProbeRoot, { recursive: true, force: true });
+}
+
+test('acquireDelegatedGhToken refuses to follow a symlinked delegation file', {
+  skip: !delegTokenSymlinkAvailable && 'file symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)',
+}, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  const { symlinkSync } = require('node:fs');
+  try {
+    const real = join(dir, 'real-token');
+    writeFileSync(real, 'ghs_throughSymlink');
+    const link = join(dir, 'link-token');
+    symlinkSync(real, link, 'file');
+    assert.equal(
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: link }, () => acquireDelegatedGhToken(process.env)),
+      null,
+      'a symlinked token file must be refused, not followed',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('revokeDelegatedGhToken deletes the delegation file and is idempotent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-'));
+  try {
+    const file = join(dir, 'tok');
+    writeFileSync(file, 'ghs_toBeRevoked');
+    withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file }, () => {
+      revokeDelegatedGhToken(process.env);
+      assert.equal(existsSync(file), false, 'token file must be gone after revoke');
+      // A second revoke (ENOENT) must not throw.
+      assert.doesNotThrow(() => revokeDelegatedGhToken(process.env));
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('revokeDelegatedGhToken is a no-op when no delegation file is configured', () => {
+  assert.doesNotThrow(() => withTokenEnv({}, () => revokeDelegatedGhToken(process.env)));
+});
+
+test('revokeDelegatedGhToken preserves the file when an ambient token made delegation inactive (CodeRabbit PR7 #6YrX0k)', () => {
+  // acquireDelegatedGhToken never READS the delegation file when an ambient
+  // GH_TOKEN/GITHUB_TOKEN is present, so revoke must not DELETE it either —
+  // the file is not this path's to destroy, and unlinking a caller's
+  // unrelated file would be a surprising side effect outside the documented
+  // contract.
+  for (const ambient of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+    const dir = mkdtempSync(join(tmpdir(), 'deleg-tok-ambient-'));
+    try {
+      const file = join(dir, 'tok');
+      writeFileSync(file, 'ghs_notOursToDelete');
+      withTokenEnv({ CLOSEOUT_GH_TOKEN_FILE: file, [ambient]: 'ghs_ambient' }, () => {
+        revokeDelegatedGhToken(process.env);
+      });
+      assert.equal(existsSync(file), true, `${ambient} present: the delegation file must survive revoke`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('buildGhArgs pr view treats --repo= as an explicit selector and does not add a second one (CodeRabbit outside-diff)', () => {
+  const savedActions = process.env.GITHUB_ACTIONS;
+  const savedRepository = process.env.GITHUB_REPOSITORY;
+  const savedRefName = process.env.GITHUB_REF_NAME;
+  const savedEventPath = process.env.GITHUB_EVENT_PATH;
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.GITHUB_REPOSITORY = 'owner/current';
+  delete process.env.GITHUB_REF_NAME;
+  const dir = mkdtempSync(join(tmpdir(), 'pr7-gh-repo-equals-'));
+  try {
+    // A resolvable PR number is required: without it the `pr view` branch
+    // returns early and the bug this covers cannot appear at all.
+    writeFileSync(join(dir, 'event.json'), JSON.stringify({ pull_request: { number: 7 } }));
+    process.env.GITHUB_EVENT_PATH = join(dir, 'event.json');
+    // The passthrough guard used args.includes('--repo'), which matches only
+    // the two-token spelling. `--repo=X` is a SINGLE token, so it fell through
+    // to the pr-view branch and got a SECOND repository selector appended —
+    // the call then silently targeted owner/current instead of the requested
+    // repository.
+    const equalsForm = ['pr', 'view', '--repo=other/repo', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(equalsForm), equalsForm, 'an explicit --repo=<value> must be left untouched');
+    const separatedForm = ['pr', 'view', '--repo', 'other/repo', '--json', 'number'];
+    assert.deepStrictEqual(buildGhArgs(separatedForm), separatedForm, 'an explicit --repo <value> must be left untouched');
+    // Count selectors directly, so this fails on a duplicate even if some
+    // future change alters the surrounding argument order.
+    for (const form of [equalsForm, separatedForm]) {
+      const selectors = buildGhArgs(form).filter((a) => a === '--repo' || (typeof a === 'string' && a.startsWith('--repo=')));
+      assert.equal(selectors.length, 1, `exactly one repository selector must survive for ${JSON.stringify(form)}`);
+    }
+    // The no-selector case must still receive the injected default.
+    assert.deepStrictEqual(
+      buildGhArgs(['pr', 'view', '--json', 'number']),
+      ['pr', 'view', '7', '--json', 'number', '--repo', 'owner/current'],
+      'a call with no explicit repository still gets exactly one injected selector',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (savedActions === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = savedActions;
+    if (savedRepository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = savedRepository;
+    if (savedRefName === undefined) delete process.env.GITHUB_REF_NAME; else process.env.GITHUB_REF_NAME = savedRefName;
+    if (savedEventPath === undefined) delete process.env.GITHUB_EVENT_PATH; else process.env.GITHUB_EVENT_PATH = savedEventPath;
+  }
+});
+
+test('resolveCurrentJobDisplayName rejects job records with a missing or unrecognised status (CodeRabbit outside-diff)', async () => {
+  // The predicate was "anything that is not COMPLETED", so a malformed record
+  // was treated as an active job. Resolving a name from one would hand
+  // classifyLivePrState a self-exclusion name that could drop a genuinely
+  // failing rollup check — fail-open. Unknown must resolve to null.
+  for (const status of [undefined, null, '', 'bogus', 'COMPLETED', 'completed']) {
+    const runGh = async () => [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner', status }] }];
+    const resolved = await resolveCurrentJobDisplayName({
+      repository: 'owner/repo',
+      runGh,
+      env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+    });
+    assert.equal(resolved, null, `status ${JSON.stringify(status)} must not resolve a display name`);
+  }
+  // Every recognised active status still resolves, so the allowlist has not
+  // silently narrowed the supported cases.
+  for (const status of ['queued', 'in_progress', 'waiting', 'requested', 'pending', 'IN_PROGRESS']) {
+    const runGh = async () => [{ jobs: [{ name: 'gate (ubuntu-latest, 20)', runner_name: 'this-runner', status }] }];
+    const resolved = await resolveCurrentJobDisplayName({
+      repository: 'owner/repo',
+      runGh,
+      env: { GITHUB_RUN_ID: '12345', RUNNER_NAME: 'this-runner' },
+    });
+    assert.equal(resolved, 'gate (ubuntu-latest, 20)', `status ${JSON.stringify(status)} must still resolve`);
+  }
+});
+
+test('readLivePrState blocks when a check is re-run into an identical status during a verification window (CodeRabbit outside-diff)', async () => {
+  // normalizeCheck omitted detailsUrl, so a check that was re-run and landed
+  // on the SAME status and conclusion compared as stable and the verdict was
+  // published against a snapshot describing a run that no longer existed.
+  // Everything below is byte-identical between the two PR shapes except the
+  // run id in detailsUrl, so this can only pass if run identity is part of
+  // the stability tuple.
+  const basePr = {
+    ...cleanPr(),
+    statusCheckRollup: [
+      { name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'CI', detailsUrl: 'https://github.example/owner/repo/actions/runs/111/job/1' },
+    ],
+  };
+  const rerunPr = {
+    ...basePr,
+    statusCheckRollup: [
+      { ...basePr.statusCheckRollup[0], detailsUrl: 'https://github.example/owner/repo/actions/runs/222/job/9' },
+    ],
+  };
+  let prCalls = 0;
+  const runGh = async (args) => {
+    if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+    if (args[0] === 'pr') { prCalls += 1; return prCalls <= 2 ? basePr : rerunPr; }
+    if (args.includes('--paginate')) return [[approvedReview()]];
+    return {
+      data: { repository: { pullRequest: { reviewThreads: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      } } } },
+    };
+  };
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh,
+  });
+  assert.equal(result.status, 'BLOCKED', 'a re-run behind an identical status/conclusion must not compare as stable');
+  assert.match(result.evidence, /changed during/i);
+  // Control: with no re-run at all, the same fixtures reach a verdict rather
+  // than blocking, so the assertion above is detecting the re-run and not
+  // some unrelated instability in the mock.
+  const steadyRunGh = async (args) => {
+    if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+    if (args[0] === 'pr') return basePr;
+    if (args.includes('--paginate')) return [[approvedReview()]];
+    return {
+      data: { repository: { pullRequest: { reviewThreads: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      } } } },
+    };
+  };
+  const steady = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh: steadyRunGh,
+  });
+  assert.notEqual(steady.status, 'BLOCKED', 'an unchanged rollup must still reach a verdict');
+});
+
+test('readLivePrState blocks when the attesting reviewer loses write access during the final thread walk (CodeRabbit outside-diff)', async () => {
+  // The final review-thread read is a paginated network window, and the
+  // PR/attestation snapshot classification uses was captured BEFORE it. A
+  // permission revocation landing in that window previously went unnoticed:
+  // the verdict published against an attestation the reviewer was no longer
+  // authorised to give. The publish-time re-read closes it.
+  //
+  // A REAL revocation is modelled, not an association downgrade (CodeRabbit
+  // outside-diff): the review keeps `author_association: 'CONTRIBUTOR'`
+  // throughout, so `reviewerAuthorization` must consult the collaborator
+  // permission endpoint every time, and only the publish-time snapshot sees
+  // `read`. An association downgrade would have changed the answer for a
+  // different reason and would not have exercised the permission path at all.
+  let permissionReads = 0;
+  const runGh = async (args) => {
+    if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
+    if (args[0] === 'pr') return cleanPr();
+    if (args.includes('--paginate')) return [[approvedReview({ author_association: 'CONTRIBUTOR' })]];
+    if (args[1]?.endsWith('/permission')) {
+      permissionReads += 1;
+      // Six attestation snapshots are taken on the stable path (first, final,
+      // terminal, post-thread, verified, publish). Only the LAST sees the
+      // revocation, which is what isolates the publish-time window: every
+      // earlier snapshot agrees, so no earlier guard can be what blocks.
+      return { permission: permissionReads >= 6 ? 'read' : 'write' };
+    }
+    return {
+      data: { repository: { pullRequest: { reviewThreads: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      } } } },
+    };
+  };
+  const result = await readLivePrState({
+    repo: 'C:/repo',
+    expectedHeadSha: 'head123',
+    expectedBaseSha: 'base123',
+    expectedConfigDigest: 'cfg123',
+    runGh,
+  });
+  assert.equal(permissionReads, 6, 'the permission endpoint must be re-read for every attestation snapshot, including the publish-time one');
+  assert.equal(result.status, 'BLOCKED', 'a permission revocation during the final thread walk must not be published through');
+  // Pinned to the publish-time message specifically. A loose /changed during/
+  // match would also accept the first, terminal, post-thread, verified and
+  // collision windows, so it could not show that the NEW read is what caught
+  // this — and would keep passing if the snapshot count drifted and some
+  // earlier guard started firing instead.
+  assert.equal(
+    result.evidence,
+    'Live GitHub PR or review/attestation state changed during the final review-thread verification window; rerun against a stable remote snapshot.',
+    'the publish-time guard must be the one that blocks, not an earlier window',
+  );
 });

@@ -98,6 +98,25 @@ test('rejects an unknown --mode value at process level: exit 3 with the machine-
   assert.equal(JSON.parse(result.stdout.trim()).status, 'BLOCKED');
 });
 
+test('redacts a credential embedded in a thrown error before stderr and the BLOCKED JSON', () => {
+  // The top-level catch must run redactCredentialPatterns over error.message
+  // so a credential-bearing diagnostic (a git/gh error embedding a token in a
+  // URL, or an echoed Authorization header) never reaches stderr or the
+  // machine-readable BLOCKED record. Exercised through the unknown-mode path,
+  // which throws a message containing the supplied value through the same
+  // catch block as any other init failure.
+  const cred = 'Authorization: Bearer eyJleGFtcGxlLXNlY3JldC12YWx1ZSJ9.payload.sig';
+  const result = spawnSync(process.execPath, [script, '--mode', cred], { encoding: 'utf8' });
+  assert.equal(result.status, 3);
+  // The raw credential value must not appear in either output stream.
+  assert.doesNotMatch(result.stderr, /Bearer eyJ/, 'stderr must not carry the raw bearer token');
+  assert.doesNotMatch(result.stdout, /Bearer eyJ/, 'BLOCKED JSON must not carry the raw bearer token');
+  assert.match(result.stderr, /Authorization=\[REDACTED\]/, 'stderr shows the redacted form');
+  const record = JSON.parse(result.stdout.trim());
+  assert.equal(record.status, 'BLOCKED');
+  assert.match(record.error, /Authorization=\[REDACTED\]/, 'BLOCKED JSON error field is redacted');
+});
+
 test('readCloseoutConfig parses a bounded regular config file', async () => {
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-cli-config-'));

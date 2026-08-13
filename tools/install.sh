@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Portability: tested on Linux (GNU coreutils/bash 5+) and Git Bash on Windows.
+# macOS/BSD is not tested in CI; the `--` long options are GNU conventions.
+# On macOS, `brew install coreutils` and ensure GNU tools precede BSD on PATH.
 set -euo pipefail
 
 target="both"

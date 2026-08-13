@@ -1,0 +1,221 @@
+name: PR Closeout Gate
+description: >-
+  Evidence-first PR closeout gate: strict 19-check tier or repo-defined engine
+  tier, as a plan preview or the full enforcing run. All logic lives in
+  support.js; this file is wiring only.
+
+inputs:
+  run:
+    description: "plan (read-only preview) or full (enforcing gate)"
+    default: plan
+  mode:
+    description: "strict (19-check gate) or engine (config.engineChecks)"
+    default: strict
+  base-ref:
+    description: "Live PR base ref; empty resolves via GITHUB_BASE_REF or the event payload"
+    default: ""
+  config:
+    description: "Path to a closeout config JSON"
+    default: ""
+  output-dir:
+    description: "Evidence directory (must be outside the repository)"
+    default: ""
+  node-version:
+    description: "Node.js version for the gate"
+    default: "24"
+  pr-comment:
+    description: "true to upsert a marker-tagged PR comment (needs pull-requests: write)"
+    default: "false"
+  artifact-name:
+    description: "Evidence artifact name"
+    default: closeout-evidence
+
+outputs:
+  status:
+    description: "overallStatus (full) or planStatus (plan); empty until the gate step has run"
+    value: ${{ steps.gate.outputs.status }}
+  mode:
+    description: "The gate-reported mode of the run; empty until the gate step has run"
+    value: ${{ steps.gate.outputs.mode }}
+  attestation:
+    description: "Plan runs: present | weakened | absent | unavailable; empty until the gate step has run"
+    value: ${{ steps.gate.outputs.attestation }}
+  report-path:
+    description: "Path of report.json (full) or the captured plan JSON (plan); empty until the gate step has run"
+    value: ${{ steps.gate.outputs.report-path }}
+  admission-status:
+    description: "Plan runs: PASS | FAIL | BLOCKED | unavailable. Aggregate of the admission sub-probes (attestation, cleanTree, preflight); distinguishes a matrix-resolution PASS from a fully-admissible PASS. Empty on full runs and until the gate step has run."
+    value: ${{ steps.gate.outputs.admission-status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Stage workflow token
+      # Isolate the workflow token from the untrusted plan-preflight probe
+      # (chatgpt-codex-connector PR7 #6Yd4Qv, P1). GH_TOKEN is set ONLY on this
+      # step — deliberately NOT on "Run closeout gate" below. A process's
+      # /proc/<pid>/environ is the environment captured at its OWN exec() and,
+      # where the runner's ptrace policy permits same-UID reads, is readable by
+      # any same-UID process including a descendant. If GH_TOKEN were on the
+      # gate step it would live in the exec-time environ of the gate shell, the
+      # support.js process, and the spawned gate CLI — every one an ANCESTOR of
+      # the repository-controlled preflight probe, which could read it straight
+      # out of procfs even though its own spawn env is scrubbed. So instead this
+      # separate step (which carries the token but spawns NO untrusted probe,
+      # and has fully exited before the gate step even starts, so it is never
+      # in the probe's process ancestry) writes the token to an owner-only file
+      # and hands the gate step only that file's PATH via GITHUB_ENV
+      # (CLOSEOUT_GH_TOKEN_FILE) — never the token value itself. The gate CLI
+      # reads the file solely to pass the token to the short-lived `gh` leaf
+      # process (which has no descendants, so it is not a probe ancestor) and
+      # REVOKES the file before any probe runs. If this step is skipped or
+      # fails, the gate simply runs unauthenticated (an honest "attestation
+      # unavailable" preview), never with the token back in the probe's tree.
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/support.js" stage-token
+
+    - name: Run closeout gate
+      id: gate
+      shell: bash
+      # No workflow token here by design (chatgpt-codex-connector PR7
+      # #6Yd4Qv): this step spawns the untrusted plan-preflight probe, so it
+      # must never carry the token in its exec-time environment. It receives
+      # the token off-environment via CLOSEOUT_GH_TOKEN_FILE (exported to
+      # GITHUB_ENV by "Stage workflow token" above), which the gate CLI reads
+      # only to feed the `gh` leaf and revokes before the probe.
+      #
+      # GH_TOKEN/GITHUB_TOKEN are set to the EMPTY STRING rather than merely
+      # omitted (CodeRabbit PR7 #6YrX05): a composite action's steps inherit
+      # the consuming workflow's workflow-level and job-level `env:`, so
+      # omission alone does not clear a token a caller set at either scope —
+      # it would flow straight into this step and back into the probe's
+      # ancestor environ, silently reopening the hole this split closes.
+      # Assigning empty overrides any inherited value. acquireDelegatedGhToken
+      # treats an empty GH_TOKEN as absent (falsy), so delegation still
+      # engages normally. Consumers must still not place EQUIVALENT
+      # credentials (a PAT under another name) at workflow or job scope — this
+      # action can only clear the two names it knows; see the README.
+      env:
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
+        CLOSEOUT_RUN: ${{ inputs.run }}
+        CLOSEOUT_MODE: ${{ inputs.mode }}
+        CLOSEOUT_BASE_REF: ${{ inputs.base-ref }}
+        CLOSEOUT_CONFIG: ${{ inputs.config }}
+        # CLOSEOUT_OUTPUT_DIR is always the CALLER-facing directory; every
+        # support.js subcommand derives the actual evidence location — the
+        # fixed `closeout-action-evidence` child — from it itself
+        # (resolveEvidenceDir, chatgpt-codex-connector PR7 #6Yd4Qx). Do not
+        # point this at the child: support.js would nest a second child
+        # under it and the upload globs below would miss the evidence.
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        CLOSEOUT_PR_COMMENT: ${{ inputs.pr-comment }}
+        CLOSEOUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      run: node "${{ github.action_path }}/support.js" run
+
+    - name: Upload evidence artifact
+      # runSubcommand ('run') always returns exit 0 for a legitimate gate
+      # verdict, even BLOCKED/FAIL — the job's own pass/fail is decided later,
+      # by "Apply gate verdict". The "gate" step's outcome is 'success' for
+      # EVERY legitimate verdict path (BLOCKED/FAIL/PASS all exit 0), and
+      # anything else means run() never validated inputs.output-dir at all:
+      # 'failure' means run() THREW (an invalid output-dir — e.g. inside the
+      # workspace, rejected by assertOutputOutsideWorkspace before anything
+      # is written — bad inputs, or another validation error); 'skipped'
+      # means an EARLIER step (e.g. Set up Node.js or Stage workflow token)
+      # failed, so "Run closeout gate" never executed at all (chatgpt-codex-
+      # connector PR7 #6YaIav) —
+      # `steps.gate.outcome != 'failure'` alone left this case uncaught,
+      # since 'skipped' != 'failure' too. In either non-success case,
+      # `inputs.output-dir` may resolve to a path never checked against the
+      # workspace — e.g. the repository root — so uploading it would publish
+      # the checkout (and any secrets a prior step left there) as if it were
+      # evidence. Require the gate step to have actually run and exited 0;
+      # on every legitimate verdict (including BLOCKED/FAIL) it still runs
+      # via always() (CodeRabbit #6YT0J3).
+      #
+      # `path:` enumerates this action's own well-known evidence filenames
+      # instead of the whole output-dir (chatgpt-codex-connector PR7 #6Yb3lY,
+      # P1, following the README's already-documented "future hardening"
+      # note for #6YYcNT): uploading the bare directory means a caller who
+      # points `output-dir` at an existing broad path (`${{ runner.temp }}`,
+      # `/tmp`) has EVERY file already there — including logs or credential
+      # material left by an earlier step — published as if it were this
+      # gate's own evidence. `actions/upload-artifact`'s `path:` treats a
+      # multi-line value as separate search patterns (the same convention
+      # #6Yb3lN's CR/LF rejection in support.js guards against for a
+      # caller-supplied value; here the multi-line value is ours, not
+      # caller-controlled, so it is exactly the intended use), so this now
+      # only ever globs the exact names support.js/the spawned CLI can
+      # produce. `if-no-files-found: ignore` already tolerates whichever of
+      # these a given tier does not write (e.g. plan.json on a full run).
+      #
+      # Every glob points one level BELOW the caller's output-dir, into the
+      # fixed `closeout-action-evidence` child (EVIDENCE_SUBDIR in
+      # support.js — support.test.js pins these lines to that constant):
+      # support.js writes ALL evidence there, and hands the same child to the
+      # gate CLI as its --output-dir, so the caller's own directory is never
+      # chmodded by the wrapper or the CLI (chatgpt-codex-connector PR7
+      # #6Yd4Qx). The child segment must stay a literal here — a composite's
+      # expressions cannot embed a per-invocation value, which is also why
+      # the child name is fixed rather than unique. Because all five lines
+      # share `<output-dir>/closeout-action-evidence` as their least common
+      # ancestor, the DOWNLOADED artifact layout is unchanged: plan.json/
+      # report.json/report.md/action-state.json/logs still sit at the
+      # artifact root. This also narrows the #6YYcNT residual: an unrelated
+      # tool's same-named file directly in a broad shared output-dir is no
+      # longer globbed — only files inside the action-owned child are.
+      if: ${{ always() && steps.gate.outcome == 'success' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/plan.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/report.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/report.md
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/action-state.json
+          ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}/closeout-action-evidence/logs
+        if-no-files-found: ignore
+
+    - name: Upsert PR comment
+      # steps.gate.outcome != 'skipped': when an EARLIER step (e.g. Set up
+      # Node.js or Stage workflow token) fails, "Run closeout gate" never
+      # executes at all — it never
+      # exported this invocation's CLOSEOUT_INVOCATION_NONCE to GITHUB_ENV
+      # (the very first thing it does), so commentSubcommand's own nonce
+      # check (chatgpt-codex-connector PR7 #6YaIao) treats that as "this job
+      # has no nonce" and its intentional backward-compat exemption skips the
+      # check entirely — a reused output-dir's PRE-EXISTING (unrelated,
+      # stale) action-state.json would then be accepted and posted to THIS
+      # PR as if it were this run's result (chatgpt-codex-connector PR7
+      # #6YaZ5H). 'failure' is deliberately still allowed through: when the
+      # gate step itself threw, its nonce WAS exported first, so the same
+      # nonce check correctly rejects any stale state on its own — no
+      # separate guard needed for that case.
+      if: ${{ always() && steps.gate.outcome != 'skipped' && inputs.pr-comment == 'true' }}
+      shell: bash
+      env:
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/support.js" comment
+
+    - name: Apply gate verdict
+      # Same reasoning as "Upsert PR comment" above: when the gate step never
+      # ran at all (outcome 'skipped'), finishSubcommand's nonce check has
+      # the identical backward-compat exemption and could apply a stale,
+      # unrelated verdict to this job. Skipping this step in that case does
+      # not let the job go green — GitHub Actions already marks the overall
+      # job's conclusion as failure because of the EARLIER step that failed
+      # and caused the skip, independent of what any later step does.
+      if: ${{ always() && steps.gate.outcome != 'skipped' }}
+      shell: bash
+      env:
+        CLOSEOUT_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/closeout-evidence', runner.temp) }}
+      run: node "${{ github.action_path }}/support.js" finish

@@ -281,6 +281,47 @@ test('redacts a multibyte secret split inside a UTF-8 code point', () => {
   assert.equal(output, 'token=[REDACTED] done');
 });
 
+test('live child-process output redacts an environment-independent Bearer token and PEM block end-to-end (CodeRabbit outside-diff pr_closeout_stream.js:23-69)', async () => {
+  // Neither credential below exists in any env var, so the value-based
+  // redactor cannot catch them: only the chunk-aware CREDENTIAL_PATTERNS
+  // stage on the live output path can. The child writes in several separate
+  // write() calls (the Bearer token split mid-token) so the credentials can
+  // arrive across stream chunk boundaries. Sentinels are deliberately
+  // non-token-shaped so the repo's suppression scanner stays quiet, and the
+  // fixture avoids status-signal words (error/fail/warn) so classification
+  // stays PASS.
+  const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-pattern-redact-'));
+  // The credentials are assembled at RUNTIME inside the child (split so the
+  // contiguous SENTINEL string never appears in the command source): the
+  // evidence log echoes the command text in its header, and a literal
+  // sentinel there would false-fail the "log carries no credential"
+  // assertions even though the live-output redaction worked.
+  const script = [
+    "const bearer = ['SENT', 'INEL-NOT-A-REAL-TOKEN.abc123'].join('');",
+    "const body = ['SENT', 'INELPEMBODYLINE=='].join('');",
+    "process.stdout.write('curl: Bearer ' + bearer.slice(0, 10));",
+    "process.stdout.write(bearer.slice(10) + ' acknowledged\\n');",
+    "process.stdout.write('-----BEGIN PLACEHOLDER KEY-----\\n');",
+    "process.stdout.write(body + '\\n');",
+    "process.stdout.write('-----END PLACEHOLDER KEY-----\\nend-marker\\n');",
+  ].join('');
+  const execute = createCommandExecutor({
+    repo: process.cwd(),
+    outputDir,
+    shell: process.execPath,
+    shellArgs: (command) => ['-e', command],
+  });
+  const result = await execute({ id: 'pattern-probe', command: script }, 'qualification');
+  assert.equal(result.status, 'PASS', statusDiag(result));
+  assert.doesNotMatch(result.stdout, /SENTINEL/, 'no pattern-shaped credential may reach captured stdout');
+  assert.match(result.stdout, /curl: Bearer \[REDACTED:token\] acknowledged/, 'the standalone Bearer token is pattern-redacted');
+  assert.match(result.stdout, /\[REDACTED:pem-block\]\nend-marker/, 'the PEM block is redacted whole and output resumes after it');
+  const log = await readFile(path.join(outputDir, 'logs', 'qualification.pattern-probe.attempt-001.log'), 'utf8');
+  assert.doesNotMatch(log, /SENTINEL/, 'no pattern-shaped credential may reach the evidence log');
+  assert.match(log, /\[REDACTED:token\]/, 'the evidence log carries the Bearer redaction marker');
+  assert.match(log, /\[REDACTED:pem-block\]/, 'the evidence log carries the PEM redaction marker');
+});
+
 test('command executor records timestamps, exit code, output, and a log', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-executor-'));
   const execute = createCommandExecutor({

@@ -1901,7 +1901,14 @@ const swapClaimAfterCreate = (claimFile, stagedFile) => {
       await new Promise((resolve) => setImmediate(resolve));
     }
   };
-  poll().catch(() => {});
+  // Expose the poll promise so a caller that sets `stopped = true` can AWAIT
+  // the in-flight iteration's completion before reading `state.landed`. A
+  // single `setImmediate` wait is not enough: the poller may be mid-`lstat`
+  // (or mid-`rename`) when `stopped` flips, and that pending operation can
+  // still land the swap AFTER the caller captures `swapped` — leaving the
+  // assertion to pass on a non-decisive attempt. Awaiting `done` guarantees
+  // the poller has observed `stopped` and exited its loop.
+  state.done = poll().catch(() => {});
   return state;
 };
 
@@ -1930,6 +1937,17 @@ const runClaimSwapAttempt = async (plantStaged) => {
     swap = swapClaimAfterCreate(claimFile, stagedFile);
     const result = await launched.outcome;
     const exitAt = Date.now();
+    // Stop the poller BEFORE capturing the landed state, and AWAIT its
+    // in-flight iteration, so `swapped` is the poller's final state — not a
+    // value that could flip to true between the capture here and the finally's
+    // stop. A single setImmediate is NOT enough: the poller may be mid-lstat
+    // (or mid-rename) when `stopped` flips, and that pending op can land the
+    // swap after `swapped` was captured. Awaiting `swap.done` guarantees the
+    // poller observed `stopped` and exited before we read `state.landed`.
+    // The child is dead by now (outcome resolved on exit), so the release
+    // has already run.
+    swap.stopped = true;
+    await swap.done;
     return { projectRoot, debugDir, claimFile, result, swapped: swap.landed, swapAt: swap.swapAt, exitAt, standInContent };
   } catch (error) {
     // On any throw (plantStaged failed, outcome rejected) the caller never
@@ -1944,8 +1962,12 @@ const runClaimSwapAttempt = async (plantStaged) => {
   } finally {
     // Stop the swap poller on every path; left running it would keep lstat-ing
     // a deleted claim path on every setImmediate tick for the rest of the
-    // process (CodeRabbit review).
-    if (swap) swap.stopped = true;
+    // process (CodeRabbit review). Await its completion so the in-flight
+    // iteration finishes before the test ends (Codex 3745151753).
+    if (swap) {
+      swap.stopped = true;
+      await swap.done;
+    }
     stopCli(child);
   }
 };
@@ -1969,7 +1991,30 @@ const assertReleaseRefusesSwappedClaim = async (t, plantStaged, verifyStandIn) =
         && result.exitCode === 1
         && /collector_port_not_private/.test(result.stderr);
       if (!decisive) continue;
-      await verifyStandIn(claimFile);
+      // A landed swap means the stand-in is at collector_claim, and every
+      // stand-in type is guarded by an early-return release check (oversized
+      // size, symlink type, or hard-link nlink), so the release can never
+      // unlink a landed stand-in. An ENOENT here therefore means the stand-in
+      // was deleted AFTER the swap landed — exactly the release regression
+      // this test exists to catch. Fail loudly with diagnostics; never retry
+      // a landed attempt's missing stand-in (that would mask the regression).
+      try {
+        await verifyStandIn(claimFile);
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          let stagedState = 'n/a';
+          let claimState = 'missing';
+          try { stagedState = `${(await lstat(path.join(projectRoot, '.debug', 'collector_claim.staged'))).size}B`; } catch { stagedState = 'absent'; }
+          try { const i = await lstat(claimFile); claimState = `${i.size}B link=${i.isSymbolicLink()}`; } catch { claimState = 'absent'; }
+          throw new Error(
+            `stand-in vanished after a landed swap (landed=${swapped} margin=${exitAt - swapAt}ms `
+            + `claim=${claimState} staged=${stagedState}): the release deleted the swapped-in `
+            + `claim it was supposed to refuse`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
       assert.equal(await readFile(path.join(projectRoot, 'swap-target.txt'), 'utf8'), standInContent);
       return;
     } finally {
