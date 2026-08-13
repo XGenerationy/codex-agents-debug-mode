@@ -174,6 +174,17 @@ no token byte-sequence and that the upload path block never references
    workflow declares least-privilege top-level `permissions` (`contents: read`). The
    repo validator enforces both automatically.
 6. Caps on rendered rows are announced ("…and N more"), never silent (closeout lesson).
+7. *(Added, Task 5 round 2.)* Captured evidence's hypothesis lines must equal EXACTLY
+   the set the action itself posted (none, or the single `OPEN` line from
+   `hypothesis-id`); any other hypothesis line is forged by definition — the action is
+   the only legitimate launch-token holder in the wrap-one-command model — and capture
+   refuses the evidence. Events remain attacker-authored by design. The action's own
+   wiring vars (`DEBUG_ACTION_*`) are stripped from the wrapped command's env.
+8. *(Added, Task 5 round 2.)* The collector keeps an incremental SHA-256 of every byte
+   it appends per session and verifies the on-disk content against it before serving
+   `GET /sessions/:id/logs` — a same-length in-place rewrite is refused
+   (`session_log_tampered`, 409 replaced-class), closing the gap in
+   metadata-plus-byte-count identity checking.
 
 ## Exit semantics
 

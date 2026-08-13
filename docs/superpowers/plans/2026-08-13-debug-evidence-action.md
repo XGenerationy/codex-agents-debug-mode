@@ -1738,6 +1738,60 @@ Codex verdict on `9a7c83a`: Critical ×1, Important ×2, Minor ×1. All accepted
 Fix commit message:
 `fix(action): collector-authenticated evidence capture, validated renders, strict toggle (Codex T5)`.
 
+#### Task 5 fix round 2 — Codex re-review decisions (recorded before code moves)
+
+Codex on `e6b5087`: renderer validation and strict toggle sound; residual (c) nothing
+required; but Critical ×2 + Important ×1 block approval. All accepted:
+
+1. **Launch-token theft via the state file (Critical).** `commandEnv` inherits
+   `DEBUG_ACTION_OUTPUT_DIR`; the wrapped command (same OS user — 0600 is no boundary)
+   reads `action-state.json`, takes the launch token, and posts forged verdicts through
+   the front door, which authenticated capture then blesses. Two layers:
+   (i) strip every `DEBUG_ACTION_*` key from `commandEnv` (the wiring vars are not part
+   of the injected contract; the path must not be handed over — though stripping alone
+   is insufficient since the default path is guessable);
+   (ii) THE LOAD-BEARING LAYER — evidence hypothesis-set validation in `report`: the
+   captured entries' hypothesis lines must be EXACTLY the action's own posted set —
+   empty when no `hypothesis-id` input, or precisely one line whose
+   `hypothesisId === state.hypothesisId`, `status === 'OPEN'`, and (when set)
+   `title === state.hypothesisTitle` — any other hypothesis line, wrong status, wrong
+   id, or duplicate ⇒ evidence-integrity failure: stderr, nothing staged, return 3.
+   Rationale: in the wrap-one-command model the action is the only legitimate
+   launch-token holder, so any hypothesis line it didn't post is forged BY DEFINITION;
+   events remain attacker-authored by design (they come from the instrumented
+   process). Token theft then yields nothing capture will bless.
+   Tests: the forged-verdict-via-stolen-token scenario re-run with a
+   PRODUCTION-SHAPED env (including `DEBUG_ACTION_OUTPUT_DIR`) posting a forged
+   CONFIRMED via the real `/hypothesis` endpoint with the stolen token ⇒ report 3;
+   plus hermetic pins for wrong-status/wrong-id/duplicate/unexpected lines; plus the
+   env-strip pin (wrapped command sees no `DEBUG_ACTION_*`).
+2. **Collector content digest (Critical — doc-note disposition REJECTED).** A
+   same-length in-place rewrite passes `verifyLogIdentity` (metadata + byte count, no
+   digest). Collector-side fix in `scripts/debug_server.js`: each session keeps an
+   incremental SHA-256 of every byte the collector has appended (update at append
+   time, in memory); `GET /sessions/:id/logs` (the serve path) hashes the on-disk
+   content up to `bytesWritten` and refuses on mismatch with the existing 409
+   replaced-class response (new reason string `session_log_tampered`), which
+   `readSessionLive` already surfaces as `live_read_log_replaced` (verify the
+   mapping). Implementation discipline: debug_server.js is ~2,600 lines and its test
+   file larger — TARGETED reads/edits only at the session-append and logs-serve
+   sites; append new tests to `scripts/debug_server.test.js` (in-place same-size
+   rewrite ⇒ serve refused; ordinary append/read unaffected; the identity checks
+   stay). No new files — census stays 43.
+3. **Invocation-scoped staging (Important).** After `report`'s entry guards (state +
+   nonce) and BEFORE capture: unlink the evidence child's three well-known files
+   (`session.log`, `report.md`, `report.json`; ENOENT-tolerant), so a reused
+   output-dir can never upload a previous invocation's evidence as this run's. Test:
+   pre-planted stale files are gone after a failed capture (upload would find
+   nothing).
+
+Spec amendments (same commit as this note): Security invariants gain (7) the
+hypothesis-set equality contract and (8) the collector content digest; the trust-model
+sentence about `verifyLogIdentity` strength is superseded.
+
+Fix commit message:
+`fix(action+collector): hypothesis-set evidence contract, append digests, invocation-scoped staging (Codex T5 r2)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`
