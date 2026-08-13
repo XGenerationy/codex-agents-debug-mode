@@ -157,6 +157,11 @@ const BLOCKED_CONCLUSIONS = new Set([
   'SKIPPED',
 ]);
 const PENDING_STATES = new Set(['EXPECTED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'REQUESTED', 'WAITING']);
+// The Actions jobs API's own non-terminal `status` values. Used as an
+// allowlist, never as a "not COMPLETED" complement — see
+// resolveCurrentJobDisplayName for why an unknown status must not be treated
+// as active.
+const ACTIVE_JOB_STATUSES = new Set(['IN_PROGRESS', 'PENDING', 'QUEUED', 'REQUESTED', 'WAITING']);
 // OWNER (repo owner) is authoritative by association. MEMBER only proves
 // organization membership and COLLABORATOR only proves an invitation to
 // collaborate; neither guarantees repository write access, so both must be
@@ -395,7 +400,14 @@ const buildGhArgs = (args, { repo } = {}) => {
     }
     return ['repo', 'view', repository, ...rest];
   }
-  if (args.includes('--repo')) return args;
+  // Both spellings again, for the same reason as above but the opposite
+  // outcome: here an explicit repository selector means "leave this call
+  // alone". Matching only the separated `--repo <value>` let the equals form
+  // fall through to the `pr view` branch, which then appended a SECOND
+  // selector — `gh pr view 7 --repo=other/repo --json number --repo owner/current`
+  // — so the call silently targeted a different repository than the caller
+  // asked for (CodeRabbit outside-diff follow-up to #6YvCO6).
+  if (args.some((arg) => arg === '--repo' || (typeof arg === 'string' && arg.startsWith('--repo=')))) return args;
 
   if (sub === 'pr' && action === 'view') {
     const number = readActionsPrNumber({ env: process.env });
@@ -453,6 +465,17 @@ const normalizeCheck = (value) => {
     status: status || null,
     conclusion: conclusion || null,
     workflowName: check.workflowName || null,
+    // Run identity, so capturePrStabilityTuple can tell "the same check result"
+    // from "a DIFFERENT run of the same check that happens to have landed on
+    // the same status and conclusion" (CodeRabbit outside-diff). Without it a
+    // re-run during a verification window compared as stable, and the gate
+    // classified against a snapshot that no longer described the live run.
+    // `detailsUrl` is the CheckRun spelling and `targetUrl` the legacy
+    // StatusContext one; both encode the run and job, so either is sufficient
+    // identity. This only ever makes the tuple STRICTER — an unchanged check
+    // keeps an unchanged URL within a run, so it cannot introduce spurious
+    // instability, and any difference fails closed to BLOCKED.
+    runIdentity: check.detailsUrl || check.targetUrl || null,
     classification,
   };
 };
@@ -528,8 +551,16 @@ const resolveCurrentJobDisplayName = async ({ repository, runGh, repo, env = pro
     // (CodeRabbit PR7 #6YZkoJ). Only trust a non-COMPLETED match, and only
     // when it is unique — an ambiguous or absent match resolves to null,
     // same as any other best-effort failure of this resolver.
+    // The status must be a RECOGNISED non-COMPLETED value, not merely
+    // "anything that isn't COMPLETED" (CodeRabbit outside-diff). A record with
+    // a missing or unrecognised status satisfied `!== 'COMPLETED'` and was
+    // accepted, so a malformed job entry sharing this runner's name could
+    // resolve a display name that self-exclusion then used to drop a genuinely
+    // failing rollup check — fail-OPEN. Unknown means unknown: resolve to null
+    // and let the caller fall back, same as any other failure of this
+    // best-effort resolver.
     const activeMatches = list.filter(
-      (job) => job && job.runner_name === runnerName && String(job.status || '').toUpperCase() !== 'COMPLETED',
+      (job) => job && job.runner_name === runnerName && ACTIVE_JOB_STATUSES.has(String(job.status || '').toUpperCase()),
     );
     const ownJob = activeMatches.length === 1 ? activeMatches[0] : null;
     const ownName = typeof ownJob?.name === 'string' && ownJob.name ? ownJob.name : null;
@@ -1628,6 +1659,58 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
       classifiedPr = postCollisionCheckPr;
       classifiedGateSnapshot = postCollisionCheckGateSnapshot;
       classifiedUnresolvedThreads = postCollisionCheckUnresolvedThreads;
+    }
+    // The verification sequence above ALTERNATES review-thread and
+    // PR/attestation reads so each one is bracketed by two matching reads of
+    // the OTHER resource. That invariant held everywhere except at the very
+    // end, on BOTH paths: the last review-thread read (verifiedUnresolvedThreads,
+    // or postCollisionCheckUnresolvedThreads when the collision check fired)
+    // is itself a paginated network window, and the PR/attestation snapshot
+    // classification uses was captured BEFORE it. A review submitted, a
+    // reviewer's write permission revoked, or a check re-run while that walk
+    // was in flight would leave the verdict resting on a snapshot that no
+    // longer describes the live PR — the mirror image of the #6Yb44Se window
+    // this file already closes in the other direction (CodeRabbit
+    // outside-diff).
+    //
+    // Re-read both once more, against whichever snapshot classification will
+    // actually use, and require them unchanged. Placed AFTER the collision
+    // block on purpose: that block makes its own `gh api` calls, so running
+    // this before it would leave exactly the window it exists to close. This
+    // is the last network read that feeds the verdict, so it terminates the
+    // alternation rather than opening a further one — every value
+    // classification uses has now been read twice with an identical result,
+    // and every other verification read happened between those two reads.
+    // What remains is only the unavoidable "state may change after we finish"
+    // gap, which no amount of re-reading can close.
+    const publishPr = await runGh(['pr', 'view', '--json', PR_VIEW_FIELDS], { repo });
+    const publishGateSnapshot = await readGateAttestationSnapshotForPr({
+      repo,
+      repository,
+      pr: publishPr,
+      expectedBaseSha,
+      expectedHeadSha,
+      expectedConfigDigest,
+      runGh,
+    });
+    const publishStable = stabilityTuplesMatch(
+      capturePrStabilityTuple(classifiedPr),
+      capturePrStabilityTuple(publishPr),
+    ) && stabilityTuplesMatch(
+      classifiedGateSnapshot.stabilityTuple,
+      publishGateSnapshot.stabilityTuple,
+    );
+    if (!publishStable) {
+      return {
+        status: 'BLOCKED',
+        evidence: 'Live GitHub PR or review/attestation state changed during the final review-thread verification window; rerun against a stable remote snapshot.',
+        repository,
+        number: publishPr.number ?? classifiedPr.number,
+        checks: [],
+        unresolvedThreads: classifiedUnresolvedThreads,
+        externalServices: [],
+        gateAttestation: publishGateSnapshot.attestation,
+      };
     }
     return classifyLivePrState({
       repository,
