@@ -1918,6 +1918,67 @@ lifecycle bullets.
 Fix commit message:
 `fix(action+collector+evidence): responder-authenticated capture, in-memory render digests, bounded live reads (Codex T5 r4)`.
 
+#### Task 5 fix round 5 — Codex re-review decisions (recorded before code moves)
+
+Codex on `d727315`: memory-first rendering/digests and the bounded reader are sound;
+rulings — (A) idle-timeout classification acceptable (fallback stays unauthenticated
+and `finish -> 3`; operational, not fail-open), (B) renderer import coupling
+acceptable WITH a sentinel pin + T8 note, (C) superseded — see Critical #2. Critical
+x2 remain. Decisions:
+
+1. **Asymmetric responder proof (Critical #2 + ruling C).** A symmetric HMAC key in
+   `report`'s process environment is readable by a surviving same-user detached child
+   (process-environment disclosure; GitHub masking protects logs, not processes) —
+   and a same-user reader can then SIGN forged responses. Replace HMAC with Ed25519:
+   - `collector_boot.js` generates the keypair at boot
+     (`crypto.generateKeyPairSync('ed25519')`). The PRIVATE key never leaves the
+     collector process (it is passed into `createDebugServer` and is never
+     serialized — not in the handshake line, not in state, not in any output). The
+     handshake line carries the PUBLIC verification key (single-line SPKI DER
+     base64) instead of the HMAC key.
+   - `start` emits the public key as step output `collector-verify-key` (replaces
+     `collector-hmac-key`; T6 note updated below). It is NOT masked — it is public
+     by design. The runner-memory channel now guards the key's INTEGRITY, not its
+     secrecy: disclosure is harmless, but only runner memory prevents a same-user
+     process from substituting its own keypair. The key must NEVER be read from
+     state or any attacker-writable file (test: a key-shaped field planted in state
+     is ignored; a counterfeit signing with its own keypair -> 3).
+   - `report` verifies with `crypto.verify(null, canonicalRecord, publicKey, sig)`;
+     env var becomes `DEBUG_ACTION_COLLECTOR_VERIFY_KEY`.
+2. **Signature bound to the unfiltered request target (Critical #1).** The logs
+   route accepts query filters, and the r4 proof bound only `nonce + bodyhash` — so
+   a counterfeit could forward `report`'s fresh challenge to the REAL collector with
+   `?limit=1`/`?type=event` and return the validly signed SUBSET (the collector was
+   an online signing oracle for incomplete responses; with the expected-hypothesis
+   state cleared, a green incomplete report resulted). Fix: the collector signs a
+   domain-separated canonical record — versioned prefix, method, the EXACT request
+   target as received (`req.url` verbatim, path + query), the challenge nonce, and
+   `sha256hex(servedBytes)` — in a fixed field order with an unambiguous encoding
+   (newline-delimited; digest/nonce fields fixed-length hex). `report` reconstructs
+   the record from what it INTENDED — `GET /sessions/<sessionId>/logs` with NO query
+   string, its own nonce, the hash of the received bytes — and verifies the
+   signature over that reconstruction: a filtered relay signs a different target and
+   fails verification with no extra comparison logic. Tests: a live-relay
+   counterfeit that forwards the real challenge to the real collector with a filter
+   and returns the signed subset -> 3, nothing staged; the four r4 counterfeit
+   strategies and the replay test adapt to the signature form; a pin that the
+   handshake JSON and state contain no private-key material.
+3. **Ruling B sentinel pin.** A test pins `debug_report.js`'s imported export
+   surface (`buildReport`/`renderMarkdown`/`renderJson`) so a payload refactor fails
+   the suite loudly, not capture at run time. T8 queue gains the coupling note.
+4. **T6 note update (supersedes the r4 wiring note).** `start` keeps its `id:`; the
+   report step env line becomes
+   `DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}`;
+   the action's public outputs still never expose it.
+
+Spec amendments (same commit): Security invariant 9 rewritten (asymmetric proof;
+integrity-not-secrecy channel; target binding), invariant 2 cross-reference and the
+boot-handshake bullet updated (public verification key), step-chain item 2 wording
+updated.
+
+Fix commit message:
+`fix(action+collector): asymmetric responder proof bound to the unfiltered request target (Codex T5 r5)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`

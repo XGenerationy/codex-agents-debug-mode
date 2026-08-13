@@ -92,8 +92,8 @@ Step chain (composite, `shell: bash` everywhere):
    uses (cross-verified both directions at plan time).
 2. **start** — `support.js start`: spawns the detached boot shim, waits for readiness,
    performs the whole launch-token lifecycle in memory (occupant auth, session mint,
-   the optional `OPEN` hypothesis post), emits the responder HMAC key as a step
-   output, persists state. Failure here fails the action immediately; no wrapped
+   the optional `OPEN` hypothesis post), emits the responder public verification key
+   as a step output, persists state. Failure here fails the action immediately; no wrapped
    command runs. *(Rewritten, Task 5 rounds 3–4; the mint and post formerly lived in
    `run`.)*
 3. **run** — `support.js run`: executes the wrapped command with collector env
@@ -125,8 +125,8 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
   `DEBUG_PORT`, `DEBUG_REDACT_NAMES` (input-extended). Env inheritance is a correctness
   requirement: the collector's redaction snapshot must include job secrets so anything the
   wrapped process logs is scrubbed. The README states this invariant explicitly.
-- The shim prints one structured JSON line (port, pid, launch token, responder HMAC
-  key, project dir) on
+- The shim prints one structured JSON line (port, pid, launch token, responder
+  public verification key, project dir) on
   ready; `start` also polls `/health` for `ready:true` with a bounded timeout
   (`DEBUG_ACTION_READY_TIMEOUT_MS`, default 15000). Timeout ⇒ infra-failure exit.
 - `start` performs the whole launch-token lifecycle in memory — handshake, mask,
@@ -211,17 +211,26 @@ the artifact.
    `GET /sessions/:id/logs` — a same-length in-place rewrite is refused
    (`session_log_tampered`, 409 replaced-class), closing the gap in
    metadata-plus-byte-count identity checking.
-9. *(Added, Task 5 round 4.)* Capture authenticates the RESPONDER, not just the
-   client: the boot shim mints a responder HMAC key that the collector holds in
-   memory and `start` emits only as a masked step output — parsed into runner memory
-   from `start`'s `GITHUB_OUTPUT` before the wrapped command ever runs, and delivered
-   to `report`'s env by the runner itself. `report` sends a fresh challenge nonce and
-   accepts evidence only when the response proves
-   `HMAC-SHA256(key, nonce + '.' + SHA-256(body))` over the exact received bytes.
-   Attacker-writable state (`port`/`sessionId`/`sessionToken`) is routing data, never
-   a capture trust anchor: a counterfeit listener cannot produce the proof, and a
-   recorded proof cannot answer a fresh nonce. The key authorizes nothing — it only
-   signs responses.
+9. *(Added, Task 5 round 4; rewritten round 5.)* Capture authenticates the RESPONDER
+   with an asymmetric proof: the boot shim generates an Ed25519 keypair at boot; the
+   PRIVATE key exists only in the collector process's memory (never serialized —
+   not in the handshake line, not in state, not in any output), and `start` emits
+   the PUBLIC verification key as a step output — parsed into runner memory from
+   `start`'s `GITHUB_OUTPUT` before the wrapped command ever runs, and delivered to
+   `report`'s env by the runner itself. The channel guards the key's INTEGRITY, not
+   its secrecy: disclosure of a verification key is harmless, but only runner memory
+   prevents a same-user process from substituting its own keypair — the key is never
+   read from state or any attacker-writable file. The collector signs a
+   domain-separated canonical record — method, the exact request target as received,
+   the challenge nonce, and the SHA-256 of the served bytes — and `report` verifies
+   the signature over the record it INTENDED: the unfiltered full-session target,
+   its own fresh nonce, the hash of the received bytes. A counterfeit cannot sign
+   (no private key); a filtered relay through the real collector signs a different
+   target and fails verification (the collector is not a signing oracle for
+   incomplete responses); a recorded proof cannot answer a fresh nonce.
+   Attacker-writable state (`port`/`sessionId`/`sessionToken`) is routing data,
+   never a capture trust anchor. The signing key authorizes nothing — it only signs
+   responses.
 
 ## Exit semantics
 
