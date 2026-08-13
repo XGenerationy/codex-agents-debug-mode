@@ -558,6 +558,42 @@ git add scripts/debug_report.js scripts/debug_report.test.js tools/validate_repo
 git commit -m "feat(report): dual-mode single-session evidence renderer + census 43"
 ```
 
+#### Task 2 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex verdict on `a5cf2c0`: Issues (Important ×4, Minor ×1). All accepted:
+
+1. **Verbatim-safe msg rendering.** `buildReport` must never `String()`-coerce:
+   `typeof parsed.msg === 'string' ? parsed.msg : parsed.msg === undefined ? '(missing msg)' : JSON.stringify(parsed.msg)`.
+   Values from `JSON.parse` cannot be circular, so `JSON.stringify` is total once
+   `undefined` is handled first. Pins: `{msg:{x:1}}` → `'{"x":1}'`; missing msg →
+   `'(missing msg)'`; `{msg:{toString:null}}` renders without throwing.
+2. **Forward-compatible line classification** (parity with the shared core and
+   `GET /sessions/:id/logs`): `parsed.type === undefined` → event; `'hypothesis'` →
+   hypothesis line; ANY other type → counted only in a new `session.otherTypedLines`
+   field (still in `entries`), never in events or excerpts. Schema stays `1`
+   (pre-release). Update the counts test; add a typed-line fixture test.
+3. **Announced render caps** bound md/text output (GitHub Step Summary is 1 MiB):
+   `EXCERPT_CHAR_CAP = 500` per excerpt msg, `FIELD_CHAR_CAP = 200` for title/note —
+   applied at RENDER time in `renderMarkdown`/`renderText` via a `capped(value, cap)`
+   helper (over-cap → slice to cap−1 chars + `…`, total length exactly cap; at exactly
+   cap → unchanged). `renderJson` stays verbatim — the machine surface is bounded by the
+   collector's own 16 MB session limits. Boundary tests both sides of each cap.
+4. **Add `~` to the shared `MARKDOWN_PUNCTUATION`** in `scripts/debug_evidence.js`
+   (→ `/[*_`\[\]()!<>&~]/g`) — closes GFM strikethrough forging. Extend the Task 1
+   escaping test with `'a~b'` → `'a\~b'` and `'~~x~~'` → `'\~\~x\~\~'`. The Task 1
+   golden hostile literal contains no `~`, so it stays valid (verify). `debug_diff`'s
+   changed behavior on `~` content is intentional hardening; its tests exercise no `~`
+   (verify; adjust only if a pin actually trips, and report it).
+5. **One-line stderr always**: both catch paths collapse newlines in the message
+   (`.replace(/\r?\n|\r/g, ' ')`) before writing. Test: a ref that resolves to an error
+   message with an embedded newline still produces exactly one stderr line.
+
+Files: `scripts/debug_report.js`, `scripts/debug_report.test.js`,
+`scripts/debug_evidence.js`, `scripts/debug_evidence.test.js`
+(+ `scripts/debug_diff.test.js` only if a pin trips — report it).
+Fix commit message:
+`fix(report): verbatim-safe msg, typed-line parity, announced render caps, tilde escaping, one-line stderr (Codex T2)`.
+
 ---
 
 ### Task 3: Action foundation — boot shim, `start`, `teardown`, state, validation
