@@ -1383,6 +1383,14 @@ const runSubcommand = async ({
 
 Also add `httpRequestJson,` and `defaultSpawnCommand,` to `module.exports` (alphabetical).
 
+> **Recorded dispositions (Task 4 spec review of `c415344`):** (1) the exit-class split
+> at mint time is deliberate: a TRANSPORT-level failure (dead collector, timeout)
+> propagates to the terminal catch and exits 1 (infra-crash class), while an HTTP-level
+> refusal returns 3; both are fail-closed end-to-end because a run that never recorded
+> `commandExitCode` makes `finish` return 3. Do not "unify" these. (2) Task 5 additionally
+> adds one hermetic signal seam test: `spawnCommand: () => ({ status: null,
+> signal: 'SIGKILL' })` → `commandExitCode === 128`, `commandSignal === 'SIGKILL'`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`
