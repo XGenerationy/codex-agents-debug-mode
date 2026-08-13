@@ -198,9 +198,14 @@ viewer/diff conventions:
 - TTY: human-readable summary (layout consistent with `debug_viewer`'s aesthetic).
 - Piped default: markdown; `--format=md` and `--format=json` explicit. JSON carries
   `schema: 1`.
-- Sections: session metadata (name, id, duration, event count by type), hypothesis
-  lifecycle table with verdicts (recorded verdicts only — the renderer never classifies),
-  capped + announced error/log excerpts, all content escaped in md/TTY.
+- Sections: session metadata (session id plus entry/event/hypothesis-line counts —
+  the evidence schema carries no session-name field, and duration is left underived),
+  per-hypothesis lifecycle blocks (heading + bullets) showing recorded statuses only —
+  the renderer never classifies or invents a verdict — then capped + announced
+  tail-event excerpts, all content escaped in md/TTY via the shared
+  `escapeMarkdownText`. *(Amended after Task 2 spec review: the original wording
+  promised name/duration metadata and a literal table; the plan — the byte
+  authority — renders counts and heading+bullet blocks instead.)*
 - Deterministic for identical input bytes (stable ordering, no timestamps beyond those in
   the evidence).
 - Payload census: 41 → 43 (`debug_report.js` + `debug_report.test.js`), bumped in
