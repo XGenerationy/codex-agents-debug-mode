@@ -91,13 +91,19 @@ Step chain (composite, `shell: bash` everywhere):
 1. **setup-node** — pinned `actions/setup-node` at the same 40-hex SHA the closeout action
    uses (cross-verified both directions at plan time).
 2. **start** — `support.js start`: spawns the detached boot shim, waits for readiness,
-   persists state. Failure here fails the action immediately; no wrapped command runs.
-3. **run** — `support.js run`: mints a session, executes the wrapped command with injected
-   collector env, records the exit code in state and `GITHUB_OUTPUT`. This step itself
-   never fails on command failure (the decision is deferred to `finish`).
-4. **report** — `support.js report`, `if: always()`: copies session evidence into
-   `output-dir`, renders `report.md` via `scripts/debug_report.js`, appends the report to
-   `GITHUB_STEP_SUMMARY`, writes `event-count`/`report-path`. If state records no
+   performs the whole launch-token lifecycle in memory (occupant auth, session mint,
+   the optional `OPEN` hypothesis post), emits the responder HMAC key as a step
+   output, persists state. Failure here fails the action immediately; no wrapped
+   command runs. *(Rewritten, Task 5 rounds 3–4; the mint and post formerly lived in
+   `run`.)*
+3. **run** — `support.js run`: executes the wrapped command with collector env
+   injected from state, records the exit code in state and `GITHUB_OUTPUT`. This step
+   itself never fails on command failure (the decision is deferred to `finish`).
+4. **report** — `support.js report`, `if: always()`: captures the session over a
+   responder-authenticated, bounded live read, validates and renders `report.md` /
+   `report.json` from the in-memory bytes via `scripts/debug_report.js`, stages the
+   evidence into `output-dir`, appends the report to
+   `GITHUB_STEP_SUMMARY`, writes `event-count`/`report-path`/`evidence-digest`. If state records no
    successful `start`, the subcommand no-ops successfully (finish already owns the
    failure decision for a failed start).
 5. **upload-artifact** — pinned, `if: always()`, `if-no-files-found: ignore`, uploads
@@ -119,7 +125,8 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
   `DEBUG_PORT`, `DEBUG_REDACT_NAMES` (input-extended). Env inheritance is a correctness
   requirement: the collector's redaction snapshot must include job secrets so anything the
   wrapped process logs is scrubbed. The README states this invariant explicitly.
-- The shim prints one structured JSON line (port, pid, launch token, project dir) on
+- The shim prints one structured JSON line (port, pid, launch token, responder HMAC
+  key, project dir) on
   ready; `start` also polls `/health` for `ready:true` with a bounded timeout
   (`DEBUG_ACTION_READY_TIMEOUT_MS`, default 15000). Timeout ⇒ infra-failure exit.
 - `start` performs the whole launch-token lifecycle in memory — handshake, mask,
@@ -130,19 +137,21 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
   Task 5 round 3; earlier shapes persisted the launch token.)* Later subcommands extend
   the state with command/capture results. The state file stays in runner temp, is never
   uploaded, and its token values never appear in outputs, summaries, or logs.
-- `run` mints a session via `POST /session` with the launch token, then executes the
-  wrapped command with exactly three injected variables: `DEBUG_LOG_URL`
-  (`http://127.0.0.1:<port>/log`), `DEBUG_SESSION_ID`, and `DEBUG_SESSION_TOKEN` —
-  plus `DEBUG_HYPOTHESIS_ID` when the `hypothesis-id` input is set. *(Amended during
-  planning: SKILL.md documents no env vars for instrumented processes — its snippets use
+- `run` executes the wrapped command with exactly three variables injected from
+  state: `DEBUG_LOG_URL` (`http://127.0.0.1:<port>/log`), `DEBUG_SESSION_ID`, and
+  `DEBUG_SESSION_TOKEN` — plus `DEBUG_HYPOTHESIS_ID` when the `hypothesis-id` input
+  is set. The session was already minted by `start`; `run` never talks to the
+  collector. *(Amended during planning; mint moved to `start` in Task 5 round 3.
+  SKILL.md documents no env vars for instrumented processes — its snippets use
   inline `REPLACE_WITH_*` constants — so the action defines this convention, reusing the
   names SKILL.md already uses as constants. `POST /log` carries the session id in the
-  body, so the wrapped process needs three values, not two.)* The launch token is never
-  exposed to the wrapped command.
-- Optional `hypothesis-id` (+ `hypothesis-title`) inputs *(amended during planning)*:
-  `POST /hypothesis` requires the launch token, which the wrapped command never gets —
-  so when `hypothesis-id` is set, `run` itself posts one `status: OPEN` hypothesis line
-  before executing the command and injects `DEBUG_HYPOTHESIS_ID` so the wrapped process
+  body, so the wrapped process needs three values, not two.)* The launch token no
+  longer exists anywhere when `run` begins.
+- Optional `hypothesis-id` (+ `hypothesis-title`) inputs *(amended during planning;
+  the post moved to `start` in Task 5 round 3)*: `POST /hypothesis` requires the
+  launch token, which only `start` ever holds — so when `hypothesis-id` is set,
+  `start` posts one `status: OPEN` hypothesis line at mint time and `run` injects
+  `DEBUG_HYPOTHESIS_ID` so the wrapped process
   can tag its events. The action never posts any other status: verdicts remain
   human/agent judgment, so the report renders whatever statuses the session actually
   recorded (the CI dogfood shows `OPEN`).
@@ -161,12 +170,16 @@ it is never enumerated in the upload path block. The collector's `.debug/` inter
 (claim, port, salt, any token files) are never copied, so the token-exfiltration hazard
 is closed structurally. `support.test.js` pins that the staged evidence child contains
 no token byte-sequence and that the upload path block never references
-`action-state.json` or a bare directory. *(Added, Task 5 round 3.)* Because upload
-happens in a later step of the same job, a hostile wrapped command's detached child
-could rewrite staged files in the window — inherent to same-user composite staging and
-outside the prevention boundary; `report` therefore prints each staged file's SHA-256
-to the step log (immutable once streamed) and to the `evidence-digest` output, making
-any post-staging swap detectable against the artifact.
+`action-state.json` or a bare directory. *(Added, Task 5 round 3; hardened round 4.)*
+Because upload happens in a later step of the same job, a hostile wrapped command's
+detached child could rewrite staged files in the window — inherent to same-user
+composite staging and outside the prevention boundary. `report` therefore validates,
+renders, and SHA-256-hashes all three payloads from one immutable in-memory buffer
+(the live read is bounded: absolute deadline, byte cap, idle timeout), writes the
+staged files only afterwards as write-only sinks, and prints the digests to the step
+log (immutable once streamed) and the `evidence-digest` output — the recorded digests
+always describe the intended bytes, so any post-staging swap is detectable against
+the artifact.
 
 ## Security invariants
 
@@ -198,6 +211,17 @@ any post-staging swap detectable against the artifact.
    `GET /sessions/:id/logs` — a same-length in-place rewrite is refused
    (`session_log_tampered`, 409 replaced-class), closing the gap in
    metadata-plus-byte-count identity checking.
+9. *(Added, Task 5 round 4.)* Capture authenticates the RESPONDER, not just the
+   client: the boot shim mints a responder HMAC key that the collector holds in
+   memory and `start` emits only as a masked step output — parsed into runner memory
+   from `start`'s `GITHUB_OUTPUT` before the wrapped command ever runs, and delivered
+   to `report`'s env by the runner itself. `report` sends a fresh challenge nonce and
+   accepts evidence only when the response proves
+   `HMAC-SHA256(key, nonce + '.' + SHA-256(body))` over the exact received bytes.
+   Attacker-writable state (`port`/`sessionId`/`sessionToken`) is routing data, never
+   a capture trust anchor: a counterfeit listener cannot produce the proof, and a
+   recorded proof cannot answer a fresh nonce. The key authorizes nothing — it only
+   signs responses.
 
 ## Exit semantics
 

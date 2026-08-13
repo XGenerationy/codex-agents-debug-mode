@@ -1841,6 +1841,83 @@ same-session read scope), state-file field list updated, lifecycle bullets updat
 Fix commit message:
 `fix(action+collector): memory-only launch token, session-token read scope, staged digests, entry cleanup (Codex T5 r3)`.
 
+#### Task 5 fix round 4 — Codex re-review decisions (recorded before code moves)
+
+Codex on `9fca375`: memory-only launch token verified real; rulings — (i) keep
+`throw -> 1` for start-phase machinery failures (document the three moved classes;
+purge the spec's stale "run mints/posts" text), (ii) no retry required but the live
+read must gain a real deadline, (iii) session token at rest acceptable as a scoped
+capability but writable state must never anchor capture trust, (iv) the pre-auth idle
+sweep is acceptable. Critical x2 + Important x1 remain. Decisions:
+
+1. **Responder-authenticated capture (Critical #1 — counterfeit collector).**
+   `report` trusted `port`/`sessionId`/`sessionToken` from attacker-writable state, so
+   a wrapped command could point capture at a counterfeit listener serving
+   contract-shaped NDJSON with a 200 — Bearer proves the client to the listener;
+   nothing proved the listener to the action. The only cross-step channel a same-user
+   process can neither read nor rewrite is RUNNER MEMORY: a step output written by
+   `start` is parsed out of its `GITHUB_OUTPUT` file when the start step ends — before
+   the wrapped command exists — and interpolated into later steps' env from the runner
+   process itself. Structure:
+   - `collector_boot.js` mints a **responder HMAC key** at boot (crypto-random, held
+     beside the launch token, authorizes NOTHING — it only signs responses), passes it
+     into `createDebugServer` (new option), and adds it to the private handshake line.
+   - `start` captures it, masks it, and emits it as step output `collector-hmac-key`
+     via `GITHUB_OUTPUT`. It is NEVER written to state. T6 wires
+     `DEBUG_ACTION_COLLECTOR_HMAC_KEY: ${{ steps.start.outputs.collector-hmac-key }}`
+     into the **report step only** (queued T6 note; `start` needs an `id:`; the
+     action's public outputs never expose it).
+   - Collector (`scripts/debug_server.js`, logs-serve site): a request carrying
+     `x-debug-challenge: <nonce>` gets the response header
+     `x-debug-proof: hex(HMAC-SHA256(key, nonce + '.' + sha256hex(servedBytes)))`,
+     computed over the exact bytes written to the response.
+   - `report` sends a fresh crypto-random nonce per capture and verifies the proof
+     over the exact received bytes (`timingSafeEqual`). A missing or wrong proof is an
+     INTEGRITY failure -> 3, nothing staged — never the unreachable-fallback class. A
+     valid-state entry with no key in env is the same integrity class (wiring broke).
+     State's `port`/`sessionId`/`sessionToken` remain routing data only (ruling iii).
+   - Tests: counterfeit 200-with-contract-shaped-NDJSON listener (no proof, then
+     wrong-key proof) -> 3, nothing staged; replay — a recorded `(body, proof)` pair
+     from an earlier challenge fails a fresh nonce; honest lifecycle green with the
+     proof verified (harness delivers the key to `report` the way `action.yml` will:
+     env seam); key absent from state and from every staged byte.
+2. **In-memory render + digest (Critical #2 — staged-pathname race).** Staging, then
+   rendering FROM the staged path, then re-reading to hash let a detached child swap
+   bytes so reports and all three digests consistently described the forgery. New
+   `report` flow: capture -> validate hypothesis set from the in-memory bytes ->
+   render `report.md`/`report.json` FROM THE SAME in-memory buffer (import the
+   renderer programmatically from `scripts/debug_report.js` — precedent:
+   `collector_boot` requires `debug_server` — or pipe the buffer to its stdin; the
+   renderer's input must never be a re-read of a shared pathname) -> SHA-256 all three
+   payloads from memory -> only then write the staged files (write-only sinks) ->
+   print digest lines -> locked CAS -> outputs. The r3 detectability disposition
+   becomes sound: digests describe INTENDED bytes, so any post-write swap mismatches
+   the step log. Tests: corrupt each staged file after `report` returns and assert the
+   logged/output digests still describe the intended bytes; corrupt the staged
+   session.log between write and return to prove render/hash never re-read it.
+3. **Bounded live read (Important).** `readSessionLive` (`scripts/debug_evidence.js` —
+   in scope: Codex implicated it by line) gains httpRequestJson's settle-guaranteed
+   discipline: absolute wall-clock deadline + response byte cap + the existing idle
+   timeout; every rejection path settles. Constants sized generously above the
+   collector's max session size (implementer picks; document beside the constants).
+   Tests in `debug_evidence.test.js`: a one-byte-per-interval drip rejected by the
+   deadline; an over-cap response rejected; both settle. Census stays 43 (existing
+   payload files edited, none added).
+4. **Ruling (i) spec purge + T8 note.** Spec step chain and lifecycle bullets
+   rewritten so mint/occupant-auth/OPEN-post live in `start` (`run` = spawn + record
+   only); the T8 queue gains: the three start-phase classes exit 1 (infra-throw), and
+   the 1-vs-3 taxonomy documentation names them.
+
+Spec amendments (same commit): new Security invariant 9 (responder authentication;
+writable state never anchors capture trust), invariant 2 gains the responder-key
+clause (signs responses, authorizes nothing), the boot-handshake line gains the key,
+the artifact staging paragraph now says digests are computed from in-memory bytes
+before staging, and the stale `run` mint/post text is removed from the step chain and
+lifecycle bullets.
+
+Fix commit message:
+`fix(action+collector+evidence): responder-authenticated capture, in-memory render digests, bounded live reads (Codex T5 r4)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`
