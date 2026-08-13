@@ -615,6 +615,14 @@ remaining findings, both accepted:
 Fix commit message:
 `fix(report): report-level render bound + surrogate-safe truncation (Codex T2 r2)`.
 
+**Fix round 3 (Codex re-review of `caeb57d`):** cap design and arithmetic verified
+(corrected ceiling ≈ 228,968 bytes, 4.58× margin); announce placement approved;
+uncapped `session.id` accepted (CLI-bounded; renderer not a public API). One Minor,
+overriding this plan's own literal: pluralize the hypothesis announce —
+`…and ${n} more ${n === 1 ? 'hypothesis' : 'hypotheses'} (full list in report.json)`
+in both human renderers, matching the excerpt announce's pluralization; update the
+pinned test. Commit: `fix(report): pluralize hypothesis overflow announce (Codex T2 r3)`.
+
 ---
 
 ### Task 3: Action foundation — boot shim, `start`, `teardown`, state, validation
