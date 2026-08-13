@@ -1481,6 +1481,19 @@ writer). Decisions:
    committing it is preferred.
 Commit: `fix(action): ownership-verified lock release and reap (Codex T4 r3)`.
 
+**Fix round 4 (Codex re-review of `64864d9`):** ownership stamps, both deletion-site
+guards, the committed tests, and the seam all verified/accepted. One Important, FIX
+NOW: the staleness observation itself is unbound — mtime (stat by path) and ownership
+bytes (read by path) are taken in separate operations that can straddle a replacement,
+a wider race than the acknowledged final check-to-unlink window. Decision: take the
+observation from ONE descriptor — open the lock `O_RDONLY`, `fstatSync(fd)` for the
+timestamp and read the content from that same fd (same inode by construction), close,
+then proceed with the existing observed-content re-check before unlink. The remaining
+single-syscall micro-window is then ACCEPTED for this portable, misconfiguration-only
+lock (Codex ruling). Adjust/extend the forced-replacement test if the seam's call
+point moves. Commit:
+`fix(action): inode-bound staleness observation (Codex T4 r4)`.
+
 ---
 
 ### Task 5: `report` + `finish` — capture, render, and the exit taxonomy
