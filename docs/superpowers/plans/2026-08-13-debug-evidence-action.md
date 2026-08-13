@@ -172,6 +172,15 @@ Codex verdict on `b3ef193`: Issues (Minor ×3). Decisions:
 
 Fix commit message: `test(evidence): golden-byte parity + edge pins for escapeMarkdownText; trim diff-side comment (Codex T1 minors)`.
 
+**Fix round 2 (Codex re-review of `6c20f91`):** all three fixes verified byte-for-byte
+(golden literals match the live implementation; backslash case is `5c 5c 5c 2a`; exactly
+one raw U+2028 in the hostile literal). One remaining Minor: the retained sentence at
+`scripts/debug_diff.js:126` — "the one exception" — lost its antecedent in the trim.
+Decision: reword that one sentence to Codex's suggested form, "Unlike Markdown
+punctuation, the box-drawing pipe must become a DIFFERENT character (¦), …" keeping the
+rest of the retained comment untouched. Commit message:
+`docs(diff): fix dangling antecedent in escaping rationale (Codex T1 re-review)`.
+
 ---
 
 ### Task 2: `scripts/debug_report.js` — dual-mode single-session renderer (+ census 41 → 43)
