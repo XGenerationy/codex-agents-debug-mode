@@ -123,7 +123,7 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 // log content forge headings, verdicts, or break out of a backtick code
 // span (report structure must reflect the engine, never log content).
 // The transform itself is owned by debug_evidence.js (escapeMarkdownText).
-// The box-drawing pipe is the one exception: it must become a
+// Unlike Markdown punctuation, the box-drawing pipe must become a
 // DIFFERENT character (¦), not just a backslashed one, because the TABLE
 // renderer's cell borders are real │ that the terminal prints regardless of
 // a preceding backslash. JSON output needs none of this.
