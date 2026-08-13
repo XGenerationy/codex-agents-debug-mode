@@ -32,10 +32,23 @@ const {
    * two chunk boundaries is completed first, instead of being corrupted or
    * letting a secret that straddles the split slip through. Defined in
    * ./pr_closeout_stream; re-exported here as part of this module's public
-   * surface.
+   * surface. NOTE: value-based only — spawnCaptured's live output path uses
+   * createProcessOutputRedactor, which additionally applies
+   * CREDENTIAL_PATTERNS chunk-safely (CodeRabbit outside-diff
+   * (pr_closeout_stream.js:23-69)).
    * @returns {{push(chunk: Buffer|string): string, flush(): string}}
    */
   createDecodedRedactor,
+  /**
+   * Full live-output redaction stack (UTF-8 decode → env-value replacements
+   * → chunk-aware CREDENTIAL_PATTERNS). Used by spawnCaptured for everything
+   * emitSafe writes, so a standalone Bearer token or PEM block that is not a
+   * known env value is redacted too (CodeRabbit outside-diff
+   * (pr_closeout_stream.js:23-69)). Defined in ./pr_closeout_stream;
+   * re-exported here as part of this module's public surface.
+   * @returns {{push(chunk: Buffer|string): string, flush(): string}}
+   */
+  createProcessOutputRedactor,
   /**
    * Streaming secret redactor (push/flush) preloaded with the replacement
    * list from buildSecretReplacements(env, names). Withholds up to
@@ -48,6 +61,7 @@ const {
   createStreamingRedactor,
   createStreamingReplacer,
   createStreamingSignalScanner,
+  redactCredentialPatterns,
 } = require('./pr_closeout_stream');
 const {
   assertNotSymlink: assertNotSymlinkShared,
@@ -1780,8 +1794,17 @@ const safeStatusSignal = ({
   platform,
 }) => {
   const category = summarizeStatusSignal(signal).split(':', 1)[0];
+  // Same ordering as createProcessOutputRedactor: exact env-value
+  // replacements on the raw text first, then pattern redaction as the
+  // heuristic net. Pattern redaction is needed here too because signals are
+  // scanned from the RAW pre-redaction chunks — a failing line that embeds a
+  // standalone Bearer token or key=value credential would otherwise ride
+  // into detectedSignals and the report evidence unredacted (same exposure
+  // class as CodeRabbit outside-diff (pr_closeout_stream.js:23-69)). A
+  // signal is one complete line from the line-buffered scanner, so the
+  // one-shot helper is chunk-boundary-safe in this position.
   const safe = normalizePaths(
-    redactSecretsReplacements(String(signal), secretReplacements),
+    redactCredentialPatterns(redactSecretsReplacements(String(signal), secretReplacements)),
     pathReplacements,
     platform,
   ).replace(/\s+/gu, ' ').trim().slice(0, 500);
@@ -2236,7 +2259,13 @@ const spawnCaptured = async ({
     // other across both streams at harvest time (see below).
     const noWork = { authoritative: false, conditional: new Set() };
     return {
-      redactor: createDecodedRedactor(redactionEnv, secretNames),
+      // Decode → env-value replacements → chunk-aware CREDENTIAL_PATTERNS.
+      // The pattern stage is required here, not just on the CLI's top-level
+      // error path: a child process can emit a standalone Bearer token or a
+      // PEM block that is not any known env value, and emitSafe would write
+      // it into the captured stdout/stderr and the evidence log unchanged
+      // (CodeRabbit outside-diff (pr_closeout_stream.js:23-69)).
+      redactor: createProcessOutputRedactor(redactionEnv, secretNames),
       normalizer: createStreamingReplacer(pathReplacements, { caseInsensitive: platform === 'win32' }),
       signalDecoder: new StringDecoder('utf8'),
       scanner: createStreamingSignalScanner(findStatusSignals, {
@@ -3862,6 +3891,7 @@ module.exports = {
   TOOL_PROBES,
   createCommandExecutor,
   createDecodedRedactor,
+  createProcessOutputRedactor,
   createStreamingRedactor,
   defaultShellArgs,
   environHasAnySpawnMark,

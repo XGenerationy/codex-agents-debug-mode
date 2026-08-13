@@ -90,12 +90,12 @@ const makeDependencies = ({
     written,
     events,
     dependencies: {
-      resolveRepositoryState: async () => {
+      resolveRepositoryState: async ({ baseRef } = {}) => {
         stateReads += 1;
         events.push(`repository-state:${stateReads}`);
         return {
           repo: 'C:/repo',
-          baseRef: 'origin/main',
+          baseRef: baseRef || 'origin/main',
           baseSha: stateReads === 1 ? 'base123' : (stateReads === 2 ? finalBase : sealBase),
           headSha: stateReads === 1 ? 'head123' : (stateReads === 2 ? finalHead : currentSealHead),
           touchedFiles: ['src/a.ts'],
@@ -306,7 +306,7 @@ test('passes only essential and explicitly configured environment variables to c
 
     await runCloseoutWorkflow({
       repo: 'C:/repo',
-      baseRef: 'origin/main',
+      baseRef: 'origin/release/7',
       config: reviewedConfig({
         requiredEnv: [requiredName],
         safeEnv: [safeName],
@@ -320,6 +320,12 @@ test('passes only essential and explicitly configured environment variables to c
       assert.equal(environment[safeName], 'safe-value');
       assert.equal(environment[ambientName], undefined);
       assert.ok(environment.PATH || environment.Path);
+      // The resolved base SHA (immutable, not the mutable ref name) is plumbed
+      // to engine checks via a dedicated env var so engine commands no longer
+      // silently fall back to `main` when GITHUB_BASE_REF is dropped by the
+      // allowlisted environment. A non-main base is used so the assertion
+      // proves the injection works (the fallback default is origin/main).
+      assert.equal(environment.CLOSEOUT_RESOLVED_BASE_REF, 'base123');
     }
   } finally {
     for (const [name, value] of Object.entries(previous)) {
@@ -327,6 +333,47 @@ test('passes only essential and explicitly configured environment variables to c
       else process.env[name] = value;
     }
   }
+});
+
+test('buildWorkflowEnvironment hard-denies credential and runner-control names even when listed in safeEnv', async () => {
+  // A PR-controlled config can list GH_TOKEN in safeEnv to exfiltrate the
+  // workflow token via a repository-local preflight probe. The denylist must
+  // override the config opt-in unconditionally.
+  let capturedEnv;
+  const fixture = makeDependencies();
+  delete fixture.dependencies.execute;
+  fixture.dependencies.createCommandExecutor = ({ env: e }) => {
+    capturedEnv = e;
+    return async () => ({ status: 'PASS', exitCode: 0 });
+  };
+  const names = ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ENV', 'GITHUB_PATH'];
+  const previous = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+  process.env.GH_TOKEN = 'dummy-token-value';
+  process.env.GITHUB_TOKEN = 'dummy-token-value-too';
+  process.env.GITHUB_ENV = '/tmp/should_not_reach';
+  process.env.GITHUB_PATH = '/tmp/should_not_reach';
+  try {
+    await runCloseoutWorkflow({
+      repo: '/r',
+      baseRef: 'origin/main',
+      config: { safeEnv: ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ENV', 'GITHUB_PATH', 'MY_SAFE_SECRET'], engineChecks: [{ id: 'noop', command: 'true' }] },
+      mode: 'engine',
+      outputDir: '/tmp/ev',
+      dependencies: fixture.dependencies,
+    });
+  } catch {
+    // The workflow may throw on stubbed filesystem; the env capture is what matters.
+  } finally {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.ok(capturedEnv, 'the command executor must have been called so the env was captured');
+  assert.equal(capturedEnv.GH_TOKEN, undefined, 'GH_TOKEN must be denied even when listed in safeEnv');
+  assert.equal(capturedEnv.GITHUB_TOKEN, undefined, 'GITHUB_TOKEN must be denied');
+  assert.equal(capturedEnv.GITHUB_ENV, undefined, 'GITHUB_ENV must be denied');
+  assert.equal(capturedEnv.GITHUB_PATH, undefined, 'GITHUB_PATH must be denied');
 });
 
 test('default evidence directories include process uniqueness for concurrent same-ms starts', () => {
@@ -1593,6 +1640,7 @@ test('resolvePlanAdmission reports present, absent, and unavailable attestation 
       readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested by reviewer' }),
       cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
       runPreflight: async () => ({ status: 'PASS', checks: [], toolVersions: { git: '2.45' } }),
+      workingTreeFingerprint: async () => 'fp-stable',
     },
   };
   const present = await resolvePlanAdmission(base);
@@ -1654,10 +1702,337 @@ test('resolvePlanAdmission does not run preflight probes when the working tree i
       readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
       cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
       runPreflight: async () => { throw new Error('probe crashed'); },
+      workingTreeFingerprint: async () => 'fp-stable',
     },
   });
   assert.equal(cleanTreeResult.preflight.status, 'BLOCKED');
   assert.match(cleanTreeResult.preflight.evidence, /probe crashed/);
+});
+
+test('resolvePlanAdmission blocks when a gitignored path is mutated by the probe (Codex #10)', async () => {
+  // cleanTreeStatus respects .gitignore, so a probe mutating a gitignored
+  // path (node_modules/.bin, generated artifacts) is invisible to it. The
+  // post-probe check now also captures a workingTreeFingerprint before and
+  // after the probe and BLOCKs on mismatch, mirroring the full-run seal.
+  //
+  // The fingerprint changes ONLY inside runPreflight (CodeRabbit 3745322364):
+  // returning a different value on every call would pass even if both reads
+  // happened before the probe. Tying the mutation to the probe call proves the
+  // pre-probe read sees the original tree, the probe mutates it, and the
+  // post-probe read sees the change — i.e. the probe is correctly bracketed.
+  let probed = false;
+  const result = await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      // The probe is the ONLY thing that mutates the tree fingerprint.
+      runPreflight: async () => { probed = true; return { status: 'PASS', checks: [], toolVersions: {} }; },
+      workingTreeFingerprint: async () => (probed ? 'fp-after' : 'fp-before'),
+    },
+  });
+  assert.equal(result.preflight.status, 'BLOCKED');
+  assert.match(result.preflight.evidence, /fingerprint changed during preflight/);
+});
+
+test('resolvePlanAdmission passes only ESSENTIAL_ENV to preflight, not raw process.env or config.safeEnv (chatgpt-codex-connector PR7 #6Yb3lZ)', async () => {
+  // The plan-path preflight spawns repository-controlled binaries, so it must
+  // receive a fixed, code-defined environment (Codex: runner command files
+  // and secrets must not leak into a preview advertised as read-only).
+  //
+  // config.safeEnv must NOT reach plan preflight at all: `config` is itself
+  // read from the checked-out (PR-controlled) config path, so honoring it
+  // here would let a PR add an existing job secret's NAME to safeEnv and have
+  // it forwarded to a repository-local probe it also controls, before any
+  // independent review runs. An earlier version of this function DID forward
+  // safeEnv-listed names (stripping only names matching a credential-name
+  // heuristic) -- this test used to assert that forwarding as correct
+  // behavior; it now asserts the opposite, since that forwarding was exactly
+  // the round-20 finding's exploit path (a secret under an unrecognized name,
+  // e.g. DEPLOY_CRED, walked straight around the heuristic).
+  const secretName = 'PR_CLOSEOUT_PLAN_AMBIENT_TEST';
+  const safeName = 'PR_CLOSEOUT_PLAN_SAFE_TEST';
+  const previous = Object.fromEntries(
+    [secretName, safeName].map((name) => [name, process.env[name]]),
+  );
+  process.env[secretName] = 'must-not-reach-probes';
+  process.env[safeName] = 'must-also-not-reach-probes';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: { safeEnv: [safeName] },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(preflightEnv[secretName], undefined, 'ambient env must not reach plan preflight');
+  assert.equal(preflightEnv[safeName], undefined, 'config safeEnv must NOT reach plan preflight, even when explicitly opted in');
+  assert.ok(preflightEnv.PATH || preflightEnv.Path, 'ESSENTIAL_ENV names must still reach preflight');
+});
+
+test('resolvePlanAdmission does not let PR-controlled safeEnv select a secret by an unrecognized name (chatgpt-codex-connector PR7 #6Yb3lZ)', async () => {
+  // The exact scenario named in the finding: a real secret set under a name
+  // the credential-shape heuristic (SENSITIVE_ENV_PATTERN) does not
+  // recognize. Before the fix, this reached the probe because the OLD
+  // buildPlanPreflightEnvironment only stripped pattern-matching names —
+  // DEPLOY_CRED (not DEPLOY_CREDENTIAL) does not match ACCESS_KEY, API_KEY,
+  // CREDENTIAL(S), SECRET, TOKEN, or any other alternative in the pattern.
+  const secretName = 'DEPLOY_CRED';
+  const previous = process.env[secretName];
+  process.env[secretName] = 'super-secret-deploy-value';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: { safeEnv: [secretName] },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    if (previous === undefined) delete process.env[secretName];
+    else process.env[secretName] = previous;
+  }
+  assert.equal(preflightEnv[secretName], undefined, 'a secret under a heuristic-evading name must still never reach plan preflight');
+});
+
+test('resolvePlanAdmission revokes the delegated token file BEFORE the untrusted preflight probe runs (chatgpt-codex-connector PR7 #6Yd4Qv)', async () => {
+  // The core security property of the fix: by the time the repository-
+  // controlled preflight probe executes, the off-environment workflow-token
+  // file must already be deleted, so a probe that walks its process ancestry
+  // (or simply reads the file by path) finds nothing. The attestation read
+  // above it — the sole authenticated GitHub call in the plan tier — has
+  // already consumed the token, so revocation here loses nothing.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'closeout-plan-tok-'));
+  const tokenFile = nodePath.join(dir, 'gh-token');
+  fs.writeFileSync(tokenFile, 'ghs_planTierSecret');
+  const priorEnv = process.env.CLOSEOUT_GH_TOKEN_FILE;
+  process.env.CLOSEOUT_GH_TOKEN_FILE = tokenFile;
+  let tokenFileExistedAtProbeTime = null;
+  let attestationSawTokenFile = null;
+  try {
+    // Sanity: the file exists before the admission run.
+    assert.equal(fs.existsSync(tokenFile), true, 'token file must exist before resolvePlanAdmission');
+    const admission = await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        // The attestation phase is where the token is legitimately consumed;
+        // assert the file is still present there (it must NOT be revoked
+        // before authentication completes).
+        readLiveGateAttestation: async () => {
+          attestationSawTokenFile = fs.existsSync(tokenFile);
+          return { status: 'PASS', evidence: 'attested' };
+        },
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        // The probe stands in for repository-controlled code. It must observe
+        // the token file already gone.
+        runPreflight: async () => {
+          tokenFileExistedAtProbeTime = fs.existsSync(tokenFile);
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+    assert.equal(attestationSawTokenFile, true, 'authenticated attestation read must happen while the token file still exists');
+    assert.equal(tokenFileExistedAtProbeTime, false, 'the delegated token file MUST be revoked before the untrusted probe runs');
+    assert.equal(fs.existsSync(tokenFile), false, 'the token file must remain gone after admission');
+    assert.equal(admission.preflight.status, 'PASS');
+  } finally {
+    if (priorEnv === undefined) delete process.env.CLOSEOUT_GH_TOKEN_FILE;
+    else process.env.CLOSEOUT_GH_TOKEN_FILE = priorEnv;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolvePlanAdmission clears requiredEnv/safeEnv from the config it hands to preflight, not just the env (CodeRabbit PR7 #6Yb44Sc)', async () => {
+  // scripts/pr_closeout_process.js's runPreflight separately checks EVERY
+  // config.requiredEnv name for presence in the given env and reports each
+  // missing one as its own BLOCKED `env:<name>` check. Since
+  // buildPlanPreflightEnvironment (the #6Yb3lZ fix) deliberately no longer
+  // forwards config-named credentials into that env at all, passing the
+  // ORIGINAL config through unchanged would report every configured
+  // requiredEnv name as missing on every plan preview -- a false BLOCKED for
+  // a repo that legitimately requires a credential for its ATTESTED full
+  // run, which plan preflight never needed in the first place.
+  let capturedConfig;
+  await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    config: { requiredEnv: ['DEPLOY_TOKEN'], safeEnv: ['SOME_SAFE_VAR'], minFreeDiskGb: 5, services: ['redis'] },
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async ({ config }) => { capturedConfig = config; return { status: 'PASS', checks: [], toolVersions: {} }; },
+      workingTreeFingerprint: async () => 'fp-stable',
+    },
+  });
+  assert.deepEqual(capturedConfig.requiredEnv, [], 'requiredEnv must be cleared for the plan-preflight config');
+  assert.deepEqual(capturedConfig.safeEnv, [], 'safeEnv must be cleared for the plan-preflight config');
+  // Every OTHER config field must still reach preflight unchanged.
+  assert.equal(capturedConfig.minFreeDiskGb, 5);
+  assert.deepEqual(capturedConfig.services, ['redis']);
+});
+
+test('resolvePlanAdmission isolates HOME/USERPROFILE/APPDATA/LOCALAPPDATA from plan preflight and cleans up after (CodeRabbit PR7 #6Yb44Sd)', async () => {
+  // HOME/USERPROFILE/APPDATA/LOCALAPPDATA are in ESSENTIAL_ENV so ordinary
+  // tools have SOME profile directory to resolve against, but their real
+  // values point at credential-bearing files on disk (~/.npmrc, ~/.netrc,
+  // the gh CLI's own token store) regardless of what is in process.env -- a
+  // repository-controlled preflight probe can read those directly by path.
+  const fs = require('node:fs/promises');
+  const names = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) process.env[name] = `C:\\Users\\real-user\\${name.toLowerCase()}`;
+  let preflightEnv;
+  let observedHomeDir;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => {
+          preflightEnv = env;
+          observedHomeDir = env.HOME;
+          // The isolated directory must actually exist (and be empty) WHILE
+          // the probe is running.
+          const entries = await fs.readdir(observedHomeDir);
+          assert.deepEqual(entries, [], 'the isolated home directory must be empty');
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  for (const name of names) {
+    assert.notEqual(preflightEnv[name], process.env[name] ?? `C:\\Users\\real-user\\${name.toLowerCase()}`,
+      `${name} must not be the real runner profile path`);
+  }
+  // All four are substituted with the SAME isolated directory.
+  assert.equal(preflightEnv.HOME, observedHomeDir);
+  assert.equal(preflightEnv.USERPROFILE, observedHomeDir);
+  assert.equal(preflightEnv.APPDATA, observedHomeDir);
+  assert.equal(preflightEnv.LOCALAPPDATA, observedHomeDir);
+  // Cleaned up afterward: the directory must no longer exist.
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/);
+});
+
+test('resolvePlanAdmission isolates all four profile variables even when none are present in the ambient environment (CodeRabbit PR7 #6Yb44Sl)', async () => {
+  // buildPlanPreflightEnvironment previously only overrode a HOME_ENV_NAMES
+  // entry that was ALREADY present in the sanitized set -- an absent name
+  // (e.g. LOCALAPPDATA on a POSIX runner, or HOME on Windows) was never
+  // added at all, leaving that name unset for the probe. Node's os.homedir()
+  // (and other profile-resolving platform APIs) falls back to an OS-level
+  // lookup when its env var is undefined, which can silently resolve to the
+  // REAL home directory and defeat the isolation entirely.
+  const fs = require('node:fs/promises');
+  const names = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  let preflightEnv;
+  let observedHomeDir;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      config: {},
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => {
+          preflightEnv = env;
+          observedHomeDir = env.HOME;
+          return { status: 'PASS', checks: [], toolVersions: {} };
+        },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.ok(observedHomeDir, 'the isolated directory must have been created and used even with no ambient profile vars');
+  for (const name of names) {
+    assert.equal(preflightEnv[name], observedHomeDir, `${name} must be forced to the isolated directory even though it was absent from the ambient env`);
+  }
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/, 'cleanup must still run');
+});
+
+test('resolvePlanAdmission cleans up the isolated home directory even when the probe throws', async () => {
+  const fs = require('node:fs/promises');
+  let observedHomeDir;
+  await resolvePlanAdmission({
+    repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+    config: {},
+    d: {
+      readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+      cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+      runPreflight: async ({ env }) => { observedHomeDir = env.HOME; throw new Error('probe crashed'); },
+      workingTreeFingerprint: async () => 'fp-stable',
+    },
+  });
+  assert.ok(observedHomeDir, 'the isolated home directory must have been created before the throw');
+  await assert.rejects(fs.stat(observedHomeDir), /ENOENT/, 'cleanup must still run when the probe throws');
+});
+
+test('resolvePlanAdmission hard-denies credential-named vars even when safeEnv opts in (Codex #7, CodeRabbit #16)', async () => {
+  // Plan admission runs BEFORE attestation on PR-controlled code, so a
+  // credential-shaped variable must be hard-denied from preflight EVEN IF an
+  // operator (or a compromised config) lists it in safeEnv. Two forms must be
+  // caught: a name the SENSITIVE_ENV_PATTERN already matches (API_TOKEN), and
+  // the AUTHORIZATION gap — `AUTH` in the pattern was anchored with a trailing
+  // `(?:$|_)`, so `AUTHORIZATION` (AUTH + 'O') and `HTTP_AUTHORIZATION` slipped
+  // through. A regression in the plan-preflight sanitizer would let a
+  // repository-local probe read a real bearer token.
+  const credNames = ['API_TOKEN', 'AUTHORIZATION', 'HTTP_AUTHORIZATION'];
+  const previous = Object.fromEntries(credNames.map((name) => [name, process.env[name]]));
+  for (const name of credNames) process.env[name] = 'bearer must-not-reach-probes';
+  let preflightEnv;
+  try {
+    await resolvePlanAdmission({
+      repo: '/r', baseSha: 'b1', headSha: 'h1', configDigest: 'd1',
+      // A hostile/misconfigured safeEnv tries to opt the credentials in.
+      config: { safeEnv: credNames },
+      d: {
+        readLiveGateAttestation: async () => ({ status: 'PASS', evidence: 'attested' }),
+        cleanTreeStatus: async () => ({ status: 'PASS', evidence: 'clean' }),
+        runPreflight: async ({ env }) => { preflightEnv = env; return { status: 'PASS', checks: [], toolVersions: {} }; },
+        workingTreeFingerprint: async () => 'fp-stable',
+      },
+    });
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  for (const name of credNames) {
+    assert.equal(preflightEnv[name], undefined,
+      `${name} must be hard-denied from plan preflight even when listed in safeEnv`);
+  }
 });
 
 test('planOnly output carries the admission block', async () => {

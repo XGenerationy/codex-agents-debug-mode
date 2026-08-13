@@ -1,5 +1,5 @@
 const { execFile, execFileSync } = require('node:child_process');
-const { constants, existsSync } = require('node:fs');
+const { constants, existsSync, openSync } = require('node:fs');
 const { lstat, open } = require('node:fs/promises');
 const path = require('node:path');
 const { promisify } = require('node:util');
@@ -39,22 +39,35 @@ const assertNotSymlink = async (target, message) => {
  *
  * Duplicates are collapsed so platforms missing one constant still get a
  * short path (preferred → plain).
+ *
+ * `requireNoFollow` (default false, CodeRabbit PR7 #6Yb1dD): when true, every
+ * returned attempt keeps `noFollow` set — the NONBLOCK-only and plain-flags
+ * fallbacks (which drop it) are omitted entirely. A caller doing a
+ * destructive, truncating WRITE (unlike a read, whose result can simply be
+ * discarded if the opened fd turns out not to be the expected file) cannot
+ * safely fall through to a link-following open: `O_TRUNC` destroys whatever
+ * the open resolves to at open time, before any caller-side check can run.
+ * If `noFollow` itself is 0 (the platform has no O_NOFOLLOW at all), there is
+ * no attempt that can carry real link-following protection. A destructive
+ * caller must apply an independent symlink guard before calling this helper
+ * (writeEvidenceFile's lstat-based guard on Windows is exactly this).
  * @param {number} flags
  * @param {number} noFollow
  * @param {number} nonBlock
+ * @param {boolean} [requireNoFollow=false]
  * @returns {number[]}
  */
-const openNoFollowFlagAttempts = (flags, noFollow, nonBlock) => {
+const openNoFollowFlagAttempts = (flags, noFollow, nonBlock, requireNoFollow = false) => {
   const attempts = [];
   const add = (value) => {
     if (!attempts.includes(value)) attempts.push(value);
   };
   add(flags | noFollow | nonBlock);
   if (noFollow && nonBlock) {
-    add(flags | nonBlock);
+    if (!requireNoFollow) add(flags | nonBlock);
     add(flags | noFollow);
   }
-  add(flags);
+  if (!requireNoFollow) add(flags);
   return attempts;
 };
 
@@ -101,6 +114,58 @@ const openNoFollow = async (target, flags = constants.O_RDONLY, mode = 0o666) =>
   for (let i = 0; i < attempts.length; i += 1) {
     try {
       return await open(target, attempts[i], mode);
+    } catch (error) {
+      lastError = error;
+      const canRetry = i < attempts.length - 1 && unsupported(error?.code);
+      if (!canRetry) throw error;
+    }
+  }
+  throw lastError;
+};
+
+/**
+ * Synchronous counterpart to openNoFollow, for callers (like the closeout
+ * action's support.js) that are fully sync throughout and cannot take on an
+ * async conversion just for this one open call. Identical flag-selection and
+ * unsupported-flag-recovery behavior — same openNoFollowFlagAttempts,
+ * fs.openSync in place of fs.promises.open. Returns a numeric file
+ * descriptor (not a FileHandle); callers are responsible for fs.closeSync.
+ *
+ * `requireNoFollow` (default false, CodeRabbit PR7 #6Yb1dD): set true for a
+ * destructive, truncating write (an evidence file, e.g. `O_WRONLY|O_CREAT|
+ * O_TRUNC`) where following a raced-in symlink would destroy an arbitrary
+ * target the instant the open succeeds — unlike a read, there is no
+ * after-the-fact check that can undo that. With it set, this drops the
+ * fully-bare fallback attempt (the one with NEITHER extra flag), so if the
+ * platform genuinely supports O_NOFOLLOW (a nonzero `constants.O_NOFOLLOW`)
+ * but the OS rejects every attempt that carries it as unsupported, this
+ * throws that real error instead of silently opening through a followed
+ * symlink. On a platform where O_NOFOLLOW is entirely unavailable
+ * (`constants.O_NOFOLLOW` reports 0, e.g. some Windows builds) OR'ing it in
+ * is already a no-op, so this is unaffected there — those platforms never
+ * had NOFOLLOW-level protection from this function to begin with; the
+ * caller's own primary guard (an lstat-based symlink check before calling
+ * this, as writeEvidenceFile already runs) is what protects them, exactly
+ * as openNoFollow's own documented contract already requires.
+ * @param {string} target
+ * @param {number} [flags=constants.O_RDONLY]
+ * @param {number} [mode=0o666]
+ * @param {boolean} [requireNoFollow=false]
+ * @returns {number} file descriptor
+ */
+const openNoFollowSync = (target, flags = constants.O_RDONLY, mode = 0o666, requireNoFollow = false) => {
+  if (!Number.isInteger(flags)) {
+    throw new TypeError('openNoFollowSync requires numeric fs.constants flags.');
+  }
+  const noFollow = constants.O_NOFOLLOW || 0;
+  const nonBlock = constants.O_NONBLOCK || 0;
+  const attempts = openNoFollowFlagAttempts(flags, noFollow, nonBlock, requireNoFollow);
+  const unsupported = (code) => ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'].includes(code);
+
+  let lastError;
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      return openSync(target, attempts[i], mode);
     } catch (error) {
       lastError = error;
       const canRetry = i < attempts.length - 1 && unsupported(error?.code);
@@ -337,6 +402,7 @@ module.exports = {
   looksLikeWindowsRoot,
   openNoFollow,
   openNoFollowFlagAttempts,
+  openNoFollowSync,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,

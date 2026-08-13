@@ -65,6 +65,70 @@ test('gitChildEnv strips GIT_* keys case-insensitively (Windows env bypass)', ()
   assert.equal(sanitized.NOT_GIT_RELATED, 'keep');
 });
 
+test('gitChildEnv preserves only safe.directory GIT_CONFIG_* triples', () => {
+  // The Codex harness marks dubious-ownership worktrees as safe by injecting
+  // GIT_CONFIG_COUNT / GIT_CONFIG_KEY_N / GIT_CONFIG_VALUE_N triples. We must
+  // keep safe.directory pairs (so `git merge-base` works) while still stripping
+  // every other GIT_* key including executable-pointing diff.external triples
+  // (CodeRabbit #4781498400, Qodo #4781532944).
+  const sanitized = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    GIT_DIR: '/evil',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'safe.directory',
+    GIT_CONFIG_VALUE_0: '/repo',
+    GIT_CONFIG_KEY_1: 'diff.external',
+    GIT_CONFIG_VALUE_1: '/evil/diff',
+  });
+  const remaining = Object.keys(sanitized).sort();
+  assert.deepEqual(remaining, ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'HOME', 'PATH']);
+  assert.equal(sanitized.GIT_CONFIG_COUNT, '1');
+  assert.equal(sanitized.GIT_CONFIG_KEY_0, 'safe.directory');
+  assert.equal(sanitized.GIT_CONFIG_VALUE_0, '/repo');
+  assert.equal(sanitized.GIT_CONFIG_KEY_1, undefined);
+  assert.equal(sanitized.GIT_CONFIG_VALUE_1, undefined);
+  assert.equal(sanitized.GIT_DIR, undefined);
+  assert.equal(sanitized.GIT_EXTERNAL_DIFF, undefined);
+});
+test('gitChildEnv preserves mixed-case Git_Config_* safe.directory triples (CodeRabbit #6X7tKX)', () => {
+  // Windows env names are case-insensitive; the Codex harness and other
+  // wrappers may inject Git_Config_Count / Git_Config_Key_0 / Git_Config_Value_0
+  // in mixed case. The sanitizer's findKey helper normalizes case-insensitively,
+  // so a mixed-case safe.directory triple is preserved with the normalized
+  // uppercase output keys.
+  const sanitized = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    Git_Config_Count: '1',
+    Git_Config_Key_0: 'safe.directory',
+    Git_Config_Value_0: '/repo',
+    Git_Dir: '/evil',
+  });
+  const remaining = Object.keys(sanitized).sort();
+  assert.deepEqual(remaining, ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'HOME', 'PATH']);
+  assert.equal(sanitized.GIT_CONFIG_COUNT, '1');
+  assert.equal(sanitized.GIT_CONFIG_KEY_0, 'safe.directory');
+  assert.equal(sanitized.GIT_CONFIG_VALUE_0, '/repo');
+});
+test('gitChildEnv caps inherited GIT_CONFIG_COUNT to avoid DoS (CodeRabbit #6X72Zj)', () => {
+  // A wrapper or hostile local invocation could set GIT_CONFIG_COUNT to an
+  // absurd value; the loop previously iterated that many times before any
+  // Git command could run. Counts above the cap are treated as 0 so the loop
+  // is skipped entirely (safe.directory discovery is best-effort anyway —
+  // any sane workflow has far fewer than 256 git-config overrides).
+  const hostile = gitChildEnv({
+    PATH: '/usr/bin',
+    HOME: '/tmp/home',
+    GIT_CONFIG_COUNT: '1000000000',
+    GIT_CONFIG_KEY_0: 'safe.directory',
+    GIT_CONFIG_VALUE_0: '/repo',
+  });
+  assert.equal(hostile.GIT_CONFIG_COUNT, undefined,
+    'an absurd GIT_CONFIG_COUNT is dropped (no iterations performed)');
+  assert.equal(hostile.GIT_CONFIG_KEY_0, undefined,
+    'no GIT_CONFIG_KEY_* triples are emitted when the count is capped out');
+});
 const fixtureRepo = async () => {
   const repo = await mkdtemp(path.join(tmpdir(), 'closeout-repo-'));
   git(repo, 'init', '--quiet');

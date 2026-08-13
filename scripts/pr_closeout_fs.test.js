@@ -1,16 +1,21 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { constants } = require('node:fs');
+const {
+  closeSync, constants, readFileSync, readSync, writeSync,
+} = require('node:fs');
 const { mkdtemp, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+
+const { symlink } = require('node:fs/promises');
 
 const {
   assertNotSymlink,
   isSameLockIdentity,
   openNoFollow,
   openNoFollowFlagAttempts,
+  openNoFollowSync,
 } = require('./pr_closeout_fs');
 
 test('openNoFollow defaults to O_RDONLY when flags are omitted', async () => {
@@ -100,6 +105,81 @@ test('openNoFollow does not hang when the path is a FIFO', { timeout: 10000 }, a
   }
 });
 
+test('openNoFollowSync defaults to O_RDONLY when flags are omitted', async () => {
+  // Sync mirror of the openNoFollow default-flags test above -- support.js's
+  // writeEvidenceFile consumes this synchronously, so it needs the same
+  // one-argument-stays-valid contract as its async counterpart.
+  const dir = await mkdtemp(path.join(tmpdir(), 'closeout-fs-sync-'));
+  const file = path.join(dir, 'sample.txt');
+  try {
+    await writeFile(file, 'hello-open-nofollow-sync\n', 'utf8');
+    const fd = openNoFollowSync(file);
+    try {
+      const buf = Buffer.alloc(32);
+      const bytesRead = readSync(fd, buf, 0, buf.length, 0);
+      assert.equal(buf.subarray(0, bytesRead).toString('utf8'), 'hello-open-nofollow-sync\n');
+    } finally {
+      closeSync(fd);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('openNoFollowSync rejects non-integer flags', () => {
+  assert.throws(
+    () => openNoFollowSync('/tmp/unused', 'r'),
+    /numeric fs\.constants flags/i,
+  );
+  assert.throws(
+    () => openNoFollowSync('/tmp/unused', 'a'),
+    TypeError,
+  );
+});
+
+test('openNoFollowSync accepts explicit numeric write flags and round-trips content', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'closeout-fs-sync-w-'));
+  const file = path.join(dir, 'out.txt');
+  try {
+    const fd = openNoFollowSync(
+      file,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+      0o600,
+    );
+    try {
+      writeSync(fd, 'written-sync\n', null, 'utf8');
+    } finally {
+      closeSync(fd);
+    }
+    assert.equal(readFileSync(file, 'utf8'), 'written-sync\n');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('openNoFollowSync refuses to follow a symlink swapped in for the target', { skip: (process.platform === 'win32' || !(constants.O_NOFOLLOW > 0)) && 'requires O_NOFOLLOW support' }, async () => {
+  // This is the exact TOCTOU this function exists to close (chatgpt-codex-
+  // connector PR7 #6Yawd4): writeEvidenceFile's lstatSync guard runs, then
+  // (in a real attack) a symlink gets replanted before the open. Proving the
+  // open itself refuses to follow a symlink -- not just that a caller-side
+  // lstat happened to catch it earlier -- is what distinguishes this from the
+  // pre-fix openSync(target, 'w') call.
+  const dir = await mkdtemp(path.join(tmpdir(), 'closeout-fs-sync-symlink-'));
+  const secret = path.join(dir, 'secret.txt');
+  const link = path.join(dir, 'evidence.json');
+  try {
+    await writeFile(secret, 'do-not-overwrite\n', 'utf8');
+    await symlink(secret, link);
+    assert.throws(
+      () => openNoFollowSync(link, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600),
+      /ELOOP/,
+    );
+    assert.equal(readFileSync(secret, 'utf8'), 'do-not-overwrite\n', 'the symlink target must be left untouched');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs', () => {
   // Codex UkAeu: ctimeMs has only millisecond resolution, so an unlink+recreate
   // that reuses the freed inode AND lands in the same millisecond can collide
@@ -152,4 +232,31 @@ test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () 
     flags,
   ]);
   assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0), [flags]);
+});
+
+test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lacks NOFOLLOW (CodeRabbit PR7 #6Yb1dD)', () => {
+  // A destructive, truncating write cannot safely fall back to a
+  // link-following open the way a read can (a read's result can simply be
+  // discarded; a truncating write destroys its target the instant open
+  // succeeds). requireNoFollow removes the NONBLOCK-only and fully-bare
+  // fallback attempts, so the retry loop can never land on a combo that
+  // omits real NOFOLLOW protection when the platform actually has it.
+  const flags = 0;
+  const noFollow = 0x100;
+  const nonBlock = 0x800;
+  assert.deepEqual(openNoFollowFlagAttempts(flags, noFollow, nonBlock, true), [
+    flags | noFollow | nonBlock,
+    flags | noFollow,
+  ], 'both remaining attempts must carry NOFOLLOW; NONBLOCK-only and bare flags are both dropped');
+  // On a platform where O_NOFOLLOW is entirely unavailable (noFollow === 0,
+  // e.g. Windows), OR'ing it into every attempt is already a no-op -- there
+  // is no attempt that COULD carry real protection either way, so this must
+  // NOT throw or produce an empty list; it degrades to whatever nonBlock
+  // alone provides, identical to what already happens today on those
+  // platforms (their real protection is the caller's own lstat guard, not
+  // this function).
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, nonBlock, true), [flags | nonBlock],
+    'a platform with no O_NOFOLLOW constant must still get a usable attempt list, not an empty one');
+  assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0, true), [flags],
+    'a platform with neither extra flag must still get the plain attempt');
 });

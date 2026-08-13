@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const { openNoFollow } = require('./pr_closeout_fs');
 const { runCloseoutWorkflow } = require('./pr_closeout_workflow');
+const { redactCredentialPatterns } = require('./pr_closeout_stream');
 
 const HELP = `Usage: pr_closeout.js --repo <path> --base-ref <ref> [options]
 
@@ -239,7 +240,14 @@ const main = async () => {
     })}\n`);
     if (result.report.overallStatus !== 'PASS') process.exitCode = 2;
   } catch (error) {
-    process.stderr.write(`pr-closeout: ${error.message}\n`);
+    // Redact credential-bearing values that may be embedded in a git/gh
+    // diagnostic error.message (token in a URL, an echoed Authorization header,
+    // a literal ghp_ token) before it reaches stderr or the JSON record. The
+    // value-based streaming redactor only catches known env secret values; a
+    // credential woven into diagnostic text by a wrapped CLI is caught here by
+    // pattern. A false positive is harmless; a miss is a credential exposure.
+    const safeMessage = redactCredentialPatterns(error?.message || String(error));
+    process.stderr.write(`pr-closeout: ${safeMessage}\n`);
     // Emit a machine-readable BLOCKED record so callers still get structured
     // evidence when init throws before an output directory/report is created
     // (bad repo path, missing base ref, unreadable metadata, etc.). Without
@@ -247,7 +255,7 @@ const main = async () => {
     process.stdout.write(`${JSON.stringify({
       status: 'BLOCKED',
       overallStatus: 'BLOCKED',
-      error: error?.message || String(error),
+      error: safeMessage,
     })}\n`);
     process.exitCode = 3;
   }

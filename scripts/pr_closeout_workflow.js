@@ -8,7 +8,9 @@ const {
   readSync,
 } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { link, lstat, mkdir, open: openFile, realpath, rename, stat, unlink } = require('node:fs/promises');
+const {
+  link, lstat, mkdir, mkdtemp, open: openFile, realpath, rename, rm, stat, unlink,
+} = require('node:fs/promises');
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
@@ -19,7 +21,9 @@ const {
   verifyBaseline,
   verifyGeneratorReproducibility,
 } = require('./pr_closeout_git');
-const { gateAttestationMarker, readLiveGateAttestation, readLivePrState } = require('./pr_closeout_github');
+const {
+  gateAttestationMarker, readLiveGateAttestation, readLivePrState, revokeDelegatedGhToken,
+} = require('./pr_closeout_github');
 const { createCommandExecutor, redactStructure, runPreflight, TOOL_PROBES } = require('./pr_closeout_process');
 const { writeEvidenceReport } = require('./pr_closeout_report');
 const {
@@ -730,14 +734,189 @@ const ESSENTIAL_ENV = new Set([
  * @param {{requiredEnv?: string[], safeEnv?: string[]}} config
  * @returns {NodeJS.ProcessEnv}
  */
+// Runner command-file names that must NEVER pass to PR-controlled processes
+// (plan preflight or full-run commands) regardless of config. These are not
+// credentials — they are runner-control surfaces.
+const DENYLISTED_ENV_NAMES = new Set([
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GITHUB_ENV',
+  'GITHUB_PATH',
+  'GITHUB_OUTPUT',
+  'GITHUB_STEP_SUMMARY',
+  'GITHUB_STATE',
+]);
+// Mirrors pr_closeout_stream.js's SENSITIVE_ENV_NAME plus the NPM _auth suffix.
+// Applied ONLY to untrusted plan admission (buildPlanPreflightEnvironment), NOT
+// to full-run command execution (buildWorkflowEnvironment) — a full run is
+// attested and may legitimately need credential-shaped requiredEnv/safeEnv.
+// Broader than pr_closeout_stream.js's SENSITIVE_ENV_NAME: adds bare KEY,
+// LICENSE, CONFIG (catches KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE→FILE),
+// CREDENTIALS (plural), and _AUTH suffix (catches NPM_CONFIG__AUTH).
+const SENSITIVE_ENV_PATTERN = /(?:^|_)(?:ACCESS_KEY|API_KEY|AUTH|AUTH_CONFIG|AUTHORIZATION|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|CONFIG|CONNECTION_STRING|COOKIE|CREDENTIAL|CREDENTIALS|DATABASE_URL|DSN|ENCRYPTION_KEY|FILE|KEY|KUBECONFIG|LICENSE|MYSQL_PWD|PASSWORD|PASSWD|PGPASSWORD|PRIVATE_KEY|REDIS_URL|SECRET|SESSION_TOKEN|SIGNING_KEY|TOKEN|URI)(?:$|_)/i;
+
+// Full-run environment: ESSENTIAL_ENV + requiredEnv/safeEnv, minus the runner
+// command-file denylist. Credential-shaped names ARE allowed here because a
+// full run is attested and may legitimately need them (API_TOKEN, etc.).
 const buildWorkflowEnvironment = (env, config) => {
   const explicit = new Set([
     ...(config.requiredEnv || []),
     ...(config.safeEnv || []),
   ].map((name) => String(name).toUpperCase()));
-  return Object.fromEntries(Object.entries(env).filter(([name]) => (
-    ESSENTIAL_ENV.has(name.toUpperCase()) || explicit.has(name.toUpperCase())
+  return Object.fromEntries(Object.entries(env).filter(([name]) => {
+    const upper = name.toUpperCase();
+    if (DENYLISTED_ENV_NAMES.has(upper)) return false;
+    return ESSENTIAL_ENV.has(upper) || explicit.has(upper);
+  }));
+};
+
+// Plan-preflight environment: ESSENTIAL_ENV only — config.requiredEnv/safeEnv
+// are NOT honored here (chatgpt-codex-connector PR7 #6Yb3lZ, P1). Plan
+// admission runs BEFORE attestation on PR-controlled code, and `config` ITSELF
+// is read from the checked-out (therefore PR-controlled) config path: a PR can
+// add an existing job secret's NAME to safeEnv — however innocuously chosen,
+// e.g. DEPLOY_CRED rather than DEPLOY_CREDENTIAL — and have it forwarded to a
+// repository-local preflight probe it also controls (e.g. a `prisma`
+// preflight), before any independent review ever runs. An earlier version of
+// this function reused buildWorkflowEnvironment's explicit allowlist (which
+// DOES honor config.requiredEnv/safeEnv, correct for the FULL attested run)
+// and only additionally stripped names matching SENSITIVE_ENV_PATTERN — a
+// finite, name-shape heuristic that a secret under an unrecognized name
+// (DEPLOY_CRED does not match ACCESS_KEY/CREDENTIAL/SECRET/TOKEN/etc.) simply
+// walks around. The PR-controlled allowlist itself was the hole, not the
+// heuristic that tried to patch it after the fact. Once a run is attested,
+// buildWorkflowEnvironment (above) is what legitimately restores the
+// explicit-allowlist behavior for the full run's own credential needs.
+//
+// ANCESTOR-PROCFS EXPOSURE (chatgpt-codex-connector PR7 #6YaZ5K, and its P1
+// follow-up #6Yd4Qv): filtering the probe's OWN spawn env does not stop it
+// from reading an ANCESTOR process's environment. On Linux, another process
+// sharing the UID may read /proc/<pid>/environ when the runner's ptrace policy
+// permits it — not only a child (access is gated by a PTRACE_MODE_READ_FSCREDS
+// check; the classic same-UID case allows it, but a stricter Yama
+// ptrace_scope, a non-dumpable target, or a missing CAP_SYS_PTRACE/CAP_PERFMON
+// can each independently deny it — CodeRabbit PR7 #6YbIQJ) — and reflects a
+// process's env as of its OWN execve(), unaffected by any later env filtering
+// an ancestor performs on ITS OWN process.env. Every process in this job's
+// tree (the runner's shell, this Node process, the spawned CLI, and the probe
+// itself) shares one UID.
+//
+// FIXED for GH_TOKEN in the plan tier (#6Yd4Qv): the GH_TOKEN that once
+// reached this whole tree via the WORKFLOW/action `env:` on the gate step is
+// no longer set there at all. It is staged into an owner-only FILE by a
+// separate earlier step and handed only to the short-lived `gh` LEAF process
+// via that leaf's own spawn env (pr_closeout_github.js
+// acquireDelegatedGhToken), and resolvePlanAdmission REVOKES that file (see
+// revokeDelegatedGhToken, called just above the runPreflight probe below)
+// before any repository-controlled code runs. So for a plan preview no probe
+// ancestor has ever held GH_TOKEN in its exec-time environ, and the token file
+// is gone before the probe spawns — the /proc/<pid>/environ read no longer
+// yields the token.
+//
+// STILL a residual, deliberately not chased further here: (1) the denylisted
+// runner command-file PATHS (GITHUB_ENV/GITHUB_OUTPUT/…) are still present in
+// ancestor environs, though they are not credentials; (2) in the FULL,
+// attested tier the token file necessarily outlives the preflight probe
+// (authenticated reads follow it), so a full-tier probe — which runs only
+// after a WRITE-access reviewer attested this exact snapshot — could still
+// read the token file by path; (3) a same-UID ptrace attach could read this
+// CLI's heap where the runner's ptrace_scope permits attaching to an ancestor.
+// A complete fix for those requires an OS-level process/privilege boundary (a
+// container, a different UID) — out of scope for a targeted change here. The
+// token itself is scoped to the consuming job's `permissions:` grant, which
+// bounds the practical impact of any residual leak.
+//
+// EXPLORED, deliberately NOT implemented (owner-approved investigation, this
+// PR): wrapping the plan-mode probe spawn in `unshare --user --map-root-user
+// --pid --mount-proc --fork -- <shell> ...` so the probe process gets its own
+// PID namespace with a freshly-mounted, namespace-scoped /proc — the standard
+// way to make a child unable to see (or read /proc/<pid>/environ for)
+// anything outside its own subtree, while the PARENT retains full visibility
+// (PID namespaces nest: an ancestor namespace always sees descendant-
+// namespace processes too, just under different numbering — verified against
+// util-linux's own unshare(1) documentation of `--mount-proc`/`--fork`).
+// runPreflight already accepts a `probeCommand` override and
+// probeCommandDefault a `spawnProcess` override, so wiring this in would not
+// have required touching either shared primitive.
+//
+// Two independent reasons this was not wired into the live spawn path:
+//   1. It may not even work on the actual target runner (GitHub-hosted
+//      ubuntu-latest). Recent Ubuntu releases ship an AppArmor
+//      `unprivileged_userns` restriction (a downstream hardening patch, ON
+//      BY DEFAULT specifically to reduce attack surface on hosts that run
+//      untrusted code — precisely this runner's own threat model) that can
+//      make unprivileged `unshare --user ...` fail with EPERM even when the
+//      `kernel.unprivileged_userns_clone` sysctl itself is 1. Whether
+//      GitHub's current runner image allows it is not something this
+//      repository controls or can assume, and could change on any future
+//      image update regardless. Any implementation MUST self-verify success
+//      (e.g. spawn `unshare --user --map-root-user --pid --mount-proc
+//      --fork -- sh -c 'echo $$'` once and confirm it prints `1`, proving a
+//      genuinely new PID namespace) and fall back to the unwrapped spawn on
+//      any failure — silently claiming isolation that did not actually take
+//      effect would be worse than the status quo.
+//   2. probeCommandDefaultInner's own orphan-sweep/termination path
+//      (terminateProcessTree) kills the POSIX process GROUP via
+//      `kill(-child.pid, signal)`, relying on every descendant remaining in
+//      the process group `detached: true` placed the spawned root in.
+//      `unshare --fork`'s forked child does not itself call `setsid`/
+//      `setpgid`, so group membership should be preserved through the extra
+//      layer — but this interaction between process-group signal delivery
+//      and PID-namespace nesting is exactly the kind of kernel behavior that
+//      needs verifying with a real spawn-and-kill integration test on actual
+//      Linux, which this development environment could not provide. Wiring
+//      an unverified extra process layer into the spawn path risks a
+//      regression in the existing, heavily-tested no-orphaned-process
+//      guarantee — a strictly worse outcome than leaving this gap as-is,
+//      for a mitigation whose own benefit is already bounded by the token's
+//      narrow read-only scope. Left for a maintainer with real Linux CI
+//      access to implement and verify, following the self-check-first
+//      design above.
+// HOME/USERPROFILE/APPDATA/LOCALAPPDATA are in ESSENTIAL_ENV because ordinary
+// tool invocation needs SOME profile directory to resolve against — but their
+// REAL values point at the runner's actual home/profile, where credential-
+// bearing files live on disk regardless of what is or is not in process.env:
+// ~/.npmrc, ~/.netrc, ~/.gitconfig (credential helpers), ~/.config/gh
+// (the GitHub CLI's own token store), cloud CLI config directories, etc. A
+// repository-controlled preflight probe (an arbitrary command this same
+// config names) can read those files directly by path -- entirely bypassing
+// the env-NAME filtering above, which only ever controlled what appears as
+// an env VALUE (CodeRabbit PR7 #6Yb44Sd, following up on the earlier,
+// distinct #6YaZ5K procfs-ancestor finding). isolatedHomeDir (when provided
+// by the caller, which creates and cleans up a fresh empty temp directory
+// around the probe call) replaces all four names with that path, so any
+// profile-relative credential lookup resolves to an empty directory instead
+// of the real one.
+const HOME_ENV_NAMES = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'];
+
+const buildPlanPreflightEnvironment = (env, isolatedHomeDir = null) => {
+  const filtered = Object.fromEntries(Object.entries(env).filter(([name]) => {
+    const upper = name.toUpperCase();
+    if (DENYLISTED_ENV_NAMES.has(upper)) return false;
+    return ESSENTIAL_ENV.has(upper);
+  }));
+  // Belt-and-suspenders only at this point: no PR-controlled name can reach
+  // `filtered` above, so this can only ever fire against a future accidental
+  // credential-shaped addition to the fixed ESSENTIAL_ENV list itself.
+  const sanitized = Object.fromEntries(Object.entries(filtered).filter(([name]) => (
+    !SENSITIVE_ENV_PATTERN.test(name)
   )));
+  if (isolatedHomeDir) {
+    for (const name of HOME_ENV_NAMES) {
+      // Preserve the ambient casing (env.HOME vs env.Home never both exist on
+      // one platform) when the name was already present; otherwise set the
+      // canonical (already-uppercase) name outright. A name absent from the
+      // ambient env must still be forced to the isolated directory, not left
+      // unset — Node's os.homedir() (and other profile-resolving platform
+      // APIs) falls back to OS-level lookups (getpwuid on POSIX, the
+      // Windows profile API) when its env var is undefined, which would
+      // silently resolve to the REAL home directory and defeat the
+      // isolation this function exists to provide (CodeRabbit PR7 #6Yb44Sl).
+      const actualName = Object.keys(sanitized).find((key) => key.toUpperCase() === name) || name;
+      sanitized[actualName] = isolatedHomeDir;
+    }
+  }
+  return sanitized;
 };
 
 /**
@@ -980,10 +1159,118 @@ const resolvePlanAdmission = async ({ repo, baseSha, headSha, configDigest, conf
       evidence: `Preflight did not run because the working tree was not clean: ${cleanTree?.evidence}`,
     };
   } else {
+    // Mirror the full-gate seal (runCloseoutWorkflowBody): capture a
+    // working-tree fingerprint BEFORE the probe so a repository-local binary
+    // mutating a GITIGNORED path (node_modules/.bin, generated artifacts, the
+    // prisma client dirs) is caught — cleanTreeStatus respects .gitignore and
+    // would miss such a mutation. The fingerprint folds in the
+    // reproducibilityPaths (config.reproducibilityPaths + the prisma client
+    // dirs) so the same set is observed before and after.
+    const reproducibilityPaths = [...new Set([
+      'node_modules/.prisma',
+      'node_modules/@prisma/client',
+      ...(config.reproducibilityPaths || []),
+    ])];
+    let preProbeFingerprint;
     try {
-      preflight = await d.runPreflight({ repo, config, env: process.env, toolProbes });
+      preProbeFingerprint = await d.workingTreeFingerprint(repo, reproducibilityPaths);
+    } catch (error) {
+      preflight = { status: 'BLOCKED', evidence: `Pre-preflight fingerprint failed: ${error.message}` };
+      return { attestation, cleanTree, preflight };
+    }
+    try {
+      // Plan probes get a fixed, code-defined environment (ESSENTIAL_ENV
+      // only — see buildPlanPreflightEnvironment), not raw process.env:
+      // preflight spawns repository-controlled binaries (e.g. `pnpm prisma
+      // --version`), and forwarding the full step env would expose runner
+      // command files (GITHUB_ENV/GITHUB_OUTPUT) and job secrets to
+      // PR-controlled code in a preview advertised as read-only. The parent
+      // gh lookups do not use this env — they authenticate via the delegated
+      // token file (pr_closeout_github.js acquireDelegatedGhToken), which is
+      // handed only to the `gh` leaf process and has been revoked just above
+      // this point so it is no longer readable by the probe about to spawn
+      // (chatgpt-codex-connector PR7 #6Yd4Qv).
+      //
+      // `config` itself is passed with requiredEnv/safeEnv cleared
+      // (CodeRabbit PR7 #6Yb44Sc): runPreflight (scripts/pr_closeout_process.js)
+      // separately checks EVERY config.requiredEnv name for presence in the
+      // given env and reports each missing one as its own BLOCKED
+      // `env:<name>` check. Since the env above deliberately no longer
+      // carries config-named credentials at all, passing the untouched
+      // config through would report every configured requiredEnv name as
+      // missing on every plan preview -- a false BLOCKED for any repo that
+      // legitimately requires a credential for its ATTESTED full run,
+      // which plan preflight was never supposed to need in the first
+      // place. Every other config field (services, ports, requiredTools,
+      // reproducibilityPaths, minFreeDiskGb, etc.) is preserved unchanged.
+      //
+      // isolatedHomeDir (CodeRabbit PR7 #6Yb44Sd): HOME/USERPROFILE/APPDATA/
+      // LOCALAPPDATA in the env above still carry the runner's REAL profile
+      // paths, where credential-bearing files (~/.npmrc, ~/.netrc, the gh
+      // CLI's own token store, cloud CLI configs) live on disk regardless of
+      // what is or is not in process.env -- a repository-controlled probe
+      // can read those directly by path. A fresh, empty temp directory
+      // substituted for all four names means any such profile-relative
+      // lookup resolves to nothing. Removed in the finally below regardless
+      // of how the probe call ends, including a throw.
+      const planPreflightConfig = { ...config, requiredEnv: [], safeEnv: [] };
+      // Revoke the delegated workflow token BEFORE spawning the first (and, in
+      // the plan tier, only) repository-controlled probe (chatgpt-codex-
+      // connector PR7 #6Yd4Qv, P1). The attestation read above is the sole
+      // authenticated GitHub call in this tier and has already completed, so
+      // the off-environment token file staged for it is no longer needed. The
+      // token never sat in this process's (or any ancestor's) exec-time
+      // environ — action.yml keeps GH_TOKEN out of the gate step entirely — so
+      // the file was the only remaining path by which a same-UID probe could
+      // reach the token; deleting it here removes that too. A no-op unless the
+      // hardened action path is in use (CLOSEOUT_GH_TOKEN_FILE set); it throws
+      // only if the file is present but cannot be removed, in which case the
+      // outer catch turns preflight into a BLOCKED preview rather than run an
+      // untrusted probe while the token file still exists. Called as the
+      // module import (not through `d`) so revocation can never be silently
+      // dropped by a caller that supplies a partial dependency object.
+      revokeDelegatedGhToken(process.env);
+      let isolatedHomeDir;
+      try {
+        isolatedHomeDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-plan-home-'));
+        preflight = await d.runPreflight({
+          repo,
+          config: planPreflightConfig,
+          env: buildPlanPreflightEnvironment(process.env, isolatedHomeDir),
+          toolProbes,
+        });
+      } finally {
+        // Not best-effort (CodeRabbit PR7 #6Yb44Sp): a cleanup failure here
+        // means the isolated profile directory a repository-controlled probe
+        // may have written into was NOT removed. Letting the error propagate
+        // (rather than swallowing it) reaches the outer catch below, which
+        // forces preflight to BLOCKED instead of returning a PASS/FAIL result
+        // computed while that leftover data still exists.
+        if (isolatedHomeDir) await rm(isolatedHomeDir, { recursive: true, force: true });
+      }
     } catch (error) {
       preflight = { status: 'BLOCKED', evidence: `Preflight probe failed: ${error.message}` };
+    }
+    // Recheck the tree after preflight regardless of PASS/FAIL: a probe binary
+    // could modify a tracked file even on a failing/throwing exit. A dirty
+    // post-probe tree must BLOCK the preview and surface the dirt. Use BOTH
+    // cleanTreeStatus (catches tracked-file mutations) AND the fingerprint
+    // (catches gitignored-path mutations cleanTreeStatus cannot see).
+    try {
+      const postProbeTree = await d.cleanTreeStatus(repo);
+      if (postProbeTree.status !== 'PASS') {
+        preflight = { status: 'BLOCKED', evidence: `Working tree was clean before preflight but dirty after: ${postProbeTree.evidence}` };
+      } else {
+        const postProbeFingerprint = await d.workingTreeFingerprint(repo, reproducibilityPaths);
+        if (postProbeFingerprint !== preProbeFingerprint) {
+          preflight = {
+            status: 'BLOCKED',
+            evidence: `Working tree fingerprint changed during preflight (a gitignored path was mutated): ${postProbeFingerprint}`,
+          };
+        }
+      }
+    } catch (error) {
+      preflight = { status: 'BLOCKED', evidence: `Post-preflight tree check failed: ${error.message}` };
     }
   }
   return { attestation, cleanTree, preflight };
@@ -1184,6 +1471,16 @@ const runCloseoutWorkflowBody = async ({
     exclusive: explicitOutputDir,
   });
   const childEnv = buildWorkflowEnvironment(process.env, config);
+  // FIX (Qodo #5): engine check processes run under the allowlisted childEnv,
+  // which drops `GITHUB_BASE_REF`, so engine commands that referenced it
+  // silently fell back to `main` even when the gate ran against a different PR
+  // base. Plumb the already-resolved base ref through a dedicated,
+  // non-secret, repo-derived env var that engine commands can rely on. This
+  // does NOT widen the allowlist for ambient env — it injects one trusted
+  // value derived from `initial.baseRef` (already rev-parsed to a stable ref
+  // by resolveRepositoryState), and the engine command's own `:-origin/main`
+  // fallback keeps it safe for any bare invocation that omits it.
+  childEnv.CLOSEOUT_RESOLVED_BASE_REF = initial.baseSha;
   const execute = d.execute || d.createCommandExecutor({
     repo: initial.repo,
     outputDir: resolvedOutput,
