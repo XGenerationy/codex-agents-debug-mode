@@ -16,7 +16,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { probeReadyCollector, probeServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { probeLaunchToken, probeReadyCollector, probeServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
 
 const STATE_FILE = 'action-state.json';
 const EVIDENCE_SUBDIR = 'debug-evidence-files';
@@ -33,6 +33,28 @@ const writeOutputs = (outputFile, pairs) => {
     .map(([name, value]) => `${name}=${String(value ?? '').replace(/\r?\n|\r/g, ' ')}`)
     .join('\n');
   appendFileSync(outputFile, `${lines}\n`);
+};
+
+const defaultStdoutWrite = (text) => process.stdout.write(text);
+
+// Register a value with the RUNNER's own redactor, so every later log line
+// that happens to contain it is replaced with '***' by Actions itself.
+//
+// This is not belt-and-braces over redactKnownSecrets: that one only cleans
+// strings THIS process chooses to print, and the leak Codex reproduced comes
+// from a printer we do not control. `NODE_DEBUG=http` anywhere in the job env
+// makes Node's own http client dump every request header — `Authorization:
+// Bearer <launch token>` included — straight to stderr, before any of our
+// code sees it (Codex T4 #1). Only the runner can censor that, and only for
+// values it was told about first, which is why both call sites mask BEFORE
+// the token is put on the wire.
+//
+// Gated on the literal 'true' because outside Actions the ::add-mask::
+// command is not interpreted by anything: it would just print the secret it
+// was meant to hide onto a developer's terminal or into a test's stdout.
+const maskValue = (env, value, write = defaultStdoutWrite) => {
+  if (env?.GITHUB_ACTIONS !== 'true' || !value) return;
+  write(`::add-mask::${value}\n`);
 };
 
 const redactKnownSecrets = (text, secrets) => {
@@ -234,6 +256,7 @@ const readShimStartLine = (child, timeoutMs) => new Promise((resolve, reject) =>
 const startSubcommand = async ({
   inputs, outputDir, env = process.env, projectRoot = process.cwd(),
   spawnShim = defaultSpawnShim, probeReady = probeReadyCollector, kill = process.kill,
+  writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
 }) => {
   const workspace = env.GITHUB_WORKSPACE || '';
@@ -274,6 +297,10 @@ const startSubcommand = async ({
   if (startLine.status !== 'started') {
     throw new Error(`collector failed to start: ${startLine.reason ?? 'unknown'}`);
   }
+  // The FIRST thing done with a freshly minted launch token, ahead of the
+  // readiness probe and the state write: from here on the runner scrubs it
+  // out of anything this job logs, including output nobody here wrote.
+  maskValue(env, startLine.launch_token, writeStdout);
   const identity = await probeReady(Number(inputs.port), startLine.project_hash, { deadlineMs: readyTimeoutMs });
   if (!identity || identity.project_hash !== startLine.project_hash || identity.ready !== true) {
     try { kill(startLine.pid); } catch {}
@@ -332,10 +359,38 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
   return 0;
 };
 
+// A collector answer is a status line and a small JSON object; a megabyte is
+// already far past anything the contract produces, so treat more as hostile
+// rather than buffering it into this process's heap.
+const RESPONSE_BYTE_CAP = 1024 * 1024;
+// Inactivity timeout: no bytes moved for this long.
+const REQUEST_IDLE_TIMEOUT_MS = 5_000;
+// Wall-clock ceiling for the WHOLE exchange. The idle timeout alone is not a
+// bound: a peer that dribbles one byte every second resets it forever and the
+// subcommand hangs for the life of the job (Codex T4 #2).
+const REQUEST_DEADLINE_MS = 10_000;
+
 // Minimal JSON-over-loopback helper (node:http; fetch is avoided so tests can
 // inject `request` and so no keep-alive agent outlives the subcommand).
-const httpRequestJson = ({ port, method, path: requestPath, headers = {}, body }) => new Promise((resolve, reject) => {
+//
+// Every exit from this promise is guarded by settle(), because the failure
+// this replaced was not a wrong answer but NO answer: a peer that declared
+// Content-Length: 100, sent ten bytes and hung up produced a response stream
+// that emitted neither 'end' nor 'error', so the promise was never settled
+// and `run` waited forever holding the whole job (Codex T4 #2, reproduced).
+const httpRequestJson = ({
+  port, method, path: requestPath, headers = {}, body,
+  idleTimeoutMs = REQUEST_IDLE_TIMEOUT_MS, deadlineMs = REQUEST_DEADLINE_MS,
+}) => new Promise((resolve, reject) => {
   const payload = body === undefined ? null : JSON.stringify(body);
+  let settled = false;
+  let deadline;
+  const settle = (fn, value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    fn(value);
+  };
   const request = http.request({
     host: '127.0.0.1',
     port,
@@ -344,15 +399,41 @@ const httpRequestJson = ({ port, method, path: requestPath, headers = {}, body }
     headers: payload === null ? headers : { ...headers, 'content-type': 'application/json' },
   }, (response) => {
     let text = '';
-    response.on('data', (chunk) => { text += chunk; });
+    let bytes = 0;
+    let ended = false;
+    // Decode through a StringDecoder rather than concatenating Buffers, so a
+    // multi-byte character split across two chunks cannot be mangled.
+    response.setEncoding('utf8');
+    response.on('data', (chunk) => {
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      if (bytes > RESPONSE_BYTE_CAP) {
+        request.destroy();
+        settle(reject, new Error(`collector response exceeded ${RESPONSE_BYTE_CAP} bytes`));
+        return;
+      }
+      text += chunk;
+    });
     response.on('end', () => {
+      ended = true;
       let json = null;
       try { json = JSON.parse(text); } catch {}
-      resolve({ status: response.statusCode, json });
+      settle(resolve, { status: response.statusCode, json });
+    });
+    response.on('aborted', () => settle(reject, new Error('collector aborted the response')));
+    response.on('error', (error) => settle(reject, error));
+    // 'close' AFTER 'end' is the ordinary finish and settle() already ignores
+    // it; 'close' WITHOUT 'end' is the peer hanging up mid-body — the lying
+    // Content-Length shape above.
+    response.on('close', () => {
+      if (!ended) settle(reject, new Error('collector closed the response before it completed'));
     });
   });
-  request.on('error', reject);
-  request.setTimeout(5_000, () => request.destroy(new Error('collector request timed out')));
+  request.on('error', (error) => settle(reject, error));
+  request.setTimeout(idleTimeoutMs, () => request.destroy(new Error('collector request timed out')));
+  deadline = setTimeout(() => {
+    request.destroy();
+    settle(reject, new Error(`collector request exceeded ${deadlineMs}ms`));
+  }, deadlineMs);
   if (payload !== null) request.write(payload);
   request.end();
 });
@@ -363,6 +444,7 @@ const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', 
 const runSubcommand = async ({
   inputs, outputDir, env = process.env,
   request = httpRequestJson, spawnCommand = defaultSpawnCommand,
+  probeToken = probeLaunchToken, writeStdout = defaultStdoutWrite,
 }) => {
   const state = readState(outputDir);
   if (!state) {
@@ -370,6 +452,18 @@ const runSubcommand = async ({
     return 3;
   }
   if (rejectForeignNonce(state, env, 'run')) return 3;
+  // Recorded state proves a collector was ours WHEN START RAN; it proves
+  // nothing about who holds the port now. If that collector died and any
+  // other local process rebound the port, the very next line would hand a
+  // stranger the launch token in an Authorization header — a credential good
+  // for minting sessions and posting hypotheses for the rest of the job
+  // (Codex T4 #4). probeLaunchToken settles that first and non-mutatingly: it
+  // sends a random challenge and verifies the HMAC proof LOCALLY, so a forged
+  // listener that cannot compute the proof never receives the token at all.
+  if (!(await probeToken(state.port, state.launchToken))) {
+    process.stderr.write(`debug-evidence-action: run: collector identity could not be verified on port ${state.port}; refusing to send the launch token.\n`);
+    return 3;
+  }
   const mint = await request({
     port: state.port,
     method: 'POST',
@@ -383,6 +477,10 @@ const runSubcommand = async ({
   }
   const sessionId = mint.json.session_id;
   const sessionToken = mint.json.session_token;
+  // Masked before the token is used for anything: the hypothesis post below,
+  // the wrapped command's own logging, and Node's http tracing all come after
+  // this line.
+  maskValue(env, sessionToken, writeStdout);
   if (state.hypothesisId) {
     // POST /hypothesis is a LAUNCH-token capability the wrapped command never
     // holds; the action records intent (OPEN) here and never any verdict —
@@ -410,11 +508,33 @@ const runSubcommand = async ({
     DEBUG_SESSION_ID: sessionId,
     DEBUG_SESSION_TOKEN: sessionToken,
   };
-  if (state.hypothesisId) commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
+  if (state.hypothesisId) {
+    commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
+  } else {
+    // The `...env` spread above would otherwise let a job-level
+    // DEBUG_HYPOTHESIS_ID through, and every event the wrapped command logged
+    // would be attributed to a hypothesis THIS action never opened — evidence
+    // filed under a claim nobody made (Codex T4 #5). Delete rather than set to
+    // '', because an empty string is still a present variable.
+    delete commandEnv.DEBUG_HYPOTHESIS_ID;
+  }
   const result = spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
   const commandExitCode = result.error ? 127 : (result.status ?? 128);
+  // Compare-and-swap on the nonce. The snapshot in `state` was read before a
+  // wrapped command that may have run for an hour, and writing it back is a
+  // blind whole-file overwrite: if another invocation claimed this output-dir
+  // meanwhile, the spread below would restore OUR stale pid/port/token over
+  // theirs and strand their live collector (Codex T4 #3). Re-read and re-check
+  // immediately before the write, and on any drift refuse completely — no
+  // state write, and no outputs either, since a session-id emitted from a
+  // state we just declined to own would be a lie.
+  const current = readState(outputDir);
+  if (!current || current.nonce !== state.nonce) {
+    process.stderr.write('debug-evidence-action: run: recorded state changed while the wrapped command ran (another invocation now owns this output-dir); refusing to overwrite it.\n');
+    return 3;
+  }
   writeState(outputDir, {
-    ...state,
+    ...current,
     sessionId,
     sessionToken,
     commandExitCode,
@@ -477,6 +597,7 @@ module.exports = {
   defaultSpawnCommand,
   finishSubcommand,
   httpRequestJson,
+  maskValue,
   readShimStartLine,
   readState,
   redactKnownSecrets,

@@ -12,6 +12,8 @@ const test = require('node:test');
 
 const {
   finishSubcommand,
+  httpRequestJson,
+  maskValue,
   readState,
   redactKnownSecrets,
   reportSubcommand,
@@ -470,9 +472,225 @@ test('run surfaces a session-mint failure as 3 without executing the command', a
     inputs: baseInputs(),
     outputDir,
     env: {},
+    // Occupant auth now runs first and would reject port 1 on its own, which
+    // would make this test pass while proving nothing about the mint path.
+    probeToken: async () => true,
     request: async () => ({ status: 401, json: { error: 'unauthorized' } }),
     spawnCommand: () => { commandRan = true; return { status: 0 }; },
   });
   assert.equal(code, 3);
   assert.equal(commandRan, false, 'no command execution after a failed mint');
+});
+
+// A raw TCP peer that speaks just enough HTTP to be hostile. node:http cannot
+// produce these responses on the server side — it will not promise a
+// Content-Length it then declines to honour — so the bad-peer cases below
+// drive a socket directly.
+const rawHttpPeer = async (respond) => {
+  const sockets = [];
+  const server = net.createServer((socket) => {
+    sockets.push(socket);
+    socket.on('error', () => {}); // the client hangs up on us by design
+    socket.once('data', () => respond(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+};
+
+test('maskValue registers a value with the runner only under GITHUB_ACTIONS=true', () => {
+  const written = [];
+  const write = (text) => written.push(text);
+  maskValue({ GITHUB_ACTIONS: 'true' }, 'launch-token-value', write);
+  assert.deepEqual(written, ['::add-mask::launch-token-value\n']);
+  written.length = 0;
+  // Anything but the literal 'true' means no runner is listening, and the
+  // command would print the secret it exists to hide onto a plain terminal.
+  for (const env of [{}, { GITHUB_ACTIONS: 'false' }, { GITHUB_ACTIONS: '1' }, { GITHUB_ACTIONS: 'TRUE' }]) {
+    maskValue(env, 'launch-token-value', write);
+  }
+  assert.deepEqual(written, [], 'outside Actions the command is noise carrying a secret');
+  maskValue({ GITHUB_ACTIONS: 'true' }, '', write);
+  assert.deepEqual(written, [], 'an empty value masks nothing and Actions rejects it anyway');
+});
+
+test('start masks the launch token the moment the handshake yields it, before the probe or any state write', async () => {
+  const outputDir = makeTempDir();
+  const child = fakeChild();
+  const launchToken = 'x'.repeat(43);
+  // One ledger for both the mask writes and the readiness probe, so ORDER is
+  // asserted rather than mere occurrence: masking after the token had already
+  // been used would satisfy a presence-only check while leaving the window
+  // NODE_DEBUG=http leaks through wide open (Codex T4 #1).
+  const ledger = [];
+  const starting = startSubcommand({
+    inputs: baseInputs(), outputDir, projectRoot: makeTempDir(),
+    env: { GITHUB_ACTIONS: 'true' },
+    spawnShim: () => child,
+    probeReady: async () => { ledger.push('probe-ready'); return { project_hash: 'hash', ready: true }; },
+    writeStdout: (text) => ledger.push(text),
+    readyTimeoutMs: 5_000,
+  });
+  setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken,
+  })}\n`));
+  assert.equal(await starting, 0);
+  assert.deepEqual(ledger, [`::add-mask::${launchToken}\n`, 'probe-ready']);
+  assert.equal(readState(outputDir).launchToken, launchToken, 'masking does not disturb what start records');
+});
+
+test('run masks the session token the moment it is minted, before the hypothesis post and the wrapped command', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug',
+    hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
+  });
+  const sessionToken = 'z'.repeat(43);
+  const ledger = [];
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: { GITHUB_ACTIONS: 'true' },
+    probeToken: async () => true,
+    request: async ({ path: requestPath }) => {
+      ledger.push(`request ${requestPath}`);
+      return requestPath === '/session'
+        ? { status: 201, json: { session_id: 'ci-debug-abc', session_token: sessionToken } }
+        : { status: 202, json: { status: 'recorded' } };
+    },
+    spawnCommand: () => { ledger.push('spawn'); return { status: 0 }; },
+    writeStdout: (text) => ledger.push(text),
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(ledger, [
+    'request /session',
+    `::add-mask::${sessionToken}\n`,
+    'request /hypothesis',
+    'spawn',
+  ]);
+});
+
+test('httpRequestJson always settles: a lying Content-Length, a trickling peer, and an over-cap body all reject', async () => {
+  // 1. Headers promise 100 bytes, ten arrive, then the peer hangs up. The old
+  // helper saw neither 'end' nor 'error' on this path, so the promise never
+  // settled and run() waited out the entire job (Codex T4 #2, reproduced).
+  const liar = await rawHttpPeer((socket) => {
+    socket.write('HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"partial"');
+    setTimeout(() => socket.destroy(), 20);
+  });
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => httpRequestJson({ port: liar.port, method: 'POST', path: '/session', body: { name: 'ci-debug' } }),
+      (error) => error instanceof Error,
+    );
+    // Asserting PROMPTNESS rather than a message: the point is that the
+    // premature close settled it, not that some timeout eventually did. The
+    // exact wording Node attaches to a mid-body reset varies by version.
+    assert.ok(Date.now() - startedAt < 2_000, 'the premature close settled it, no timeout was needed');
+  } finally {
+    await liar.close();
+  }
+
+  // 2. One byte every 25ms resets the 5s inactivity timeout forever, so only a
+  // wall-clock deadline can stop it. Shortened through the seam; the shipped
+  // default is 10s.
+  let trickle;
+  const trickler = await rawHttpPeer((socket) => {
+    socket.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n');
+    trickle = setInterval(() => socket.write('x'), 25);
+    socket.on('close', () => clearInterval(trickle));
+  });
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => httpRequestJson({ port: trickler.port, method: 'GET', path: '/health', deadlineMs: 400 }),
+      /exceeded 400ms/,
+    );
+    assert.ok(Date.now() - startedAt < 4_000, 'the deadline fired; the 5s inactivity timeout never could');
+  } finally {
+    clearInterval(trickle);
+    await trickler.close();
+  }
+
+  // 3. Two megabytes is past the 1 MiB cap: rejected and the socket destroyed
+  // rather than buffered into this process's heap.
+  const flood = await rawHttpPeer((socket) => {
+    socket.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2097152\r\n\r\n');
+    socket.write('x'.repeat(2 * 1024 * 1024));
+  });
+  try {
+    await assert.rejects(
+      () => httpRequestJson({ port: flood.port, method: 'GET', path: '/health' }),
+      /exceeded 1048576 bytes/,
+    );
+  } finally {
+    await flood.close();
+  }
+});
+
+test('run authenticates the port occupant and never sends the launch token to one that fails', async () => {
+  const outputDir = makeTempDir();
+  const launchToken = 'x'.repeat(43);
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 4321, launchToken, sessionName: 'ci-debug' });
+  const probes = [];
+  let requested = 0;
+  let commandRan = false;
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: {},
+    probeToken: async (port, token) => { probes.push([port, token]); return false; },
+    request: async () => { requested += 1; return { status: 201, json: {} }; },
+    spawnCommand: () => { commandRan = true; return { status: 0 }; },
+  });
+  assert.equal(code, 3);
+  assert.deepEqual(probes, [[4321, launchToken]], 'the recorded port and token are what get challenged');
+  assert.equal(requested, 0, 'a process that cannot prove it holds the token never receives it');
+  assert.equal(commandRan, false);
+});
+
+test('run refuses to overwrite state that a concurrent invocation replaced while the wrapped command ran', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
+  const githubOutput = path.join(outputDir, 'github_output');
+  writeFileSync(githubOutput, '');
+  const usurper = { nonce: 'n2', pid: 2222, port: 9999, launchToken: 'y'.repeat(43), sessionName: 'other' };
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: { GITHUB_OUTPUT: githubOutput },
+    probeToken: async () => true,
+    request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
+    // Stands in for a second invocation claiming this output-dir while we sat
+    // blocked in spawnSync: writing our pre-command snapshot back would strand
+    // the collector recorded in the newer state (Codex T4 #3).
+    spawnCommand: () => { writeState(outputDir, usurper); return { status: 0 }; },
+  });
+  assert.equal(code, 3);
+  assert.deepEqual(readState(outputDir), usurper, 'the newer invocation keeps its state, byte for byte');
+  assert.equal(readFileSync(githubOutput, 'utf8'), '',
+    'a session-id emitted from state we just declined to own would be a lie');
+});
+
+test('a job-level DEBUG_HYPOTHESIS_ID is never inherited when this action opened no hypothesis', async () => {
+  const { outputDir, inputs } = await startReal();
+  try {
+    const probe = 'node -e "process.exit(process.env.DEBUG_HYPOTHESIS_ID === undefined ? 0 : 91)"';
+    const code = await runSubcommand({
+      inputs: { ...inputs, runCommand: probe },
+      outputDir,
+      env: { DEBUG_HYPOTHESIS_ID: 'H-from-the-job' },
+    });
+    assert.equal(code, 0);
+    assert.equal(readState(outputDir).commandExitCode, 0,
+      'the wrapped command must not see a hypothesis id this action never posted');
+  } finally {
+    teardownSubcommand({ outputDir, env: {} });
+  }
 });
