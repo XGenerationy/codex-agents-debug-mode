@@ -798,6 +798,42 @@ they are roadmap items, not accepted risk:
   `workflow_dispatch` with the `pr-number` input (see below), or wait for the
   next naturally covered event (a head push or a new/edited review) once all
   sibling checks have settled (CodeRabbit PR7 #6YW9UP).
+- **The `MERGEABLE/CLEAN` admission requirement is self-referential when the
+  gate runs as a check on the PR it is gating.** `classifyLivePrState`
+  (`scripts/pr_closeout_github.js`) requires `pr.mergeStateStatus === 'CLEAN'`
+  in addition to `pr.mergeable === 'MERGEABLE'`. GitHub derives
+  `mergeStateStatus` from EVERY check on the head commit — including this
+  job's own check run, which is necessarily `in_progress` for as long as the
+  gate is evaluating. An in-progress check makes `mergeStateStatus` `UNSTABLE`
+  (or `BLOCKED` under branch protection), never `CLEAN`, so on a PR where the
+  gate itself is one of the checks the requirement cannot be satisfied by the
+  running gate.
+
+  This is the same self-observation hazard the bullet above resolves for
+  `statusCheckRollup`: that fix excludes the job's own checks from the LIST
+  the gate classifies, but `mergeStateStatus` is an opaque enum GitHub
+  computes across all checks, so the exclusion does not reach it.
+
+  Empirically confirmed on this repository's own PR #7: a `workflow_dispatch`
+  run taken after every sibling check had settled obtained a clean, stable
+  snapshot (no stability re-verification block) and still reported
+  `Mergeability is MERGEABLE/UNSTABLE; MERGEABLE/CLEAN is required.`; four
+  `gate` check runs were present on the head commit at the time; and across
+  the workflow's entire run history the `gate` JOB has never once concluded
+  `success` — every `success` at the workflow level is a run in which the job
+  was `skipped` by its `if:` guard.
+
+  **Not changed here, by repository-owner decision** — the requirement is an
+  admission criterion of a security control, and relaxing it is a policy call
+  rather than a defect fix. Recorded so the behavior is not mistaken for a
+  transient CI failure. The narrow remedy, if it is ever taken, is to drop the
+  redundant `CLEAN` comparison and rely on `mergeable === 'MERGEABLE'`, the
+  existing `DIRTY`/conflict failure, and the post-self-exclusion checks list —
+  which already answers "is every OTHER check green" and is the signal
+  `CLEAN` was standing in for. Consumers who install the gate as a check on
+  their own PRs are affected identically; consumers who run it out-of-band
+  (`workflow_dispatch` on a ref where the gate is not itself a PR check) are
+  not.
 - ~~**Event triggers do not cover a base-branch advance.**~~ **Resolved
   (chatgpt-codex-connector PR7 #6YbMwY).** The attestation is base-SHA-bound,
   so if the base branch receives a new commit while a PR's head is unchanged,
