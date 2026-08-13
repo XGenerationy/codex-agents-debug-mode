@@ -33,6 +33,7 @@ test('buildReport counts events vs hypothesis lines and groups tagged events per
   assert.equal(report.session.entries, 4);
   assert.equal(report.session.events, 3);
   assert.equal(report.session.hypothesisLines, 1);
+  assert.equal(report.session.otherTypedLines, 0);
   assert.equal(report.untaggedEvents, 1);
   assert.equal(report.hypotheses.length, 1);
   const h1 = report.hypotheses[0];
@@ -46,6 +47,30 @@ test('buildReport renders recorded statuses only — it never invents a verdict'
   const report = buildReport(SESSION, { sessionId: null });
   assert.equal(report.hypotheses[0].status, 'OPEN');
   assert.ok(!('verdict' in report.hypotheses[0]), 'no synthesized verdict field');
+});
+
+test('a line with an unknown type is counted apart — never an event, never an excerpt', () => {
+  const report = buildReport(parseSessionText(
+    line({ ts: '2026-08-13T10:00:01.000Z', msg: 'real event' })
+    + line({ ts: '2026-08-13T10:00:02.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN' })
+    + line({ ts: '2026-08-13T10:00:03.000Z', type: 'marker', msg: 'a line shape this renderer predates' }),
+  ), { sessionId: null });
+  assert.equal(report.session.entries, 3, 'the unknown line still counts as an entry');
+  assert.equal(report.session.events, 1);
+  assert.equal(report.session.hypothesisLines, 1);
+  assert.equal(report.session.otherTypedLines, 1);
+  assert.deepEqual(report.excerpts, ['real event'], 'unknown line shapes stay out of the excerpts');
+});
+
+test('event messages are verbatim — objects serialize, a missing msg is named, and no coercion can throw', () => {
+  const report = buildReport(parseSessionText(
+    line({ ts: '2026-08-13T10:00:01.000Z', msg: { x: 1 } })
+    + line({ ts: '2026-08-13T10:00:02.000Z' })
+    + line({ ts: '2026-08-13T10:00:03.000Z', msg: { toString: null } }),
+  ), { sessionId: null });
+  assert.deepEqual(report.excerpts, ['{"x":1}', '(missing msg)', '{"toString":null}']);
+  assert.doesNotThrow(() => renderMarkdown(report), 'a msg that breaks String() must still render');
+  assert.doesNotThrow(() => renderText(report));
 });
 
 test('excerpts keep the LAST events, cap at 20, and announce the overflow — no announce at exactly the cap', () => {
@@ -73,6 +98,43 @@ test('renderMarkdown escapes hostile log content — structure reflects the rend
   assert.ok(!md.includes('\n## injected heading'), 'stored newline must not open a real heading line');
   assert.ok(md.includes('\\*\\*bold\\*\\*'), 'markdown punctuation escaped');
   assert.ok(md.includes('¦'), 'box-drawing pipe swapped');
+});
+
+const excerptReport = (msg) => buildReport(
+  parseSessionText(line({ ts: '2026-08-13T10:00:01.000Z', msg })),
+  { sessionId: null },
+);
+
+test('human surfaces cap an excerpt at 500 chars with an announced ellipsis; JSON stays verbatim', () => {
+  const atCap = excerptReport('a'.repeat(500));
+  assert.ok(renderMarkdown(atCap).includes(`- "${'a'.repeat(500)}"`), 'exactly at the cap is untouched');
+  assert.ok(renderText(atCap).includes(`  - ${'a'.repeat(500)}`));
+  const overCap = excerptReport('a'.repeat(501));
+  assert.ok(renderMarkdown(overCap).includes(`- "${'a'.repeat(499)}…"`), 'one over the cap loses its tail');
+  assert.ok(renderText(overCap).includes(`  - ${'a'.repeat(499)}…`));
+  assert.ok(!renderMarkdown(overCap).includes('a'.repeat(500)), 'no uncapped copy survives anywhere');
+  assert.equal(JSON.parse(renderJson(overCap)).excerpts[0].length, 501, 'the machine surface is never capped');
+  // The cap binds the ESCAPED text: 400 asterisks escape to 800 characters,
+  // so capping the raw value first would let the surface emit 800 of them.
+  const hostile = excerptReport('*'.repeat(400));
+  const bullet = renderMarkdown(hostile).split('\n').find((l) => l.startsWith('- "'));
+  assert.equal(bullet.length, 3 + 500 + 1, 'bullet is `- "` + exactly 500 capped chars + `"`');
+});
+
+const fieldsReport = (title, note) => buildReport(parseSessionText(line({
+  ts: '2026-08-13T10:00:01.000Z', type: 'hypothesis', hypothesisId: 'H1', status: 'OPEN', title, note,
+})), { sessionId: null });
+
+test('human surfaces cap a hypothesis title and note at 200 chars, both sides of the boundary', () => {
+  const atCap = fieldsReport('T'.repeat(200), 'N'.repeat(200));
+  assert.ok(renderMarkdown(atCap).includes(`— ${'T'.repeat(200)}**`), 'title exactly at the cap is untouched');
+  assert.ok(renderMarkdown(atCap).includes(`- note: "${'N'.repeat(200)}"`));
+  const overCap = fieldsReport('T'.repeat(201), 'N'.repeat(201));
+  assert.ok(renderMarkdown(overCap).includes(`— ${'T'.repeat(199)}…**`), 'one over the cap loses its tail');
+  assert.ok(renderMarkdown(overCap).includes(`- note: "${'N'.repeat(199)}…"`));
+  assert.ok(renderText(overCap).includes(`— ${'T'.repeat(199)}…`));
+  assert.ok(renderText(overCap).includes(`  note: ${'N'.repeat(199)}…`));
+  assert.equal(JSON.parse(renderJson(overCap)).hypotheses[0].title.length, 201, 'JSON keeps the whole field');
 });
 
 test('renderJson is verbatim machine output with schema 1 and no escaping layer', () => {
@@ -129,4 +191,13 @@ test('CLI runtime failure exits 1 with one clean stderr line and no stack', asyn
     assert.equal(stderrLines.length, 1);
     assert.ok(!result.stderr.includes(' at '), 'no stack frames');
   });
+});
+
+test('CLI failure stays ONE line even when the ref (and the OS error quoting it) embeds a newline', async () => {
+  const result = await run(['forged\nline.log']);
+  assert.equal(result.code, 1);
+  assert.equal(result.stderr.split('\n').filter(Boolean).length, 1);
+  assert.ok(result.stderr.endsWith('\n'));
+  assert.ok(!result.stderr.slice(0, -1).includes('\n'), 'no embedded newline survives the collapse');
+  assert.ok(result.stderr.startsWith('debug_report: cannot read session (forged line.log)'), 'newline became a space');
 });

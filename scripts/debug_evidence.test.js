@@ -167,6 +167,10 @@ test('escapeMarkdownText escapes markdown punctuation, box-drawing pipes, and co
   const { escapeMarkdownText } = require('./debug_evidence');
   assert.equal(escapeMarkdownText('a*b_c`d[e]f(g)h!i<j>k&l'), 'a\\*b\\_c\\`d\\[e\\]f\\(g\\)h\\!i\\<j\\>k\\&l');
   assert.equal(escapeMarkdownText('col│umn'), 'col¦umn');
+  // GFM strikethrough: `~~x~~` would restyle surrounding text, so `~` is in
+  // the punctuation set alongside the emphasis/link characters above.
+  assert.equal(escapeMarkdownText('a~b'), 'a\\~b');
+  assert.equal(escapeMarkdownText('~~x~~'), '\\~\\~x\\~\\~');
   // escapeEvidenceText layer still applies underneath: newline stays escaped text
   assert.equal(escapeMarkdownText('line1\nline2'), 'line1\\nline2');
 });

@@ -70,8 +70,10 @@ const escapeEvidenceText = (value) => JSON.stringify(String(value))
 // Markdown-surface escaping layered on the core helper: box-drawing pipes
 // would break diff/report tables, and markdown punctuation in stored log
 // content could restyle the surrounding document. Owned here so every
-// markdown renderer (debug_diff, debug_report) shares one transform.
-const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&]/g;
+// markdown renderer (debug_diff, debug_report) shares one transform. `~` is
+// in the set because GFM reads `~~x~~` as strikethrough, so without it stored
+// log content could still restyle text around it.
+const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&~]/g;
 const escapeMarkdownText = (value) => escapeEvidenceText(value)
   .replaceAll('│', '¦')
   .replace(MARKDOWN_PUNCTUATION, '\\$&');

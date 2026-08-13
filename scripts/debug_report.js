@@ -18,6 +18,12 @@ const {
 
 const USAGE = 'Usage: debug_report.js <sessionRef> [projectRoot] [--format=text|md|json]';
 const EXCERPT_CAP = 20;
+// Per-value length bounds for the HUMAN surfaces only. A GitHub Step Summary
+// is capped at 1 MiB, and a single logged line can be far larger than any
+// reader wants inline; renderJson stays verbatim because the machine surface
+// is already bounded by the collector's own per-session byte/event limits.
+const EXCERPT_CHAR_CAP = 500;
+const FIELD_CHAR_CAP = 200;
 const SESSION_FILE_PATTERN = /^debug-([A-Za-z0-9_-]+)\.log$/;
 
 // Same equals-only convention as debug_diff (space-form values rejected).
@@ -48,6 +54,7 @@ const buildReport = (entries, { sessionId = null } = {}) => {
   const folded = foldHypotheses(entries);
   let events = 0;
   let hypothesisLines = 0;
+  let otherTypedLines = 0;
   let untaggedEvents = 0;
   const taggedCounts = new Map();
   const allEventMsgs = [];
@@ -56,8 +63,23 @@ const buildReport = (entries, { sessionId = null } = {}) => {
       hypothesisLines += 1;
       continue;
     }
+    // Parity with the shared core and GET /sessions/:id/logs: ONLY an absent
+    // type is an event. A line carrying a type this renderer predates is
+    // counted on its own — folding it into events would inflate the counts
+    // and leak an unknown line shape into the excerpts, while dropping it
+    // silently would hide it; it still shows up in `entries`.
+    if (parsed.type !== undefined) {
+      otherTypedLines += 1;
+      continue;
+    }
     events += 1;
-    allEventMsgs.push(typeof parsed.msg === 'string' ? parsed.msg : String(parsed.msg));
+    // Verbatim, never String()-coerced: `String({a:1})` renders the useless
+    // '[object Object]', and a msg object carrying `toString: null` would
+    // make the coercion THROW. Values here come from JSON.parse, so they are
+    // finite and acyclic — JSON.stringify is total once undefined is handled.
+    allEventMsgs.push(typeof parsed.msg === 'string'
+      ? parsed.msg
+      : parsed.msg === undefined ? '(missing msg)' : JSON.stringify(parsed.msg));
     if (typeof parsed.hypothesisId === 'string' && parsed.hypothesisId !== '') {
       taggedCounts.set(parsed.hypothesisId, (taggedCounts.get(parsed.hypothesisId) ?? 0) + 1);
     } else {
@@ -82,7 +104,9 @@ const buildReport = (entries, { sessionId = null } = {}) => {
   const excerpts = allEventMsgs.slice(-EXCERPT_CAP);
   return {
     schema: 1,
-    session: { id: sessionId, entries: entries.length, events, hypothesisLines },
+    session: {
+      id: sessionId, entries: entries.length, events, hypothesisLines, otherTypedLines,
+    },
     hypotheses,
     untaggedEvents,
     excerpts,
@@ -94,17 +118,26 @@ const renderJson = (report) => `${JSON.stringify(report, null, 2)}\n`;
 
 const statusOr = (status) => (status === null ? '—' : escapeMarkdownText(status));
 
+// Truncation is ANNOUNCED, never silent: an over-cap value keeps its first
+// cap-1 characters and ends in an ellipsis, so the result is exactly `cap`
+// characters and a reader can tell the tail was dropped. Applied to the
+// ESCAPED text (not the raw value) — escaping can multiply a hostile string's
+// length several times over, so capping afterwards is the only order that
+// actually bounds what the surface emits. Slicing escaped text is safe: it
+// only removes characters, and every structural character is already neutered.
+const capped = (value, cap) => (value.length > cap ? `${value.slice(0, cap - 1)}…` : value);
+
 const renderMarkdown = (report) => {
   const lines = ['## Debug evidence report', ''];
   const id = report.session.id === null ? '(file)' : escapeMarkdownText(report.session.id);
   lines.push(`_session ${id} · ${report.session.events} events · ${report.session.hypothesisLines} hypothesis lines_`);
   lines.push('');
   for (const h of report.hypotheses) {
-    const title = h.title ? ` — ${escapeMarkdownText(h.title)}` : '';
+    const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
     lines.push(`**${escapeMarkdownText(h.id)}${title}**  ${statusOr(h.status)}`);
     lines.push('');
     lines.push(`- events ${h.events} · hypothesis lines ${h.lines}`);
-    if (h.note) lines.push(`- note: "${escapeMarkdownText(h.note)}"`);
+    if (h.note) lines.push(`- note: "${capped(escapeMarkdownText(h.note), FIELD_CHAR_CAP)}"`);
     lines.push('');
   }
   if (report.untaggedEvents > 0) {
@@ -114,7 +147,7 @@ const renderMarkdown = (report) => {
   if (report.excerpts.length > 0) {
     lines.push('**Last events**');
     lines.push('');
-    for (const msg of report.excerpts) lines.push(`- "${escapeMarkdownText(msg)}"`);
+    for (const msg of report.excerpts) lines.push(`- "${capped(escapeMarkdownText(msg), EXCERPT_CHAR_CAP)}"`);
     if (report.excerptsTruncated > 0) lines.push(`- …and ${report.excerptsTruncated} more earlier event${report.excerptsTruncated === 1 ? '' : 's'}`);
     lines.push('');
   }
@@ -128,14 +161,14 @@ const renderText = (report) => {
   lines.push(`entries ${report.session.entries} · events ${report.session.events} · hypothesis lines ${report.session.hypothesisLines} · untagged ${report.untaggedEvents}`);
   lines.push('');
   for (const h of report.hypotheses) {
-    const title = h.title ? ` — ${escapeMarkdownText(h.title)}` : '';
+    const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
     lines.push(`${escapeMarkdownText(h.id)}${title}  [${statusOr(h.status)}]  events ${h.events}`);
-    if (h.note) lines.push(`  note: ${escapeMarkdownText(h.note)}`);
+    if (h.note) lines.push(`  note: ${capped(escapeMarkdownText(h.note), FIELD_CHAR_CAP)}`);
   }
   if (report.hypotheses.length > 0) lines.push('');
   if (report.excerpts.length > 0) {
     lines.push('last events:');
-    for (const msg of report.excerpts) lines.push(`  - ${escapeMarkdownText(msg)}`);
+    for (const msg of report.excerpts) lines.push(`  - ${capped(escapeMarkdownText(msg), EXCERPT_CHAR_CAP)}`);
     if (report.excerptsTruncated > 0) lines.push(`  …and ${report.excerptsTruncated} more earlier`);
   }
   return `${lines.join('\n')}\n`;
@@ -144,6 +177,15 @@ const renderText = (report) => {
 const deriveSessionId = (resolvedPath) => {
   const match = SESSION_FILE_PATTERN.exec(path.basename(resolvedPath));
   return match ? match[1] : null;
+};
+
+// A failure MUST be exactly one stderr line. Both the message and the ref
+// interpolated into it are attacker-influenced (a session ref from a workflow
+// input, an OS error quoting that path), so a raw newline anywhere inside
+// would split one diagnostic into what reads as two — and the action's
+// log-tail capture treats one line as one failure.
+const writeErrorLine = (message) => {
+  process.stderr.write(`${String(message).replace(/\r?\n|\r/g, ' ')}\n`);
 };
 
 const main = async () => {
@@ -171,7 +213,7 @@ const main = async () => {
   try {
     entries = await readSessionFile(filePath);
   } catch (error) {
-    process.stderr.write(`debug_report: cannot read session (${ref}): ${error.message}\n`);
+    writeErrorLine(`debug_report: cannot read session (${ref}): ${error.message}`);
     process.exitCode = 1;
     return;
   }
@@ -183,7 +225,7 @@ const main = async () => {
 
 if (require.main === module) {
   main().catch((error) => {
-    process.stderr.write(`${error.message}\n`);
+    writeErrorLine(error.message);
     process.exitCode = 1;
   });
 }
