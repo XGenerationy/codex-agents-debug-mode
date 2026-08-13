@@ -37,9 +37,22 @@ const main = () => {
   const server = createDebugServer({
     projectRoot,
     limits,
+    // Comma OR whitespace separated, per the documented input contract: a
+    // comma-only split turned `DEBUG_REDACT_NAMES="A B,C"` into the names
+    // ['A B', 'C'], so A's and B's values were never redacted at all
+    // (Codex T3 #5).
     redactionNames: String(process.env.DEBUG_REDACT_NAMES ?? '')
-      .split(',').map((name) => name.trim()).filter(Boolean),
+      .split(/[\s,]+/).map((name) => name.trim()).filter(Boolean),
   });
+  // EPIPE survival (Codex T3 #1). This collector outlives the `start` step:
+  // once the startup line below is read, the parent releases its end of these
+  // pipes and eventually exits. Any later write from here — a stray warning,
+  // an unhandled rejection trace — would then raise EPIPE on a stream with no
+  // 'error' listener, which is an uncaught exception that kills the collector
+  // mid-job. Swallowing pipe errors for the process's lifetime is the whole
+  // fix; there is no diagnostic value left in a pipe nobody reads.
+  process.stdout.on('error', () => {});
+  process.stderr.on('error', () => {});
   server.on('error', (error) => {
     fail(error?.code === 'EADDRINUSE' ? 'port_in_use' : 'listen_failed');
   });

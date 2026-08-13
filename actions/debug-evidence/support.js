@@ -6,7 +6,10 @@
 // OUTPUT-DIR ROOT — deliberately outside the evidence child, because it
 // carries the collector launch token and must never be uploaded.
 
-const { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+const {
+  appendFileSync, closeSync, constants, copyFileSync, lstatSync, mkdirSync, openSync,
+  readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync, writeSync,
+} = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const http = require('node:http');
@@ -42,6 +45,18 @@ const redactKnownSecrets = (text, secrets) => {
   return result;
 };
 
+// Is `candidate` the directory `parent` itself, or somewhere under it? The
+// relative path escapes only when it IS '..' or starts with '..' + separator;
+// a bare `startsWith('..')` test does NOT mean that, because it also matches
+// an ordinary child whose name merely begins with two dots — so
+// `<workspace>/..cache` read as "outside the workspace" and sailed through
+// the containment check it was supposed to fail (Codex T3 #3).
+const isInsideDirectory = (parent, candidate) => {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === ''
+    || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+};
+
 const validateActionInputs = ({
   runCommand, sessionName, failOnCommandFailure, port, maxEvents, maxBytes,
   hypothesisId, workingDirectory = '.', outputDir = '', workspace = '',
@@ -67,18 +82,69 @@ const validateActionInputs = ({
   if (/[\r\n]/.test(workingDirectory) || /[\r\n]/.test(outputDir)) {
     errors.push('working-directory/output-dir: must not contain a CR or LF');
   }
-  if (workspace) {
-    const relative = path.relative(path.resolve(workspace), path.resolve(outputDir));
-    if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
-      errors.push('output-dir: must be outside the repository workspace');
-    }
+  if (workspace && isInsideDirectory(workspace, outputDir)) {
+    errors.push('output-dir: must be outside the repository workspace');
   }
   return errors;
 };
 
+// The state file carries the collector's LAUNCH TOKEN, so it is written the
+// way actions/closeout writes its own private evidence (same discipline,
+// deliberately re-stated rather than imported — the two actions stay
+// independently deployable): never through a pre-existing link, never with a
+// window in which the bytes exist at a wider mode.
+//
+// 1. lstat the target: an existing symlink or non-regular entry is REFUSED,
+//    never followed — a plain writeFileSync would happily write the token
+//    through a symlink a local user pre-planted at this well-known path.
+// 2. Stage into a temp sibling opened O_WRONLY|O_CREAT|O_EXCL at 0600, so the
+//    open either creates a fresh inode or fails closed on anything already
+//    there (a hard link included, which no-follow alone would not catch).
+// 3. rename() over the target: path-based and atomic, and it REPLACES a
+//    destination entry rather than writing through it. Windows cannot always
+//    rename over an existing file, so EEXIST/EPERM there falls back to
+//    unlink-then-rename; Linux runners always take the atomic path.
 const writeState = (outputDir, state) => {
   mkdirSync(outputDir, { recursive: true });
-  writeFileSync(path.join(outputDir, STATE_FILE), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  const target = path.join(outputDir, STATE_FILE);
+  let existing = null;
+  try {
+    existing = lstatSync(target);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error(`refusing to write action state through a non-regular file (symlink, directory, or special): ${target}`);
+  }
+  const tempPath = path.join(outputDir, `.${STATE_FILE}.${process.pid}.${Date.now()}.tmp`);
+  const fd = openSync(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  let staged = false;
+  try {
+    writeSync(fd, `${JSON.stringify(state)}\n`, null, 'utf8');
+    staged = true;
+  } finally {
+    // Close before any cleanup: Windows refuses to unlink a file that is
+    // still open, which would strand a half-written staging file.
+    closeSync(fd);
+    if (!staged) {
+      try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+    }
+  }
+  try {
+    renameSync(tempPath, target);
+  } catch (error) {
+    if (error?.code !== 'EEXIST' && error?.code !== 'EPERM') {
+      try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+      throw error;
+    }
+    try {
+      unlinkSync(target);
+      renameSync(tempPath, target);
+    } catch (retryError) {
+      try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+      throw retryError;
+    }
+  }
 };
 
 const readState = (outputDir) => {
@@ -104,7 +170,8 @@ const defaultSpawnShim = (args, { env }) => spawn(process.execPath, [BOOT_SHIM, 
 });
 
 // Read the shim's single startup line (private pipe). Resolves the parsed
-// JSON object; rejects on timeout, child exit, or unparsable output.
+// JSON object; rejects on timeout, spawn failure, child exit, or unparsable
+// output.
 const readShimStartLine = (child, timeoutMs) => new Promise((resolve, reject) => {
   let settled = false;
   let stdout = '';
@@ -129,7 +196,19 @@ const readShimStartLine = (child, timeoutMs) => new Promise((resolve, reject) =>
     }
   });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  child.on('exit', () => {
+  // A spawn failure (ENOENT on the node binary, EACCES, fork limits) emits
+  // 'error' and NO exit — without this listener it surfaces as an uncaught
+  // exception on an EventEmitter instead of this promise's rejection
+  // (Codex T3 #6).
+  child.on('error', (error) => {
+    settle(reject, new Error(`collector shim failed to spawn: ${error?.message ?? error}`));
+  });
+  // 'close', not 'exit': 'exit' fires as soon as the process is gone, which
+  // can precede the final stderr chunk, so the shim's own structured reason
+  // ({"status":"error","reason":"port_in_use"}) was routinely lost and
+  // replaced by the generic message. 'close' waits for the stdio streams to
+  // drain first (Codex T3 #6).
+  child.on('close', () => {
     let reason = 'exited before startup';
     try { reason = JSON.parse(stderr.split('\n')[0]).reason ?? reason; } catch {}
     settle(reject, new Error(`collector shim did not report startup: ${reason}`));
@@ -138,11 +217,28 @@ const readShimStartLine = (child, timeoutMs) => new Promise((resolve, reject) =>
 
 const startSubcommand = async ({
   inputs, outputDir, env = process.env, projectRoot = process.cwd(),
-  spawnShim = defaultSpawnShim, probeReady = probeReadyCollector,
+  spawnShim = defaultSpawnShim, probeReady = probeReadyCollector, kill = process.kill,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
 }) => {
-  const errors = validateActionInputs({ ...inputs, outputDir, workspace: env.GITHUB_WORKSPACE || '' });
+  const workspace = env.GITHUB_WORKSPACE || '';
+  const errors = validateActionInputs({ ...inputs, outputDir, workspace });
   if (errors.length > 0) throw new Error(`invalid inputs: ${errors.join('; ')}`);
+  // Containment layer 2 (Codex T3 #3): the check above compares the paths as
+  // WRITTEN, so an output-dir that merely RESOLVES into the workspace — a
+  // symlink pointing back inside the checkout, or a workspace that is itself
+  // a link — passes it. Create the directory (it has to exist to be
+  // resolved), then compare real paths, before anything is spawned or
+  // written. A workspace that does not resolve contains nothing.
+  mkdirSync(outputDir, { recursive: true });
+  if (workspace) {
+    let realWorkspace = null;
+    try {
+      realWorkspace = realpathSync(workspace);
+    } catch { /* no such workspace on disk — nothing to be contained by */ }
+    if (realWorkspace !== null && isInsideDirectory(realWorkspace, realpathSync(outputDir))) {
+      throw new Error('invalid inputs: output-dir: must be outside the repository workspace (it resolves inside it)');
+    }
+  }
   if (env.GITHUB_ENV) writeOutputs(env.GITHUB_ENV, { DEBUG_ACTION_INVOCATION_NONCE: nonce });
   const shimEnv = { ...env, DEBUG_PORT: inputs.port };
   if (inputs.maxEvents) shimEnv.DEBUG_ACTION_MAX_EVENTS = inputs.maxEvents;
@@ -164,23 +260,41 @@ const startSubcommand = async ({
   }
   const identity = await probeReady(Number(inputs.port), startLine.project_hash, { deadlineMs: readyTimeoutMs });
   if (!identity || identity.project_hash !== startLine.project_hash || identity.ready !== true) {
-    try { process.kill(startLine.pid); } catch {}
+    try { kill(startLine.pid); } catch {}
     throw new Error('collector did not become ready before the timeout');
   }
-  child.stdout.destroy();
-  child.stderr.destroy();
+  // Persist BEFORE releasing the pipes, and kill the child if persisting
+  // fails (Codex T3 #2). teardown stops the collector by reading its pid out
+  // of this file, so a live collector whose state never landed is a collector
+  // nothing can stop: it would hold the port and keep writing session logs
+  // for the rest of the runner's life.
+  try {
+    writeState(outputDir, {
+      nonce,
+      pid: startLine.pid,
+      port: Number(inputs.port),
+      launchToken: startLine.launch_token,
+      projectRoot,
+      sessionName: inputs.sessionName,
+      hypothesisId: inputs.hypothesisId,
+      hypothesisTitle: inputs.hypothesisTitle,
+      failOnCommandFailure: inputs.failOnCommandFailure,
+    });
+  } catch (error) {
+    try { kill(startLine.pid); } catch {}
+    throw error;
+  }
+  // RELEASE the pipes, never destroy them (Codex T3 #1): destroying this end
+  // leaves the collector writing into a closed pipe for the rest of the job,
+  // which is the exact EPIPE the shim's no-op handlers are the backstop for.
+  // Dropping the 'data' listeners and resuming leaves the pipe drained and
+  // discarded; unref stops it from holding this process open.
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.removeAllListeners('data');
+    stream.resume();
+    stream.unref();
+  }
   child.unref();
-  writeState(outputDir, {
-    nonce,
-    pid: startLine.pid,
-    port: Number(inputs.port),
-    launchToken: startLine.launch_token,
-    projectRoot,
-    sessionName: inputs.sessionName,
-    hypothesisId: inputs.hypothesisId,
-    hypothesisTitle: inputs.hypothesisTitle,
-    failOnCommandFailure: inputs.failOnCommandFailure,
-  });
   return 0;
 };
 
