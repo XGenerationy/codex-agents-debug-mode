@@ -73,6 +73,8 @@ Inputs:
 | `redact-names` | `''` | Comma/space-separated additional `DEBUG_REDACT_NAMES` entries for the collector env. |
 | `max-events` | `''` (collector default) | Per-session event-count limit override. |
 | `max-bytes` | `''` (collector default) | Total evidence byte-limit override. |
+| `hypothesis-id` | `''` | Optional: when set, `run` posts one `status: OPEN` hypothesis line (launch-token capability) and injects `DEBUG_HYPOTHESIS_ID` into the wrapped command's env. |
+| `hypothesis-title` | `''` | Optional title for that hypothesis line; ignored when `hypothesis-id` is empty. |
 
 Outputs (all written by `support.js` via `GITHUB_OUTPUT`; each is empty until its
 producing step has run — documented per-output, closeout style):
@@ -124,21 +126,37 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
   The state file stays in runner temp, is never uploaded, and its token values never
   appear in outputs, summaries, or logs.
 - `run` mints a session via `POST /session` with the launch token, then executes the
-  wrapped command with exactly two injected variables — the collector base URL and the
-  session token — using the same env-var names the skill already documents for
-  instrumented processes (no new naming convention). The launch token is never exposed
-  to the wrapped command.
+  wrapped command with exactly three injected variables: `DEBUG_LOG_URL`
+  (`http://127.0.0.1:<port>/log`), `DEBUG_SESSION_ID`, and `DEBUG_SESSION_TOKEN` —
+  plus `DEBUG_HYPOTHESIS_ID` when the `hypothesis-id` input is set. *(Amended during
+  planning: SKILL.md documents no env vars for instrumented processes — its snippets use
+  inline `REPLACE_WITH_*` constants — so the action defines this convention, reusing the
+  names SKILL.md already uses as constants. `POST /log` carries the session id in the
+  body, so the wrapped process needs three values, not two.)* The launch token is never
+  exposed to the wrapped command.
+- Optional `hypothesis-id` (+ `hypothesis-title`) inputs *(amended during planning)*:
+  `POST /hypothesis` requires the launch token, which the wrapped command never gets —
+  so when `hypothesis-id` is set, `run` itself posts one `status: OPEN` hypothesis line
+  before executing the command and injects `DEBUG_HYPOTHESIS_ID` so the wrapped process
+  can tag its events. The action never posts any other status: verdicts remain
+  human/agent judgment, so the report renders whatever statuses the session actually
+  recorded (the CI dogfood shows `OPEN`).
 - `teardown` kills the shim PID; hosted runners also reap the process tree at job end.
   The README documents that self-hosted runners rely on the teardown step (and on the
   collector's own 15-minute idle timeout as a backstop).
 
 ### Evidence artifact — clean by construction
 
-`report` **copies** the session NDJSON and rendered `report.md` into `output-dir`. The
-collector's `.debug/` internals (launch/session token files, claim, port, salt) are never
-copied, so no exclusion list is needed and the token-exfiltration hazard is closed
-structurally. `support.test.js` pins that an artifact-staging dir listing contains no
-token-bearing filename and no token byte-sequence.
+`report` **copies** the session log (`.debug/debug-<session-id>.log` — NDJSON content,
+`.log` extension) plus rendered `report.md` and machine `report.json` into a fixed
+evidence child of `output-dir`; the upload step enumerates exactly those well-known
+filenames (closeout pattern), never a bare directory. `action-state.json` lives at the
+`output-dir` root — outside the evidence child — because it carries the launch token;
+it is never enumerated in the upload path block. The collector's `.debug/` internals
+(claim, port, salt, any token files) are never copied, so the token-exfiltration hazard
+is closed structurally. `support.test.js` pins that the staged evidence child contains
+no token byte-sequence and that the upload path block never references
+`action-state.json` or a bare directory.
 
 ## Security invariants
 
@@ -192,9 +210,13 @@ viewer/diff conventions:
 ## Demo and dogfood workflow
 
 - `actions/debug-evidence/demo/repro.js` (action-local, outside the payload census): a
-  deterministic scripted session — seeded synthetic bug, logs a few typed events, posts
-  hypothesis → instrument → verdict (failure verdict), exits 1. Clearly labeled DEMO in
-  its output and in the rendered report title.
+  deterministic scripted session — seeded synthetic bug, posts tagged events (via
+  `DEBUG_HYPOTHESIS_ID`), untagged noise, and one secret-shaped value proving redaction,
+  then exits 1. *(Amended during planning: the wrapped command holds only the session
+  token, so it cannot post hypothesis/verdict lines itself — the dogfood instead sets
+  `hypothesis-id`, so the action posts the `OPEN` line and the report exercises the
+  hypothesis table with the truthful `OPEN` status.)* Clearly labeled DEMO in its output
+  and in the rendered report title.
 - `.github/workflows/debug-evidence-demo.yml`: `pull_request` + `workflow_dispatch`,
   top-level `permissions: contents: read`, per-ref concurrency with
   `cancel-in-progress: true` (advisory demo — cancellation is safe, unlike the gate),
@@ -202,9 +224,13 @@ viewer/diff conventions:
   `uses: ./actions/debug-evidence` with `fail-on-command-failure: false` and
   `artifact-name: debug-evidence-demo`.
 - **Integration decisions (recorded here deliberately):**
-  1. The demo workflow is NOT added to the gate's `workflow_run` retry-forwarder list
-     (`["Validate", "Closeout preview"]`): it gates nothing, so its retries need no
-     forwarding.
+  1. The demo workflow IS added to the gate's `workflow_run` retry-forwarder list
+     (`["Validate", "Closeout preview"]` → plus `"Debug evidence demo"`). *(Amended
+     during planning — the original decision misread the forwarder's purpose: it exists
+     to re-run the GATE after the gate correctly BLOCKED on a sibling workflow's
+     then-pending check. A per-PR demo is exactly such a sibling; omitting it would
+     leave the gate stuck red whenever an approval lands while the demo is still
+     running — the CodeRabbit PR7 #6YW9UP gap, reopened.)*
   2. The closeout gate's self-exclusion is re-verified against the new workflow name in
      the implementation battery (the exclusion logic was reworked five times in PR #7 —
      treat it as fragile and pin the interaction with a test or a documented manual check).
