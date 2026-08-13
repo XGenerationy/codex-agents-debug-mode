@@ -1458,6 +1458,29 @@ drives the wrapped command's state mutation through the locked API and asserts
 serialization (loser refuses, winner's state survives).
 Commit: `fix(action): state-lock critical sections for nonce ownership (Codex T4 r2)`.
 
+**Fix round 3 (Codex re-review of `7407458`):** ordinary nonce race fixed; contention
+posture and lock-free provisional read ruled acceptable. One Important, FIX NOW: the
+stale sweep plus the owner-blind release recreate the clobber (two reapers both
+observe a >30 s lock; one wins the O_EXCL re-create; the loser's unlink — or the
+original holder's `finally` — removes the winner's fresh lock, admitting a third
+writer). Decisions:
+1. Lock files carry OWNERSHIP CONTENT: `${pid}\n${randomUUID()}\n` written into the
+   O_EXCL fd at creation.
+2. Normal release unlinks ONLY if the lock's current content equals this holder's own
+   token (read immediately before unlink; mismatch ⇒ skip unlink — ownership was lost
+   to a reaper, and the successor's lock must survive).
+3. Stale reap unlinks ONLY if the content read immediately before unlink still equals
+   the exact stale content observed when staleness was established (replacement between
+   observation and deletion ⇒ do not unlink; resume retrying).
+4. A deterministic two-reaper test uses an injectable seam (e.g. an `onStaleObserved`
+   hook or injected `now`) to FORCE replacement between observation and deletion and
+   asserts the fresh lock survives and the loser retries/fails bounded rather than
+   unlinking it.
+5. The round-2 report's 8-holder concurrency probe was scratch-only (Codex: not in the
+   commit) — commit it as a real test this round or drop the claim from the record;
+   committing it is preferred.
+Commit: `fix(action): ownership-verified lock release and reap (Codex T4 r3)`.
+
 ---
 
 ### Task 5: `report` + `finish` — capture, render, and the exit taxonomy
