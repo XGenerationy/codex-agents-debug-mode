@@ -160,7 +160,7 @@ const renderMarkdown = (report) => {
   }
   const hidden = Math.max(0, report.hypotheses.length - HYPOTHESIS_RENDER_CAP);
   if (hidden > 0) {
-    lines.push(`_…and ${hidden} more hypotheses (full list in report.json)_`);
+    lines.push(`_…and ${hidden} more ${hidden === 1 ? 'hypothesis' : 'hypotheses'} (full list in report.json)_`);
     lines.push('');
   }
   if (report.untaggedEvents > 0) {
@@ -189,7 +189,7 @@ const renderText = (report) => {
     if (h.note) lines.push(`  note: ${capped(escapeMarkdownText(h.note), FIELD_CHAR_CAP)}`);
   }
   const hidden = Math.max(0, report.hypotheses.length - HYPOTHESIS_RENDER_CAP);
-  if (hidden > 0) lines.push(`…and ${hidden} more hypotheses (full list in report.json)`);
+  if (hidden > 0) lines.push(`…and ${hidden} more ${hidden === 1 ? 'hypothesis' : 'hypotheses'} (full list in report.json)`);
   if (report.hypotheses.length > 0) lines.push('');
   if (report.excerpts.length > 0) {
     lines.push('last events:');

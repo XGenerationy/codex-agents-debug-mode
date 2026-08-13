@@ -153,18 +153,24 @@ const hypothesesReport = (count) => {
 test('human surfaces render at most 100 hypothesis blocks and announce the remainder', () => {
   const atCap = hypothesesReport(100);
   assert.equal(atCap.hypotheses.length, 100);
-  assert.ok(!renderMarkdown(atCap).includes('more hypotheses'), 'no announce at exactly the cap');
-  assert.ok(!renderText(atCap).includes('more hypotheses'));
+  assert.ok(!renderMarkdown(atCap).includes('more hypothes'), 'no announce at exactly the cap');
+  assert.ok(!renderText(atCap).includes('more hypothes'));
   const overCap = hypothesesReport(101);
   assert.equal(overCap.hypotheses.length, 101, 'the report object keeps every hypothesis');
   const md = renderMarkdown(overCap);
-  assert.ok(md.includes('_…and 1 more hypotheses (full list in report.json)_'), 'italic md footer');
+  assert.ok(md.includes('_…and 1 more hypothesis (full list in report.json)_'), 'italic md footer, singular at 1');
   assert.equal((md.match(/^\*\*H\d{4}/gm) ?? []).length, 100, 'exactly 100 blocks rendered');
   assert.ok(!md.includes('H0100'), 'the 101st block never reaches the human surface');
   const txt = renderText(overCap);
-  assert.ok(txt.includes('…and 1 more hypotheses (full list in report.json)'), 'plain text footer');
+  assert.ok(txt.includes('…and 1 more hypothesis (full list in report.json)'), 'plain text footer, singular at 1');
   assert.ok(!txt.includes('H0100'));
   assert.equal(JSON.parse(renderJson(overCap)).hypotheses.length, 101, 'the machine surface keeps all 101');
+});
+
+test('the hypothesis overflow announce pluralizes, like the excerpt announce above it', () => {
+  const many = hypothesesReport(102);
+  assert.ok(renderMarkdown(many).includes('_…and 2 more hypotheses (full list in report.json)_'));
+  assert.ok(renderText(many).includes('…and 2 more hypotheses (full list in report.json)'));
 });
 
 test('human surfaces cap a hypothesis id at 200 chars and a status at 40', () => {
