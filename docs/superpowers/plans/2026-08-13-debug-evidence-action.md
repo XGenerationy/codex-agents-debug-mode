@@ -152,6 +152,26 @@ git add scripts/debug_evidence.js scripts/debug_diff.js scripts/debug_evidence.t
 git commit -m "refactor(evidence): promote markdown escaping into the shared core for report/diff parity"
 ```
 
+#### Task 1 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex verdict on `b3ef193`: Issues (Minor ×3). Decisions:
+
+1. **Golden-bytes parity test.** The parity test recomputed the old formula from the same
+   building block (self-referential). Replace the reconstruction with HARDCODED expected
+   output bytes for the hostile sample (compute once, paste the literal) so the test is a
+   genuine regression pin independent of the implementation.
+2. **Edge coverage.** Add one test pinning `escapeMarkdownText` for: `''` (empty → `''`),
+   `'││'` (→ `'¦¦'`), pre-escaped `'\*'` input (backslash doubles then `*` escapes →
+   `'\\\\\*'` as source-literal, i.e. backslash-backslash-backslash-asterisk in bytes),
+   and an astral pair `'😀*'` (emoji passes through, `*` escaped). Pin exact bytes.
+3. **Move the rationale comment.** Trim `scripts/debug_diff.js:120–146` to only the
+   diff-renderer-specific rationale (why the TABLE renderer needs `¦`, the quoted-text
+   call-site concern) plus a one-line pointer to `debug_evidence.js` as the transform
+   owner — both reviewers agree the full normative copy would drift. No wording changes
+   to what remains beyond the trim itself.
+
+Fix commit message: `test(evidence): golden-byte parity + edge pins for escapeMarkdownText; trim diff-side comment (Codex T1 minors)`.
+
 ---
 
 ### Task 2: `scripts/debug_report.js` — dual-mode single-session renderer (+ census 41 → 43)
