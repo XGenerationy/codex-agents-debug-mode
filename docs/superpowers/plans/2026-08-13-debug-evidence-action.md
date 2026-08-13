@@ -1696,6 +1696,48 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
 
 Add `defaultSpawnReport,` to `module.exports` (alphabetical).
 
+#### Task 5 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex verdict on `9a7c83a`: Critical ×1, Important ×2, Minor ×1. All accepted:
+
+1. **Authenticated capture (Critical).** The wrapped command can replace
+   `.debug/debug-<id>.log` (it knows the session id and shares the filesystem), and
+   pathname-copy renders the forgery — including verdict lines it could never POST.
+   Decision: evidence is captured FROM THE COLLECTOR, not the filesystem. `report`:
+   - `authProbe = probeToken(state.port, state.launchToken)` (seam, default
+     `probeLaunchToken`) — replaces the identity-blind `probeServer` liveness check
+     (also closing Important #2: `collectorAlive` now means *authenticated* alive).
+   - If authenticated: fetch the authoritative NDJSON via `readSessionLive({ port,
+     token: launchToken, sessionId, timeoutMs: 5000 })` (from
+     `scripts/debug_evidence.js`; injectable seam) and write
+     `entries.map((e) => e.raw).join('\n') + '\n'` as the evidence child's
+     `session.log`. A live-read throw (`live_read_log_replaced`,
+     `live_read_unknown_session`, …) is an evidence-integrity failure: stderr,
+     `evidenceCopied: false`, return 3 — the collector's own identity protection is
+     now load-bearing.
+   - If NOT authenticated: `collectorAlive: false`; best-effort filesystem copy as
+     labeled PARTIAL evidence (`evidenceAuthentic: false` recorded in state); render
+     what was staged; `finish` still fails via `collectorAlive !== true`, so forged
+     bytes can never ride a green run.
+   Tests: forged-log swap by the wrapped command (seam command rewrites the session
+   log) yields either a live-read capture that ignores the forged file (authenticated
+   path — staged bytes match the collector's view, not the disk file) or, with a dead
+   collector, a partial capture that `finish` fails; a `live_read_log_replaced`
+   rejection maps to 3.
+2. **Validate renderer output before committing (Important).** Parse the JSON render's
+   stdout BEFORE writing either file or setting `reportRendered`: require
+   `schema === 1` and `Number.isInteger(session.events) && session.events >= 0`;
+   failure ⇒ renderer-failure path (3), nothing written, no outputs. `event-count`
+   comes from the validated object (the `catch {}` fallback dies). Tests: status-0
+   malformed JSON, wrong schema, negative events.
+3. **Toggle validated on green runs too (Minor).** `finish` rejects a
+   `failOnCommandFailure` outside {'true','false'} with 3 REGARDLESS of
+   `commandExitCode` (fail-closed applies to forged/corrupt state on green runs as
+   well). Test: unknown toggle + exit 0 ⇒ 3.
+
+Fix commit message:
+`fix(action): collector-authenticated evidence capture, validated renders, strict toggle (Codex T5)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`
