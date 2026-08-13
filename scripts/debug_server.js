@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
+const {
+  createHash, createHmac, randomBytes, sign, timingSafeEqual,
+} = require('node:crypto');
 const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, unlinkSync, writeSync } = require('node:fs');
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
@@ -467,6 +469,40 @@ const safeTokenEqual = (actual, expected) => {
     actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
   );
 };
+
+// What a responder signature actually covers. Exported because the VERIFIER
+// must build the identical string from what it INTENDED to ask — one shared
+// definition means the two sides cannot drift apart.
+//
+// Fields, in this fixed order, newline-delimited:
+//   1. a versioned domain tag, so a signature can never be mistaken for one
+//      over some other protocol's bytes (or a later version of this one)
+//   2. the HTTP method
+//   3. the request target EXACTLY as received — path AND query string
+//   4. the caller's challenge nonce
+//   5. sha256 hex of the bytes actually served
+//
+// Field 3 is the one that closes the oracle. Signing only the nonce and the
+// body made the collector a signing service for ANY question: a relay could
+// forward a caller's fresh challenge with `?limit=1` bolted on and hand back
+// a genuinely signed fraction of the session, which the caller had no way to
+// tell from the whole (Codex T5 r5 #1). With the target inside the signature,
+// an answer to a narrower question simply does not verify against the wider
+// one the caller asked.
+//
+// The encoding is unambiguous because no field can contain the delimiter:
+// HTTP forbids CR/LF in the method and request target (Node's parser rejects
+// them outright), the challenge is constrained to a token charset below
+// before anything is signed, and the digest is fixed-length hex.
+const RESPONDER_RECORD_DOMAIN = 'debug-evidence.logs.v1';
+const RESPONDER_CHALLENGE_PATTERN = /^[A-Za-z0-9._-]{16,128}$/;
+const canonicalResponderRecord = ({ method, target, challenge, bodyDigest }) => [
+  RESPONDER_RECORD_DOMAIN,
+  method,
+  target,
+  challenge,
+  bodyDigest,
+].join('\n');
 
 const bearerToken = (request) => {
   const authorization = request.headers.authorization;
@@ -973,15 +1009,24 @@ const createDebugServer = ({
   redactionEnv = { ...process.env },
   redactionNames = [],
   redactionMaxTokens = 512,
-  // Optional RESPONSE-SIGNING key. Unlike `token`, it authorizes nothing:
-  // holding it lets you verify that an answer came from this process, never
-  // ask this process for anything. That asymmetry is the point — a caller
+  // Optional RESPONSE-SIGNING key: an Ed25519 PRIVATE KeyObject. Unlike
+  // `token`, it authorizes nothing — holding it lets you sign answers as this
+  // process, never ask this process for anything. It exists because a caller
   // whose port/session routing data lives in a file another local process can
   // rewrite otherwise has no way to distinguish this collector from a
-  // counterfeit listener returning contract-shaped NDJSON, because Bearer
-  // authenticates the CLIENT and nothing authenticates the SERVER. Omitted by
-  // every existing caller (CLI, viewer), which simply never challenges.
-  responderKey = null,
+  // counterfeit listener returning contract-shaped NDJSON: Bearer
+  // authenticates the CLIENT, and nothing authenticated the SERVER.
+  //
+  // ASYMMETRIC on purpose. A shared secret would have to reach the verifier's
+  // process environment, where a surviving same-user child can read it
+  // (/proc/<pid>/environ, same-user process handles) — and a reader of a
+  // symmetric key can forge signatures with it (Codex T5 r5 #2). The private
+  // half never leaves this process: it is never serialized, never logged,
+  // never handed back over the boot pipe. Only the public half travels.
+  //
+  // Omitted by every existing caller (CLI, viewer), which simply never
+  // challenges.
+  responderPrivateKey = null,
 } = {}) => {
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
@@ -1724,19 +1769,29 @@ const createDebugServer = ({
         }
         const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
         const responseHeaders = { 'Content-Type': 'application/x-ndjson' };
-        // Sign the answer when asked to, over the caller's fresh nonce AND a
-        // digest of the EXACT bytes about to be written. Binding both is what
-        // makes the proof useful: the nonce stops a recorded (body, proof)
-        // pair from being replayed against a later challenge, and the body
-        // digest stops a proof obtained for one response from vouching for
-        // different bytes. A counterfeit listener can copy this header shape
-        // but cannot compute the value without the key, which never leaves
-        // the runner's memory and travels in no response.
+        // Sign the answer when asked to, over the canonical record: the
+        // request target, the caller's fresh nonce, and a digest of the EXACT
+        // bytes about to be written. Each binding closes one substitution —
+        // the target stops a narrowed relay from passing off a signed subset,
+        // the nonce stops a recorded (body, proof) pair from being replayed at
+        // a later challenge, and the digest stops a signature obtained for one
+        // response from vouching for different bytes. A counterfeit listener
+        // can copy this header's shape, but computing its value needs the
+        // private half, which never leaves this process.
         const challenge = request.headers['x-debug-challenge'];
-        if (responderKey && typeof challenge === 'string' && challenge !== '') {
-          responseHeaders['x-debug-proof'] = createHmac('sha256', responderKey)
-            .update(`${challenge}.${createHash('sha256').update(body, 'utf8').digest('hex')}`)
-            .digest('hex');
+        if (responderPrivateKey && typeof challenge === 'string' && RESPONDER_CHALLENGE_PATTERN.test(challenge)) {
+          // Signed over the canonical record, not the body: what makes an
+          // answer trustworthy is WHICH question it answers as much as what it
+          // says. `request.url` is the target verbatim — filters included — so
+          // a narrowed request produces a signature that only verifies against
+          // that narrowed target. Base64 because an Ed25519 signature is 64
+          // raw bytes and base64 carries them in 88 header-safe characters.
+          responseHeaders['x-debug-proof'] = sign(null, Buffer.from(canonicalResponderRecord({
+            method: request.method,
+            target: request.url,
+            challenge,
+            bodyDigest: createHash('sha256').update(body, 'utf8').digest('hex'),
+          }), 'utf8'), responderPrivateKey).toString('base64');
         }
         response.writeHead(200, responseHeaders);
         response.end(body);
@@ -2738,6 +2793,7 @@ module.exports = {
   COLLECTOR_VERSION,
   REDACTION_MAX_DEPTH,
   RequestError,
+  canonicalResponderRecord,
   createDebugServer,
   createRedactionContext,
   isInsideRoot,

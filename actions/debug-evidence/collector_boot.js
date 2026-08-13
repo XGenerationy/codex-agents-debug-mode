@@ -7,7 +7,7 @@
 // The CLI's .debug/collector_token / collector_port / collector_claim files
 // are deliberately NOT written: the only credential handoff is this pipe.
 
-const { randomBytes } = require('node:crypto');
+const { generateKeyPairSync } = require('node:crypto');
 const path = require('node:path');
 const { createDebugServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
 
@@ -35,17 +35,23 @@ const main = () => {
   // redactionEnv defaults to { ...process.env } inside createDebugServer, and
   // this shim inherits the full job env from `start` — that inheritance is the
   // redaction guarantee for job secrets (spec Security invariant 3).
-  // The RESPONDER key: minted here, beside the launch token, and handed back
-  // over the same private pipe. It authorizes nothing — it only lets `report`
-  // check that a captured log came from THIS process rather than from a
-  // counterfeit listener a wrapped command stood up on a port it rewrote in
-  // the action's state file (Codex T5 r4 #1). Fresh per boot, so it cannot
-  // outlive the collector it identifies.
-  const responderKey = randomBytes(32).toString('base64url');
+  // The RESPONDER KEYPAIR, minted fresh per boot so it cannot outlive the
+  // collector it identifies. It lets `report` check that a captured log came
+  // from THIS process rather than from a counterfeit listener a wrapped
+  // command stood up on a port it rewrote in the action's state file
+  // (Codex T5 r4 #1).
+  //
+  // Only the PUBLIC half is handed back. A shared secret would have to sit in
+  // the report step's environment, where a surviving same-user child can read
+  // it — and whoever can read a symmetric key can sign with it, which is the
+  // whole capability this is meant to withhold (Codex T5 r5 #2). The private
+  // half is passed straight into the server and never serialized: it appears
+  // in no startup line, no state file, no output, no log.
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const server = createDebugServer({
     projectRoot,
     limits,
-    responderKey,
+    responderPrivateKey: privateKey,
     // Comma OR whitespace separated, per the documented input contract: a
     // comma-only split turned `DEBUG_REDACT_NAMES="A B,C"` into the names
     // ['A B', 'C'], so A's and B's values were never redacted at all
@@ -73,7 +79,10 @@ const main = () => {
       pid: process.pid,
       project_hash: server.collectorProjectHash,
       launch_token: server.collectorToken,
-      responder_key: responderKey,
+      // SPKI DER, base64: one line, no newlines, travels unharmed through
+      // JSON, through GITHUB_OUTPUT's key=value format, and through the
+      // runner's own step-output plumbing.
+      verify_key: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
     })}\n`);
   });
 };

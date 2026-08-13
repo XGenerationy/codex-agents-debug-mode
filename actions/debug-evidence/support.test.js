@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert');
-const { createHash, createHmac } = require('node:crypto');
+const { createHash, createPublicKey, generateKeyPairSync, sign } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const {
   closeSync, constants, existsSync, openSync, readFileSync, readdirSync, unlinkSync, utimesSync,
@@ -14,7 +14,12 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  canonicalResponderRecord,
+} = require('../../scripts/debug_server');
+
+const {
   defaultRenderReport,
+  defaultSpawnShim,
   finishSubcommand,
   httpRequestJson,
   maskValue,
@@ -73,29 +78,45 @@ const mintSeams = { probeToken: async () => true, request: async () => MINTED };
 // fallback; every other failure means the collector answered and refused.
 const unreachableRead = async () => { throw new Error('live_read_connect_failed:ECONNREFUSED'); };
 
-// The responder key the harness stands in for the runner to deliver. In
-// production it is minted by the boot shim, returned over the private pipe,
-// published by start as a step output, and interpolated into the report
-// step's env — never written to state, which is why a wrapped command that
-// owns the state file still cannot forge a proof.
-const RESPONDER_KEY = 'test-responder-key-with-enough-entropy-here';
-const REPORT_ENV = { DEBUG_ACTION_COLLECTOR_HMAC_KEY: RESPONDER_KEY };
+// The responder KEYPAIR the harness stands in for the runner to deliver. In
+// production the boot shim generates it, hands back only the public half over
+// the private pipe, start publishes that half as a step output, and the runner
+// interpolates it into the report step's env. It is never written to state —
+// which is what stops a wrapped command that owns the state file from
+// substituting a keypair of its own.
+const RESPONDER_KEYS = generateKeyPairSync('ed25519');
+const VERIFY_KEY_B64 = RESPONDER_KEYS.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+const REPORT_ENV = { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: VERIFY_KEY_B64 };
 
-const proofFor = (key, challenge, text) => createHmac('sha256', key)
-  .update(`${challenge}.${createHash('sha256').update(text, 'utf8').digest('hex')}`)
-  .digest('hex');
+// A keypair the attacker generated for itself. Generating one is free, which
+// is exactly why the verification key's INTEGRITY — not its secrecy — is what
+// the runner-memory channel protects.
+const IMPOSTOR_KEYS = generateKeyPairSync('ed25519');
+
+// Sign exactly what the collector signs: the canonical record, imported from
+// the collector itself so a drift between the two definitions is impossible to
+// write by accident. `target` defaults to the unfiltered form report expects.
+const proofFor = (privateKey, challenge, text, target = '/sessions/ci-debug-abc/logs') => sign(
+  null,
+  Buffer.from(canonicalResponderRecord({
+    method: 'GET',
+    target,
+    challenge,
+    bodyDigest: createHash('sha256').update(text, 'utf8').digest('hex'),
+  }), 'utf8'),
+  privateKey,
+).toString('base64');
 
 // A readLive seam that answers the way the real collector does: it signs the
-// bytes it serves over the nonce REPORT chose, so a test never has to know
-// the challenge in advance. Pass { key } to sign with the wrong secret, or
-// { proof: null } to answer with none at all.
-const collectorAnswer = (lines, { key = RESPONDER_KEY, proof } = {}) => async ({ challenge }) => {
-  const text = lines.map((line) => `${JSON.stringify(line)}
-`).join('');
+// bytes it serves over the nonce REPORT chose, so a test never has to know the
+// challenge in advance. Pass { privateKey } to sign with the wrong key,
+// { target } to sign a different question, or { proof: null } for no proof.
+const collectorAnswer = (lines, { privateKey = RESPONDER_KEYS.privateKey, target, proof } = {}) => async ({ challenge }) => {
+  const text = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   return {
     entries: lines.map(servedEntry),
     text,
-    proof: proof === undefined ? proofFor(key, challenge, text) : proof,
+    proof: proof === undefined ? proofFor(privateKey, challenge, text, target) : proof,
   };
 };
 
@@ -282,7 +303,7 @@ test('start kills the collector when its state cannot be recorded, leaving no un
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
   })}\n`));
   await assert.rejects(starting, /non-regular file/);
   assert.deepEqual(killed, [4242], 'a collector whose pid was never persisted must be killed on the spot');
@@ -306,7 +327,7 @@ test('a healthy start records state first, then RELEASES the shim pipes instead 
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
   })}\n`));
   assert.equal(await starting, 0);
   // fakeChild's destroy() throws, so getting here at all proves neither pipe
@@ -461,17 +482,17 @@ const startReal = async (overrides = {}) => {
   const code = await startSubcommand({ inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
   assert.equal(code, 0);
   const emitted = readFileSync(startOutput, 'utf8');
-  const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-hmac-key='));
-  assert.ok(keyLine, 'start must publish the responder key as a step output');
-  const collectorHmacKey = keyLine.slice('collector-hmac-key='.length);
-  assert.ok(collectorHmacKey.length >= 32);
+  const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-verify-key='));
+  assert.ok(keyLine, 'start must publish the verification key as a step output');
+  const collectorVerifyKey = keyLine.slice('collector-verify-key='.length);
+  assert.ok(collectorVerifyKey.length >= 32);
   return {
     outputDir,
     projectRoot,
     port,
     inputs,
-    collectorHmacKey,
-    reportEnv: { DEBUG_ACTION_COLLECTOR_HMAC_KEY: collectorHmacKey },
+    collectorVerifyKey,
+    reportEnv: { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: collectorVerifyKey },
   };
 };
 
@@ -570,7 +591,7 @@ test('a session-mint failure kills the collector in start, so nothing is left ho
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
   })}\n`));
   await assert.rejects(starting, /session mint failed \(HTTP 401\)/);
   assert.equal(requests, 1);
@@ -598,7 +619,7 @@ test('start challenges the port occupant before the launch token is ever put on 
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, responder_key: RESPONDER_KEY,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, verify_key: VERIFY_KEY_B64,
   })}\n`));
   await assert.rejects(starting, /identity could not be verified/);
   assert.deepEqual(probes, [[8787, launchToken]]);
@@ -672,15 +693,14 @@ test('start masks each token the moment it exists and in the order it is used, b
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, responder_key: RESPONDER_KEY,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, verify_key: VERIFY_KEY_B64,
   })}\n`));
   assert.equal(await starting, 0);
   assert.deepEqual(ledger, [
     `::add-mask::${launchToken}\n`,
-    // The responder key is masked with the tokens even though it authorizes
-    // nothing: anything that learns it can FORGE a capture proof, which is
-    // the one thing the key exists to make impossible.
-    `::add-mask::${RESPONDER_KEY}\n`,
+    // NO mask for the verification key: it is public by design, and masking a
+    // harmless value only litters later logs with '***'. What protects it is
+    // where it travels, not who can read it.
     'probe-ready',
     'probe-token',
     'request /session',
@@ -690,8 +710,8 @@ test('start masks each token the moment it exists and in the order it is used, b
   const state = readState(outputDir);
   assert.equal(state.sessionToken, sessionToken, 'masking does not disturb what start records');
   assert.equal('launchToken' in state, false, 'and the launch token is spent, not stored');
-  assert.equal(readFileSync(path.join(outputDir, 'action-state.json'), 'utf8').includes(RESPONDER_KEY), false,
-    'the responder key travels through runner memory, never through state');
+  assert.equal(readFileSync(path.join(outputDir, 'action-state.json'), 'utf8').includes(VERIFY_KEY_B64), false,
+    'the verification key travels through runner memory, never through state');
 });
 
 test('run re-registers the session token with the runner before handing it to a child process', async () => {
@@ -1049,10 +1069,10 @@ test('report captures the session from the collector, renders md+json, appends t
       // The responder key is verification material, never evidence: it lives
       // in runner memory and this step's env, and must reach neither the
       // artifact nor the state file.
-      assert.ok(!bytes.includes(context.collectorHmacKey), `${file} must not contain the responder key`);
+      assert.ok(!bytes.includes(context.collectorVerifyKey), `${file} must not contain the verification key`);
     }
     assert.equal(readFileSync(path.join(context.outputDir, 'action-state.json'), 'utf8')
-      .includes(context.collectorHmacKey), false, 'nor the state file');
+      .includes(context.collectorVerifyKey), false, 'nor the state file');
     // Staging-window detectability: staging and upload are separate steps of
     // the same composite action, so a detached child CAN rewrite these files
     // in between. The step log cannot be revised once streamed, so a digest
@@ -1545,7 +1565,7 @@ test('an entry the hypothesis check cannot inspect is refused rather than skippe
     readLive: async ({ challenge }) => ({
       entries: [{ raw: uninspectable }],
       text,
-      proof: proofFor(RESPONDER_KEY, challenge, text),
+      proof: proofFor(RESPONDER_KEYS.privateKey, challenge, text),
     }),
     renderReport: () => { throw new Error('an uninspectable capture must never reach the renderer'); },
   });
@@ -1750,9 +1770,10 @@ const counterfeitState = (outputDir, projectRoot, port) => writeState(outputDir,
 test('a counterfeit collector serving perfect NDJSON is refused: capture believes proof, not shape', async () => {
   for (const [label, sign] of [
     ['no proof at all', () => null],
-    ['a proof signed with a key it guessed', (challenge, body) => proofFor('not-the-runners-key-at-all', challenge, body)],
-    ['a proof over different bytes', (challenge) => proofFor(RESPONDER_KEY, challenge, 'other bytes entirely')],
-    ['a proof over a challenge it chose itself', (_challenge, body) => proofFor(RESPONDER_KEY, 'a-nonce-nobody-asked-for', body)],
+    ['a signature from a keypair it generated itself', (challenge, body) => proofFor(IMPOSTOR_KEYS.privateKey, challenge, body)],
+    ['a signature over different bytes', (challenge) => proofFor(RESPONDER_KEYS.privateKey, challenge, 'other bytes entirely')],
+    ['a signature over a challenge it chose itself', (_challenge, body) => proofFor(RESPONDER_KEYS.privateKey, 'a-nonce-nobody-asked-for-000000', body)],
+    ['a signature over a narrower request target', (challenge, body) => proofFor(RESPONDER_KEYS.privateKey, challenge, body, '/sessions/ci-debug-abc/logs?limit=1')],
   ]) {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
@@ -1799,7 +1820,7 @@ test('a recorded answer cannot be replayed: an old proof does not answer a fresh
   // request: replay that exact (body, proof) pair — the strongest move
   // available to an attacker who once observed a valid answer.
   const listener = await counterfeitCollector((challenge, body, nth) => {
-    if (nth === 1) recorded = proofFor(RESPONDER_KEY, challenge, body);
+    if (nth === 1) recorded = proofFor(RESPONDER_KEYS.privateKey, challenge, body);
     return recorded;
   });
   try {
@@ -1825,7 +1846,7 @@ test('capture refuses when the responder key never reached this step, rather tha
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-14T00:00:00.000Z', msg: 'on disk' }]);
-  const listener = await counterfeitCollector((challenge, body) => proofFor(RESPONDER_KEY, challenge, body));
+  const listener = await counterfeitCollector((challenge, body) => proofFor(RESPONDER_KEYS.privateKey, challenge, body));
   try {
     counterfeitState(outputDir, projectRoot, listener.port);
     // Wiring broken: action.yml did not pass the step output through, so this
@@ -1965,4 +1986,206 @@ test('the digests are computed from the payload, not from the sink: a lossy writ
     assert.equal(logged.includes(`${name}=${onDisk}`), false,
       `${name}: hashing the file back would have described the swap and called it evidence`);
   }
+});
+
+// The oracle attack. This counterfeit signs nothing itself — it cannot, and
+// does not need to. It forwards `report`'s own fresh challenge to the REAL
+// collector with a filter bolted onto the target, and hands back the answer
+// the real collector genuinely signed. Every byte is authentic; every
+// signature is valid; the evidence is a fraction of the truth.
+const relayCollector = async (realPort, extraQuery) => {
+  const targets = [];
+  const server = http.createServer((request, response) => {
+    targets.push(request.url);
+    const upstream = http.request({
+      hostname: '127.0.0.1',
+      port: realPort,
+      // The whole attack in one line: the caller asked for the session, we ask
+      // for a slice of it, and the collector signs what it was asked for.
+      path: `${request.url}${extraQuery}`,
+      method: 'GET',
+      // Everything the caller sent, including its Bearer token and its fresh
+      // challenge — with Host rewritten, which any relay must do and which the
+      // collector's own loopback-host check would otherwise reject.
+      headers: { ...request.headers, host: `127.0.0.1:${realPort}` },
+    }, (up) => {
+      let body = '';
+      up.setEncoding('utf8');
+      up.on('data', (chunk) => { body += chunk; });
+      up.on('end', () => {
+        const headers = { 'Content-Type': 'application/x-ndjson' };
+        if (up.headers['x-debug-proof']) headers['x-debug-proof'] = up.headers['x-debug-proof'];
+        response.writeHead(up.statusCode, headers);
+        response.end(body);
+      });
+    });
+    upstream.on('error', () => { response.writeHead(502); response.end(); });
+    upstream.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    targets,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+};
+
+test('a relay that filters the real collector\'s answer is refused: the signature covers the request, not just the bytes', async () => {
+  // No hypothesis-id, so the expected hypothesis set is empty and a subset of
+  // plain events would sail through every content check. The only thing that
+  // can catch this is the signature not covering the target that was asked.
+  const context = await startReal();
+  try {
+    const probe = 'node -e "' + [
+      'const post = (msg) => fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg }) });',
+      'Promise.all([\'first finding\', \'second finding\', \'the finding that matters\'].map(post)).then((rs) => process.exit(rs.every((r) => r.status === 202) ? 0 : 99));',
+    ].join('') + '"';
+    const runCode = await runSubcommand({
+      inputs: { ...context.inputs, runCommand: probe },
+      outputDir: context.outputDir,
+      env: {},
+    });
+    assert.equal(runCode, 0);
+    assert.equal(readState(context.outputDir).commandExitCode, 0, 'all three events reached the collector');
+
+    const relay = await relayCollector(context.port, '?type=event&limit=1');
+    try {
+      // The wrapped command's parting move: point the state file's port at the
+      // relay. Everything else about the state is honest.
+      const state = readState(context.outputDir);
+      writeState(context.outputDir, { ...state, port: relay.port });
+      const code = await reportSubcommand({ outputDir: context.outputDir, env: context.reportEnv });
+      assert.equal(code, 3, 'a validly signed answer to a DIFFERENT question is not evidence');
+      assert.equal(relay.targets.length, 1, 'the relay was asked exactly once');
+      assert.equal(relay.targets[0].includes('?'), false, 'report asked for the whole session, unfiltered');
+      const after = readState(context.outputDir);
+      assert.equal(after.collectorAlive, false);
+      assert.equal(after.evidenceCopied, false);
+      assert.equal(after.evidenceAuthentic, false);
+      assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')),
+        'a truncated session is never staged, however genuine its signature');
+      assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3);
+    } finally {
+      await relay.close();
+    }
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+test('a verification key planted in state is ignored: only runner memory can say who to trust', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-14T00:00:00.000Z', msg: 'disk fallback bait' }]);
+  // The wrapped command's best move once the key stopped being a secret:
+  // generate its own keypair, sign its own answers with the private half, and
+  // plant the public half wherever capture might look for it. State is the
+  // one place it can write — so state must not be one of those places.
+  const listener = await counterfeitCollector((challenge, body) => proofFor(IMPOSTOR_KEYS.privateKey, challenge, body));
+  try {
+    const impostorVerifyKey = IMPOSTOR_KEYS.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: listener.port, sessionName: 'ci-debug',
+      sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
+      commandExitCode: 0, failOnCommandFailure: 'true',
+      // Every plausible name a careless implementation might reach for.
+      verifyKey: impostorVerifyKey,
+      collectorVerifyKey: impostorVerifyKey,
+      responderKey: impostorVerifyKey,
+      DEBUG_ACTION_COLLECTOR_VERIFY_KEY: impostorVerifyKey,
+    });
+    // 1. The real key is in the environment: it wins, and the impostor's
+    //    signature does not verify against it.
+    const code = await reportSubcommand({ outputDir, env: REPORT_ENV });
+    assert.equal(code, 3, 'the key in the environment is the only one that counts');
+    const state = readState(outputDir);
+    assert.equal(state.collectorAlive, false);
+    assert.equal(state.evidenceCopied, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
+    assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
+
+    // 2. And with NO key in the environment at all, the planted ones are still
+    //    not consulted — capture refuses rather than falling back to a key an
+    //    attacker chose. This is the case that separates "env wins" from "state
+    //    is never a source": an implementation that read state here would
+    //    verify the impostor's signature perfectly and return 0.
+    const withoutEnvKey = await reportSubcommand({ outputDir, env: {} });
+    assert.equal(withoutEnvKey, 3, 'a key from an attacker-writable file is not a key');
+    assert.equal(readState(outputDir).evidenceCopied, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
+    assert.equal(listener.requests.length, 1,
+      'the second capture never even asked: with no trustworthy key there is no point');
+  } finally {
+    await listener.close();
+  }
+});
+
+test('the boot handshake and the state file carry no private key material', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const port = await getFreePort();
+  // The real shim, spawned exactly as start spawns it, so the assertion is
+  // about the line the collector actually prints rather than a fixture of it.
+  const handshakes = [];
+  const startOutput = path.join(outputDir, 'start_output');
+  writeFileSync(startOutput, '');
+  const code = await startSubcommand({
+    inputs: baseInputs({ port: String(port) }),
+    outputDir,
+    projectRoot,
+    env: { GITHUB_OUTPUT: startOutput },
+    spawnShim: (args, options) => {
+      const child = defaultSpawnShim(args, options);
+      child.stdout.on('data', (chunk) => handshakes.push(String(chunk)));
+      return child;
+    },
+  });
+  try {
+    assert.equal(code, 0);
+    const handshake = JSON.parse(handshakes.join('').split('\n')[0]);
+    // The public half travels; the private half has no representation here at
+    // all. Ed25519 private keys serialize as PKCS#8 PEM/DER — no field of this
+    // line may look like one, under any name.
+    assert.equal(typeof handshake.verify_key, 'string');
+    assert.ok(handshake.verify_key.length >= 32);
+    const asText = JSON.stringify(handshake);
+    for (const marker of ['PRIVATE KEY', 'privateKey', 'private_key', 'responder_key']) {
+      assert.equal(asText.includes(marker), false, `handshake must not carry ${marker}`);
+    }
+    // Reconstructing a PUBLIC key from what travelled must succeed, and that
+    // object must not be usable for signing.
+    const rebuilt = createPublicKey({ key: Buffer.from(handshake.verify_key, 'base64'), format: 'der', type: 'spki' });
+    assert.equal(rebuilt.type, 'public');
+    const stateText = readFileSync(path.join(outputDir, 'action-state.json'), 'utf8');
+    for (const marker of ['PRIVATE KEY', handshake.verify_key, 'verify_key', 'verifyKey']) {
+      assert.equal(stateText.includes(marker), false, `state must not carry ${marker}`);
+    }
+    // And the key that DID travel reached the step output, unmasked and whole.
+    assert.ok(readFileSync(startOutput, 'utf8').includes(`collector-verify-key=${handshake.verify_key}`));
+  } finally {
+    teardownSubcommand({ outputDir, env: {} });
+  }
+});
+
+test('the renderer export surface capture depends on is pinned', () => {
+  // support.js imports these three from debug_report.js and calls them
+  // in-process, so a rename or a signature change there breaks CAPTURE — at
+  // run time, in CI, with no evidence produced. This is the loud failure
+  // instead (Codex T5 r5, ruling B; the coupling is documented in the action
+  // README).
+  const renderer = require('../../scripts/debug_report');
+  for (const name of ['buildReport', 'renderMarkdown', 'renderJson']) {
+    assert.equal(typeof renderer[name], 'function', `debug_report.js must export ${name}`);
+  }
+  // And the shapes support.js relies on: buildReport takes entries plus a
+  // session id, and the two renderers turn its result into strings.
+  const report = renderer.buildReport(
+    [{ raw: '{"msg":"e"}', parsed: { ts: '2026-08-14T00:00:00.000Z', msg: 'e' } }],
+    { sessionId: 'ci-debug-abc' },
+  );
+  assert.equal(report.schema, 1);
+  assert.equal(report.session.id, 'ci-debug-abc');
+  assert.equal(report.session.events, 1);
+  assert.equal(typeof renderer.renderMarkdown(report), 'string');
+  assert.equal(JSON.parse(renderer.renderJson(report)).schema, 1);
 });

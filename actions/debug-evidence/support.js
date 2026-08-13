@@ -12,13 +12,13 @@ const {
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const {
-  createHash, createHmac, randomBytes, randomUUID, timingSafeEqual,
+  createHash, createPublicKey, randomBytes, randomUUID, verify,
 } = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { canonicalResponderRecord, probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
 const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
@@ -482,11 +482,6 @@ const startSubcommand = async ({
   // readiness probe and the state write: from here on the runner scrubs it
   // out of anything this job logs, including output nobody here wrote.
   maskValue(env, startLine.launch_token, writeStdout);
-  // The responder key is not a credential — it authorizes nothing — but it is
-  // still a secret in the sense that matters: anything that knows it can
-  // FORGE a proof, and a forged proof is how a counterfeit listener would
-  // pass capture's check. Masked alongside the tokens for the same reason.
-  maskValue(env, startLine.responder_key, writeStdout);
   // From here on the collector is RUNNING and outlives this process, so every
   // failure has to take it down first: nothing has recorded its pid yet, and
   // a collector nothing can stop holds the port and writes session logs for
@@ -495,11 +490,15 @@ const startSubcommand = async ({
     try { kill(startLine.pid); } catch {}
     return new Error(message);
   };
-  if (typeof startLine.responder_key !== 'string' || startLine.responder_key === '') {
+  // The PUBLIC verification key. Deliberately not masked: it is public by
+  // design, and masking it would only litter later logs with '***' where a
+  // harmless value belongs. What matters is where it travels, not who sees
+  // it — see the step-output write below.
+  if (typeof startLine.verify_key !== 'string' || startLine.verify_key === '') {
     // Without it, `report` can never prove who served a log, and would fail
     // every capture. Better to stop here, while the collector can still be
     // killed cleanly, than to run a whole job that cannot produce evidence.
-    throw abort('collector did not report a responder key; capture could never be verified');
+    throw abort('collector did not report a verification key; capture could never be verified');
   }
   const port = Number(inputs.port);
   const identity = await probeReady(port, startLine.project_hash, { deadlineMs: readyTimeoutMs });
@@ -581,15 +580,17 @@ const startSubcommand = async ({
     try { kill(startLine.pid); } catch {}
     throw error;
   }
-  // The responder key travels as a STEP OUTPUT, never in state. That routing
-  // is the whole security property: the runner parses this file when the
-  // start step ends — before the wrapped command exists — and interpolates
-  // the value into later steps' env from its own memory. A same-user process
-  // can rewrite action-state.json at leisure, but it cannot reach into the
+  // The verification key travels as a STEP OUTPUT, never in state. That
+  // routing is the whole security property, and it is about INTEGRITY rather
+  // than secrecy: the runner parses this file when the start step ends —
+  // before the wrapped command exists — and interpolates the value into later
+  // steps' env from its own memory. A same-user process can rewrite
+  // action-state.json at leisure, and could happily put ITS OWN public key
+  // there and sign with the matching private one; it cannot reach into the
   // runner to change what a later step is handed. State stays routing data;
-  // trust is anchored in memory (Codex T5 r4 #1, ruling iii).
+  // trust is anchored in memory (Codex T5 r4 #1 / r5 #2, ruling iii).
   if (env.GITHUB_OUTPUT) {
-    writeOutputs(env.GITHUB_OUTPUT, { 'collector-hmac-key': startLine.responder_key });
+    writeOutputs(env.GITHUB_OUTPUT, { 'collector-verify-key': startLine.verify_key });
   }
   // RELEASE the pipes, never destroy them (Codex T3 #1): destroying this end
   // leaves the collector writing into a closed pipe for the rest of the job,
@@ -821,26 +822,48 @@ const defaultRenderReport = (sessionText, sessionId) => {
 // disk.
 const defaultStageFile = (filePath, bytes) => writeFileSync(filePath, bytes);
 
+// Rebuild the collector's public verification key from the SPKI DER base64
+// that travelled as a step output. Anything unparsable is treated as no key
+// at all — a verifier that cannot verify must not proceed.
+const responderVerifyKey = (encoded) => {
+  if (typeof encoded !== 'string' || encoded === '') return null;
+  try {
+    return createPublicKey({ key: Buffer.from(encoded, 'base64'), format: 'der', type: 'spki' });
+  } catch {
+    return null;
+  }
+};
+
 // Does this answer carry proof that it came from the collector `start`
-// booted? The key is the one the boot shim minted and handed back over its
-// private pipe; it reached this process through runner memory (a step output
-// interpolated into this step's env), which is the one channel a same-user
-// process can neither read nor rewrite.
+// booted, AND that it answers the question this process actually asked?
 //
-// Both halves matter. The nonce is fresh per capture, so a (body, proof) pair
-// recorded from an earlier read cannot be replayed; the body digest binds the
-// proof to these exact bytes, so a proof obtained for one answer cannot vouch
-// for another. Compared in constant time out of habit rather than need — a
-// forged proof is rejected either way, but timing-independent comparison is
-// the house style for every token check in this repo.
-const verifyResponderProof = ({ key, challenge, text, proof }) => {
-  if (typeof key !== 'string' || key === '' || typeof proof !== 'string' || proof === '') return false;
-  const expected = createHmac('sha256', key)
-    .update(`${challenge}.${createHash('sha256').update(text, 'utf8').digest('hex')}`)
-    .digest('hex');
-  const presented = Buffer.from(proof, 'utf8');
-  const wanted = Buffer.from(expected, 'utf8');
-  return presented.length === wanted.length && timingSafeEqual(presented, wanted);
+// The record is rebuilt from INTENT, never from the response: the target is
+// the unfiltered `/sessions/<id>/logs` this capture meant to fetch, the nonce
+// is the one this capture generated, and the digest is over the bytes that
+// came back. A relay that forwarded the challenge to the real collector with
+// `?limit=1` gets back a perfectly valid signature — over a DIFFERENT target
+// — and it will not verify against this reconstruction. No comparison logic
+// is needed for that; the signature simply fails (Codex T5 r5 #1).
+//
+// The key is public, so this is verification, not a shared secret: nothing
+// here could sign anything even if the whole environment leaked.
+const verifyResponderProof = ({ verifyKey, sessionId, challenge, text, proof }) => {
+  if (verifyKey === null || typeof proof !== 'string' || proof === '') return false;
+  const signature = Buffer.from(proof, 'base64');
+  // Ed25519 signatures are exactly 64 bytes; anything else is not one, and
+  // base64 decoding never throws, so the length is the guard.
+  if (signature.length !== 64) return false;
+  const record = Buffer.from(canonicalResponderRecord({
+    method: 'GET',
+    target: `/sessions/${sessionId}/logs`,
+    challenge,
+    bodyDigest: createHash('sha256').update(text, 'utf8').digest('hex'),
+  }), 'utf8');
+  try {
+    return verify(null, record, verifyKey, signature) === true;
+  } catch {
+    return false;
+  }
 };
 
 // A renderer that exited 0 has not thereby produced a report. Its stdout is
@@ -1050,14 +1073,21 @@ const reportSubcommand = async ({
   let entries = null;
   let capturedText = null;
   let readFailure = null;
-  const responderKey = env.DEBUG_ACTION_COLLECTOR_HMAC_KEY || '';
-  if (responderKey === '') {
-    // Valid state, no key: the wiring that carries it from start's step
-    // output into this step's env is broken or absent. That is an integrity
-    // failure, not a missing collector — capture cannot prove anything, so it
-    // must not fall back to the on-disk log and call the result evidence.
+  // From the ENVIRONMENT only, never from state. The key's secrecy no longer
+  // matters — it is public — but its INTEGRITY is everything: a same-user
+  // process that could substitute its own public key could then sign answers
+  // with the matching private one. Runner memory is the only channel here
+  // that such a process cannot rewrite, so state and every other file on disk
+  // are excluded as sources by construction (Codex T5 r5 #2).
+  const verifyKey = responderVerifyKey(env.DEBUG_ACTION_COLLECTOR_VERIFY_KEY);
+  if (verifyKey === null) {
+    // Valid state, no usable key: the wiring that carries it from start's
+    // step output into this step's env is broken or absent. That is an
+    // integrity failure, not a missing collector — capture cannot prove
+    // anything, so it must not fall back to the on-disk log and call the
+    // result evidence.
     readFailure = 'responder_key_missing';
-    process.stderr.write('debug-evidence-action: report: no collector responder key in this step\'s environment; capture cannot verify who it is talking to.\n');
+    process.stderr.write('debug-evidence-action: report: no usable collector verification key in this step\'s environment; capture cannot verify who it is talking to.\n');
   } else {
     // Fresh per capture. A nonce reused across captures would let a recorded
     // answer be replayed by anything that saw it.
@@ -1074,7 +1104,9 @@ const reportSubcommand = async ({
         deadlineMs: LIVE_READ_DEADLINE_MS,
         challenge,
       });
-      if (!verifyResponderProof({ key: responderKey, challenge, text: answer.text, proof: answer.proof })) {
+      if (!verifyResponderProof({
+        verifyKey, sessionId: state.sessionId, challenge, text: answer.text, proof: answer.proof,
+      })) {
         readFailure = 'responder_proof_invalid';
         process.stderr.write(oneLine(`debug-evidence-action: report: whatever served session ${state.sessionId} on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
       } else {
@@ -1291,6 +1323,7 @@ if (require.main === module) void main();
 module.exports = {
   defaultRenderReport,
   defaultSpawnCommand,
+  defaultSpawnShim,
   finishSubcommand,
   httpRequestJson,
   maskValue,

@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { createHash, createHmac } = require('node:crypto');
+const { createHash, generateKeyPairSync, verify } = require('node:crypto');
 const { constants, existsSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
@@ -13,6 +13,7 @@ const {
   COLLECTOR_VERSION,
   REDACTION_MAX_DEPTH,
   RequestError,
+  canonicalResponderRecord,
   createDebugServer,
   createRedactionContext,
   isInsideRoot,
@@ -4862,15 +4863,16 @@ test('the session token stays read-and-append: it can never post a hypothesis li
 
 // Responder authentication: a caller whose routing data came from a file
 // another local process can rewrite needs a way to tell THIS collector from a
-// counterfeit listener wearing its shape. The key signs responses and
-// authorizes nothing, so leaking it grants no capability.
-const withResponderServer = async (responderKey, run) => {
+// counterfeit listener wearing its shape. The keypair is asymmetric on
+// purpose — the verifier only ever holds the public half, so disclosure of
+// what the verifier knows grants no ability to sign.
+const withResponderServer = async (responderPrivateKey, run) => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-responder-'));
   const server = createDebugServer({
     projectRoot,
     token: TEST_LAUNCH_TOKEN,
     redactionEnv: {},
-    responderKey,
+    responderPrivateKey,
   });
   const baseUrl = await listen(server);
   try {
@@ -4881,9 +4883,9 @@ const withResponderServer = async (responderKey, run) => {
   }
 };
 
-test('GET /sessions/:id/logs signs its response over the challenge nonce and the exact served bytes', async () => {
-  const responderKey = 'responder-key-with-enough-entropy-for-fixtures';
-  await withResponderServer(responderKey, async ({ baseUrl }) => {
+test('GET /sessions/:id/logs signs a record covering the request target, the nonce and the served bytes', async () => {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  await withResponderServer(privateKey, async ({ baseUrl }) => {
     const session = (await createSession(baseUrl)).body;
     await requestJson(baseUrl, {
       method: 'POST',
@@ -4891,35 +4893,100 @@ test('GET /sessions/:id/logs signs its response over the challenge nonce and the
       body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'signed event' },
     });
     const pathname = `/sessions/${session.session_id}/logs`;
-    const proofFor = (nonce, body) => createHmac('sha256', responderKey)
-      .update(`${nonce}.${createHash('sha256').update(body, 'utf8').digest('hex')}`)
-      .digest('hex');
+    const verifies = (response, { target, challenge }) => verify(
+      null,
+      Buffer.from(canonicalResponderRecord({
+        method: 'GET',
+        target,
+        challenge,
+        bodyDigest: createHash('sha256').update(response.text, 'utf8').digest('hex'),
+      }), 'utf8'),
+      publicKey,
+      Buffer.from(response.headers['x-debug-proof'], 'base64'),
+    );
+    const nonceOne = 'nonce-one-with-enough-length';
+    const nonceTwo = 'nonce-two-with-enough-length';
 
     const signed = await requestRaw(baseUrl, {
       pathname,
-      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one' },
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceOne },
     });
     assert.equal(signed.status, 200);
-    assert.equal(signed.headers['x-debug-proof'], proofFor('nonce-one', signed.text));
+    assert.equal(verifies(signed, { target: pathname, challenge: nonceOne }), true);
 
-    // A different nonce over the same bytes is a different proof: that is what
-    // stops a recorded (body, proof) pair from being replayed at a later
+    // A different nonce over the same bytes is a different signature: that is
+    // what stops a recorded (body, proof) pair from being replayed at a later
     // challenge.
     const again = await requestRaw(baseUrl, {
       pathname,
-      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-two' },
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceTwo },
     });
     assert.equal(again.text, signed.text, 'same bytes...');
-    assert.notEqual(again.headers['x-debug-proof'], signed.headers['x-debug-proof'], '...different proof');
-    assert.equal(again.headers['x-debug-proof'], proofFor('nonce-two', again.text));
+    assert.notEqual(again.headers['x-debug-proof'], signed.headers['x-debug-proof'], '...different signature');
+    assert.equal(verifies(again, { target: pathname, challenge: nonceTwo }), true);
+    assert.equal(verifies(again, { target: pathname, challenge: nonceOne }), false,
+      'and the old nonce does not verify the new answer');
+
+    // THE ORACLE CLOSER. A filtered request returns a genuinely signed answer
+    // — over the filtered target. Anyone verifying against the unfiltered
+    // target they asked for sees it fail, with no comparison logic of their
+    // own (Codex T5 r5 #1).
+    const filtered = await requestRaw(baseUrl, {
+      pathname: `${pathname}?limit=1`,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceOne },
+    });
+    assert.equal(filtered.status, 200);
+    assert.equal(verifies(filtered, { target: `${pathname}?limit=1`, challenge: nonceOne }), true,
+      'the collector signed exactly what it was asked');
+    assert.equal(verifies(filtered, { target: pathname, challenge: nonceOne }), false,
+      'and that signature says nothing about the unfiltered session');
 
     // Unchallenged callers are unaffected: no header, no behaviour change.
     const plain = await requestRaw(baseUrl, { pathname, headers: LAUNCH_AUTH });
     assert.equal(plain.status, 200);
     assert.equal(plain.headers['x-debug-proof'], undefined);
-    // The key itself never travels.
-    assert.equal(signed.text.includes(responderKey), false);
-    assert.equal(JSON.stringify(signed.headers).includes(responderKey), false);
+    // A challenge that is not a plain token is refused rather than signed, so
+    // nothing an attacker controls can inject a delimiter into the canonical
+    // record. A literal newline cannot even be attempted — Node's HTTP client
+    // refuses to put one in a header value, and its server would reject the
+    // request — so the charset check below is the second line of a defence
+    // whose first line is the protocol itself.
+    for (const hostile of ['', 'short', `${nonceOne} with spaces`, `${nonceOne}/slash`, 'a'.repeat(129)]) {
+      const rejected = await requestRaw(baseUrl, {
+        pathname,
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': hostile },
+      });
+      assert.equal(rejected.headers['x-debug-proof'], undefined, `refused to sign for: ${JSON.stringify(hostile)}`);
+    }
+  });
+});
+
+test('the collector never emits private key material, whatever it is asked', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  await withResponderServer(privateKey, async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'signed event' },
+    });
+    const responses = [
+      await requestRaw(baseUrl, { pathname: '/health' }),
+      await requestRaw(baseUrl, {
+        pathname: `/sessions/${session.session_id}/logs`,
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one-with-enough-length' },
+      }),
+    ];
+    for (const response of responses) {
+      const seen = `${response.text}${JSON.stringify(response.headers)}`;
+      assert.equal(seen.includes(privatePem), false, 'no PEM anywhere in a response');
+      assert.equal(seen.includes('PRIVATE KEY'), false);
+    }
+    // Nor on disk: the collector writes session logs and a salt, and neither
+    // has any business carrying signing material.
+    const onDisk = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(onDisk.includes('PRIVATE KEY'), false);
   });
 });
 
