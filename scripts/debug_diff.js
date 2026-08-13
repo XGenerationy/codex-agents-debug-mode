@@ -6,7 +6,7 @@
 // three renderers; the no-flag default is TTY-aware: table for humans,
 // JSON (schema: 1) for pipes, because agents must never scrape tables.
 const {
-  escapeEvidenceText,
+  escapeMarkdownText,
   foldHypotheses,
   readSessionFile,
   resolveSessionRef,
@@ -144,12 +144,7 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 // DIFFERENT character (¦), not just a backslashed one, because the TABLE
 // renderer's cell borders are real │ that the terminal prints regardless of
 // a preceding backslash. JSON output needs none of this.
-const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&]/g;
-function escapeText(value) {
-  return escapeEvidenceText(value)
-    .replaceAll('│', '¦')
-    .replace(MARKDOWN_PUNCTUATION, '\\$&');
-}
+const escapeText = escapeMarkdownText;
 
 // Stored status is untrusted log content, and older logs can carry a
 // non-string value (foldHypotheses copies parsed.status verbatim). Escape

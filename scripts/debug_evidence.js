@@ -67,6 +67,15 @@ const escapeEvidenceText = (value) => JSON.stringify(String(value))
   .replaceAll('\u2028', '\\u2028')
   .replaceAll('\u2029', '\\u2029');
 
+// Markdown-surface escaping layered on the core helper: box-drawing pipes
+// would break diff/report tables, and markdown punctuation in stored log
+// content could restyle the surrounding document. Owned here so every
+// markdown renderer (debug_diff, debug_report) shares one transform.
+const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&]/g;
+const escapeMarkdownText = (value) => escapeEvidenceText(value)
+  .replaceAll('│', '¦')
+  .replace(MARKDOWN_PUNCTUATION, '\\$&');
+
 const FILTER_KEYS = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
 const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
 
@@ -384,6 +393,7 @@ module.exports = {
   createSessionTail,
   discoverCollector,
   escapeEvidenceText,
+  escapeMarkdownText,
   filterEntries,
   foldHypotheses,
   listSessions,

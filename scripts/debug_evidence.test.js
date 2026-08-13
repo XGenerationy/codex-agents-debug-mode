@@ -163,6 +163,23 @@ test('escapeEvidenceText escapes U+2028 and U+2029, which JSON.stringify leaves 
   assert.equal(escapeEvidenceText('a\u2029b'), 'a\\u2029b');
 });
 
+test('escapeMarkdownText escapes markdown punctuation, box-drawing pipes, and control text on top of escapeEvidenceText', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  assert.equal(escapeMarkdownText('a*b_c`d[e]f(g)h!i<j>k&l'), 'a\\*b\\_c\\`d\\[e\\]f\\(g\\)h\\!i\\<j\\>k\\&l');
+  assert.equal(escapeMarkdownText('col│umn'), 'col¦umn');
+  // escapeEvidenceText layer still applies underneath: newline stays escaped text
+  assert.equal(escapeMarkdownText('line1\nline2'), 'line1\\nline2');
+});
+
+test('escapeMarkdownText output is byte-identical to debug_diff\'s previous private escapeText for a hostile sample', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  const hostile = '│ **bold** [link](x) <img> & `tick` \n end';
+  const expected = require('./debug_evidence').escapeEvidenceText(hostile)
+    .replaceAll('│', '¦')
+    .replace(/[*_`\[\]()!<>&]/g, '\\$&');
+  assert.equal(escapeMarkdownText(hostile), expected);
+});
+
 test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
   try {
