@@ -722,9 +722,151 @@ const runSubcommand = async ({
   return 0; // command failure is finish's decision, never run's
 };
 
-// Implemented in later tasks — stable export surface from day one.
-const reportSubcommand = async () => { throw new Error('not implemented: reportSubcommand (Task 5)'); };
-const finishSubcommand = () => { throw new Error('not implemented: finishSubcommand (Task 5)'); };
+// The renderer runs as a separate process: it is the repo's own payload
+// script, covered by its own tests, and everything it needs is one argument —
+// the path to the staged copy. No token is passed to it on the command line
+// or in its environment, and it is invoked identically to how a human would
+// run it. maxBuffer is generous because the rendered surfaces are capped by
+// the renderer itself, not by this pipe; a child that somehow exceeds it
+// fails with a non-zero status and is handled like any other render failure
+// rather than silently truncating the evidence.
+const defaultSpawnReport = (args) => spawnSync(process.execPath, [REPORT_CLI, ...args], {
+  encoding: 'utf8',
+  maxBuffer: 64 * 1024 * 1024,
+});
+
+// Capture: stage the session log and both rendered surfaces into the evidence
+// child, record what actually happened, and leave every VERDICT to finish.
+//
+// Two orderings here are load-bearing:
+//
+// 1. The collector is probed, the log copied, and the renderer spawned BEFORE
+//    the lock is taken. Copying a session log and running two child processes
+//    can take seconds; the state lock's staleness threshold is 30s and its
+//    retry budget ~450ms, so a holder doing that work inside the critical
+//    section would make every concurrent invocation fail to acquire — and, at
+//    the tail, would itself risk being judged stale and reaped mid-flight
+//    (recorded T4 r2 requirement: no holder approaches the threshold).
+// 2. The state commit is a compare-and-set under that lock, exactly as run's
+//    is: re-read, compare nonces, and spread the CURRENT state rather than the
+//    snapshot this function opened with. A blind `{...state}` write would
+//    restore a stale pid, port and launch token over a newer invocation's and
+//    strand its live collector (Codex T4 #3/r2).
+const reportSubcommand = async ({
+  outputDir, env = process.env,
+  spawnReport = defaultSpawnReport, probe = probeServer,
+}) => {
+  const state = readState(outputDir);
+  if (!state) return 0; // start never completed; finish owns that failure
+  if (rejectForeignNonce(state, env, 'report')) return 3;
+  if (!state.sessionId) {
+    process.stderr.write('debug-evidence-action: report: the run step never completed; nothing to capture.\n');
+    return 0; // finish fails on the missing commandExitCode
+  }
+  // Liveness is RECORDED, never acted on: a collector that died mid-run still
+  // leaves a partial log worth staging, and whether that partial evidence is
+  // acceptable is finish's call, not this step's.
+  const identity = await probe(state.port, { deadlineMs: 2_000 });
+  // Positively true or nothing: an absent probe answer, a missing field, or a
+  // stranger on the port all read as "not alive", which finish treats as a
+  // failure rather than a pass.
+  const collectorAlive = identity?.ready === true;
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  mkdirSync(evidenceDir, { recursive: true });
+  const sessionSource = path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`);
+  let evidenceCopied = false;
+  try {
+    copyFileSync(sessionSource, path.join(evidenceDir, 'session.log'));
+    evidenceCopied = true;
+  } catch (error) {
+    process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
+  }
+  let reportRendered = false;
+  let markdownText = '';
+  let eventCount = '';
+  if (evidenceCopied) {
+    // Rendered from the COPY, never the live log: the original is still being
+    // appended to by a collector that outlives this step, so rendering it
+    // could read a torn tail the staged artifact does not contain.
+    const sessionCopy = path.join(evidenceDir, 'session.log');
+    const markdown = spawnReport([sessionCopy, '--format=md']);
+    const json = spawnReport([sessionCopy, '--format=json']);
+    if (markdown.status === 0 && json.status === 0) {
+      writeFileSync(path.join(evidenceDir, 'report.md'), markdown.stdout);
+      writeFileSync(path.join(evidenceDir, 'report.json'), json.stdout);
+      reportRendered = true;
+      markdownText = markdown.stdout;
+      try { eventCount = String(JSON.parse(json.stdout).session.events); } catch { /* the count is a convenience, not the evidence */ }
+    } else {
+      process.stderr.write(`debug-evidence-action: report: renderer failed (md ${markdown.status}, json ${json.status}).\n`);
+    }
+  }
+  const committed = await withStateLock(outputDir, () => {
+    const current = readState(outputDir);
+    if (!current || current.nonce !== state.nonce) return false;
+    writeState(outputDir, { ...current, collectorAlive, evidenceCopied, reportRendered });
+    return true;
+  });
+  if (!committed) {
+    process.stderr.write('debug-evidence-action: report: recorded state changed while evidence was captured (another invocation now owns this output-dir); refusing to overwrite it.\n');
+    return 3;
+  }
+  // Published only AFTER the commit succeeds. The staged files are already on
+  // disk — they have to be, since the render runs outside the lock — but a
+  // report-path or a step summary announced from state this invocation just
+  // declined to own would be advertising someone else's run as its own, the
+  // same lie run refuses to tell with a session-id.
+  if (reportRendered) {
+    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${markdownText}\n`);
+    if (env.GITHUB_OUTPUT) {
+      writeOutputs(env.GITHUB_OUTPUT, {
+        'event-count': eventCount,
+        'report-path': path.join(evidenceDir, 'report.md'),
+      });
+    }
+  }
+  return evidenceCopied && reportRendered ? 0 : 3; // capture is the product — fail closed
+};
+
+// The exit taxonomy, and the only place the action turns evidence into a
+// verdict. Read-only by construction, so it takes no lock (recorded
+// decision: lock-free read paths). Every failure mode of the machinery is a
+// 3; only a wrapped command's own non-zero exit is mirrored, so a consumer
+// can always tell "your build failed" from "this action failed".
+const finishSubcommand = ({ outputDir, env = process.env }) => {
+  const state = readState(outputDir);
+  if (!state) {
+    process.stderr.write('debug-evidence-action: finish: no recorded state; the start step never completed.\n');
+    return 3;
+  }
+  if (rejectForeignNonce(state, env, 'finish')) return 3;
+  if (!Number.isInteger(state.commandExitCode)) {
+    process.stderr.write('debug-evidence-action: finish: the run step never completed.\n');
+    return 3;
+  }
+  if (state.collectorAlive !== true) {
+    process.stderr.write('debug-evidence-action: finish: the collector was not alive and ready at capture time; evidence may be incomplete.\n');
+    return 3;
+  }
+  if (state.evidenceCopied !== true || state.reportRendered !== true) {
+    process.stderr.write('debug-evidence-action: finish: evidence capture or report rendering failed.\n');
+    return 3;
+  }
+  if (state.commandExitCode !== 0) {
+    if (state.failOnCommandFailure === 'false') {
+      process.stderr.write(`debug-evidence-action: wrapped command exited ${state.commandExitCode}; fail-on-command-failure is false, so the action succeeds. Evidence is in the artifact.\n`);
+      return 0;
+    }
+    // Anything but the literal 'false' mirrors — fail closed on unknowns.
+    process.stderr.write(`debug-evidence-action: wrapped command exited ${state.commandExitCode}.\n`);
+    // Out of range (a 128+signal sentinel above 255, or anything a shell
+    // could not have produced) becomes a plain 1: process.exitCode is taken
+    // modulo 256, so passing 300 through would surface as 44 — a code that
+    // looks like a real, different failure.
+    return state.commandExitCode >= 1 && state.commandExitCode <= 255 ? state.commandExitCode : 1;
+  }
+  return 0;
+};
 
 const collectStateSecrets = (state) => [state?.launchToken, state?.sessionToken].filter(Boolean);
 
@@ -770,6 +912,7 @@ if (require.main === module) void main();
 
 module.exports = {
   defaultSpawnCommand,
+  defaultSpawnReport,
   finishSubcommand,
   httpRequestJson,
   maskValue,

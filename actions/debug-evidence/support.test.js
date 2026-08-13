@@ -12,6 +12,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  defaultSpawnReport,
   finishSubcommand,
   httpRequestJson,
   maskValue,
@@ -850,4 +851,246 @@ test('withStateLock serializes concurrent holders: one inside at a time, nothing
       `${order[i]} was interrupted before it left the critical section`);
   }
   assert.ok(!existsSync(lockPath), 'the last release left no lock behind');
+});
+
+test('a wrapped command killed by a signal records the 128 sentinel and the signal that did it', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
+    // spawnSync reports a signal death as status null + signal name. `status
+    // ?? 128` is the only branch that turns that into a number, and a plain
+    // `||` there would have mapped a clean exit 0 to 128 as well — so the
+    // sentinel needs its own pin, not just the ordinary exit-code path.
+    spawnCommand: () => ({ status: null, signal: 'SIGKILL' }),
+  });
+  assert.equal(code, 0, 'run still succeeds; finish owns the verdict');
+  const state = readState(outputDir);
+  assert.equal(state.commandExitCode, 128, 'no exit code exists, so the 128+signal convention stands in');
+  assert.equal(state.commandSignal, 'SIGKILL', 'the signal name is recorded, not merely the sentinel');
+});
+
+const fullLifecycle = async () => {
+  const context = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
+  const githubOutput = path.join(context.outputDir, 'github_output');
+  const stepSummary = path.join(context.outputDir, 'step_summary');
+  writeFileSync(githubOutput, '');
+  writeFileSync(stepSummary, '');
+  const probe = 'node -e "' + [
+    'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'demo event\', hypothesisId: process.env.DEBUG_HYPOTHESIS_ID }) }).then((r) => process.exit(r.status === 202 ? 1 : 99));',
+  ].join('') + '"';
+  const runCode = await runSubcommand({
+    inputs: { ...context.inputs, runCommand: probe },
+    outputDir: context.outputDir,
+    env: { GITHUB_OUTPUT: githubOutput },
+  });
+  assert.equal(runCode, 0);
+  return { ...context, githubOutput, stepSummary };
+};
+
+test('report copies the session log, renders md+json, appends the summary, and emits outputs — token bytes never enter the evidence child', async () => {
+  const context = await fullLifecycle();
+  try {
+    const code = await reportSubcommand({
+      outputDir: context.outputDir,
+      env: { GITHUB_OUTPUT: context.githubOutput, GITHUB_STEP_SUMMARY: context.stepSummary },
+    });
+    assert.equal(code, 0);
+    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const state = readState(context.outputDir);
+    const copied = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
+    assert.ok(copied.includes('demo event'));
+    const reportMd = readFileSync(path.join(evidenceDir, 'report.md'), 'utf8');
+    assert.ok(reportMd.startsWith('## Debug evidence report'));
+    assert.ok(reportMd.includes('H-demo'));
+    const reportJson = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    assert.equal(reportJson.schema, 1);
+    assert.equal(reportJson.hypotheses[0].status, 'OPEN');
+    assert.ok(readFileSync(context.stepSummary, 'utf8').includes('## Debug evidence report'));
+    const outputs = readFileSync(context.githubOutput, 'utf8');
+    assert.match(outputs, /event-count=\d+/);
+    assert.match(outputs, /report-path=.+report\.md/);
+    for (const file of ['session.log', 'report.md', 'report.json']) {
+      const bytes = readFileSync(path.join(evidenceDir, file), 'utf8');
+      assert.ok(!bytes.includes(state.launchToken), `${file} must not contain the launch token`);
+      assert.ok(!bytes.includes(state.sessionToken), `${file} must not contain the session token`);
+    }
+    assert.equal(state.collectorAlive, true);
+    assert.equal(state.evidenceCopied, true);
+    assert.equal(state.reportRendered, true);
+    // The capture flags are ADDED to whatever run recorded, never written
+    // from report's own pre-capture snapshot: the CAS re-reads the file under
+    // the lock and spreads THAT, so nothing run committed is rolled back
+    // (Codex T4 #3/r2, applied to report).
+    assert.ok(state.sessionId.startsWith('ci-debug-'), 'run\'s session id survives report\'s commit');
+    assert.equal(state.commandExitCode, 1, 'and so does the exit code it recorded');
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+test('report with no state no-ops successfully (finish owns start failures); report after run-skip no-ops too', async () => {
+  const outputDir = makeTempDir();
+  assert.equal(await reportSubcommand({ outputDir, env: {} }), 0);
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43) });
+  assert.equal(await reportSubcommand({ outputDir, env: {} }), 0, 'no sessionId — run never completed; nothing to capture');
+});
+
+test('report refuses a state carrying another invocation\'s nonce before it touches the collector', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-abc', projectRoot: makeTempDir(),
+  });
+  let probed = 0;
+  const code = await reportSubcommand({
+    outputDir,
+    env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' },
+    probe: async () => { probed += 1; return { ready: true }; },
+    spawnReport: () => { throw new Error('a refused report must never reach the renderer'); },
+  });
+  assert.equal(code, 3);
+  assert.equal(probed, 0, 'the refusal is settled from state alone, before any network contact');
+});
+
+// A hand-written session log: the CAS path below has to be driven
+// deterministically, and a real collector's timing is not the thing under
+// test here.
+const writeSessionLog = (projectRoot, sessionId, lines) => {
+  mkdirSync(path.join(projectRoot, '.debug'), { recursive: true });
+  writeFileSync(
+    path.join(projectRoot, '.debug', `debug-${sessionId}.log`),
+    lines.map((line) => `${JSON.stringify(line)}\n`).join(''),
+  );
+};
+
+test('report stages evidence outside the lock but refuses to commit over a newer invocation, and advertises nothing it disowned', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const recorded = {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0,
+  };
+  writeState(outputDir, recorded);
+  writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'hand written event' }]);
+  const githubOutput = path.join(outputDir, 'github_output');
+  const stepSummary = path.join(outputDir, 'step_summary');
+  writeFileSync(githubOutput, '');
+  writeFileSync(stepSummary, '');
+  const usurper = { nonce: 'n2', pid: 2222, port: 9999, launchToken: 'y'.repeat(43), sessionName: 'other' };
+  let claimed = false;
+  const code = await reportSubcommand({
+    outputDir,
+    env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
+    probe: async () => ({ ready: true }),
+    // Rendering happens OUTSIDE the critical section by design — a holder
+    // that spawned two child processes could sit in the section for seconds,
+    // and the stale threshold is 30s (recorded T4 r2 requirement). The seam
+    // uses that window to let a second invocation claim the output-dir, which
+    // is exactly the interleave the lock cannot prevent and the CAS must.
+    spawnReport: (args) => {
+      if (!claimed) {
+        claimed = true;
+        writeState(outputDir, usurper);
+      }
+      return defaultSpawnReport(args);
+    },
+  });
+  assert.equal(code, 3, 'the nonce compare under the lock saw state it does not own');
+  assert.deepEqual(readState(outputDir), usurper, 'the newer invocation keeps its state, byte for byte');
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  assert.ok(existsSync(path.join(evidenceDir, 'report.md')),
+    'the render already happened — it runs outside the lock, so ownership is decided after it');
+  assert.equal(readFileSync(githubOutput, 'utf8'), '',
+    'a report-path emitted from state we just declined to own would be a lie');
+  assert.equal(readFileSync(stepSummary, 'utf8'), '',
+    'and so would a step summary for a run this invocation no longer owns');
+  assert.ok(!existsSync(path.join(outputDir, 'action-state.lock')), 'the critical section released behind it');
+});
+
+test('report records a dead collector without inventing evidence, and finish is what fails on it', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-abc', projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'last words' }]);
+  const code = await reportSubcommand({
+    outputDir,
+    env: {},
+    probe: async () => null, // nothing answers on the port any more
+  });
+  assert.equal(code, 0, 'report only fails on ITS OWN mechanical failures; a dead collector is not one');
+  const state = readState(outputDir);
+  assert.equal(state.collectorAlive, false);
+  assert.equal(state.evidenceCopied, true, 'whatever was readable is still staged');
+  assert.equal(state.reportRendered, true);
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
+    'the collector being dead at capture time is finish\'s verdict to make');
+});
+
+test('report returns 3 when the session log cannot be read — evidence is the product, so its absence fails closed', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-missing', projectRoot,
+  });
+  const githubOutput = path.join(outputDir, 'github_output');
+  writeFileSync(githubOutput, '');
+  const code = await reportSubcommand({
+    outputDir,
+    env: { GITHUB_OUTPUT: githubOutput },
+    probe: async () => ({ ready: true }),
+    spawnReport: () => { throw new Error('nothing was copied, so nothing can be rendered'); },
+  });
+  assert.equal(code, 3);
+  const state = readState(outputDir);
+  assert.equal(state.evidenceCopied, false);
+  assert.equal(state.reportRendered, false);
+  assert.equal(state.collectorAlive, true, 'the liveness fact is still recorded — it was observed');
+  assert.equal(readFileSync(githubOutput, 'utf8'), '', 'no report-path is emitted for a report that does not exist');
+});
+
+test('finish taxonomy: missing state 3; missing exit code 3; dead collector 3; command failure mirrors or is waived by the toggle', async () => {
+  const outputDir = makeTempDir();
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'no state');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true' });
+  assert.equal(finishSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3, 'nonce mismatch');
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'run never recorded an exit code');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: false, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'collector died before capture');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: true, evidenceCopied: false, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'nothing was captured');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'mirrors the command exit code');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'false', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 0, 'toggle waives the failure');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'maybe', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'anything but the literal string false mirrors (fail closed)');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 300, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 1, 'out-of-range exit codes clamp to 1');
+  writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: true, evidenceCopied: true, reportRendered: true });
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 0, 'green run');
+});
+
+test('the terminal main() catch redacts state tokens from stderr', async () => {
+  const { spawnSync: spawnSyncChild } = require('node:child_process');
+  const outputDir = makeTempDir();
+  const token = ['fake-launch-', 'token-', 'abcdefghijklmnop'].join('');
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: token });
+  const result = spawnSyncChild(process.execPath, [path.join(__dirname, 'support.js'), 'bogus-subcommand'], {
+    env: { ...process.env, DEBUG_ACTION_OUTPUT_DIR: outputDir },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /debug-evidence-action:/);
+  assert.match(result.stderr, /Unknown subcommand/);
+  assert.ok(!result.stderr.includes(token), 'known state tokens are redacted from the terminal catch');
 });
