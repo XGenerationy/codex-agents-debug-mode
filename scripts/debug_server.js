@@ -1551,12 +1551,38 @@ const createDebugServer = ({
         ? pathname.match(/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/)
         : null;
       if (sessionLogsMatch) {
-        // Reads are a launch-token capability (see POST /hypothesis). The id
-        // is used ONLY as a map key — client input never reaches filesystem
-        // path construction, so there is no traversal surface.
-        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        // Reads accept EITHER credential, and this is the ONLY route that
+        // does: the launch token reads any session (operator scope), and a
+        // session's OWN token reads that session and nothing else
+        // (same-session read scope). Every mutating route stays launch-only
+        // or session-only exactly as before — in particular POST /hypothesis
+        // remains launch-token-only.
+        //
+        // The scope exists so a CI caller can read back what it recorded
+        // without holding a credential that could also forge a verdict into
+        // it: the debug-evidence action mints a session in its start step and
+        // then drops the launch token, so the only token that survives into
+        // the job is this one — read-and-append, never judge.
+        //
+        // Bearer is the channel because that is what the shared reader
+        // (debug_evidence.js readSessionLive) sends on this route; the
+        // x-debug-session-token header belongs to POST /log and stays there.
+        //
+        // The id is used ONLY as a map key — client input never reaches
+        // filesystem path construction, so there is no traversal surface.
+        const presented = bearerToken(request);
         retireInactiveSessions();
         const session = sessions.get(sessionLogsMatch[1]);
+        // One choke point still decides: select which credential this request
+        // is claiming, then let authorizeRequest do the timing-safe compare
+        // and own the 401 shape. safeTokenEqual is total and constant-time on
+        // both arms, and a request presenting neither token falls through to
+        // the launch-token comparison — so an unknown session is a 401, not a
+        // 404, for anyone who cannot already read every session.
+        const expected = session && safeTokenEqual(presented, session.sessionToken)
+          ? session.sessionToken
+          : token;
+        if (!authorizeRequest(response, presented, expected)) return;
         if (!session) {
           sendJson(response, 404, { error: 'unknown_session' });
           return;

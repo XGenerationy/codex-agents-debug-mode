@@ -11,7 +11,7 @@ const {
   openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
@@ -418,9 +418,23 @@ const readShimStartLine = (child, timeoutMs) => new Promise((resolve, reject) =>
   });
 });
 
+// start owns the LAUNCH TOKEN's entire lifecycle, and it ends here.
+//
+// The token is the collector's operator credential: it mints sessions and,
+// crucially, it is the only thing that can POST a hypothesis line. Persisting
+// it in action-state.json put that capability on disk for the rest of the
+// job, where the wrapped command — same OS user, derivable path — could pick
+// it up and forge a verdict the evidence contract then had to detect after
+// the fact (Codex T5 r3). So the token is used and dropped inside this one
+// process: handshake, mask, prove the port occupant holds it, mint the
+// session, open the hypothesis, and write state carrying only the SESSION
+// token. After start returns, no credential capable of writing a verdict
+// exists anywhere in the job — the hypothesis-set contract stops being a
+// detection and becomes a structural fact.
 const startSubcommand = async ({
   inputs, outputDir, env = process.env, projectRoot = process.cwd(),
   spawnShim = defaultSpawnShim, probeReady = probeReadyCollector, kill = process.kill,
+  request = httpRequestJson, probeToken = probeLaunchToken,
   writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
 }) => {
@@ -466,24 +480,84 @@ const startSubcommand = async ({
   // readiness probe and the state write: from here on the runner scrubs it
   // out of anything this job logs, including output nobody here wrote.
   maskValue(env, startLine.launch_token, writeStdout);
-  const identity = await probeReady(Number(inputs.port), startLine.project_hash, { deadlineMs: readyTimeoutMs });
-  if (!identity || identity.project_hash !== startLine.project_hash || identity.ready !== true) {
+  // From here on the collector is RUNNING and outlives this process, so every
+  // failure has to take it down first: nothing has recorded its pid yet, and
+  // a collector nothing can stop holds the port and writes session logs for
+  // the rest of the runner's life.
+  const abort = (message) => {
     try { kill(startLine.pid); } catch {}
-    throw new Error('collector did not become ready before the timeout');
+    return new Error(message);
+  };
+  const port = Number(inputs.port);
+  const identity = await probeReady(port, startLine.project_hash, { deadlineMs: readyTimeoutMs });
+  if (!identity || identity.project_hash !== startLine.project_hash || identity.ready !== true) {
+    throw abort('collector did not become ready before the timeout');
+  }
+  // Prove the port occupant actually holds the token before handing it over.
+  // The shim reported a pid and a token, but between that report and this
+  // line the collector could have died and any local process could have taken
+  // the port; the very next request puts the launch token in an Authorization
+  // header (Codex T4 #4). probeLaunchToken settles it non-mutatingly — a
+  // random challenge whose HMAC proof is verified locally, so a listener that
+  // cannot compute it never receives the token.
+  if (!(await probeToken(port, startLine.launch_token))) {
+    throw abort(`collector identity could not be verified on port ${port}; refusing to send the launch token`);
+  }
+  const mint = await request({
+    port,
+    method: 'POST',
+    path: '/session',
+    headers: { Authorization: `Bearer ${startLine.launch_token}` },
+    body: { name: inputs.sessionName },
+  });
+  if (mint.status !== 201 || !mint.json?.session_id || !mint.json?.session_token) {
+    throw abort(`session mint failed (HTTP ${mint.status ?? 'no response'})`);
+  }
+  const sessionId = mint.json.session_id;
+  const sessionToken = mint.json.session_token;
+  // Masked before the token is used for anything else, and before it is
+  // written anywhere.
+  maskValue(env, sessionToken, writeStdout);
+  if (inputs.hypothesisId) {
+    // The ONLY hypothesis line this action will ever post, and the last thing
+    // the launch token is used for. It records intent (OPEN) and never a
+    // verdict — judgment stays with humans and agents (spec amendment,
+    // planning round). Because the token dies with this process, this is also
+    // the only hypothesis line that CAN exist in the session.
+    const hypothesis = await request({
+      port,
+      method: 'POST',
+      path: '/hypothesis',
+      headers: { Authorization: `Bearer ${startLine.launch_token}` },
+      body: {
+        sessionId,
+        hypothesisId: inputs.hypothesisId,
+        status: 'OPEN',
+        ...(inputs.hypothesisTitle ? { title: inputs.hypothesisTitle } : {}),
+      },
+    });
+    if (hypothesis.status !== 202) {
+      throw abort(`hypothesis post failed (HTTP ${hypothesis.status ?? 'no response'})`);
+    }
   }
   // Persist BEFORE releasing the pipes, and kill the child if persisting
   // fails (Codex T3 #2). teardown stops the collector by reading its pid out
   // of this file, so a live collector whose state never landed is a collector
   // nothing can stop: it would hold the port and keep writing session logs
   // for the rest of the runner's life.
+  //
+  // Note what is NOT in here: the launch token. The session token that is
+  // recorded can append events and read this session's own log back, and
+  // nothing else — it cannot mint, and it cannot post a hypothesis line.
   try {
     await withStateLock(outputDir, () => writeState(outputDir, {
       nonce,
       pid: startLine.pid,
-      port: Number(inputs.port),
-      launchToken: startLine.launch_token,
+      port,
       projectRoot,
       sessionName: inputs.sessionName,
+      sessionId,
+      sessionToken,
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
@@ -610,8 +684,7 @@ const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', 
 
 const runSubcommand = async ({
   inputs, outputDir, env = process.env,
-  request = httpRequestJson, spawnCommand = defaultSpawnCommand,
-  probeToken = probeLaunchToken, writeStdout = defaultStdoutWrite,
+  spawnCommand = defaultSpawnCommand, writeStdout = defaultStdoutWrite,
 }) => {
   const state = readState(outputDir);
   if (!state) {
@@ -619,74 +692,32 @@ const runSubcommand = async ({
     return 3;
   }
   if (rejectForeignNonce(state, env, 'run')) return 3;
-  // Recorded state proves a collector was ours WHEN START RAN; it proves
-  // nothing about who holds the port now. If that collector died and any
-  // other local process rebound the port, the very next line would hand a
-  // stranger the launch token in an Authorization header — a credential good
-  // for minting sessions and posting hypotheses for the rest of the job
-  // (Codex T4 #4). probeLaunchToken settles that first and non-mutatingly: it
-  // sends a random challenge and verifies the HMAC proof LOCALLY, so a forged
-  // listener that cannot compute the proof never receives the token at all.
-  if (!(await probeToken(state.port, state.launchToken))) {
-    process.stderr.write(`debug-evidence-action: run: collector identity could not be verified on port ${state.port}; refusing to send the launch token.\n`);
+  // The session was minted in start, while the launch token still existed.
+  // This step talks to no one: it injects what start recorded, runs the
+  // command, and records how it went. Nothing here holds a credential that
+  // could mint a session or post a hypothesis, because no such credential
+  // survives into this process (Codex T5 r3).
+  if (!state.sessionId || !state.sessionToken) {
+    process.stderr.write('debug-evidence-action: run: recorded state carries no session; the start step never completed its mint.\n');
     return 3;
   }
-  const mint = await request({
-    port: state.port,
-    method: 'POST',
-    path: '/session',
-    headers: { Authorization: `Bearer ${state.launchToken}` },
-    body: { name: state.sessionName },
-  });
-  if (mint.status !== 201 || !mint.json?.session_id || !mint.json?.session_token) {
-    process.stderr.write(`debug-evidence-action: run: session mint failed (HTTP ${mint.status ?? 'no response'}).\n`);
-    return 3;
-  }
-  const sessionId = mint.json.session_id;
-  const sessionToken = mint.json.session_token;
-  // Masked before the token is used for anything: the hypothesis post below,
-  // the wrapped command's own logging, and Node's http tracing all come after
-  // this line.
-  maskValue(env, sessionToken, writeStdout);
-  if (state.hypothesisId) {
-    // POST /hypothesis is a LAUNCH-token capability the wrapped command never
-    // holds; the action records intent (OPEN) here and never any verdict —
-    // judgment stays with humans/agents (spec amendment, planning round).
-    const hypothesis = await request({
-      port: state.port,
-      method: 'POST',
-      path: '/hypothesis',
-      headers: { Authorization: `Bearer ${state.launchToken}` },
-      body: {
-        sessionId,
-        hypothesisId: state.hypothesisId,
-        status: 'OPEN',
-        ...(state.hypothesisTitle ? { title: state.hypothesisTitle } : {}),
-      },
-    });
-    if (hypothesis.status !== 202) {
-      process.stderr.write(`debug-evidence-action: run: hypothesis post failed (HTTP ${hypothesis.status ?? 'no response'}).\n`);
-      return 3;
-    }
-  }
+  // Re-registering a value the runner already masks in start is a no-op for
+  // Actions and cheap insurance for this step's own log, which is where the
+  // token is about to be put into a child process's environment.
+  maskValue(env, state.sessionToken, writeStdout);
   const commandEnv = {
     ...env,
     DEBUG_LOG_URL: `http://127.0.0.1:${state.port}/log`,
-    DEBUG_SESSION_ID: sessionId,
-    DEBUG_SESSION_TOKEN: sessionToken,
+    DEBUG_SESSION_ID: state.sessionId,
+    DEBUG_SESSION_TOKEN: state.sessionToken,
   };
   // The action's own wiring is not part of the contract the wrapped command
-  // is promised, and one of those variables is a loaded gun:
-  // DEBUG_ACTION_OUTPUT_DIR points straight at action-state.json, which
-  // carries the LAUNCH token — a credential that can post hypothesis verdicts
-  // the session token cannot. The wrapped command runs as the same OS user,
-  // so the file's 0600 mode is no boundary against it; handing over the path
-  // is (Codex T5 r2 #1). Stripping the whole prefix rather than that one name
-  // keeps the rule stable as more wiring vars appear.
-  //
-  // Not a fix on its own — the default output-dir is derivable — which is why
-  // report's hypothesis-set contract, not this loop, is the layer that
-  // actually closes the hole.
+  // is promised, and DEBUG_ACTION_OUTPUT_DIR points straight at
+  // action-state.json — which no longer carries a launch token, but does
+  // carry the session token and this invocation's nonce. The wrapped command
+  // runs as the same OS user, so the file's 0600 mode is no boundary against
+  // it; handing over the path is (Codex T5 r2 #1). Stripping the whole prefix
+  // rather than one name keeps the rule stable as more wiring vars appear.
   for (const key of Object.keys(commandEnv)) {
     if (key.startsWith('DEBUG_ACTION_')) delete commandEnv[key];
   }
@@ -708,7 +739,7 @@ const runSubcommand = async ({
   // `state` was read before a wrapped command that may have run for an hour,
   // and the write below is a blind whole-file overwrite: if another
   // invocation claimed this output-dir meanwhile, it would restore OUR stale
-  // pid/port/token over theirs and strand their live collector. Re-reading
+  // pid/port/session over theirs and strand their live collector. Re-reading
   // first was not enough on its own — between the compare and the rename a
   // second invocation could still commit, and this one would clobber it
   // anyway (Codex T4 #3, then r2). Under the lock the re-read and the write
@@ -718,8 +749,6 @@ const runSubcommand = async ({
     if (!current || current.nonce !== state.nonce) return false;
     writeState(outputDir, {
       ...current,
-      sessionId,
-      sessionToken,
       commandExitCode,
       commandSignal: result.signal ?? null,
       commandError: result.error ? String(result.error.message) : null,
@@ -733,7 +762,7 @@ const runSubcommand = async ({
     return 3;
   }
   if (env.GITHUB_OUTPUT) {
-    writeOutputs(env.GITHUB_OUTPUT, { 'command-exit-code': commandExitCode, 'session-id': sessionId });
+    writeOutputs(env.GITHUB_OUTPUT, { 'command-exit-code': commandExitCode, 'session-id': state.sessionId });
   }
   return 0; // command failure is finish's decision, never run's
 };
@@ -782,14 +811,15 @@ const EVIDENCE_FILES = ['session.log', 'report.md', 'report.json'];
 // sent — or none at all when no hypothesis-id was configured. Any other
 // hypothesis line was forged, by definition.
 //
-// This is the layer that survives token theft. The wrapped command runs as
-// the same OS user and can read action-state.json out of an output-dir whose
-// default location is derivable, so it can take the launch token and post a
-// CONFIRMED verdict through the real endpoint — which the collector then
-// records as faithfully as anything else, and which authenticated capture
-// would otherwise bless as the run's official finding (Codex T5 r2 #1).
-// Stripping DEBUG_ACTION_* from the wrapped command's env raises the bar;
-// this check is what makes a stolen token worth nothing.
+// As of T5 r3 this is a BELT, not the braces. It was introduced when the
+// launch token was persisted in action-state.json, where the wrapped command
+// — same OS user, derivable path — could take it and post a CONFIRMED verdict
+// through the real endpoint for authenticated capture to bless (Codex T5 r2
+// #1). That token now lives and dies inside start's process, so no credential
+// able to write a hypothesis line exists while the wrapped command runs and
+// this check should never fire. It stays precisely because of that: if it
+// ever does fire, the structural guarantee has been broken somewhere and the
+// evidence must not be published on the strength of an assumption.
 //
 // EVENTS are deliberately not checked: they come from the instrumented
 // process and are attacker-authored by design — recording what that process
@@ -832,6 +862,43 @@ const describeHypothesisDeviation = (entries, state) => {
 // the job; timing out here is an evidence-integrity failure like any other.
 const LIVE_READ_TIMEOUT_MS = 5_000;
 
+// Which live-read failures mean "there is no collector to ask" rather than
+// "the collector answered and refused". Only the first class may fall back to
+// the on-disk log, and only as labeled partial evidence: nothing answered
+// (connect failure), nothing answered in time, or what answered does not hold
+// this session's token — a foreign process that rebound the port. Every other
+// failure came from a collector that authenticated us and then declined, and
+// preferring the file on disk over its refusal would stage the exact bytes it
+// refused to vouch for.
+const UNREACHABLE_READ = /^live_read_(connect_failed|timeout|unauthorized)/;
+
+// SHA-256 of every staged file, as one line.
+//
+// Prevention is not available here: staging and upload are separate steps of
+// the same composite action running as the same user, so a detached child of
+// the wrapped command can rewrite a staged file in the window between them.
+// Detection is. The step log is streamed and immutable once emitted, so a
+// digest printed at staging time is a record no later rewrite can revise —
+// compare the uploaded artifact against this line and any swap is visible
+// (Codex T5 r3, threat-model option taken with teeth).
+//
+// Only files that were actually staged appear; a run that staged nothing
+// emits nothing to claim.
+const stagedDigestLine = (evidenceDir) => {
+  const parts = [];
+  for (const name of EVIDENCE_FILES) {
+    let bytes;
+    try {
+      bytes = readFileSync(path.join(evidenceDir, name));
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    parts.push(`${name}=${createHash('sha256').update(bytes).digest('hex')}`);
+  }
+  return parts.length === 0 ? null : `evidence-sha256 ${parts.join(' ')}`;
+};
+
 // One diagnostic is one line. The values interpolated into report's stderr
 // come from a state file and from OS/collector errors quoting it, so a raw
 // newline in either would split one message into what reads as two — the same
@@ -849,14 +916,15 @@ const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 //    hypothesis lines carrying a CONFIRMED verdict it has no credential to
 //    POST — and a copyFileSync would stage that forgery and render it as the
 //    run's official evidence (Codex T5 #1, Critical). Reading back through
-//    GET /sessions/:id/logs puts the collector's own log-identity check
-//    (dev/ino/birthtime/size vs the bytes it wrote) in the path, so a tampered
-//    log is a 409 rather than a report.
-// 2. Aliveness is proven, not observed. probeLaunchToken challenges the port
-//    occupant to demonstrate it holds the launch token; an unauthenticated
-//    /health answer only tells us SOMETHING is listening, which is exactly
-//    what a process that rebound the port would also produce.
-// 3. Probe, live read and renderer all run BEFORE the lock is taken. That
+//    GET /sessions/:id/logs puts the collector's own checks in the path —
+//    dev/ino/birthtime/size identity, and since r2 a SHA-256 of every byte it
+//    appended — so a tampered log is a 409 rather than a report, including
+//    the same-length in-place rewrite metadata alone cannot see.
+// 2. Aliveness is the authenticated read itself. An unauthenticated /health
+//    answer only says SOMETHING is listening — exactly what a process that
+//    rebound the port would also produce. A served log proves the occupant
+//    holds the session this run minted; a foreign one answers 401.
+// 3. Live read and renderer both run BEFORE the lock is taken. That
 //    work can take seconds; the state lock's staleness threshold is 30s and
 //    its retry budget ~450ms, so a holder doing it inside the critical
 //    section would make every concurrent invocation fail to acquire — and, at
@@ -867,22 +935,21 @@ const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 //    snapshot this function opened with (Codex T4 #3/r2).
 const reportSubcommand = async ({
   outputDir, env = process.env,
-  spawnReport = defaultSpawnReport,
-  probeToken = probeLaunchToken, readLive = readSessionLive,
+  spawnReport = defaultSpawnReport, readLive = readSessionLive,
+  writeStdout = defaultStdoutWrite,
 }) => {
-  const state = readState(outputDir);
-  if (!state) return 0; // start never completed; finish owns that failure
-  if (rejectForeignNonce(state, env, 'report')) return 3;
+  // FIRST, before state is even read. Staging is invocation-scoped: an
+  // output-dir can be reused — across steps, across jobs on a self-hosted
+  // runner — and the upload step enumerates three fixed filenames, so a
+  // previous invocation's report left sitting there ships as this run's
+  // evidence under this run's artifact name. A failed start, an absent state
+  // file and a foreign nonce are exactly the paths that used to return
+  // without clearing, and they are the ones where stale evidence is most
+  // plausible (Codex T5 r2 #3, hoisted in r3). Anything other than "it was
+  // not there" is left to throw: a staging slot that cannot be cleared cannot
+  // be scoped either.
   const evidenceDir = resolveEvidenceDir(outputDir);
   mkdirSync(evidenceDir, { recursive: true });
-  // Staging is INVOCATION-SCOPED. An output-dir can be reused — across steps,
-  // across jobs on a self-hosted runner — and the upload step enumerates
-  // three fixed filenames, so a previous invocation's report left sitting
-  // there is a previous invocation's evidence shipped as this run's, under
-  // this run's artifact name (Codex T5 r2 #3). Clearing before capture makes
-  // the artifact either what this invocation produced or nothing at all.
-  // Anything other than "it was not there" is left to throw: a staging slot
-  // that cannot be cleared cannot be scoped either.
   for (const name of EVIDENCE_FILES) {
     try {
       unlinkSync(path.join(evidenceDir, name));
@@ -890,64 +957,78 @@ const reportSubcommand = async ({
       if (error?.code !== 'ENOENT') throw error;
     }
   }
-  if (!state.sessionId) {
-    process.stderr.write('debug-evidence-action: report: the run step never completed; nothing to capture.\n');
+  const state = readState(outputDir);
+  if (!state) return 0; // start never completed; finish owns that failure
+  if (rejectForeignNonce(state, env, 'report')) return 3;
+  if (!state.sessionId || !state.sessionToken) {
+    process.stderr.write('debug-evidence-action: report: recorded state carries no session; nothing to capture.\n');
     return 0; // finish fails on the missing commandExitCode
   }
-  // AUTHENTICATED aliveness: this is both the liveness fact finish gates on
-  // and the precondition for trusting anything the port says.
-  const collectorAlive = (await probeToken(state.port, state.launchToken)) === true;
   const sessionCopy = path.join(evidenceDir, 'session.log');
+  // Aliveness is the READ ITSELF succeeding. There is no launch token left to
+  // challenge the port with, and there does not need to be: an authenticated
+  // read of this session's own log is a stronger statement than a liveness
+  // probe ever was — it proves something on that port holds the session we
+  // minted AND could serve its bytes. A foreign occupant answers 401 and
+  // fails it (Codex T5 r3).
+  let collectorAlive = false;
   let evidenceCopied = false;
   // Did the staged bytes come from the collector, or off a filesystem the
   // wrapped command can write? Recorded either way, so the artifact's
   // provenance is a fact in the state file rather than an assumption.
   let evidenceAuthentic = false;
-  if (collectorAlive) {
-    let entries = null;
-    try {
-      entries = await readLive({
-        port: state.port,
-        token: state.launchToken,
-        sessionId: state.sessionId,
-        timeoutMs: LIVE_READ_TIMEOUT_MS,
-      });
-    } catch (error) {
-      // live_read_log_replaced (and its tampered sibling) is the collector
-      // telling us the file it wrote is no longer the file on disk. Falling
-      // back to that file would stage precisely the forgery the check just
-      // caught, so an authenticated collector that cannot serve its own
-      // session is an evidence-integrity failure and nothing else.
-      process.stderr.write(oneLine(`debug-evidence-action: report: the collector could not serve session ${state.sessionId} (${error?.message ?? error}); the on-disk log is not a substitute for it.`) + '\n');
+  let entries = null;
+  let readFailure = null;
+  try {
+    entries = await readLive({
+      port: state.port,
+      // The session's OWN token. GET /sessions/:id/logs accepts it for this
+      // session and nothing else, which is why start could drop the launch
+      // token and still leave capture possible.
+      token: state.sessionToken,
+      sessionId: state.sessionId,
+      timeoutMs: LIVE_READ_TIMEOUT_MS,
+    });
+    collectorAlive = true;
+  } catch (error) {
+    readFailure = String(error?.message ?? error);
+  }
+  if (entries !== null) {
+    const deviation = describeHypothesisDeviation(entries, state);
+    if (deviation !== null) {
+      // Belt to the structural braces. No credential capable of posting a
+      // hypothesis line survives start, so this should now be unreachable —
+      // which is exactly why it stays: if it ever fires, something about that
+      // invariant is wrong and the evidence must not be published.
+      process.stderr.write(oneLine(`debug-evidence-action: report: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
+    } else {
+      // The raw lines, verbatim and in order: `raw` is the byte-for-byte
+      // text the collector served, so the staged artifact is the
+      // collector's view rather than a re-serialization of it.
+      writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
+      evidenceCopied = true;
+      evidenceAuthentic = true;
     }
-    if (entries !== null) {
-      const deviation = describeHypothesisDeviation(entries, state);
-      if (deviation !== null) {
-        // Authentically recorded and still forged: the collector faithfully
-        // stored a line posted by whoever held the launch token, and that was
-        // not this action.
-        process.stderr.write(oneLine(`debug-evidence-action: report: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
-      } else {
-        // The raw lines, verbatim and in order: `raw` is the byte-for-byte
-        // text the collector served, so the staged artifact is the
-        // collector's view rather than a re-serialization of it.
-        writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
-        evidenceCopied = true;
-        evidenceAuthentic = true;
-      }
-    }
-  } else {
-    process.stderr.write(oneLine(`debug-evidence-action: report: nothing on port ${state.port} could prove it holds this session's launch token; staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
-    // Best effort, and labeled as such. Whatever is readable is still worth
-    // uploading for a human to look at, and finish refuses the run anyway on
-    // collectorAlive — so unverifiable bytes can be inspected but can never
-    // ride a green build.
+  } else if (UNREACHABLE_READ.test(readFailure)) {
+    // Nothing answered, or what answered is not our collector. There is no
+    // authoritative source to prefer, so the on-disk log is staged best-effort
+    // and LABELED: whatever is readable is still worth a human's eyes, and
+    // finish refuses the run on collectorAlive, so unverifiable bytes can be
+    // inspected but can never ride a green build.
+    process.stderr.write(oneLine(`debug-evidence-action: report: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
     try {
       copyFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), sessionCopy);
       evidenceCopied = true;
     } catch (error) {
       process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
     }
+  } else {
+    // The collector answered us and refused — session_log_tampered or
+    // session_log_replaced surfacing as live_read_log_replaced, an unknown
+    // session, a torn line. Falling back to the file on disk would stage
+    // precisely the forgery the collector just caught, so this is an
+    // evidence-integrity failure and nothing else.
+    process.stderr.write(oneLine(`debug-evidence-action: report: the collector refused to serve session ${state.sessionId} (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
   }
   let reportRendered = false;
   let markdownText = '';
@@ -973,6 +1054,13 @@ const reportSubcommand = async ({
       }
     }
   }
+  // Printed as soon as the bytes exist and BEFORE the ownership commit: this
+  // line is a forensic record of what this process wrote to disk, not a claim
+  // about which invocation owns the output-dir. Emitting it late — or only on
+  // the paths that go on to succeed — would leave exactly the failure windows
+  // undocumented.
+  const digestLine = stagedDigestLine(evidenceDir);
+  if (digestLine !== null) writeStdout(`${digestLine}\n`);
   const committed = await withStateLock(outputDir, () => {
     const current = readState(outputDir);
     if (!current || current.nonce !== state.nonce) return false;
@@ -994,6 +1082,9 @@ const reportSubcommand = async ({
       writeOutputs(env.GITHUB_OUTPUT, {
         'event-count': eventCount,
         'report-path': path.join(evidenceDir, 'report.md'),
+        // Byte-identical to the stdout line, so a consumer can compare the
+        // artifact against either surface.
+        'evidence-digest': digestLine ?? '',
       });
     }
   }
@@ -1050,7 +1141,10 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
   return 0;
 };
 
-const collectStateSecrets = (state) => [state?.launchToken, state?.sessionToken].filter(Boolean);
+// The session token is the only credential a state file can carry now — the
+// launch token never reaches disk (Codex T5 r3), so there is nothing else
+// here to redact out of a terminal diagnostic.
+const collectStateSecrets = (state) => [state?.sessionToken].filter(Boolean);
 
 const main = async () => {
   const [subcommand] = process.argv.slice(2);

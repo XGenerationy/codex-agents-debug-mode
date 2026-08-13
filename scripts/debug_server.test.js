@@ -4508,16 +4508,23 @@ const seedReadableSession = async (baseUrl) => {
   return session;
 };
 
-test('GET /sessions/:id/logs requires the launch token and serves verbatim NDJSON', async () => {
+test('GET /sessions/:id/logs requires a credential for THIS session and serves verbatim NDJSON', async () => {
   await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
     const session = await seedReadableSession(baseUrl);
     const noAuth = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs` });
     assert.equal(noAuth.status, 401);
-    const sessionAuth = await requestRaw(baseUrl, {
+    const strangerAuth = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: { Authorization: 'Bearer not-a-token-this-server-ever-issued' },
+    });
+    assert.equal(strangerAuth.status, 401);
+    // The session's own token reads its own log — same-session read scope,
+    // added so a CI caller can drop the launch token and still capture.
+    const ownAuth = await requestRaw(baseUrl, {
       pathname: `/sessions/${session.session_id}/logs`,
       headers: { Authorization: `Bearer ${session.session_token}` },
     });
-    assert.equal(sessionAuth.status, 401);
+    assert.equal(ownAuth.status, 200);
     const ok = await requestRaw(baseUrl, {
       pathname: `/sessions/${session.session_id}/logs`,
       headers: LAUNCH_AUTH,
@@ -4796,5 +4803,59 @@ test('the content digest keeps pace with ordinary appends: interleaved writes an
     assert.equal(res.text.split('\n').filter(Boolean).length, 4, 'hypothesis appends are digested too');
     // The served bytes are still exactly the file the collector wrote.
     assert.equal(res.text, await readFile(path.join(projectRoot, session.log_file), 'utf8'));
+  });
+});
+
+test('GET /sessions/:id/logs accepts a session\'s own token for its own session and nothing else', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const mine = (await createSession(baseUrl)).body;
+    const other = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: mine.session_id, sessionToken: mine.session_token, msg: 'my own event' },
+    });
+    const sessionAuth = { authorization: `Bearer ${mine.session_token}` };
+    // Same-session read scope: this is what lets a CI caller read back what it
+    // recorded after dropping the launch token.
+    const own = await requestRaw(baseUrl, { pathname: `/sessions/${mine.session_id}/logs`, headers: sessionAuth });
+    assert.equal(own.status, 200);
+    assert.equal(own.text.includes('my own event'), true);
+    // ...and no further. A session token is not an operator credential.
+    const foreign = await requestRaw(baseUrl, { pathname: `/sessions/${other.session_id}/logs`, headers: sessionAuth });
+    assert.equal(foreign.status, 401);
+    assert.equal(JSON.parse(foreign.text).error, 'unauthorized');
+    // An unknown session is a 401 for a caller who cannot read every session,
+    // never a 404 that would confirm which ids exist.
+    const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: sessionAuth });
+    assert.equal(unknown.status, 401);
+    // The launch token still reads anything, and no token still reads nothing.
+    const operator = await requestRaw(baseUrl, { pathname: `/sessions/${other.session_id}/logs`, headers: LAUNCH_AUTH });
+    assert.equal(operator.status, 200);
+    const anonymous = await requestRaw(baseUrl, { pathname: `/sessions/${mine.session_id}/logs` });
+    assert.equal(anonymous.status, 401);
+  });
+});
+
+test('the session token stays read-and-append: it can never post a hypothesis line', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    // The whole point of the read scope: the credential that survives into a
+    // CI job can record events and read them back, but cannot forge a verdict.
+    const forged = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/hypothesis',
+      headers: { authorization: `Bearer ${session.session_token}` },
+      body: { sessionId: session.session_id, hypothesisId: 'H-forged', status: 'CONFIRMED' },
+    });
+    assert.equal(forged.status, 401);
+    // Nor can it mint a fresh session to work around that.
+    const minted = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/session',
+      headers: { authorization: `Bearer ${session.session_token}` },
+      body: { name: 'ci-debug' },
+    });
+    assert.equal(minted.status, 401);
   });
 });
