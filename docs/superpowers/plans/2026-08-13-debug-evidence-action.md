@@ -1441,6 +1441,23 @@ All accepted:
 Fix commit message:
 `fix(action): token masking, bounded http, nonce CAS, port-occupant auth, env hygiene (Codex T4)`.
 
+**Fix round 2 (Codex re-review of `2e2eb74`):** four fixes sound; residuals ruled —
+slow-collector refusal acceptable (correct fail-closed tradeoff), transport exit-1
+class acceptable (finish still fail-closed), strict `=== 'true'` masking gate correct
+per GitHub's documented contract. One remaining Important: the nonce "CAS" is
+check-then-act — between `run`'s re-read/compare and `writeState`'s unconditional
+rename, a second invocation can write, and the first then clobbers it (orphan hazard
+persists). Decision: a real critical section honored by EVERY state writer —
+`withStateLock(outputDir, fn)` acquiring `action-state.lock` via `O_CREAT|O_EXCL`
+(retry ~10 × 50 ms; a lock older than 30 s is stale → unlink and retry once; final
+acquisition failure ⇒ throw, landing in the terminal catch), releasing in `finally`.
+`start`'s initial write and `run`'s read-compare-write go under the lock now; Task 5's
+`report` write must use it too. Tests: (1) a pre-held fresh lock makes `run`'s commit
+path fail bounded (not hang); (2) a stale lock is reaped; (3) the interleave test now
+drives the wrapped command's state mutation through the locked API and asserts
+serialization (loser refuses, winner's state survives).
+Commit: `fix(action): state-lock critical sections for nonce ownership (Codex T4 r2)`.
+
 ---
 
 ### Task 5: `report` + `finish` — capture, render, and the exit taxonomy
