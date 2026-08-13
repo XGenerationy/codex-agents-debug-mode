@@ -389,3 +389,90 @@ test('redactKnownSecrets replaces every occurrence of each known token and ignor
   assert.equal(redactKnownSecrets(`x ${secret} y ${secret}`, [secret, 'short']),
     'x [REDACTED] y [REDACTED]');
 });
+
+const startReal = async (overrides = {}) => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const port = await getFreePort();
+  const inputs = baseInputs({ port: String(port), ...overrides });
+  const code = await startSubcommand({ inputs, outputDir, projectRoot, env: {} });
+  assert.equal(code, 0);
+  return { outputDir, projectRoot, port, inputs };
+};
+
+test('run mints a session, injects exactly the documented env, records the exit code, and never fails on command failure', async () => {
+  const { outputDir, projectRoot, inputs } = await startReal();
+  try {
+    const githubOutput = path.join(outputDir, 'github_output');
+    writeFileSync(githubOutput, '');
+    // The wrapped command posts one event using ONLY the injected env, then exits 7.
+    const probe = 'node -e "' + [
+      'const assert = require(\'node:assert\');',
+      'assert.ok(process.env.DEBUG_LOG_URL.startsWith(\'http://127.0.0.1:\'));',
+      'assert.ok(process.env.DEBUG_SESSION_ID);',
+      'assert.ok(process.env.DEBUG_SESSION_TOKEN);',
+      'assert.equal(process.env.DEBUG_HYPOTHESIS_ID, undefined);',
+      'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'probe event\' }) }).then((r) => process.exit(r.status === 202 ? 7 : 99));',
+    ].join('') + '"';
+    const code = await runSubcommand({
+      inputs: { ...inputs, runCommand: probe },
+      outputDir,
+      env: { GITHUB_OUTPUT: githubOutput },
+    });
+    assert.equal(code, 0, 'run itself succeeds; finish owns the verdict');
+    const state = readState(outputDir);
+    assert.equal(state.commandExitCode, 7);
+    assert.ok(state.sessionId.startsWith('ci-debug-'));
+    const sessionLog = readFileSync(path.join(projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
+    assert.ok(sessionLog.includes('probe event'), 'wrapped command reached the collector');
+    const outputs = readFileSync(githubOutput, 'utf8');
+    assert.match(outputs, /command-exit-code=7/);
+    assert.match(outputs, new RegExp(`session-id=${state.sessionId}`));
+    assert.ok(!outputs.includes(state.launchToken), 'launch token never enters GITHUB_OUTPUT');
+    assert.ok(!outputs.includes(state.sessionToken), 'session token never enters GITHUB_OUTPUT');
+  } finally {
+    teardownSubcommand({ outputDir, env: {} });
+  }
+});
+
+test('run posts one OPEN hypothesis line and injects DEBUG_HYPOTHESIS_ID when hypothesis-id is set — and never any other status', async () => {
+  const { outputDir, projectRoot, inputs } = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
+  try {
+    const probe = 'node -e "process.exit(process.env.DEBUG_HYPOTHESIS_ID === \'H-demo\' ? 0 : 90)"';
+    const code = await runSubcommand({ inputs: { ...inputs, runCommand: probe }, outputDir, env: {} });
+    assert.equal(code, 0);
+    const state = readState(outputDir);
+    assert.equal(state.commandExitCode, 0);
+    const sessionLog = readFileSync(path.join(projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
+    const hypothesisLines = sessionLog.split('\n').filter((l) => l.includes('"type":"hypothesis"'));
+    assert.equal(hypothesisLines.length, 1);
+    const parsed = JSON.parse(hypothesisLines[0]);
+    assert.equal(parsed.status, 'OPEN');
+    assert.equal(parsed.hypothesisId, 'H-demo');
+    assert.equal(parsed.title, 'seeded demo');
+  } finally {
+    teardownSubcommand({ outputDir, env: {} });
+  }
+});
+
+test('run without state (start never completed) is a 3-class refusal; nonce mismatch likewise', async () => {
+  const outputDir = makeTempDir();
+  assert.equal(await runSubcommand({ inputs: baseInputs(), outputDir, env: {} }), 3);
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43) });
+  assert.equal(await runSubcommand({ inputs: baseInputs(), outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3);
+});
+
+test('run surfaces a session-mint failure as 3 without executing the command', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
+  let commandRan = false;
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: {},
+    request: async () => ({ status: 401, json: { error: 'unauthorized' } }),
+    spawnCommand: () => { commandRan = true; return { status: 0 }; },
+  });
+  assert.equal(code, 3);
+  assert.equal(commandRan, false, 'no command execution after a failed mint');
+});

@@ -332,8 +332,102 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
   return 0;
 };
 
+// Minimal JSON-over-loopback helper (node:http; fetch is avoided so tests can
+// inject `request` and so no keep-alive agent outlives the subcommand).
+const httpRequestJson = ({ port, method, path: requestPath, headers = {}, body }) => new Promise((resolve, reject) => {
+  const payload = body === undefined ? null : JSON.stringify(body);
+  const request = http.request({
+    host: '127.0.0.1',
+    port,
+    method,
+    path: requestPath,
+    headers: payload === null ? headers : { ...headers, 'content-type': 'application/json' },
+  }, (response) => {
+    let text = '';
+    response.on('data', (chunk) => { text += chunk; });
+    response.on('end', () => {
+      let json = null;
+      try { json = JSON.parse(text); } catch {}
+      resolve({ status: response.statusCode, json });
+    });
+  });
+  request.on('error', reject);
+  request.setTimeout(5_000, () => request.destroy(new Error('collector request timed out')));
+  if (payload !== null) request.write(payload);
+  request.end();
+});
+
+// stdio: 'inherit' — the wrapped command's output belongs in the step log.
+const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', command], { cwd, env, stdio: 'inherit' });
+
+const runSubcommand = async ({
+  inputs, outputDir, env = process.env,
+  request = httpRequestJson, spawnCommand = defaultSpawnCommand,
+}) => {
+  const state = readState(outputDir);
+  if (!state) {
+    process.stderr.write('debug-evidence-action: run: no recorded state; the start step never completed.\n');
+    return 3;
+  }
+  if (rejectForeignNonce(state, env, 'run')) return 3;
+  const mint = await request({
+    port: state.port,
+    method: 'POST',
+    path: '/session',
+    headers: { Authorization: `Bearer ${state.launchToken}` },
+    body: { name: state.sessionName },
+  });
+  if (mint.status !== 201 || !mint.json?.session_id || !mint.json?.session_token) {
+    process.stderr.write(`debug-evidence-action: run: session mint failed (HTTP ${mint.status ?? 'no response'}).\n`);
+    return 3;
+  }
+  const sessionId = mint.json.session_id;
+  const sessionToken = mint.json.session_token;
+  if (state.hypothesisId) {
+    // POST /hypothesis is a LAUNCH-token capability the wrapped command never
+    // holds; the action records intent (OPEN) here and never any verdict —
+    // judgment stays with humans/agents (spec amendment, planning round).
+    const hypothesis = await request({
+      port: state.port,
+      method: 'POST',
+      path: '/hypothesis',
+      headers: { Authorization: `Bearer ${state.launchToken}` },
+      body: {
+        sessionId,
+        hypothesisId: state.hypothesisId,
+        status: 'OPEN',
+        ...(state.hypothesisTitle ? { title: state.hypothesisTitle } : {}),
+      },
+    });
+    if (hypothesis.status !== 202) {
+      process.stderr.write(`debug-evidence-action: run: hypothesis post failed (HTTP ${hypothesis.status ?? 'no response'}).\n`);
+      return 3;
+    }
+  }
+  const commandEnv = {
+    ...env,
+    DEBUG_LOG_URL: `http://127.0.0.1:${state.port}/log`,
+    DEBUG_SESSION_ID: sessionId,
+    DEBUG_SESSION_TOKEN: sessionToken,
+  };
+  if (state.hypothesisId) commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
+  const result = spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
+  const commandExitCode = result.error ? 127 : (result.status ?? 128);
+  writeState(outputDir, {
+    ...state,
+    sessionId,
+    sessionToken,
+    commandExitCode,
+    commandSignal: result.signal ?? null,
+    commandError: result.error ? String(result.error.message) : null,
+  });
+  if (env.GITHUB_OUTPUT) {
+    writeOutputs(env.GITHUB_OUTPUT, { 'command-exit-code': commandExitCode, 'session-id': sessionId });
+  }
+  return 0; // command failure is finish's decision, never run's
+};
+
 // Implemented in later tasks — stable export surface from day one.
-const runSubcommand = async () => { throw new Error('not implemented: runSubcommand (Task 4)'); };
 const reportSubcommand = async () => { throw new Error('not implemented: reportSubcommand (Task 5)'); };
 const finishSubcommand = () => { throw new Error('not implemented: finishSubcommand (Task 5)'); };
 
@@ -380,7 +474,9 @@ const main = async () => {
 if (require.main === module) void main();
 
 module.exports = {
+  defaultSpawnCommand,
   finishSubcommand,
+  httpRequestJson,
   readShimStartLine,
   readState,
   redactKnownSecrets,
