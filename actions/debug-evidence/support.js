@@ -209,6 +209,36 @@ const readLockToken = (lockPath) => {
   }
 };
 
+// Take the WHOLE staleness observation from one descriptor: the timestamp the
+// verdict is computed from and the bytes that verdict will be checked against
+// must describe the same file.
+//
+// Statting the path and then reading the path are two independent lookups. A
+// replacement landing between them yields a verdict assembled from the OLD
+// file's mtime and the NEW file's content — evidence that never coexisted, and
+// a wider race than the final check-to-unlink window (Codex T4 r4). One open
+// pins one inode and both facts come off it.
+//
+// O_RDONLY follows symlinks where the lstat it replaces did not, which is
+// harmless here: a lock can never be CREATED through a link, because
+// O_CREAT|O_EXCL fails outright on one, and the unlink below removes the link
+// itself rather than anything it points at. (O_NOFOLLOW is not portable to
+// Windows, so it is not an option.)
+const observeLock = (lockPath) => {
+  let fd;
+  try {
+    fd = openSync(lockPath, constants.O_RDONLY);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null; // released while we looked
+    throw error;
+  }
+  try {
+    return { mtimeMs: fstatSync(fd).mtimeMs, content: readFileSync(fd, 'utf8') };
+  } finally {
+    closeSync(fd);
+  }
+};
+
 // Create the lock and stamp it with WHO holds it. Returns the open fd, or
 // null when someone else already holds the path.
 //
@@ -273,17 +303,12 @@ const withStateLock = async (outputDir, fn, { onStaleObserved = null } = {}) => 
     // OOM-killed mid-write leaves this file behind forever, and without a
     // stale sweep every later job on that output-dir would fail to start.
     if (!reaped) {
-      let held = null;
-      try {
-        held = lstatSync(lockPath);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-      if (held && Date.now() - held.mtimeMs > LOCK_STALE_MS) {
+      const observation = observeLock(lockPath);
+      if (observation && Date.now() - observation.mtimeMs > LOCK_STALE_MS) {
         reaped = true;
-        // The EXACT bytes staleness was judged against. Everything below is
-        // about not deleting anything else.
-        const observed = readLockToken(lockPath);
+        // The EXACT bytes staleness was judged against, off the same inode as
+        // the timestamp. Everything below is about not deleting anything else.
+        const observed = observation.content;
         if (onStaleObserved) await onStaleObserved({ lockPath, observed });
         // Two reapers can both find the same stale lock. One wins the
         // O_EXCL re-create; if the loser then unlinks blindly it deletes the
@@ -291,7 +316,7 @@ const withStateLock = async (outputDir, fn, { onStaleObserved = null } = {}) => 
         // whole round exists to close (Codex T4 r3). Re-read immediately
         // before deleting: if the path no longer holds the bytes we judged,
         // it belongs to someone live now, so leave it and keep retrying.
-        if (observed !== null && readLockToken(lockPath) === observed) {
+        if (readLockToken(lockPath) === observed) {
           try {
             unlinkSync(lockPath);
           } catch (error) {
