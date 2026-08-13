@@ -1792,6 +1792,55 @@ sentence about `verifyLogIdentity` strength is superseded.
 Fix commit message:
 `fix(action+collector): hypothesis-set evidence contract, append digests, invocation-scoped staging (Codex T5 r2)`.
 
+#### Task 5 fix round 3 — Codex re-review decisions (recorded before code moves)
+
+Codex on `6d33180`: digest + contract mechanics verified; rulings (a)/(c)/(e) accepted
+with T8 notes, (d) optional. Critical ×1 + Important ×2 remain. Decisions:
+
+1. **Launch token never persisted (Important #1 — the architectural fix).** The
+   expected-set contract was derived from attacker-writable state; the root cause is
+   the launch token at rest. Restructure:
+   - `start` absorbs the mint and the optional hypothesis `OPEN` post: handshake →
+     mask launch token → occupant auth (`probeLaunchToken`, while the token lives) →
+     `POST /session` → mask session token → optional `POST /hypothesis` (`OPEN`) →
+     write state WITH `sessionId`/`sessionToken` and WITHOUT `launchToken` — the
+     launch token lives and dies in `start`'s process memory.
+   - Collector change (`scripts/debug_server.js`, targeted edit at the logs-serve
+     auth site + tests): `GET /sessions/:id/logs` additionally accepts the session's
+     OWN token via `x-debug-session-token` (launch token still works). Everything
+     else stays launch-only — so after `start` returns, NO credential that can post
+     hypothesis lines exists anywhere in the job. The hypothesis-set contract becomes
+     STRUCTURAL; the report-side check stays as belt.
+   - `run` simplifies: no mint, no `probeToken` — inject env from state, execute,
+     record. `report` authenticates its live read with the session token
+     (`readSessionLive({ token: sessionToken })` — verify debug_evidence sends it as
+     Bearer; the collector must accept the session token for this route via either
+     header; adapt the collector edit accordingly and document which channel is used).
+     `collectorAlive` := successful authenticated read (401 from a foreign occupant
+     fails it).
+   - State-file consequences: `launchToken` gone from every state shape and from
+     `collectStateSecrets` (session token stays); T3/T4 tests referencing it adapt.
+2. **Staging-window detectability (Critical — prevention impossible in same-job
+   composite staging; Codex's threat-model option taken WITH teeth).** After staging,
+   `report` computes SHA-256 of each staged file and (a) prints
+   `evidence-sha256 session.log=<hex> report.md=<hex> report.json=<hex>` to stdout —
+   the step log is streamed and immutable once emitted — and (b) writes them to
+   `GITHUB_OUTPUT` as `evidence-digest`. T8 documents: a detached child CAN rewrite
+   staged files before upload (inherent to same-user staging); the logged digests
+   make any such swap detectable by comparing the artifact against the step log.
+3. **Cleanup hoisted (Important #2).** The invocation-scoped unlink of the three
+   well-known staged files moves to the TOP of `report` (before the state/nonce
+   guards): a failed start, absent state, or foreign nonce must also leave nothing
+   uploadable. The shared-output-dir byte race stays as already ruled.
+
+Spec amendments (same commit): invariant 2 rewritten (launch token exists only in
+`start`'s memory; session token is the wrapped command's only credential and gains
+same-session read scope), state-file field list updated, lifecycle bullets updated
+(mint in `start`), staging-window detectability added to the artifact section.
+
+Fix commit message:
+`fix(action+collector): memory-only launch token, session-token read scope, staged digests, entry cleanup (Codex T5 r3)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`

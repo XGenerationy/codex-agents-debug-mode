@@ -122,11 +122,13 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
 - The shim prints one structured JSON line (port, pid, launch token, project dir) on
   ready; `start` also polls `/health` for `ready:true` with a bounded timeout
   (`DEBUG_ACTION_READY_TIMEOUT_MS`, default 15000). Timeout ⇒ infra-failure exit.
-- `start` writes `action-state.json`: `{ nonce, pid, port, launchToken, projectRoot,
-  sessionName, hypothesisId, hypothesisTitle, failOnCommandFailure }` (later subcommands
-  extend it with the session/command/capture results). *(Amended after Task 3 spec
-  review: the original sketch listed five fields and `projectDir`; the byte-authoritative
-  plan ships the superset above.)* The state file stays in runner temp, is never
+- `start` performs the whole launch-token lifecycle in memory — handshake, mask,
+  occupant auth (`probeLaunchToken`), `POST /session` mint, session-token mask, and the
+  optional single `POST /hypothesis` `OPEN` line — then writes `action-state.json`:
+  `{ nonce, pid, port, projectRoot, sessionName, sessionId, sessionToken, hypothesisId,
+  hypothesisTitle, failOnCommandFailure }` — NO `launchToken` field exists. *(Rewritten,
+  Task 5 round 3; earlier shapes persisted the launch token.)* Later subcommands extend
+  the state with command/capture results. The state file stays in runner temp, is never
   uploaded, and its token values never appear in outputs, summaries, or logs.
 - `run` mints a session via `POST /session` with the launch token, then executes the
   wrapped command with exactly three injected variables: `DEBUG_LOG_URL`
@@ -159,13 +161,24 @@ it is never enumerated in the upload path block. The collector's `.debug/` inter
 (claim, port, salt, any token files) are never copied, so the token-exfiltration hazard
 is closed structurally. `support.test.js` pins that the staged evidence child contains
 no token byte-sequence and that the upload path block never references
-`action-state.json` or a bare directory.
+`action-state.json` or a bare directory. *(Added, Task 5 round 3.)* Because upload
+happens in a later step of the same job, a hostile wrapped command's detached child
+could rewrite staged files in the window — inherent to same-user composite staging and
+outside the prevention boundary; `report` therefore prints each staged file's SHA-256
+to the step log (immutable once streamed) and to the `evidence-digest` output, making
+any post-staging swap detectable against the artifact.
 
 ## Security invariants
 
 1. Collector binds `127.0.0.1` only; no CI service container, no exposed port.
-2. Launch token: state file only. Session token: wrapped command env only. Neither ever
-   reaches outputs, Step Summary, logs, or the artifact.
+2. *(Rewritten, Task 5 round 3.)* The launch token exists ONLY in the `start` step's
+   process memory — it is never written to disk, so a same-user wrapped command has
+   nothing to steal; after `start` returns, no credential capable of posting hypothesis
+   lines exists anywhere in the job. The session token is the wrapped command's only
+   credential (env-injected; also recorded in state for `report`'s authenticated read —
+   the collector grants it same-session read scope). Neither token ever reaches
+   outputs, Step Summary, logs, or the artifact; both are runner-masked at first
+   existence.
 3. The collector inherits the full job env at start so redaction covers job secrets;
    `redact-names` extends, never replaces, that coverage.
 4. All rendered log text in `report.md` / Step Summary passes the same escaping
