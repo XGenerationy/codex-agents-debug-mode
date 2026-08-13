@@ -1684,6 +1684,17 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
     // What remains is only the unavoidable "state may change after we finish"
     // gap, which no amount of re-reading can close.
     const publishPr = await runGh(['pr', 'view', '--json', PR_VIEW_FIELDS], { repo });
+    // Same identity guards as the five earlier PR reads (pr, finalPr,
+    // terminalPr, postThreadPr, verifiedPr). Without them this read was the
+    // one exception to the contract: a missing number or author still failed
+    // closed, but by way of readGateAttestationSnapshotForPr throwing on a
+    // `pulls/undefined/reviews` path, which surfaces a generic exception
+    // string instead of the precise instability evidence below (CodeRabbit
+    // outside-diff #6Y1... consistency finding).
+    if (!Number.isInteger(publishPr.number)) throw new Error('GitHub did not return a publish-time pull request number.');
+    if (typeof publishPr.author?.login !== 'string' || !publishPr.author.login.trim()) {
+      throw new Error('GitHub did not return a publish-time pull request author identity.');
+    }
     const publishGateSnapshot = await readGateAttestationSnapshotForPr({
       repo,
       repository,
@@ -1705,7 +1716,7 @@ const readLivePrState = async ({ repo, expectedHeadSha, expectedBaseSha, expecte
         status: 'BLOCKED',
         evidence: 'Live GitHub PR or review/attestation state changed during the final review-thread verification window; rerun against a stable remote snapshot.',
         repository,
-        number: publishPr.number ?? classifiedPr.number,
+        number: publishPr.number,
         checks: [],
         unresolvedThreads: classifiedUnresolvedThreads,
         externalServices: [],

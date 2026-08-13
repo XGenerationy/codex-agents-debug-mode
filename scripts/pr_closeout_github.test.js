@@ -2322,17 +2322,25 @@ test('readLivePrState blocks when the attesting reviewer loses write access duri
   // permission revocation landing in that window previously went unnoticed:
   // the verdict published against an attestation the reviewer was no longer
   // authorised to give. The publish-time re-read closes it.
-  let reviewCalls = 0;
+  //
+  // A REAL revocation is modelled, not an association downgrade (CodeRabbit
+  // outside-diff): the review keeps `author_association: 'CONTRIBUTOR'`
+  // throughout, so `reviewerAuthorization` must consult the collaborator
+  // permission endpoint every time, and only the publish-time snapshot sees
+  // `read`. An association downgrade would have changed the answer for a
+  // different reason and would not have exercised the permission path at all.
+  let permissionReads = 0;
   const runGh = async (args) => {
     if (args[0] === 'repo') return { nameWithOwner: 'owner/repo' };
     if (args[0] === 'pr') return cleanPr();
-    if (args.includes('--paginate')) {
-      reviewCalls += 1;
-      // The last snapshot sees the same APPROVED review submitted by a
-      // reviewer whose association has been downgraded — the attestation is
-      // no longer authorised, but every earlier snapshot already agreed.
-      if (reviewCalls >= 6) return [[approvedReview({ author_association: 'NONE' })]];
-      return [[approvedReview()]];
+    if (args.includes('--paginate')) return [[approvedReview({ author_association: 'CONTRIBUTOR' })]];
+    if (args[1]?.endsWith('/permission')) {
+      permissionReads += 1;
+      // Six attestation snapshots are taken on the stable path (first, final,
+      // terminal, post-thread, verified, publish). Only the LAST sees the
+      // revocation, which is what isolates the publish-time window: every
+      // earlier snapshot agrees, so no earlier guard can be what blocks.
+      return { permission: permissionReads >= 6 ? 'read' : 'write' };
     }
     return {
       data: { repository: { pullRequest: { reviewThreads: {
@@ -2348,6 +2356,16 @@ test('readLivePrState blocks when the attesting reviewer loses write access duri
     expectedConfigDigest: 'cfg123',
     runGh,
   });
-  assert.equal(result.status, 'BLOCKED', 'a permission change during the final thread walk must not be published through');
-  assert.match(result.evidence, /changed during/i);
+  assert.equal(permissionReads, 6, 'the permission endpoint must be re-read for every attestation snapshot, including the publish-time one');
+  assert.equal(result.status, 'BLOCKED', 'a permission revocation during the final thread walk must not be published through');
+  // Pinned to the publish-time message specifically. A loose /changed during/
+  // match would also accept the first, terminal, post-thread, verified and
+  // collision windows, so it could not show that the NEW read is what caught
+  // this — and would keep passing if the snapshot count drifted and some
+  // earlier guard started firing instead.
+  assert.equal(
+    result.evidence,
+    'Live GitHub PR or review/attestation state changed during the final review-thread verification window; rerun against a stable remote snapshot.',
+    'the publish-time guard must be the one that blocks, not an earlier window',
+  );
 });
