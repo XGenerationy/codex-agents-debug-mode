@@ -3,7 +3,7 @@
 const assert = require('node:assert');
 const { EventEmitter } = require('node:events');
 const {
-  closeSync, constants, existsSync, openSync, readFileSync, readdirSync, utimesSync,
+  closeSync, constants, existsSync, openSync, readFileSync, readdirSync, unlinkSync, utimesSync,
   writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
 } = require('node:fs');
 const net = require('node:net');
@@ -764,4 +764,90 @@ test('a job-level DEBUG_HYPOTHESIS_ID is never inherited when this action opened
   } finally {
     teardownSubcommand({ outputDir, env: {} });
   }
+});
+
+const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('a reaper whose stale lock is replaced between observation and deletion leaves the successor standing', async () => {
+  const outputDir = makeTempDir();
+  const lockPath = path.join(outputDir, 'action-state.lock');
+  // A crashed invocation's litter, old enough to be judged stale.
+  const staleContent = '4242\nstale-holder-token\n';
+  writeFileSync(lockPath, staleContent);
+  const longAgo = new Date(Date.now() - 120_000);
+  utimesSync(lockPath, longAgo, longAgo);
+  const successor = '777\nsuccessor-token\n';
+  let observedStale = null;
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => withStateLock(
+      outputDir,
+      () => { throw new Error('the critical section must never be entered here'); },
+      {
+        // The second reaper wins the race: between THIS one establishing
+        // staleness and its unlink, the other removes the stale file and
+        // takes the path with a fresh lock of its own. An owner-blind unlink
+        // would delete that live lock and admit a third writer (Codex T4 r3).
+        onStaleObserved: ({ observed }) => {
+          observedStale = observed;
+          unlinkSync(lockPath);
+          writeFileSync(lockPath, successor);
+        },
+      },
+    ),
+    /could not acquire the action state lock/,
+  );
+  assert.equal(observedStale, staleContent, 'staleness was judged against the bytes that were actually there');
+  assert.equal(readFileSync(lockPath, 'utf8'), successor,
+    'the winner\'s fresh lock must survive the losing reaper');
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 5_000, `the loser failed bounded at ${elapsed}ms rather than spinning or deleting`);
+  unlinkSync(lockPath);
+});
+
+test('a holder whose lock was reaped and replaced releases without evicting the successor', async () => {
+  const outputDir = makeTempDir();
+  const lockPath = path.join(outputDir, 'action-state.lock');
+  const successor = '999\nsuccessor-token\n';
+  let stamped = null;
+  await withStateLock(outputDir, () => {
+    stamped = readFileSync(lockPath, 'utf8');
+    // A reaper judged this holder stale, deleted its lock, and a successor
+    // took the path. This holder is now a ghost: its fd is still open, but
+    // the lock on disk is someone else's.
+    unlinkSync(lockPath);
+    writeFileSync(lockPath, successor);
+  });
+  assert.match(stamped, new RegExp(`^${process.pid}\\n[0-9a-f-]{36}\\n$`),
+    'the lock is stamped with its holder pid and a per-acquisition uuid');
+  assert.equal(readFileSync(lockPath, 'utf8'), successor,
+    'the release must not delete a lock this holder no longer owns');
+  unlinkSync(lockPath);
+});
+
+test('withStateLock serializes concurrent holders: one inside at a time, nothing left behind', async () => {
+  const outputDir = makeTempDir();
+  const lockPath = path.join(outputDir, 'action-state.lock');
+  let inside = 0;
+  let maxConcurrent = 0;
+  const order = [];
+  // Six is chosen against the shipped budget: contenders retry every 50ms, so
+  // the last one waits ~250ms of the ~450ms allowance.
+  const holders = Array.from({ length: 6 }, (_, index) => withStateLock(outputDir, async () => {
+    inside += 1;
+    maxConcurrent = Math.max(maxConcurrent, inside);
+    order.push(`enter-${index}`);
+    await sleepFor(2); // yield inside the section, so an overlap could be observed
+    order.push(`exit-${index}`);
+    inside -= 1;
+  }));
+  await Promise.all(holders);
+  assert.equal(maxConcurrent, 1, 'two holders inside at once is the entire failure this lock prevents');
+  assert.equal(order.length, 12);
+  // Every enter is immediately followed by its OWN exit: no interleaving.
+  for (let i = 0; i < order.length; i += 2) {
+    assert.equal(order[i].replace('enter-', ''), order[i + 1].replace('exit-', ''),
+      `${order[i]} was interrupted before it left the critical section`);
+  }
+  assert.ok(!existsSync(lockPath), 'the last release left no lock behind');
 });

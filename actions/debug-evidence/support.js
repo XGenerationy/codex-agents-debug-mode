@@ -197,6 +197,51 @@ const LOCK_STALE_MS = 30_000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The lock's current bytes, or null when it is gone. Never throws for the
+// ordinary "someone deleted it" case, because both callers race deletion by
+// construction.
+const readLockToken = (lockPath) => {
+  try {
+    return readFileSync(lockPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+
+// Create the lock and stamp it with WHO holds it. Returns the open fd, or
+// null when someone else already holds the path.
+//
+// The ownership stamp is what makes an unlink decidable: without it every
+// deleter is blind, and "remove the lock file" cannot distinguish the lock it
+// created from a successor's that merely lives at the same path.
+const tryAcquireLock = (lockPath, ownership) => {
+  let fd;
+  try {
+    fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  } catch (error) {
+    if (error?.code === 'EEXIST') return null;
+    throw error;
+  }
+  // Full-write discipline, same as writeState (T3 r2): a lock whose ownership
+  // bytes landed short would match NOBODY, so its own holder could not
+  // release it and every later invocation would have to wait out the whole
+  // staleness threshold to make progress.
+  try {
+    writeFileSync(fd, ownership);
+    const staged = fstatSync(fd).size;
+    const expected = Buffer.byteLength(ownership, 'utf8');
+    if (staged !== expected) {
+      throw new Error(`refusing to hold a partially stamped lock (${staged} of ${expected} bytes): ${lockPath}`);
+    }
+  } catch (error) {
+    closeSync(fd);
+    try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ }
+    throw error;
+  }
+  return fd;
+};
+
 // A real critical section for the state file, honored by every writer.
 //
 // writeState alone is not enough. Its rename is atomic, but atomic means the
@@ -210,19 +255,19 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //
 // O_CREAT|O_EXCL is the primitive: the open either creates the lock or fails
 // EEXIST, with no window between testing and taking it.
-const withStateLock = async (outputDir, fn) => {
+const withStateLock = async (outputDir, fn, { onStaleObserved = null } = {}) => {
   mkdirSync(outputDir, { recursive: true });
   const lockPath = path.join(outputDir, LOCK_FILE);
+  // Unique per acquisition, not per process: one process may take this lock
+  // several times, and a recycled pid must never be able to impersonate an
+  // earlier holder.
+  const ownership = `${process.pid}\n${randomUUID()}\n`;
   let fd = null;
   let reaped = false;
   let attempts = 0;
   while (fd === null) {
-    try {
-      fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-      break;
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-    }
+    fd = tryAcquireLock(lockPath, ownership);
+    if (fd !== null) break;
     // Someone holds it. Reap it ONCE, and only when it is old enough that no
     // live invocation could still own it — a runner that was cancelled or
     // OOM-killed mid-write leaves this file behind forever, and without a
@@ -236,12 +281,24 @@ const withStateLock = async (outputDir, fn) => {
       }
       if (held && Date.now() - held.mtimeMs > LOCK_STALE_MS) {
         reaped = true;
-        try {
-          unlinkSync(lockPath);
-        } catch (error) {
-          if (error?.code !== 'ENOENT') throw error;
+        // The EXACT bytes staleness was judged against. Everything below is
+        // about not deleting anything else.
+        const observed = readLockToken(lockPath);
+        if (onStaleObserved) await onStaleObserved({ lockPath, observed });
+        // Two reapers can both find the same stale lock. One wins the
+        // O_EXCL re-create; if the loser then unlinks blindly it deletes the
+        // WINNER's fresh lock and a third writer walks in — the clobber this
+        // whole round exists to close (Codex T4 r3). Re-read immediately
+        // before deleting: if the path no longer holds the bytes we judged,
+        // it belongs to someone live now, so leave it and keep retrying.
+        if (observed !== null && readLockToken(lockPath) === observed) {
+          try {
+            unlinkSync(lockPath);
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+          }
         }
-        continue; // retry immediately against the now-free path
+        continue; // retry against the path, freed or not
       }
     }
     attempts += 1;
@@ -253,10 +310,17 @@ const withStateLock = async (outputDir, fn) => {
   try {
     return await fn();
   } finally {
-    // Close before unlink: Windows refuses to remove a file that is still
-    // open, which would leave the lock standing until the stale sweep.
+    // Close before touching the path: Windows refuses to remove a file that
+    // is still open.
     try { closeSync(fd); } catch { /* best-effort release */ }
-    try { unlinkSync(lockPath); } catch { /* a stale sweep may have taken it */ }
+    try {
+      // Ownership-verified release. A holder that ran long enough to be
+      // judged stale no longer owns this path — a reaper deleted its lock and
+      // a successor created their own. Unlinking on the way out would evict
+      // that live successor, which is the same clobber by a different route,
+      // so release only what is still demonstrably ours (Codex T4 r3).
+      if (readLockToken(lockPath) === ownership) unlinkSync(lockPath);
+    } catch { /* best-effort release */ }
   }
 };
 
