@@ -483,3 +483,46 @@ test('discoverCollector rejects collector_port_invalid for a non-decimal-integer
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('readSessionLive is bounded by an absolute deadline, not just socket inactivity', async () => {
+  let drip;
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Length': '4096' });
+    // One byte every 25ms resets the inactivity timeout forever. Only a
+    // wall-clock deadline can end this, and without one a listener dripping a
+    // byte every few seconds holds a capture step for the life of the job.
+    drip = setInterval(() => response.write('x'), 25);
+    request.on('close', () => clearInterval(drip));
+  });
+  const port = await listen(server);
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'drip-session-1', deadlineMs: 300 }),
+      /live_read_deadline_exceeded/,
+    );
+    assert.ok(Date.now() - startedAt < 3_000, 'the deadline fired; the idle timeout never could');
+  } finally {
+    clearInterval(drip);
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects a response past the byte cap instead of buffering it', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    // Well past the cap the test passes in, and it keeps coming: the read has
+    // to stop accumulating rather than grow this process's heap to match.
+    for (let i = 0; i < 8; i += 1) response.write('x'.repeat(64 * 1024));
+    response.end();
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'flood-session-1', maxBytes: 64 * 1024 }),
+      /live_read_response_too_large/,
+    );
+  } finally {
+    await close(server);
+  }
+});

@@ -7,6 +7,7 @@
 // The CLI's .debug/collector_token / collector_port / collector_claim files
 // are deliberately NOT written: the only credential handoff is this pipe.
 
+const { randomBytes } = require('node:crypto');
 const path = require('node:path');
 const { createDebugServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
 
@@ -34,9 +35,17 @@ const main = () => {
   // redactionEnv defaults to { ...process.env } inside createDebugServer, and
   // this shim inherits the full job env from `start` — that inheritance is the
   // redaction guarantee for job secrets (spec Security invariant 3).
+  // The RESPONDER key: minted here, beside the launch token, and handed back
+  // over the same private pipe. It authorizes nothing — it only lets `report`
+  // check that a captured log came from THIS process rather than from a
+  // counterfeit listener a wrapped command stood up on a port it rewrote in
+  // the action's state file (Codex T5 r4 #1). Fresh per boot, so it cannot
+  // outlive the collector it identifies.
+  const responderKey = randomBytes(32).toString('base64url');
   const server = createDebugServer({
     projectRoot,
     limits,
+    responderKey,
     // Comma OR whitespace separated, per the documented input contract: a
     // comma-only split turned `DEBUG_REDACT_NAMES="A B,C"` into the names
     // ['A B', 'C'], so A's and B's values were never redacted at all
@@ -64,6 +73,7 @@ const main = () => {
       pid: process.pid,
       project_hash: server.collectorProjectHash,
       launch_token: server.collectorToken,
+      responder_key: responderKey,
     })}\n`);
   });
 };

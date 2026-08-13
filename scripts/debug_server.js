@@ -973,6 +973,15 @@ const createDebugServer = ({
   redactionEnv = { ...process.env },
   redactionNames = [],
   redactionMaxTokens = 512,
+  // Optional RESPONSE-SIGNING key. Unlike `token`, it authorizes nothing:
+  // holding it lets you verify that an answer came from this process, never
+  // ask this process for anything. That asymmetry is the point — a caller
+  // whose port/session routing data lives in a file another local process can
+  // rewrite otherwise has no way to distinguish this collector from a
+  // counterfeit listener returning contract-shaped NDJSON, because Bearer
+  // authenticates the CLIENT and nothing authenticates the SERVER. Omitted by
+  // every existing caller (CLI, viewer), which simply never challenges.
+  responderKey = null,
 } = {}) => {
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
@@ -1714,7 +1723,22 @@ const createDebugServer = ({
           tail.push(rawLine);
         }
         const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
-        response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        const responseHeaders = { 'Content-Type': 'application/x-ndjson' };
+        // Sign the answer when asked to, over the caller's fresh nonce AND a
+        // digest of the EXACT bytes about to be written. Binding both is what
+        // makes the proof useful: the nonce stops a recorded (body, proof)
+        // pair from being replayed against a later challenge, and the body
+        // digest stops a proof obtained for one response from vouching for
+        // different bytes. A counterfeit listener can copy this header shape
+        // but cannot compute the value without the key, which never leaves
+        // the runner's memory and travels in no response.
+        const challenge = request.headers['x-debug-challenge'];
+        if (responderKey && typeof challenge === 'string' && challenge !== '') {
+          responseHeaders['x-debug-proof'] = createHmac('sha256', responderKey)
+            .update(`${challenge}.${createHash('sha256').update(body, 'utf8').digest('hex')}`)
+            .digest('hex');
+        }
+        response.writeHead(200, responseHeaders);
         response.end(body);
         return;
       }

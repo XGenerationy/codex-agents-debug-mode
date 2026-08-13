@@ -4,25 +4,27 @@
 // Subcommands: start | run | report | teardown | finish, driven by
 // DEBUG_ACTION_* env vars. State travels via action-state.json at the
 // OUTPUT-DIR ROOT — deliberately outside the evidence child, because it
-// carries the collector launch token and must never be uploaded.
+// carries this run's session token and must never be uploaded.
 
 const {
-  appendFileSync, closeSync, constants, copyFileSync, fstatSync, lstatSync, mkdirSync,
+  appendFileSync, closeSync, constants, fstatSync, lstatSync, mkdirSync,
   openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
-const { createHash, randomUUID } = require('node:crypto');
+const {
+  createHash, createHmac, randomBytes, randomUUID, timingSafeEqual,
+} = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
 const { probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
-const { readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
+const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
+const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
 const STATE_FILE = 'action-state.json';
 const EVIDENCE_SUBDIR = 'debug-evidence-files';
 const BOOT_SHIM = path.join(__dirname, 'collector_boot.js');
-const REPORT_CLI = path.join(__dirname, '..', '..', 'scripts', 'debug_report.js');
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 const resolveEvidenceDir = (outputDir) => path.join(outputDir, EVIDENCE_SUBDIR);
@@ -111,7 +113,7 @@ const validateActionInputs = ({
   return errors;
 };
 
-// The state file carries the collector's LAUNCH TOKEN, so it is written the
+// The state file carries this run's SESSION TOKEN, so it is written the
 // way actions/closeout writes its own private evidence (same discipline,
 // deliberately re-stated rather than imported — the two actions stay
 // independently deployable): never through a pre-existing link, never with a
@@ -480,6 +482,11 @@ const startSubcommand = async ({
   // readiness probe and the state write: from here on the runner scrubs it
   // out of anything this job logs, including output nobody here wrote.
   maskValue(env, startLine.launch_token, writeStdout);
+  // The responder key is not a credential — it authorizes nothing — but it is
+  // still a secret in the sense that matters: anything that knows it can
+  // FORGE a proof, and a forged proof is how a counterfeit listener would
+  // pass capture's check. Masked alongside the tokens for the same reason.
+  maskValue(env, startLine.responder_key, writeStdout);
   // From here on the collector is RUNNING and outlives this process, so every
   // failure has to take it down first: nothing has recorded its pid yet, and
   // a collector nothing can stop holds the port and writes session logs for
@@ -488,6 +495,12 @@ const startSubcommand = async ({
     try { kill(startLine.pid); } catch {}
     return new Error(message);
   };
+  if (typeof startLine.responder_key !== 'string' || startLine.responder_key === '') {
+    // Without it, `report` can never prove who served a log, and would fail
+    // every capture. Better to stop here, while the collector can still be
+    // killed cleanly, than to run a whole job that cannot produce evidence.
+    throw abort('collector did not report a responder key; capture could never be verified');
+  }
   const port = Number(inputs.port);
   const identity = await probeReady(port, startLine.project_hash, { deadlineMs: readyTimeoutMs });
   if (!identity || identity.project_hash !== startLine.project_hash || identity.ready !== true) {
@@ -567,6 +580,16 @@ const startSubcommand = async ({
     // was never recorded is a collector nothing can stop.
     try { kill(startLine.pid); } catch {}
     throw error;
+  }
+  // The responder key travels as a STEP OUTPUT, never in state. That routing
+  // is the whole security property: the runner parses this file when the
+  // start step ends — before the wrapped command exists — and interpolates
+  // the value into later steps' env from its own memory. A same-user process
+  // can rewrite action-state.json at leisure, but it cannot reach into the
+  // runner to change what a later step is handed. State stays routing data;
+  // trust is anchored in memory (Codex T5 r4 #1, ruling iii).
+  if (env.GITHUB_OUTPUT) {
+    writeOutputs(env.GITHUB_OUTPUT, { 'collector-hmac-key': startLine.responder_key });
   }
   // RELEASE the pipes, never destroy them (Codex T3 #1): destroying this end
   // leaves the collector writing into a closed pipe for the rest of the job,
@@ -767,18 +790,58 @@ const runSubcommand = async ({
   return 0; // command failure is finish's decision, never run's
 };
 
-// The renderer runs as a separate process: it is the repo's own payload
-// script, covered by its own tests, and everything it needs is one argument —
-// the path to the staged copy. No token is passed to it on the command line
-// or in its environment, and it is invoked identically to how a human would
-// run it. maxBuffer is generous because the rendered surfaces are capped by
-// the renderer itself, not by this pipe; a child that somehow exceeds it
-// fails with a non-zero status and is handled like any other render failure
-// rather than silently truncating the evidence.
-const defaultSpawnReport = (args) => spawnSync(process.execPath, [REPORT_CLI, ...args], {
-  encoding: 'utf8',
-  maxBuffer: 64 * 1024 * 1024,
-});
+// Render both surfaces from bytes ALREADY IN MEMORY.
+//
+// The renderer used to be a child process reading the staged session.log back
+// off disk. That path is a race with teeth: a detached child of the wrapped
+// command could swap the staged bytes between capture and render, and because
+// the digests were also computed by re-reading the same path, report.md,
+// report.json and all three hashes ended up consistently describing the
+// forgery (Codex T5 r4 #2). A pathname is a shared, writable name; a buffer
+// this process holds is not. So the captured bytes are rendered, hashed and
+// written from one immutable in-memory value, and the staged files become
+// write-only sinks — nothing downstream ever reads them back.
+//
+// In-process rather than piping to the CLI's stdin: debug_report.js already
+// exports exactly the three functions its own main() composes, so importing
+// them removes the serialization boundary entirely instead of narrowing it
+// (precedent: collector_boot requires debug_server directly). It also lets
+// the report carry the real session id, which the CLI could only derive from
+// a filename — the staged copy is called session.log, so the CLI rendered
+// every report as "(file)".
+const defaultRenderReport = (sessionText, sessionId) => {
+  const report = buildReport(parseSessionText(sessionText), { sessionId });
+  return { markdown: renderMarkdown(report), json: renderJson(report) };
+};
+
+// The staged files are WRITE-ONLY SINKS. Nothing downstream reads them back —
+// not the renderer, not the digests — so this is the single point where the
+// in-memory payload leaves the process, and injecting it is how a test can
+// prove the digests describe the payload rather than whatever ended up on
+// disk.
+const defaultStageFile = (filePath, bytes) => writeFileSync(filePath, bytes);
+
+// Does this answer carry proof that it came from the collector `start`
+// booted? The key is the one the boot shim minted and handed back over its
+// private pipe; it reached this process through runner memory (a step output
+// interpolated into this step's env), which is the one channel a same-user
+// process can neither read nor rewrite.
+//
+// Both halves matter. The nonce is fresh per capture, so a (body, proof) pair
+// recorded from an earlier read cannot be replayed; the body digest binds the
+// proof to these exact bytes, so a proof obtained for one answer cannot vouch
+// for another. Compared in constant time out of habit rather than need — a
+// forged proof is rejected either way, but timing-independent comparison is
+// the house style for every token check in this repo.
+const verifyResponderProof = ({ key, challenge, text, proof }) => {
+  if (typeof key !== 'string' || key === '' || typeof proof !== 'string' || proof === '') return false;
+  const expected = createHmac('sha256', key)
+    .update(`${challenge}.${createHash('sha256').update(text, 'utf8').digest('hex')}`)
+    .digest('hex');
+  const presented = Buffer.from(proof, 'utf8');
+  const wanted = Buffer.from(expected, 'utf8');
+  return presented.length === wanted.length && timingSafeEqual(presented, wanted);
+};
 
 // A renderer that exited 0 has not thereby produced a report. Its stdout is
 // what report.json and the event-count output are made of, so it is parsed
@@ -862,6 +925,13 @@ const describeHypothesisDeviation = (entries, state) => {
 // the job; timing out here is an evidence-integrity failure like any other.
 const LIVE_READ_TIMEOUT_MS = 5_000;
 
+// And the absolute one. The idle timeout above is reset by every byte, so a
+// listener dripping a byte every four seconds satisfies it forever; only a
+// wall-clock ceiling ends that. Thirty seconds is far longer than a loopback
+// read of a capped session log has any business taking, and it bounds the
+// capture step no matter what is on the other end.
+const LIVE_READ_DEADLINE_MS = 30_000;
+
 // Which live-read failures mean "there is no collector to ask" rather than
 // "the collector answered and refused". Only the first class may fall back to
 // the on-disk log, and only as labeled partial evidence: nothing answered
@@ -872,7 +942,8 @@ const LIVE_READ_TIMEOUT_MS = 5_000;
 // refused to vouch for.
 const UNREACHABLE_READ = /^live_read_(connect_failed|timeout|unauthorized)/;
 
-// SHA-256 of every staged file, as one line.
+// SHA-256 of every payload this invocation intends to stage, as one line,
+// computed from the IN-MEMORY bytes.
 //
 // Prevention is not available here: staging and upload are separate steps of
 // the same composite action running as the same user, so a detached child of
@@ -882,19 +953,19 @@ const UNREACHABLE_READ = /^live_read_(connect_failed|timeout|unauthorized)/;
 // compare the uploaded artifact against this line and any swap is visible
 // (Codex T5 r3, threat-model option taken with teeth).
 //
-// Only files that were actually staged appear; a run that staged nothing
-// emits nothing to claim.
-const stagedDigestLine = (evidenceDir) => {
+// Hashing the FILES back off disk would have quietly destroyed that: a swap
+// landing before the hash produced digests that described the forgery
+// perfectly, and the step log would have blessed it (Codex T5 r4 #2). These
+// digests describe what this process decided to write, so any later
+// divergence is exactly what the comparison is meant to catch.
+//
+// Only payloads that exist appear; a run that staged nothing claims nothing.
+const payloadDigestLine = (payloads) => {
   const parts = [];
   for (const name of EVIDENCE_FILES) {
-    let bytes;
-    try {
-      bytes = readFileSync(path.join(evidenceDir, name));
-    } catch (error) {
-      if (error?.code === 'ENOENT') continue;
-      throw error;
-    }
-    parts.push(`${name}=${createHash('sha256').update(bytes).digest('hex')}`);
+    const bytes = payloads[name];
+    if (bytes === undefined) continue;
+    parts.push(`${name}=${createHash('sha256').update(bytes, 'utf8').digest('hex')}`);
   }
   return parts.length === 0 ? null : `evidence-sha256 ${parts.join(' ')}`;
 };
@@ -935,8 +1006,8 @@ const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 //    snapshot this function opened with (Codex T4 #3/r2).
 const reportSubcommand = async ({
   outputDir, env = process.env,
-  spawnReport = defaultSpawnReport, readLive = readSessionLive,
-  writeStdout = defaultStdoutWrite,
+  renderReport = defaultRenderReport, readLive = readSessionLive,
+  stageFile = defaultStageFile, writeStdout = defaultStdoutWrite,
 }) => {
   // FIRST, before state is even read. Staging is invocation-scoped: an
   // output-dir can be reused — across steps, across jobs on a self-hosted
@@ -964,35 +1035,63 @@ const reportSubcommand = async ({
     process.stderr.write('debug-evidence-action: report: recorded state carries no session; nothing to capture.\n');
     return 0; // finish fails on the missing commandExitCode
   }
-  const sessionCopy = path.join(evidenceDir, 'session.log');
-  // Aliveness is the READ ITSELF succeeding. There is no launch token left to
-  // challenge the port with, and there does not need to be: an authenticated
-  // read of this session's own log is a stronger statement than a liveness
-  // probe ever was — it proves something on that port holds the session we
-  // minted AND could serve its bytes. A foreign occupant answers 401 and
-  // fails it (Codex T5 r3).
+  // Aliveness is a PROVEN read succeeding. An authenticated read alone is not
+  // enough any more: Bearer proves this caller to the listener, and the port,
+  // session id and token it used all came out of a file the wrapped command
+  // can rewrite — so a counterfeit listener serving contract-shaped NDJSON
+  // would have satisfied every check (Codex T5 r4 #1). The responder key
+  // closes the loop in the other direction, and it reaches this process
+  // through runner memory rather than through anything on disk.
   let collectorAlive = false;
-  let evidenceCopied = false;
   // Did the staged bytes come from the collector, or off a filesystem the
   // wrapped command can write? Recorded either way, so the artifact's
   // provenance is a fact in the state file rather than an assumption.
   let evidenceAuthentic = false;
   let entries = null;
+  let capturedText = null;
   let readFailure = null;
-  try {
-    entries = await readLive({
-      port: state.port,
-      // The session's OWN token. GET /sessions/:id/logs accepts it for this
-      // session and nothing else, which is why start could drop the launch
-      // token and still leave capture possible.
-      token: state.sessionToken,
-      sessionId: state.sessionId,
-      timeoutMs: LIVE_READ_TIMEOUT_MS,
-    });
-    collectorAlive = true;
-  } catch (error) {
-    readFailure = String(error?.message ?? error);
+  const responderKey = env.DEBUG_ACTION_COLLECTOR_HMAC_KEY || '';
+  if (responderKey === '') {
+    // Valid state, no key: the wiring that carries it from start's step
+    // output into this step's env is broken or absent. That is an integrity
+    // failure, not a missing collector — capture cannot prove anything, so it
+    // must not fall back to the on-disk log and call the result evidence.
+    readFailure = 'responder_key_missing';
+    process.stderr.write('debug-evidence-action: report: no collector responder key in this step\'s environment; capture cannot verify who it is talking to.\n');
+  } else {
+    // Fresh per capture. A nonce reused across captures would let a recorded
+    // answer be replayed by anything that saw it.
+    const challenge = randomBytes(32).toString('hex');
+    try {
+      const answer = await readLive({
+        port: state.port,
+        // The session's OWN token. GET /sessions/:id/logs accepts it for this
+        // session and nothing else, which is why start could drop the launch
+        // token and still leave capture possible.
+        token: state.sessionToken,
+        sessionId: state.sessionId,
+        timeoutMs: LIVE_READ_TIMEOUT_MS,
+        deadlineMs: LIVE_READ_DEADLINE_MS,
+        challenge,
+      });
+      if (!verifyResponderProof({ key: responderKey, challenge, text: answer.text, proof: answer.proof })) {
+        readFailure = 'responder_proof_invalid';
+        process.stderr.write(oneLine(`debug-evidence-action: report: whatever served session ${state.sessionId} on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
+      } else {
+        entries = answer.entries;
+        // The bytes the proof covers, and the only copy anything downstream
+        // will read. Staging exactly these keeps the artifact byte-identical
+        // to what was proven.
+        capturedText = answer.text;
+        collectorAlive = true;
+      }
+    } catch (error) {
+      readFailure = String(error?.message ?? error);
+    }
   }
+  // Everything from here works on in-memory payloads; the staged files are
+  // written once, at the end, and never read back.
+  const payloads = {};
   if (entries !== null) {
     const deviation = describeHypothesisDeviation(entries, state);
     if (deviation !== null) {
@@ -1002,64 +1101,67 @@ const reportSubcommand = async ({
       // invariant is wrong and the evidence must not be published.
       process.stderr.write(oneLine(`debug-evidence-action: report: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
     } else {
-      // The raw lines, verbatim and in order: `raw` is the byte-for-byte
-      // text the collector served, so the staged artifact is the
-      // collector's view rather than a re-serialization of it.
-      writeFileSync(sessionCopy, `${entries.map((entry) => entry.raw).join('\n')}\n`);
-      evidenceCopied = true;
+      payloads['session.log'] = capturedText;
       evidenceAuthentic = true;
     }
   } else if (UNREACHABLE_READ.test(readFailure)) {
     // Nothing answered, or what answered is not our collector. There is no
-    // authoritative source to prefer, so the on-disk log is staged best-effort
+    // authoritative source to prefer, so the on-disk log is read best-effort
     // and LABELED: whatever is readable is still worth a human's eyes, and
     // finish refuses the run on collectorAlive, so unverifiable bytes can be
-    // inspected but can never ride a green build.
+    // inspected but can never ride a green build. Read into memory like every
+    // other payload — a copyFileSync would put the render back on a pathname.
     process.stderr.write(oneLine(`debug-evidence-action: report: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
     try {
-      copyFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), sessionCopy);
-      evidenceCopied = true;
+      payloads['session.log'] = readFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
     } catch (error) {
       process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
     }
   } else {
     // The collector answered us and refused — session_log_tampered or
     // session_log_replaced surfacing as live_read_log_replaced, an unknown
-    // session, a torn line. Falling back to the file on disk would stage
-    // precisely the forgery the collector just caught, so this is an
-    // evidence-integrity failure and nothing else.
+    // session, a torn line, an unprovable responder. Falling back to the file
+    // on disk would stage precisely the bytes nothing will vouch for, so this
+    // is an evidence-integrity failure and nothing else.
     process.stderr.write(oneLine(`debug-evidence-action: report: the collector refused to serve session ${state.sessionId} (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
   }
+  const evidenceCopied = payloads['session.log'] !== undefined;
   let reportRendered = false;
   let markdownText = '';
   let eventCount = '';
   if (evidenceCopied) {
-    // Rendered from the STAGED copy, never from the project's log: the
-    // artifact and the report a reader compares it against must be the same
-    // bytes, and on the authenticated path those bytes only exist here.
-    const markdown = spawnReport([sessionCopy, '--format=md']);
-    const json = spawnReport([sessionCopy, '--format=json']);
-    if (markdown.status !== 0 || json.status !== 0) {
-      process.stderr.write(`debug-evidence-action: report: renderer failed (md ${markdown.status}, json ${json.status}).\n`);
-    } else {
-      const rendered = parseRenderedReport(json.stdout);
-      if (rendered === null) {
-        process.stderr.write('debug-evidence-action: report: the renderer exited 0 but did not print a schema-1 report; refusing to publish it.\n');
+    let rendered = null;
+    try {
+      rendered = renderReport(payloads['session.log'], state.sessionId);
+    } catch (error) {
+      process.stderr.write(oneLine(`debug-evidence-action: report: renderer failed (${error?.message ?? error}).`) + '\n');
+    }
+    if (rendered !== null) {
+      const validated = parseRenderedReport(rendered.json);
+      if (validated === null) {
+        process.stderr.write('debug-evidence-action: report: the renderer returned no schema-1 report; refusing to publish it.\n');
       } else {
-        writeFileSync(path.join(evidenceDir, 'report.md'), markdown.stdout);
-        writeFileSync(path.join(evidenceDir, 'report.json'), json.stdout);
+        payloads['report.md'] = rendered.markdown;
+        payloads['report.json'] = rendered.json;
         reportRendered = true;
-        markdownText = markdown.stdout;
-        eventCount = String(rendered.session.events);
+        markdownText = rendered.markdown;
+        eventCount = String(validated.session.events);
       }
     }
+  }
+  // Hash from memory, THEN write. The order is the guarantee: the digest
+  // describes what this invocation decided to stage, so anything that reaches
+  // the files afterwards is a mismatch rather than a blessing. Computing it
+  // from the files instead would hand a swap the step log's endorsement.
+  const digestLine = payloadDigestLine(payloads);
+  for (const name of EVIDENCE_FILES) {
+    if (payloads[name] !== undefined) stageFile(path.join(evidenceDir, name), payloads[name]);
   }
   // Printed as soon as the bytes exist and BEFORE the ownership commit: this
   // line is a forensic record of what this process wrote to disk, not a claim
   // about which invocation owns the output-dir. Emitting it late — or only on
   // the paths that go on to succeed — would leave exactly the failure windows
   // undocumented.
-  const digestLine = stagedDigestLine(evidenceDir);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   const committed = await withStateLock(outputDir, () => {
     const current = readState(outputDir);
@@ -1187,8 +1289,8 @@ const main = async () => {
 if (require.main === module) void main();
 
 module.exports = {
+  defaultRenderReport,
   defaultSpawnCommand,
-  defaultSpawnReport,
   finishSubcommand,
   httpRequestJson,
   maskValue,

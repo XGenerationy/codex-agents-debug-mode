@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, createHmac } = require('node:crypto');
 const { constants, existsSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
@@ -4857,5 +4857,83 @@ test('the session token stays read-and-append: it can never post a hypothesis li
       body: { name: 'ci-debug' },
     });
     assert.equal(minted.status, 401);
+  });
+});
+
+// Responder authentication: a caller whose routing data came from a file
+// another local process can rewrite needs a way to tell THIS collector from a
+// counterfeit listener wearing its shape. The key signs responses and
+// authorizes nothing, so leaking it grants no capability.
+const withResponderServer = async (responderKey, run) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-responder-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    responderKey,
+  });
+  const baseUrl = await listen(server);
+  try {
+    return await run({ baseUrl, projectRoot });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+};
+
+test('GET /sessions/:id/logs signs its response over the challenge nonce and the exact served bytes', async () => {
+  const responderKey = 'responder-key-with-enough-entropy-for-fixtures';
+  await withResponderServer(responderKey, async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'signed event' },
+    });
+    const pathname = `/sessions/${session.session_id}/logs`;
+    const proofFor = (nonce, body) => createHmac('sha256', responderKey)
+      .update(`${nonce}.${createHash('sha256').update(body, 'utf8').digest('hex')}`)
+      .digest('hex');
+
+    const signed = await requestRaw(baseUrl, {
+      pathname,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one' },
+    });
+    assert.equal(signed.status, 200);
+    assert.equal(signed.headers['x-debug-proof'], proofFor('nonce-one', signed.text));
+
+    // A different nonce over the same bytes is a different proof: that is what
+    // stops a recorded (body, proof) pair from being replayed at a later
+    // challenge.
+    const again = await requestRaw(baseUrl, {
+      pathname,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-two' },
+    });
+    assert.equal(again.text, signed.text, 'same bytes...');
+    assert.notEqual(again.headers['x-debug-proof'], signed.headers['x-debug-proof'], '...different proof');
+    assert.equal(again.headers['x-debug-proof'], proofFor('nonce-two', again.text));
+
+    // Unchallenged callers are unaffected: no header, no behaviour change.
+    const plain = await requestRaw(baseUrl, { pathname, headers: LAUNCH_AUTH });
+    assert.equal(plain.status, 200);
+    assert.equal(plain.headers['x-debug-proof'], undefined);
+    // The key itself never travels.
+    assert.equal(signed.text.includes(responderKey), false);
+    assert.equal(JSON.stringify(signed.headers).includes(responderKey), false);
+  });
+});
+
+test('a collector booted without a responder key cannot be made to sign anything', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const challenged = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one' },
+    });
+    // Serving unsigned is correct — the CLI and the viewer never challenge.
+    // A caller that DID challenge sees no proof and must treat that as a
+    // failure, which is what the action does.
+    assert.equal(challenged.status, 200);
+    assert.equal(challenged.headers['x-debug-proof'], undefined);
   });
 });

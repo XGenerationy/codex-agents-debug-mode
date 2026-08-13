@@ -1,19 +1,20 @@
 'use strict';
 
 const assert = require('node:assert');
-const { createHash } = require('node:crypto');
+const { createHash, createHmac } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const {
   closeSync, constants, existsSync, openSync, readFileSync, readdirSync, unlinkSync, utimesSync,
   writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
 } = require('node:fs');
+const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
 const {
-  defaultSpawnReport,
+  defaultRenderReport,
   finishSubcommand,
   httpRequestJson,
   maskValue,
@@ -71,6 +72,32 @@ const mintSeams = { probeToken: async () => true, request: async () => MINTED };
 // authoritative source to ask", which is what licenses the labeled on-disk
 // fallback; every other failure means the collector answered and refused.
 const unreachableRead = async () => { throw new Error('live_read_connect_failed:ECONNREFUSED'); };
+
+// The responder key the harness stands in for the runner to deliver. In
+// production it is minted by the boot shim, returned over the private pipe,
+// published by start as a step output, and interpolated into the report
+// step's env — never written to state, which is why a wrapped command that
+// owns the state file still cannot forge a proof.
+const RESPONDER_KEY = 'test-responder-key-with-enough-entropy-here';
+const REPORT_ENV = { DEBUG_ACTION_COLLECTOR_HMAC_KEY: RESPONDER_KEY };
+
+const proofFor = (key, challenge, text) => createHmac('sha256', key)
+  .update(`${challenge}.${createHash('sha256').update(text, 'utf8').digest('hex')}`)
+  .digest('hex');
+
+// A readLive seam that answers the way the real collector does: it signs the
+// bytes it serves over the nonce REPORT chose, so a test never has to know
+// the challenge in advance. Pass { key } to sign with the wrong secret, or
+// { proof: null } to answer with none at all.
+const collectorAnswer = (lines, { key = RESPONDER_KEY, proof } = {}) => async ({ challenge }) => {
+  const text = lines.map((line) => `${JSON.stringify(line)}
+`).join('');
+  return {
+    entries: lines.map(servedEntry),
+    text,
+    proof: proof === undefined ? proofFor(key, challenge, text) : proof,
+  };
+};
 
 // readSessionLive resolves [{ raw, parsed }] — parsed being JSON.parse(raw).
 // Seams build entries through this helper so a fixture can never drift into a
@@ -255,7 +282,7 @@ test('start kills the collector when its state cannot be recorded, leaving no un
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43),
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
   })}\n`));
   await assert.rejects(starting, /non-regular file/);
   assert.deepEqual(killed, [4242], 'a collector whose pid was never persisted must be killed on the spot');
@@ -279,7 +306,7 @@ test('a healthy start records state first, then RELEASES the shim pipes instead 
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43),
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
   })}\n`));
   assert.equal(await starting, 0);
   // fakeChild's destroy() throws, so getting here at all proves neither pipe
@@ -423,9 +450,29 @@ const startReal = async (overrides = {}) => {
   const projectRoot = makeTempDir();
   const port = await getFreePort();
   const inputs = baseInputs({ port: String(port), ...overrides });
-  const code = await startSubcommand({ inputs, outputDir, projectRoot, env: {} });
+  // The responder key reaches `report` exactly the way action.yml will route
+  // it: start writes it to GITHUB_OUTPUT, the runner parses that file when the
+  // step ends, and the value is interpolated into the report step's env. The
+  // harness stands in for the runner — reading the step output here and
+  // handing it back as `reportEnv` — precisely so nothing in these tests can
+  // accidentally take a shortcut through state or the filesystem.
+  const startOutput = path.join(outputDir, 'start_output');
+  writeFileSync(startOutput, '');
+  const code = await startSubcommand({ inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
   assert.equal(code, 0);
-  return { outputDir, projectRoot, port, inputs };
+  const emitted = readFileSync(startOutput, 'utf8');
+  const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-hmac-key='));
+  assert.ok(keyLine, 'start must publish the responder key as a step output');
+  const collectorHmacKey = keyLine.slice('collector-hmac-key='.length);
+  assert.ok(collectorHmacKey.length >= 32);
+  return {
+    outputDir,
+    projectRoot,
+    port,
+    inputs,
+    collectorHmacKey,
+    reportEnv: { DEBUG_ACTION_COLLECTOR_HMAC_KEY: collectorHmacKey },
+  };
 };
 
 test('run injects exactly the documented env from the session start minted, records the exit code, and never fails on command failure', async () => {
@@ -523,7 +570,7 @@ test('a session-mint failure kills the collector in start, so nothing is left ho
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43),
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), responder_key: RESPONDER_KEY,
   })}\n`));
   await assert.rejects(starting, /session mint failed \(HTTP 401\)/);
   assert.equal(requests, 1);
@@ -551,7 +598,7 @@ test('start challenges the port occupant before the launch token is ever put on 
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, responder_key: RESPONDER_KEY,
   })}\n`));
   await assert.rejects(starting, /identity could not be verified/);
   assert.deepEqual(probes, [[8787, launchToken]]);
@@ -625,11 +672,15 @@ test('start masks each token the moment it exists and in the order it is used, b
     readyTimeoutMs: 5_000,
   });
   setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
-    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken,
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: launchToken, responder_key: RESPONDER_KEY,
   })}\n`));
   assert.equal(await starting, 0);
   assert.deepEqual(ledger, [
     `::add-mask::${launchToken}\n`,
+    // The responder key is masked with the tokens even though it authorizes
+    // nothing: anything that learns it can FORGE a capture proof, which is
+    // the one thing the key exists to make impossible.
+    `::add-mask::${RESPONDER_KEY}\n`,
     'probe-ready',
     'probe-token',
     'request /session',
@@ -639,6 +690,8 @@ test('start masks each token the moment it exists and in the order it is used, b
   const state = readState(outputDir);
   assert.equal(state.sessionToken, sessionToken, 'masking does not disturb what start records');
   assert.equal('launchToken' in state, false, 'and the launch token is spent, not stored');
+  assert.equal(readFileSync(path.join(outputDir, 'action-state.json'), 'utf8').includes(RESPONDER_KEY), false,
+    'the responder key travels through runner memory, never through state');
 });
 
 test('run re-registers the session token with the runner before handing it to a child process', async () => {
@@ -966,7 +1019,7 @@ test('report captures the session from the collector, renders md+json, appends t
   try {
     const code = await reportSubcommand({
       outputDir: context.outputDir,
-      env: { GITHUB_OUTPUT: context.githubOutput, GITHUB_STEP_SUMMARY: context.stepSummary },
+      env: { ...context.reportEnv, GITHUB_OUTPUT: context.githubOutput, GITHUB_STEP_SUMMARY: context.stepSummary },
       writeStdout: (text) => printed.push(text),
     });
     assert.equal(code, 0);
@@ -989,10 +1042,17 @@ test('report captures the session from the collector, renders md+json, appends t
     const outputs = readFileSync(context.githubOutput, 'utf8');
     assert.match(outputs, /event-count=\d+/);
     assert.match(outputs, /report-path=.+report\.md/);
+    assert.equal(state.evidenceAuthentic, true, 'the collector proved the answer was its own');
     for (const file of ['session.log', 'report.md', 'report.json']) {
       const bytes = readFileSync(path.join(evidenceDir, file), 'utf8');
       assert.ok(!bytes.includes(state.sessionToken), `${file} must not contain the session token`);
+      // The responder key is verification material, never evidence: it lives
+      // in runner memory and this step's env, and must reach neither the
+      // artifact nor the state file.
+      assert.ok(!bytes.includes(context.collectorHmacKey), `${file} must not contain the responder key`);
     }
+    assert.equal(readFileSync(path.join(context.outputDir, 'action-state.json'), 'utf8')
+      .includes(context.collectorHmacKey), false, 'nor the state file');
     // Staging-window detectability: staging and upload are separate steps of
     // the same composite action, so a detached child CAN rewrite these files
     // in between. The step log cannot be revised once streamed, so a digest
@@ -1053,7 +1113,7 @@ const forgedLifecycle = async () => {
 test('a wrapped command that forges its own session log cannot get the forgery into the evidence child', async () => {
   const context = await forgedLifecycle();
   try {
-    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: context.reportEnv });
     assert.equal(code, 3, 'the collector refuses to serve a log that is no longer the one it wrote');
     const state = readState(context.outputDir);
     // collectorAlive now MEANS 'an authenticated read of this session's log
@@ -1086,7 +1146,7 @@ test('a same-length in-place rewrite of the session log is caught end to end, no
     const forged = original.replace('demo event', 'FAKE event');
     assert.equal(Buffer.byteLength(forged, 'utf8'), Buffer.byteLength(original, 'utf8'));
     writeFileSync(logPath, forged);
-    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: context.reportEnv });
     // Collector: content digest mismatch → 409 session_log_tampered.
     // readSessionLive: 409 → live_read_log_replaced. report: no fallback → 3.
     assert.equal(code, 3);
@@ -1104,7 +1164,7 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
   try {
     const code = await reportSubcommand({
       outputDir: context.outputDir,
-      env: {},
+      env: context.reportEnv,
       // No authoritative source: the run's own collector is gone (or was
       // never the thing on that port), so the filesystem is all there is.
       readLive: unreachableRead,
@@ -1203,7 +1263,7 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
     // And capture is clean: the run is honest, so it stays green. The
     // hypothesis-set contract has nothing left to catch, which is the point —
     // it is now a belt over a structural guarantee.
-    const code = await reportSubcommand({ outputDir: context.outputDir, env: {} });
+    const code = await reportSubcommand({ outputDir: context.outputDir, env: context.reportEnv });
     assert.equal(code, 0);
     const after = readState(context.outputDir);
     assert.equal(after.collectorAlive, true);
@@ -1235,8 +1295,8 @@ test('report refuses a state carrying another invocation\'s nonce before it touc
   const code = await reportSubcommand({
     outputDir,
     env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' },
-    readLive: async () => { probed += 1; return []; },
-    spawnReport: () => { throw new Error('a refused report must never reach the renderer'); },
+    readLive: async () => { probed += 1; return { entries: [], text: '', proof: null }; },
+    renderReport: () => { throw new Error('a refused report must never reach the renderer'); },
   });
   assert.equal(code, 3);
   assert.equal(probed, 0, 'the refusal is settled from state alone, before any network contact');
@@ -1270,19 +1330,19 @@ test('report stages evidence outside the lock but refuses to commit over a newer
   let claimed = false;
   const code = await reportSubcommand({
     outputDir,
-    env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
-    readLive: async () => [servedEntry({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' })],
+    env: { ...REPORT_ENV, GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
+    readLive: collectorAnswer([{ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }]),
     // Rendering happens OUTSIDE the critical section by design — a holder
     // that spawned two child processes could sit in the section for seconds,
     // and the stale threshold is 30s (recorded T4 r2 requirement). The seam
     // uses that window to let a second invocation claim the output-dir, which
     // is exactly the interleave the lock cannot prevent and the CAS must.
-    spawnReport: (args) => {
+    renderReport: (sessionText, sessionId) => {
       if (!claimed) {
         claimed = true;
         writeState(outputDir, usurper);
       }
-      return defaultSpawnReport(args);
+      return defaultRenderReport(sessionText, sessionId);
     },
   });
   assert.equal(code, 3, 'the nonce compare under the lock saw state it does not own');
@@ -1307,7 +1367,7 @@ test('report records an unauthenticated collector without inventing evidence, an
   writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'last words' }]);
   const code = await reportSubcommand({
     outputDir,
-    env: {},
+    env: REPORT_ENV,
     // Dead, or replaced by something that cannot answer at all — the two are
     // indistinguishable from here, and both mean the same thing: no
     // authoritative source for this session's bytes.
@@ -1334,9 +1394,9 @@ test('report returns 3 when there is nothing to stage at all — evidence is the
   writeFileSync(githubOutput, '');
   const code = await reportSubcommand({
     outputDir,
-    env: { GITHUB_OUTPUT: githubOutput },
+    env: { ...REPORT_ENV, GITHUB_OUTPUT: githubOutput },
     readLive: unreachableRead,
-    spawnReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
+    renderReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
   });
   assert.equal(code, 3);
   const state = readState(outputDir);
@@ -1359,24 +1419,31 @@ test('the staged log is the collector\'s answer, not whatever is on disk under t
   // stage this; the authenticated path never opens it.
   writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'FORGED disk line' }]);
   const served = [
-    servedEntry({ ts: '2026-08-13T00:00:01.000Z', msg: 'served by the collector' }),
-    servedEntry({ ts: '2026-08-13T00:00:02.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN' }),
+    { ts: '2026-08-13T00:00:01.000Z', msg: 'served by the collector' },
+    { ts: '2026-08-13T00:00:02.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN' },
   ];
+  const answer = collectorAnswer(served);
   const reads = [];
   const code = await reportSubcommand({
     outputDir,
-    env: {},
-    readLive: async (options) => { reads.push(options); return served; },
+    env: REPORT_ENV,
+    readLive: async (options) => { reads.push(options); return answer(options); },
   });
   assert.equal(code, 0);
   const staged = readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8');
-  assert.equal(staged, `${served.map((entry) => entry.raw).join('\n')}\n`,
-    'the collector\'s raw lines are staged verbatim and in order');
+  assert.equal(staged, served.map((line) => `${JSON.stringify(line)}\n`).join(''),
+    'the bytes the proof covers are the bytes staged, verbatim and in order');
   assert.ok(!staged.includes('FORGED disk line'), 'the file at the well-known path was never opened');
   assert.equal(readState(outputDir).evidenceAuthentic, true);
-  // Reading a session is a LAUNCH-token capability, so the read is addressed
-  // with exactly what start recorded — a session token would 401.
-  assert.deepEqual(reads, [{ port: 4321, token: sessionToken, sessionId: 'ci-debug-abc', timeoutMs: 5000 }]);
+  // Addressed with exactly what start recorded, carrying a fresh challenge
+  // and both bounds.
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].port, 4321);
+  assert.equal(reads[0].token, sessionToken, 'the session token is the read credential');
+  assert.equal(reads[0].sessionId, 'ci-debug-abc');
+  assert.equal(reads[0].timeoutMs, 5000);
+  assert.ok(reads[0].deadlineMs > 0, 'the read carries an absolute bound, not just an idle timeout');
+  assert.match(reads[0].challenge, /^[0-9a-f]{64}$/, 'a fresh 256-bit nonce per capture');
 });
 
 test('a live read the collector refuses is an evidence-integrity failure, never a reason to fall back to the disk', async () => {
@@ -1393,7 +1460,7 @@ test('a live read the collector refuses is an evidence-integrity failure, never 
   ]);
   const code = await reportSubcommand({
     outputDir,
-    env: {},
+    env: REPORT_ENV,
     // 409 session_log_replaced: the collector's own identity check found that
     // the file it wrote is not the file on disk.
     readLive: async () => { throw new Error('live_read_log_replaced'); },
@@ -1433,9 +1500,9 @@ test('every way a captured hypothesis set can deviate from the one this action p
     });
     const code = await reportSubcommand({
       outputDir,
-      env: {},
-      readLive: async () => served.map(servedEntry),
-      spawnReport: () => { throw new Error('forged evidence must never reach the renderer'); },
+      env: REPORT_ENV,
+      readLive: collectorAnswer(served),
+      renderReport: () => { throw new Error('forged evidence must never reach the renderer'); },
     });
     assert.equal(code, 3, label);
     assert.equal(readState(outputDir).evidenceCopied, false, label);
@@ -1453,8 +1520,8 @@ test('every way a captured hypothesis set can deviate from the one this action p
   });
   assert.equal(await reportSubcommand({
     outputDir,
-    env: {},
-    readLive: async () => [event, openLine].map(servedEntry),
+    env: REPORT_ENV,
+    readLive: collectorAnswer([event, openLine]),
   }), 0, 'the action\'s own set is exactly what capture accepts');
   assert.equal(readState(outputDir).evidenceAuthentic, true);
 });
@@ -1466,14 +1533,21 @@ test('an entry the hypothesis check cannot inspect is refused rather than skippe
     nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
     projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
   });
+  // A line whose parsed form is missing or is not an object cannot be
+  // classified. Skipping it would let a forged hypothesis through any future
+  // path that produced this shape, so it fails closed instead — even though
+  // the answer is otherwise perfectly signed.
+  const uninspectable = '{"type":"hypothesis","status":"CONFIRMED"}';
+  const text = `${uninspectable}\n`;
   const code = await reportSubcommand({
     outputDir,
-    env: {},
-    // A line whose parsed form is missing or is not an object cannot be
-    // classified. Skipping it would let a forged hypothesis through any
-    // future path that produced this shape, so it fails closed instead.
-    readLive: async () => [{ raw: '{"type":"hypothesis","status":"CONFIRMED"}' }],
-    spawnReport: () => { throw new Error('an uninspectable capture must never reach the renderer'); },
+    env: REPORT_ENV,
+    readLive: async ({ challenge }) => ({
+      entries: [{ raw: uninspectable }],
+      text,
+      proof: proofFor(RESPONDER_KEY, challenge, text),
+    }),
+    renderReport: () => { throw new Error('an uninspectable capture must never reach the renderer'); },
   });
   assert.equal(code, 3);
   assert.equal(readState(outputDir).evidenceCopied, false);
@@ -1523,9 +1597,9 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   });
   const code = await reportSubcommand({
     outputDir,
-    env: {},
+    env: REPORT_ENV,
     readLive: unreachableRead,
-    spawnReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
+    renderReport: () => { throw new Error('nothing was staged, so nothing can be rendered'); },
   });
   assert.equal(code, 3);
   assertCleared(evidenceDir, 'failed capture');
@@ -1541,7 +1615,7 @@ test('a foreign occupant answering 401 fails liveness and licenses only labeled 
   writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-13T00:00:00.000Z', msg: 'whatever is on disk' }]);
   const code = await reportSubcommand({
     outputDir,
-    env: {},
+    env: REPORT_ENV,
     // Our collector died and something else took the port. It answers — but
     // not for our session, which is exactly what the session-token read scope
     // is there to distinguish (Codex T5 r3).
@@ -1555,14 +1629,14 @@ test('a foreign occupant answering 401 fails liveness and licenses only labeled 
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'and it can never ride a green run');
 });
 
-test('a renderer that exits 0 without printing a schema-1 report publishes nothing', async () => {
+test('a renderer that returns without producing a schema-1 report publishes nothing', async () => {
   const cases = [
     ['truncated JSON', '{"schema":1,"session":{"events":'],
     ['a schema this action does not speak', JSON.stringify({ schema: 2, session: { events: 3 } })],
     ['a negative event count', JSON.stringify({ schema: 1, session: { events: -1 } })],
     ['no session block at all', JSON.stringify({ schema: 1 })],
   ];
-  for (const [label, stdout] of cases) {
+  for (const [label, rendered] of cases) {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
     writeState(outputDir, {
@@ -1575,13 +1649,12 @@ test('a renderer that exits 0 without printing a schema-1 report publishes nothi
     writeFileSync(stepSummary, '');
     const code = await reportSubcommand({
       outputDir,
-      env: { GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
-      readLive: async () => [servedEntry({ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' })],
-      // Exit status 0 throughout: a healthy child that printed rubbish is the
-      // whole point — status alone was never proof of a report (Codex T5 #2).
-      spawnReport: (args) => (args.includes('--format=json')
-        ? { status: 0, stdout }
-        : { status: 0, stdout: '## Debug evidence report\n' }),
+      env: { ...REPORT_ENV, GITHUB_OUTPUT: githubOutput, GITHUB_STEP_SUMMARY: stepSummary },
+      readLive: collectorAnswer([{ ts: '2026-08-13T00:00:00.000Z', msg: 'served event' }]),
+      // A renderer that RETURNS rubbish rather than throwing is the whole
+      // point: nothing but a shape check on what it produced can catch that
+      // (Codex T5 #2).
+      renderReport: () => ({ markdown: '## Debug evidence report\n', json: rendered }),
     });
     const evidenceDir = resolveEvidenceDir(outputDir);
     assert.equal(code, 3, label);
@@ -1637,4 +1710,259 @@ test('the terminal main() catch redacts state tokens from stderr', async () => {
   assert.match(result.stderr, /debug-evidence-action:/);
   assert.match(result.stderr, /Unknown subcommand/);
   assert.ok(!result.stderr.includes(token), 'known state tokens are redacted from the terminal catch');
+});
+
+// A listener that speaks the logs route's contract perfectly: 200, the right
+// content type, well-formed NDJSON carrying exactly the hypothesis set the
+// action posted. Everything capture checked before this round it satisfies —
+// which is the point. `sign` decides what proof, if any, it returns.
+const counterfeitCollector = async (sign) => {
+  const served = [
+    { ts: '2026-08-14T00:00:00.000Z', msg: 'looks just like a real event' },
+    { ts: '2026-08-14T00:00:01.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN', title: 'seeded demo' },
+  ];
+  const body = served.map((line) => `${JSON.stringify(line)}\n`).join('');
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.headers['x-debug-challenge']);
+    const headers = { 'Content-Type': 'application/x-ndjson' };
+    const proof = sign(request.headers['x-debug-challenge'], body, requests.length);
+    if (proof !== null) headers['x-debug-proof'] = proof;
+    response.writeHead(200, headers);
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    body,
+    requests,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+};
+
+const counterfeitState = (outputDir, projectRoot, port) => writeState(outputDir, {
+  nonce: 'n1', pid: 1, port, sessionName: 'ci-debug',
+  sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
+  hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
+  commandExitCode: 0, failOnCommandFailure: 'true',
+});
+
+test('a counterfeit collector serving perfect NDJSON is refused: capture believes proof, not shape', async () => {
+  for (const [label, sign] of [
+    ['no proof at all', () => null],
+    ['a proof signed with a key it guessed', (challenge, body) => proofFor('not-the-runners-key-at-all', challenge, body)],
+    ['a proof over different bytes', (challenge) => proofFor(RESPONDER_KEY, challenge, 'other bytes entirely')],
+    ['a proof over a challenge it chose itself', (_challenge, body) => proofFor(RESPONDER_KEY, 'a-nonce-nobody-asked-for', body)],
+  ]) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    // The wrapped command's own log, left where a pathname copy would find it.
+    writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-14T00:00:00.000Z', msg: 'disk fallback bait' }]);
+    const fake = await counterfeitCollector(sign);
+    try {
+      counterfeitState(outputDir, projectRoot, fake.port);
+      // No readLive seam: the real reader, the real HTTP request, the real
+      // verification. Only the listener is fake — which is exactly the attack,
+      // a wrapped command rewriting `port` in a state file it can write and
+      // standing up its own server there.
+      const code = await reportSubcommand({ outputDir, env: REPORT_ENV });
+      assert.equal(code, 3, label);
+      const state = readState(outputDir);
+      assert.equal(state.collectorAlive, false, `${label}: an unprovable answer is not a live collector`);
+      assert.equal(state.evidenceCopied, false, label);
+      assert.equal(state.evidenceAuthentic, false, label);
+      assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+        `${label}: an unproven answer is never staged`);
+      assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'report.md')), label);
+      // And it must not slide into the unreachable class either: a listener
+      // that answers is not an absent collector, so the on-disk log is not a
+      // licensed fallback here.
+      assert.equal(
+        readFileSync(path.join(projectRoot, '.debug', 'debug-ci-debug-abc.log'), 'utf8').includes('disk fallback bait'),
+        true,
+        `${label}: the bait is still on disk, and still unstaged`,
+      );
+      assert.equal(finishSubcommand({ outputDir, env: {} }), 3, label);
+      assert.equal(fake.requests.length, 1, `${label}: challenged exactly once`);
+      assert.match(fake.requests[0], /^[0-9a-f]{64}$/, `${label}: with a fresh nonce`);
+    } finally {
+      await fake.close();
+    }
+  }
+});
+
+test('a recorded answer cannot be replayed: an old proof does not answer a fresh challenge', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  let recorded = null;
+  // First request: sign honestly, as the real collector would. Every later
+  // request: replay that exact (body, proof) pair — the strongest move
+  // available to an attacker who once observed a valid answer.
+  const listener = await counterfeitCollector((challenge, body, nth) => {
+    if (nth === 1) recorded = proofFor(RESPONDER_KEY, challenge, body);
+    return recorded;
+  });
+  try {
+    counterfeitState(outputDir, projectRoot, listener.port);
+    const first = await reportSubcommand({ outputDir, env: REPORT_ENV });
+    assert.equal(first, 0, 'a correctly signed answer is accepted');
+    assert.equal(readState(outputDir).evidenceAuthentic, true);
+
+    const replayed = await reportSubcommand({ outputDir, env: REPORT_ENV });
+    assert.equal(replayed, 3, 'the same proof against a fresh nonce is not a proof');
+    const state = readState(outputDir);
+    assert.equal(state.collectorAlive, false);
+    assert.equal(state.evidenceCopied, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+      'and entry cleanup means the first capture is not left behind to pass as this one');
+    assert.notEqual(listener.requests[0], listener.requests[1], 'each capture challenged with a different nonce');
+  } finally {
+    await listener.close();
+  }
+});
+
+test('capture refuses when the responder key never reached this step, rather than trusting the port', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeSessionLog(projectRoot, 'ci-debug-abc', [{ ts: '2026-08-14T00:00:00.000Z', msg: 'on disk' }]);
+  const listener = await counterfeitCollector((challenge, body) => proofFor(RESPONDER_KEY, challenge, body));
+  try {
+    counterfeitState(outputDir, projectRoot, listener.port);
+    // Wiring broken: action.yml did not pass the step output through, so this
+    // step cannot verify anything. That is an integrity failure, not a missing
+    // collector — falling back to the on-disk log would hand back bytes with no
+    // provenance at all and call them evidence.
+    const code = await reportSubcommand({ outputDir, env: {} });
+    assert.equal(code, 3);
+    const state = readState(outputDir);
+    assert.equal(state.collectorAlive, false);
+    assert.equal(state.evidenceCopied, false);
+    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
+    assert.equal(listener.requests.length, 0, 'nothing is even asked without a way to check the answer');
+  } finally {
+    await listener.close();
+  }
+});
+
+test('render and digest never re-read the staged path: the payload is one immutable buffer', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  const lines = [
+    { ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' },
+    { ts: '2026-08-14T00:00:01.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN', title: 'seeded demo' },
+  ];
+  const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+    sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
+    hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
+    commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  const printed = [];
+  const githubOutput = path.join(outputDir, 'github_output');
+  writeFileSync(githubOutput, '');
+  const handed = [];
+  const code = await reportSubcommand({
+    outputDir,
+    env: { ...REPORT_ENV, GITHUB_OUTPUT: githubOutput },
+    readLive: collectorAnswer(lines),
+    // The renderer is handed BYTES, never a path — assert that directly — and
+    // it uses the moment it is called to plant a forgery at the staged path.
+    // A render or a hash that re-read that path would pick the forgery up; the
+    // final write overwrites it, and the digest describes the capture.
+    renderReport: (sessionText, sessionId) => {
+      handed.push([sessionText, sessionId]);
+      mkdirSync(evidenceDir, { recursive: true });
+      writeFileSync(path.join(evidenceDir, 'session.log'), '{"msg":"FORGED mid-flight"}\n');
+      return defaultRenderReport(sessionText, sessionId);
+    },
+    writeStdout: (text) => printed.push(text),
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(handed, [[captured, 'ci-debug-abc']],
+    'the renderer receives the captured bytes and the real session id, not a filename');
+  const staged = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
+  assert.equal(staged, captured, 'the write is the last word; the mid-flight forgery is gone');
+  const reportJson = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+  assert.equal(reportJson.session.id, 'ci-debug-abc', 'rendered from memory, so the session id is the real one');
+  assert.equal(reportJson.session.events, 1);
+  assert.equal(reportJson.hypotheses[0].status, 'OPEN');
+  assert.ok(!readFileSync(path.join(evidenceDir, 'report.md'), 'utf8').includes('FORGED mid-flight'));
+  // Every digest describes the bytes this invocation decided to stage.
+  const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
+    .map((file) => `${file}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, file))).digest('hex')}`)
+    .join(' ')}`;
+  assert.deepEqual(printed, [`${expected}\n`]);
+  assert.ok(readFileSync(githubOutput, 'utf8').includes(`evidence-digest=${expected}\n`));
+});
+
+test('a swap after staging is DETECTABLE: the logged digests still describe what was captured', async () => {
+  const context = await fullLifecycle();
+  const printed = [];
+  try {
+    const code = await reportSubcommand({
+      outputDir: context.outputDir,
+      env: { ...context.reportEnv, GITHUB_OUTPUT: context.githubOutput },
+      writeStdout: (text) => printed.push(text),
+    });
+    assert.equal(code, 0);
+    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const logged = printed[0].trim();
+    // The window this cannot close: staging and upload are separate steps of
+    // one composite action, same user, so a detached child can still rewrite
+    // these files. What it CAN do is make that rewrite visible — the step log
+    // is streamed and immutable, and the digests in it describe the capture,
+    // not whatever is on disk at upload time.
+    for (const name of ['session.log', 'report.md', 'report.json']) {
+      writeFileSync(path.join(evidenceDir, name), 'swapped after the fact\n');
+      const actual = createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex');
+      assert.equal(logged.includes(`${name}=${actual}`), false,
+        `${name}: the swapped bytes must not match the digest that was logged`);
+    }
+    // And the machine surface carries the same record, so a consumer can
+    // compare without scraping the log.
+    assert.ok(readFileSync(context.githubOutput, 'utf8').includes(`evidence-digest=${logged}\n`));
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+test('the digests are computed from the payload, not from the sink: a lossy write is caught, not blessed', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  const lines = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' }];
+  const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+    sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
+    commandExitCode: 0, failOnCommandFailure: 'true',
+  });
+  const printed = [];
+  const code = await reportSubcommand({
+    outputDir,
+    env: REPORT_ENV,
+    readLive: collectorAnswer(lines),
+    // The sink stands in for everything that can happen to a file after this
+    // process decides what belongs in it — a detached child mid-write, a
+    // filesystem that lies. Whatever lands here, the digest must still be the
+    // one over the captured payload, or the step log would be endorsing the
+    // swap instead of exposing it.
+    stageFile: (filePath) => {
+      mkdirSync(path.dirname(filePath), { recursive: true });
+      writeFileSync(filePath, 'the sink wrote something else entirely\n');
+    },
+    writeStdout: (text) => printed.push(text),
+  });
+  assert.equal(code, 0);
+  assert.equal(printed.length, 1);
+  const logged = printed[0].trim();
+  assert.ok(logged.includes(`session.log=${createHash('sha256').update(captured, 'utf8').digest('hex')}`),
+    'the logged digest is the one over the captured bytes');
+  for (const name of ['session.log', 'report.md', 'report.json']) {
+    const onDisk = createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex');
+    assert.equal(logged.includes(`${name}=${onDisk}`), false,
+      `${name}: hashing the file back would have described the swap and called it evidence`);
+  }
 });
