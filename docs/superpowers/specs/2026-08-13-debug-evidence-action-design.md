@@ -122,9 +122,12 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
 - The shim prints one structured JSON line (port, pid, launch token, project dir) on
   ready; `start` also polls `/health` for `ready:true` with a bounded timeout
   (`DEBUG_ACTION_READY_TIMEOUT_MS`, default 15000). Timeout ⇒ infra-failure exit.
-- `start` writes `action-state.json`: `{ pid, port, launchToken, projectDir, sessionName }`.
-  The state file stays in runner temp, is never uploaded, and its token values never
-  appear in outputs, summaries, or logs.
+- `start` writes `action-state.json`: `{ nonce, pid, port, launchToken, projectRoot,
+  sessionName, hypothesisId, hypothesisTitle, failOnCommandFailure }` (later subcommands
+  extend it with the session/command/capture results). *(Amended after Task 3 spec
+  review: the original sketch listed five fields and `projectDir`; the byte-authoritative
+  plan ships the superset above.)* The state file stays in runner temp, is never
+  uploaded, and its token values never appear in outputs, summaries, or logs.
 - `run` mints a session via `POST /session` with the launch token, then executes the
   wrapped command with exactly three injected variables: `DEBUG_LOG_URL`
   (`http://127.0.0.1:<port>/log`), `DEBUG_SESSION_ID`, and `DEBUG_SESSION_TOKEN` —
