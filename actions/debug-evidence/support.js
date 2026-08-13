@@ -185,6 +185,81 @@ const writeState = (outputDir, state, { writeAll = writeFileSync } = {}) => {
   }
 };
 
+// Lock parameters. The retry budget (~450ms) is deliberately far below the
+// staleness threshold: a live holder finishes a state write in microseconds,
+// so anything still held after half a second is contention worth failing on
+// rather than waiting out, while anything held for THIRTY seconds is not a
+// holder at all — it is a crashed invocation's litter.
+const LOCK_FILE = 'action-state.lock';
+const LOCK_RETRY_LIMIT = 10;
+const LOCK_RETRY_DELAY_MS = 50;
+const LOCK_STALE_MS = 30_000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A real critical section for the state file, honored by every writer.
+//
+// writeState alone is not enough. Its rename is atomic, but atomic means the
+// file is never torn — not that a decision made by reading it is still valid
+// when the write lands. `run` re-read the state, compared nonces, then wrote;
+// a second invocation could commit in that gap and the first would rename its
+// stale snapshot straight over the top, restoring a dead pid and port over a
+// live collector's and orphaning it (Codex T4 r2). Check-then-act cannot be
+// fixed by checking harder; the read and the write have to be indivisible,
+// which is what holding this lock across BOTH of them buys.
+//
+// O_CREAT|O_EXCL is the primitive: the open either creates the lock or fails
+// EEXIST, with no window between testing and taking it.
+const withStateLock = async (outputDir, fn) => {
+  mkdirSync(outputDir, { recursive: true });
+  const lockPath = path.join(outputDir, LOCK_FILE);
+  let fd = null;
+  let reaped = false;
+  let attempts = 0;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    // Someone holds it. Reap it ONCE, and only when it is old enough that no
+    // live invocation could still own it — a runner that was cancelled or
+    // OOM-killed mid-write leaves this file behind forever, and without a
+    // stale sweep every later job on that output-dir would fail to start.
+    if (!reaped) {
+      let held = null;
+      try {
+        held = lstatSync(lockPath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      if (held && Date.now() - held.mtimeMs > LOCK_STALE_MS) {
+        reaped = true;
+        try {
+          unlinkSync(lockPath);
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+        continue; // retry immediately against the now-free path
+      }
+    }
+    attempts += 1;
+    if (attempts >= LOCK_RETRY_LIMIT) {
+      throw new Error(`could not acquire the action state lock at ${lockPath} after ${attempts} attempts over ~${attempts * LOCK_RETRY_DELAY_MS}ms`);
+    }
+    await sleep(LOCK_RETRY_DELAY_MS);
+  }
+  try {
+    return await fn();
+  } finally {
+    // Close before unlink: Windows refuses to remove a file that is still
+    // open, which would leave the lock standing until the stale sweep.
+    try { closeSync(fd); } catch { /* best-effort release */ }
+    try { unlinkSync(lockPath); } catch { /* a stale sweep may have taken it */ }
+  }
+};
+
 const readState = (outputDir) => {
   try {
     return JSON.parse(readFileSync(path.join(outputDir, STATE_FILE), 'utf8'));
@@ -312,7 +387,7 @@ const startSubcommand = async ({
   // nothing can stop: it would hold the port and keep writing session logs
   // for the rest of the runner's life.
   try {
-    writeState(outputDir, {
+    await withStateLock(outputDir, () => writeState(outputDir, {
       nonce,
       pid: startLine.pid,
       port: Number(inputs.port),
@@ -322,8 +397,10 @@ const startSubcommand = async ({
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
-    });
+    }));
   } catch (error) {
+    // Covers a failed lock acquisition too, and must: a collector whose state
+    // was never recorded is a collector nothing can stop.
     try { kill(startLine.pid); } catch {}
     throw error;
   }
@@ -518,29 +595,38 @@ const runSubcommand = async ({
     // '', because an empty string is still a present variable.
     delete commandEnv.DEBUG_HYPOTHESIS_ID;
   }
-  const result = spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
+  // Awaited so a seam can be asynchronous; defaultSpawnCommand is spawnSync
+  // and resolves immediately.
+  const result = await spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
   const commandExitCode = result.error ? 127 : (result.status ?? 128);
-  // Compare-and-swap on the nonce. The snapshot in `state` was read before a
-  // wrapped command that may have run for an hour, and writing it back is a
-  // blind whole-file overwrite: if another invocation claimed this output-dir
-  // meanwhile, the spread below would restore OUR stale pid/port/token over
-  // theirs and strand their live collector (Codex T4 #3). Re-read and re-check
-  // immediately before the write, and on any drift refuse completely — no
-  // state write, and no outputs either, since a session-id emitted from a
-  // state we just declined to own would be a lie.
-  const current = readState(outputDir);
-  if (!current || current.nonce !== state.nonce) {
+  // Ownership check and commit as ONE indivisible step. The snapshot in
+  // `state` was read before a wrapped command that may have run for an hour,
+  // and the write below is a blind whole-file overwrite: if another
+  // invocation claimed this output-dir meanwhile, it would restore OUR stale
+  // pid/port/token over theirs and strand their live collector. Re-reading
+  // first was not enough on its own — between the compare and the rename a
+  // second invocation could still commit, and this one would clobber it
+  // anyway (Codex T4 #3, then r2). Under the lock the re-read and the write
+  // cannot be split, so whoever the compare saw is still who is there.
+  const committed = await withStateLock(outputDir, () => {
+    const current = readState(outputDir);
+    if (!current || current.nonce !== state.nonce) return false;
+    writeState(outputDir, {
+      ...current,
+      sessionId,
+      sessionToken,
+      commandExitCode,
+      commandSignal: result.signal ?? null,
+      commandError: result.error ? String(result.error.message) : null,
+    });
+    return true;
+  });
+  // Refuse completely: no state write, and no outputs either, since a
+  // session-id emitted from state we just declined to own would be a lie.
+  if (!committed) {
     process.stderr.write('debug-evidence-action: run: recorded state changed while the wrapped command ran (another invocation now owns this output-dir); refusing to overwrite it.\n');
     return 3;
   }
-  writeState(outputDir, {
-    ...current,
-    sessionId,
-    sessionToken,
-    commandExitCode,
-    commandSignal: result.signal ?? null,
-    commandError: result.error ? String(result.error.message) : null,
-  });
   if (env.GITHUB_OUTPUT) {
     writeOutputs(env.GITHUB_OUTPUT, { 'command-exit-code': commandExitCode, 'session-id': sessionId });
   }
@@ -607,6 +693,7 @@ module.exports = {
   startSubcommand,
   teardownSubcommand,
   validateActionInputs,
+  withStateLock,
   writeOutputs,
   writeState,
 };

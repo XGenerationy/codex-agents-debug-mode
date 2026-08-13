@@ -3,7 +3,8 @@
 const assert = require('node:assert');
 const { EventEmitter } = require('node:events');
 const {
-  readFileSync, readdirSync, writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
+  closeSync, constants, existsSync, openSync, readFileSync, readdirSync, utimesSync,
+  writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
 } = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
@@ -22,6 +23,7 @@ const {
   startSubcommand,
   teardownSubcommand,
   validateActionInputs,
+  withStateLock,
   writeOutputs,
   writeState,
 } = require('./support');
@@ -655,27 +657,96 @@ test('run authenticates the port occupant and never sends the launch token to on
   assert.equal(commandRan, false);
 });
 
-test('run refuses to overwrite state that a concurrent invocation replaced while the wrapped command ran', async () => {
+test('state writes serialize: the invocation that lost the output-dir refuses, and the winner survives intact', async () => {
   const outputDir = makeTempDir();
   writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
   const githubOutput = path.join(outputDir, 'github_output');
   writeFileSync(githubOutput, '');
+  const lockPath = path.join(outputDir, 'action-state.lock');
   const usurper = { nonce: 'n2', pid: 2222, port: 9999, launchToken: 'y'.repeat(43), sessionName: 'other' };
+  const order = [];
   const code = await runSubcommand({
     inputs: baseInputs(),
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput },
     probeToken: async () => true,
     request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
-    // Stands in for a second invocation claiming this output-dir while we sat
-    // blocked in spawnSync: writing our pre-command snapshot back would strand
-    // the collector recorded in the newer state (Codex T4 #3).
-    spawnCommand: () => { writeState(outputDir, usurper); return { status: 0 }; },
+    // Invocation B claims the output-dir while A sits blocked in its wrapped
+    // command. B goes through the SAME locked API A's commit will use, so the
+    // two are ordered by the lock rather than by luck (Codex T4 r2).
+    spawnCommand: () => withStateLock(outputDir, () => {
+      // Mutual exclusion is real, not advisory: while B holds the lock, the
+      // exact open() A's critical section performs fails EEXIST. Without this
+      // the test would only re-prove the nonce compare, which is the
+      // check-then-act this round exists to replace.
+      assert.throws(
+        () => closeSync(openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)),
+        /EEXIST/,
+        'a second holder must not be able to enter while B is inside',
+      );
+      writeState(outputDir, usurper);
+      order.push('B committed');
+      return { status: 0 };
+    }),
   });
-  assert.equal(code, 3);
+  assert.deepEqual(order, ['B committed'], 'B ran its whole critical section before A opened its own');
+  assert.equal(code, 3, 'A re-read under the lock, saw a nonce it does not own, and stood down');
   assert.deepEqual(readState(outputDir), usurper, 'the newer invocation keeps its state, byte for byte');
   assert.equal(readFileSync(githubOutput, 'utf8'), '',
     'a session-id emitted from state we just declined to own would be a lie');
+  assert.ok(!existsSync(lockPath), 'both critical sections released the lock behind them');
+});
+
+test('a fresh lock held by another invocation makes the commit fail bounded, never hang', async () => {
+  const outputDir = makeTempDir();
+  const recorded = { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' };
+  writeState(outputDir, recorded);
+  const githubOutput = path.join(outputDir, 'github_output');
+  writeFileSync(githubOutput, '');
+  // Held and FRESH, so the stale sweep must not touch it: only the retry
+  // budget can end this wait.
+  const lockPath = path.join(outputDir, 'action-state.lock');
+  writeFileSync(lockPath, '');
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => runSubcommand({
+      inputs: baseInputs(),
+      outputDir,
+      env: { GITHUB_OUTPUT: githubOutput },
+      probeToken: async () => true,
+      request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
+      spawnCommand: () => ({ status: 0 }),
+    }),
+    /could not acquire the action state lock/,
+  );
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 5_000,
+    `the retry budget bounded the wait at ${elapsed}ms, nowhere near the 30s stale threshold`);
+  assert.deepEqual(readState(outputDir), recorded, 'the holder\'s state is left exactly as it was');
+  assert.equal(readFileSync(githubOutput, 'utf8'), '', 'a run that never committed emits no outputs');
+  assert.ok(existsSync(lockPath), 'a lock this invocation never acquired must not be released by it');
+});
+
+test('a lock older than the stale threshold is reaped so a crashed invocation cannot wedge the output-dir forever', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1, port: 1, launchToken: 'x'.repeat(43), sessionName: 'ci-debug' });
+  const lockPath = path.join(outputDir, 'action-state.lock');
+  writeFileSync(lockPath, '');
+  // Backdated past the threshold: indistinguishable from a runner that was
+  // cancelled or OOM-killed mid-write and never released.
+  const longAgo = new Date(Date.now() - 120_000);
+  utimesSync(lockPath, longAgo, longAgo);
+  const code = await runSubcommand({
+    inputs: baseInputs(),
+    outputDir,
+    env: {},
+    probeToken: async () => true,
+    request: async () => ({ status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } }),
+    spawnCommand: () => ({ status: 0 }),
+  });
+  assert.equal(code, 0);
+  assert.equal(readState(outputDir).sessionId, 'ci-debug-abc', 'the reaped lock did not block the commit');
+  assert.ok(!existsSync(lockPath), 'the replacement lock is released too, not leaked');
 });
 
 test('a job-level DEBUG_HYPOTHESIS_ID is never inherited when this action opened no hypothesis', async () => {
