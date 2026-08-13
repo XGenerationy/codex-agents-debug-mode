@@ -594,6 +594,27 @@ Files: `scripts/debug_report.js`, `scripts/debug_report.test.js`,
 Fix commit message:
 `fix(report): verbatim-safe msg, typed-line parity, announced render caps, tilde escaping, one-line stderr (Codex T2)`.
 
+**Fix round 2 (Codex re-review of `ab15cc0`):** usage-path newline residue ruled
+acceptable (caller-controlled, deliberately two lines, not evidence-derived). Two
+remaining findings, both accepted:
+
+1. **Report-level render bound (Important).** Per-field caps don't bound the document —
+   a collector-valid 2,000-hypothesis session measured 1,732,966 bytes of markdown.
+   Decisions: `HYPOTHESIS_RENDER_CAP = 100` hypothesis blocks in md/text, announced
+   (`…and N more hypotheses (full list in report.json)` — md footer italic, text plain;
+   no announce at exactly 100); additionally cap the ESCAPED id at `FIELD_CHAR_CAP`
+   (200) and the escaped status at 40 via the same `capped()` helper, in both human
+   renderers. Worst case is then ~100 KB, safely under GitHub's 1 MiB. `renderJson`
+   stays verbatim. Boundary tests at 100/101 hypotheses plus long-id/long-status pins.
+2. **Surrogate-safe truncation (Minor).** `capped()` must not split a surrogate pair:
+   after slicing, if the last code unit is an unpaired high surrogate (0xD800–0xDBFF),
+   drop it before appending `…` (result length cap−1 is acceptable in that case). Pin
+   with an emoji-boundary test (e.g. 101 × `😀` title: no replacement character in the
+   UTF-8 output, ends with a whole emoji then `…`).
+
+Fix commit message:
+`fix(report): report-level render bound + surrogate-safe truncation (Codex T2 r2)`.
+
 ---
 
 ### Task 3: Action foundation — boot shim, `start`, `teardown`, state, validation
