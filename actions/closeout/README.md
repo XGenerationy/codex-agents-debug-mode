@@ -744,9 +744,15 @@ they are roadmap items, not accepted risk:
   check, e.g. `preview`, which is never excluded) is independently re-derived
   from LIVE state on each call, so a stale self check-run carries no additional
   protection to lose. Making the `Closeout gate` check a required merge gate is
-  therefore safe; it can reach PASS on its own run (CodeRabbit PR7 #6X_pwH,
-  refined by #6YSx9w — landed before this bullet was corrected, CodeRabbit
-  #6YW9UF).
+  therefore safe (CodeRabbit PR7 #6X_pwH, refined by #6YSx9w — landed before
+  this bullet was corrected, CodeRabbit #6YW9UF). **Scope correction:** this
+  bullet previously went on to say the gate "can reach PASS on its own run".
+  That is true of THIS exclusion — an in-progress or stale self check-run in
+  `statusCheckRollup` does not by itself prevent PASS — but it is not true in
+  general, and must not be read as one: the separate `MERGEABLE/CLEAN`
+  admission requirement independently prevents PASS whenever the gate is one
+  of the PR's own checks. See the `MERGEABLE/CLEAN` bullet below, which
+  supersedes the unqualified claim.
 - ~~**A verdict recorded while a sibling check is still pending goes stale
   once that check settles.**~~ **The gate correctly RE-EVALUATES for
   same-repo PRs; the required PR check itself is NOT resolved
