@@ -7,8 +7,8 @@
 // carries the collector launch token and must never be uploaded.
 
 const {
-  appendFileSync, closeSync, constants, copyFileSync, lstatSync, mkdirSync, openSync,
-  readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync, writeSync,
+  appendFileSync, closeSync, constants, copyFileSync, fstatSync, lstatSync, mkdirSync,
+  openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
@@ -104,7 +104,17 @@ const validateActionInputs = ({
 //    destination entry rather than writing through it. Windows cannot always
 //    rename over an existing file, so EEXIST/EPERM there falls back to
 //    unlink-then-rename; Linux runners always take the atomic path.
-const writeState = (outputDir, state) => {
+//
+// The staged bytes are written with writeFileSync — which loops until the
+// whole payload lands — rather than a bare writeSync, whose return value is a
+// COUNT that a caller must honour: a legal short write (1 of 85 bytes, say)
+// silently renamed truncated JSON into place, so `start` reported success
+// while readState() returned null forever after and teardown, finding no
+// usable pid, orphaned the collector (Codex T3 r2). The staged size is then
+// verified against the payload before the commit, so the invariant holds for
+// ANY writer, not merely the one this code happens to call today: a committed
+// action-state.json always parses to the full state.
+const writeState = (outputDir, state, { writeAll = writeFileSync } = {}) => {
   mkdirSync(outputDir, { recursive: true });
   const target = path.join(outputDir, STATE_FILE);
   let existing = null;
@@ -117,10 +127,16 @@ const writeState = (outputDir, state) => {
     throw new Error(`refusing to write action state through a non-regular file (symlink, directory, or special): ${target}`);
   }
   const tempPath = path.join(outputDir, `.${STATE_FILE}.${process.pid}.${Date.now()}.tmp`);
+  const payload = `${JSON.stringify(state)}\n`;
+  const expectedBytes = Buffer.byteLength(payload, 'utf8');
   const fd = openSync(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   let staged = false;
   try {
-    writeSync(fd, `${JSON.stringify(state)}\n`, null, 'utf8');
+    writeAll(fd, payload);
+    const stagedBytes = fstatSync(fd).size;
+    if (stagedBytes !== expectedBytes) {
+      throw new Error(`refusing to commit a partially written action state (${stagedBytes} of ${expectedBytes} bytes): ${tempPath}`);
+    }
     staged = true;
   } finally {
     // Close before any cleanup: Windows refuses to unlink a file that is

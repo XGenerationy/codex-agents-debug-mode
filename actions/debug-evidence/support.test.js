@@ -2,7 +2,9 @@
 
 const assert = require('node:assert');
 const { EventEmitter } = require('node:events');
-const { readFileSync, readdirSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } = require('node:fs');
+const {
+  readFileSync, readdirSync, writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
+} = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
@@ -263,6 +265,27 @@ test('writeState commits over an existing state file and leaves no staging file 
   assert.equal(readState(outputDir).nonce, 'n2', 'the rename-over-existing path must commit the new state');
   assert.deepEqual(readdirSync(outputDir), ['action-state.json'],
     'the exclusively-created temp sibling must not survive the commit');
+});
+
+test('a short write can never commit a truncated, unparsable state file', () => {
+  const outputDir = makeTempDir();
+  const state = { nonce: 'n1', pid: 4242, port: 8787, launchToken: 'x'.repeat(43) };
+  // The seam is the writer. This one reproduces exactly what a bare
+  // writeSync() does when the OS accepts only part of the buffer and the
+  // caller ignores the returned count: one byte lands, the call returns, and
+  // the old code renamed that truncation into place — `start` then reported
+  // success while readState() returned null forever after, so teardown found
+  // no pid and orphaned a live collector (Codex T3 r2).
+  const shortWrite = (fd, text) => { writeSync(fd, Buffer.from(text, 'utf8').subarray(0, 1)); };
+  assert.throws(() => writeState(outputDir, state, { writeAll: shortWrite }), /partially written/);
+  assert.deepEqual(readdirSync(outputDir), [],
+    'a truncated staging file is never committed and never left behind');
+  assert.equal(readState(outputDir), null);
+  // The real writer completes the payload, so the commit does happen and the
+  // committed file parses back to the whole state.
+  writeState(outputDir, state);
+  assert.deepEqual(readState(outputDir), state);
+  assert.deepEqual(readdirSync(outputDir), ['action-state.json']);
 });
 
 test('writeState refuses to follow a symlink planted at the state path', {
