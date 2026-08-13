@@ -24,6 +24,12 @@ const EXCERPT_CAP = 20;
 // is already bounded by the collector's own per-session byte/event limits.
 const EXCERPT_CHAR_CAP = 500;
 const FIELD_CHAR_CAP = 200;
+const STATUS_CHAR_CAP = 40;
+// Per-FIELD caps alone do not bound the DOCUMENT: a collector-valid session
+// carrying 2,000 hypotheses rendered 1,732,966 bytes of markdown, well past
+// the 1 MiB a Step Summary accepts. Blocks beyond this cap are announced, not
+// dropped in silence, and report.json still carries every one of them.
+const HYPOTHESIS_RENDER_CAP = 100;
 const SESSION_FILE_PATTERN = /^debug-([A-Za-z0-9_-]+)\.log$/;
 
 // Same equals-only convention as debug_diff (space-form values rejected).
@@ -116,8 +122,6 @@ const buildReport = (entries, { sessionId = null } = {}) => {
 
 const renderJson = (report) => `${JSON.stringify(report, null, 2)}\n`;
 
-const statusOr = (status) => (status === null ? '—' : escapeMarkdownText(status));
-
 // Truncation is ANNOUNCED, never silent: an over-cap value keeps its first
 // cap-1 characters and ends in an ellipsis, so the result is exactly `cap`
 // characters and a reader can tell the tail was dropped. Applied to the
@@ -125,19 +129,38 @@ const statusOr = (status) => (status === null ? '—' : escapeMarkdownText(statu
 // length several times over, so capping afterwards is the only order that
 // actually bounds what the surface emits. Slicing escaped text is safe: it
 // only removes characters, and every structural character is already neutered.
-const capped = (value, cap) => (value.length > cap ? `${value.slice(0, cap - 1)}…` : value);
+const capped = (value, cap) => {
+  if (value.length <= cap) return value;
+  const head = value.slice(0, cap - 1);
+  // slice() counts UTF-16 code units, so a cut can land BETWEEN the halves of
+  // an astral character (an emoji in a log message). The orphaned high
+  // surrogate is not valid UTF-8 and would reach the reader as U+FFFD, so it
+  // is dropped — the result is cap-1 characters in that case, never garbage.
+  const lastUnit = head.charCodeAt(head.length - 1);
+  const whole = lastUnit >= 0xD800 && lastUnit <= 0xDBFF ? head.slice(0, -1) : head;
+  return `${whole}…`;
+};
+
+const statusOr = (status) => (
+  status === null ? '—' : capped(escapeMarkdownText(status), STATUS_CHAR_CAP)
+);
 
 const renderMarkdown = (report) => {
   const lines = ['## Debug evidence report', ''];
   const id = report.session.id === null ? '(file)' : escapeMarkdownText(report.session.id);
   lines.push(`_session ${id} · ${report.session.events} events · ${report.session.hypothesisLines} hypothesis lines_`);
   lines.push('');
-  for (const h of report.hypotheses) {
+  for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
     const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
-    lines.push(`**${escapeMarkdownText(h.id)}${title}**  ${statusOr(h.status)}`);
+    lines.push(`**${capped(escapeMarkdownText(h.id), FIELD_CHAR_CAP)}${title}**  ${statusOr(h.status)}`);
     lines.push('');
     lines.push(`- events ${h.events} · hypothesis lines ${h.lines}`);
     if (h.note) lines.push(`- note: "${capped(escapeMarkdownText(h.note), FIELD_CHAR_CAP)}"`);
+    lines.push('');
+  }
+  const hidden = Math.max(0, report.hypotheses.length - HYPOTHESIS_RENDER_CAP);
+  if (hidden > 0) {
+    lines.push(`_…and ${hidden} more hypotheses (full list in report.json)_`);
     lines.push('');
   }
   if (report.untaggedEvents > 0) {
@@ -160,11 +183,13 @@ const renderText = (report) => {
   lines.push(`Debug evidence report — session ${id}`);
   lines.push(`entries ${report.session.entries} · events ${report.session.events} · hypothesis lines ${report.session.hypothesisLines} · untagged ${report.untaggedEvents}`);
   lines.push('');
-  for (const h of report.hypotheses) {
+  for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
     const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
-    lines.push(`${escapeMarkdownText(h.id)}${title}  [${statusOr(h.status)}]  events ${h.events}`);
+    lines.push(`${capped(escapeMarkdownText(h.id), FIELD_CHAR_CAP)}${title}  [${statusOr(h.status)}]  events ${h.events}`);
     if (h.note) lines.push(`  note: ${capped(escapeMarkdownText(h.note), FIELD_CHAR_CAP)}`);
   }
+  const hidden = Math.max(0, report.hypotheses.length - HYPOTHESIS_RENDER_CAP);
+  if (hidden > 0) lines.push(`…and ${hidden} more hypotheses (full list in report.json)`);
   if (report.hypotheses.length > 0) lines.push('');
   if (report.excerpts.length > 0) {
     lines.push('last events:');

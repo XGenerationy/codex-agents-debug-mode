@@ -137,6 +137,66 @@ test('human surfaces cap a hypothesis title and note at 200 chars, both sides of
   assert.equal(JSON.parse(renderJson(overCap)).hypotheses[0].title.length, 201, 'JSON keeps the whole field');
 });
 
+const hypothesesReport = (count) => {
+  let text = '';
+  for (let i = 0; i < count; i += 1) {
+    text += line({
+      ts: '2026-08-13T10:00:01.000Z',
+      type: 'hypothesis',
+      hypothesisId: `H${String(i).padStart(4, '0')}`,
+      status: 'OPEN',
+    });
+  }
+  return buildReport(parseSessionText(text), { sessionId: null });
+};
+
+test('human surfaces render at most 100 hypothesis blocks and announce the remainder', () => {
+  const atCap = hypothesesReport(100);
+  assert.equal(atCap.hypotheses.length, 100);
+  assert.ok(!renderMarkdown(atCap).includes('more hypotheses'), 'no announce at exactly the cap');
+  assert.ok(!renderText(atCap).includes('more hypotheses'));
+  const overCap = hypothesesReport(101);
+  assert.equal(overCap.hypotheses.length, 101, 'the report object keeps every hypothesis');
+  const md = renderMarkdown(overCap);
+  assert.ok(md.includes('_…and 1 more hypotheses (full list in report.json)_'), 'italic md footer');
+  assert.equal((md.match(/^\*\*H\d{4}/gm) ?? []).length, 100, 'exactly 100 blocks rendered');
+  assert.ok(!md.includes('H0100'), 'the 101st block never reaches the human surface');
+  const txt = renderText(overCap);
+  assert.ok(txt.includes('…and 1 more hypotheses (full list in report.json)'), 'plain text footer');
+  assert.ok(!txt.includes('H0100'));
+  assert.equal(JSON.parse(renderJson(overCap)).hypotheses.length, 101, 'the machine surface keeps all 101');
+});
+
+test('human surfaces cap a hypothesis id at 200 chars and a status at 40', () => {
+  const report = buildReport(parseSessionText(line({
+    ts: '2026-08-13T10:00:01.000Z',
+    type: 'hypothesis',
+    hypothesisId: 'I'.repeat(201),
+    status: 'S'.repeat(41),
+  })), { sessionId: null });
+  const md = renderMarkdown(report);
+  assert.ok(md.includes(`**${'I'.repeat(199)}…**`), 'id capped at 200');
+  assert.ok(md.includes(`${'S'.repeat(39)}…`), 'status capped at 40');
+  assert.ok(!md.includes('I'.repeat(200)), 'no uncapped id survives');
+  assert.ok(!md.includes('S'.repeat(40)), 'no uncapped status survives');
+  const txt = renderText(report);
+  assert.ok(txt.includes(`${'I'.repeat(199)}…`));
+  assert.ok(txt.includes(`[${'S'.repeat(39)}…]`));
+  const parsed = JSON.parse(renderJson(report));
+  assert.equal(parsed.hypotheses[0].id.length, 201, 'JSON keeps the full id');
+  assert.equal(parsed.hypotheses[0].status.length, 41, 'JSON keeps the full status');
+});
+
+test('truncation never splits a surrogate pair — an emoji title ends on a whole emoji', () => {
+  const emoji = '\u{1F600}';
+  // 101 emoji = 202 UTF-16 code units, so the 200-unit cap cuts mid-pair.
+  const md = renderMarkdown(fieldsReport(emoji.repeat(101), null));
+  assert.ok(md.includes(`— ${emoji.repeat(99)}…**`), 'drops the orphaned half, keeps 99 whole emoji');
+  assert.ok(!md.includes('\uFFFD'), 'no replacement character in the string');
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(md), 'no unpaired high surrogate');
+  assert.ok(!Buffer.from(md, 'utf8').includes(Buffer.from('\uFFFD', 'utf8')), 'none in the UTF-8 bytes either');
+});
+
 test('renderJson is verbatim machine output with schema 1 and no escaping layer', () => {
   const report = buildReport(SESSION, { sessionId: 'demo-abc' });
   const parsed = JSON.parse(renderJson(report));
