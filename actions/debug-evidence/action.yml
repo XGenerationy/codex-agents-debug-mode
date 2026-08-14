@@ -69,9 +69,11 @@ inputs:
       'strict' (default): refuse to run the wrapped command at all unless this
       host positively establishes the in-process boundary this action's
       evidence depends on. That takes ALL of: Linux Yama ptrace_scope 3, a
-      non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo or
-      /usr/local/bin/sudo, and none of CAP_SYS_ADMIN, CAP_BPF, CAP_SYS_PTRACE
-      or CAP_SYS_MODULE held by this process. 'best-effort': run anyway, and
+      non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo,
+      /usr/local/bin/sudo or anywhere on the inherited PATH, and none of
+      CAP_SYS_ADMIN, CAP_BPF, CAP_SYS_PTRACE or CAP_SYS_MODULE held by this
+      process. An empty PATH counts as naming the working directory and denies;
+      only an unset PATH means the conventional locations alone. 'best-effort': run anyway, and
       treat the resulting evidence as a diagnostic claim rather than an
       authenticated one. Mode 3 is necessary, not sufficient — it forbids
       ptrace attachment, but a principal that can reach root rewrites another
@@ -96,7 +98,8 @@ inputs:
       step log, plus the artifact — all three together. This action verifies
       none of that correspondence: the comparison is external and manual, and
       is only meaningful between copies carrying the same invocation nonce,
-      which every copy of the record states.
+      which every copy of the record states. The nonce enforces nothing — it
+      lets a reader detect a mismatch that would otherwise be invisible.
     required: false
     default: "strict"
 
@@ -244,7 +247,9 @@ runs:
       # plus the artifact, and a reader compares the copies. THIS ACTION
       # VERIFIES NONE OF THAT CORRESPONDENCE (Codex T6 r10) — it is a human
       # comparison, and one that is only meaningful against the start record
-      # carrying the SAME invocation nonce, which every copy states. And the
+      # carrying the SAME invocation nonce, which every copy states. The nonce
+      # ENFORCES no pairing: it lets a reader detect a mismatch that would
+      # otherwise be invisible, which is worth having and is a weaker claim. And the
       # authenticated reading of the unit requires a successful STRICT
       # admission, not merely clear host readings: a best-effort run on a
       # spotless host is still diagnostic, because the regime it chose accepts

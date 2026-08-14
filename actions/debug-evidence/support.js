@@ -208,10 +208,25 @@ const SUDO_BINARY_NAME = 'sudo';
 // EMPTY entry as the working directory, and a relative entry resolves against a
 // cwd this code has no business reasoning about. Both are real places a sudo
 // could sit, so both deny.
+// A FIXED LITERAL, never the component itself (Codex T6 r11, ruling (b)). The
+// reason is worth reporting — "unknown" alone leaves a caller guessing why a
+// clean-looking host was refused — but PATH is attacker-influenced text, and
+// this value travels into the step log, the admission record and the uploaded
+// artifact. Interpolating it would hand a wrapped command a writable line in
+// the evidence about that command.
+const SUDO_PATH_UNRESOLVABLE = 'unknown: empty-or-relative PATH entry';
+
 const sudoCandidatePaths = (pathValue) => {
   const candidates = [...SUDO_CONVENTIONAL_PATHS];
   let unresolvable = false;
-  if (typeof pathValue === 'string' && pathValue !== '') {
+  // AN EXPLICITLY EMPTY PATH IS NOT AN ABSENT ONE (Codex T6 r11, Critical).
+  // POSIX and bash both read a NULL COMPONENT as the current working
+  // directory, and '' is a single null component — so PATH='' says "look in
+  // the cwd", which is a place a sudo can sit and this code cannot resolve.
+  // Skipping the parse for '' returned `absent` and GRANTED strict admission
+  // on exactly that host. Only an ABSENT variable (undefined/null, i.e. not a
+  // string at all) means "conventional locations only".
+  if (typeof pathValue === 'string') {
     for (const entry of pathValue.split(':')) {
       if (!entry.startsWith('/')) {
         unresolvable = true;
@@ -246,22 +261,25 @@ const detectSudoBinary = (options = {}) => {
   if (platform !== 'linux') return 'unknown';
   const { candidates, unresolvable } = sudoCandidatePaths(pathValue);
   const found = [];
-  let ambiguous = unresolvable;
+  let unreadable = false;
   for (const candidate of candidates) {
     let reading;
     try {
       reading = statPath(candidate);
     } catch {
-      ambiguous = true;
+      unreadable = true;
       continue;
     }
     if (reading === 'present') found.push(candidate);
-    else if (reading !== 'absent') ambiguous = true;
+    else if (reading !== 'absent') unreadable = true;
   }
   // A named binary beats a shrug: both deny, and the caller gets the better
   // diagnostic.
   if (found.length > 0) return `present: ${found.join(', ')}`;
-  return ambiguous ? 'unknown' : 'absent';
+  // An unreadable candidate outranks an unresolvable entry only because it is
+  // the more specific failure; both deny, so the order costs nothing.
+  if (unreadable) return 'unknown';
+  return unresolvable ? SUDO_PATH_UNRESOLVABLE : 'absent';
 };
 
 const readOwnCapabilities = (options = {}) => {
@@ -304,7 +322,7 @@ const CAPABILITY_LIST = /^CAP_[A-Z0-9_]+(?:\+CAP_[A-Z0-9_]+)*$/;
 const ADMISSION_FIELDS = [
   { key: 'ptrace', label: 'same-UID ptrace policy', clear: 'unconditional', valid: (value) => PTRACE_VALUES.has(value) },
   { key: 'uid', label: 'effective uid', clear: 'non-root', valid: (value) => UID_VALUES.has(value) },
-  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => value === 'absent' || value === 'unknown' || SUDO_PRESENT.test(value) },
+  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => value === 'absent' || value === 'unknown' || value === SUDO_PATH_UNRESOLVABLE || SUDO_PRESENT.test(value) },
   { key: 'capabilities', label: 'privileged capabilities', clear: 'clear', valid: (value) => value === 'clear' || value === 'unknown' || CAPABILITY_LIST.test(value) },
 ];
 
@@ -396,30 +414,49 @@ const admissionCaveats = (admission, evidenceTrust, nonce) => {
     + ` evidence-trust=${regime}; in-process boundary=${established ? 'ESTABLISHED' : 'NOT established'};`
     + ` admission=${authenticated ? 'STRICT (authenticated)' : 'DIAGNOSTIC ONLY'};`
     + ` findings=${describeAdmission(admission)}.`,
-    'Checked: Yama ptrace mode, effective uid, sudo binary presence, and this process\'s own permitted/effective capabilities.'
-    + ' The sudo check covers the conventional absolute paths and every sudo candidate on the inherited PATH, lstat-ed and never executed;'
-    + ' any sudo binary at a conventional absolute path or anywhere on the inherited PATH denies strict admission,'
-    + ' because sudoers rules are command-specific and no probe of one command can establish the absence of a rule for another.'
-    + ' These are the escalation routes this action checks, not a proof that no route exists:'
+    // SPLIT, because a single caveat of this length did not survive being
+    // rendered (Codex T6 r11 #2). debug_report.js caps each rendered caveat at
+    // 500 characters, so the 676-character version reached report.md ending
+    // "These are the escala…" — deleting the limitation itself and leaving the
+    // human artifact reading STRONGER than the JSON and the step logs. The cap
+    // is right and stays; the text is what has to fit through it, so each
+    // statement below stands alone and is comfortably short.
+    'Checked: Yama ptrace mode, effective uid, sudo binary presence, and this process\'s own permitted/effective capabilities.',
+    'The sudo check covers the conventional absolute paths and every sudo candidate on the inherited PATH, lstat-ed and never executed.'
+    + ' Any sudo binary at a conventional absolute path or anywhere on the inherited PATH denies strict admission,'
+    + ' because sudoers rules are command-specific and no probe of one command can establish the absence of a rule for another.',
+    'These are the escalation routes this action checks, not a proof that no route exists:'
     + ' a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved.',
-    authenticated
-      ? 'The trust unit is this admission record, plus the matching digest from run\'s step log, plus the artifact — all three together, and none of them alone.'
+    // Each branch contributes SHORT entries rather than one long one. A single
+    // sentence per caveat is what keeps every statement whole once the renderer
+    // applies its per-caveat cap, and it is why this is a flat spread instead of
+    // a nested ternary returning one string.
+    ...(authenticated
+      ? ['The trust unit is this admission record, plus the matching digest from run\'s step log, plus the artifact — all three together, and none of them alone.']
       : established
-        ? `The host readings came back clear, but this run was NOT admitted under strict (evidence-trust=${regime}), so nothing here is authenticated:`
-          + ' the capture, its digest and this report are diagnostic claims only, because the regime that was selected accepts a wrapped command able to rewrite the process that produced them.'
-        : 'The in-process guarantees were NOT established on this host, so a same-user process may be able to attach to the collector or to the capturing step,'
-          + ' or to rewrite their memory without ptrace at all where it can reach root.'
-          + ' This run was NOT admitted under strict, and the capture, its digest and this report are diagnostic claims only;'
+        ? [
+          `The host readings came back clear, but this run was NOT admitted under strict (evidence-trust=${regime}), so nothing here is authenticated.`,
+          'The capture, its digest and this report are diagnostic claims only, because the regime that was selected accepts a wrapped command able to rewrite the process that produced them.',
+        ]
+        : [
+          'The in-process guarantees were NOT established on this host, so a same-user process may be able to attach to the collector or to the capturing step,'
+          + ' or to rewrite their memory without ptrace at all where it can reach root.',
+          'This run was NOT admitted under strict, and the capture, its digest and this report are diagnostic claims only;'
           + ' the copy of this record in start\'s own step log is the only one the wrapped command could not reach.',
+        ]),
     // THE LIMIT OF THE UNIT ITSELF (Codex T6 r10 #4). Naming three pieces
     // invites a reader to assume something checked that they belong together.
     // This action verifies none of that correspondence: the comparison is
     // external, manual, and only meaningful between copies carrying the SAME
     // invocation — which is why the nonce is on the first line of every copy.
-    // Binding them here would need `start` to hand `run` something unforgeable,
-    // which is the very problem the platform prerequisite exists to solve.
-    `This action verifies none of that correspondence. Compare the copies by hand, and only against the start record with the same invocation=${nonce ?? 'unrecorded'};`
-    + ' a digest paired with a different invocation\'s admission record proves nothing at all.',
+    // The nonce ENFORCES nothing: it lets a reader detect a mismatch that would
+    // otherwise be invisible, and that is the whole of its contribution (Codex
+    // T6 r11 #4). Binding the pieces here would need `start` to hand `run`
+    // something unforgeable, which is the very problem the platform
+    // prerequisite exists to solve.
+    `This action verifies none of that correspondence. Compare the copies by hand, and only against the start record with the same invocation=${nonce ?? 'unrecorded'}.`,
+    'A digest paired with a different invocation\'s admission record proves nothing at all.'
+    + ' The nonce does not enforce the pairing — nothing here does; it lets a reader detect a mismatch that would otherwise be invisible.',
   ];
 };
 
@@ -964,7 +1001,7 @@ const startSubcommand = async ({
     // The diagnostic has to leave the caller somewhere to go, so it names what
     // was found, why that is not a boundary, and both ways forward.
     if (inputs.evidenceTrust !== 'best-effort') {
-      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}). Strict admission requires ALL of: Linux Yama ptrace_scope 3, a non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo or /usr/local/bin/sudo, and none of CAP_SYS_ADMIN/CAP_BPF/CAP_SYS_PTRACE/CAP_SYS_MODULE in this process's own permitted or effective set. Mode 3 is necessary, not sufficient: it forbids classic same-UID ptrace attachment, but a command that can reach root rewrites another task's memory with a privileged BPF program (bpf_probe_write_user) or a kernel module without calling ptrace at all — and standard GitHub-hosted runners ship sudo with a passwordless rule, so hosted execution stays best-effort. Either run where the wrapped principal has no route to root, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
+      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}). Strict admission requires ALL of: Linux Yama ptrace_scope 3, a non-root effective uid, NO sudo binary at a conventional absolute path or anywhere on the inherited PATH (the inspection lstats /usr/bin/sudo, /bin/sudo, /usr/local/bin/sudo and every PATH candidate, and executes nothing), and none of CAP_SYS_ADMIN/CAP_BPF/CAP_SYS_PTRACE/CAP_SYS_MODULE in this process's own permitted or effective set. Mode 3 is necessary, not sufficient: it forbids classic same-UID ptrace attachment, but a command that can reach root rewrites another task's memory with a privileged BPF program (bpf_probe_write_user) or a kernel module without calling ptrace at all — and standard GitHub-hosted runners ship sudo with a passwordless rule, so hosted execution stays best-effort. Either run where the wrapped principal has no route to root, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
       return 3;
     }
     // Opted in. This copy of the qualification is the only one the wrapped

@@ -270,7 +270,14 @@ under a successful strict admission.)* **The trust regime depends on
   cannot be forged after the fact, the digest binds the bytes, and the artifact
   carries them. Duplicate or conflicting `evidence-sha256` lines invalidate the
   artifact; the `evidence-digest` output is a convenience, not the trust anchor.
-  Every copy of the record carries the checked-routes limitation. *(Added, round
+  Every copy of the record carries the checked-routes limitation — which
+  constrains how the record is WRITTEN, not only what it says *(added, round 11:
+  `debug_report.js` caps each rendered caveat at `EXCERPT_CHAR_CAP`, and a
+  676-character caveat reached `report.md` truncated at "These are the escala…",
+  deleting the limitation from the human surface while the JSON and the logs
+  still carried it. Each generated caveat is therefore one short statement, and
+  the guarantee is asserted against RENDERED Markdown rather than against the
+  caveat strings)*. *(Added, round
   10.)* The action verifies NONE of the correspondence between the three pieces:
   the comparison is external and manual, and is only meaningful between copies
   carrying the same invocation nonce — which every copy of the record states.
@@ -315,7 +322,14 @@ That is positively established only when:
   host where the wrapped command can become root. Any candidate present, or any
   candidate that cannot be evaluated, denies. Inspecting `PATH` without executing
   anything is fail-closed; what the round-9 ruling forbade was EXECUTING a
-  `PATH`-resolved binary and trusting its behaviour.)*
+  `PATH`-resolved binary and trusting its behaviour. TIGHTENED, round 11: an
+  explicitly EMPTY `PATH` is not an absent one — POSIX and bash read a null
+  component as the current working directory, so `PATH=""` denies exactly as
+  `":"` and `"/usr/bin:"` do. Only an ABSENT variable means "conventional
+  locations only". The unresolvable reading is reported as the fixed literal
+  `unknown: empty-or-relative PATH entry`; the raw component is attacker-
+  influenced text and is never interpolated into a diagnostic that reaches the
+  step log or the artifact.)*
 
 `ptrace_scope` 1 or 2 is NOT sufficient: both are bypassable by
 `CAP_SYS_PTRACE`. **Mode 3 alone is not sufficient either** *(corrected, Task 6

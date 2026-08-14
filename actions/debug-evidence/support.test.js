@@ -12,6 +12,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { escapeMarkdownText } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 
 const {
   canonicalResponderRecord,
@@ -552,12 +553,20 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
   for (const bad of [
     { ptrace: 'unconditional ' }, { ptrace: 'UNCONDITIONAL' }, { ptrace: true },
     { uid: 0 }, { uid: 'nonroot' }, { sudo: 'unavailable' }, { sudo: 'absent ' },
+    { sudo: 'unknown: some other reason' }, { sudo: 'unknown:' },
     { capabilities: '' }, { capabilities: 'clear!' }, { capabilities: ['clear'] },
   ]) {
     const record = { ...ADMITTED(), ...bad };
     assert.equal(admissionEstablished(record), false, `${JSON.stringify(bad)} is not a reading this code produced`);
     assert.ok(admissionBlockers(record).some((blocker) => /unreadable record/.test(blocker)),
       `${JSON.stringify(bad)} is reported as unreadable`);
+  }
+  // The two fixed unknown readings ARE part of the vocabulary — reporting them
+  // as "unreadable record" would lose the remediation hint they exist to give.
+  for (const reading of ['unknown', 'unknown: empty-or-relative PATH entry']) {
+    const record = { ...ADMITTED(), sudo: reading };
+    assert.equal(admissionEstablished(record), false, `${reading} denies`);
+    assert.deepEqual(admissionBlockers(record), [`sudo binary: ${reading}`], `${reading} is reported as itself`);
   }
   // Inherited properties are not readings either.
   assert.equal(admissionEstablished(Object.create({ ptrace: 'unconditional', uid: 'non-root', sudo: 'absent', capabilities: 'clear' })), false,
@@ -832,19 +841,48 @@ test('every probe denies strict when it cannot be evaluated', () => {
     'present: /opt/vendor/bin/sudo',
     'any PATH entry is a candidate',
   );
-  // A HOSTILE PATH CANNOT SHRINK THE CHECK. Empty, unset, stripped down to one
+  // A HOSTILE PATH CANNOT SHRINK THE CHECK. Unset, or stripped down to one
   // harmless directory — the conventional paths are checked regardless.
+  //
+  // ONLY AN ABSENT PATH means "conventional locations only". An explicitly
+  // EMPTY one does not (Codex T6 r11, Critical): POSIX and bash both read a
+  // NULL COMPONENT as the current working directory, and '' is a single null
+  // component — so PATH='' says "look in the cwd", a place a sudo can sit.
+  // The round-10 version of this table pinned '' as `absent`, which meant the
+  // suite was DEFENDING a false grant of strict admission.
   for (const [label, pathValue] of [
     ['unset', undefined],
-    ['empty', ''],
+    ['null', null],
     ['stripped', '/nowhere'],
     ['not a string', 42],
-    ['null', null],
   ]) {
     assert.equal(sudoAt({ '/usr/bin/sudo': 'present' }, { pathValue }), 'present: /usr/bin/sudo',
       `${label} PATH still checks the conventional locations`);
     assert.equal(sudoAt({}, { pathValue }), 'absent',
       `${label} PATH with nothing installed is still a clean reading`);
+  }
+  // THE NULL-COMPONENT TABLE. All three spellings of "this PATH names the
+  // working directory" answer identically, in one place, so a future edit
+  // cannot fix one and leave the others behind.
+  for (const [label, pathValue] of [
+    ['a wholly empty PATH', ''],
+    ['a lone separator', ':'],
+    ['a trailing separator', '/usr/bin:'],
+    ['a leading separator', ':/usr/bin'],
+    ['a doubled separator', '/usr/bin::/bin'],
+    ['a relative entry', 'relative/bin'],
+    ['a bare dot', '.'],
+  ]) {
+    assert.equal(sudoAt({}, { pathValue }), 'unknown: empty-or-relative PATH entry',
+      `${label} is an unchecked candidate, not a clean reading`);
+  }
+  // The reason is a FIXED LITERAL. The raw component is attacker-influenced
+  // text and never reaches a diagnostic — it would travel into the step log,
+  // the admission record and the artifact (ruling (b), Codex T6 r11).
+  for (const hostile of ['\n::CRITICAL::injected', 'a'.repeat(5000), '${IFS}', '../../etc']) {
+    const reading = sudoAt({}, { pathValue: hostile });
+    assert.equal(reading, 'unknown: empty-or-relative PATH entry', `${JSON.stringify(hostile.slice(0, 20))}: fixed reason`);
+    assert.equal(reading.includes(hostile), false, 'the raw component is never echoed');
   }
   // Both lists at once, each named once — a directory that repeats, or that is
   // also a conventional path, must not double-report.
@@ -855,14 +893,12 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // A trailing slash names the same directory.
   assert.equal(sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin///' }), 'present: /opt/bin/sudo');
   assert.equal(sudoAt({ '/sudo': 'present' }, { pathValue: '/' }), 'present: /sudo');
-  // An entry this code cannot resolve to a stable absolute path is a candidate
-  // it could not check. POSIX reads an EMPTY entry as the working directory,
-  // and a relative entry is resolved against a cwd that is not this code's to
-  // reason about — so both deny rather than being quietly skipped.
-  for (const pathValue of ['/usr/bin:', ':/usr/bin', '/usr/bin::/bin', 'relative/bin', '/usr/bin:relative/bin', '.']) {
-    assert.equal(sudoAt({}, { pathValue }), 'unknown',
-      `${JSON.stringify(pathValue)}: an unresolvable entry is an unchecked candidate`);
-  }
+  // (The unresolvable-entry cases live in the null-component table above, which
+  // is the single place all of them are pinned — the round-10 version of this
+  // loop asserted the bare 'unknown' and sat one table away from the '' case
+  // that disagreed with it, which is how the two drifted apart.)
+  assert.equal(sudoAt({}, { pathValue: '/usr/bin:relative/bin' }), 'unknown: empty-or-relative PATH entry',
+    'a mixed PATH is judged by its worst entry');
   // And an unstattable PATH candidate denies exactly like an unstattable
   // conventional one.
   assert.equal(sudoAt({ '/opt/bin/sudo': 'unreadable' }, { pathValue: '/opt/bin' }), 'unknown');
@@ -998,7 +1034,8 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
     // boundary, and both ways forward.
     assert.match(written, new RegExp(`same-UID ptrace policy: ${policy}`), `${policy}: names what it found`);
     assert.match(written, /refusing to run the wrapped command/);
-    assert.match(written, /NO sudo binary at \/usr\/bin\/sudo/, 'the sudo policy is stated as existence, not behaviour');
+    assert.match(written, /NO sudo binary at a conventional absolute path or anywhere on the inherited PATH/,
+      'the sudo policy is stated as existence over the whole inspection, not the old three-path rule');
     assert.match(written, /hosted execution stays best-effort/, 'the hosted-runner consequence is stated, not implied');
     assert.match(written, /bpf_probe_write_user/, 'and the non-ptrace route root opens (Codex T6 r8)');
     assert.match(written, /not a proof that no route exists/i, 'the check states its own limits');
@@ -1142,6 +1179,76 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
   const digestIndex = printed.findIndex((text) => text.startsWith('evidence-sha256'));
   assert.ok(digestIndex > 0, 'session.log still has a digest');
   assertQualifiedDigest(printed, digestIndex);
+});
+
+test('every security statement in the admission record survives Markdown rendering intact', async () => {
+  // ASSERTED ON THE RENDERED OUTPUT, NEVER ON THE INPUT (Codex T6 r11 #2).
+  // The record was correct in every copy the action produced and still reached
+  // report.md truncated: debug_report.js caps each rendered caveat at 500
+  // characters, and one generated caveat was 676 — so the human artifact ended
+  // "These are the escala…", silently deleting "not a proof that no route
+  // exists" and the examples of routes this action cannot see. report.md read
+  // STRONGER than report.json and the step logs, which is the exact inversion
+  // the caveat exists to prevent.
+  //
+  // Neither component was wrong on its own. A Task 2 render cap ate Task 6
+  // security text, and only a test that reads what a human is actually shown
+  // could see it — which is why every assertion below is against rendered
+  // Markdown, and why asserting the caveat strings themselves is what let this
+  // through in the first place.
+  const required = [
+    'not a proof that no route exists',
+    'a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved',
+    'every sudo candidate on the inherited PATH, lstat-ed and never executed',
+    'This action verifies none of that correspondence',
+    'Compare the copies by hand',
+  ];
+  // Both regimes, and both the longest and the shortest admission records: the
+  // denied record names four findings and is the one closest to any cap.
+  for (const [label, admission, evidenceTrust] of [
+    ['admitted', ADMITTED(), 'strict'],
+    ['clear but best-effort', ADMITTED(), 'best-effort'],
+    ['every route blocked', admissionOf({
+      ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
+    }), 'best-effort'],
+    ['an unresolvable PATH', admissionOf({ sudo: 'unknown: empty-or-relative PATH entry' }), 'best-effort'],
+  ]) {
+    const outputDir = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+      projectRoot: makeTempDir(), failOnCommandFailure: 'true', admission, evidenceTrust,
+    });
+    const code = await captureViaRun({
+      outputDir,
+      env: RUN_ENV,
+      readLive: collectorAnswer([{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }]),
+    });
+    assert.equal(code, 0, label);
+    const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
+    const markdown = readFileSync(path.join(evidenceDir, 'report.md'), 'utf8');
+    // NOTHING the renderer showed a human was cut short. The cap appends an
+    // ellipsis, so its presence on a caveat line is the truncation itself.
+    const caveatLines = markdown.split('\n').filter((line) => line.startsWith('> **Caveat:**'));
+    assert.ok(caveatLines.length > 0, `${label}: the record reached the report`);
+    for (const line of caveatLines) {
+      assert.equal(line.includes('…'), false, `${label}: a caveat was truncated: ${line.slice(-60)}`);
+    }
+    // And every statement that carries the limitation is present in full,
+    // compared through the renderer's own escaper so this is a test about
+    // SURVIVAL rather than about escaping.
+    for (const statement of required) {
+      assert.ok(markdown.includes(escapeMarkdownText(statement)),
+        `${label}: report.md must carry "${statement.slice(0, 40)}…"`);
+    }
+    // The plain-text surface is capped by the same helper, so it gets the same
+    // guarantee — a consumer reading the step log must not see less than one
+    // reading report.md.
+    const json = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    for (const caveat of json.caveats) {
+      assert.ok(escapeMarkdownText(caveat).length <= 500,
+        `${label}: a caveat is too long to render whole: ${caveat.length} chars`);
+    }
+  }
 });
 
 test('run stamps the rendered evidence with the platform caveat, and omits it only when the prerequisite is established', async () => {
@@ -4784,6 +4891,12 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
       required: /verifies none of that correspondence/i,
       forbidden: /the action (?:verifies|checks|confirms|proves) (?:that )?(?:the )?(?:copies|records|three pieces) match|correspondence is verified automatically/i,
+    },
+    {
+      what: 'that the nonce lets a reader detect a mismatch rather than preventing one',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /lets a reader detect (?:a|any) mismatch/i,
+      forbidden: /cannot accidentally be paired|cannot be paired with|prevents (?:a |any )?(?:cross-invocation|mismatched) pairing|makes (?:a |any )?mismatch impossible/i,
     },
     // Hosted execution stays best-effort, and the round-7 sysctl route is
     // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF
