@@ -365,11 +365,52 @@ const CAPABILITY_VALUES = (() => {
   }
   return values;
 })();
+// THE STRUCTURAL INVARIANT, stated once and enforced for every reading — not
+// re-derived per field (round-13 residual). The anchored vocabularies above
+// describe the readings that exist TODAY; three of the four were bounded by
+// luck of construction rather than by design, and nothing said so. A fifth
+// reading added tomorrow with an unbounded value AND a matching unbounded
+// vocabulary would reintroduce the class this cycle has already hit twice:
+// round 11's `unknown` reason and round 13's `present:` value, both of which
+// carried raw PATH bytes into the evidence.
+//
+// A reading is a string, at most 128 characters, with NO control characters at
+// all. Not merely no CR/LF: a NUL truncates C-side consumers, and an escape
+// sequence rewrites a terminal reading the step log. Today's widest reading is
+// sudo at 85, so 128 is generous headroom and still far too small to hold an
+// interpolated path.
+const READING_MAX_LENGTH = 128;
+const CONTROL_CHARACTER = /[\u0000-\u001F\u007F]/;
+const structurallyValid = (value) => typeof value === 'string'
+  && value.length <= READING_MAX_LENGTH
+  && !CONTROL_CHARACTER.test(value);
+
+// THE GATE, AND THE ORDERING IS ENFORCED BY REACHABILITY. The vocabulary
+// predicate is captured in this closure and is deliberately NOT a property of
+// the field it returns — so there is no path from a caller to the vocabulary
+// that skips the structural check. A future edit cannot consult one first by
+// accident, because it has nothing to consult: `read` is the only way in.
+//
+// It classifies rather than returning a boolean, because "this host failed the
+// check" and "our own probe returned something malformed" are different
+// problems with different fixes, and an operator has to be able to tell them
+// apart. It never throws, whatever it is handed.
+const admissionField = (key, label, clear, vocabulary) => ({
+  key,
+  label,
+  clear,
+  read: (value) => {
+    if (!structurallyValid(value)) return 'malformed';
+    if (!vocabulary(value)) return 'unrecognised';
+    return value === clear ? 'clear' : 'blocked';
+  },
+});
+
 const ADMISSION_FIELDS = [
-  { key: 'ptrace', label: 'same-UID ptrace policy', clear: 'unconditional', valid: (value) => PTRACE_VALUES.has(value) },
-  { key: 'uid', label: 'effective uid', clear: 'non-root', valid: (value) => UID_VALUES.has(value) },
-  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => SUDO_VALUES.has(value) || SUDO_PRESENT.test(value) },
-  { key: 'capabilities', label: 'privileged capabilities', clear: 'clear', valid: (value) => CAPABILITY_VALUES.has(value) },
+  admissionField('ptrace', 'same-UID ptrace policy', 'unconditional', (value) => PTRACE_VALUES.has(value)),
+  admissionField('uid', 'effective uid', 'non-root', (value) => UID_VALUES.has(value)),
+  admissionField('sudo', 'sudo binary', 'absent', (value) => SUDO_VALUES.has(value) || SUDO_PRESENT.test(value)),
+  admissionField('capabilities', 'privileged capabilities', 'clear', (value) => CAPABILITY_VALUES.has(value)),
 ];
 
 // DERIVED FROM THE READINGS, NEVER READ OFF THE RECORD (Codex T6 r9 #2). The
@@ -387,8 +428,20 @@ const admissionBlockers = (admission) => {
   return ADMISSION_FIELDS.flatMap((field) => {
     // hasOwn, so an inherited property cannot supply a reading.
     const value = Object.hasOwn(admission, field.key) ? admission[field.key] : undefined;
-    if (typeof value !== 'string' || !field.valid(value)) return [`${field.label}: unreadable record`];
-    return value === field.clear ? [] : [`${field.label}: ${value}`];
+    switch (field.read(value)) {
+      case 'clear':
+        return [];
+      // Both rejections deny and both name the field. They share the
+      // "unreadable record" stem because the consequence is identical, and
+      // differ in the parenthetical because the remedy is not: one is a host
+      // this action cannot read, the other is a value it did not produce.
+      case 'malformed':
+        return [`${field.label}: unreadable record (malformed reading — not a bounded single-line string)`];
+      case 'unrecognised':
+        return [`${field.label}: unreadable record (outside this action's vocabulary)`];
+      default:
+        return [`${field.label}: ${value}`];
+    }
   });
 };
 
@@ -2187,6 +2240,7 @@ module.exports = {
   admissionBlockers,
   admissionCaveats,
   admissionEstablished,
+  admissionField,
   defaultRenderReport,
   defaultSpawnCommand,
   defaultSpawnShim,

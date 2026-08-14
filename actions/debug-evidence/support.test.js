@@ -33,6 +33,7 @@ const {
   actionInputsFromEnv,
   admissionBlockers,
   admissionCaveats,
+  admissionField,
   admissionEstablished,
   evaluateAdmission,
   detectSudoBinary,
@@ -594,6 +595,9 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
     assert.equal(admissionEstablished(record), false, `${JSON.stringify(bad)} is not a reading this code produced`);
     assert.ok(admissionBlockers(record).some((blocker) => /unreadable record/.test(blocker)),
       `${JSON.stringify(bad)} is reported as unreadable`);
+    // ...and the reason is one of exactly two, never a bare "unreadable".
+    assert.ok(admissionBlockers(record).some((blocker) => /unreadable record \((?:malformed reading|outside this action's vocabulary)/.test(blocker)),
+      `${JSON.stringify(bad)} names why it was rejected`);
   }
   // The two fixed unknown readings ARE part of the vocabulary — reporting them
   // as "unreadable record" would lose the remediation hint they exist to give.
@@ -1233,6 +1237,69 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
 // passed while report.md was being truncated in production (Codex T6 r13).
 const LONG_DIRECTORY = `/opt/${'nested-vendor-directory/'.repeat(14)}bin`;
 const NEWLINE_DIRECTORY = '/tmp/evil\nFORGED-LINE';
+
+test('a reading is validated STRUCTURALLY before any vocabulary is consulted', () => {
+  // THE ENUMERATED DEFENCE BECOMES A STRUCTURAL ONE (round-13 residual).
+  // Three of the four readings were bounded by luck of construction, and the
+  // anchored vocabularies added in round 13 only describe the readings that
+  // exist TODAY. A fifth reading added tomorrow with an unbounded value AND a
+  // matching unbounded vocabulary would reintroduce the class, and the field
+  // sweep would only notice if someone remembered to extend it. This test
+  // drives exactly that: a SYNTHETIC field whose vocabulary accepts
+  // everything, which is the worst case a future edit can produce.
+  const consulted = [];
+  const permissive = admissionField('synthetic', 'synthetic reading', 'clear', (value) => {
+    consulted.push(value);
+    return true;
+  });
+  // The clean case still works, and the vocabulary IS consulted for it —
+  // otherwise this test would pass for the wrong reason.
+  assert.equal(permissive.read('clear'), 'clear');
+  assert.equal(permissive.read('something'), 'blocked');
+  assert.deepEqual(consulted, ['clear', 'something']);
+
+  // And the four rejections. Each must deny, and none may reach the
+  // vocabulary — which is the property that makes this a GATE rather than a
+  // lint running alongside one.
+  consulted.length = 0;
+  for (const [label, value] of [
+    ['9000 producer bytes', 'x'.repeat(9000)],
+    ['an embedded newline', 'clear\nFORGED-LINE'],
+    ['a NUL', 'clear\u0000injected'],
+    ['a non-string', { toString: () => 'clear' }],
+    ['a carriage return', 'clear\rFORGED'],
+    ['an escape sequence', 'clear\u001b[31m'],
+    ['a DEL', 'clear\u007f'],
+    ['a tab', 'clear\tsplit'],
+    ['one character over the bound', 'x'.repeat(129)],
+    ['undefined', undefined],
+    ['null', null],
+    ['a number', 0],
+  ]) {
+    assert.equal(permissive.read(value), 'malformed', `${label}: must be rejected structurally`);
+    assert.deepEqual(consulted, [], `${label}: the vocabulary must never see it`);
+  }
+  // The bound itself: 128 is generous headroom over today's widest reading
+  // (sudo, at 85) and still far too small for an interpolated path.
+  assert.equal(permissive.read('x'.repeat(128)), 'blocked', 'the bound is inclusive');
+
+  // A malformed reading DENIES, and says whose fault it is. "This host failed
+  // the check" and "our own probe returned something malformed" are different
+  // problems with different fixes, so they are different blockers.
+  const malformed = { ...ADMITTED(), capabilities: 'CAP_SYS_ADMIN\nFORGED-LINE' };
+  assert.equal(admissionEstablished(malformed), false, 'a malformed reading denies');
+  assert.deepEqual(admissionBlockers(malformed), [
+    'privileged capabilities: unreadable record (malformed reading — not a bounded single-line string)',
+  ]);
+  // Distinct from a well-formed value that is simply not in the vocabulary.
+  assert.deepEqual(admissionBlockers({ ...ADMITTED(), capabilities: 'CAP_MADE_UP' }), [
+    'privileged capabilities: unreadable record (outside this action\'s vocabulary)',
+  ]);
+  // Never throws, whatever it is handed.
+  for (const value of [Symbol('x'), 9007199254740993n, () => 'clear', new Error('x')]) {
+    assert.equal(admissionEstablished({ ...ADMITTED(), uid: value }), false);
+  }
+});
 
 test('no reading can carry producer bytes: every field is bounded and single-line', () => {
   // THE FIELD-LEVEL SWEEP (Codex T6 r13). "Bounded" was assumed for three
