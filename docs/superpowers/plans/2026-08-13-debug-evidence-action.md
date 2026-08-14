@@ -2120,6 +2120,59 @@ evidence verdicts are made in `run`.
 Fix commit message:
 `fix(action): unreachable-collector verdict decided in run, not deferred to finish (pre-empted Critical)`.
 
+#### Task 5 fix round 8 — Codex re-review decisions on r6+r7 (recorded before code moves)
+
+Codex on `8d65a63` + `4ac5aeb`: **both Critical verdict bypasses are closed**, and
+it independently verified the load-bearing platform property (a failed internal
+composite step remains a failure unless `continue-on-error` is set, which this
+design never sets). Rulings (a)–(d) below are final and feed T8. Important ×1:
+
+1. **`report` deletes authentic evidence on the renderer-failure paths (the
+   Important).** `report`'s entry cleanup equates `reportRendered !== true` with
+   "nothing captured" and unlinks all three staged files. But on either
+   renderer-failure class, `run` has ALREADY authenticated and staged
+   `session.log` and set `evidenceCopied: true` — that is r6 adaptation 5's
+   deliberate "real evidence a human can read" — leaving only
+   `reportRendered: false`. Because `report` runs before the upload step, it
+   destroys the authentic raw log before anyone can receive it. The r6 taxonomy
+   test missed this by asserting staging immediately after `run` and never
+   executing the publish step. Fix:
+   - When the nonce matches AND `evidenceCopied === true`, `report` PRESERVES
+     `session.log` and removes only the unavailable report surfaces
+     (`report.md`, `report.json`), skipping the summary append. Every other
+     entry path (absent state, foreign nonce, `evidenceCopied` false) keeps
+     today's clear-everything behaviour.
+   - New SEQUENCE test (the gap this exposes is a test-shape gap, not just a
+     code gap): renderer failure → `runSubcommand` → `reportSubcommand` →
+     assert `session.log` is still present and byte-identical for upload, and
+     that the two report surfaces are gone. Mutation: restoring the
+     unconditional three-file unlink turns it red.
+   - Sweep the other staging assertions for the same shape: any test that
+     asserts "staged after `run`" for a class whose `report` step then runs must
+     assert through `report`, not before it.
+2. **T8 documentation wordings — Codex's rulings, to be used close to verbatim.**
+   - (a) Staging window ACCEPTABLE with precise wording: *the artifact is not
+     self-authenticating*. Validate it against the trusted run-process digest in
+     the step log; **duplicate or conflicting `evidence-sha256` lines invalidate
+     the artifact**; treat the `evidence-digest` output as convenience, not the
+     trust anchor.
+   - (b) Step Summary forgeability ACCEPTABLE, but "the artifact is evidence" is
+     TOO STRONG: neither the Step Summary nor the artifact alone is
+     authoritative — *the artifact plus the matching trusted digest* is.
+   - (c) KEEP the evidence-asserting outputs on a red `run`: they truthfully
+     describe staged partial evidence. Document that **output existence does not
+     imply authenticity**; the failed `run` outcome is the provenance signal.
+   - (d) KEEP `finish`'s belts: they still catch ordinary corruption and wiring
+     failures, their comments correctly admit they are not security boundaries,
+     and `finish` remains necessary for the command-exit mirror.
+
+Spec amendment (same commit): the artifact section's detectability paragraph
+adopts wordings (a)/(b) — artifact + matching trusted digest is the unit of
+trust; duplicate/conflicting digest lines invalidate.
+
+Fix commit message:
+`fix(action): preserve authenticated session.log through report's renderer-failure cleanup (Codex T5 r8)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`

@@ -190,7 +190,14 @@ renders, and SHA-256-hashes all three payloads from one immutable in-memory buff
 staged files only afterwards as write-only sinks, and prints the digests to the step
 log (immutable once streamed) and the `evidence-digest` output — the recorded digests
 always describe the intended bytes, so any post-staging swap is detectable against
-the artifact.
+the artifact. *(Wording fixed, Task 5 round 8.)* The artifact is therefore NOT
+self-authenticating, and neither the artifact nor the Step Summary alone is
+authoritative: the unit of trust is **the artifact plus the matching digest from
+the trusted `run` process's step log**. Duplicate or conflicting `evidence-sha256`
+lines invalidate the artifact; the `evidence-digest` output is a convenience, not
+the trust anchor. Output existence likewise does not imply authenticity — a red
+`run` still publishes outputs describing labeled partial evidence, and the failed
+`run` outcome is the provenance signal.
 
 ## Security invariants
 
