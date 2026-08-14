@@ -39,17 +39,22 @@ const {
 
 const makeTempDir = () => mkdtempSync(path.join(os.tmpdir(), 'debug-evidence-action-'));
 
-// The environment the runner hands every step AFTER `start`: `start` wrote
-// this invocation's nonce to GITHUB_ENV, and the runner injects it into each
-// later step's process environment by itself. A test that calls one of those
-// subcommands directly has to stand in for that hand-off — exactly as
-// `runEnv` stands in for the verification-key one — because `report` fails
+// The environment the runner hands every step AFTER `start`: `start` emits
+// this invocation's nonce as the step output `invocation-nonce`, and
+// action.yml maps it into run/report/teardown/finish. A test that calls one of
+// those subcommands directly has to stand in for that hand-off — exactly as
+// `runEnv` stands in for the verification-key one — because all four fail
 // closed without it. Read from the state file rather than passed in, so the
 // tests that let `start` mint its own random nonce work unchanged.
 const invocationEnv = (outputDir, extra = {}) => ({
   DEBUG_ACTION_INVOCATION_NONCE: readState(outputDir)?.nonce,
   ...extra,
 });
+
+// The staged evidence child is INVOCATION-SCOPED (Codex T6 r1 #3), so naming
+// it takes the same identity the production steps are handed. Resolved from
+// the committed state so a test never has to hard-code the directory layout.
+const evidenceDirOf = (outputDir) => resolveEvidenceDir(outputDir, readState(outputDir).nonce);
 
 const getFreePort = () => new Promise((resolve) => {
   const srv = net.createServer();
@@ -100,7 +105,11 @@ const unreachableRead = async () => { throw new Error('live_read_connect_failed:
 // file from substituting a keypair of its own.
 const RESPONDER_KEYS = generateKeyPairSync('ed25519');
 const VERIFY_KEY_B64 = RESPONDER_KEYS.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
-const RUN_ENV = { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: VERIFY_KEY_B64 };
+// The two values action.yml wires into the RUN step, both from `start`'s step
+// outputs: the verification key and this invocation's identity. `run` needs
+// the second before it can name its own staging directory, so a fixture state
+// written with `nonce: 'n1'` and this env are one matched pair.
+const RUN_ENV = { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: VERIFY_KEY_B64, DEBUG_ACTION_INVOCATION_NONCE: 'n1' };
 
 // A keypair the attacker generated for itself. Generating one is free, which
 // is exactly why the verification key's INTEGRITY — not its secrecy — is what
@@ -231,12 +240,14 @@ test('start boots a real collector, mints the session, and records state that ca
   const projectRoot = makeTempDir();
   const port = await getFreePort();
   const githubEnv = path.join(outputDir, 'github_env');
+  const githubOutput = path.join(outputDir, 'github_output');
   writeFileSync(githubEnv, '');
+  writeFileSync(githubOutput, '');
   const code = await startSubcommand({
     inputs: baseInputs({ port: String(port) }),
     outputDir,
     projectRoot,
-    env: { GITHUB_ENV: githubEnv },
+    env: { GITHUB_ENV: githubEnv, GITHUB_OUTPUT: githubOutput },
   });
   assert.equal(code, 0);
   const state = readState(outputDir);
@@ -252,22 +263,107 @@ test('start boots a real collector, mints the session, and records state that ca
     assert.ok(typeof state.sessionToken === 'string' && state.sessionToken.length >= 32);
     assert.equal(readFileSync(path.join(outputDir, 'action-state.json'), 'utf8').includes('launchToken'), false,
       'not under any other name either');
-    assert.ok(!path.dirname(path.join(outputDir, 'action-state.json')).includes(resolveEvidenceDir(outputDir)),
+    assert.ok(!path.dirname(path.join(outputDir, 'action-state.json')).includes(evidenceDirOf(outputDir)),
       'state lives at the output-dir root, not inside the evidence child');
-    const envFile = readFileSync(githubEnv, 'utf8');
-    assert.match(envFile, /DEBUG_ACTION_INVOCATION_NONCE=/);
-    assert.ok(!envFile.includes(state.sessionToken), 'no credential enters GITHUB_ENV');
+    // GITHUB_ENV is a JOB-GLOBAL channel: whatever is written there persists
+    // to every later step of the job, including the steps of a LATER
+    // invocation of this action. Invocation identity therefore travels as a
+    // step output (below), and this file is left completely untouched
+    // (Codex T6 r1 #1).
+    assert.equal(readFileSync(githubEnv, 'utf8'), '', 'start writes nothing job-global');
+    const emitted = readFileSync(githubOutput, 'utf8');
+    assert.match(emitted, /^invocation-nonce=[A-Za-z0-9_-]{8,64}$/m, 'the nonce travels as a step output');
+    assert.equal(emitted.includes(`invocation-nonce=${state.nonce}`), true, 'and it is the nonce the state records');
+    assert.ok(!emitted.includes(state.sessionToken), 'no credential enters a step output');
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
+});
+
+// Ordering is the property, not merely presence. `start` validates its inputs
+// and resolves output-dir containment before it can do anything useful, and an
+// identity emitted after those checks would leave the later steps of a FAILED
+// start with no identity of their own. On the job-global GITHUB_ENV channel
+// those steps then inherit a PREVIOUS invocation's nonce (env-file values
+// persist to every later step of the job and do appear in the expression `env`
+// context — the runner source settles it), find that invocation's state in a
+// shared output-dir, declare it owned, and let the always() upload publish its
+// evidence under this run's artifact name (Codex T6 r1 #1). Emitting first, and
+// only as a step output, closes both halves.
+test('start emits the invocation nonce as its first action, before any check that can fail', async () => {
+  const outputDir = makeTempDir();
+  const githubOutput = path.join(outputDir, 'github_output');
+  const githubEnv = path.join(outputDir, 'github_env');
+  writeFileSync(githubOutput, '');
+  writeFileSync(githubEnv, '');
+  const refuse = (label) => () => { throw new Error(`a refused start must never ${label}`); };
+  await assert.rejects(startSubcommand({
+    inputs: baseInputs({ runCommand: '' }),
+    outputDir,
+    env: { GITHUB_OUTPUT: githubOutput, GITHUB_ENV: githubEnv },
+    spawnShim: refuse('spawn a collector'),
+  }), /invalid inputs/);
+  const emitted = readFileSync(githubOutput, 'utf8');
+  assert.match(emitted, /^invocation-nonce=[A-Za-z0-9_-]{8,64}$/m,
+    'a start that goes on to fail has still published an identity for its own later steps');
+  assert.equal(readFileSync(githubEnv, 'utf8'), '',
+    'and nothing is written to the job-global channel, on any path');
+  // Distinct per invocation by construction, which is what makes a later
+  // invocation unable to answer for an earlier one.
+  const second = makeTempDir();
+  const secondOutput = path.join(second, 'github_output');
+  writeFileSync(secondOutput, '');
+  await assert.rejects(startSubcommand({
+    inputs: baseInputs({ runCommand: '' }),
+    outputDir: second,
+    env: { GITHUB_OUTPUT: secondOutput },
+    spawnShim: refuse('spawn a collector'),
+  }), /invalid inputs/);
+  assert.notEqual(readFileSync(secondOutput, 'utf8'), emitted, 'a second invocation mints its own');
 });
 
 test('teardown is idempotent: dead pid is success, missing state is success, nonce mismatch is 3', async () => {
   const outputDir = makeTempDir();
-  assert.equal(teardownSubcommand({ outputDir, env: {} }), 0, 'missing state = start never ran = success');
+  // An identity with no state behind it: `start` emitted its nonce and then
+  // failed before writing anything, so there is nothing to tear down.
+  assert.equal(teardownSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0, 'missing state = start never ran = success');
   writeState(outputDir, { nonce: 'n1', pid: 999999999 });
-  assert.equal(teardownSubcommand({ outputDir, env: {} }), 0, 'ESRCH on a dead pid is success');
+  assert.equal(teardownSubcommand({ outputDir, env: invocationEnv(outputDir) }), 0, 'ESRCH on a dead pid is success');
   assert.equal(teardownSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3, 'nonce mismatch refuses to trust state');
+});
+
+// A fresh job whose `start` fails early hands teardown NO nonce. Pointed at a
+// REUSED custom output-dir, the lenient check let it read that directory's
+// stale state and kill(state.pid) — a pid belonging to another invocation, or
+// recycled by the OS to an unrelated process on a self-hosted runner. A
+// missing identity must mean "do not read, do not act" (Codex T6 r1 #2).
+// `finish` takes the same posture: it reads the same state file, and an exit
+// code it cannot show belongs to this invocation is not this job's verdict.
+test('teardown and finish refuse to touch recorded state when no invocation nonce reached the step', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 4242, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    commandExitCode: 7, collectorAlive: true, evidenceCopied: true, evidenceAuthentic: true,
+    reportRendered: true, failOnCommandFailure: 'true',
+  });
+  const killed = [];
+  const { written } = await captureStderr(() => {
+    assert.equal(teardownSubcommand({ outputDir, env: {}, kill: (pid) => killed.push(pid) }), 3);
+    assert.deepEqual(killed, [], 'a pid out of unidentifiable state is never signalled');
+    // 3 rather than the 7 the state records: a stranger's exit code is not
+    // this job's verdict.
+    assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
+  });
+  assert.match(written, /teardown: this step received no usable invocation nonce/);
+  assert.match(written, /finish: this step received no usable invocation nonce/);
+  // And with the identity present, both act on exactly the same state.
+  assert.equal(teardownSubcommand({
+    outputDir,
+    env: invocationEnv(outputDir),
+    kill: (pid) => killed.push(pid),
+  }), 0);
+  assert.deepEqual(killed, [4242]);
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 7);
 });
 
 test('a shim that never reports startup times out AND is killed, not left running', async () => {
@@ -481,7 +577,7 @@ test('the shim splits redact-names on whitespace as well as commas, so "A B,C" i
     }
     assert.match(line, /\[REDACTED\]/);
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
 });
 
@@ -511,13 +607,25 @@ const startReal = async (overrides = {}) => {
   assert.ok(keyLine, 'start must publish the verification key as a step output');
   const collectorVerifyKey = keyLine.slice('collector-verify-key='.length);
   assert.ok(collectorVerifyKey.length >= 32);
+  // Both step outputs travel together, exactly as action.yml maps them: the
+  // verification key and the invocation identity `run` needs to name its own
+  // staging child. The nonce is read back out of the step-output file for the
+  // same reason the key is — nothing in these tests may take a shortcut
+  // through state or the filesystem.
+  const nonceLine = emitted.split('\n').find((line) => line.startsWith('invocation-nonce='));
+  assert.ok(nonceLine, 'start must publish the invocation nonce as a step output');
+  const invocationNonce = nonceLine.slice('invocation-nonce='.length);
   return {
     outputDir,
     projectRoot,
     port,
     inputs,
     collectorVerifyKey,
-    runEnv: { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: collectorVerifyKey },
+    invocationNonce,
+    runEnv: {
+      DEBUG_ACTION_COLLECTOR_VERIFY_KEY: collectorVerifyKey,
+      DEBUG_ACTION_INVOCATION_NONCE: invocationNonce,
+    },
   };
 };
 
@@ -551,7 +659,7 @@ test('run injects exactly the documented env from the session start minted, reco
     assert.match(outputs, new RegExp(`session-id=${state.sessionId}`));
     assert.ok(!outputs.includes(state.sessionToken), 'session token never enters GITHUB_OUTPUT');
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
 });
 
@@ -573,7 +681,7 @@ test('start posts one OPEN hypothesis line and run injects DEBUG_HYPOTHESIS_ID �
     assert.equal(code, 0);
     assert.equal(readState(outputDir).commandExitCode, 0);
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
 });
 
@@ -846,7 +954,7 @@ test('state writes serialize: the invocation that lost the output-dir refuses, a
   const code = await runSubcommand({
     inputs: baseInputs(),
     outputDir,
-    env: { GITHUB_OUTPUT: githubOutput },
+    env: { ...RUN_ENV, GITHUB_OUTPUT: githubOutput },
     // Invocation B claims the output-dir while A sits blocked in its wrapped
     // command. B goes through the SAME locked API A's commit will use, so the
     // two are ordered by the lock rather than by luck (Codex T4 r2).
@@ -891,7 +999,7 @@ test('a fresh lock held by another invocation makes the commit fail bounded, nev
     () => runSubcommand({
       inputs: baseInputs(),
       outputDir,
-      env: { GITHUB_OUTPUT: githubOutput },
+      env: { ...RUN_ENV, GITHUB_OUTPUT: githubOutput },
       spawnCommand: () => ({ status: 0 }),
     }),
     /could not acquire the action state lock/,
@@ -941,7 +1049,7 @@ test('a job-level DEBUG_HYPOTHESIS_ID is never inherited when this action opened
     assert.equal(readState(outputDir).commandExitCode, 0,
       'the wrapped command must not see a hypothesis id this action never posted');
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
 });
 
@@ -1093,7 +1201,7 @@ test('run captures the session from the collector, renders md+json, emits output
       outputDir: context.outputDir,
       env: invocationEnv(context.outputDir, { GITHUB_STEP_SUMMARY: context.stepSummary }),
     }), 0);
-    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const evidenceDir = evidenceDirOf(context.outputDir);
     const state = readState(context.outputDir);
     const copied = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
     assert.ok(copied.includes('demo event'));
@@ -1144,7 +1252,7 @@ test('run captures the session from the collector, renders md+json, emits output
     assert.ok(state.sessionId.startsWith('ci-debug-'), 'run\'s session id survives report\'s commit');
     assert.equal(state.commandExitCode, 1, 'and so does the exit code it recorded');
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1199,11 +1307,11 @@ test('a wrapped command that forges its own session log cannot get the forgery i
     assert.equal(state.evidenceCopied, false);
     assert.equal(state.evidenceAuthentic, false);
     assert.equal(state.reportRendered, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')),
+    assert.ok(!existsSync(path.join(evidenceDirOf(context.outputDir), 'session.log')),
       'a pathname copy would have staged the forged file right here, and rendered its verdict');
-    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3);
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 3);
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1233,9 +1341,9 @@ test('a same-length in-place rewrite of the session log is caught end to end, no
     const state = readState(context.outputDir);
     assert.equal(state.collectorAlive, false, 'the read never completed, so nothing authoritative was served');
     assert.equal(state.evidenceCopied, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')));
+    assert.ok(!existsSync(path.join(evidenceDirOf(context.outputDir), 'session.log')));
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1259,13 +1367,13 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
     // Through the publish step: "still worth a human's eyes" is a claim about
     // what reaches the artifact, not about what run wrote (Codex T5 r8).
     assert.equal(reportSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0);
-    const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
+    const staged = readFileSync(path.join(evidenceDirOf(context.outputDir), 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'),
       'this really is the forged file — labeling it, not hiding it, is what makes this safe');
-    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3,
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 3,
       'forged bytes can be inspected but can never ride a green run');
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1374,7 +1482,7 @@ test('a wrapped command that kills the collector, forges the log and poisons the
     // Through the publish step. The detached child may already have flipped
     // `reportRendered`, but this class rendered fine, so the flag is true
     // either way and report preserves what run staged regardless.
-    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const evidenceDir = evidenceDirOf(context.outputDir);
     assert.equal(reportSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0);
     const staged = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'), 'the forgery is staged for a human to read, not hidden');
@@ -1389,12 +1497,12 @@ test('a wrapped command that kills the collector, forges the log and poisons the
       'the detached child rewrote the state after run committed');
     const poisoned = readState(context.outputDir);
     assert.equal(poisoned.evidenceAuthentic, true, 'the state now claims the forgery is authenticated');
-    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 0,
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0,
       'finish, reading that record, is fooled completely — which is exactly why it is no longer the one deciding');
     // The job is red regardless, because run already failed and a failed
     // composite step cannot be un-failed.
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1423,13 +1531,13 @@ test('a collector that merely died still stages the labeled partial log, still f
   assert.equal(state.evidenceAuthentic, false, 'the label is a reader\'s aid, never a gate');
   assert.equal(state.reportRendered, true, 'and it stays truthful about what was actually produced');
   assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
-  assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8')
+  assert.ok(readFileSync(path.join(evidenceDirOf(outputDir), 'session.log'), 'utf8')
     .includes('the last thing the collector wrote down'),
     'and it is still there after the publish step, for the upload step to take');
   assert.match(written, /no collector on port 1 would serve session ci-debug-abc/);
   assert.match(written, /UNAUTHENTICATED partial evidence and failing this step/,
     'the step log says both what was staged and what it cost');
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'finish agrees; the job was already red');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'finish agrees; the job was already red');
 });
 
 test('the wrapped command is handed no DEBUG_ACTION_* wiring and none of the runner\'s command files', async () => {
@@ -1540,13 +1648,13 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
     const after = readState(context.outputDir);
     assert.equal(after.collectorAlive, true);
     assert.equal(after.evidenceAuthentic, true);
-    const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
+    const staged = readFileSync(path.join(evidenceDirOf(context.outputDir), 'session.log'), 'utf8');
     const hypothesisLines = staged.split('\n').filter((line) => line.includes('"type":"hypothesis"'));
     assert.equal(hypothesisLines.length, 1, 'exactly the one line start posted');
     assert.equal(JSON.parse(hypothesisLines[0]).status, 'OPEN');
-    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 0);
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0);
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -1627,7 +1735,10 @@ test('run stages evidence outside the lock but refuses to commit over a newer in
   });
   assert.equal(code, 3, 'the nonce compare under the lock saw state it does not own');
   assert.deepEqual(readState(outputDir), usurper, 'the newer invocation keeps its state, byte for byte');
-  const evidenceDir = resolveEvidenceDir(outputDir);
+  // Resolved from the nonce THIS invocation ran under: the usurper's state is
+  // in place by now, and a staging child is named for the invocation that
+  // staged into it, not for whoever owns the output-dir afterwards.
+  const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
   assert.ok(existsSync(path.join(evidenceDir, 'report.md')),
     'the render already happened — it runs outside the lock, so ownership is decided after it');
   assert.equal(readFileSync(githubOutput, 'utf8'), '',
@@ -1664,9 +1775,9 @@ test('run records an unauthenticated collector without inventing evidence, and f
   assert.equal(state.evidenceAuthentic, false, 'and it is labeled as unverified in the state file');
   assert.equal(state.reportRendered, true);
   assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
-  assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8').includes('last words'),
+  assert.ok(readFileSync(path.join(evidenceDirOf(outputDir), 'session.log'), 'utf8').includes('last words'),
     'and it survives the publish step, which is the only way the upload step can receive it');
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3,
     'finish agrees, as a belt over a job that is already red');
 });
 
@@ -1695,7 +1806,16 @@ test('run returns 3 when there is nothing to stage at all — evidence is the pr
   // is a fact this process observed. What is withheld is every output that
   // would ASSERT evidence: no path, no digest, no event count.
   const published = readFileSync(githubOutput, 'utf8');
-  assert.equal(published, 'command-exit-code=0\nsession-id=ci-debug-missing\n');
+  assert.equal(published, [
+    'command-exit-code=0',
+    'session-id=ci-debug-missing',
+    // Where it would have staged, and the empty list that closes the upload
+    // gate: the upload step runs on always() and needs this step to tell it
+    // there is nothing to take (Codex T6 r1 #3).
+    `evidence-dir=${resolveEvidenceDir(outputDir, 'n1')}`,
+    'evidence-staged=',
+    '',
+  ].join('\n'));
   for (const name of ['report-path', 'evidence-digest', 'event-count']) {
     assert.equal(published.includes(name), false, `${name} is not emitted for a report that does not exist`);
   }
@@ -1724,7 +1844,7 @@ test('the staged log is the collector\'s answer, not whatever is on disk under t
     readLive: async (options) => { reads.push(options); return answer(options); },
   });
   assert.equal(code, 0);
-  const staged = readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8');
+  const staged = readFileSync(path.join(evidenceDirOf(outputDir), 'session.log'), 'utf8');
   assert.equal(staged, served.map((line) => `${JSON.stringify(line)}\n`).join(''),
     'the bytes the proof covers are the bytes staged, verbatim and in order');
   assert.ok(!staged.includes('FORGED disk line'), 'the file at the well-known path was never opened');
@@ -1765,9 +1885,9 @@ test('a live read the collector refuses is an evidence-integrity failure, never 
   assert.equal(state.collectorAlive, false, 'a refused read is not an authenticated read');
   assert.equal(state.evidenceCopied, false);
   assert.equal(state.evidenceAuthentic, false);
-  assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+  assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')),
     'the readable file at the well-known path is not a fallback');
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3);
 });
 
 test('every way a captured hypothesis set can deviate from the one this action posted is refused', async () => {
@@ -1800,8 +1920,8 @@ test('every way a captured hypothesis set can deviate from the one this action p
     });
     assert.equal(code, 3, label);
     assert.equal(readState(outputDir).evidenceCopied, false, label);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')), `${label}: nothing is staged`);
-    assert.equal(finishSubcommand({ outputDir, env: {} }), 3, label);
+    assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')), `${label}: nothing is staged`);
+    assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, label);
   }
   // And the shape the action DID post is accepted, events and all — a check
   // that refused everything would pass the cases above while breaking capture.
@@ -1848,11 +1968,13 @@ test('an entry the hypothesis check cannot inspect is refused rather than skippe
 });
 
 test('staging is invocation-scoped on EVERY entry path, including the ones that return before capture', async () => {
-  // What a previous invocation left behind. The upload step enumerates these
-  // three names, so leaving any of them is shipping last run's evidence under
-  // this run's artifact name.
-  const plantStale = (outputDir) => {
-    const evidenceDir = resolveEvidenceDir(outputDir);
+  // Files sitting in the staging slots this invocation is about to use. Those
+  // slots are invocation-scoped now, so this is not a previous run's directory
+  // any more — it is a plant in THIS run's, which is the harder case: the
+  // upload step is told to take exactly this directory, so anything left in it
+  // ships as this run's evidence.
+  const plantStale = (outputDir, nonce) => {
+    const evidenceDir = resolveEvidenceDir(outputDir, nonce);
     mkdirSync(evidenceDir, { recursive: true });
     for (const [name, body] of [['session.log', '{"msg":"last run"}\n'], ['report.md', '## stale\n'], ['report.json', '{"schema":1}\n']]) {
       writeFileSync(path.join(evidenceDir, name), body);
@@ -1877,7 +1999,8 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   ];
   for (const [label, env, state] of runRefusals) {
     const refused = makeTempDir();
-    const refusedEvidence = plantStale(refused);
+    // The identity a refusal runs under names the slots it has to clear.
+    const refusedEvidence = plantStale(refused, { ...RUN_ENV, ...env }.DEBUG_ACTION_INVOCATION_NONCE);
     if (state !== null) writeState(refused, state);
     assert.equal(await captureViaRun({
       outputDir: refused,
@@ -1892,7 +2015,7 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   // else. Refusing to trust it must not mean leaving its predecessor's files
   // behind either.
   const noState = makeTempDir();
-  const noStateEvidence = plantStale(noState);
+  const noStateEvidence = plantStale(noState, 'n1');
   assert.equal(reportSubcommand({ outputDir: noState, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
   assertCleared(noStateEvidence, 'absent state');
 
@@ -1902,7 +2025,7 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   // preserving another run's log here would ship it under this run's artifact
   // name (Codex T5 r8, guarding r2 #3).
   const foreign = makeTempDir();
-  const foreignEvidence = plantStale(foreign);
+  const foreignEvidence = plantStale(foreign, 'other');
   writeState(foreign, {
     nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
     evidenceCopied: true, evidenceAuthentic: true, collectorAlive: true,
@@ -1913,7 +2036,7 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   // 3. A real attempt that captures nothing.
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
-  const evidenceDir = plantStale(outputDir);
+  const evidenceDir = plantStale(outputDir, 'n1');
   writeState(outputDir, {
     nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
     projectRoot, commandExitCode: 0, failOnCommandFailure: 'true',
@@ -1949,7 +2072,7 @@ test('a foreign occupant answering 401 fails liveness and licenses only labeled 
   assert.equal(state.collectorAlive, false, 'a stranger on the port is not our collector');
   assert.equal(state.evidenceAuthentic, false);
   assert.equal(state.evidenceCopied, true, 'the on-disk log is still worth a human\'s eyes');
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'and it can never ride a green run');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'and it can never ride a green run');
 });
 
 test('a renderer that returns without producing a schema-1 report publishes nothing', async () => {
@@ -1979,7 +2102,7 @@ test('a renderer that returns without producing a schema-1 report publishes noth
       // (Codex T5 #2).
       renderReport: () => ({ markdown: '## Debug evidence report\n', json: rendered }),
     });
-    const evidenceDir = resolveEvidenceDir(outputDir);
+    const evidenceDir = evidenceDirOf(outputDir);
     assert.equal(code, 3, label);
     assert.equal(readState(outputDir).reportRendered, false, label);
     assert.ok(!existsSync(path.join(evidenceDir, 'report.json')), `${label}: nothing is written before the shape is checked`);
@@ -2032,7 +2155,7 @@ test('a renderer failure costs the report surfaces and nothing else: the authent
       renderReport,
     });
     assert.equal(runCode, 3, `${label}: no report means no evidence product`);
-    const evidenceDir = resolveEvidenceDir(outputDir);
+    const evidenceDir = evidenceDirOf(outputDir);
     const captured = readFileSync(path.join(evidenceDir, 'session.log'));
     assert.equal(captured.toString('utf8'), served.map((line) => `${JSON.stringify(line)}\n`).join(''),
       `${label}: run staged the bytes the collector proved`);
@@ -2058,30 +2181,32 @@ test('a renderer failure costs the report surfaces and nothing else: the authent
 
 test('finish taxonomy: missing state 3; missing exit code 3; dead collector 3; command failure mirrors or is waived by the toggle', async () => {
   const outputDir = makeTempDir();
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'no state');
+  // An identity with no state behind it, which is what a `start` that emitted
+  // its nonce and then failed leaves behind.
+  assert.equal(finishSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n' } }), 3, 'no state');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true' });
   assert.equal(finishSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3, 'nonce mismatch');
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'run never recorded an exit code');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'run never recorded an exit code');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: false, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'collector died before capture');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'collector died before capture');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: true, evidenceCopied: false, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'nothing was captured');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'nothing was captured');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'mirrors the command exit code');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 7, 'mirrors the command exit code');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'false', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 0, 'toggle waives the failure');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 0, 'toggle waives the failure');
   // A toggle validateActionInputs could never have produced means the state
   // file is corrupt or forged, and the exit code sitting next to it is worth
   // no more than the toggle is — so it is a 3 on a failing run AND on a green
   // one, not a "treat anything but false as true" (Codex T5 #3).
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'maybe', commandExitCode: 7, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'an out-of-contract toggle is refused, not reinterpreted');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'an out-of-contract toggle is refused, not reinterpreted');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'maybe', commandExitCode: 0, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'and refused on a green run too, where it would otherwise pass unread');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'and refused on a green run too, where it would otherwise pass unread');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 300, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 1, 'out-of-range exit codes clamp to 1');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 1, 'out-of-range exit codes clamp to 1');
   writeState(outputDir, { nonce: 'n', failOnCommandFailure: 'true', commandExitCode: 0, collectorAlive: true, evidenceCopied: true, reportRendered: true });
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 0, 'green run');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 0, 'green run');
 });
 
 test('the terminal main() catch redacts state tokens from stderr', async () => {
@@ -2160,9 +2285,9 @@ test('a counterfeit collector serving perfect NDJSON is refused: capture believe
       assert.equal(state.collectorAlive, false, `${label}: an unprovable answer is not a live collector`);
       assert.equal(state.evidenceCopied, false, label);
       assert.equal(state.evidenceAuthentic, false, label);
-      assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+      assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')),
         `${label}: an unproven answer is never staged`);
-      assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'report.md')), label);
+      assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'report.md')), label);
       // And it must not slide into the unreachable class either: a listener
       // that answers is not an absent collector, so the on-disk log is not a
       // licensed fallback here.
@@ -2171,7 +2296,7 @@ test('a counterfeit collector serving perfect NDJSON is refused: capture believe
         true,
         `${label}: the bait is still on disk, and still unstaged`,
       );
-      assert.equal(finishSubcommand({ outputDir, env: {} }), 3, label);
+      assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, label);
       assert.equal(fake.requests.length, 1, `${label}: challenged exactly once`);
       assert.match(fake.requests[0], /^[0-9a-f]{64}$/, `${label}: with a fresh nonce`);
     } finally {
@@ -2202,7 +2327,7 @@ test('a recorded answer cannot be replayed: an old proof does not answer a fresh
     const state = readState(outputDir);
     assert.equal(state.collectorAlive, false);
     assert.equal(state.evidenceCopied, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')),
+    assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')),
       'and entry cleanup means the first capture is not left behind to pass as this one');
     assert.notEqual(listener.requests[0], listener.requests[1], 'each capture challenged with a different nonce');
   } finally {
@@ -2221,12 +2346,12 @@ test('capture refuses when the responder key never reached this step, rather tha
     // step cannot verify anything. That is an integrity failure, not a missing
     // collector — falling back to the on-disk log would hand back bytes with no
     // provenance at all and call them evidence.
-    const code = await captureViaRun({ outputDir, env: {} });
+    const code = await captureViaRun({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } });
     assert.equal(code, 3);
     const state = readState(outputDir);
     assert.equal(state.collectorAlive, false);
     assert.equal(state.evidenceCopied, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
+    assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')));
     assert.equal(listener.requests.length, 0, 'nothing is even asked without a way to check the answer');
   } finally {
     await listener.close();
@@ -2236,7 +2361,7 @@ test('capture refuses when the responder key never reached this step, rather tha
 test('render and digest never re-read the staged path: the payload is one immutable buffer', async () => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
-  const evidenceDir = resolveEvidenceDir(outputDir);
+  const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
   const lines = [
     { ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' },
     { ts: '2026-08-14T00:00:01.000Z', type: 'hypothesis', hypothesisId: 'H-demo', status: 'OPEN', title: 'seeded demo' },
@@ -2297,7 +2422,7 @@ test('a swap after staging is DETECTABLE: the logged digests still describe what
       writeStdout: (text) => printed.push(text),
     });
     assert.equal(code, 0);
-    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const evidenceDir = evidenceDirOf(context.outputDir);
     const logged = printed[0].trim();
     // The window this cannot close: staging and upload are separate steps of
     // one composite action, same user, so a detached child can still rewrite
@@ -2314,14 +2439,14 @@ test('a swap after staging is DETECTABLE: the logged digests still describe what
     // compare without scraping the log.
     assert.ok(readFileSync(context.githubOutput, 'utf8').includes(`evidence-digest=${logged}\n`));
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
 test('the digests are computed from the payload, not from the sink: a lossy write is caught, not blessed', async () => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
-  const evidenceDir = resolveEvidenceDir(outputDir);
+  const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
   const lines = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' }];
   const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   writeState(outputDir, {
@@ -2431,14 +2556,14 @@ test('a relay that filters the real collector\'s answer is refused: the signatur
       assert.equal(after.collectorAlive, false);
       assert.equal(after.evidenceCopied, false);
       assert.equal(after.evidenceAuthentic, false);
-      assert.ok(!existsSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log')),
+      assert.ok(!existsSync(path.join(evidenceDirOf(context.outputDir), 'session.log')),
         'a truncated session is never staged, however genuine its signature');
-      assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 3);
+      assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 3);
     } finally {
       await relay.close();
     }
   } finally {
-    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
 });
 
@@ -2470,8 +2595,8 @@ test('a verification key planted in state is ignored: only runner memory can say
     const state = readState(outputDir);
     assert.equal(state.collectorAlive, false);
     assert.equal(state.evidenceCopied, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
-    assert.equal(finishSubcommand({ outputDir, env: {} }), 3);
+    assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')));
+    assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3);
 
     // 2. And with NO key in the environment at all, the planted ones are still
     //    not consulted — capture refuses rather than falling back to a key an
@@ -2481,7 +2606,7 @@ test('a verification key planted in state is ignored: only runner memory can say
     const withoutEnvKey = await captureViaRun({ outputDir, env: {} });
     assert.equal(withoutEnvKey, 3, 'a key from an attacker-writable file is not a key');
     assert.equal(readState(outputDir).evidenceCopied, false);
-    assert.ok(!existsSync(path.join(resolveEvidenceDir(outputDir), 'session.log')));
+    assert.ok(!existsSync(path.join(evidenceDirOf(outputDir), 'session.log')));
     assert.equal(listener.requests.length, 1,
       'the second capture never even asked: with no trustworthy key there is no point');
   } finally {
@@ -2595,7 +2720,7 @@ test('a wrapped command that poisons every later step\'s environment changes not
       env: { ...laterStepEnv, GITHUB_STEP_SUMMARY: honestRun.stepSummary },
     }), 0);
     assert.ok(readFileSync(honestRun.stepSummary, 'utf8').includes('## Debug evidence report'));
-    assert.equal(readFileSync(path.join(resolveEvidenceDir(honestRun.outputDir), 'session.log'), 'utf8'), honest.body,
+    assert.equal(readFileSync(path.join(evidenceDirOf(honestRun.outputDir), 'session.log'), 'utf8'), honest.body,
       'and the artifact is byte-for-byte the answer the proof covered');
     assert.equal(finishSubcommand({ outputDir: honestRun.outputDir, env: laterStepEnv }), 0,
       'an honest run stays green even from inside the poisoned environment');
@@ -2617,7 +2742,7 @@ test('a wrapped command that poisons every later step\'s environment changes not
     assert.equal(forgedState.collectorAlive, false);
     assert.equal(forgedState.evidenceAuthentic, false);
     assert.equal(forgedState.reportRendered, false);
-    const evidenceDir = resolveEvidenceDir(forgedRun.outputDir);
+    const evidenceDir = evidenceDirOf(forgedRun.outputDir);
     for (const name of ['session.log', 'report.md', 'report.json']) {
       assert.ok(!existsSync(path.join(evidenceDir, name)), `${name} is never staged`);
     }
@@ -2677,7 +2802,9 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
     // 3 and not 1: this is the action's machinery failing, which a consumer
     // must be able to tell apart from the wrapped command's own verdict.
     assert.equal(code, 3, label);
-    const evidenceDir = resolveEvidenceDir(outputDir);
+    // Named for the identity this class ran under, which for the foreign-nonce
+    // class is deliberately not the one the state carries.
+    const evidenceDir = resolveEvidenceDir(outputDir, env.DEBUG_ACTION_INVOCATION_NONCE);
     assert.deepEqual(
       ['session.log', 'report.md', 'report.json'].filter((name) => existsSync(path.join(evidenceDir, name))),
       staged,
@@ -2714,7 +2841,7 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
   });
   assert.equal(code, 0, 'the evidence is complete, which is all this step promises');
   assert.equal(readState(outputDir).commandExitCode, 7);
-  assert.equal(finishSubcommand({ outputDir, env: {} }), 7, 'the command\'s own code is mirrored, once, by finish');
+  assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 7, 'the command\'s own code is mirrored, once, by finish');
 });
 
 test('report publishes only what run committed, and holds nothing worth poisoning', async () => {
@@ -2728,7 +2855,7 @@ test('report publishes only what run committed, and holds nothing worth poisonin
     nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc',
     sessionToken: 'x'.repeat(43), reportRendered: false,
   });
-  const evidenceDir = resolveEvidenceDir(outputDir);
+  const evidenceDir = evidenceDirOf(outputDir);
   mkdirSync(evidenceDir, { recursive: true });
   for (const name of ['session.log', 'report.md', 'report.json']) {
     writeFileSync(path.join(evidenceDir, name), 'left behind by an earlier invocation\n');
@@ -2810,7 +2937,7 @@ test('the boot handshake and the state file carry no private key material', asyn
     // And the key that DID travel reached the step output, unmasked and whole.
     assert.ok(readFileSync(startOutput, 'utf8').includes(`collector-verify-key=${handshake.verify_key}`));
   } finally {
-    teardownSubcommand({ outputDir, env: {} });
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
   }
 });
 
@@ -2837,247 +2964,489 @@ test('the renderer export surface capture depends on is pinned', () => {
   assert.equal(JSON.parse(renderer.renderJson(report)).schema, 1);
 });
 
-// Codex's T6 ruling, and the same fail-closed posture `run` already takes.
-// This step is handed the invocation nonce because `start` wrote it to
-// GITHUB_ENV and the runner injects it into every later step. Its ABSENCE
-// means `start` never reached that line, or the wiring that carries it was
-// cut — and in neither case can this step show that the staged bytes belong
-// to this invocation. "A state file exists" proves nothing on its own: an
-// output-dir is reusable across steps and across jobs on a self-hosted
-// runner, so a PREVIOUS invocation's state and evidence sit at exactly these
-// paths. Degrading to that check would publish someone else's report into
-// this job's summary and hand their session.log to this job's upload step
-// under this job's artifact name.
-test('report fails closed when no invocation nonce reached this step, instead of degrading to "state exists"', async () => {
+// Invocation-scoped staging (Codex T6 r1 #3). Two invocations can share an
+// output-dir: the default is a fixed path under runner.temp, and a self-hosted
+// runner can see the same custom directory again minutes later. With ONE fixed
+// staging child, the second invocation's entry clear destroys the first's
+// evidence, a concurrent restage lands in exactly the three filenames the
+// upload step enumerates, and a stale entry that cannot be unlinked (a
+// DIRECTORY where a session.log belongs) fails `report` while the always()
+// upload still ships that directory's descendants — the pinned uploader
+// expands directories with implicitDescendants. Scoping the child to the
+// invocation removes the shared name, and therefore the whole class.
+test('staging is invocation-scoped: a second invocation neither sees, clears, nor ships the first one\'s evidence', async () => {
   const outputDir = makeTempDir();
-  const evidenceDir = resolveEvidenceDir(outputDir);
-  mkdirSync(evidenceDir, { recursive: true });
+  const projectRoot = makeTempDir();
+  const stage = async (nonce, message) => {
+    // Exactly what a second invocation does to a shared output-dir: it takes
+    // ownership of the state file.
+    writeState(outputDir, {
+      nonce, pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+      projectRoot, failOnCommandFailure: 'true',
+    });
+    const githubOutput = path.join(outputDir, `github_output_${nonce}`);
+    writeFileSync(githubOutput, '');
+    const code = await captureViaRun({
+      outputDir,
+      env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: nonce, GITHUB_OUTPUT: githubOutput },
+      readLive: collectorAnswer([{ ts: '2026-08-14T00:00:00.000Z', msg: message }]),
+    });
+    assert.equal(code, 0, `invocation ${nonce} captured its own session`);
+    return { dir: resolveEvidenceDir(outputDir, nonce), githubOutput };
+  };
+  const first = await stage('inv-first', 'the first invocation');
+  const second = await stage('inv-second', 'the second invocation');
+  assert.notEqual(first.dir, second.dir, 'the staging children are distinct paths');
+  assert.ok(readFileSync(path.join(first.dir, 'session.log'), 'utf8').includes('the first invocation'),
+    'the first invocation\'s evidence survived the second one entirely');
+  assert.ok(readFileSync(path.join(second.dir, 'session.log'), 'utf8').includes('the second invocation'));
+  // What the upload step is told to take is THIS invocation's directory, so a
+  // stale sibling can never be inside its path set.
+  assert.match(readFileSync(second.githubOutput, 'utf8'), new RegExp(`^evidence-dir=${second.dir.replace(/[\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'm'));
+  // And the second invocation's publish step leaves the first's alone: it is
+  // not this run's to ship, and not this run's to delete either.
+  assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'inv-second' } }), 0);
+  assert.ok(existsSync(path.join(first.dir, 'session.log')), 'a stranger\'s staging is left untouched');
+});
+
+// The upload step cannot look at the filesystem to decide whether there is
+// anything worth uploading — by the time it runs, anything could be sitting in
+// the staging path. So `run`, the one process that knows, says both WHERE it
+// staged and WHAT it put there; the upload step gates on the second and takes
+// its paths from the first. Deliberately NOT gated on `report` succeeding: a
+// Step Summary failure must never suppress evidence run actually proved
+// (Codex's explicit warning, T6 r1 #3).
+test('run tells the upload step where it staged and exactly what it staged there', async () => {
+  const served = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }];
+  const cases = [
+    ['a complete capture', {}, 'session.log report.md report.json'],
+    // A renderer failure still staged the authenticated log, and that log is
+    // real evidence a human can read: the gate must stay OPEN for it.
+    ['a renderer that throws', { renderReport: () => { throw new Error('renderer exploded'); } }, 'session.log'],
+    // An integrity failure staged nothing at all, so the gate closes and the
+    // upload step does not run.
+    ['no verification key in this step\'s environment', { env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }, ''],
+  ];
+  for (const [label, overrides, expected] of cases) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+      projectRoot, failOnCommandFailure: 'true',
+    });
+    const githubOutput = path.join(outputDir, 'github_output');
+    writeFileSync(githubOutput, '');
+    const { env = RUN_ENV, ...seams } = overrides;
+    await captureViaRun({
+      outputDir,
+      env: { ...env, GITHUB_OUTPUT: githubOutput },
+      readLive: collectorAnswer(served),
+      ...seams,
+    });
+    const published = readFileSync(githubOutput, 'utf8');
+    assert.match(published, new RegExp(`^evidence-staged=${expected}$`, 'm'), `${label}: names what it staged`);
+    assert.match(
+      published,
+      new RegExp(`^evidence-dir=${resolveEvidenceDir(outputDir, 'n1').replace(/[\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'm'),
+      `${label}: and where`,
+    );
+    // The claim is checkable against the filesystem, which is what makes it
+    // usable as an upload gate rather than a decoration.
+    assert.deepEqual(
+      ['session.log', 'report.md', 'report.json'].filter((name) => existsSync(path.join(resolveEvidenceDir(outputDir, 'n1'), name))),
+      expected === '' ? [] : expected.split(' '),
+      `${label}: the claim matches what is actually on disk`,
+    );
+  }
+});
+
+test('run refuses when no usable invocation nonce reached it: it cannot even name its own staging', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot: makeTempDir(), failOnCommandFailure: 'true',
+  });
+  const refuse = () => { throw new Error('a refused run must never reach the wrapped command'); };
+  assert.equal(await captureViaRun({
+    outputDir,
+    env: { DEBUG_ACTION_COLLECTOR_VERIFY_KEY: VERIFY_KEY_B64 },
+    spawnCommand: refuse,
+  }), 3, 'no identity, no run');
+  // A nonce is a directory-name segment now, so a traversal-shaped one is
+  // refused rather than resolved. Entropy comes from randomUUID in start; this
+  // is the path-safety half.
+  assert.equal(await captureViaRun({
+    outputDir,
+    env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: '../escape' },
+    spawnCommand: refuse,
+  }), 3, 'a traversal-shaped identity is refused');
+  assert.equal(existsSync(path.join(outputDir, 'escape')), false, 'and nothing was created outside the staging child');
+});
+
+test('resolveEvidenceDir refuses any invocation nonce that is not a safe path segment', () => {
+  const outputDir = makeTempDir();
+  for (const bad of [undefined, null, '', '../escape', 'a/b', 'a\\b', '.', '..', 'x'.repeat(65)]) {
+    assert.throws(() => resolveEvidenceDir(outputDir, bad), /not a safe path segment/, `refuses ${JSON.stringify(bad)}`);
+  }
+  // The shape start actually mints, and the shapes the tests use.
+  for (const good of ['0e2b1c34-5d6e-4f70-8a9b-0c1d2e3f4a5b', 'n1', 'inv-second']) {
+    assert.equal(resolveEvidenceDir(outputDir, good), path.join(outputDir, `debug-evidence-files-${good}`));
+  }
+});
+
+// This step is handed the invocation nonce as `start`'s step output. Its
+// ABSENCE means this invocation's `start` never ran far enough to emit one —
+// and nothing in the output-dir can then be shown to belong to this run. "A
+// state file exists" proves nothing on its own: an output-dir is reusable
+// across steps and across jobs on a self-hosted runner, so a PREVIOUS
+// invocation's state sits at exactly that path. Degrading to that check would
+// publish a stranger's report into this job's summary.
+//
+// What it must NOT do is clean up: staging is invocation-scoped, so every
+// directory it could clear belongs to some other invocation — possibly one
+// still running. Their evidence is not this step's to publish and not this
+// step's to destroy, and it cannot reach this job's artifact either way,
+// because the upload step is gated on THIS invocation's run outputs
+// (Codex T6 r1 #1/#3).
+test('report fails closed when no invocation nonce reached this step, and destroys nobody else\'s evidence', async () => {
+  const outputDir = makeTempDir();
+  const strangerDir = resolveEvidenceDir(outputDir, 'inv-stranger');
+  mkdirSync(strangerDir, { recursive: true });
   const stepSummary = path.join(outputDir, 'step_summary');
   writeFileSync(stepSummary, '');
   // The most favourable state that can exist: a complete, successful,
-  // authenticated capture. None of it may buy a publish without the nonce.
+  // authenticated capture. None of it may buy a publish without the identity.
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    nonce: 'inv-stranger', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
     commandExitCode: 0, collectorAlive: true, evidenceAuthentic: true, evidenceCopied: true,
     reportRendered: true, failOnCommandFailure: 'true',
   });
   for (const name of ['session.log', 'report.md', 'report.json']) {
-    writeFileSync(path.join(evidenceDir, name), `staged ${name}\n`);
+    writeFileSync(path.join(strangerDir, name), `staged ${name}\n`);
   }
   const { result, written } = await captureStderr(() => reportSubcommand({
     outputDir,
     env: { GITHUB_STEP_SUMMARY: stepSummary },
   }));
-  assert.equal(result, 3, 'no nonce is an infra failure, never a licence to publish');
+  assert.equal(result, 3, 'no identity is an infra failure, never a licence to publish');
+  assert.equal(readFileSync(stepSummary, 'utf8'), '', 'nothing may reach the step summary');
   for (const name of ['session.log', 'report.md', 'report.json']) {
-    assert.equal(
-      existsSync(path.join(evidenceDir, name)),
-      false,
-      `${name} must be cleared: unowned staging must never reach the upload step`,
-    );
+    assert.ok(existsSync(path.join(strangerDir, name)), `${name} belongs to another invocation and is left alone`);
   }
-  assert.equal(readFileSync(stepSummary, 'utf8'), '', 'and nothing may reach the step summary');
-  assert.match(written, /report: this step received no invocation nonce/);
+  assert.match(written, /report: this step received no usable invocation nonce/);
 });
 
 // ---------------------------------------------------------------------------
-// action.yml — structural pins (Task 6).
+// action.yml — structural pins (Task 6, rebuilt for Codex T6 r1 #4).
 //
-// Plain-text assertions over the YAML source, with no YAML-parser dependency:
-// the same approach actions/closeout/support.test.js takes to its own
-// action.yml and tools/workflow_checks.js takes to workflow files. What these
-// pin is WIRING — which value reaches which step — because that routing is
-// where this action's security properties live, and none of it is reachable
-// from a unit test of support.js.
+// The first version of these pins matched SUBSTRINGS, and Codex demonstrated
+// four mutations that survived them: all four exact step guards replaced by a
+// bare `${{ always() }}` (the check was a prefix match); an extra
+// `C:/foreign/**` added to the upload block (the check required the expected
+// paths but never rejected extras); the verify-key mapping moved into an
+// INLINE comment (the stripper removed only whole-line comments, so the
+// "which step carries it" answer stayed the same while no mapping existed);
+// and two output-dir sites diverging under a `>= 6` occurrence count. A
+// substring pin can only say "this appears somewhere"; these properties need
+// "this, exactly, and nothing else".
+//
+// So the raw text is parsed instead, by a small structure-aware reader for the
+// subset of YAML this file uses — block mappings, one block scalar (`path: |`),
+// no flow collections, no anchors, no multi-line quoted scalars — and every
+// assertion below is an exact deepEqual over what it returns. The repo ships
+// zero runtime dependencies and this adds no test dependency either. The
+// SHA-pin assertion deliberately stays on the RAW text: the version comment is
+// part of what it pins, and the reader strips comments.
 const ACTION_YML = () => readFileSync(path.join(__dirname, 'action.yml'), 'utf8');
-// Comment lines are stripped before every "this must NOT appear" assertion.
-// Several pins below are also DOCUMENTED in the file — the nonce one quotes
-// the exact expression that must never be used — and a prose mention of a
-// variable must never be mistaken for a wiring of it.
-const withoutComments = (text) => text.split('\n').filter((line) => !line.trim().startsWith('#')).join('\n');
-const ACTION_YML_CODE = () => withoutComments(ACTION_YML());
 const OUTPUT_DIR_EXPR = "${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}";
-// The composite's step list ONLY. `inputs:` declares a key literally named
-// `run`, so scanning the whole file for lines beginning `run:` reads that
-// input declaration as a step body (the plan's draft of the wiring-only test
-// did exactly that, and would have failed against its own YAML).
-const ACTION_YML_STEPS = () => {
-  const text = ACTION_YML();
-  const index = text.search(/^runs:$/m);
-  assert.notEqual(index, -1, 'action.yml must declare a runs: block');
-  return text.slice(index);
-};
-// One chunk per composite step, each starting at its own `- name:` line, so a
-// test can ask which STEP carries a value rather than merely whether the file
-// contains it anywhere.
-const compositeSteps = () => ACTION_YML_STEPS().split(/\n(?= {4}- name: )/).slice(1).map((text) => ({
-  name: /^ {4}- name: (.+)$/m.exec(text)[1].trim(),
-  text,
-}));
+const NONCE_EXPR = '${{ steps.start.outputs.invocation-nonce }}';
+const START_GUARD = "${{ always() && steps.start.outcome != 'skipped' }}";
 
-test('action.yml is wiring-only: every step body invokes support.js with a known subcommand', () => {
-  const runLines = ACTION_YML_STEPS().split('\n').map((line) => line.trim()).filter((line) => line.startsWith('run:'));
-  assert.ok(runLines.length >= 5, 'start/run/report/teardown/finish steps exist');
-  for (const lineText of runLines) {
-    assert.match(
-      lineText,
-      /^run: node "\$\{\{ github\.action_path \}\}\/support\.js" (start|run|report|teardown|finish)$/,
-      `wiring-only violated: ${lineText}`,
-    );
+// A `#` opens a comment only at line start or after whitespace, and never
+// inside a quoted scalar — the rule tools/workflow_checks.js documents for the
+// same reason. Quote state is per line: this file has no multi-line quoted
+// scalars, and introducing one would break the exact assertions below loudly
+// rather than silently.
+const stripYamlComment = (line) => {
+  let quote = null;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (quote) {
+      if (character === quote) quote = null;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
+      return line.slice(0, index);
+    }
   }
-  // Each subcommand exactly once: a duplicated step would run a second
-  // capture or a second teardown against the same state.
-  assert.deepEqual(
-    runLines.map((line) => line.split(' ').pop()).sort(),
-    ['finish', 'report', 'run', 'start', 'teardown'],
-  );
+  return line;
+};
+
+// `key: value`, `key:`, or the `- key: value` that opens a sequence item.
+const splitEntry = (body) => {
+  const match = /^(?:- )?([A-Za-z0-9_.-]+):(?: (.*))?$/.exec(body);
+  return match ? { key: match[1], value: match[2] ?? '' } : null;
+};
+
+// Returns { outputs: { name: value }, steps: [{ name, id, if, shell, uses, run,
+// env: {}, with: { path: [] } }] }. Indentation is the structure, exactly as
+// the file is written; anything that does not fit throws rather than being
+// silently skipped, so a rewrite in another style fails these tests instead of
+// quietly passing them.
+const parseActionYml = () => {
+  const lines = [];
+  for (const raw of ACTION_YML().split(/\r?\n/)) {
+    const text = stripYamlComment(raw).replace(/\s+$/, '');
+    if (text.trim() === '') continue;
+    lines.push({ indent: text.length - text.trimStart().length, body: text.trim() });
+  }
+  const outputs = {};
+  const steps = [];
+  let section = null;
+  let outputName = null;
+  let step = null;
+  let nested = null;
+  let blockScalar = null;
+  for (const line of lines) {
+    if (line.indent === 0) {
+      section = { 'outputs:': 'outputs', 'runs:': 'runs' }[line.body] ?? null;
+      step = null;
+      continue;
+    }
+    if (section === 'outputs') {
+      const entry = splitEntry(line.body);
+      if (line.indent === 2 && entry && entry.value === '') outputName = entry.key;
+      if (line.indent === 4 && entry && entry.key === 'value') outputs[outputName] = entry.value;
+      continue;
+    }
+    if (section !== 'runs') continue;
+    if (blockScalar && line.indent >= blockScalar.indent) {
+      blockScalar.items.push(line.body);
+      continue;
+    }
+    blockScalar = null;
+    // The `runs:` mapping's own keys: `using: composite` and `steps:`.
+    if (line.indent === 2) continue;
+    if (line.indent === 4 && line.body.startsWith('- ')) {
+      step = { env: {}, with: {} };
+      steps.push(step);
+    }
+    if (line.indent === 4 || line.indent === 6) {
+      const entry = splitEntry(line.body);
+      if (!entry) throw new Error(`unparsed step line: ${line.body}`);
+      nested = null;
+      if (entry.key === 'env' || entry.key === 'with') nested = entry.key;
+      else step[entry.key] = entry.value;
+      continue;
+    }
+    if (line.indent === 8) {
+      const entry = splitEntry(line.body);
+      if (!entry || !nested) throw new Error(`unparsed nested line: ${line.body}`);
+      if (entry.value === '|') {
+        blockScalar = { items: [], indent: 10 };
+        step[nested][entry.key] = blockScalar.items;
+      } else {
+        step[nested][entry.key] = entry.value;
+      }
+      continue;
+    }
+    throw new Error(`unexpected indentation ${line.indent}: ${line.body}`);
+  }
+  return { outputs, steps };
+};
+
+// The same stripper the reader uses, applied to the whole file: a rule about
+// what must NOT appear has to be read against wiring, not against the prose
+// that explains the rule. Inline comments included — a whole-line-only
+// stripper is exactly what Codex's third mutation walked straight through.
+const ACTION_YML_CODE = () => ACTION_YML().split(/\r?\n/).map(stripYamlComment).join('\n');
+
+const actionStepsByName = () => Object.fromEntries(parseActionYml().steps.map((step) => [step.name, step]));
+
+test('action.yml declares exactly the steps this action runs, in the order the architecture requires', () => {
+  // run before report before upload: `report` decides what the upload step
+  // finds staged (Codex T5 r8), and every evidence verdict is already made by
+  // the time either of them runs.
+  assert.deepEqual(parseActionYml().steps.map((step) => step.name), [
+    'Set up Node.js',
+    'Start collector',
+    'Run wrapped command',
+    'Render evidence report',
+    'Upload evidence artifact',
+    'Stop collector',
+    'Apply verdict',
+  ]);
 });
 
-test('action.yml pins third-party actions to the closeout SHAs', () => {
+test('action.yml is wiring-only: each subcommand exactly once, with its exact shell', () => {
+  const steps = parseActionYml().steps;
+  const wiring = steps.filter((step) => step.run !== undefined);
+  assert.deepEqual(wiring.map((step) => step.run), [
+    'node "${{ github.action_path }}/support.js" start',
+    'node "${{ github.action_path }}/support.js" run',
+    'node "${{ github.action_path }}/support.js" report',
+    'node "${{ github.action_path }}/support.js" teardown',
+    'node "${{ github.action_path }}/support.js" finish',
+  ]);
+  assert.deepEqual(wiring.map((step) => step.shell), ['bash', 'bash', 'bash', 'bash', 'bash']);
+  // Everything that is not a support.js call is one of the two pinned
+  // third-party actions — there is no third kind of step.
+  assert.deepEqual(steps.filter((step) => step.run === undefined).map((step) => step.uses), [
+    'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38',
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+  ]);
+  assert.equal(ACTION_YML_CODE().includes('continue-on-error'), false, 'a failed run step must stay failed');
+});
+
+test('action.yml pins third-party actions to the closeout SHAs, version comments included', () => {
+  // RAW text on purpose: the trailing `# vX.Y.Z` is part of the pin a human
+  // reads, and the semantic reader strips comments by design.
   const text = ACTION_YML();
   assert.ok(text.includes('uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0'));
   assert.ok(text.includes('uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2'));
   assert.ok(!/uses:\s+[^.@\s]+\/[^@\s]+@(?![0-9a-f]{40})/.test(text), 'no unpinned remote uses');
 });
 
-test('action.yml repeats the output-dir default expression identically at every use site', () => {
-  const text = ACTION_YML();
-  const occurrences = text.split(OUTPUT_DIR_EXPR).length - 1;
-  assert.ok(
-    occurrences >= 6,
-    `expected the default expression in start/run/report/upload/teardown/finish env + upload paths, found ${occurrences}`,
-  );
-  assert.ok(!text.includes("format('{0}/debug-evidence',runner.temp"), 'no whitespace variant of the expression');
-});
-
-test('action.yml uploads only enumerated evidence files — never the bare dir, never action-state.json', () => {
-  const text = ACTION_YML();
-  const uploadIndex = text.indexOf('Upload evidence artifact');
-  assert.notEqual(uploadIndex, -1);
-  const pathBlock = /path:\s*\|\r?\n((?:[ \t]+\S.*\r?\n?)+)/.exec(text.slice(uploadIndex));
-  assert.ok(pathBlock, 'path: must be a multi-line block scalar');
-  const lines = pathBlock[1].split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (const name of ['session.log', 'report.md', 'report.json']) {
-    assert.ok(lines.some((line) => line.endsWith(`/debug-evidence-files/${name}`)), `enumerates ${name}`);
-  }
-  for (const line of lines) {
-    assert.ok(!line.includes('action-state.json'), 'the state file (session token) must never be uploaded');
-    assert.notEqual(line, OUTPUT_DIR_EXPR, 'never the bare output dir');
-  }
-});
-
-// Scoped to each step's own chunk rather than to a fixed window of characters
-// after its name (the plan's draft used a 400-character slice, which the
-// documenting comments these steps carry push the `if:` line straight out of),
-// and to a real `if:` KEY line rather than to the text appearing anywhere.
-test('action.yml guards report/upload/teardown/finish with always()', () => {
-  for (const name of ['Render evidence report', 'Upload evidence artifact', 'Stop collector', 'Apply verdict']) {
-    const step = compositeSteps().find((candidate) => candidate.name === name);
-    assert.ok(step, `step ${name} exists`);
-    assert.match(withoutComments(step.text), /^ {6}if: \$\{\{ always\(\)/m, `${name} runs on failure paths too`);
-  }
-  // And the step that must NOT be guarded: a skipped or soft-guarded run step
-  // would leave the evidence verdict to a later one.
-  const run = compositeSteps().find((candidate) => candidate.name === 'Run wrapped command');
-  assert.ok(!/^ {6}if:/m.test(withoutComments(run.text)), 'the run step is unconditional');
-});
-
-// The round-6 Critical, as a property of the FILE. Capture must happen in the
-// one process the wrapped command cannot reach, and it can only happen there
-// if the verification key is delivered there and nowhere else. A later step's
-// environment is attacker-influenceable (spec invariant 10), so handing the
-// key to `report` — which is what this action did before round 6 — would put
-// the trust anchor exactly where it can be swapped.
-test('action.yml hands the collector verification key to the run step and to no other step', () => {
-  const code = ACTION_YML_CODE();
-  assert.equal(
-    code.split('DEBUG_ACTION_COLLECTOR_VERIFY_KEY').length - 1,
-    1,
-    'the verification key must be wired exactly once',
-  );
-  assert.ok(
-    code.includes('DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}'),
-    'the key must come from start\'s step output — runner memory, never a file',
-  );
-  assert.equal(
-    code.split('steps.start.outputs.collector-verify-key').length - 1,
-    1,
-    'start\'s key output must be consumed exactly once',
-  );
-  const carriers = compositeSteps()
-    .filter((step) => withoutComments(step.text).includes('DEBUG_ACTION_COLLECTOR_VERIFY_KEY'))
-    .map((step) => step.name);
-  assert.deepEqual(carriers, ['Run wrapped command'], 'only the trusted process may hold the key');
-});
-
-// Codex's T6 ruling. `start` writes DEBUG_ACTION_INVOCATION_NONCE to
-// GITHUB_ENV, and the runner injects it into every LATER step's process
-// environment. The expression `env` context does NOT include such
-// runner-inherited variables, so an explicit `${{ env.… }}` remap resolves to
-// the empty string — it would not merely be redundant, it would OVERRIDE the
-// inherited value with nothing and break exactly the wiring it looks like it
-// creates. Every subcommand after `start` reads the nonce from its own
-// process env; nothing may re-declare it.
-test('action.yml never remaps the invocation nonce into a step env', () => {
-  const code = ACTION_YML_CODE();
-  assert.ok(
-    !code.includes('env.DEBUG_ACTION_INVOCATION_NONCE'),
-    'an ${{ env.… }} remap of a GITHUB_ENV variable resolves to empty',
-  );
-  assert.ok(
-    !/^\s*DEBUG_ACTION_INVOCATION_NONCE\s*:/m.test(code),
-    'no step may re-declare the nonce under any expression',
-  );
-  // And the reason stays IN the file, so the next reader does not "fix" the
-  // apparent omission. This also makes the comment-stripping above
-  // load-bearing: the documented rationale quotes the forbidden expression.
-  assert.match(ACTION_YML(), /^\s*#.*DEBUG_ACTION_INVOCATION_NONCE/m, 'the omission must be documented');
-});
-
-// Adaptation item 1. Capture moved into `run` in round 6, so `run` is the only
-// step that can report what was captured; `report` writes no outputs at all
-// (it holds no credential and makes no decision).
-test('action.yml sources every output from the run step, and no later step produces one', () => {
-  const code = ACTION_YML_CODE();
-  for (const name of ['command-exit-code', 'session-id', 'event-count', 'report-path', 'evidence-digest']) {
-    assert.match(code, new RegExp(`^ {2}${name}:$`, 'm'), `declares the ${name} output`);
-    assert.ok(code.includes(`value: \${{ steps.run.outputs.${name} }}`), `${name} must be produced by the run step`);
-  }
-  const producers = [...code.matchAll(/value: \$\{\{ steps\.([a-z]+)\.outputs\./g)].map((match) => match[1]);
-  assert.deepEqual([...new Set(producers)], ['run'], 'every output comes from the step that captured the evidence');
-});
-
-// Adaptation item 6. `run` can exit 3, and nothing may soften that: a failed
-// composite step is what no later step can un-fail, which is the whole reason
-// the verdict was moved into `run`. The order is equally load-bearing —
-// `report` decides what the upload step finds staged (round 8).
-test('action.yml keeps the run -> report -> upload order and gives no step a continue-on-error escape', () => {
-  const text = ACTION_YML();
-  let previous = -1;
-  for (const name of ['Run wrapped command', 'Render evidence report', 'Upload evidence artifact', 'Stop collector', 'Apply verdict']) {
-    const index = text.indexOf(`- name: ${name}`);
-    assert.ok(index > previous, `${name} must appear after the step before it`);
-    previous = index;
-  }
-  assert.ok(!ACTION_YML_CODE().includes('continue-on-error'), 'a failed run step must stay failed');
-});
-
-// `report`, `teardown` and `finish` run AFTER the wrapped command, so their
-// environments are the ones an attacker can influence. Each therefore carries
-// exactly one variable — where to look — and nothing that could be turned into
-// a capability. Everything else they need is in the state file `run` committed.
-test('action.yml gives every post-command step nothing but the output dir', () => {
+test('every step env is exactly what its subcommand reads — no more, no less', () => {
+  const byName = actionStepsByName();
+  // Reconciled against support.js: main() builds `inputs` from these names,
+  // and start is the only subcommand that reads any of them beyond the output
+  // dir. `artifact-name` is deliberately absent — no subcommand reads it; the
+  // upload step's `name:` is its only consumer.
+  assert.deepEqual(byName['Start collector'].env, {
+    DEBUG_ACTION_RUN: '${{ inputs.run }}',
+    DEBUG_ACTION_SESSION_NAME: '${{ inputs.session-name }}',
+    DEBUG_ACTION_WORKDIR: '${{ inputs.working-directory }}',
+    DEBUG_ACTION_FAIL_ON_COMMAND_FAILURE: '${{ inputs.fail-on-command-failure }}',
+    DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
+    DEBUG_ACTION_PORT: '${{ inputs.port }}',
+    DEBUG_ACTION_REDACT_NAMES: '${{ inputs.redact-names }}',
+    DEBUG_ACTION_MAX_EVENTS_INPUT: '${{ inputs.max-events }}',
+    DEBUG_ACTION_MAX_BYTES_INPUT: '${{ inputs.max-bytes }}',
+    DEBUG_ACTION_HYPOTHESIS_ID: '${{ inputs.hypothesis-id }}',
+    DEBUG_ACTION_HYPOTHESIS_TITLE: '${{ inputs.hypothesis-title }}',
+  });
+  // run reads the command and its working directory; everything else it needs
+  // is in the state start committed.
+  assert.deepEqual(byName['Run wrapped command'].env, {
+    DEBUG_ACTION_RUN: '${{ inputs.run }}',
+    DEBUG_ACTION_WORKDIR: '${{ inputs.working-directory }}',
+    DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
+    DEBUG_ACTION_COLLECTOR_VERIFY_KEY: '${{ steps.start.outputs.collector-verify-key }}',
+    DEBUG_ACTION_INVOCATION_NONCE: NONCE_EXPR,
+  });
+  // The post-command steps get where to look and who they are. Nothing else:
+  // their environments are the ones a hostile wrapped command can influence,
+  // so there must be nothing in them worth influencing.
   for (const name of ['Render evidence report', 'Stop collector', 'Apply verdict']) {
-    const step = compositeSteps().find((candidate) => candidate.name === name);
-    assert.ok(step, `step ${name} exists`);
-    const declared = [...withoutComments(step.text).matchAll(/^ {8}([A-Z][A-Z0-9_]*):/gm)].map((match) => match[1]);
-    assert.deepEqual(declared, ['DEBUG_ACTION_OUTPUT_DIR'], `${name} must carry only the output dir`);
+    assert.deepEqual(byName[name].env, {
+      DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
+      DEBUG_ACTION_INVOCATION_NONCE: NONCE_EXPR,
+    }, `${name} carries its output dir and its identity, and nothing else`);
+  }
+  assert.deepEqual(byName['Set up Node.js'].env, {});
+  assert.deepEqual(byName['Upload evidence artifact'].env, {});
+});
+
+test('the collector verification key reaches the run step and no other step', () => {
+  // The round-6 Critical as a property of the file. A later step's environment
+  // is attacker-influenceable (spec invariant 10), so the trust anchor must be
+  // consumed only in the process whose env was resolved before the wrapped
+  // command existed.
+  const steps = parseActionYml().steps;
+  const carriers = steps.filter((step) => 'DEBUG_ACTION_COLLECTOR_VERIFY_KEY' in step.env);
+  assert.deepEqual(carriers.map((step) => step.name), ['Run wrapped command']);
+  assert.equal(
+    carriers[0].env.DEBUG_ACTION_COLLECTOR_VERIFY_KEY,
+    '${{ steps.start.outputs.collector-verify-key }}',
+    'runner memory, never a file',
+  );
+});
+
+test('invocation identity travels as start\'s step output, to every step that reads state', () => {
+  // Codex T6 r1 #1, and it REPLACES the round-8 "never remap the nonce" pin:
+  // that rule rested on the claim that GITHUB_ENV values are absent from the
+  // expression env context, which the runner source disproves. They are
+  // present — and job-global — which is precisely why identity cannot live
+  // there: a later invocation whose own start failed would inherit an earlier
+  // one's nonce and claim its evidence. A step output cannot be inherited.
+  const steps = parseActionYml().steps;
+  const carriers = steps.filter((step) => 'DEBUG_ACTION_INVOCATION_NONCE' in step.env);
+  assert.deepEqual(carriers.map((step) => step.name), [
+    'Run wrapped command',
+    'Render evidence report',
+    'Stop collector',
+    'Apply verdict',
+  ], 'every step that reads recorded state is told which invocation it belongs to');
+  for (const step of carriers) {
+    assert.equal(step.env.DEBUG_ACTION_INVOCATION_NONCE, NONCE_EXPR, `${step.name} reads this invocation's start`);
+  }
+  assert.equal(ACTION_YML_CODE().includes('${{ env.'), false,
+    'nothing is sourced from the expression env context, which carries job-global GITHUB_ENV values');
+});
+
+test('the guards are exact: post-command steps on always(), upload on what run actually staged', () => {
+  const byName = actionStepsByName();
+  for (const name of ['Render evidence report', 'Stop collector', 'Apply verdict']) {
+    // Exact, not prefix: a bare `${{ always() }}` would also run these on the
+    // path where an earlier step failed and `start` never executed at all,
+    // where they have neither identity nor state of their own.
+    assert.equal(byName[name].if, START_GUARD, `${name} carries the exact guard`);
+  }
+  // The upload step asks the only process that can honestly answer. Not gated
+  // on `report` succeeding: a Step Summary failure must never suppress
+  // evidence run proved (Codex T6 r1 #3).
+  assert.equal(byName['Upload evidence artifact'].if, "${{ always() && steps.run.outputs.evidence-staged != '' }}");
+  // And the three steps that must be unconditional: a guard on any of them
+  // would let the evidence verdict be skipped rather than made.
+  for (const name of ['Set up Node.js', 'Start collector', 'Run wrapped command']) {
+    assert.equal(byName[name].if, undefined, `${name} is unconditional`);
   }
 });
 
-test('every support.js step declares shell: bash', () => {
-  for (const step of compositeSteps()) {
-    if (!withoutComments(step.text).includes('support.js')) continue;
-    assert.match(step.text, /^ {6}shell: bash$/m, `${step.name} must declare shell: bash`);
+test('upload takes exactly the paths run reports staging into, and nothing else', () => {
+  const upload = actionStepsByName()['Upload evidence artifact'];
+  assert.deepEqual(Object.keys(upload.with), ['name', 'path', 'if-no-files-found']);
+  assert.equal(upload.with.name, '${{ inputs.artifact-name }}');
+  assert.equal(upload.with['if-no-files-found'], 'ignore');
+  // EXACT list: an extra entry is how a broad path (or a foreign directory)
+  // gets into the artifact, and the pinned uploader expands directories with
+  // implicitDescendants, so one extra line can ship a whole tree.
+  assert.deepEqual([...upload.with.path].sort(), [
+    '${{ steps.run.outputs.evidence-dir }}/report.json',
+    '${{ steps.run.outputs.evidence-dir }}/report.md',
+    '${{ steps.run.outputs.evidence-dir }}/session.log',
+  ]);
+  // The state file carries this run's session token and lives at the
+  // output-dir ROOT, outside the invocation-scoped child, so no path here can
+  // reach it. Asserted as well as arranged.
+  for (const entry of upload.with.path) {
+    assert.equal(entry.includes('action-state.json'), false);
+    assert.notEqual(entry, OUTPUT_DIR_EXPR);
+    assert.equal(entry.startsWith('${{ steps.run.outputs.evidence-dir }}/'), true);
   }
+});
+
+test('every action output is produced by the run step, and the set is exactly these five', () => {
+  // Capture happens in run, so run is the only step whose account of the
+  // session can be trusted; `report` publishes and produces nothing.
+  // `evidence-dir`/`evidence-staged` are run's own STEP outputs, consumed by
+  // the upload step's guard and paths — deliberately not part of the action's
+  // public contract.
+  assert.deepEqual(parseActionYml().outputs, {
+    'command-exit-code': '${{ steps.run.outputs.command-exit-code }}',
+    'session-id': '${{ steps.run.outputs.session-id }}',
+    'event-count': '${{ steps.run.outputs.event-count }}',
+    'report-path': '${{ steps.run.outputs.report-path }}',
+    'evidence-digest': '${{ steps.run.outputs.evidence-digest }}',
+  });
+});
+
+test('the output-dir default expression is byte-identical at every site, and there are exactly five', () => {
+  const text = ACTION_YML();
+  // Exact, not a floor: under a `>=` bound two sites could diverge — one
+  // pointing somewhere else entirely — while the count still passed.
+  assert.equal(text.split(OUTPUT_DIR_EXPR).length - 1, 5,
+    'start/run/report/teardown/finish env, and nowhere else');
+  assert.equal(text.includes("format('{0}/debug-evidence',runner.temp"), false, 'no whitespace variant');
 });

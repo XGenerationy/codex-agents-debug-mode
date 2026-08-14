@@ -123,8 +123,11 @@ Step chain (composite, `shell: bash` everywhere):
    makes no integrity decision. If state records no
    successful `start`, the subcommand no-ops successfully (finish already owns the
    failure decision for a failed start).
-5. **upload-artifact** — pinned, `if: always()`, `if-no-files-found: ignore`, uploads
-   `output-dir` as `artifact-name`.
+5. **upload-artifact** — pinned, `if-no-files-found: ignore`, uploads the three
+   enumerated payloads from `steps.run.outputs.evidence-dir` as `artifact-name`,
+   guarded by `always() && steps.run.outputs.evidence-staged != ''`. *(Rewritten,
+   Task 6 round 1: the guard and the paths both come from the trusted `run` step,
+   never from `output-dir` or from `report`'s outcome.)*
 6. **teardown** — `support.js teardown`, `if: always()`: kills the boot-shim PID from
    state; an already-dead process is success, a missing state file is success (start
    never ran). Never masks earlier failures.
@@ -178,10 +181,34 @@ The collector CLI exposes no limit overrides, so the action uses the programmati
 
 ### Evidence artifact — clean by construction
 
-`report` **copies** the session log (`.debug/debug-<session-id>.log` — NDJSON content,
-`.log` extension) plus rendered `report.md` and machine `report.json` into a fixed
-evidence child of `output-dir`; the upload step enumerates exactly those well-known
-filenames (closeout pattern), never a bare directory. `action-state.json` lives at the
+`run` **stages** the session log (`.debug/debug-<session-id>.log` — NDJSON content,
+`.log` extension) plus rendered `report.md` and machine `report.json` into an
+evidence child of `output-dir` *(it was `report` that copied them until capture moved
+into `run` in Task 5 round 6)*; the upload step enumerates exactly those well-known
+filenames (closeout pattern), never a bare directory.
+
+*(Rewritten, Task 6 round 1.)* That child is **invocation-scoped**:
+`debug-evidence-files-<invocation nonce>`, resolved from the nonce the step was
+handed and refused outright if that value is not a safe path segment. A fixed child
+name is a rendezvous point for invocations sharing an `output-dir` — the default one
+under `runner.temp`, or a reused custom directory on a self-hosted runner — and
+everything downstream keys off three fixed filenames: one invocation's entry clear
+destroys another's evidence, a concurrent restage lands in exactly the names the
+upload step enumerates, and a stale entry that cannot be unlinked (a directory where
+`session.log` belongs) fails `report` while the `always()` upload still expands that
+directory into the artifact. The upload step is correspondingly gated on the trusted
+`run` step's own outputs rather than on the filesystem or on `report`: `run` reports
+`evidence-staged` (exactly which payloads it wrote — empty closes the gate and the
+step does not execute) and `evidence-dir` (the absolute staging path, which the
+`path:` entries are built from). It is deliberately NOT gated on `report` succeeding:
+a Step Summary failure must never suppress evidence `run` proved. Known and
+unprevented: `actions/upload-artifact` v4.6.2 exposes no symlink control — its seven
+inputs carry none, and its glob options hardcode `followSymbolicLinks: true` and
+`implicitDescendants: true` (verified against the pinned SHA) — so a hostile swap
+inside the staging window can substitute a symlink to an unrelated readable file and
+pull its bytes into the artifact. As with every other post-staging swap, the defence
+is detection: the digest `run` printed to its own step log before staging does not
+match what the artifact then carries. `action-state.json` lives at the
 `output-dir` root — outside the evidence child — because it carries the launch token;
 it is never enumerated in the upload path block. The collector's `.debug/` internals
 (claim, port, salt, any token files) are never copied, so the token-exfiltration hazard

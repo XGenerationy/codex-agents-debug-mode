@@ -27,7 +27,30 @@ const EVIDENCE_SUBDIR = 'debug-evidence-files';
 const BOOT_SHIM = path.join(__dirname, 'collector_boot.js');
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
-const resolveEvidenceDir = (outputDir) => path.join(outputDir, EVIDENCE_SUBDIR);
+// PATH SAFETY, not entropy. The invocation nonce is a directory-name segment
+// now, and it arrives from this step's environment: the unguessability comes
+// from randomUUID in `start`, while this pattern is what stops a '..', a
+// separator or an empty string from turning a staging directory into a
+// traversal. Bounded length so a hostile value cannot produce a name the
+// filesystem rejects in some more confusing way.
+const NONCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+// The staged evidence child is INVOCATION-SCOPED (Codex T6 r1 #3). A fixed
+// child name is a rendezvous point for invocations that share an output-dir —
+// the default one under runner.temp, or a reused custom directory on a
+// self-hosted runner — and everything downstream keys off those three
+// filenames: one invocation's entry clear destroys another's evidence, a
+// concurrent restage lands in the exact names the upload step enumerates, and
+// a stale entry that cannot be unlinked (a DIRECTORY where session.log
+// belongs) fails `report` while the always() upload still expands that
+// directory's descendants into the artifact. With the invocation in the name,
+// no two invocations ever address the same path.
+const resolveEvidenceDir = (outputDir, nonce) => {
+  if (!NONCE_PATTERN.test(String(nonce ?? ''))) {
+    throw new Error('invocation nonce is missing or not a safe path segment; refusing to resolve a staging directory');
+  }
+  return path.join(outputDir, `${EVIDENCE_SUBDIR}-${nonce}`);
+};
 
 // Same helper contract as actions/closeout: the env-file path is the first
 // argument so tests inject a temp file instead of the real GITHUB_OUTPUT.
@@ -360,6 +383,28 @@ const readState = (outputDir) => {
   }
 };
 
+// Missing identity is a refusal, not a waiver (Codex T6 r1 #2). Every step
+// after `start` is handed `steps.start.outputs.invocation-nonce`, so an empty
+// one means this invocation's `start` never got far enough to emit it — and
+// whatever state is sitting in the output-dir was therefore written by
+// somebody else. The old lenient reading ("no nonce, so skip the check") let a
+// fresh job pointed at a REUSED output-dir act on a stranger's record: kill a
+// pid that may since have been recycled to an unrelated process, or mirror an
+// exit code no step of this job produced.
+//
+// The check is deliberately made BEFORE readState in every caller: "do not
+// act" and "do not read" are the same rule when the only thing a read can
+// produce is a decision.
+// Presence AND shape: the same value names this invocation's staging
+// directory, so a nonce that could not be a path segment is no more usable
+// than an absent one, and both fail the same way rather than one of them
+// throwing out of resolveEvidenceDir.
+const requireInvocationNonce = (env, subcommand) => {
+  if (NONCE_PATTERN.test(String(env.DEBUG_ACTION_INVOCATION_NONCE ?? ''))) return false;
+  process.stderr.write(`debug-evidence-action: ${subcommand}: this step received no usable invocation nonce; refusing to read or act on recorded state.\n`);
+  return true;
+};
+
 const rejectForeignNonce = (state, env, subcommand) => {
   if (env.DEBUG_ACTION_INVOCATION_NONCE && state.nonce !== env.DEBUG_ACTION_INVOCATION_NONCE) {
     process.stderr.write(`debug-evidence-action: ${subcommand}: recorded state does not carry this invocation's nonce (output-dir overwritten by a concurrent run, or never written by this run); refusing to trust it.\n`);
@@ -440,6 +485,26 @@ const startSubcommand = async ({
   writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
 }) => {
+  // THE FIRST THING THIS PROCESS DOES, ahead of validation and ahead of any
+  // filesystem work: publish this invocation's identity as a STEP OUTPUT.
+  //
+  // Two properties, and the order matters as much as the channel:
+  //
+  // 1. A step output is per-invocation by construction. The runner resolves
+  //    `steps.start.outputs.*` from THIS action instance, so a second
+  //    invocation in the same job reads its own `start`, never this one's.
+  //    GITHUB_ENV — where this used to go — is job-global: its values persist
+  //    into every later step of the job and DO appear in the expression `env`
+  //    context (settled against the runner's own source; an earlier ruling in
+  //    this project's plan claimed otherwise and was wrong). A nonce on that
+  //    channel is inheritable, and inheritable identity is no identity at all.
+  // 2. Emitting BEFORE the checks below means a `start` that fails still hands
+  //    its own later steps an identity nothing else in the job can match.
+  //    Emitting after them would leave a failed invocation's `report` with an
+  //    EARLIER invocation's nonce, its state in a shared output-dir would then
+  //    look owned, and the always() upload would publish that evidence under
+  //    this run's artifact name (Codex T6 r1 #1).
+  if (env.GITHUB_OUTPUT) writeOutputs(env.GITHUB_OUTPUT, { 'invocation-nonce': nonce });
   const workspace = env.GITHUB_WORKSPACE || '';
   const errors = validateActionInputs({ ...inputs, outputDir, workspace });
   if (errors.length > 0) throw new Error(`invalid inputs: ${errors.join('; ')}`);
@@ -459,7 +524,6 @@ const startSubcommand = async ({
       throw new Error('invalid inputs: output-dir: must be outside the repository workspace (it resolves inside it)');
     }
   }
-  if (env.GITHUB_ENV) writeOutputs(env.GITHUB_ENV, { DEBUG_ACTION_INVOCATION_NONCE: nonce });
   const shimEnv = { ...env, DEBUG_PORT: inputs.port };
   if (inputs.maxEvents) shimEnv.DEBUG_ACTION_MAX_EVENTS = inputs.maxEvents;
   if (inputs.maxBytes) shimEnv.DEBUG_ACTION_MAX_BYTES = inputs.maxBytes;
@@ -607,6 +671,7 @@ const startSubcommand = async ({
 };
 
 const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill }) => {
+  if (requireInvocationNonce(env, 'teardown')) return 3;
   const state = readState(outputDir);
   if (!state) return 0; // start never wrote state — nothing to tear down
   if (rejectForeignNonce(state, env, 'teardown')) return 3;
@@ -1015,7 +1080,12 @@ const runSubcommand = async ({
   // which is why the clear precedes them (Codex T5 r2 #3, hoisted in r3, and
   // hoisted again with capture in r6). Clearing here also means a run that
   // dies mid-command leaves nothing behind to be mistaken for its own output.
-  const evidenceDir = resolveEvidenceDir(outputDir);
+  //
+  // The identity comes first because the staging path is DERIVED from it: this
+  // step cannot even name where its evidence goes without knowing which
+  // invocation it belongs to (Codex T6 r1 #1/#3).
+  if (requireInvocationNonce(env, 'run')) return 3;
+  const evidenceDir = resolveEvidenceDir(outputDir, env.DEBUG_ACTION_INVOCATION_NONCE);
   clearStagedEvidence(evidenceDir);
   const state = readState(outputDir);
   if (!state) {
@@ -1194,9 +1264,8 @@ const runSubcommand = async ({
   // the files afterwards is a mismatch rather than a blessing. Computing it
   // from the files instead would hand a swap the step log's endorsement.
   const digestLine = payloadDigestLine(payloads);
-  for (const name of EVIDENCE_FILES) {
-    if (payloads[name] !== undefined) stageFile(path.join(evidenceDir, name), payloads[name]);
-  }
+  const stagedNames = EVIDENCE_FILES.filter((name) => payloads[name] !== undefined);
+  for (const name of stagedNames) stageFile(path.join(evidenceDir, name), payloads[name]);
   // Printed as soon as the bytes exist and BEFORE the ownership commit: this
   // line is a forensic record of what this process wrote to disk, not a claim
   // about which invocation owns the output-dir. Emitting it late — or only on
@@ -1237,7 +1306,25 @@ const runSubcommand = async ({
   // this invocation just declined to own would be advertising someone else's
   // run as its own.
   if (env.GITHUB_OUTPUT) {
-    const outputs = { 'command-exit-code': commandExitCode, 'session-id': state.sessionId };
+    const outputs = {
+      'command-exit-code': commandExitCode,
+      'session-id': state.sessionId,
+      // What the upload step needs, from the only process that can honestly
+      // say it (Codex T6 r1 #3). The upload step runs `always()`, cannot
+      // inspect the filesystem for a trustworthy answer, and must not simply
+      // point at a well-known path: by the time it runs, anything could be
+      // sitting there. So this step reports WHERE it staged — its own
+      // invocation-scoped child, which a stale sibling can never be inside —
+      // and exactly WHAT it put there. An empty `evidence-staged` closes the
+      // upload gate entirely.
+      //
+      // Deliberately not conditioned on the report rendering: a renderer
+      // failure still staged an authenticated session.log, and suppressing
+      // that would throw away evidence this process proved (Codex's explicit
+      // warning against gating upload on `report`).
+      'evidence-dir': evidenceDir,
+      'evidence-staged': stagedNames.join(' '),
+    };
     if (reportRendered) {
       outputs['event-count'] = eventCount;
       outputs['report-path'] = path.join(evidenceDir, 'report.md');
@@ -1278,25 +1365,23 @@ const runSubcommand = async ({
 // It still runs with `if: always()` so a human gets the summary even when the
 // wrapped command failed.
 const reportSubcommand = ({ outputDir, env = process.env }) => {
-  const evidenceDir = resolveEvidenceDir(outputDir);
-  // No nonce, no publish — decided before state is even read (Codex T6
-  // ruling). `start` writes DEBUG_ACTION_INVOCATION_NONCE to GITHUB_ENV and
-  // the runner injects it into every later step, so its absence means `start`
-  // never reached that line or the wiring that carries it was cut. Either way
-  // this step cannot show that the staged bytes belong to this invocation,
-  // and "a state file exists" is not a substitute: an output-dir is reusable
-  // across steps and across jobs on a self-hosted runner, so a PREVIOUS
-  // invocation's state and evidence sit at exactly these paths. Degrading to
-  // that check would append somebody else's report to this job's summary and
-  // hand their session.log to this job's upload step under this job's
-  // artifact name. Clearing is part of the refusal for the same reason it is
-  // in the foreign-nonce path below: this step runs BEFORE the upload step,
-  // so leaving unowned files staged is publishing them.
-  if (!env.DEBUG_ACTION_INVOCATION_NONCE) {
-    clearStagedEvidence(evidenceDir);
-    process.stderr.write('debug-evidence-action: report: this step received no invocation nonce, so nothing staged here can be shown to belong to this run; publishing nothing and clearing the staged evidence.\n');
-    return 3;
-  }
+  // No identity, no publish — decided before state is read and before any
+  // path is resolved. `start` emits this invocation's nonce as a step output
+  // as its very first action, so an empty one means this invocation's `start`
+  // never ran that far. Whatever is in the output-dir was then written by
+  // somebody else, and "a state file exists" is not a substitute for
+  // ownership: an output-dir is reusable across steps and across jobs on a
+  // self-hosted runner. Degrading to that check would append a stranger's
+  // report to this job's summary.
+  //
+  // Nothing is deleted on this path, and that is deliberate: staging is
+  // invocation-scoped, so the only directories that could be cleared here
+  // belong to OTHER invocations — possibly a live concurrent one. Their
+  // evidence is not this step's to ship and not this step's to destroy, and
+  // it cannot leak into this job's artifact either way, because the upload
+  // step is gated on THIS invocation's `run` outputs (Codex T6 r1 #3).
+  if (requireInvocationNonce(env, 'report')) return 3;
+  const evidenceDir = resolveEvidenceDir(outputDir, env.DEBUG_ACTION_INVOCATION_NONCE);
   const state = readState(outputDir);
   // Is this invocation's own run what wrote these slots? Absent state and a
   // foreign nonce both mean no, and in both cases whatever is sitting in the
@@ -1353,6 +1438,7 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
 // step's is the command-failure mirror, which is not security-critical: a
 // hostile wrapped command chooses its own exit code regardless.
 const finishSubcommand = ({ outputDir, env = process.env }) => {
+  if (requireInvocationNonce(env, 'finish')) return 3;
   const state = readState(outputDir);
   if (!state) {
     process.stderr.write('debug-evidence-action: finish: no recorded state; the start step never completed.\n');
