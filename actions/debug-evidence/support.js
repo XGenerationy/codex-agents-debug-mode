@@ -27,26 +27,36 @@ const EVIDENCE_SUBDIR = 'debug-evidence-files';
 const BOOT_SHIM = path.join(__dirname, 'collector_boot.js');
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
-// THE PLATFORM PREREQUISITE, detected rather than assumed (Codex T6 r5).
+// THE PLATFORM PREREQUISITE, detected rather than assumed (Codex T6 r5,
+// classification corrected after the r6 Critical).
 //
 // Every in-process guarantee this action rests on — the trusted `run` process,
 // the verification key held only in its memory, the collector's private
-// signing key — assumes the host REFUSES classic same-UID ptrace attachment.
-// Under Linux Yama `ptrace_scope = 0` a same-user process may attach to any
-// dumpable process of the same user, and the kernel documentation names
-// arbitrary code injection as a consequence: a hostile native wrapped command
-// could rewrite `run`'s memory or read the collector's signing state (its pid
-// is in the state file), and "authenticated evidence" would mean nothing.
+// signing key — assumes the host FORBIDS same-UID ptrace attachment. A
+// same-user process that can attach may, per the kernel documentation, inject
+// code: a hostile native wrapped command could rewrite `run`'s memory or read
+// the collector's signing state (its pid is in the state file), and
+// "authenticated evidence" would mean nothing.
 //
-// The action cannot create that boundary — making the processes non-dumpable
-// would not stop a caller who granted CAP_SYS_PTRACE — so it does the next
-// honest thing: read the policy once, record it, and label the evidence when
-// it is not established. Classification is conservative in one direction only.
-// `restricted` requires a value this code positively understood; EVERYTHING
-// else, including a file it could not read, a value it could not parse and a
-// platform with no Yama at all, is `unknown` and labels the evidence. A policy
-// that could not be read is never a policy assumed in the host's favour.
+// Only Yama mode 3 forbids attachment unconditionally. Modes 1 and 2 restrict
+// it to a descendant or to a privileged process, and BOTH are bypassable with
+// CAP_SYS_PTRACE — which is not a theoretical escape here, because standard
+// VM-based GitHub-hosted Linux runners give workflow commands PASSWORDLESS
+// SUDO. A command that can `sudo` can grant itself the capability and attach.
+// Reading the current process's own capabilities would not detect this: the
+// escalation path is sudo, not an inherited capability. So mode 1 — the
+// hosted-runner default — is `privilege-bypassable`, and calling it
+// "restricted" (as this code did) was the action's core authentication
+// guarantee silently failing on its principal platform.
+//
+// The action cannot create the boundary. It classifies honestly, and
+// `startSubcommand` refuses to run the wrapped command at all unless the
+// prerequisite is POSITIVELY ESTABLISHED — which is `unconditional` and
+// nothing else. Every other value, including one this code does not recognise
+// (a future mode, a typo), a file it could not read, and a platform with no
+// Yama at all, is `unknown`: never read in the host's favour.
 const PTRACE_SCOPE_PATH = '/proc/sys/kernel/yama/ptrace_scope';
+const PTRACE_MODES = { 0: 'permissive', 1: 'privilege-bypassable', 2: 'privilege-bypassable', 3: 'unconditional' };
 const readPtraceScope = ({ platform = process.platform, readFile = readFileSync } = {}) => {
   if (platform !== 'linux') return 'unknown';
   let raw;
@@ -56,16 +66,20 @@ const readPtraceScope = ({ platform = process.platform, readFile = readFileSync 
     return 'unknown';
   }
   const text = String(raw).trim();
-  // Digits only: '' parses to 0 under Number(), which would read an empty or
-  // truncated file as the WEAKEST policy and then report it as a fact.
-  if (!/^\d+$/.test(text)) return 'unknown';
-  return Number(text) >= 1 ? 'restricted' : 'permissive';
+  // A single recognised digit, and nothing else. `''` parses to 0 under
+  // Number(), which would read an empty or truncated file as the weakest
+  // policy and then report it as a fact; `4`/`999` are modes this code has
+  // never heard of and must not guess at either way.
+  return PTRACE_MODES[text] ?? 'unknown';
 };
 
-// The label that travels with the evidence. Empty when the prerequisite holds,
-// so an ordinary report is unchanged; otherwise one line naming exactly what
-// was found, rendered above the evidence it qualifies.
-const platformCaveats = (ptraceScope) => (ptraceScope === 'restricted' ? [] : [
+// The prerequisite is met at exactly one value. Written once, used everywhere,
+// so no caller can drift into treating a bypassable mode as a boundary.
+const ptraceBoundaryEstablished = (ptraceScope) => ptraceScope === 'unconditional';
+
+// The qualification, in the words used on all three surfaces. Empty when the
+// prerequisite holds, so an ordinary report is unchanged.
+const platformCaveats = (ptraceScope) => (ptraceBoundaryEstablished(ptraceScope) ? [] : [
   `The in-process guarantees were NOT established on this host (same-UID ptrace policy: ${ptraceScope ?? 'unknown'}).`
   + ' A same-user process may be able to attach to the collector or to the capturing step and read or alter the memory this evidence depends on.',
 ]);
@@ -151,9 +165,17 @@ const isInsideDirectory = (parent, candidate) => {
 const validateActionInputs = ({
   runCommand, sessionName, failOnCommandFailure, port, maxEvents, maxBytes,
   hypothesisId, workingDirectory = '.', outputDir = '', workspace = '',
+  evidenceTrust = 'strict',
 }) => {
   const errors = [];
   if (!runCommand || !runCommand.trim()) errors.push('run: a command is required');
+  // Two literals, exactly. This input decides whether the action runs an
+  // arbitrary command on a host where it cannot defend its own capture, so a
+  // value it cannot interpret is an error rather than something to round to
+  // the nearest meaning.
+  if (evidenceTrust !== 'strict' && evidenceTrust !== 'best-effort') {
+    errors.push("evidence-trust: must be 'strict' or 'best-effort'");
+  }
   if (!NAME_PATTERN.test(sessionName)) errors.push('session-name: must match [A-Za-z0-9_-]+');
   if (failOnCommandFailure !== 'true' && failOnCommandFailure !== 'false') {
     errors.push("fail-on-command-failure: must be 'true' or 'false'");
@@ -527,7 +549,11 @@ const startSubcommand = async ({
   request = httpRequestJson, probeToken = probeLaunchToken,
   writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
-  ptraceScope = readPtraceScope(),
+  // A SEAM, not a default value: evaluating `readPtraceScope()` as a default
+  // parameter would run it before this function's body, and therefore before
+  // the identity outputs below — contradicting the "first act" invariant those
+  // outputs are pinned by (Codex T6 r6, ordering).
+  readPtrace = readPtraceScope,
 }) => {
   // THE FIRST THING THIS PROCESS DOES, ahead of validation and ahead of any
   // filesystem work: publish this invocation's identity as a STEP OUTPUT.
@@ -564,20 +590,39 @@ const startSubcommand = async ({
       'evidence-dir': resolveEvidenceDir(outputDir, nonce),
     });
   }
-  // Read once, here, and carried in state from now on: the policy cannot
-  // change under a running kernel, and every later step needs the same answer
-  // to label the same way. Warned about immediately — the step log is where an
-  // operator looks when a job's evidence turns out to be qualified — and NOT
-  // treated as a failure. A permissive host is a weaker platform, not a
-  // detected attack, and refusing would strand legitimate self-hosted callers
-  // with no way forward (Codex T6 r5; escalation to a refusal is the
-  // reviewer's call, not this code's assumption).
-  if (ptraceScope !== 'restricted') {
-    process.stderr.write(`debug-evidence-action: start: WARNING: the in-process guarantees this action's evidence rests on are NOT established on this host (same-UID ptrace policy: ${ptraceScope}). A same-user process may be able to attach to the collector or to the capturing step. The rendered evidence will carry this caveat.\n`);
-  }
   const workspace = env.GITHUB_WORKSPACE || '';
   const errors = validateActionInputs({ ...inputs, outputDir, workspace });
   if (errors.length > 0) throw new Error(`invalid inputs: ${errors.join('; ')}`);
+  // Read here — after the identity outputs, before anything is spawned or
+  // written — and carried in state from now on, so every later step answers
+  // the same way. Read ONCE, and deliberately not re-read later: a re-read
+  // would be defense in depth at best, never a fix, because a privileged actor
+  // can change modes 0-2 at runtime, including after any check this code makes
+  // (Codex T6 r6, ruling (c)). What the value is NOT is immutable.
+  const ptraceScope = readPtrace();
+  if (!ptraceBoundaryEstablished(ptraceScope)) {
+    // THE REFUSAL, and it happens here because here is the last moment that is
+    // still before the wrapped command exists (Codex T6 r6).
+    //
+    // Labeling alone cannot be a security control on this platform: the whole
+    // hazard is a command able to rewrite `run`, and such a command can strip
+    // the caveat that warns about it. Only a refusal that precedes the command
+    // is out of its reach. `start` returning 3 fails this step, and the run
+    // step is unconditional — so the runner skips it and the command never
+    // executes at all.
+    //
+    // The diagnostic has to leave the caller somewhere to go, so it names what
+    // was found, why that is not a boundary, and both ways forward.
+    if (inputs.evidenceTrust !== 'best-effort') {
+      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}). Only Linux Yama ptrace_scope 3 forbids same-UID attachment unconditionally — modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and GitHub-hosted runners grant workflow commands passwordless sudo, so a hostile command can elevate and attach to the collector or to the capturing step. Either run on a host with ptrace_scope 3, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
+      return 3;
+    }
+    // Opted in. This copy of the qualification is the TRUSTWORTHY one: it is
+    // streamed before the wrapped command exists, so nothing that command does
+    // afterwards can retract it. The other two copies (run's pre-digest line
+    // and the report caveat) are written after it has run.
+    process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step, so the capture below cannot be treated as tamper-resistant. This line is written before the wrapped command runs and cannot be retracted by it.\n`);
+  }
   // Containment layer 2 (Codex T3 #3): the check above compares the paths as
   // WRITTEN, so an output-dir that merely RESOLVES into the workspace — a
   // symlink pointing back inside the checkout, or a workspace that is itself
@@ -707,9 +752,12 @@ const startSubcommand = async ({
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
-      // Detected here, consumed by `run` when it renders: the label belongs on
-      // the evidence, and only this step is in a position to have looked.
+      // Detected here, consumed by `run` when it qualifies and renders: the
+      // label belongs on the evidence, and only this step is in a position to
+      // have looked before the wrapped command existed. Reaching this line
+      // with anything but `unconditional` means the caller opted in.
       ptraceScope,
+      evidenceTrust: inputs.evidenceTrust,
     }));
   } catch (error) {
     // Covers a failed lock acquisition too, and must: a collector whose state
@@ -1140,14 +1188,17 @@ const RUNNER_COMMAND_FILE_VARS = [
 // kill the collector, and authors every event in the log. What it cannot
 // reach is the copy this process read before the command started.
 //
-// And that much is CONDITIONAL on the platform (Codex T6 r5). It holds where
-// the host refuses classic same-UID ptrace attachment — Linux Yama
-// ptrace_scope >= 1, the default on GitHub-hosted runners. Where such
-// attachment is permitted, a hostile native command can attach to this
-// process, or to the collector whose pid is in state, and read or inject
-// memory; no in-process argument survives that. `start` detects the policy
-// and records it, and the evidence rendered below carries a caveat when it is
-// not established. The action labels the platform; it does not create it.
+// And that much is CONDITIONAL on the platform (Codex T6 r5, corrected r6). It
+// holds only where the host refuses same-UID ptrace attachment, and only Linux
+// Yama ptrace_scope 3 does that unconditionally: modes 1 and 2 are bypassable
+// with CAP_SYS_PTRACE, and GitHub-hosted runners ship mode 1 together with
+// passwordless sudo. Where attachment is reachable, a hostile native command
+// can attach to this process, or to the collector whose pid is in state, and
+// read or inject memory; no in-process argument survives that. `start` refuses
+// to run the wrapped command at all unless the policy is positively
+// established, and a caller who sets `evidence-trust: best-effort` gets
+// evidence labeled as unverifiable-by-construction instead. The action
+// classifies the platform; it does not create the boundary on it.
 //
 // This also means the verification key is read BEFORE the command runs. It is
 // public, so a child reading /proc/<ppid>/environ learns nothing it can use;
@@ -1380,6 +1431,15 @@ const runSubcommand = async ({
   // about which invocation owns the output-dir. Emitting it late — or only on
   // the paths that go on to succeed — would leave exactly the failure windows
   // undocumented.
+  // The qualification belongs BESIDE the digest, because the digest is the
+  // authoritative record of what this process staged and the two are read
+  // together (Codex T6 r6, ruling (b)). Printed even on the renderer-failure
+  // classes, where only session.log is staged and there is no report.md to
+  // carry a caveat — those are exactly the runs where the log copy is the only
+  // copy. `start` printed the trustworthy copy before the command existed;
+  // this one and the report caveat are both written after it ran, and a
+  // command that can rewrite this process could suppress either.
+  for (const caveat of platformCaveats(state.ptraceScope)) writeStdout(`evidence-qualification ${caveat}\n`);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   // Ownership check and commit as ONE indivisible step. The snapshot in
   // `state` was read before a wrapped command that may have run for an hour,
@@ -1609,6 +1669,9 @@ const main = async () => {
     maxBytes: env.DEBUG_ACTION_MAX_BYTES_INPUT || '',
     hypothesisId: env.DEBUG_ACTION_HYPOTHESIS_ID || '',
     hypothesisTitle: env.DEBUG_ACTION_HYPOTHESIS_TITLE || '',
+    // Defaulted to the SAFE literal, never to whatever the env happens to
+    // carry: an absent input means the caller has not opted out of anything.
+    evidenceTrust: env.DEBUG_ACTION_EVIDENCE_TRUST || 'strict',
   };
   try {
     if (subcommand === 'start') {

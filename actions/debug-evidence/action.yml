@@ -64,6 +64,16 @@ inputs:
     description: "Optional title for the hypothesis line; ignored without hypothesis-id"
     required: false
     default: ""
+  evidence-trust:
+    description: >-
+      'strict' (default): refuse to run the wrapped command at all unless the
+      host positively establishes the in-process boundary this action's
+      evidence depends on — Linux Yama ptrace_scope 3. 'best-effort': run
+      anyway and label the evidence as unverifiable-by-construction. NOTE that
+      strict REFUSES on standard GitHub-hosted runners, which ship ptrace_scope
+      1 plus passwordless sudo; hosted callers must opt in explicitly.
+    required: false
+    default: "strict"
 
 # Every output is produced by the RUN step, because run is where capture
 # happens: it is the only process that spans the wrapped command's execution,
@@ -129,6 +139,7 @@ runs:
         DEBUG_ACTION_MAX_BYTES_INPUT: ${{ inputs.max-bytes }}
         DEBUG_ACTION_HYPOTHESIS_ID: ${{ inputs.hypothesis-id }}
         DEBUG_ACTION_HYPOTHESIS_TITLE: ${{ inputs.hypothesis-title }}
+        DEBUG_ACTION_EVIDENCE_TRUST: ${{ inputs.evidence-trust }}
       run: node "${{ github.action_path }}/support.js" start
 
     - name: Run wrapped command
@@ -147,15 +158,22 @@ runs:
       # own copy of what it read before the command started.
       #
       # PLATFORM PREREQUISITE, because the claim is conditional and the file
-      # must say so (Codex T6 r5): it holds only where the host REFUSES classic
-      # same-UID ptrace attachment (Linux Yama ptrace_scope >= 1, the default
-      # on GitHub-hosted runners). Where same-UID attachment is permitted
-      # (ptrace_scope = 0, or a container granted CAP_SYS_PTRACE) a hostile
-      # native command can attach to this process — or to the collector, whose
-      # pid is in the state file — and read or inject memory, which defeats
-      # authenticated evidence outright. `start` detects the policy and records
-      # it; when it is not established, the rendered report.md and report.json
-      # carry a caveat saying so. The action labels that platform; it cannot
+      # must say so (Codex T6 r5, corrected r6): it holds only where the host
+      # refuses classic same-UID ptrace attachment, and ONLY Linux Yama
+      # ptrace_scope 3 does that unconditionally. Modes 1 and 2 restrict
+      # attachment but are bypassable with CAP_SYS_PTRACE, and standard
+      # GitHub-hosted runners ship mode 1 WITH passwordless sudo — so a hostile
+      # native command there can elevate and attach to this process, or to the
+      # collector whose pid is in the state file, and read or inject memory,
+      # which defeats authenticated evidence outright.
+      #
+      # `start` therefore REFUSES to run the wrapped command at all unless the
+      # policy is positively established, which is mode 3 and nothing else.
+      # `evidence-trust: best-effort` opts out and takes clearly labeled
+      # evidence instead. Labeling alone could not be the control: the hazard
+      # is a command able to rewrite this process, and such a command can strip
+      # the caveat that warns about it — only a refusal that precedes the
+      # command is out of its reach. The action labels that platform; it cannot
       # create the boundary on it.
       #
       # (One more limit, load-bearing: a command an EARLIER invocation ran in

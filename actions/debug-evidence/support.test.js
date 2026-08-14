@@ -209,6 +209,7 @@ const baseInputs = (overrides = {}) => ({
   maxBytes: '',
   hypothesisId: '',
   hypothesisTitle: '',
+  evidenceTrust: 'strict',
   ...overrides,
 });
 
@@ -260,6 +261,7 @@ test('start boots a real collector, mints the session, and records state that ca
   writeFileSync(githubEnv, '');
   writeFileSync(githubOutput, '');
   const code = await startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ port: String(port) }),
     outputDir,
     projectRoot,
@@ -318,6 +320,7 @@ test('start emits the invocation nonce and the staging directory as its first ac
   writeFileSync(githubEnv, '');
   const refuse = (label) => () => { throw new Error(`a refused start must never ${label}`); };
   await assert.rejects(startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ runCommand: '' }),
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput, GITHUB_ENV: githubEnv },
@@ -346,6 +349,7 @@ test('start emits the invocation nonce and the staging directory as its first ac
   const secondOutput = path.join(second, 'github_output');
   writeFileSync(secondOutput, '');
   await assert.rejects(startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ runCommand: '' }),
     outputDir: second,
     env: { GITHUB_OUTPUT: secondOutput },
@@ -371,17 +375,23 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // missing identity must mean "do not read, do not act" (Codex T6 r1 #2).
 // `finish` takes the same posture: it reads the same state file, and an exit
 // code it cannot show belongs to this invocation is not this job's verdict.
-// THE PLATFORM PREREQUISITE (Codex T6 r5). Every in-process guarantee this
-// action rests on — the trusted run process, the verification key held in
-// memory, the collector's private signing key — assumes the host REFUSES
-// classic same-UID ptrace attachment. Under Linux Yama ptrace_scope 0 a
-// same-user process may attach to any dumpable process of the same user and,
-// per the kernel documentation, inject code: a hostile native wrapped command
-// could then rewrite `run`'s memory or read the collector's signing state
-// (its pid is in the state file), and authenticated evidence would mean
-// nothing. The action cannot create that boundary. It detects the policy,
-// records it, and labels the evidence when it is not established.
-test('the ptrace policy is read once, classified conservatively, and never guessed in favour of the host', () => {
+// THE PLATFORM PREREQUISITE (Codex T6 r5, rewritten after the r6 Critical).
+// Every in-process guarantee this action rests on — the trusted run process,
+// the verification key held only in its memory, the collector's private signing
+// key — assumes the host forbids same-UID ptrace attachment. Only Yama mode 3
+// does that unconditionally: modes 1 and 2 are bypassable with CAP_SYS_PTRACE,
+// and standard VM-based GitHub-hosted Linux runners hand workflow commands
+// PASSWORDLESS SUDO, so a hostile native command there can elevate, attach to
+// the waiting run process or to the collector (whose pid is in state), and
+// defeat authentication outright. Calling mode 1 "restricted" was therefore the
+// action's core guarantee silently failing on its principal platform.
+//
+// So: the prerequisite is POSITIVELY ESTABLISHED only at mode 3, and anything
+// less is refused before the wrapped command exists unless the caller has
+// consciously opted into best-effort evidence.
+const ESTABLISHED = () => 'unconditional';
+
+test('the ptrace policy is classified honestly: only mode 3 forbids attachment unconditionally', () => {
   const scope = (raw, platform = 'linux') => readPtraceScope({
     platform,
     readFile: () => {
@@ -389,69 +399,195 @@ test('the ptrace policy is read once, classified conservatively, and never guess
       return raw;
     },
   });
-  // The prerequisite is met at 1 (restricted), 2 (admin-only) and 3 (no
-  // attach), and only at those.
-  assert.equal(scope('1\n'), 'restricted');
-  assert.equal(scope('2\n'), 'restricted');
-  assert.equal(scope('3'), 'restricted');
-  // Classic same-UID attachment permitted: the guarantees do not hold here.
+  // The ONLY value that establishes the prerequisite.
+  assert.equal(scope('3\n'), 'unconditional');
+  // Bypassable with CAP_SYS_PTRACE — which a command holding passwordless sudo
+  // can simply grant itself. Named for what it is, never "restricted".
+  for (const mode of ['1', '2']) {
+    assert.equal(scope(`${mode}\n`), 'privilege-bypassable', `mode ${mode} is not a boundary`);
+  }
+  // Classic same-UID attachment permitted outright.
   assert.equal(scope('0\n'), 'permissive');
-  // Everything else is UNKNOWN, never "met": a policy this action could not
-  // read is not a policy it may assume in the host's favour.
-  for (const unreadable of [Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), '', '  ', 'yes', '-1', '1x']) {
-    assert.equal(scope(unreadable), 'unknown', `unreadable input ${JSON.stringify(String(unreadable))}`);
+  // Everything else is UNKNOWN, never read in the host's favour: values this
+  // code does not understand (a future mode, a typo), values it cannot parse,
+  // a file it could not read, and platforms with no Yama at all.
+  const unreadable = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  for (const junk of ['4', '999', '', '  ', 'yes', '-1', '1x', '03x', unreadable]) {
+    assert.equal(scope(junk), 'unknown', `unrecognised input ${JSON.stringify(String(junk))}`);
   }
-  // A host with no Yama at all is unknown too, whatever a file at that path
-  // might happen to say.
-  assert.equal(scope('1\n', 'win32'), 'unknown');
-  assert.equal(scope('1\n', 'darwin'), 'unknown');
+  assert.equal(scope('3\n', 'win32'), 'unknown');
+  assert.equal(scope('3\n', 'darwin'), 'unknown');
 });
 
-test('start records the ptrace policy in state and warns prominently when the prerequisite is not met', async () => {
-  for (const [policy, expectWarning] of [['restricted', false], ['permissive', true], ['unknown', true]]) {
+test('evidence-trust accepts exactly two literals and fails closed on anything else', () => {
+  assert.deepEqual(validateActionInputs(baseInputs({ evidenceTrust: 'strict' })), []);
+  assert.deepEqual(validateActionInputs(baseInputs({ evidenceTrust: 'best-effort' })), []);
+  for (const bad of ['', 'STRICT', 'Best-Effort', 'yes', 'best effort', 'loose']) {
+    assert.ok(
+      validateActionInputs(baseInputs({ evidenceTrust: bad })).some((error) => /evidence-trust/.test(error)),
+      `refuses ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('strict refuses before the wrapped command exists, and nothing downstream can run it', async () => {
+  for (const policy of ['privilege-bypassable', 'permissive', 'unknown']) {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
-    const port = await getFreePort();
-    const { written } = await captureStderr(async () => {
-      const code = await startSubcommand({
-        inputs: baseInputs({ port: String(port) }),
-        outputDir,
-        projectRoot,
-        env: {},
-        ptraceScope: policy,
-      });
-      assert.equal(code, 0, `${policy}: a weaker platform is not a failure`);
+    const githubOutput = path.join(outputDir, 'github_output');
+    writeFileSync(githubOutput, '');
+    const { result, written } = await captureStderr(() => startSubcommand({
+      inputs: baseInputs({ evidenceTrust: 'strict' }),
+      outputDir,
+      projectRoot,
+      env: { GITHUB_OUTPUT: githubOutput },
+      readPtrace: () => policy,
+      // The refusal happens BEFORE the collector exists, so there is nothing
+      // to tear down and nothing listening on the port.
+      spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
+    }));
+    assert.equal(result, 3, `${policy}: 3 is the machinery-failure class`);
+    // The diagnostic has to be actionable: what was found, why it is not a
+    // boundary, and both ways forward.
+    assert.match(written, new RegExp(`detected policy: ${policy}`), `${policy}: names what it found`);
+    assert.match(written, /refusing to run the wrapped command/);
+    assert.match(written, /passwordless sudo/, 'the hosted-runner reason is stated, not implied');
+    assert.match(written, /evidence-trust: best-effort/, 'the opt-out is named');
+    assert.equal(readState(outputDir), null, `${policy}: no state, so no collector to strand`);
+    // And the wrapped command cannot run afterwards either. In production the
+    // run step is unconditional, so a failed start SKIPS it (pinned by the
+    // guards test); here the same outcome is proved from the other side —
+    // there is no state, so run refuses without ever reaching the command.
+    const nonce = /^invocation-nonce=(.+)$/m.exec(readFileSync(githubOutput, 'utf8'))[1];
+    const runCode = await runSubcommand({
+      inputs: baseInputs(),
+      outputDir,
+      env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: nonce },
+      spawnCommand: () => { throw new Error('the wrapped command must never execute after a refusal'); },
     });
-    try {
-      assert.equal(readState(outputDir).ptraceScope, policy, `${policy}: recorded for the steps that label the evidence`);
-      assert.equal(
-        /WARNING: the in-process guarantees this action's evidence rests on are NOT established/.test(written),
-        expectWarning,
-        `${policy}: the step log warns exactly when the prerequisite is unmet`,
-      );
-      if (expectWarning) assert.match(written, new RegExp(`same-UID ptrace policy: ${policy}`));
-    } finally {
-      teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
-    }
+    assert.equal(runCode, 3, `${policy}: run refuses too`);
   }
 });
 
-test('run stamps the rendered evidence with the platform caveat, and omits it only when the prerequisite is met', async () => {
+test('the policy is read AFTER the identity outputs are published, never as a default parameter', async () => {
+  const outputDir = makeTempDir();
+  const githubOutput = path.join(outputDir, 'github_output');
+  writeFileSync(githubOutput, '');
+  let publishedWhenRead = null;
+  await captureStderr(() => startSubcommand({
+    inputs: baseInputs({ evidenceTrust: 'strict' }),
+    outputDir,
+    projectRoot: makeTempDir(),
+    env: { GITHUB_OUTPUT: githubOutput },
+    readPtrace: () => {
+      publishedWhenRead = readFileSync(githubOutput, 'utf8');
+      return 'permissive';
+    },
+    spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
+  }));
+  // start's first act is publishing this invocation's identity and its staging
+  // directory; a detector evaluated as a DEFAULT PARAMETER would run before the
+  // function body and so before both (Codex T6 r6, ordering).
+  assert.match(publishedWhenRead, /^invocation-nonce=/m, 'the nonce was already published');
+  assert.match(publishedWhenRead, /^evidence-dir=/m, 'and so was the staging directory');
+});
+
+test('best-effort proceeds and qualifies the evidence in all three places', async () => {
+  // (i) start's step log, BEFORE the wrapped command exists. This is the
+  //     trustworthy copy: immutable once streamed, and no later process can
+  //     retract it.
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  const port = await getFreePort();
+  const { written } = await captureStderr(async () => {
+    const code = await startSubcommand({
+      inputs: baseInputs({ port: String(port), evidenceTrust: 'best-effort' }),
+      outputDir,
+      projectRoot,
+      env: {},
+      readPtrace: () => 'privilege-bypassable',
+    });
+    assert.equal(code, 0, 'an opted-in caller proceeds');
+  });
+  try {
+    assert.match(written, /BEST-EFFORT/);
+    assert.match(written, /detected policy: privilege-bypassable/);
+    const state = readState(outputDir);
+    assert.equal(state.ptraceScope, 'privilege-bypassable');
+    assert.equal(state.evidenceTrust, 'best-effort');
+  } finally {
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
+  }
+
+  // (ii) run's own log, immediately before the digest line — beside the
+  //      authoritative trust-unit record rather than somewhere else in the job
+  //      (Codex T6 r6 ruling (b)) — and (iii) the report caveat, which is the
+  //      strippable copy that only helps on an honest run.
+  const runDir = makeTempDir();
+  writeState(runDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot: makeTempDir(), failOnCommandFailure: 'true',
+    ptraceScope: 'privilege-bypassable', evidenceTrust: 'best-effort',
+  });
+  const printed = [];
+  const code = await captureViaRun({
+    outputDir: runDir,
+    env: RUN_ENV,
+    readLive: collectorAnswer([{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }]),
+    writeStdout: (text) => printed.push(text),
+  });
+  assert.equal(code, 0);
+  const digestIndex = printed.findIndex((text) => text.startsWith('evidence-sha256'));
+  assert.ok(digestIndex > 0, 'the digest line was printed');
+  assert.match(printed[digestIndex - 1], /the in-process guarantees were NOT established/i,
+    'the qualification sits immediately before the digest it qualifies');
+  const report = JSON.parse(readFileSync(path.join(resolveEvidenceDir(runDir, 'n1'), 'report.json'), 'utf8'));
+  assert.ok(report.caveats.some((caveat) => caveat.includes('privilege-bypassable')));
+});
+
+test('a renderer failure still gets the qualification: it belongs to the log, not to the report', async () => {
+  // The class where only session.log is staged. The report caveat cannot exist
+  // here, which is exactly why the log copy is the one that matters.
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot: makeTempDir(), failOnCommandFailure: 'true',
+    ptraceScope: 'permissive', evidenceTrust: 'best-effort',
+  });
+  const printed = [];
+  const code = await captureViaRun({
+    outputDir,
+    env: RUN_ENV,
+    readLive: collectorAnswer([{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }]),
+    renderReport: () => { throw new Error('renderer exploded'); },
+    writeStdout: (text) => printed.push(text),
+  });
+  assert.equal(code, 3);
+  assert.equal(existsSync(path.join(resolveEvidenceDir(outputDir, 'n1'), 'report.json')), false);
+  const digestIndex = printed.findIndex((text) => text.startsWith('evidence-sha256'));
+  assert.ok(digestIndex > 0, 'session.log still has a digest');
+  assert.match(printed[digestIndex - 1], /the in-process guarantees were NOT established/i);
+});
+
+test('run stamps the rendered evidence with the platform caveat, and omits it only when the prerequisite is established', async () => {
   const served = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }];
-  for (const [policy, expectStamp] of [['restricted', false], ['permissive', true], ['unknown', true], [undefined, true]]) {
+  for (const [policy, expectStamp] of [
+    ['unconditional', false],
+    ['privilege-bypassable', true],
+    ['permissive', true],
+    ['unknown', true],
+    [undefined, true],
+  ]) {
     const outputDir = makeTempDir();
-    const projectRoot = makeTempDir();
     writeState(outputDir, {
       nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
-      projectRoot, failOnCommandFailure: 'true', ptraceScope: policy,
+      projectRoot: makeTempDir(), failOnCommandFailure: 'true', ptraceScope: policy,
     });
     const code = await captureViaRun({ outputDir, env: RUN_ENV, readLive: collectorAnswer(served) });
-    assert.equal(code, 0, `${policy}: labeling is not refusing`);
+    assert.equal(code, 0, `${policy}: labeling is not refusing — the refusal already happened in start`);
     const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
     const markdown = readFileSync(path.join(evidenceDir, 'report.md'), 'utf8');
     const json = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
-    // The label travels WITH the artifact, on both surfaces — a reader who has
-    // the evidence and not the job log must still see it.
     assert.equal(/> \*\*Caveat:\*\*[^\n]*in-process guarantees were NOT established/.test(markdown), expectStamp,
       `${policy}: markdown stamp`);
     assert.equal(
@@ -459,11 +595,8 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
       expectStamp,
       `${policy}: json stamp`,
     );
-    if (expectStamp) {
-      // An absent record is labeled as UNKNOWN rather than silently trusted:
-      // state written by an older start, or by anything else, may not carry it.
-      assert.ok(json.caveats[0].includes(`same-UID ptrace policy: ${policy ?? 'unknown'}`), `${policy}: names what was found`);
-    }
+    // An absent record labels as unknown rather than being silently trusted.
+    if (expectStamp) assert.ok(json.caveats[0].includes(`same-UID ptrace policy: ${policy ?? 'unknown'}`));
   }
 });
 
@@ -499,6 +632,7 @@ test('a shim that never reports startup times out AND is killed, not left runnin
   const silent = fakeChild();
   await assert.rejects(
     () => startSubcommand({
+      readPtrace: ESTABLISHED,
       inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
       spawnShim: () => silent, readyTimeoutMs: 200,
     }),
@@ -511,6 +645,7 @@ test('start surfaces the shim error line: a structured stderr reason reaches the
   const outputDir = makeTempDir();
   const child = fakeChild();
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child, readyTimeoutMs: 5_000,
   });
@@ -528,6 +663,7 @@ test('a spawn failure rejects instead of escaping as an uncaught error event', a
   const outputDir = makeTempDir();
   const child = fakeChild();
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child, readyTimeoutMs: 5_000,
   });
@@ -544,6 +680,7 @@ test('start kills the collector when its state cannot be recorded, leaving no un
   const child = fakeChild();
   const killed = [];
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -568,6 +705,7 @@ test('a healthy start records state first, then RELEASES the shim pipes instead 
     child[name].unref = () => released.push(`${name}:unref`);
   }
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -645,6 +783,7 @@ test('start refuses an output-dir that only lands inside the workspace once syml
     'lexically this path is outside the workspace — only realpath can tell');
   await assert.rejects(
     () => startSubcommand({
+      readPtrace: ESTABLISHED,
       inputs: baseInputs(), outputDir: link, projectRoot: makeTempDir(),
       env: { GITHUB_WORKSPACE: workspace }, spawnShim,
     }),
@@ -659,6 +798,7 @@ test('start refuses an output-dir that only lands inside the workspace once syml
   assert.deepEqual(validateActionInputs({ ...baseInputs(), outputDir: nested, workspace: workspaceLink }), []);
   await assert.rejects(
     () => startSubcommand({
+      readPtrace: ESTABLISHED,
       inputs: baseInputs(), outputDir: nested, projectRoot: makeTempDir(),
       env: { GITHUB_WORKSPACE: workspaceLink }, spawnShim,
     }),
@@ -680,6 +820,7 @@ test('the shim splits redact-names on whitespace as well as commas, so "A B,C" i
     CHARLIE_VALUE: 'charlie3333cccc',
   };
   const code = await startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ port: String(port), redactNames: 'ALPHA_VALUE BRAVO_VALUE,CHARLIE_VALUE' }),
     outputDir,
     projectRoot,
@@ -728,7 +869,7 @@ const startReal = async (overrides = {}) => {
   // shortcut through state or the filesystem.
   const startOutput = path.join(outputDir, 'start_output');
   writeFileSync(startOutput, '');
-  const code = await startSubcommand({ inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
+  const code = await startSubcommand({ readPtrace: ESTABLISHED, inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
   assert.equal(code, 0);
   const emitted = readFileSync(startOutput, 'utf8');
   const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-verify-key='));
@@ -862,6 +1003,7 @@ test('a session-mint failure kills the collector in start, so nothing is left ho
   const killed = [];
   let requests = 0;
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -887,6 +1029,7 @@ test('start challenges the port occupant before the launch token is ever put on 
   const killed = [];
   let requests = 0;
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -956,6 +1099,7 @@ test('start masks each token the moment it exists and in the order it is used, b
   // through wide open (Codex T4 #1).
   const ledger = [];
   const starting = startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' }),
     outputDir,
     projectRoot: makeTempDir(),
@@ -998,7 +1142,7 @@ test('run re-registers the session token with the runner before handing it to a 
   const outputDir = makeTempDir();
   const sessionToken = 'z'.repeat(43);
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
     sessionId: 'ci-debug-abc', sessionToken,
     hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
   });
@@ -2511,7 +2655,7 @@ test('render and digest never re-read the staged path: the payload is one immuta
   ];
   const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
     sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
     hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
     commandExitCode: 0, failOnCommandFailure: 'true',
@@ -2593,7 +2737,7 @@ test('the digests are computed from the payload, not from the sink: a lossy writ
   const lines = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' }];
   const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
     sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
     commandExitCode: 0, failOnCommandFailure: 'true',
   });
@@ -3054,6 +3198,7 @@ test('the boot handshake and the state file carry no private key material', asyn
   const startOutput = path.join(outputDir, 'start_output');
   writeFileSync(startOutput, '');
   const code = await startSubcommand({
+    readPtrace: ESTABLISHED,
     inputs: baseInputs({ port: String(port) }),
     outputDir,
     projectRoot,
@@ -3612,6 +3757,10 @@ test('action.yml declares a composite action with exactly these inputs and defau
       'max-bytes': '',
       'hypothesis-id': '',
       'hypothesis-title': '',
+      // The default that REFUSES on a standard hosted runner. Pinned here
+      // because a silent flip to 'best-effort' would turn every unverifiable
+      // host back into a green run (Codex T6 r6).
+      'evidence-trust': 'strict',
     },
   );
   // The one input with no default is the one the action cannot invent.
@@ -3681,6 +3830,7 @@ test('every step env is exactly what its subcommand reads — no more, no less',
     DEBUG_ACTION_MAX_BYTES_INPUT: '${{ inputs.max-bytes }}',
     DEBUG_ACTION_HYPOTHESIS_ID: '${{ inputs.hypothesis-id }}',
     DEBUG_ACTION_HYPOTHESIS_TITLE: '${{ inputs.hypothesis-title }}',
+    DEBUG_ACTION_EVIDENCE_TRUST: '${{ inputs.evidence-trust }}',
   });
   // run reads the command and its working directory; everything else it needs
   // is in the state start committed.
@@ -3869,12 +4019,34 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   const platformClaims = [
     {
       what: 'the ptrace prerequisite',
-      required: /it holds only where the host refuses classic same-uid ptrace attachment/i,
+      required: /it holds only where the host\s+refuses classic same-uid ptrace attachment/i,
       forbidden: /(?:regardless of|whatever) the host'?s? ptrace|on any host/i,
     },
     {
-      what: 'what a permissive host costs',
-      required: /can attach to this process[^.]*and read or inject memory, which defeats\s+authenticated evidence/i,
+      what: 'that only mode 3 establishes it',
+      required: /only linux yama\s+ptrace_scope 3 does that unconditionally/i,
+      // The exact overclaim the r6 Critical was: modes 1 and 2 counted as a
+      // boundary, which is the hosted-runner default.
+      forbidden: /ptrace_scope >= 1|modes? 1 and 2 (?:are|is) (?:enough|sufficient|a boundary)/i,
+    },
+    {
+      what: 'why modes 1 and 2 are not a boundary here',
+      required: /bypassable with cap_sys_ptrace, and standard\s+github-hosted runners ship mode 1 with passwordless sudo/i,
+      forbidden: /cap_sys_ptrace (?:is|remains) (?:theoretical|unreachable)/i,
+    },
+    {
+      what: 'that the action refuses rather than merely labels',
+      required: /refuses to run the wrapped command at all unless the\s+policy is positively established/i,
+      forbidden: /proceeds anyway and labels the evidence(?! instead)/i,
+    },
+    {
+      what: 'why labeling alone cannot be the control',
+      required: /such a command can strip\s+the caveat that warns about it/i,
+      forbidden: /the caveat (?:is|remains) sufficient|labeling alone is enough/i,
+    },
+    {
+      what: 'what an unestablished host costs',
+      required: /attach to this process, or to the\s+collector whose pid is in the state file, and read or inject memory,\s+which defeats authenticated evidence/i,
       forbidden: /(?:ptrace|attachment) (?:is|remains) (?:irrelevant|not a concern|out of scope entirely)/i,
     },
     {
