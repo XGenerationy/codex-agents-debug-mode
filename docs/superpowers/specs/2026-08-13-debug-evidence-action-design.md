@@ -83,8 +83,14 @@ producing step has run — documented per-output, closeout style):
 |---|---|---|
 | `command-exit-code` | `run` step | Exit code of the wrapped command (string). |
 | `session-id` | `run` step | Collector session id for the wrapped run. |
-| `event-count` | `report` step | Events captured in the session. |
-| `report-path` | `report` step | Absolute path of `report.md` inside `output-dir`. |
+| `event-count` | `run` step | Events captured in the session. |
+| `report-path` | `run` step | Absolute path of `report.md` inside `output-dir`. |
+| `evidence-digest` | `run` step | SHA-256 of each staged evidence file. A convenience copy of the step-log digests, never the trust anchor (see the artifact section). |
+
+*(Table corrected, Task 6: capture moved from `report` into `run` in Task 5 round
+6, so every evidence-asserting output is produced by `run`. Output existence does
+not imply authenticity — a red `run` still publishes outputs describing labeled
+partial evidence.)*
 
 Step chain (composite, `shell: bash` everywhere):
 
