@@ -3333,7 +3333,14 @@ earlier gloss "two PATH entries resolving to the same file count twice" was
 misleading in one direction.)* Precisely: candidates are deduplicated by EXACT
 SPELLING before inspection, so `/usr/bin:/usr/bin` yields count 1; two DISTINCT
 spellings count separately even when they resolve to the same file, so `/a/sudo`
-and `/b/sudo` yield count 2 regardless of filesystem identity.
+and `/b/sudo` yield count 2 regardless of filesystem identity (no `realpath`, no
+inode comparison). *(Added, round 16, verified empirically by the implementer —
+without this sentence a reader recomputing the digest from their raw `PATH` gets
+a different answer.)* **Deduplication happens on the DERIVED CANDIDATE, not on
+the raw `PATH` entry** — after trailing-slash normalisation and after the three
+conventional paths are merged in. So `/usr/bin:/usr/bin/` yields count 1, and a
+`PATH` entry naming `/usr/bin` does not double-count against the conventional
+`/usr/bin/sudo`.
 
 Fix commit message:
 `fix(action): accept the producer's real count range and restrict readings to printable ASCII (Codex T6 r15)`.
