@@ -244,10 +244,24 @@ log (immutable once streamed) and the `evidence-digest` output — the recorded 
 always describe the intended bytes, so any post-staging swap is detectable against
 the artifact. *(Wording fixed, Task 5 round 8.)* The artifact is therefore NOT
 self-authenticating, and neither the artifact nor the Step Summary alone is
-authoritative: the unit of trust is **the artifact plus the matching digest from
-the trusted `run` process's step log**. Duplicate or conflicting `evidence-sha256`
-lines invalidate the artifact; the `evidence-digest` output is a convenience, not
-the trust anchor. Output existence likewise does not imply authenticity — a red
+authoritative. *(Made conditional, Task 6 round 7 — the claim below holds only
+under a successful strict admission.)* **The trust regime depends on
+`evidence-trust`:**
+
+- **After a successful `strict` admission** (the platform prerequisite was
+  positively established — Yama mode 3 or real isolation), the unit of trust is
+  **the artifact plus the matching digest from the trusted `run` process's step
+  log**. Duplicate or conflicting `evidence-sha256` lines invalidate the artifact;
+  the `evidence-digest` output is a convenience, not the trust anchor.
+- **In `best-effort` mode**, the artifact, the digest, the rendered report and the
+  post-command qualification are **diagnostic claims only — none of them
+  authenticates the evidence**. The stated threat in that mode is precisely that
+  the wrapped command may rewrite `run`, forge its digest, or suppress its
+  qualification. The one trustworthy record is the pre-command warning in
+  `start`'s step log, and all it establishes is that best-effort was consciously
+  selected — never that the resulting capture is tamper-resistant.
+
+Output existence likewise does not imply authenticity in either regime — a red
 `run` still publishes outputs describing labeled partial evidence, and the failed
 `run` outcome is the provenance signal.
 

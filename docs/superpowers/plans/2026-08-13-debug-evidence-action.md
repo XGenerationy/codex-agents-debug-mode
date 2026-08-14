@@ -2872,6 +2872,64 @@ Minors, and the Critical invalidates last round's central assumption.
 Fix commit message:
 `fix(action): refuse unless the ptrace boundary is positively established, honest mode classification (Codex T6 r6)`.
 
+#### Task 6 fix round 7 — Codex re-review decisions (recorded before code moves)
+
+Codex on `99d4d0e`: the strict refusal placement, the no-spawn proof, the
+identity-before-detection ordering, the three qualification copies and the
+disclosed test adaptations all check out, and the corrected platform-prerequisite
+block reads correctly. Rulings: **(a) keep `strict` as the default** — reversing
+it would recreate silent over-trust; (b) Task 8 documents that the DEFAULT hosted
+configuration refuses, but must NOT claim strict is unreachable — include the
+mode-3 hardening route; (c) the open upload gate after a refusal is acceptable
+(the invocation directory is empty, `if-no-files-found: ignore` uploads nothing,
+and retaining the pre-validation output preserves the identity invariant);
+(d) a Task 8 grammar note suffices for the log prefixes, but it must distinguish
+strict from best-effort and eventually define step provenance plus
+duplicate/conflicting-line handling. Important ×1, Minor ×3:
+
+1. **Best-effort inherits strict-mode trust claims (the Important).** Adding a
+   second trust regime left every trust claim unconditional: `action.yml:78` calls
+   `run` the process "whose account … can be trusted", lines 95–100 call its log
+   authoritative, `support.js:1486` repeats it, and spec:243 said artifact plus the
+   trusted `run` digest IS the unit of trust. Those hold only after a successful
+   STRICT admission. In best-effort the stated threat is exactly that the command
+   may rewrite `run`, forge its digest, or suppress its qualification. Make the
+   contract CONDITIONAL everywhere it appears:
+   - successful strict admission ⇒ artifact plus matching `run` digest is the
+     authenticated trust unit;
+   - best-effort ⇒ artifact, digest, report and post-command qualification are
+     DIAGNOSTIC CLAIMS ONLY; none authenticates the evidence;
+   - the pre-command `start` warning establishes ONLY that best-effort was
+     consciously selected — never that the later evidence is trustworthy.
+   Spec fixed by the coordinator in this same commit (done). The implementer fixes
+   every code-side site, with polarity pairs on each (required conditional form;
+   forbidden unconditional inverse).
+2. **The mode lookup resolves inherited properties (Minor).** `PTRACE_MODES` is a
+   plain object read as `PTRACE_MODES[text]`, so `__proto__`, `constructor` and
+   `toString` resolve inherited values instead of falling through to `unknown`.
+   The security predicate still refuses them, so it is not a boundary bypass, but
+   it violates the classification contract and can put objects/functions into
+   diagnostics or state. Use `Object.hasOwn`, a null-prototype object, or a `Map`,
+   plus one inherited-key test.
+3. **Explicit empty `evidence-trust` bypasses its own input error (Minor).**
+   `validateActionInputs` correctly rejects `''`, but `main()` normalises with
+   `|| 'strict'` first, so an explicitly empty action input is silently rounded
+   instead of raising the promised error. Use nullish/default-by-absence handling:
+   omitted ⇒ `strict`; explicit empty ⇒ validation error.
+4. **"Hosted callers must use best-effort" is not categorical (Minor).**
+   `action.yml:73` overstates it. A trusted EARLIER step can use the hosted
+   runner's own passwordless `sudo` to set `kernel.yama.ptrace_scope=3`, and mode
+   3 cannot subsequently be lowered — so strict IS reachable on hosted runners
+   after deliberate hardening. Reword to "hosted callers using the default mode 1
+   configuration must opt in or harden the runner first."
+   **Task 7 consequence (supersedes the round-6 demo note):** the dogfood workflow
+   SHOULD exercise the STRICT happy path by setting mode 3 in a prior step before
+   invoking the action, with a separate best-effort scenario if desired. That is
+   strictly better than demonstrating only the opt-out.
+
+Fix commit message:
+`fix(action): make the trust contract conditional on the admission mode, harden mode lookup and input defaulting (Codex T6 r7)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
