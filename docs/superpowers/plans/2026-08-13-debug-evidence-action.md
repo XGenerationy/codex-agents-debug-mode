@@ -2062,6 +2062,64 @@ action's `event-count`/`report-path`/`evidence-digest` outputs now map to
 Fix commit message:
 `fix(action): capture in the trusted run process, fail-closed exit 3, control-plane env hygiene (Codex T5 r6)`.
 
+#### Task 5 fix round 7 — pre-empted Critical (implementer-found; recorded before code moves)
+
+Found by the round-6 implementer on its own work at `8d65a63`, accepted by the
+coordinator without waiting for Codex: the unreachable-collector path is the
+round-6 Critical in a different suit, and it is reachable by the same actor.
+
+**The hole.** When no authenticated read is possible (`live_read_connect_failed`
+/ `_timeout` / `_unauthorized`), `run` stages the on-disk session log labeled
+`evidenceAuthentic: false`, sets `reportRendered: true`, and returns **0**; only
+`finish` fails the job, on `collectorAlive: false` read from
+`action-state.json`. The wrapped command can KILL the collector (same OS user),
+write a forged NDJSON log at the derivable `.debug/` path, and leave a detached
+child that rewrites `action-state.json` after `run`'s CAS commit and before
+`finish` reads it — flipping `collectorAlive`/`evidenceAuthentic` to true. Result:
+a green job carrying wholly attacker-authored evidence. Round 6's "a failed
+composite step cannot be un-failed" only protects the paths where `run` returns
+3; this path returns 0 and hands the verdict to a later step through an
+attacker-writable channel — exactly the shape Codex rejected in round 6.
+
+**Decision: the unreachable class returns 3 from `run`.** This is a
+where-not-what change: the exit table already rules "collector died before
+capture ⇒ fail with diagnostic (partial evidence still staged if readable)", so
+the job outcome is unchanged — only the deciding process moves from `finish`
+(untrusted, post-command) to `run` (trusted, spans command execution).
+- Staging behaviour is UNCHANGED: the labeled on-disk fallback is still staged
+  and still marked `evidenceAuthentic: false`, because partial evidence a human
+  can read is the point of the fallback. The label is a reader's aid, never a
+  gate.
+- `reportRendered` stays truthful for whatever was actually produced; `finish`
+  keeps its existing checks (belt — the job is already red).
+- The round-1 decision that a live-read failure MAY fall back to disk survives
+  intact; what changes is that falling back can no longer yield exit 0.
+- Nothing about the integrity classes changes: they still stage nothing and
+  return 3.
+
+**Tests.** (a) THE test: a wrapped command that kills the collector, writes a
+forged session log at the derivable path, and leaves a detached child which
+rewrites `action-state.json` to all-green after `run` commits — `run` must
+return 3, and the poisoned state must not change that; `finish` in the poisoned
+env is irrelevant because the action already failed. (b) The benign case: a
+collector that dies without an attacker still stages the labeled partial log AND
+returns 3, with the diagnostic intact. (c) Existing unreachable-path tests adapt
+from expecting 0 to expecting 3, keeping their staging assertions. Mutation: the
+unreachable class returning 0 again turns test (a) red.
+
+After this round, every evidence verdict — integrity failure, unreachable
+collector, and success — is decided inside `run`. `finish` retains only the
+command-failure mirror and teardown reporting, neither of which is
+security-critical (a hostile command chooses its own exit code regardless), which
+is recorded in the spec and queued for T8.
+
+Spec amendments (same commit): exit-table "collector died before capture" row
+notes the verdict is raised by `run`; invariant 10 gains the sentence that ALL
+evidence verdicts are made in `run`.
+
+Fix commit message:
+`fix(action): unreachable-collector verdict decided in run, not deferred to finish (pre-empted Critical)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`

@@ -260,7 +260,11 @@ the artifact.
     alongside `DEBUG_ACTION_*`; this raises the bar (the command must enumerate
     runner-temp command files) and is documented as such, never as a boundary.
     Command-failure semantics are deliberately outside this model: a hostile
-    command can always choose its own exit code.
+    command can always choose its own exit code. *(Extended, Task 5 round 7.)*
+    EVERY evidence verdict — integrity failure, unreachable collector, and
+    success — is decided inside `run`; none is deferred to a later step through
+    state or env. `finish` retains only the command-failure mirror and teardown
+    reporting, neither of which is security-critical.
 
 ## Exit semantics
 
@@ -270,7 +274,7 @@ the artifact.
 | wrapped command non-zero, `fail-on-command-failure: true` | fail: `command exited <code>` |
 | wrapped command non-zero, `fail-on-command-failure: false` | succeed; exit code in the `command-exit-code` output and visible in the step log (the wrapped command runs with inherited stdio). *(Amended after Task 5 spec review: the summary carries evidence only — `report.md` stays a deterministic render of the session, and the exit code's surfaces are the output and the log.)* |
 | evidence capture/report failure | fail (evidence integrity is the product; fail-closed) — *(Task 5 round 6)* raised by the `run` step itself as exit 3 with nothing staged, so no later step can reverse it |
-| collector died before capture | fail with diagnostic (partial evidence still staged if readable) |
+| collector died before capture | fail with diagnostic (partial evidence still staged if readable) — *(Task 5 round 7)* raised as exit 3 by `run` itself, not deferred to `finish`: the labeled fallback is a reader's aid, never a gate, and a later step must not be able to flip the verdict |
 | teardown failure after otherwise-green run | fail with diagnostic (leaked process on self-hosted is a real defect) |
 
 `finish` evaluates the recorded state fail-closed: an absent or unparsable state file, or
