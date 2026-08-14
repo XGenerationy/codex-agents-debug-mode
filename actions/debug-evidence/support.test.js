@@ -5336,7 +5336,15 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
     if (line.indent < indent) break;
     if (line.indent > indent) throw new Error(`unexpected indentation ${line.indent}: ${line.body}`);
     if (line.item) break; // the next sequence element starts here
-    const entry = /^([A-Za-z0-9_.-]+):(?:\s(.*))?$/.exec(line.body);
+    // ALL of the separation after the colon, not one character of it (Codex T7
+    // r5 #2). YAML treats the whitespace between a `:` and its value as
+    // separation rather than content, and a pattern that ate exactly one space
+    // stored ` *missing` for `runs-on:  *missing` — which is a non-empty string
+    // that begins with a space, so the anchor refusal below examined the space
+    // and waved the alias through. `[ \t]+` rather than `\s+` because a line
+    // break is not separation here: `key:` with nothing after it is the
+    // null/nested form the block below reads, and must keep reaching it.
+    const entry = /^([A-Za-z0-9_.-]+):(?:[ \t]+(.*))?$/.exec(line.body);
     if (!entry) throw new Error(`unparsed workflow line: ${line.body}`);
     const [, key, rawValue] = entry;
     // NOT LAST-WINS. A second `runs-on:`, or a second `with:` block, silently
@@ -5348,14 +5356,38 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
     if (key === '__proto__') throw new Error("workflow reader: '__proto__' is not a workflow key");
     if (Object.hasOwn(map, key)) throw new Error(`workflow reader: duplicate key '${key}'`);
     cursor.i += 1;
-    if (rawValue === '|') {
+    // BLOCK SCALARS, LITERAL AND FOLDED. `|` keeps the line breaks and `>`
+    // folds them to spaces; the `-` chomping indicator strips a trailing
+    // newline this reader never produced in the first place, so it is accepted
+    // and changes nothing. `>` was added in round 5 (Codex T7 r5 #3): the
+    // closeout gate writes one long `description:` that way and the reader
+    // could not read the gate AT ALL until it did — the body threw
+    // `unexpected indentation`, which is fail-closed and therefore invisible
+    // until something actually asked the reader to read that file.
+    //
+    // Blank lines are dropped before this point, so a folded body reads as one
+    // line and a literal body loses its paragraph breaks. That is a real limit
+    // of the reader, and it is why `run:` bodies are asserted over for WHICH
+    // LINES they contain rather than for their exact text.
+    const blockScalar = rawValue === undefined ? null : /^([|>])(-?)$/.exec(rawValue);
+    if (blockScalar) {
       const body = [];
       while (cursor.i < lines.length && lines[cursor.i].indent > indent) {
         body.push(lines[cursor.i].body);
         cursor.i += 1;
       }
-      map[key] = body.join('\n');
+      map[key] = body.join(blockScalar[1] === '|' ? '\n' : ' ');
       continue;
+    }
+    // EVERY OTHER BLOCK-SCALAR HEADER IS REFUSED, NOT STORED. `|+`, `>+` and
+    // the explicit-indentation forms (`|2`) are constructs this reader does not
+    // implement, and no plain scalar in YAML may begin with `|` or `>` — those
+    // are indicators, so a quoted `"> file"` reaches this line as `"…` and is
+    // unaffected. A header whose body is EMPTY would otherwise be stored as the
+    // literal string `|+`: a plausible non-empty scalar satisfying every rule
+    // below, which is the anchor defect in a new costume.
+    if (rawValue !== undefined && /^[|>]/.test(rawValue)) {
+      throw new Error(`workflow reader: '${key}' uses a block scalar header this reader does not implement: ${rawValue}`);
     }
     if (rawValue === undefined || rawValue === '') {
       const next = lines[cursor.i];
@@ -5379,12 +5411,19 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
     // second pass, and avoids the quote-aware resolution whose own
     // false-rejection edge was the reason for leaving this open.
     //
-    // The test is the FIRST character of the UNQUOTED value, which is the only
-    // position YAML reads a node property in. Anywhere else `*` and `&` are
-    // ordinary text and must stay so, or this fix would introduce exactly the
-    // kind of false rejection round 4 exists to remove: `run: rm -rf build/*`,
-    // `run: "*.js"`, and every glob and `>&2` redirect inside a `run: |` body
-    // (which never reaches this line at all) are accepted unchanged.
+    // The test is the first NON-SEPARATION character of the UNQUOTED value,
+    // which is the only position YAML reads a node property in — `rawValue[0]`
+    // is that character because the entry pattern above now consumes every
+    // separator, which it did not in round 4 (Codex T7 r5 #2). Anywhere else
+    // `*` and `&` are ordinary text and must stay so, or this fix would
+    // introduce exactly the kind of false rejection round 4 exists to remove:
+    // `run: rm -rf build/*`, `run: "*.js"`, and every glob and `>&2` redirect
+    // inside a `run: |` body (which never reaches this line at all) are
+    // accepted unchanged.
+    //
+    // NOT INSIDE A FLOW COLLECTION, and the claim below says so. `[*missing]`
+    // is stored as an opaque literal string because flow collections are not
+    // parsed at all, so no element of one is ever a scalar this line sees.
     if (rawValue[0] === '&' || rawValue[0] === '*') {
       throw new Error(`workflow reader: '${key}' carries a YAML anchor or alias, which this reader refuses rather than resolves`);
     }
@@ -5564,6 +5603,10 @@ const parseWorkflowText = (text) => {
 const parseWorkflow = (name) => parseWorkflowText(workflowText(name));
 
 const DEMO_WORKFLOW = 'debug-evidence-demo.yml';
+// The repository's OTHER workflow, named here because the claim below is about
+// both of them (Codex T7 r5 #3). It used to be read as raw text only, so the
+// "protects this repository's own two workflows" claim was true of one file.
+const GATE_WORKFLOW = 'closeout-gate.yml';
 const DEMO_ACTION_REF = './actions/debug-evidence';
 const actionInvocations = (job) => job.steps.filter((step) => step.uses === DEMO_ACTION_REF);
 
@@ -5597,6 +5640,14 @@ const MINIMAL_WORKFLOW = [
 // IN THIS REPOSITORY'S OWN TWO WORKFLOWS. IT DOES NOT IMPLEMENT GITHUB'S
 // SCHEMA AND NO LONGER CLAIMS TO.
 //
+// BOTH OF THOSE TWO FILES GO THROUGH IT, as of round 5 (Codex T7 r5 #3). Until
+// then only `debug-evidence-demo.yml` did; `closeout-gate.yml` was read as raw
+// text, so a claim about two workflows was structurally true of one — and the
+// gate is the file that gates every merge. Reading it needed one construct the
+// reader did not have: the FOLDED BLOCK SCALAR (`description: >-`), which threw
+// `unexpected indentation` on its own body. That was fail-closed and therefore
+// silent, which is exactly how a reader nobody points at a file stays green.
+//
 // Three consecutive rounds tightened this pass toward "rejects whatever GitHub
 // would reject", and each one produced fresh divergence from a schema this
 // repository does not implement — round 3's tightening produced an outright
@@ -5605,26 +5656,29 @@ const MINIMAL_WORKFLOW = [
 // than the thing it protects, and the thing this protects is two files.
 //
 // WHAT IT DECIDES — every rule named here is pinned by at least one case
-// below, and the list was audited against the code rather than written from
-// memory: which keys may appear at the workflow, job and step levels and
-// whether they are spelled as GitHub spells them; that no key is repeated in
-// one mapping; that `on:` and `jobs:` are present and that no key at these
-// three levels is null; that `jobs` is a mapping and each job a mapping; that
-// job ids and step ids match GitHub's identifier pattern, and that step ids
-// are unique within a job under the case-insensitive comparison the runner
-// uses; that `runs-on` and `steps` are PRESENT and that `steps` is a
-// non-empty sequence; that a step carries exactly one of `uses` and `run`,
-// that it is a string, that `uses` is additionally non-empty, and that `with`
-// accompanies a `uses`; that the six keys GitHub always types as tables hold
-// tables; and that YAML anchors and aliases are refused rather than absorbed.
+// below, and the list was audited against the code by DISABLING EACH RULE IN
+// TURN rather than written from memory: that indentation is the structure, so
+// a key written past its siblings' column belongs to no mapping; which keys
+// may appear at the workflow, job and step levels and whether they are spelled
+// as GitHub spells them; that no key is repeated in one mapping; that `on:`
+// and `jobs:` are present and that no key at these three levels is null; that
+// `jobs` is a mapping and each job a mapping; that job ids and step ids match
+// GitHub's identifier pattern, and that step ids are unique within a job under
+// the case-insensitive comparison the runner uses; that `runs-on` is PRESENT
+// and a NON-EMPTY SCALAR and that `steps` is present and a non-empty sequence;
+// that a step carries exactly one of `uses` and `run`, that it is a string,
+// that `uses` is additionally non-empty, and that `with` accompanies a `uses`;
+// that the six keys GitHub always types as tables hold tables; that a block
+// scalar is read as `|` or `>` says and any other header is refused rather
+// than stored; and that YAML anchors and aliases are refused rather than
+// absorbed, wherever this reader reads a scalar.
 //
-// ONE RULE IS ENFORCED BUT DELIBERATELY NOT PINNED, and saying so is the
-// point of this round. `runs-on` must additionally be a NON-EMPTY SCALAR;
-// deleting that line leaves every case below green, and it is left unpinned
-// on purpose, because there is no unambiguously-invalid value that reaches
-// it. Everything that would is either caught earlier — null by the empty-key
-// rule, `*alias` by the anchor rule — or is LEGAL GitHub that this reader
-// nonetheless refuses:
+// THE `runs-on` NON-EMPTY RULE IS NOW PINNED, and how it came to be unpinned
+// is the most useful thing in this comment (Codex T7 r5 #1). Round 4 declined
+// to pin it and wrote the reasoning down: nothing unambiguously invalid
+// reaches it, because null is caught earlier by the empty-key rule, `*alias`
+// by the anchor rule, and the two remaining shapes are LEGAL GitHub this
+// reader refuses anyway —
 //
 //     runs-on:            # the `group`/`labels` mapping form: legal, refused
 //       group: ours
@@ -5632,14 +5686,38 @@ const MINIMAL_WORKFLOW = [
 //     runs-on:            # the block-sequence array form: legal, refused
 //       - self-hosted     # (as an "unparsed workflow line")
 //
-// so a negative case here would pin a FALSE REJECTION rather than a rule.
-// (`runs-on: [self-hosted, linux]` is accepted, but only because flow
-// sequences are not parsed at all and it is stored as a literal string —
-// accepted for the wrong reason, which is worth knowing before relying on
-// it.) Every workflow in this repository names its runner as a plain string,
-// so none of this is wrong about anything here. Relaxing it means teaching
-// this reader the `group`/`labels` and array forms, which is schema work, and
-// the lesson of this round is that schema work does not belong here.
+// — so a case over either would pin a FALSE REJECTION. Every step of that is
+// still true, and the two forms above are still deliberately NOT pinned. The
+// enumeration simply missed `runs-on: ""`. GitHub's schema admits a non-empty
+// string, a sequence or a mapping and never an empty scalar; it reaches the
+// rule; deleting the rule accepts it. "THERE IS NOTHING TO PIN HERE" IS ITSELF
+// A CLAIM AND NEEDS THE SAME EXHAUSTIVE ENUMERATION AS ANY OTHER — a round
+// that reasons its way out of writing a test must show its enumeration so
+// somebody can find the missing row, which is what happened here.
+//
+// TWO RULES REMAIN ENFORCED AND UNPINNED, and the enumeration for each is
+// written out so it can be checked rather than taken on trust. Both are
+// backstops that no input can reach while the rules in front of them hold:
+//
+//   - `workflow reader stopped at line N` (the top-level cursor did not reach
+//     the end). To leave the cursor short, the top-level mapping loop must
+//     break early, and it has exactly two early exits: a line indented LESS
+//     than 0, which cannot exist, and a sequence-item line. Item lines are
+//     re-indented to `indent + 2` when they are read, so every one of them has
+//     an indent of at least 2 and trips the indentation rule before the item
+//     break is reached. A `---` document marker, a top-level sequence, a stray
+//     item after a complete mapping and a dedent to an unaligned column were
+//     all tried: each is refused earlier, by the indentation rule or by
+//     `unparsed workflow line`. It stays because it is the assertion that
+//     would catch a future relaxation of the indentation rule.
+//   - `step: not a mapping`. `job.steps` is only ever what the block reader
+//     built, which is a mapping (refused by `!Array.isArray`), a scalar
+//     (refused likewise), null (refused as `'steps' has no value`), or an
+//     array whose every element is a mapping BY CONSTRUCTION — the array is
+//     filled from `parseWorkflowMapping`, which returns a plain object and
+//     nothing else. A scalar sequence element (`- plain`), a nested sequence
+//     and an empty item are all refused earlier as unparsed lines. It mirrors
+//     the job-level check one scope down and costs one line.
 //
 // WHAT IT DOES NOT DECIDE — listed at the point of the claim rather than left
 // to be rediscovered a fourth time. Each of these is ACCEPTED by this reader:
@@ -5666,6 +5744,31 @@ const MINIMAL_WORKFLOW = [
 //   - `on:` IS ONLY CAUGHT EMPTY IN ITS NULL FORM. `on: ""`, `on: []` and
 //     `on: {}` all pass, so the round-3 null rule still admits three
 //     representations of a workflow that cannot trigger (Codex T7 r4 #2).
+//   - FLOW COLLECTIONS ARE NOT PARSED, so nothing INSIDE one is judged — and
+//     that includes anchors and aliases, which is why the rule above is worded
+//     "wherever this reader reads a scalar" (Codex T7 r5 #2). `runs-on:
+//     [*missing]` is stored as the opaque literal string `[*missing]` and
+//     accepted, exactly as `runs-on: [self-hosted, linux]` is accepted for the
+//     wrong reason. This is ONE limit with two faces, not two limits: an
+//     element of a flow collection is never a scalar this reader reads, so the
+//     anchor rule cannot see it without the collection being parsed first.
+//     REACHING INSIDE WITHOUT PARSING WAS CONSIDERED AND REJECTED, and here is
+//     the enumeration. A scan for `&`/`*` ANYWHERE in the literal refuses
+//     `paths: ['**/*.js']`, which is one of the commonest lines in any
+//     workflow. A scan of ELEMENT STARTS ONLY — after `[`, `{` or `,` — gets
+//     that case right but must decide what a comma is, and a comma inside a
+//     quoted element (`["a,*b"]`) makes it wrong again; getting THAT right
+//     means tracking quote state across the collection, which is a flow parser
+//     by another name and the one thing this round was told not to build. The
+//     gate raises the stakes rather than the difficulty: it carries five flow
+//     collections (`types:` three times, `workflows:` once, and `push: {}`)
+//     and this suite is now required to ACCEPT it, so a new rule reaching
+//     inside collections has a real merge-gating file to be wrong about — the
+//     `{}` among them being a flow MAPPING, which the same rule would have to
+//     handle too. Round 4's standing lesson
+//     decides it: generality bought at the price of a false rejection is a net
+//     loss. Neither workflow here uses an anchor anywhere, in a flow
+//     collection or out of one.
 //
 // None of the excluded cases is pinned as ACCEPTED, deliberately: an
 // `assert.doesNotThrow` over them would make today's gap tomorrow's
@@ -5678,6 +5781,14 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // one this reader accepts, so every red below is caused by the mutation.
   assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW));
   assert.doesNotThrow(() => parseWorkflowText(workflowText(DEMO_WORKFLOW)));
+  // BOTH WORKFLOWS, because the claim above says both (Codex T7 r5 #3). The
+  // gate was previously read as raw text only, so every structural rule in this
+  // file protected exactly one of the two files it claimed to protect — and the
+  // gate is the more consequential one. Passing it through here is also the
+  // legal-document control for every strictness rule in the reader: it is the
+  // largest real workflow this repository owns, and a rule that rejects a legal
+  // construct is far likelier to meet one here than in MINIMAL_WORKFLOW.
+  assert.doesNotThrow(() => parseWorkflowText(workflowText(GATE_WORKFLOW)));
   const real = workflowText(DEMO_WORKFLOW);
   assert.ok(real.includes('    runs-on: ubuntu-latest\n'), 'the mutation target exists as written');
   // CODEX'S EXACT CASE, on the real file: one job loses its runner definition
@@ -5701,6 +5812,52 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
     /duplicate key/,
     'the last one does not silently win',
   );
+  // …AND THE SAME SURGERY ON THE GATE, because "accepts it" is not "protects
+  // it": a reader that parsed the gate and rejected nothing in it would satisfy
+  // the positive control above while catching none of the typos the claim says
+  // it catches. The gate declares three jobs and gates every merge, so a job of
+  // its own that lost its runner definition is the more expensive version of
+  // exactly the defect this reader was built for.
+  const gate = workflowText(GATE_WORKFLOW);
+  assert.ok(gate.includes('    runs-on: ubuntu-latest\n'), 'the gate mutation target exists as written');
+  assert.throws(
+    () => parseWorkflowText(gate.replace('    runs-on: ubuntu-latest\n', '    run-on: ubuntu-latest\n')),
+    /run-on/,
+    'a typo in the gate is a typo the reader reports',
+  );
+  assert.throws(
+    () => parseWorkflowText(gate.replace('  retry-forwarder:\n', '  retry.forwarder:\n')),
+    /not a job id/,
+    'and the gate obeys the identifier rule like any other file',
+  );
+  // `runs-on` MUST BE A NON-EMPTY SCALAR, and round 4 concluded — wrongly, and
+  // with the coordinator's endorsement — that there was no case here to pin
+  // (Codex T7 r5 #1). Its enumeration ran: null, caught upstream by the
+  // empty-key rule; `*alias`, caught by the anchor rule; the `group`/`labels`
+  // mapping and the block-sequence array, both LEGAL GitHub this reader refuses
+  // anyway, so a case over them would pin a FALSE REJECTION. Every step of that
+  // was true. It simply MISSED THE EMPTY STRING. GitHub's schema admits a
+  // non-empty string, a sequence or a mapping and never an empty scalar;
+  // `runs-on: ""` reaches this rule, and deleting the rule makes it accepted.
+  //
+  // The transferable half: "there is nothing to pin here" is itself a claim,
+  // and needs the same exhaustive enumeration as any other. A round that
+  // reasons its way out of a test has to show its enumeration.
+  for (const empty of ['""', "''"]) {
+    assert.throws(
+      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('    runs-on: ubuntu-latest\n', `    runs-on: ${empty}\n`)),
+      /runs-on must be a non-empty scalar/,
+      `runs-on: ${empty} names no runner GitHub could schedule on`,
+    );
+  }
+  // …and it must NOT be strict about what a runner NAME looks like, which is
+  // the false rejection lurking one step past this rule and the reason round 4
+  // was right to be careful. An expression is the ordinary way to write a
+  // matrix job's runner, and this is a legal document end to end.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '    runs-on: ubuntu-latest\n',
+    '    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n',
+  )), 'a matrix expression is a runner declaration, not a missing one');
   // ANCHORS AND ALIASES ARE REFUSED, NOT ABSORBED (Codex T7 r4 #5). Round 3
   // recorded `&`/`*` as a known limit on the argument that "every assertion
   // over such a value fails closed" — which was wrong, because NO assertion in
@@ -5709,6 +5866,13 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // to notice that a runner definition went missing. Refusal is the fix rather
   // than resolution: this repository's workflows use neither construct, so a
   // flat refusal is fail-closed and cannot mis-resolve anything.
+  //
+  // SCOPED TO WHERE THIS READER READS A SCALAR, and the claim above says so
+  // (Codex T7 r5 #2). `runs-on: [*missing]` is NOT refused: flow collections
+  // are stored as opaque literals, so no element of one is ever a scalar this
+  // rule sees. That exclusion is recorded rather than closed — see the claim
+  // for why reaching inside a collection this reader does not parse costs more
+  // than it buys — and it is deliberately not pinned as accepted.
   assert.throws(
     () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on: *missing\n')),
     /anchor or alias/,
@@ -5731,6 +5895,40 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('  workflow_dispatch:\n', '  push: &trigger\n')),
     /anchor or alias/,
   );
+  // …AND THE SEPARATOR IS NOT ONE CHARACTER WIDE (Codex T7 r5 #2). The entry
+  // pattern consumed EXACTLY ONE space after the colon, so `runs-on:  *missing`
+  // — two spaces — left the value beginning with a space. The character the
+  // refusal examined was therefore that space rather than the alias indicator,
+  // the value was stored as the non-empty literal ` *missing`, and the document
+  // took the very path this refusal exists to close. The bypass is one keypress
+  // wide and survives every case above it.
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on:  *missing\n')),
+    /anchor or alias/,
+    'two spaces after the colon does not turn an alias into a runner name',
+  );
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on: \t&runner ubuntu-latest\n')),
+    /anchor or alias/,
+    'a tab is separation as much as a space is',
+  );
+  // The root of that bypass, pinned at the root: YAML says the separation
+  // between a `:` and its value is NOT part of the value, so what the reader
+  // stores is the value — not the value with a space glued to its front. A
+  // `uses:` written with two spaces used to be stored as ` ./actions/…`, which
+  // no exact comparison in this file matches, so the invocation it names simply
+  // stopped being counted. That is the reader answering for a document nobody
+  // wrote, one character wide.
+  const separated = parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:  echo hello\n'));
+  assert.equal(separated.jobs.only.steps[0].run, 'echo hello', 'separation after the colon is separation, not the first character of the value');
+  // …and widening the separator does not mean allowing NONE of it: `run:echo`
+  // is a plain scalar in YAML, not a key with a value, so a step written that
+  // way has no command at all and the reader must not invent one.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:echo hello\n')),
+    /unparsed workflow line/,
+    'a colon with no separation after it is not a key indicator',
+  );
   // AND THE LEGAL CASES STAY LEGAL, which is the whole difficulty: `*` and `&`
   // are node properties only as the first character of an unquoted scalar, and
   // are ordinary text everywhere else. Rejecting a shell glob or a `>&2`
@@ -5749,6 +5947,65 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
       `a '*' or '&' that is not a node property is ordinary text: ${legal.trim()}`,
     );
   }
+  // BLOCK SCALARS, BOTH KINDS (Codex T7 r5 #3). Until round 5 the reader knew
+  // only `|`, so the gate's folded `description: >-` threw on its own body and
+  // the gate could not be read at all. `>` folds its lines to spaces and `|`
+  // keeps the breaks, and both are pinned because a fold implemented as a join
+  // with '\n' — or the reverse — passes every other case in this file.
+  const folded = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: >-\n          echo one\n          echo two\n',
+  ));
+  assert.equal(folded.jobs.only.steps[0].run, 'echo one echo two', '`>` folds its line breaks to spaces');
+  const literal = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          echo one\n          echo two\n',
+  ));
+  assert.equal(literal.jobs.only.steps[0].run, 'echo one\necho two', '`|` keeps them');
+  // The chomping indicator this reader accepts changes only a trailing newline
+  // it never emits, so `|-` must read exactly as `|` does rather than as a
+  // header it refuses.
+  const chomped = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |-\n          echo one\n          echo two\n',
+  ));
+  assert.equal(chomped.jobs.only.steps[0].run, 'echo one\necho two');
+  // …and the headers it does NOT implement are refused rather than stored as
+  // scalars. `|+` keeps trailing blank lines, which this reader drops before it
+  // ever sees them, and `|2` sets an explicit indentation this reader does not
+  // read — storing either as the literal text `|+` would hand every rule below
+  // a plausible non-empty string.
+  for (const header of ['|+', '>+', '|2']) {
+    assert.throws(
+      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', `        run: ${header}\n          echo one\n`)),
+      /block scalar header this reader does not implement/,
+      `${header} is not a header this reader can honour`,
+    );
+  }
+  // AND A QUOTED SCALAR THAT MERELY STARTS WITH ONE IS ORDINARY TEXT, which is
+  // the same false-rejection edge the anchor rule has: `|` and `>` are
+  // indicators only where a value begins unquoted, and a redirect is neither.
+  for (const legal of ['        run: "> out.txt"\n', "        run: '|'\n", '        run: echo hi > out.txt\n']) {
+    assert.doesNotThrow(
+      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal)),
+      `a '|' or '>' that is not a block header is ordinary text: ${legal.trim()}`,
+    );
+  }
+  // INDENTATION IS THE STRUCTURE, and a key written past its siblings' column
+  // belongs to no mapping — YAML refuses the file rather than guessing which
+  // level was meant. Nothing pinned this until round 5's disable-each-rule
+  // sweep: with the check inert, a `timeout-minutes` one column too deep is
+  // silently absorbed into the job above it, so the reader answers for a job
+  // the file does not declare. That is the duplicate-key defect again, one
+  // column wide, and it is the rule the whole reader is built on.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '     timeout-minutes: 5\n    steps:\n')),
+    /unexpected indentation 5/,
+    'a key indented past its siblings is a key of no mapping',
+  );
+  // …and the same key at the right column is an ordinary job key, or this
+  // would be a reader that refuses nesting rather than one that reads it.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    timeout-minutes: 5\n    steps:\n')));
   // JOB IDS, which nothing validated at all (Codex T7 r3). GitHub's rule is
   // explicit — a job id starts with a letter or `_` and holds only letters,
   // digits, `-` and `_` — and the reader's line pattern is looser than that BY
@@ -6799,10 +7056,20 @@ test('the two-invocation job demonstrates NAMESPACING ONLY, and says so in the f
 });
 
 test('the closeout gate forwards a retry for the demo workflow, and still excludes itself', () => {
-  const text = workflowText('closeout-gate.yml');
+  const text = workflowText(GATE_WORKFLOW);
   // The trigger list, exactly: a fourth entry (or a reordering) is a change to
   // which siblings can unblock a gate that BLOCKED on a pending check.
   assert.match(text, /^ {4}workflows: \["Validate", "Closeout preview", "Debug evidence demo"\]$/m);
+  // …and the same list read STRUCTURALLY, which the regex above cannot do
+  // (Codex T7 r5 #3). A `workflows:` list is only a trigger where it sits under
+  // `on.workflow_run`; the pattern above matches it at any four-space indent
+  // anywhere in the file, so the list could be moved under a neighbouring
+  // trigger — or the trigger renamed — with the regex still green and the gate
+  // no longer listening. The value is compared as the literal text the reader
+  // stores, because flow sequences are not parsed (see the reader's claim).
+  const gateDocument = parseWorkflow(GATE_WORKFLOW);
+  assert.equal(gateDocument.on.workflow_run.workflows, '["Validate", "Closeout preview", "Debug evidence demo"]');
+  assert.deepEqual(Object.keys(gateDocument.jobs), ['gate', 'retry-forwarder', 'base-drift-forwarder']);
   // The invariant the list exists to preserve: the gate must never watch for
   // its OWN completion, or every run re-triggers another.
   assert.doesNotMatch(text, /workflows: \[[^\]]*"Closeout gate"/);
