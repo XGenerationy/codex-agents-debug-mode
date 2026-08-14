@@ -350,8 +350,21 @@ const readOwnCapabilities = (options = {}) => {
 // matches end of INPUT, never end of line.
 const PTRACE_VALUES = new Set(['unconditional', 'privilege-bypassable', 'permissive', 'unknown']);
 const UID_VALUES = new Set(['non-root', 'root', 'unknown']);
-// Count then digest — the whole reading is at most 84 characters.
-const SUDO_PRESENT = /^present: [1-9][0-9]{0,4} at sha256=[0-9a-f]{64}$/;
+// Count then digest. 'present: ' is 9 characters, ' at sha256=' is 11 and the
+// digest is 64, so a reading is 84 PLUS THE COUNT DIGITS — 85 at one digit and
+// 94 at ten. (Earlier rounds quoted 85 as the maximum; that was the
+// single-digit case mistaken for the widest, and an ordinary two-digit count
+// already exceeds it.)
+//
+// Ten digits, because the count is bounded only by how many candidates PATH can
+// name: a probe with 99,999 entries plus the three conventional paths produced
+// `present: 100002 …`, which a five-digit vocabulary then rejected as a value
+// this action does not produce (Codex T6 r15 #1). Fail-closed, but it broke the
+// producer/vocabulary closure the anchor exists to state, and degraded a
+// correct best-effort reading to "unreadable". Widened rather than CLAMPED: a
+// clamp would invent a semantics — what would "100002" mean if it were capped?
+// — that we would then have to document and defend.
+const SUDO_PRESENT = /^present: [1-9][0-9]{0,9} at sha256=[0-9a-f]{64}$/;
 const SUDO_VALUES = new Set(['absent', 'unknown', SUDO_PATH_UNRESOLVABLE]);
 // Derived from the SAME Map the producer joins, so the vocabulary cannot drift
 // wider than what can actually be produced: every non-empty subset, in the
@@ -374,16 +387,27 @@ const CAPABILITY_VALUES = (() => {
 // round 11's `unknown` reason and round 13's `present:` value, both of which
 // carried raw PATH bytes into the evidence.
 //
-// A reading is a string, at most 128 characters, with NO control characters at
-// all. Not merely no CR/LF: a NUL truncates C-side consumers, and an escape
-// sequence rewrites a terminal reading the step log. Today's widest reading is
-// sudo at 85, so 128 is generous headroom and still far too small to hold an
-// interpolated path.
+// A reading is a string, at most 128 characters, and PRINTABLE ASCII
+// throughout. Today's widest reading is sudo at 94 (84 fixed characters plus up
+// to ten count digits), so 128 is generous headroom and still far too small to
+// hold an interpolated path.
+//
+// Printable ASCII rather than "no control characters" (Codex T6 r15 #2). Round
+// 14 advertised "no control characters at all" and "true single-line" and
+// delivered neither: excluding C0/C1 and DEL still admits U+0085 NEL, the
+// U+2028/U+2029 line separators, the U+202E right-to-left override that
+// reverses how a record READS without changing what it says, and zero-width
+// characters that hide differences between two records a human is asked to
+// compare. Current vocabularies happen to reject all of them, so this was never
+// an admission bypass — but a gate whose stated invariant is false is not
+// future-proofing, which is the only reason this gate exists rather than a
+// per-field check. Every reading this action produces is ASCII by construction,
+// so the restriction costs nothing and closes the class.
 const READING_MAX_LENGTH = 128;
-const CONTROL_CHARACTER = /[\u0000-\u001F\u007F]/;
+const PRINTABLE_ASCII = /^[\u0020-\u007E]*$/;
 const structurallyValid = (value) => typeof value === 'string'
   && value.length <= READING_MAX_LENGTH
-  && !CONTROL_CHARACTER.test(value);
+  && PRINTABLE_ASCII.test(value);
 
 // THE GATE, AND THE ORDERING IS ENFORCED BY REACHABILITY. The vocabulary
 // predicate is captured in this closure and is deliberately NOT a property of
@@ -1707,10 +1731,11 @@ const RUNNER_COMMAND_FILE_VARS = [
 // reaches root rewrites this process's memory with a privileged BPF program or
 // a kernel module and never calls ptrace at all. So the condition is all four
 // readings: Yama ptrace_scope 3 (modes 1 and 2 are bypassable with
-// CAP_SYS_PTRACE), a non-root effective uid, no sudo binary at a trusted
-// absolute path, and no CAP_SYS_ADMIN / CAP_BPF / CAP_SYS_PTRACE /
-// CAP_SYS_MODULE in this process's own set. Any sudo binary at a trusted
-// absolute path denies strict admission: sudoers rules are command-specific,
+// CAP_SYS_PTRACE), a non-root effective uid, no sudo binary at a conventional
+// absolute path OR anywhere on the inherited PATH, and no CAP_SYS_ADMIN /
+// CAP_BPF / CAP_SYS_PTRACE / CAP_SYS_MODULE in this process's own set. Any sudo
+// binary the inspection finds denies strict admission: sudoers rules are
+// command-specific,
 // so no probe of one command can establish the absence of a rule for another,
 // and a PATH-planted fake could fabricate a denial that GRANTED admission.
 // Where any of that is open, a hostile native command can reach this process,

@@ -405,9 +405,13 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // ptrace, but a principal that can reach root rewrites another task's memory
 // with a privileged BPF program or a kernel module without ever calling
 // ptrace. Strict admission is therefore a CONJUNCTION — mode 3, a non-root
-// euid, no passwordless sudo, no dangerous capability in this process's own
-// set — and anything less is refused before the wrapped command exists unless
-// the caller has consciously opted into best-effort evidence.
+// euid, NO SUDO BINARY at a conventional absolute path or anywhere on the
+// inherited PATH, no dangerous capability in this process's own set — and
+// anything less is refused before the wrapped command exists unless the caller
+// has consciously opted into best-effort evidence. (The sudo term read "no
+// passwordless sudo" until round 15 caught it: that was the BEHAVIOURAL probe
+// withdrawn in round 9, and this sentence states the condition as it is now,
+// not as it once was.)
 //
 // Records are built by the REAL evaluator with its probes injected, never
 // hand-written. A hand-written fixture would keep passing after the
@@ -1238,6 +1242,54 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
 const LONG_DIRECTORY = `/opt/${'nested-vendor-directory/'.repeat(14)}bin`;
 const NEWLINE_DIRECTORY = '/tmp/evil\nFORGED-LINE';
 
+test('the sudo vocabulary spans the counts the producer can actually emit', () => {
+  // THE CLOSURE WE CLAIMED WAS NOT CLOSED (Codex T6 r15 #1). The producer's
+  // count is the number of matched candidates, which is bounded only by the
+  // length of PATH — and a probe with 99,999 PATH entries plus the three
+  // conventional paths produced `present: 100002 …`, which the vocabulary then
+  // rejected as a value this action does not produce. Fail-closed, so not an
+  // admission bypass, but it degrades a best-effort record to "unreadable" for
+  // a reading that was perfectly correct, and it falsifies the closure the
+  // anchored vocabulary exists to state.
+  //
+  // NO CLAMPING: a clamped count would invent a semantics ("100002 means at
+  // least 99999"?) that we would then have to document and defend. The
+  // vocabulary widens to the producer's real range instead.
+  const digest = `at sha256=${'a'.repeat(64)}`;
+  const accepted = (count) => admissionBlockers({ ...ADMITTED(), sudo: `present: ${count} ${digest}` });
+  for (const [label, count] of [
+    ['one digit', 1],
+    ['two digits', 12],
+    ['six digits', 100002],
+    ['ten digits', 1234567890],
+  ]) {
+    assert.deepEqual(accepted(count), [`sudo binary: present: ${count} ${digest}`],
+      `${label}: a count the producer can emit is a finding, not an unreadable record`);
+  }
+  // Eleven digits is past anything a PATH can produce and stays out.
+  assert.deepEqual(accepted(12345678901), ["sudo binary: unreadable record (outside this action's vocabulary)"]);
+  assert.deepEqual(accepted(0), ["sudo binary: unreadable record (outside this action's vocabulary)"],
+    'present means at least one');
+
+  // THE TRUE MAXIMUM. 'present: ' is 9, ' at sha256=' is 11, the digest is 64,
+  // so a reading is 84 + digits: 85 at one digit and 94 at ten. The 85 quoted
+  // in earlier rounds was the single-digit case mistaken for the maximum, and
+  // an ordinary two-digit count already exceeds it.
+  assert.equal(`present: 1 ${digest}`.length, 85);
+  assert.equal(`present: 1234567890 ${digest}`.length, 94);
+  assert.ok(94 <= 128, 'and the widest reading still sits well inside the structural bound');
+
+  // Through the REAL producer, at the scale that was probed. Building the PATH
+  // here rather than asserting the regex in isolation is the point: the claim
+  // is about what detectSudoBinary can emit, not about what a pattern matches.
+  const many = Array.from({ length: 99999 }, (_, index) => `/probe${index}`).join(':');
+  const reading = detectSudoBinary({ platform: 'linux', pathValue: many, statPath: () => 'present' });
+  assert.match(reading, /^present: 100002 at sha256=[0-9a-f]{64}$/, 'three conventional paths plus 99,999 candidates');
+  assert.deepEqual(admissionBlockers({ ...ADMITTED(), sudo: reading }), [`sudo binary: ${reading}`],
+    'and the vocabulary accepts what the producer just produced');
+  assert.ok(reading.length <= 128, 'still inside the structural bound');
+});
+
 test('a reading is validated STRUCTURALLY before any vocabulary is consulted', () => {
   // THE ENUMERATED DEFENCE BECOMES A STRUCTURAL ONE (round-13 residual).
   // Three of the four readings were bounded by luck of construction, and the
@@ -1271,6 +1323,19 @@ test('a reading is validated STRUCTURALLY before any vocabulary is consulted', (
     ['an escape sequence', 'clear\u001b[31m'],
     ['a DEL', 'clear\u007f'],
     ['a tab', 'clear\tsplit'],
+    // BEYOND C0/C1 AND DEL (Codex T6 r15 #2). Round 14 advertised "no control
+    // characters at all" and "single-line", and delivered neither: these five
+    // all passed. Today's vocabularies reject them, so this was never an
+    // admission bypass — but it defeats exactly the future-proofing the
+    // structural gate exists to provide, which is the whole reason that gate is
+    // not a lint. Readings are printable ASCII now.
+    ['NEL, U+0085', 'clear\u0085FORGED'],
+    ['LINE SEPARATOR, U+2028', 'clear\u2028FORGED'],
+    ['PARAGRAPH SEPARATOR, U+2029', 'clear\u2029FORGED'],
+    ['RIGHT-TO-LEFT OVERRIDE, U+202E', 'clear\u202EFORGED'],
+    ['a zero-width space, U+200B', 'clear\u200BFORGED'],
+    ['a non-ASCII letter, U+00E9', 'cl\u00e9ar'],
+    ['an astral character', 'clear\u{1F600}'],
     ['one character over the bound', 'x'.repeat(129)],
     ['undefined', undefined],
     ['null', null],
@@ -1280,7 +1345,8 @@ test('a reading is validated STRUCTURALLY before any vocabulary is consulted', (
     assert.deepEqual(consulted, [], `${label}: the vocabulary must never see it`);
   }
   // The bound itself: 128 is generous headroom over today's widest reading
-  // (sudo, at 85) and still far too small for an interpolated path.
+  // (sudo, at 94 — 84 fixed characters plus up to ten count digits) and still
+  // far too small for an interpolated path.
   assert.equal(permissive.read('x'.repeat(128)), 'blocked', 'the bound is inclusive');
 
   // A malformed reading DENIES, and says whose fault it is. "This host failed
@@ -1339,7 +1405,7 @@ test('no reading can carry producer bytes: every field is bounded and single-lin
       platform: 'linux',
       pathValue,
       statPath: () => 'present',
-    }), 90);
+    }), 94);
   }
 
   // 4. CAPABILITIES. The producer is a hex mask; the reading is a join over a
