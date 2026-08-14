@@ -42,11 +42,13 @@ const main = () => {
   // rewrote in the action's state file (Codex T5 r4 #1).
   //
   // Only the PUBLIC half is handed back. A shared secret would have to sit in
-  // the report step's environment, where a surviving same-user child can read
-  // it — and whoever can read a symmetric key can sign with it, which is the
-  // whole capability this is meant to withhold (Codex T5 r5 #2). The private
-  // half is passed straight into the server and never serialized: it appears
-  // in no startup line, no state file, no output, no log.
+  // the environment of the step that verifies — the `run` step since Task 5
+  // round 6 — which is the environment the wrapped command's own process tree
+  // inherits and a same-user child can read out of procfs. Whoever can read a
+  // symmetric key can sign with it, and signing is the whole capability this
+  // withholds (Codex T5 r5 #2). A public verification key gives a reader
+  // nothing. The private half is passed straight into the server and never
+  // serialized: it appears in no startup line, no state file, no output, no log.
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const server = createDebugServer({
     projectRoot,

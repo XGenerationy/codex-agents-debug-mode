@@ -666,8 +666,14 @@ const startSubcommand = async ({
   // steps' env from its own memory. A same-user process can rewrite
   // action-state.json at leisure, and could happily put ITS OWN public key
   // there and sign with the matching private one; it cannot reach into the
-  // runner to change what a later step is handed. State stays routing data;
-  // trust is anchored in memory (Codex T5 r4 #1 / r5 #2, ruling iii).
+  // runner and change the value the runner already parsed out of this file.
+  // State stays routing data; trust is anchored in memory (Codex T5 r4 #1 /
+  // r5 #2, ruling iii). Scope, stated because it does not generalise: what is
+  // out of reach is the RUNNER'S copy. A `shell: bash` step's env can still be
+  // rewritten after the runner resolves it, by BASH_ENV — which is why the key
+  // is consumed only inside `run`, whose process starts before this
+  // invocation's command exists, and why an EARLIER invocation's command in
+  // the same job is outside the guarantee (Codex T6 r3 #1).
   if (env.GITHUB_OUTPUT) {
     writeOutputs(env.GITHUB_OUTPUT, { 'collector-verify-key': startLine.verify_key });
   }
@@ -1121,9 +1127,13 @@ const runSubcommand = async ({
   // From the environment only, never from state: the key is public, so its
   // secrecy does not matter, but its INTEGRITY is everything — a same-user
   // process that could substitute its own public key would then sign answers
-  // with the matching private one. Runner memory is the one channel such a
-  // process cannot reach, so state and every other file on disk are excluded
-  // as sources by construction (Codex T5 r5 #2, r6 #1).
+  // with the matching private one. This process's own memory, populated before
+  // the wrapped command exists, is the one channel that command cannot reach,
+  // so state and every other file on disk are excluded as sources by
+  // construction (Codex T5 r5 #2, r6 #1). It is THIS invocation's command that
+  // cannot reach it: a command an earlier invocation ran in the same job can
+  // rewrite this step's env through BASH_ENV before node starts, which is why
+  // the guarantees are scoped to the first invocation in a job (Codex T6 r3 #1).
   const verifyKey = responderVerifyKey(env.DEBUG_ACTION_COLLECTOR_VERIFY_KEY);
   // Re-registering a value the runner already masks in start is a no-op for
   // Actions and cheap insurance for this step's own log, which is where the

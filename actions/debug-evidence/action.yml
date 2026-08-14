@@ -210,7 +210,9 @@ runs:
       # covers the verification key handed to the run step. Wrapping a second
       # command after an instrumented one therefore belongs in a SEPARATE JOB;
       # same-job reuse is not something this runner channel can be made to
-      # guarantee, and the README says so in the same words.
+      # guarantee. Task 8's README must say so in the same words — that is a
+      # recorded obligation on the documentation, not a claim about what it
+      # already contains.
       #
       # `evidence-dir` is start's invocation-scoped staging child. It is empty
       # only when start never executed, which is exactly when there is nothing

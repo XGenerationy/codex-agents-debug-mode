@@ -2759,7 +2759,7 @@ test('a wrapped command that poisons every later step\'s environment changes not
     assert.equal(laterStepEnv.DEBUG_ACTION_COLLECTOR_VERIFY_KEY, impostorVerifyKey,
       'a step that verified with ITS OWN environment would have rejected the real collector and believed the attacker\'s');
     assert.notEqual(honestRun.runStepEnv.DEBUG_ACTION_COLLECTOR_VERIFY_KEY, impostorVerifyKey,
-      'while the run step\'s environment was resolved before the command existed and cannot be revised');
+      'while the run step\'s environment was resolved before the command existed, so the command it runs cannot revise it');
     // report runs in exactly that poisoned environment — and there is nothing
     // in it left to poison. It holds no key, verifies nothing, and publishes
     // the bytes run already proved and staged.
@@ -3658,7 +3658,7 @@ test('the guards are exact: post-command steps on always(), upload on what run a
   }
 });
 
-test('upload takes exactly the paths run reports staging into, and nothing else', () => {
+test('upload takes exactly the paths start advertises before the command runs, and nothing else', () => {
   const upload = actionStepsByName()['Upload evidence artifact'];
   assert.deepEqual(Object.keys(upload.with), ['name', 'path', 'if-no-files-found']);
   assert.equal(upload.with.name, '${{ inputs.artifact-name }}');
@@ -3724,6 +3724,42 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   }
   // And the claim it qualifies is stated as scoped, not absolute.
   assert.match(commentary, /out of (?:the reach of|reach of)?\s*THIS invocation'?s? (?:wrapped )?command|unreachable by THIS invocation/i);
+  // POLARITY, not vocabulary (Codex T6 r4 #1). The checks above pass on
+  // keywords, so flipping "does NOT survive" to "DOES survive" left every one
+  // of them green while the comment asserted the opposite of the truth — a pin
+  // that stays green through a reversal is worse than no pin. Each claim below
+  // is therefore pinned twice: the form it MUST take, and the absence of its
+  // inverse.
+  const claims = [
+    {
+      what: 'the same-job limitation',
+      required: /it does not survive an earlier instrumented command in the same job/i,
+      forbidden: /it does survive an earlier instrumented command|survives an earlier instrumented command/i,
+    },
+    {
+      what: 'the separate-job requirement',
+      required: /belongs in a separate job/i,
+      forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|can be reused safely in the same job/i,
+    },
+    {
+      what: 'the refusal to guarantee same-job reuse',
+      required: /same-job reuse is not something this runner channel can be made to guarantee/i,
+      forbidden: /same-job reuse is something this runner channel can be made to guarantee/i,
+    },
+    {
+      what: 'the invocation the guarantee is scoped to',
+      required: /it holds for the first \(or only\) invocation of this action in a job/i,
+      forbidden: /it holds for (?:every|any|each|all) invocations?/i,
+    },
+  ];
+  for (const claim of claims) {
+    assert.match(commentary, claim.required, `the scope note must state ${claim.what}`);
+    assert.doesNotMatch(commentary, claim.forbidden, `the scope note must not reverse ${claim.what}`);
+  }
+  // The README reference is an OBLIGATION on Task 8, not a claim that a
+  // tracked README already carries the warning — there is none (Codex T6 r4 #3).
+  assert.match(commentary, /task 8'?s? readme must say so/i);
+  assert.doesNotMatch(commentary, /the readme (?:says|already says) so/i);
 });
 
 test('the output-dir default expression is byte-identical at every site, and there are exactly five', () => {
