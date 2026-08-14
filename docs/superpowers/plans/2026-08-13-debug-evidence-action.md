@@ -2930,6 +2930,69 @@ duplicate/conflicting-line handling. Important ×1, Minor ×3:
 Fix commit message:
 `fix(action): make the trust contract conditional on the admission mode, harden mode lookup and input defaulting (Codex T6 r7)`.
 
+#### Task 6 fix round 8 — Codex re-review decisions (recorded before code moves)
+
+Codex on `153bb41`: `Map` and `?? 'strict'` confirmed correct; the fourth mutation
+is confirmed as THE STANDARD — required and forbidden halves must each be shown
+capable of failing independently, so security-critical pairs get both mutations
+when introduced; Task 8's README needs its own semantic polarity assertions, but a
+LIGHTER per-section check suffices (hashing a README is brittle and proves only
+that someone updated a hash). **Critical ×1** — and it overturns Codex's own
+round-7 hardening suggestion — plus Important ×1 and Minor ×2:
+
+1. **Mode 3 does not establish the boundary while the command can reach root
+   (CRITICAL).** Mode 3 blocks `ptrace`, but a principal that can become root can
+   load a privileged tracing BPF program and overwrite another task's userspace
+   memory via `bpf_probe_write_user()` — or insert a kernel module — without ever
+   calling `ptrace`. Hosted Linux VMs grant passwordless `sudo`, so the
+   `sysctl -w kernel.yama.ptrace_scope=3` route recorded last round does NOT turn
+   a default hosted runner into an authenticated strict path: the same `sudo` that
+   sets mode 3 opens the BPF route. **Task 7's proposed sysctl-only strict
+   scenario would demonstrate a FALSE GUARANTEE and is withdrawn.** Codex: strict
+   admission needs real privilege/process isolation — at minimum the wrapped
+   principal must have no route to root, privileged BPF, kernel modules, or
+   equivalent — or hosted execution must remain best-effort. Decisions:
+   - **Strict admission requires ALL of:** Yama mode 3; effective uid ≠ 0;
+     passwordless `sudo` unavailable (probe `sudo -n true`, treating any
+     unexpected outcome as "available" — fail closed); and no dangerous capability
+     in the process's own permitted/effective set (`CAP_SYS_ADMIN`, `CAP_BPF`,
+     `CAP_SYS_PTRACE`, `CAP_SYS_MODULE` via `/proc/self/status`). Any probe that
+     cannot be evaluated ⇒ NOT established.
+   - **These are the routes CHECKED, never a proof that none exists.** A setuid
+     binary, a mounted container socket, or a writable privileged service grants
+     the same power unobserved. Say exactly that wherever the prerequisite is
+     described — with a polarity pair forbidding "proves no escalation path
+     exists"-style claims.
+   - **Hosted execution remains best-effort**, and no site may claim otherwise.
+     Remove the round-7 "harden with sysctl and strict becomes reachable" wording
+     from `action.yml`; replace it with the true statement that mode 3 is
+     necessary but not sufficient while passwordless `sudo` remains.
+   - Spec prerequisite block rewritten by the coordinator in this commit (done).
+2. **The spec's artifact section contradicted its own two-regime block
+   (Important).** Lines 218–226 and 237–245 still said unconditionally that "the
+   trust unit answers" hostile planting, called `run` trusted, called digest
+   comparison "the defence", and said recorded digests "always" make swaps
+   detectable — all false under best-effort. **Fixed by the coordinator in this
+   commit** (three passages now name the regime they hold in).
+3. **The defaulting test infers the default from the live host (Minor).**
+   `support.test.js:454` assumes the host is not mode 3, so it would FAIL on
+   exactly the hardened runner strict mode is meant for. Normalise through an
+   injected `main`/environment-building seam instead of reading the host's policy.
+4. **The polarity block does not cover what it claims (Minor).** It scans only
+   `ACTION_YML()`, not `support.js`, so the round-7 claim that it protects both
+   files is wrong; and it treats the whole action file as ONE haystack, so a
+   duplicate comment elsewhere can satisfy a requirement after a consumer-facing
+   `description:` disappears. Assert the important surfaces SEPARATELY — at
+   minimum the input/output `description:` blocks distinct from comment prose, and
+   `support.js` in its own right.
+5. **Ruling on `THE TRUSTED PROCESS`:** acceptable with its nearby qualification
+   ONLY once strict admission actually establishes the boundary. It does not on
+   the documented hosted path, so the qualification must name the checked-routes
+   limitation too.
+
+Fix commit message:
+`fix(action): strict admission requires no route to root, not merely Yama mode 3 (Codex T6 r8)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

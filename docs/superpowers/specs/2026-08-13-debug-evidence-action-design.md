@@ -215,16 +215,21 @@ case where `start` ran but nothing was staged. It is deliberately NOT gated on
 `report` succeeding: a Step Summary failure must never suppress evidence `run` proved.
 A second residual follows from same-user staging and is documented rather than
 prevented: a hostile command can create files INSIDE the invocation-scoped directory,
-so the artifact may carry payloads this action never staged. The trust unit answers
-it — evidence is bytes whose SHA-256 matches a digest line the trusted `run` process
-printed to its own step log; a planted file has no backing digest, and a `run` that
-staged nothing prints none. Known and unprevented: `actions/upload-artifact` v4.6.2 exposes no symlink control — its seven
+so the artifact may carry payloads this action never staged. *(Made conditional,
+Task 6 round 8.)* UNDER A SUCCESSFUL STRICT ADMISSION the trust unit answers it —
+evidence is bytes whose SHA-256 matches a digest line the `run` process printed to
+its own step log; a planted file has no backing digest, and a `run` that staged
+nothing prints none. UNDER BEST-EFFORT it does not: a command that can rewrite
+`run` can also print whatever digest line it likes, so the digests are diagnostic
+claims, not authentication. Known and unprevented: `actions/upload-artifact` v4.6.2 exposes no symlink control — its seven
 inputs carry none, and its glob options hardcode `followSymbolicLinks: true` and
 `implicitDescendants: true` (verified against the pinned SHA) — so a hostile swap
 inside the staging window can substitute a symlink to an unrelated readable file and
-pull its bytes into the artifact. As with every other post-staging swap, the defence
-is detection: the digest `run` printed to its own step log before staging does not
-match what the artifact then carries. `action-state.json` lives at the
+pull its bytes into the artifact. As with every other post-staging swap, the
+strict-mode defence is detection: the digest `run` printed to its own step log
+before staging does not match what the artifact then carries — a defence that
+holds only under a successful strict admission, since best-effort grants the
+command the ability to forge that line too. `action-state.json` lives at the
 `output-dir` root — outside the evidence child — and is never enumerated in the
 upload path block. *(Corrected, Task 6 round 2: it no longer carries the launch
 token — that token has lived only in `start`'s memory since Task 5 round 3 — but
@@ -240,9 +245,10 @@ composite staging and outside the prevention boundary. `run` therefore validates
 renders, and SHA-256-hashes all three payloads from one immutable in-memory buffer
 (the live read is bounded: absolute deadline, byte cap, idle timeout), writes the
 staged files only afterwards as write-only sinks, and prints the digests to the step
-log (immutable once streamed) and the `evidence-digest` output — the recorded digests
-always describe the intended bytes, so any post-staging swap is detectable against
-the artifact. *(Wording fixed, Task 5 round 8.)* The artifact is therefore NOT
+log (immutable once streamed) and the `evidence-digest` output — so under a strict
+admission the recorded digests describe the intended bytes and any post-staging swap
+is detectable against the artifact. Under best-effort that inference is unavailable:
+the process printing the digest is itself within the command's reach. *(Wording fixed, Task 5 round 8.)* The artifact is therefore NOT
 self-authenticating, and neither the artifact nor the Step Summary alone is
 authoritative. *(Made conditional, Task 6 round 7 — the claim below holds only
 under a successful strict admission.)* **The trust regime depends on
@@ -274,17 +280,30 @@ key — assumes the wrapped command CANNOT attach to another same-user process.
 That is positively established only when:
 
 - Linux Yama `ptrace_scope = 3` (attachment forbidden unconditionally, and the
-  mode cannot be lowered again at runtime); or
+  mode cannot be lowered again at runtime), **AND** the wrapped principal has no
+  route to root — no passwordless `sudo`, not already uid 0, and no
+  privileged capability in its own set; or
 - real process/user isolation between the trusted processes and the wrapped
   command.
 
 `ptrace_scope` 1 or 2 is NOT sufficient: both are bypassable by
-`CAP_SYS_PTRACE`, and **standard VM-based GitHub-hosted Linux runners grant
-workflow commands passwordless `sudo`** — so on the action's principal platform a
-hostile command can elevate, attach to `run` or to the collector (whose pid is
-recorded in state), and defeat authenticated evidence outright. Neither process
-is made non-dumpable, and no check of the current process's capabilities would
-help, because the escalation path is `sudo`, not an inherited capability.
+`CAP_SYS_PTRACE`. **Mode 3 alone is not sufficient either** *(corrected, Task 6
+round 8)*: it blocks `ptrace`, but a principal that can reach root can load a
+privileged tracing BPF program and overwrite another task's userspace memory via
+`bpf_probe_write_user()`, or insert a kernel module, without ever calling
+`ptrace`. **Standard VM-based GitHub-hosted Linux runners grant workflow commands
+passwordless `sudo`**, so on the action's principal platform a hostile command
+can elevate and defeat authenticated evidence outright — and `sysctl -w
+kernel.yama.ptrace_scope=3` does NOT repair that, because the same `sudo` that
+sets it also opens the BPF route. Neither the `run` process nor the collector is
+made non-dumpable, and the collector's pid is recorded in state.
+
+The action therefore probes the escalation routes it can observe — Yama mode,
+effective uid, passwordless `sudo`, and dangerous capabilities in its own set —
+and admits `strict` only when ALL are clear. Those are the routes it CHECKS, not
+a proof that no route exists: a setuid binary, a mounted container socket, or a
+writable privileged service can grant the same power unobserved. Hosted execution
+remains BEST-EFFORT.
 
 The action therefore treats the prerequisite as established ONLY for mode 3, and
 refuses to launch the wrapped command otherwise unless the caller explicitly
