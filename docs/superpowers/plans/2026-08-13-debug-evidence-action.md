@@ -3707,6 +3707,25 @@ Round 2 implemented Importants (1) and (2) and Minor (4); Important (3) was the 
 
 **Open items carried to the re-review:** one mutation (M5) SURVIVED — deleting the record-count line in the strict-refusal probe — because the `record_line=` assignment below already fails closed through `pipefail`/`set -e`. It was kept and labelled deliberately redundant. Coordinator's lean is KEEP, because the emergent fail-closed behaviour is invisible to a reader and the label removes the misreading risk; a line that cannot fail is only a defect when it reads as load-bearing. **Residual bound explicitly NOT closed:** the msg-field equality plus the whole-value sweep do not catch a partial leak in a non-`msg` field (e.g. `data`), nor a value split across a line boundary in `report.md`. `repro.js` puts the secret only in `msg` and both reports render from `session.log`, so the demo cannot exercise those channels — flagged rather than implied as covered.
 
+#### Task 7 fix round 3 (Codex review of `f10982b`: 1 Minor, everything else ruled sound)
+
+**One finding stands between Task 7 and closure**, and it is the same shape as round 2's Minor one level deeper: the schema pass rejects the structures it was told about and still admits GitHub-invalid ones it was not.
+
+**(1) Minor — the schema pass still accepts GitHub-invalid workflows.** Two concrete holes:
+- **Job IDs are never validated.** `support.test.js:5339` accepts a job ID such as `9.bad`, and `:5427` never checks `jobName` at all. GitHub requires a job ID to start with a letter or `_` and to contain only alphanumerics, `-`, or `_`.
+- **An empty `run:` passes the XOR.** An empty `run:` parses to `null` at `:5360` but still satisfies the mere-PROPERTY-presence XOR at `:5444`, so a step with an empty command is admitted.
+
+Both contradict the broad claim the test itself makes at `:5508` — *"rejects documents GitHub would reject."* FIX: validate job IDs against GitHub's rule, and require `uses`/`run` to be non-empty STRINGS rather than merely present keys, each with a constructed negative case. Codex offered an alternative — rename and explicitly bound this as a repository-specific structural reader — but **the fix is cheap and the claim is worth keeping, so fix rather than weaken the claim.** The general rule this keeps re-teaching: a validator's advertised scope is a claim like any other, and must be pinned by a case that would fail if the claim were false.
+
+**RULED SOUND, no further work:**
+- **The redaction pair is SUFFICIENT for the demo contract.** `exact.length === 1` plus `mentions.length === 1` means the sole `token=` message is exactly the redacted one (`debug-evidence-demo.yml:157`). **Codex confirmed the round-2 correction to its own prescription was valid.**
+- **Positional findings binding is SOUND.** Missing, displaced, doubled and free-floating findings all fail closed; no relevant false-pass survives under `admissionCaveats`' deterministic one-findings-line contract.
+- **M5: KEEP.** *"Mutation survival does not make documentary redundancy defective"* — clearly labelled redundancy that exposes an important invariant is acceptable. The coordinator's lean was right.
+- **The non-`msg` / split-line residual is ACCEPTED.** `repro.js:89` places the fixture only in the stable `msg` channel and reports derive from the captured log. **Condition: the limitation must be re-scoped explicitly if that input contract ever changes** — i.e. if `repro.js` ever writes the fixture into `data` or any non-`msg` field, this coverage claim must be revisited in the same commit.
+- **The scanner/rollout decision is ACCEPTED AS OWNER POLICY** — an external/manual gate, not an unresolved Task 7 code finding. Both merge-time actions stand as recorded.
+
+Codex confirmed `f10982b`'s parent is `da61a21`, that `9bb2113` changes only the plan, and that the workflow and test files at HEAD are byte-identical to `f10982b`. It still could not start Node (`EPERM` on the parent path), so all suite counts remain coordinator-verified rather than independently reproduced.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
