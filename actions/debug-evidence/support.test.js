@@ -5339,6 +5339,14 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
     const entry = /^([A-Za-z0-9_.-]+):(?:\s(.*))?$/.exec(line.body);
     if (!entry) throw new Error(`unparsed workflow line: ${line.body}`);
     const [, key, rawValue] = entry;
+    // NOT LAST-WINS. A second `runs-on:`, or a second `with:` block, silently
+    // overwrote the first and left this reader answering for a document nobody
+    // wrote (Codex T7 r2 #4). `__proto__` is refused outright rather than
+    // counted: assigning it sets the prototype instead of creating an own
+    // property, so neither the duplicate check nor any assertion below could
+    // ever observe it, and it is not a workflow key in any case.
+    if (key === '__proto__') throw new Error("workflow reader: '__proto__' is not a workflow key");
+    if (Object.hasOwn(map, key)) throw new Error(`workflow reader: duplicate key '${key}'`);
     cursor.i += 1;
     if (rawValue === '|') {
       const body = [];
@@ -5384,9 +5392,73 @@ const workflowText = (name) => readFileSync(workflowPath(name), 'utf8');
 // exactly that string.)
 const workflowCode = (name) => workflowText(name).split(/\r?\n/).map(stripYamlComment).join('\n');
 
-const parseWorkflow = (name) => {
+// GitHub's OWN key sets, at the three levels this reader produces. Allowlists
+// rather than denylists, for the same reason the reader throws on a shape it
+// does not understand: a key nobody recognises is a key nobody reads, and the
+// runner ignores it in silence — `run-on:` is not a slightly-wrong runner
+// declaration, it is a job with no runner declaration at all.
+const WORKFLOW_KEYS = ['name', 'run-name', 'on', 'permissions', 'env', 'defaults', 'concurrency', 'jobs'];
+const JOB_KEYS = ['name', 'permissions', 'needs', 'if', 'runs-on', 'environment', 'concurrency',
+  'outputs', 'env', 'defaults', 'steps', 'timeout-minutes', 'strategy', 'continue-on-error',
+  'container', 'services', 'uses', 'with', 'secrets'];
+const STEP_KEYS = ['id', 'if', 'name', 'uses', 'run', 'working-directory', 'shell', 'with', 'env',
+  'continue-on-error', 'timeout-minutes'];
+
+const isMapping = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const assertWorkflowKeys = (where, mapping, allowed, required) => {
+  for (const key of Object.keys(mapping)) {
+    if (!allowed.includes(key)) throw new Error(`${where}: '${key}' is not a key GitHub reads here`);
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(mapping, key)) throw new Error(`${where}: missing required key '${key}'`);
+  }
+};
+
+// THE SCHEMA, applied to everything this reader returns. Without it the reader
+// accepted any key matching its lexical pattern, so a job whose `runs-on` had
+// been renamed to `run-on` satisfied every Task 7 assertion while GitHub had no
+// runner definition to act on. Structure is the only thing that can catch that:
+// no assertion about `uses` pinning, port allocation or input validity reads
+// the key that went missing.
+const assertWorkflowSchema = (document) => {
+  assertWorkflowKeys('workflow', document, WORKFLOW_KEYS, ['on', 'jobs']);
+  if (!isMapping(document.jobs)) throw new Error('workflow: jobs must be a mapping of job ids');
+  for (const [jobName, job] of Object.entries(document.jobs)) {
+    if (!isMapping(job)) throw new Error(`job ${jobName}: not a mapping`);
+    // `runs-on` and `steps` are required because every job in this repository's
+    // workflows runs steps on a runner; a reusable-workflow call (job-level
+    // `uses:`) would need its own branch here, and adding one without adding
+    // its assertions would be the same fail-open in a new place.
+    assertWorkflowKeys(`job ${jobName}`, job, JOB_KEYS, ['runs-on', 'steps']);
+    if (typeof job['runs-on'] !== 'string' || job['runs-on'] === '') {
+      throw new Error(`job ${jobName}: runs-on must be a non-empty scalar`);
+    }
+    if (!Array.isArray(job.steps) || job.steps.length === 0) {
+      throw new Error(`job ${jobName}: steps must be a non-empty sequence`);
+    }
+    job.steps.forEach((step, index) => {
+      const where = `job ${jobName} step ${index}`;
+      if (!isMapping(step)) throw new Error(`${where}: not a mapping`);
+      assertWorkflowKeys(where, step, STEP_KEYS, []);
+      if (Object.hasOwn(step, 'uses') === Object.hasOwn(step, 'run')) {
+        throw new Error(`${where}: a step needs exactly one of 'uses' and 'run'`);
+      }
+      if (Object.hasOwn(step, 'with') && !Object.hasOwn(step, 'uses')) {
+        throw new Error(`${where}: 'with' belongs to a 'uses' step; the runner ignores it here`);
+      }
+    });
+  }
+  return document;
+};
+
+// Text in, document out, so a CONSTRUCTED workflow — one deliberately broken
+// in a way GitHub would reject — can be pushed through the very same reader the
+// assertions below rely on. Reading only from disk left the reader's own
+// tolerances untestable.
+const parseWorkflowText = (text) => {
   const lines = [];
-  for (const raw of workflowText(name).split(/\r?\n/)) {
+  for (const raw of text.split(/\r?\n/)) {
     const text = stripYamlComment(raw).replace(/\s+$/, '');
     if (text.trim() === '') continue;
     const indent = text.length - text.trimStart().length;
@@ -5400,12 +5472,103 @@ const parseWorkflow = (name) => {
   const cursor = { i: 0 };
   const document = parseWorkflowMapping(lines, cursor, 0);
   if (cursor.i !== lines.length) throw new Error(`workflow reader stopped at line ${cursor.i}: ${lines[cursor.i].body}`);
-  return document;
+  return assertWorkflowSchema(document);
 };
+
+const parseWorkflow = (name) => parseWorkflowText(workflowText(name));
 
 const DEMO_WORKFLOW = 'debug-evidence-demo.yml';
 const DEMO_ACTION_REF = './actions/debug-evidence';
 const actionInvocations = (job) => job.steps.filter((step) => step.uses === DEMO_ACTION_REF);
+
+// The smallest workflow GitHub would actually run, used as the base for the
+// step-level mutations below: surgery on the real file cannot express "a step
+// with neither uses nor run" without also disturbing its indentation.
+const MINIMAL_WORKFLOW = [
+  'name: Minimal',
+  'on:',
+  '  workflow_dispatch:',
+  'jobs:',
+  '  only:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - name: Do something',
+  '        run: echo hello',
+  '',
+].join('\n');
+
+// THE READER'S OWN TOLERANCES, which nothing tested (Codex T7 r2 #4). It
+// accepted any key matching a lexical pattern and assigned it with no schema
+// and no duplicate check, so RENAMING a job's `runs-on` to `run-on` left every
+// Task 7 assertion below satisfied — the reader stored the typo'd key, no
+// assertion read it, and the workflow GitHub would have run had no runner
+// definition at all. A reader whose stated doctrine is that an unrecognised
+// construct THROWS rather than being skipped has to apply that doctrine to
+// keys, not only to shapes.
+test('the workflow reader rejects documents GitHub would reject rather than storing them', () => {
+  // The positive control first: the base each mutation below starts from is
+  // one this reader accepts, so every red below is caused by the mutation.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW));
+  assert.doesNotThrow(() => parseWorkflowText(workflowText(DEMO_WORKFLOW)));
+  const real = workflowText(DEMO_WORKFLOW);
+  assert.ok(real.includes('    runs-on: ubuntu-latest\n'), 'the mutation target exists as written');
+  // CODEX'S EXACT CASE, on the real file: one job loses its runner definition
+  // and keeps a plausible-looking neighbour in its place.
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    run-on: ubuntu-latest\n')),
+    /run-on/,
+    'a job key GitHub does not know is an error, not a stored property',
+  );
+  // …and the same file with the key simply GONE, because an allowlist that
+  // only rejected the typo would pass a job that dropped the line entirely.
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '')),
+    /runs-on/,
+    'a job with no runner definition is not a job',
+  );
+  // DUPLICATES. YAML last-wins silently, so a second `runs-on:` (or a second
+  // `with:` block) meant the reader answered for a document nobody wrote.
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on: ubuntu-latest\n    runs-on: windows-latest\n')),
+    /duplicate key/,
+    'the last one does not silently win',
+  );
+  // Prototype keys are not workflow keys, and `map.__proto__ = value` would not
+  // even become an own property — so neither the duplicate check nor any later
+  // assertion could see it.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: echo hello\n        __proto__: x\n')),
+    /__proto__/,
+  );
+  // STEP SHAPE. GitHub runs a step through exactly one of `uses` or `run`;
+  // both is an error and neither is a no-op the reader used to accept.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses: actions/checkout@v4\n        run: echo hello\n')),
+    /exactly one of/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '')),
+    /exactly one of/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    step:\n')),
+    /step/,
+    'a mistyped `steps` leaves the job with nothing to run',
+  );
+  // A `with:` on a `run:` step is silently ignored by the runner — the same
+  // class of defect as the typo'd key, one level down.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: echo hello\n        with:\n          k: v\n')),
+    /with/,
+  );
+  // Top level: a workflow with no trigger never runs, and one with no jobs
+  // does nothing. Both parsed fine before.
+  assert.throws(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', '')), /on/);
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(/jobs:\n[\s\S]*$/, 'jobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - name: n\n        run: r\n').replace('jobs:', 'job:')),
+    /job/,
+  );
+});
 
 test('demo/repro.js reads exactly the injected session contract and nothing the run step strips', () => {
   const source = readFileSync(REPRO_PATH, 'utf8');
@@ -5546,6 +5709,19 @@ test('demo repro drives the full lifecycle: seeded exit 1, redacted secret, dete
     writeState(context.outputDir, { ...readState(context.outputDir), failOnCommandFailure: 'false' });
     assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0,
       'the dogfood toggle waives it');
+    // AND THE WORKFLOW'S OWN ASSERTION STEP, run against the bytes this real
+    // lifecycle staged. The executor tests further down drive that same script
+    // with CONSTRUCTED payloads to prove it rejects a partial mask and an
+    // unreadable file; this is the one place that proves their honest fixture
+    // is the shape the action really produces, so a session.log format change
+    // cannot leave those tests passing against a model of a format that is gone.
+    // Guarded rather than skipped because none of the assertions above need a
+    // shell and only this one does.
+    if (SHELL_AVAILABLE) {
+      const accepted = runDemoAssertionsOn(path.join(evidenceDir, 'report.md'), { secret });
+      assert.equal(accepted.status, 0,
+        `the shipped demo assertions must accept a real capture: ${accepted.stdout}${accepted.stderr}`);
+    }
   } finally {
     teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
   }
@@ -5741,19 +5917,45 @@ test('the demo job wraps the seeded repro under best-effort and waives its exit 
     'test -n "$DEMO_FAKE_SECRET"',
     'test -f "$REPORT_PATH"',
     'evidence_dir=$(dirname "$REPORT_PATH")',
-    // PRESENCE, on the file the header names.
-    'grep -qF "[REDACTED]" "$evidence_dir/session.log"',
+    // PRESENCE, ON THE WHOLE FIELD (Codex T7 r2 #1). The superseded form asked
+    // only that `[REDACTED]` occur SOMEWHERE in session.log, which
+    // `token=[REDACTED]secret-value-0123456789` satisfies while leaking most of
+    // the fixture — and the absence sweep below could not see it either,
+    // because the COMPLETE value never appears. The log is parsed and the msg
+    // field compared for equality instead, with the token-bearing events
+    // counted so a correct event cannot cover for a leaking neighbour.
+    'const expected = "DEMO config dump: token=[REDACTED]";',
+    'const mentions = events.filter((event) => typeof event.msg === "string" && event.msg.includes("token="));',
+    'const exact = mentions.filter((event) => event.msg === expected);',
+    'if (mentions.length !== 1 || exact.length !== 1) {',
     // ABSENCE is the success case, so it is written out rather than left to a
-    // bare `!`: each payload is proven to EXIST first (grep exits 2 on a
-    // missing file, which an `if` would read as "no match" and pass), and only
-    // then is a match turned into an explicit, diagnosed failure.
+    // bare `!`: each payload is proven to EXIST first, and the sweep's status is
+    // CAPTURED rather than consumed as an `if` condition — as a condition,
+    // grep's 1 (absent) and its 2 (unreadable) take the same branch and `set -e`
+    // does not rescue it, so the step reported success on a file it never read.
     'test -f "$evidence_dir/$payload"',
-    'if grep -qF "$DEMO_FAKE_SECRET" "$evidence_dir/$payload"; then',
+    'status=0',
+    'grep -qF -- "$DEMO_FAKE_SECRET" "$evidence_dir/$payload" || status=$?',
+    'if test "$status" = "0"; then',
     'echo "FAIL: the fixture value reached $payload unredacted" >&2',
+    'if test "$status" != "1"; then',
     'exit 1',
   ]) {
     assert.ok(assertion.run.includes(line), `the demo assertion must check: ${line}`);
   }
+  // THE SUPERSEDED FORMS ARE GONE, both of them: a bare presence grep would
+  // still read as the proof to a reviewer skimming the file, and the `if grep`
+  // condition is the fail-open itself.
+  for (const superseded of [
+    'grep -qF "[REDACTED]" "$evidence_dir/session.log"',
+    'if grep -qF "$DEMO_FAKE_SECRET" "$evidence_dir/$payload"; then',
+  ]) {
+    assert.equal(assertion.run.includes(superseded), false, `superseded: ${superseded}`);
+  }
+  // The parser reaches the fixture and the staged log through env, exactly as
+  // the rest of the step does — no expression, and no value spliced into the
+  // script text.
+  assert.match(assertion.run, /^SESSION_LOG="\$evidence_dir\/session\.log" node -e '$/m);
   // BOTH loops cover all three staged payloads. session.log alone would leave
   // report.md and report.json free to carry the value the artifact ships.
   assert.equal((assertion.run.match(/^for payload in session\.log report\.md report\.json; do$/gm) ?? []).length, 2,
@@ -5808,6 +6010,24 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
     // SAME record; a second record in this log would mean the run emitted two,
     // and a reader comparing copies could not tell which one to compare.
     'test "$(grep -c \'ADMISSION RECORD\' "$log")" = "1"',
+    // …and exactly one of them is the anchored record this invocation is
+    // entitled to: counting the headline SUBSTRING and matching the anchored
+    // line were two different facts, and only the second one is a claim.
+    'test "$(grep -cE "$record_pattern" "$log")" = "1"',
+    // EXACTLY ONE FINDINGS LINE, AND IT IS THE ONE THAT FOLLOWS THAT HEADLINE
+    // (Codex T7 r2 #2). The old probe counted headlines with one grep and then
+    // searched EVERY findings line with another, so a log whose own record said
+    // `sudo binary: absent` still passed on an unrelated second findings line
+    // carrying the sudo-present reading — establishing the exact opposite of
+    // this job's unique live claim. The two lines are read as one block:
+    // position, not coincidence, is what binds the finding to the record.
+    'test "$(grep -c \'^debug-evidence-action: start: Findings: \' "$log")" = "1"',
+    'record_line=$(grep -nE "$record_pattern" "$log" | cut -d: -f1)',
+    'findings_line=$(sed -n "$((record_line + 1))p" "$log")',
+    // bash's own ERE, deliberately not a `printf | grep -q` pipeline: with
+    // `pipefail` set, grep -q closing the pipe early can leave the WRITER dying
+    // of SIGPIPE and the whole pipeline reading as a failure on the good path.
+    '[[ $findings_line =~ $findings_pattern ]]',
     // …and nothing created: the refusal precedes the staging directory and
     // the state file, so neither exists.
     'test ! -e "$evidence_dir"',
@@ -5826,6 +6046,12 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
   ]) {
     assert.equal(probe.run.includes(scattered), false, `superseded by an anchored match: ${scattered}`);
   }
+  // AND THE FINDINGS PATTERN IS NEVER HANDED TO A WHOLE-FILE SEARCH AGAIN. That
+  // was the round-2 defect exactly: an anchored, well-formed pattern, applied
+  // to every line in the log instead of to the one line that belongs to the
+  // record this probe matched.
+  assert.doesNotMatch(probe.run, /grep -q[A-Za-z]* '\^debug-evidence-action: start: Findings:[^']*' "\$log"/,
+    'the sudo finding is read out of its record, never searched for across the log');
   // THE PATTERNS ARE CHECKED AGAINST THE SHIPPED BUILDER, not against this
   // test's memory of it. admissionCaveats is the single source of the record's
   // text, so a pattern that had drifted from it would match nothing on the
@@ -5840,7 +6066,10 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
     capabilities: 'clear',
   };
   const emitted = (admission, trust, index) => `debug-evidence-action: start: ${admissionCaveats(admission, trust, sampleNonce)[index]}`;
-  const recordSource = /grep -qE "(\^debug-evidence-action: start: ADMISSION RECORD[^"]*)" "\$log"/.exec(probe.run);
+  // Both patterns are read out of the SHELL VARIABLES the probe now assigns
+  // them to, which is also what lets one pattern serve the count, the position
+  // lookup and the block match without being written three times.
+  const recordSource = /^record_pattern="(\^debug-evidence-action: start: ADMISSION RECORD[^"]*)"$/m.exec(probe.run);
   assert.ok(recordSource, 'the probe matches ONE anchored admission-record line');
   const recordPattern = new RegExp(recordSource[1].replace('$nonce', sampleNonce));
   assert.match(emitted(hosted, 'strict', 0), recordPattern, 'the anchored pattern matches what start emits');
@@ -5853,7 +6082,7 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
   // The live half no stubbed unit test can establish — a hosted runner ships
   // sudo — anchored to the FINDINGS line of the same record rather than
   // floating free anywhere in the log.
-  const findingsSource = /grep -qE '(\^debug-evidence-action: start: Findings:[^']*)' "\$log"/.exec(probe.run);
+  const findingsSource = /^findings_pattern='(\^debug-evidence-action: start: Findings:[^']*)'$/m.exec(probe.run);
   assert.ok(findingsSource, 'the probe matches ONE anchored findings line');
   const findingsPattern = new RegExp(findingsSource[1]);
   assert.match(emitted(hosted, 'strict', 1), findingsPattern, 'sudo present, in the findings of this record');
@@ -5870,6 +6099,233 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
     .join(' ');
   assert.match(jobCommentary, /cannot establish ORDER/);
   assert.match(jobCommentary, /remains a source claim, pinned by the unit test/);
+});
+
+// --- The shipped shell, RUN, against inputs constructed to be broken --------
+//
+// Every assertion above reads the workflow as TEXT, which can establish that a
+// check is written and never that it holds. Both round-2 Importants were
+// checks that WERE written: they simply had the wrong subject, and stayed green
+// on a log and on a set of staged bytes that were genuinely broken. The only
+// thing that settles that is executing the shipped script against the broken
+// input and watching it refuse.
+const { spawnSync: spawnShell } = require('node:child_process');
+// MSYS/Git Bash reads C:/x happily and C:\x not at all, and the assertions
+// below interpolate these paths into shell words.
+const bashPath = (value) => value.replace(/\\/g, '/');
+const SHELL_TOOLS = 'command -v grep >/dev/null && command -v sed >/dev/null && command -v cut >/dev/null && command -v node >/dev/null';
+const SHELL_AVAILABLE = (() => {
+  try {
+    return spawnShell('bash', ['-c', SHELL_TOOLS], { encoding: 'utf8' }).status === 0;
+  } catch {
+    return false;
+  }
+})();
+const NO_SHELL = 'no bash with grep/sed/cut/node here; the shipped scripts cannot be executed';
+
+const STRICT_NONCE = 'abcdef01-2345-6789-abcd-ef0123456789';
+// What a GitHub-hosted runner actually reports: sudo present, and a ptrace mode
+// that is not 3. The same readings the pattern assertions above use.
+const HOSTED_ADMISSION = {
+  ptrace: 'privilege-bypassable',
+  uid: 'non-root',
+  sudo: `present: 1 at sha256=${'a'.repeat(64)}`,
+  capabilities: 'clear',
+};
+const startLine = (text) => `debug-evidence-action: start: ${text}`;
+const REFUSAL_LINE = startLine('refusing to run the wrapped command: this host does not establish the'
+  + ' in-process boundary this action\'s evidence depends on (same-UID ptrace policy: privilege-bypassable).');
+
+// Everything ABOVE `test "$status" = "3"` is the invocation itself — a
+// `support.js start` that only a Linux host shipping sudo can drive to the
+// refusal — so the harness supplies that invocation's three results (its exit
+// status, its captured log, its redirected output file) and then runs the
+// SHIPPED BYTES from that line down. None of the assertions are reproduced
+// here; only their inputs are constructed.
+const STRICT_PROBE_SPLIT = 'test "$status" = "3"';
+const runStrictProbeAssertions = (logLines) => {
+  const script = probeStep(parseWorkflow(DEMO_WORKFLOW).jobs['strict-refusal'],
+    'Probe the start subcommand at the default evidence-trust').run;
+  const at = script.indexOf(STRICT_PROBE_SPLIT);
+  assert.ok(at > 0, 'the probe still separates its invocation from its assertions');
+  const dir = makeTempDir();
+  const logFile = path.join(dir, 'strict-probe.log');
+  const outputFile = path.join(dir, 'strict-probe-output');
+  const runnerTemp = path.join(dir, 'runner-temp');
+  mkdirSync(runnerTemp);
+  writeFileSync(logFile, `${logLines.join('\n')}\n`);
+  // The identity half the probe reads back, and an evidence-dir that was never
+  // created — which is what a refusal before staging leaves behind.
+  writeFileSync(outputFile, `invocation-nonce=${STRICT_NONCE}\nevidence-dir=${bashPath(path.join(dir, 'never-created'))}\n`);
+  return spawnShell('bash', ['-c', `set -euo pipefail\nstatus=3\nlog="${bashPath(logFile)}"\n${script.slice(at)}`], {
+    encoding: 'utf8',
+    env: { ...process.env, GITHUB_OUTPUT: bashPath(outputFile), RUNNER_TEMP: bashPath(runnerTemp) },
+  });
+};
+
+test('the strict-refusal probe binds the sudo finding to the admission record, and rejects a log where it floats free', {
+  skip: !SHELL_AVAILABLE && NO_SHELL,
+}, () => {
+  // THE HONEST LOG, assembled from the SHIPPED BUILDER rather than from this
+  // test's memory of it: exactly what `start` streams on a hosted runner that
+  // refuses under strict, plus the refusal line itself.
+  const honest = [
+    ...admissionCaveats(HOSTED_ADMISSION, 'strict', STRICT_NONCE).map(startLine),
+    REFUSAL_LINE,
+  ];
+  const accepted = runStrictProbeAssertions(honest);
+  assert.equal(accepted.status, 0, `the real record must satisfy the probe: ${accepted.stderr}`);
+  // CODEX'S EXACT COUNTER-EXAMPLE (T7 r2 #2). One admission headline, whose own
+  // findings say sudo is ABSENT, and a SECOND findings line — belonging to
+  // nothing — that carries the sudo-present reading. The old probe counted
+  // headlines with one grep and searched every findings line with another, so
+  // all four of its greps matched and the job went green while asserting the
+  // opposite of this runner's own record. This is the job's UNIQUE LIVE CLAIM;
+  // a log that contradicts it must never satisfy it.
+  const forged = [
+    startLine(admissionCaveats(HOSTED_ADMISSION, 'strict', STRICT_NONCE)[0]),
+    startLine('Findings: same-UID ptrace policy: privilege-bypassable; sudo binary: absent.'),
+    startLine(`Findings: unrelated sweep; same-UID ptrace policy: privilege-bypassable; sudo binary: present: 1 at sha256=${'a'.repeat(64)}.`),
+    REFUSAL_LINE,
+  ];
+  const rejected = runStrictProbeAssertions(forged);
+  assert.notEqual(rejected.status, 0, 'a sudo finding that belongs to no admission record proves nothing');
+  // AND THE NARROWER HALF, so the rejection above cannot be credited to the
+  // second findings line alone: ONE headline, ONE findings line, and it is the
+  // wrong one. Position is what settles this, not counting.
+  const displaced = [
+    startLine(admissionCaveats(HOSTED_ADMISSION, 'strict', STRICT_NONCE)[0]),
+    startLine('Checked: Yama ptrace mode, effective uid, sudo binary presence, and this process\'s own permitted/effective capabilities.'),
+    startLine(admissionCaveats(HOSTED_ADMISSION, 'strict', STRICT_NONCE)[1]),
+    REFUSAL_LINE,
+  ];
+  assert.notEqual(runStrictProbeAssertions(displaced).status, 0,
+    'the findings line must be the one that follows the matched headline');
+  // …and the mirror image, which POSITION alone cannot see: the record and its
+  // own findings line are correct and in order, and a second findings line
+  // appears further down. One record's findings are the whole claim, so a log
+  // carrying two of them is not the log this probe is entitled to read.
+  const doubled = [
+    ...admissionCaveats(HOSTED_ADMISSION, 'strict', STRICT_NONCE).map(startLine),
+    REFUSAL_LINE,
+    startLine('Findings: stray sweep; same-UID ptrace policy: privilege-bypassable.'),
+  ];
+  assert.notEqual(runStrictProbeAssertions(doubled).status, 0,
+    'exactly one findings line, not merely a correct first one');
+  // …and the polarity in the other direction: the honest log with its findings
+  // line saying sudo is absent is the case this whole job exists to detect.
+  const noSudo = [
+    ...admissionCaveats({ ...HOSTED_ADMISSION, sudo: 'absent' }, 'strict', STRICT_NONCE).map(startLine),
+    REFUSAL_LINE,
+  ];
+  assert.notEqual(runStrictProbeAssertions(noSudo).status, 0,
+    'if GitHub ever shipped a runner without sudo this job goes red, which is the point of it');
+});
+
+// session.log's ON-DISK FORMAT, measured rather than assumed: one
+// JSON.stringify'd event per LF-terminated line (debug_server.js's append path),
+// staged byte-for-byte as the collector served it. The demo posts four events
+// and opens one hypothesis, so a real capture is five lines.
+const DEMO_SECRET = ['demo-fake-', 'secret-value-', '0123456789'].join('');
+const REDACTED_CONFIG_MSG = 'DEMO config dump: token=[REDACTED]';
+const demoSessionLog = (configMessages) => [
+  { type: 'hypothesis', hypothesisId: 'DEMO-H1', status: 'OPEN', title: 'seeded demo failure' },
+  { msg: 'DEMO fetch: userId=42 loaded from fixture', hypothesisId: 'DEMO-H1' },
+  { msg: 'DEMO render: userId=null on first render', data: { userId: null }, hypothesisId: 'DEMO-H1' },
+  ...configMessages.map((msg) => ({ msg, hypothesisId: 'DEMO-H1' })),
+  { msg: 'DEMO unrelated background noise' },
+].map((event, index) => `${JSON.stringify({ ts: `2026-08-13T00:00:0${index}.000Z`, ...event })}\n`).join('');
+
+const DEMO_ASSERTION_STEP = 'Assert the action reported the seeded failure without failing the job';
+// The demo job's assertion step, SHIPPED BYTES, pointed at a report.md whose
+// directory holds the three staged payloads — which is exactly how the step
+// finds them on the runner. The action's four outputs arrive through env, as
+// they do live; only the staged bytes differ between the cases below.
+const runDemoAssertionsOn = (reportPath, { preamble = '', secret = DEMO_SECRET } = {}) => {
+  const script = probeStep(parseWorkflow(DEMO_WORKFLOW).jobs.demo, DEMO_ASSERTION_STEP).run;
+  return spawnShell('bash', ['-c', `${preamble}${script}`], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      EXIT_CODE: '1',
+      EVENT_COUNT: '4',
+      SESSION_ID: 'demo-0f3efe83b2633f14d915568e',
+      DIGEST: `evidence-sha256 session.log=${'0'.repeat(64)}`,
+      REPORT_PATH: bashPath(reportPath),
+      DEMO_FAKE_SECRET: secret,
+    },
+  });
+};
+
+const stageDemoPayloads = ({ sessionLog, reportMd = '## Debug evidence report\n', reportJson = '{"schema":1}\n' }) => {
+  const evidenceDir = path.join(makeTempDir(), 'debug-evidence-files-n1');
+  mkdirSync(evidenceDir);
+  writeFileSync(path.join(evidenceDir, 'session.log'), sessionLog);
+  writeFileSync(path.join(evidenceDir, 'report.md'), reportMd);
+  writeFileSync(path.join(evidenceDir, 'report.json'), reportJson);
+  return path.join(evidenceDir, 'report.md');
+};
+
+// The read error Codex REPRODUCED, injected as the exit status it produces
+// rather than as a permission bit: `chmod 000` denies nothing on Windows and
+// nothing to root, so a filesystem-based reproduction would silently stop
+// testing anything on two of the hosts this suite runs on. A shell function
+// shadows the external command for the sweep and returns 2 with no match,
+// which is precisely what an unreadable payload looks like to the script.
+const grepFailsOn = (payload) => [
+  'grep() {',
+  '  for arg in "$@"; do',
+  `    case "$arg" in */${payload})`,
+  `      printf 'grep: %s: Permission denied\\n' "$arg" >&2`,
+  '      return 2 ;;',
+  '    esac',
+  '  done',
+  '  command grep "$@"',
+  '}',
+  '',
+].join('\n');
+
+test('the demo job\'s redaction proof rejects a partial mask and a payload it could not read', {
+  skip: !SHELL_AVAILABLE && NO_SHELL,
+}, () => {
+  const honest = stageDemoPayloads({ sessionLog: demoSessionLog([REDACTED_CONFIG_MSG]) });
+  const accepted = runDemoAssertionsOn(honest);
+  assert.equal(accepted.status, 0, `a correctly redacted capture must pass: ${accepted.stderr}`);
+  // PARTIAL MASKING (Codex T7 r2 #1). The marker is present, the COMPLETE
+  // fixture value is absent from all three payloads, and most of the secret
+  // leaked anyway. A presence grep for `[REDACTED]` plus an absence grep for
+  // the whole value both pass on this; only equality on the whole field does
+  // not.
+  const partial = stageDemoPayloads({ sessionLog: demoSessionLog([`DEMO config dump: token=[REDACTED]${DEMO_SECRET.slice('demo-fake-'.length)}`]) });
+  assert.notEqual(runDemoAssertionsOn(partial).status, 0, 'a partially masked secret is a leak');
+  // …and the case an "exactly one event equals the expected string" check ALONE
+  // still passes: the correct event IS present, exactly once, and a second
+  // event carries the partial leak beside it.
+  const alongside = stageDemoPayloads({
+    sessionLog: demoSessionLog([REDACTED_CONFIG_MSG, `DEMO config dump: token=[REDACTED]${DEMO_SECRET.slice('demo-fake-'.length)}`]),
+  });
+  assert.notEqual(runDemoAssertionsOn(alongside).status, 0,
+    'one correct event does not excuse a leaking one beside it');
+  // A GREP READ ERROR IS NOT AN ABSENCE. As the condition of an `if`, statuses
+  // 1 (absent - the success case) and 2 (could not read the file) take the same
+  // branch and `set -e` does not rescue a condition, so the sweep reported
+  // success on a payload it never examined. `test -f` immediately above it
+  // neither guarantees continued readability nor closes the check/use gap.
+  for (const payload of ['session.log', 'report.md', 'report.json']) {
+    const unreadable = runDemoAssertionsOn(honest, { preamble: grepFailsOn(payload) });
+    assert.notEqual(unreadable.status, 0, `an unreadable ${payload} must fail the step, not pass it`);
+  }
+  // THE STATUS THAT MEANS WHAT IT SAYS still has to work, in both directions:
+  // a complete leak is a failure, and the leak may be in any of the three.
+  for (const [payload, extra] of [['report.md', { reportMd: `## Debug evidence report\n${DEMO_SECRET}\n` }],
+    ['report.json', { reportJson: `{"schema":1,"leak":"${DEMO_SECRET}"}\n` }]]) {
+    const leaked = stageDemoPayloads({ sessionLog: demoSessionLog([REDACTED_CONFIG_MSG]), ...extra });
+    assert.notEqual(runDemoAssertionsOn(leaked).status, 0, `the fixture value reached ${payload}`);
+  }
+  // And the vacuous capture: no config-dump event at all is not a redaction
+  // proof, it is the absence of one.
+  const missing = stageDemoPayloads({ sessionLog: demoSessionLog([]) });
+  assert.notEqual(runDemoAssertionsOn(missing).status, 0, 'no redacted event is not proof of redaction');
 });
 
 test('the failing-start probe is rejected at input validation and takes nothing from its neighbours', () => {

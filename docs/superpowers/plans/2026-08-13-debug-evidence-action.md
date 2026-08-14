@@ -3693,7 +3693,7 @@ That falsely establishes this job's UNIQUE LIVE CLAIM — that the hosted runner
 
 **STANDING CAVEAT for Task 9:** the PR-controlled artifact-upload posture is acceptable ONLY under the stated read-only / no-real-secret threat model, and the artifact BYTES themselves remain unverified until a live download inspection.
 
-Codex again could not execute Node or the scanner (`EPERM: lstat C:\Users\Mrmah`), so it did not independently confirm the suite counts; the coordinator re-ran `support.test.js` at `1c2e2a4` (122/121/0/1) and the scanner (exit 1, unchanged). Codex did verify `6c3a693` touches only the plan's final blank line and that both `git diff --check` invocations now pass.
+Codex again could not execute Node or the scanner (`EPERM: lstat C:\Users\<user>`), so it did not independently confirm the suite counts; the coordinator re-ran `support.test.js` at `1c2e2a4` (122/121/0/1) and the scanner (exit 1, unchanged). Codex did verify `6c3a693` touches only the plan's final blank line and that both `git diff --check` invocations now pass.
 
 ---
 

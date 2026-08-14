@@ -140,14 +140,52 @@ jobs:
           for payload in session.log report.md report.json; do
             test -f "$evidence_dir/$payload"
           done
-          grep -qF "[REDACTED]" "$evidence_dir/session.log"
+          # THE PROOF ITSELF IS A WHOLE-FIELD EQUALITY over the parsed log, not a
+          # substring search across it. session.log is one JSON-encoded event per
+          # line, so requiring that "[REDACTED]" occur SOMEWHERE in that file is
+          # satisfied by an event reading token=[REDACTED] followed by most of
+          # the fixture value: the marker is present, the COMPLETE value is
+          # absent from all three payloads, and the secret leaked anyway.
+          # Comparing the whole msg field for equality rejects that, and counting
+          # every token-bearing event rejects a correct event sitting beside a
+          # leaking one. The expected text is a byte contract with demo/repro.js:
+          # a change to what that file logs SHOULD require changing this line.
+          #
+          # `node` is not set up by this job and does not need to be: every step
+          # of the composite action above already runs support.js through it, so
+          # a runner without node fails long before reaching this step.
+          SESSION_LOG="$evidence_dir/session.log" node -e '
+            const events = require("node:fs").readFileSync(process.env.SESSION_LOG, "utf8")
+              .split("\n").filter((line) => line !== "").map((line) => JSON.parse(line));
+            const expected = "DEMO config dump: token=[REDACTED]";
+            const mentions = events.filter((event) => typeof event.msg === "string" && event.msg.includes("token="));
+            const exact = mentions.filter((event) => event.msg === expected);
+            if (mentions.length !== 1 || exact.length !== 1) {
+              process.stderr.write("FAIL: " + mentions.length + " event(s) mention a token and "
+                + exact.length + " carry exactly the redacted fixture line\n");
+              process.exit(1);
+            }
+          '
           for payload in session.log report.md report.json; do
-            if grep -qF "$DEMO_FAKE_SECRET" "$evidence_dir/$payload"; then
+            # THE STATUS IS CAPTURED, never consumed as a condition. As the
+            # condition of an `if`, grep's 1 (no match, which is the success case
+            # here) and its 2 (could not read the file) take the SAME branch, and
+            # `set -e` does not rescue a condition — so the sweep reported
+            # success on a payload it never examined. Exactly 1 is the only
+            # reading that establishes absence; the `test -f` above neither
+            # guarantees continued readability nor closes the check/use gap.
+            status=0
+            grep -qF -- "$DEMO_FAKE_SECRET" "$evidence_dir/$payload" || status=$?
+            if test "$status" = "0"; then
               echo "FAIL: the fixture value reached $payload unredacted" >&2
               exit 1
             fi
+            if test "$status" != "1"; then
+              echo "FAIL: grep could not read $payload (status $status); its absence was never established" >&2
+              exit 1
+            fi
           done
-          echo "redaction proved on the staged bytes: the marker is present, the fixture value is in none of the three"
+          echo "redaction proved on the staged bytes: exactly one event carries the redacted fixture line, and the fixture value is in none of the three"
 
   # 2. THE REFUSAL, on a real hosted runner. This is the one claim in the
   # matrix that no unit test can make: every admission probe is stubbed in the
@@ -196,6 +234,22 @@ jobs:
         # substrings separately, which four unrelated lines would also have
         # satisfied - four facts, and nothing about whether they belonged to
         # one coherent record.
+        #
+        # AND THE SUDO FINDING IS READ OUT OF THAT RECORD rather than looked
+        # for in the log. Counting the headlines with one search and scanning
+        # every findings line with another are two independent facts: a log
+        # whose own record reported `sudo binary: absent`, followed by an
+        # unrelated second findings line carrying a sudo-present reading,
+        # satisfied both while establishing the exact opposite of this job's
+        # one live claim. So the log must hold exactly one findings line, the
+        # record's own findings line is the one at the NEXT position, and the
+        # sudo reading is matched against THAT line and no other.
+        #
+        # The record wording below is a byte contract with support.js's
+        # admissionCaveats, and deliberately so: a builder change that reworded
+        # the record SHOULD require updating this probe, because the probe's
+        # whole value is that it matches the text a reader will be comparing
+        # the artifact's copy against.
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/strict-probe.log"
@@ -207,9 +261,20 @@ jobs:
           test "$status" = "3"
           test "$(grep -cE '^invocation-nonce=[A-Za-z0-9_-]+$' "$GITHUB_OUTPUT")" = "1"
           nonce=$(grep -oE '^invocation-nonce=[A-Za-z0-9_-]+$' "$GITHUB_OUTPUT" | cut -d= -f2-)
+          record_pattern="^debug-evidence-action: start: ADMISSION RECORD \(streamed by start before the wrapped command existed\): invocation=$nonce; evidence-trust=strict; in-process boundary=NOT established; admission=DIAGNOSTIC ONLY\.$"
+          findings_pattern='^debug-evidence-action: start: Findings: .*sudo binary: present: [1-9][0-9]{0,9} at sha256=[0-9a-f]{64}[;.]'
           test "$(grep -c 'ADMISSION RECORD' "$log")" = "1"
-          grep -qE "^debug-evidence-action: start: ADMISSION RECORD \(streamed by start before the wrapped command existed\): invocation=$nonce; evidence-trust=strict; in-process boundary=NOT established; admission=DIAGNOSTIC ONLY\.$" "$log"
-          grep -qE '^debug-evidence-action: start: Findings: .*sudo binary: present: [1-9][0-9]{0,9} at sha256=[0-9a-f]{64}[;.]' "$log"
+          # Deliberately redundant with the lookup two lines down, which already
+          # fails closed when the anchored pattern matches nothing (grep exits 1,
+          # pipefail propagates it, set -e stops the step). Stated anyway because
+          # "exactly one record matches what this invocation is entitled to" is a
+          # claim a reader should be able to SEE, not one they have to derive
+          # from the exit-status behaviour of an assignment.
+          test "$(grep -cE "$record_pattern" "$log")" = "1"
+          test "$(grep -c '^debug-evidence-action: start: Findings: ' "$log")" = "1"
+          record_line=$(grep -nE "$record_pattern" "$log" | cut -d: -f1)
+          findings_line=$(sed -n "$((record_line + 1))p" "$log")
+          [[ $findings_line =~ $findings_pattern ]]
           grep -qE '^debug-evidence-action: start: refusing to run the wrapped command: ' "$log"
           evidence_dir=$(grep -m1 '^evidence-dir=' "$GITHUB_OUTPUT" | cut -d= -f2-)
           test -n "$evidence_dir"
