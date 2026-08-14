@@ -3098,6 +3098,53 @@ Minor ×2.**
 Fix commit message:
 `fix(action): inspect PATH for sudo candidates, gate authenticated wording on strict admission (Codex T6 r10)`.
 
+#### Task 6 fix round 11 — Codex re-review decisions (recorded before code moves)
+
+Codex on `98500b6`: the regime gate, probe wrapper, nonce propagation, PATH union
+for non-empty absolute entries and the corrected spec sudo clauses all behave as
+claimed. Rulings: default stays `strict`; **(a)** off-PATH, non-conventional sudo
+locations are acceptable inside the bounded "routes checked, not a proof" model —
+NO extra warning needed, *once the existing warning actually survives Markdown
+rendering* (see the Important); **(b)** thin-but-correct `unknown` is
+security-acceptable, but a FIXED SAFE reason materially improves remediation —
+`unknown: empty-or-relative PATH entry`, and **never interpolate the raw PATH
+component** (it is attacker-influenced text); **(c)** the record volume is
+acceptable and a Task 8 rendered example is appropriate, but the oversized caveat
+must be split first. **Critical ×1, Important ×1, Minor ×2.**
+
+1. **A wholly empty `PATH` falsely clears the sudo inspection (CRITICAL).**
+   `sudoCandidatePaths` skips parsing when `pathValue === ''` and returns
+   `absent`, while `PATH=":"` and `PATH="/usr/bin:"` correctly return `unknown`.
+   Bash defines a null PATH component as the CURRENT DIRECTORY, so `PATH=""` IS
+   the null-component case — strict can be granted while `sudo` is reachable from
+   the working directory. Worse, `support.test.js:837` PINS the wrong answer, so
+   the suite defends the bug. Fix: an explicitly empty string is
+   unresolvable ⇒ `unknown` ⇒ deny; ONLY an absent PATH means "conventional
+   locations only". Update the test that pinned it, and add the three probe cases
+   (`''`, `':'`, `'/usr/bin:'`) as one table so they cannot drift apart again.
+2. **The record is TRUNCATED on the human artifact surface (Important).** The
+   generated second caveat is 676 characters; `debug_report.js` caps each rendered
+   caveat at `EXCERPT_CHAR_CAP` (500), so `report.md` ends `These are the escala…`
+   — silently deleting "not a proof that no route exists" and the examples of
+   unchecked escalation routes. `report.md` therefore reads STRONGER than
+   `report.json` and the logs, and contradicts the spec's claim that every copy
+   carries the limitation. This is a cross-component interaction: a Task 2 render
+   cap eating Task 6 security text. Fix: SPLIT the generated qualification into
+   several shorter caveats, each comfortably under the cap, AND add a
+   renderer-level assertion that every required security statement survives in
+   Markdown without truncation — assert on the RENDERED output, not the input.
+3. **The strict-refusal diagnostic still describes the old three-path rule
+   (Minor).** It says strict requires no sudo at `/usr/bin`, `/bin` or
+   `/usr/local/bin`, omitting inherited-PATH inspection, and a test pins that
+   stale wording. Update both.
+4. **The spec overclaimed the nonce's enforcement (Minor).** It said a digest
+   "cannot accidentally" be paired with another invocation's record. Nothing
+   enforces that — the nonce lets a careful reader DETECT a mismatch. **Fixed by
+   the coordinator in this commit.**
+
+Fix commit message:
+`fix(action): empty PATH denies, split the admission caveat so the limitation survives rendering (Codex T6 r11)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

@@ -273,8 +273,10 @@ under a successful strict admission.)* **The trust regime depends on
   Every copy of the record carries the checked-routes limitation. *(Added, round
   10.)* The action verifies NONE of the correspondence between the three pieces:
   the comparison is external and manual, and is only meaningful between copies
-  carrying the same invocation nonce — which every copy of the record states, so
-  a digest cannot accidentally be paired with a different invocation's record.
+  carrying the same invocation nonce — which every copy of the record states.
+  *(Corrected, round 11: an earlier draft said a digest "cannot accidentally" be
+  paired with another invocation's record. Nothing enforces that. The nonce lets
+  a careful reader DETECT such a mismatch; it does not prevent one.)*
   The authenticated reading requires a successful `strict` admission, not merely
   clear host readings: a `best-effort` run on a spotless host is still
   diagnostic.
