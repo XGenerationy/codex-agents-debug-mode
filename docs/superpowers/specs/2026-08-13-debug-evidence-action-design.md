@@ -96,14 +96,25 @@ Step chain (composite, `shell: bash` everywhere):
    as a step output, persists state. Failure here fails the action immediately; no wrapped
    command runs. *(Rewritten, Task 5 rounds 3–4; the mint and post formerly lived in
    `run`.)*
-3. **run** — `support.js run`: executes the wrapped command with collector env
-   injected from state, records the exit code in state and `GITHUB_OUTPUT`. This step
-   itself never fails on command failure (the decision is deferred to `finish`).
-4. **report** — `support.js report`, `if: always()`: captures the session over a
-   responder-authenticated, bounded live read, validates and renders `report.md` /
-   `report.json` from the in-memory bytes via `scripts/debug_report.js`, stages the
-   evidence into `output-dir`, appends the report to
-   `GITHUB_STEP_SUMMARY`, writes `event-count`/`report-path`/`evidence-digest`. If state records no
+3. **run** — `support.js run`: the trusted process. It receives the responder
+   verification key in its env *before the wrapped command exists*, clears stale
+   staged files, executes the wrapped command with collector env injected from
+   state and the runner control plane stripped, and then — in the same process,
+   still holding the authentic key — captures the session over a
+   responder-authenticated, bounded live read, validates the hypothesis set,
+   renders `report.md` / `report.json` from the in-memory bytes via
+   `scripts/debug_report.js`, hashes all three payloads in memory, stages them,
+   prints the digests, and writes
+   `command-exit-code`/`session-id`/`event-count`/`report-path`/`evidence-digest`.
+   Any integrity failure exits 3 with nothing staged — a failed composite step
+   cannot be un-failed by a later one. Command failure alone never fails this step
+   (that decision stays with `finish`). *(Rewritten, Task 5 round 6: capture moved
+   here from `report`, which no post-command step can be trusted to perform.)*
+4. **report** — `support.js report`, `if: always()`: publish-only and key-free.
+   It appends the staged report to `GITHUB_STEP_SUMMARY` when `run` recorded a
+   capture, and otherwise ensures no stale evidence remains staged and records the
+   diagnostic `finish` needs. It performs no capture, holds no credential, and
+   makes no integrity decision. If state records no
    successful `start`, the subcommand no-ops successfully (finish already owns the
    failure decision for a failed start).
 5. **upload-artifact** — pinned, `if: always()`, `if-no-files-found: ignore`, uploads
@@ -230,7 +241,26 @@ the artifact.
    incomplete responses); a recorded proof cannot answer a fresh nonce.
    Attacker-writable state (`port`/`sessionId`/`sessionToken`) is routing data,
    never a capture trust anchor. The signing key authorizes nothing — it only signs
-   responses.
+   responses. *(Extended, Task 5 round 6.)* The verification key is consumed ONLY
+   inside the `run` step's process, whose environment is resolved before the
+   wrapped command exists and whose memory a child cannot rewrite. It never
+   crosses a step boundary after the wrapped command has executed, because no
+   post-command step's environment can be trusted (see invariant 10).
+10. *(Added, Task 5 round 6.)* A hostile wrapped command can poison every LATER
+    step of the job — it can reach the runner's command files and set `BASH_ENV`,
+    which non-interactive bash sources at shell startup, after step-level `env:`
+    has been resolved. This is inherent to executing an arbitrary command in
+    GitHub Actions and applies to every action sharing that job. The action's
+    answer is structural rather than preventive: every evidence decision happens
+    inside `run`, before any such poisoning can take effect, and an integrity
+    failure exits 3 from `run` itself — a failed composite step cannot be
+    un-failed by a later step, so a poisoned `report`/`finish` cannot manufacture
+    green. The wrapped command's environment additionally strips `GITHUB_ENV`,
+    `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE`, and `GITHUB_STEP_SUMMARY`
+    alongside `DEBUG_ACTION_*`; this raises the bar (the command must enumerate
+    runner-temp command files) and is documented as such, never as a boundary.
+    Command-failure semantics are deliberately outside this model: a hostile
+    command can always choose its own exit code.
 
 ## Exit semantics
 
@@ -239,7 +269,7 @@ the artifact.
 | start failure (spawn error, ready timeout, port busy) | fail, infra-error message; wrapped command never runs |
 | wrapped command non-zero, `fail-on-command-failure: true` | fail: `command exited <code>` |
 | wrapped command non-zero, `fail-on-command-failure: false` | succeed; exit code in the `command-exit-code` output and visible in the step log (the wrapped command runs with inherited stdio). *(Amended after Task 5 spec review: the summary carries evidence only — `report.md` stays a deterministic render of the session, and the exit code's surfaces are the output and the log.)* |
-| evidence capture/report failure | fail (evidence integrity is the product; fail-closed) |
+| evidence capture/report failure | fail (evidence integrity is the product; fail-closed) — *(Task 5 round 6)* raised by the `run` step itself as exit 3 with nothing staged, so no later step can reverse it |
 | collector died before capture | fail with diagnostic (partial evidence still staged if readable) |
 | teardown failure after otherwise-green run | fail with diagnostic (leaked process on self-hosted is a real defect) |
 

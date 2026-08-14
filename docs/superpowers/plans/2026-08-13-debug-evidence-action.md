@@ -1979,6 +1979,89 @@ updated.
 Fix commit message:
 `fix(action+collector): asymmetric responder proof bound to the unfiltered request target (Codex T5 r5)`.
 
+#### Task 5 fix round 6 — Codex re-review decisions (recorded before code moves)
+
+Codex on `769b729`: Ed25519 private-key confinement and exact request-target
+binding "look correct"; rulings — (b) collector-death-makes-evidence-unverifiable
+accepted (fails closed), (c) challenge charset accepted with a T8 protocol note,
+(a) REJECTED: the step-output-integrity concern is exploitable from the CURRENT
+wrapped command, not a hypothetical future refactor. Critical ×1. Decisions:
+
+1. **Capture moves into the `run` step — the only trusted process that spans
+   command execution (the Critical).** The attack: `runSubcommand` passes the
+   runner's full env (including `GITHUB_ENV`) to the wrapped command, which
+   appends `BASH_ENV=/tmp/attacker.sh`. GitHub applies the env file to SUBSEQUENT
+   steps; non-interactive bash sources `BASH_ENV` at shell startup — i.e. inside
+   the report step, AFTER the runner resolved step-level `env:` — so the attacker
+   script overwrites `DEBUG_ACTION_COLLECTOR_VERIFY_KEY` and a counterfeit
+   collector signs the intended canonical record with its matching private key.
+   Step-env precedence does not help; target binding does not help. Structure:
+   - `action.yml` (T6) wires
+     `DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}`
+     into the **run** step, NOT the report step. The run step's shell starts and
+     its env resolves BEFORE the wrapped command exists, so no `BASH_ENV` written
+     by that command can reach it; a child cannot rewrite its parent's memory.
+     The key stays PUBLIC, so the child reading `/proc/<ppid>/environ` learns
+     nothing useful — this is precisely what round 5's asymmetric switch bought.
+   - `run` therefore performs, in one process, in order: invocation-scoped
+     cleanup of stale staged files → spawn the wrapped command (sanitized env) →
+     await exit → authenticated bounded capture → hypothesis-set validation →
+     in-memory render → in-memory digests → stage → print digest lines → write
+     outputs → locked CAS. Every round-2..round-5 property moves with it
+     unchanged; only the hosting step changes.
+   - **`run` exits 3 on any integrity failure** (counterfeit/unverified/relayed
+     response, tampered log, hypothesis-set deviation, render/validation
+     failure, missing verify key), staging nothing. This is the decisive part: a
+     composite step that fails makes the action fail, and NO later step can undo
+     it — so even a fully poisoned `report`/`finish` cannot turn a failed
+     verification green. Command-failure semantics stay deferred to `finish`
+     (unchanged, and not security-critical: a hostile command can always choose
+     its own exit code).
+   - `report` (`if: always()`) becomes **publish-only and key-free**: append the
+     staged `report.md` to the Step Summary when a capture is recorded; when none
+     is, ensure no stale staged files remain and record the diagnostic for
+     `finish`. It performs no capture, no verification, and holds no credential —
+     nothing it can be tricked into is security-relevant.
+2. **Runner control-plane hygiene (defense in depth, not a boundary).** The
+   wrapped command's env additionally strips `GITHUB_ENV`, `GITHUB_PATH`,
+   `GITHUB_OUTPUT`, `GITHUB_STATE`, and `GITHUB_STEP_SUMMARY` alongside
+   `DEBUG_ACTION_*`. Codex is right that this is not a boundary — the child can
+   still enumerate the runner's command files under `RUNNER_TEMP` — so it is
+   documented as raising the bar, never as prevention. Test: the wrapped command
+   sees none of those five variables while `DEBUG_SESSION_*`/`DEBUG_LOG_URL` and
+   unrelated variables survive.
+3. **Honest threat-model statement (T8, prominent).** A hostile wrapped command
+   can poison the remainder of the JOB (BASH_ENV via runner command files) — this
+   is inherent to executing an arbitrary command in GitHub Actions and applies to
+   every action in that job, not only this one. The action's structural answer is
+   that every evidence decision is made inside `run`, before any such poisoning
+   can take effect, and that a failed `run` cannot be un-failed by a later step.
+   Corollary to document: do not place a second adversarial-input invocation
+   after a hostile one in the same job.
+4. **Tests.** (a) THE round-6 test: the wrapped command writes a `BASH_ENV`
+   payload into the runner's env-file channel and stands up a counterfeit
+   collector with its own keypair; the harness applies the poisoned env to the
+   POST-command steps exactly as a runner would, and capture still succeeds
+   against the authentic collector because `run` already holds the real key —
+   with the mutant (key read in a post-command step) going red. (b) `run` exits 3
+   with nothing staged on each integrity class. (c) The five stripped control
+   variables. (d) All existing round-2..round-5 capture tests move to `run` and
+   keep passing. (e) `report` with no recorded capture stages nothing and leaves
+   nothing stale.
+
+Spec amendments (same commit): step-chain items 3–4 rewritten (capture in `run`;
+report publish-only), invariant 9 gains the trusted-process clause, new invariant
+10 (control-plane hygiene + the job-poisoning statement), exit-semantics table
+gains the `run` exit-3 integrity row.
+
+T6 note (supersedes the round-4/round-5 wiring notes): the verify key is wired
+into the **run** step (`id: run` for outputs); `report` receives no key; the
+action's `event-count`/`report-path`/`evidence-digest` outputs now map to
+`steps.run.outputs.*`.
+
+Fix commit message:
+`fix(action): capture in the trusted run process, fail-closed exit 3, control-plane env hygiene (Codex T5 r6)`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `node --test actions/debug-evidence/support.test.js`
