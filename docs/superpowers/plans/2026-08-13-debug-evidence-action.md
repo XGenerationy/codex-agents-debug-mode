@@ -2474,6 +2474,95 @@ git add actions/debug-evidence/action.yml actions/debug-evidence/support.test.js
 git commit -m "feat(action): debug-evidence composite wiring with structural pins"
 ```
 
+#### Task 6 fix round 1 — Codex review decisions (recorded before code moves)
+
+Codex on `12a1a3f` (fresh thread): the shipped YAML routes the key correctly,
+maps all five outputs to `steps.run`, uses the exact guards and enumerates the
+intended paths; the disclosed 13-call-site test edits check out (no expected
+value changed, no assertion removed, no skip added); no verify-key neutralizer
+needed; the second red step after an early `start` failure is honest noise.
+Important ×4. **A PREMISE THIS PLAN CARRIED IS WRONG:** the round-8 T6 ruling
+that `GITHUB_ENV` values are excluded from the `env` expression context is FALSE
+on the current runner — Codex verified against the runner source
+(`FileCommandManager.cs`, `CompositeActionHandler.cs`). The remedy is not to add
+the remap; it is to stop using a job-global channel for invocation identity.
+
+1. **Nonce becomes an invocation-scoped step output (Important #1).** `start`
+   validates inputs BEFORE replacing the nonce in `GITHUB_ENV`, and `GITHUB_ENV`
+   persists to every later step of the JOB. So: invocation A leaves nonce `N1`
+   and evidence in the shared default directory; invocation B fails validation
+   early; B's `report` inherits `N1`, finds A's state carrying `N1`, declares it
+   OWNED, and the `always()` upload publishes A's evidence under B's artifact
+   name. B stays red, so this is not Critical, but invocation isolation is
+   broken. Fix — remove the job-global channel entirely:
+   - `start` mints the nonce and emits it as step output `invocation-nonce` as
+     its FIRST action, before input validation or anything else that can fail.
+   - `start` NO LONGER writes `DEBUG_ACTION_INVOCATION_NONCE` to `GITHUB_ENV`.
+     Job-global pollution and the replay channel both disappear.
+   - `action.yml` wires `DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}`
+     into run/report/teardown/finish. Step outputs are per-invocation by
+     construction: B's steps read B's `start`, so they can never observe A's
+     value; if B's `start` died before emitting, the value is empty and the
+     strict subcommands refuse. This SUPERSEDES the round-8 no-remap rule and
+     the structural test that pinned it — that test must be replaced, not kept.
+2. **`teardown` must be strict about the nonce (Important #2).**
+   `rejectForeignNonce` accepts a missing nonce, so a fresh job whose `start`
+   fails early, pointed at a REUSED custom output directory holding stale state,
+   reads that state and runs `kill(state.pid)` — a pid that may belong to another
+   invocation or be recycled to an unrelated process on a self-hosted runner.
+   Codex: strict `teardown` is REQUIRED, strict `finish` is sensible symmetry.
+   Missing nonce ⇒ do not read or act on state. Apply to both.
+3. **Upload must be scoped to what THIS invocation staged (Important #3).**
+   `clearStagedEvidence` throws on anything but `ENOENT` (e.g. a stale
+   `session.log` that is a DIRECTORY), which fails `report` — but upload still
+   runs, because its condition only checks that `start` was not skipped. The
+   pinned uploader treats paths as files, directories or globs with
+   `implicitDescendants` and `followSymbolicLinks` enabled, so that directory's
+   descendants get uploaded. A concurrent invocation can likewise restage between
+   cleanup and upload, and with `run` skipped there is no current digest to
+   expose the substitution. Fix (both halves — Codex offers either; they
+   compose):
+   - The staged evidence child is INVOCATION-SCOPED (name derived from the
+     invocation nonce), and `run` emits its absolute path as output
+     `evidence-dir`. A stale sibling from another invocation can then never be
+     inside this invocation's upload path set.
+   - `run` emits `evidence-staged` naming exactly which payloads it staged
+     (empty when none). Upload gains
+     `if: ${{ always() && steps.run.outputs.evidence-staged != '' }}` and takes
+     its `path:` entries from `steps.run.outputs.evidence-dir`. Do NOT gate on
+     `report` succeeding — that would suppress valid evidence when only the Step
+     Summary failed (Codex's explicit warning).
+   - ALSO investigate and report: whether the pinned `upload-artifact` exposes a
+     control for symlink following. The staging window plus `followSymbolicLinks`
+     means a hostile swap could substitute a symlink to an unrelated readable
+     file and pull its bytes into the artifact. If no control exists, record it
+     as a T8 threat-model line (the digest mismatch detects it after the fact).
+4. **The structural tests do not pin what their names claim (Important #4).**
+   Codex demonstrated four mutation SURVIVORS against the committed tests:
+   replacing all four exact guards with bare `${{ always() }}` passes (prefix-only
+   check); adding `C:/foreign/**` to the upload block passes (requires the three
+   expected paths, never rejects extras); moving the verify-key mapping into an
+   INLINE comment passes (comment stripping removes only whole-line comments, so
+   the carrier assertion still reports the run step while no real mapping
+   exists); the output-dir expression check requires ≥6 occurrences where the
+   file has 8, so two sites could diverge unnoticed. Fix: a test-local SEMANTIC
+   reader (~60 lines, no dependency — the repo ships zero runtime deps) that
+   walks `runs.steps` and extracts per step: `name`, `id`, `if`, `shell`, `uses`,
+   `with:` paths, `env` keys AND values, `run` — stripping comments properly
+   (from an unquoted `#` to end of line). Every assertion then becomes an EXACT
+   `deepEqual` — env key sets, the full `if:` string, the sorted upload path
+   list, the output map — so extras and near-misses fail. Keep the SHA-pin
+   assertions on RAW text, since they must see the version comments. Re-run
+   Codex's four mutations as regression checks and report each going red.
+
+Fix commit message:
+`fix(action): invocation-scoped nonce and staging, strict teardown/finish, semantic structural pins (Codex T6 r1)`.
+
+Spec amendment (same commit): the artifact section records that the evidence
+child is invocation-scoped and that upload is gated on a trusted `run` output;
+invariant 10 notes that invocation identity travels as a step output, never
+through `GITHUB_ENV` (with the corrected `env`-context fact).
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

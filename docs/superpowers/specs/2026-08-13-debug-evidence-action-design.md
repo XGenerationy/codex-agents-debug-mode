@@ -273,7 +273,16 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
     alongside `DEBUG_ACTION_*`; this raises the bar (the command must enumerate
     runner-temp command files) and is documented as such, never as a boundary.
     Command-failure semantics are deliberately outside this model: a hostile
-    command can always choose its own exit code. *(Extended, Task 5 round 7.)*
+    command can always choose its own exit code. *(Extended, Task 6 round 1.)*
+    Invocation identity travels as a `start` STEP OUTPUT, never through
+    `GITHUB_ENV`: env-file values persist to every later step of the job and DO
+    appear in the expression `env` context (verified against the runner source —
+    an earlier note in this design claiming otherwise was wrong), so a
+    job-global nonce lets a failed later invocation inherit an earlier one's
+    identity and claim its evidence. Step outputs are per-invocation by
+    construction. The staged evidence child is likewise invocation-scoped, and
+    the upload step is gated on a trusted `run` output naming what was actually
+    staged. *(Extended, Task 5 round 7.)*
     EVERY evidence verdict — integrity failure, unreachable collector, and
     success — is decided inside `run`; none is deferred to a later step through
     state or env. `finish` retains only the command-failure mirror and teardown
