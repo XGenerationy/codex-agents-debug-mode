@@ -45,6 +45,7 @@ const {
   reportSubcommand,
   resolveEvidenceDir,
   runSubcommand,
+  RUNNER_COMMAND_FILE_VARS,
   startSubcommand,
   teardownSubcommand,
   validateActionInputs,
@@ -5580,12 +5581,38 @@ test('the demo workflow is a dogfood, not a gate: read-only, pinned, and no step
   // in full would fail this repo's CI on this very file.
   assert.equal(/continue-on-error["']?\s*[:=]\s*true/i.test(workflowText(DEMO_WORKFLOW)), false,
     'not even in a comment');
-  const uses = [...workflowText(DEMO_WORKFLOW).matchAll(/uses: (\S+)/g)].map((match) => match[1]);
-  for (const reference of uses) {
-    if (reference === DEMO_ACTION_REF) continue;
+  // FROM THE PARSED STRUCTURE, never from raw text (Codex T7 r1 #3). A
+  // raw-text scan reads COMMENTED-OUT lines too, so commenting a checkout step
+  // out left its pinned `uses:` plainly visible to this assertion while the
+  // workflow the runner would actually execute had no checkout at all and
+  // would fail resolving the local action. What is asserted has to be what the
+  // runner would run — actionlint would also catch it, and is deliberately not
+  // adopted: this repo ships "dependencies": 0 and that posture is load-bearing.
+  const uses = Object.values(workflow.jobs)
+    .flatMap((job) => job.steps)
+    .filter((step) => step.uses !== undefined)
+    .map((step) => step.uses);
+  // LOCAL AND REMOTE ARE DIFFERENT CLAIMS, so they are separated rather than
+  // one being `continue`d past. A path reference cannot be pinned at all —
+  // that is precisely why it is called out — and the only one permitted here
+  // is the action under test.
+  const local = uses.filter((reference) => reference.startsWith('./'));
+  const remote = uses.filter((reference) => !reference.startsWith('./'));
+  assert.deepEqual([...new Set(local)], [DEMO_ACTION_REF], 'the only local reference is the action under test');
+  assert.equal(local.length, 3, 'and it is invoked three times');
+  for (const reference of remote) {
     assert.match(reference, /^[^@\s]+@[0-9a-f]{40}$/, `${reference} must be SHA-pinned`);
   }
-  assert.ok(uses.includes('actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10'), 'the repo-wide checkout pin');
+  // EVERY job checks out, as its first step. This is the assertion the raw-text
+  // form could not make: a job whose checkout is commented out still carried
+  // the pinned string in the file, and only the parsed structure knows the
+  // step is gone.
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    assert.equal(job.steps[0].uses, 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
+      `${jobName}: the repo-wide checkout pin, first, as the runner would resolve it`);
+  }
+  // The version COMMENT is a claim about the raw text by construction, so it
+  // is the one thing here still read that way.
   for (const pin of [
     'uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3',
     'uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0',
@@ -5692,6 +5719,45 @@ test('the demo job wraps the seeded repro under best-effort and waives its exit 
   assert.equal(assertion.env.EVENT_COUNT, '${{ steps.demo.outputs.event-count }}');
   assert.ok(assertion.run.includes('test "$EXIT_CODE" = "1"'), 'the seeded failure is asserted, not just reported');
   assert.ok(assertion.run.includes('test "$EVENT_COUNT" = "4"'), 'four events, exactly as the lifecycle test counts them');
+  // AND THE ADVERTISED CLAIM ITSELF (Codex T7 r1 #1). Every check above is
+  // satisfied by a collector that wrote the fixture value verbatim into all
+  // three payloads: the exit code, the event count, a session id and a digest
+  // are all produced either way, so the job stayed green while this file's
+  // header promised that "the artifact's session.log must then read [REDACTED]
+  // where repro.js logged it". The unit test above checks redaction; the LIVE
+  // job — the only surface that runs on a real runner — did not, and a demo
+  // that certifies a claim it never checked is worse than no demo.
+  assert.equal(assertion.env.REPORT_PATH, '${{ steps.demo.outputs.report-path }}');
+  // The needle arrives by ENV INHERITANCE from the workflow-level `env:`, and
+  // is deliberately NOT re-bound here: this file's standing rule is that no
+  // `${{ }}` expression is substituted into a script body, and the cheapest
+  // way to keep the rule auditable is for the body to contain none at all.
+  assert.equal(Object.hasOwn(assertion.env, 'DEMO_FAKE_SECRET'), false, 'inherited, never re-bound');
+  assert.doesNotMatch(assertion.run, /\$\{\{/, 'no expression is interpolated into the script body');
+  for (const line of [
+    // A needle that went missing would make grep -F match every line, so this
+    // is a diagnostic rather than a load-bearing guard — but the polarity is
+    // still stated instead of assumed.
+    'test -n "$DEMO_FAKE_SECRET"',
+    'test -f "$REPORT_PATH"',
+    'evidence_dir=$(dirname "$REPORT_PATH")',
+    // PRESENCE, on the file the header names.
+    'grep -qF "[REDACTED]" "$evidence_dir/session.log"',
+    // ABSENCE is the success case, so it is written out rather than left to a
+    // bare `!`: each payload is proven to EXIST first (grep exits 2 on a
+    // missing file, which an `if` would read as "no match" and pass), and only
+    // then is a match turned into an explicit, diagnosed failure.
+    'test -f "$evidence_dir/$payload"',
+    'if grep -qF "$DEMO_FAKE_SECRET" "$evidence_dir/$payload"; then',
+    'echo "FAIL: the fixture value reached $payload unredacted" >&2',
+    'exit 1',
+  ]) {
+    assert.ok(assertion.run.includes(line), `the demo assertion must check: ${line}`);
+  }
+  // BOTH loops cover all three staged payloads. session.log alone would leave
+  // report.md and report.json free to carry the value the artifact ships.
+  assert.equal((assertion.run.match(/^for payload in session\.log report\.md report\.json; do$/gm) ?? []).length, 2,
+    'existence and absence are each checked over all three staged payloads');
 });
 
 // The two refusal probes, read as what they are: `support.js start` invoked
@@ -5731,15 +5797,17 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
   assert.match(probe.env.GITHUB_OUTPUT, /^\$\{\{ runner\.temp \}\}\//);
   for (const line of [
     'test "$status" = "3"',
-    'grep -q "refusing to run the wrapped command" "$log"',
-    'grep -q "ADMISSION RECORD" "$log"',
-    'grep -q "evidence-trust=strict" "$log"',
-    'grep -q "in-process boundary=NOT established" "$log"',
-    // The live half no stubbed unit test can establish: a hosted runner ships
-    // sudo, which is why hosted execution stays best-effort.
-    'grep -q "sudo binary: present" "$log"',
-    // Identity FIRST, before validation and before any filesystem work…
+    // Identity FIRST, before validation and before any filesystem work — and
+    // the nonce is read back through the SAME anchored vocabulary that counts
+    // it, so what is spliced into the record pattern below can only ever be
+    // one bounded [A-Za-z0-9_-] segment.
     'test "$(grep -cE \'^invocation-nonce=[A-Za-z0-9_-]+$\' "$GITHUB_OUTPUT")" = "1"',
+    'nonce=$(grep -oE \'^invocation-nonce=[A-Za-z0-9_-]+$\' "$GITHUB_OUTPUT" | cut -d= -f2-)',
+    // EXACTLY ONE admission record (Codex T7 r1 ruling). Five separate greps
+    // established five facts and nothing about whether they belonged to the
+    // SAME record; a second record in this log would mean the run emitted two,
+    // and a reader comparing copies could not tell which one to compare.
+    'test "$(grep -c \'ADMISSION RECORD\' "$log")" = "1"',
     // …and nothing created: the refusal precedes the staging directory and
     // the state file, so neither exists.
     'test ! -e "$evidence_dir"',
@@ -5748,6 +5816,60 @@ test('the strict-refusal probe reaches the admission refusal, not an input error
   ]) {
     assert.ok(probe.run.includes(line), `the strict probe must check: ${line}`);
   }
+  // THE SCATTERED SUBSTRINGS ARE GONE. Each one could match any line of the
+  // log, so together they proved four facts and no coherence between them.
+  for (const scattered of [
+    'grep -q "ADMISSION RECORD" "$log"',
+    'grep -q "evidence-trust=strict" "$log"',
+    'grep -q "in-process boundary=NOT established" "$log"',
+    'grep -q "sudo binary: present" "$log"',
+  ]) {
+    assert.equal(probe.run.includes(scattered), false, `superseded by an anchored match: ${scattered}`);
+  }
+  // THE PATTERNS ARE CHECKED AGAINST THE SHIPPED BUILDER, not against this
+  // test's memory of it. admissionCaveats is the single source of the record's
+  // text, so a pattern that had drifted from it would match nothing on the
+  // runner — a red job for a reason nobody could act on. The host readings are
+  // the ones a GitHub-hosted runner actually produces: sudo present, and a
+  // ptrace mode that is not 3.
+  const sampleNonce = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const hosted = {
+    ptrace: 'privilege-bypassable',
+    uid: 'non-root',
+    sudo: `present: 1 at sha256=${'a'.repeat(64)}`,
+    capabilities: 'clear',
+  };
+  const emitted = (admission, trust, index) => `debug-evidence-action: start: ${admissionCaveats(admission, trust, sampleNonce)[index]}`;
+  const recordSource = /grep -qE "(\^debug-evidence-action: start: ADMISSION RECORD[^"]*)" "\$log"/.exec(probe.run);
+  assert.ok(recordSource, 'the probe matches ONE anchored admission-record line');
+  const recordPattern = new RegExp(recordSource[1].replace('$nonce', sampleNonce));
+  assert.match(emitted(hosted, 'strict', 0), recordPattern, 'the anchored pattern matches what start emits');
+  // POLARITY, because an anchored pattern that matched anything would be the
+  // same defect in a longer form: the regime and the boundary verdict are part
+  // of the claim, so a record carrying different ones must NOT satisfy it.
+  assert.doesNotMatch(emitted(hosted, 'best-effort', 0), recordPattern, 'a best-effort record is a different claim');
+  assert.doesNotMatch(emitted({ ...hosted, ptrace: 'unconditional', sudo: 'absent' }, 'strict', 0), recordPattern,
+    'a record whose boundary IS established is a different claim');
+  // The live half no stubbed unit test can establish — a hosted runner ships
+  // sudo — anchored to the FINDINGS line of the same record rather than
+  // floating free anywhere in the log.
+  const findingsSource = /grep -qE '(\^debug-evidence-action: start: Findings:[^']*)' "\$log"/.exec(probe.run);
+  assert.ok(findingsSource, 'the probe matches ONE anchored findings line');
+  const findingsPattern = new RegExp(findingsSource[1]);
+  assert.match(emitted(hosted, 'strict', 1), findingsPattern, 'sudo present, in the findings of this record');
+  assert.doesNotMatch(emitted({ ...hosted, sudo: 'absent' }, 'strict', 1), findingsPattern,
+    'a runner without sudo does not satisfy it — that is the point of the job');
+  // ORDERING IS NOT A PROBE CLAIM (Codex T7 r1 ruling). Reading the output
+  // afterwards can establish CONTENT and never SEQUENCE: that the nonce was
+  // published before admission was decided is a fact about the source, pinned
+  // by the unit test named below, and the workflow must say so rather than
+  // implying its greps established it.
+  const jobCommentary = workflowText(DEMO_WORKFLOW).split(/\r?\n/)
+    .filter((line) => line.trim().startsWith('#'))
+    .map((line) => line.trim().replace(/^#\s?/, ''))
+    .join(' ');
+  assert.match(jobCommentary, /cannot establish ORDER/);
+  assert.match(jobCommentary, /remains a source claim, pinned by the unit test/);
 });
 
 test('the failing-start probe is rejected at input validation and takes nothing from its neighbours', () => {
@@ -5771,9 +5893,13 @@ test('the failing-start probe is rejected at input validation and takes nothing 
     'test "$status" = "1"',
     'grep -q "invalid inputs: session-name" "$log"',
     // Its own staging child, named from its own pre-validation identity, and
-    // empty — never the neighbours' evidence.
-    'test ! -e "$evidence_dir/report.md"',
-    'test ! -e "$evidence_dir/session.log"',
+    // NOT PRESENT AT ALL — never the neighbours' evidence (Codex T7 r1 #4).
+    // Naming two files checked two files: a directory holding report.json, a
+    // lock, or any other residue satisfied both while flatly contradicting
+    // "stays empty". The claim is about the directory, so the check is too —
+    // and it is the stronger claim the refusal actually earns, since `start`
+    // rejects these inputs before it creates anything at all.
+    'test ! -e "$evidence_dir"',
     // A DIFFERENT directory from the neighbour's, whose staged report is
     // still there afterwards: neither adopted nor destroyed.
     'test "$evidence_dir" != "$(dirname "$SECOND_REPORT")"',
@@ -5826,6 +5952,16 @@ test('the two-invocation job demonstrates NAMESPACING ONLY, and says so in the f
   assert.match(commentary, /not adversarial isolation/i);
   assert.match(commentary, /separate job/i);
   assert.doesNotMatch(commentary, /(?:demonstrates|proves|shows) (?:adversarial )?isolation|isolated from each other|safe to reuse in the same job/i);
+  // AND THE SECOND LABEL THIS JOB NEEDS (Codex T7 r1 ruling on teardown).
+  // Distinct ports are operationally right — they dodge the signal-to-port-
+  // release race — but dodging the race also dodges the evidence: a first
+  // collector that IGNORED termination outright would still be listening on
+  // 8787 while this second invocation succeeded on 8788. So the only teardown
+  // fact this job establishes is that the call RETURNED, and the comment has
+  // to say that rather than leaving a reader to infer more.
+  assert.match(commentary, /the only teardown fact established here is that teardown RETURNED/);
+  assert.match(commentary, /proves NOTHING about whether the first collector actually died/);
+  assert.match(commentary, /bounded process-exit polling or a teardown that waits/);
 });
 
 test('the closeout gate forwards a retry for the demo workflow, and still excludes itself', () => {
@@ -5845,6 +5981,22 @@ test('the closeout gate forwards a retry for the demo workflow, and still exclud
   assert.doesNotMatch(commentary, /ONLY these two sibling/i);
   assert.match(commentary, /NOT "Closeout gate" itself/);
   assert.match(commentary, /no retrigger loop/i);
+  // THE BOOTSTRAP COST, documented rather than fixed (Codex T7 r1 #2). A
+  // workflow_run listener runs the YAML as committed on the DEFAULT branch, so
+  // a sibling newly added to the list above does not exist for this trigger
+  // until the PR adding it has merged — which means that PR's own gate run
+  // cannot be unblocked by that sibling's completion. This is a real one-time
+  // operational cost and the comment must not read as though it were closed.
+  assert.match(commentary, /BOOTSTRAP/);
+  assert.match(commentary, /a one-time operational cost, NOT something this file fixes/);
+  assert.match(commentary, /does not\s+exist for this trigger until the PR that adds it has MERGED/);
+  assert.match(commentary, /re-runs the gate by hand, once/);
+  assert.match(commentary, /it is paid once per newly-listed sibling, at merge time/);
+  // The parenthetical that enumerates the siblings drifted when the third one
+  // was added: a list that names two of three is a claim about the repository
+  // that is simply false.
+  assert.doesNotMatch(commentary, /sibling workflow \(Validate \/ Closeout preview\) completes/);
+  assert.match(commentary, /sibling workflow \(Validate \/ Closeout preview \/ Debug evidence demo\)\s+completes/);
   // AND the structural fact the gate's own blast-radius note asserts about its
   // siblings, which the demo workflow CHANGES: it uploads an evidence
   // artifact, so the old "neither uploads an artifact" sentence became false
@@ -5860,4 +6012,48 @@ test('the closeout gate forwards a retry for the demo workflow, and still exclud
   const invocations = Object.values(parseWorkflow(DEMO_WORKFLOW).jobs)
     .flatMap((job) => actionInvocations(job));
   assert.equal(Number(claimed[1]), invocations.length);
+  // AND THE BOUND ON THOSE ARTIFACTS IS SNAPSHOT-SCOPED, not structural
+  // (Codex T7 r1 #5). The note models a hostile PR-controlled checkout and
+  // then describes the artifact contents as three deterministic demo files —
+  // but the same PR controls the action, the repro AND the upload
+  // configuration, so "three files from a deterministic repro" describes the
+  // reviewed snapshot and nothing a PR is prevented from changing.
+  assert.match(commentary, /bounded only for the SNAPSHOT\s+REVIEWED/);
+  assert.match(commentary, /the same PR controls the\s+action, the repro and the upload configuration/);
+  // The neighbouring half genuinely IS structural and must not be dragged down
+  // with it: no write scope is requested, and no sibling exposes a repository
+  // secret this token could reach. Qualifying that would be the opposite error.
+  assert.match(commentary, /The permissions: block above is entirely READ-only/);
+  assert.doesNotMatch(commentary, /read-only[^.]{0,60}(?:snapshot|only for the snapshot)/i);
+  // The blast-radius summary further down said "neither sibling workflow
+  // exposes a secret or artifact this token could reach" — a two-of-three
+  // count AND, since this task shipped, a false claim about artifacts.
+  assert.doesNotMatch(commentary, /neither sibling workflow exposes a secret or artifact/);
+  assert.match(commentary, /no\s+sibling workflow exposes a repository secret this token could reach/);
+});
+
+// THE CROSS-MODULE BYTE CONTRACT the demo's exit-98 guard silently depends on.
+// repro.js enumerates the variables `run` promises to delete from the wrapped
+// command's environment, support.js enumerates the ones it actually deletes,
+// and the two lists were byte-identical with NOTHING pinning them: a grep of
+// this suite returned zero hits for either name, and the repro's own comment
+// invited a reader to compare them "by eye". Add a sixth command-file variable
+// to support.js and the demo's guard quietly stops checking it while staying
+// green — a guard that certifies a contract it no longer covers.
+test('the demo repro checks exactly the control-plane variables the run step deletes', () => {
+  const { STRIPPED_CONTROL_PLANE } = require(REPRO_PATH);
+  // BOTH SIDES ARE PROVEN TO EXIST FIRST. deepEqual(undefined, undefined)
+  // passes, so an export that silently disappeared from either module would
+  // turn this pin into a vacuous green — the exact failure mode the pin exists
+  // to remove, reintroduced one level up.
+  for (const [label, list] of [['repro.js STRIPPED_CONTROL_PLANE', STRIPPED_CONTROL_PLANE], ['support.js RUNNER_COMMAND_FILE_VARS', RUNNER_COMMAND_FILE_VARS]]) {
+    assert.ok(Array.isArray(list) && list.length >= 5, `${label} must be exported, and be the five runner command files at least`);
+    assert.equal(list.every((name) => typeof name === 'string' && name.startsWith('GITHUB_')), true, `${label}: every entry is a GITHUB_ variable`);
+  }
+  // Order included, deliberately: deepEqual on arrays is order-sensitive, and
+  // the point of the pin is that these are the same list rather than the same
+  // set assembled twice.
+  assert.deepEqual(STRIPPED_CONTROL_PLANE, RUNNER_COMMAND_FILE_VARS);
+  // And the repro no longer advertises an eyeball contract it does not need.
+  assert.doesNotMatch(readFileSync(REPRO_PATH, 'utf8'), /by eye/i);
 });

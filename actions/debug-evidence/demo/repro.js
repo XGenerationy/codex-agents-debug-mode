@@ -34,8 +34,12 @@
 //      mistaken for the failure it is supposed to seed.
 
 // Everything `run` promises to remove. Named here so the check below reads as
-// the contract it is, and so this list can be compared against
-// RUNNER_COMMAND_FILE_VARS in support.js by eye.
+// the contract it is, and EXPORTED so support.test.js can assert it is deeply
+// equal to RUNNER_COMMAND_FILE_VARS in support.js. That pin replaces an
+// earlier invitation to compare the two lists by inspection, which pinned
+// nothing: a sixth command-file variable added to support.js and not here
+// would leave the exit 98 guard below silently checking five of six, staying
+// green while covering less than it advertises.
 const STRIPPED_CONTROL_PLANE = [
   'GITHUB_ENV',
   'GITHUB_PATH',
@@ -88,7 +92,18 @@ const main = async () => {
   process.exitCode = 1;
 };
 
-main().catch((error) => {
-  process.stderr.write(`DEMO repro failed unexpectedly: ${error.message}\n`);
-  process.exitCode = 99; // 99 = demo infrastructure broke (≠ the seeded 1)
-});
+// AS A PROGRAM ONLY, guarded exactly as support.js guards its own main.
+// support.test.js requires this file to pin STRIPPED_CONTROL_PLANE against
+// support.js, and an unguarded import would also run main() in the test
+// process: DEMO_FAKE_SECRET is a workflow fixture that no test process sets,
+// so the fixture check would set process.exitCode = 99 on the whole suite.
+// The action always invokes this file as `node .../repro.js`, where
+// require.main === module holds and nothing changes.
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`DEMO repro failed unexpectedly: ${error.message}\n`);
+    process.exitCode = 99; // 99 = demo infrastructure broke (≠ the seeded 1)
+  });
+}
+
+module.exports = { STRIPPED_CONTROL_PLANE };

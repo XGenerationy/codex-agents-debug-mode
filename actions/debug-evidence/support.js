@@ -2293,6 +2293,11 @@ module.exports = {
   reportSubcommand,
   resolveEvidenceDir,
   runSubcommand,
+  // Exported for the cross-module byte contract, not for reuse: demo/repro.js
+  // keeps its own copy of this list so its exit 98 guard reads as the contract
+  // it checks, and support.test.js asserts the two are deeply equal so the
+  // copy cannot drift out from under the guard.
+  RUNNER_COMMAND_FILE_VARS,
   startSubcommand,
   teardownSubcommand,
   validateActionInputs,

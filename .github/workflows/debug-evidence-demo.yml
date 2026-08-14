@@ -104,11 +104,28 @@ jobs:
         # parses it. These particular values are the action's own outputs, but
         # keeping every expression out of the script text is the rule that does
         # not need re-auditing when a value's provenance changes.
+        #
+        # DEMO_FAKE_SECRET is deliberately NOT re-bound here. It is already in
+        # this job's environment from the workflow-level `env:` above, which is
+        # how the script body below can reach the fixture value without a
+        # single expression appearing in it.
+        #
+        # AND THE REDACTION HALF IS THE POINT OF THE STEP. The four output
+        # checks below are all satisfied by a collector that copied the fixture
+        # value verbatim into every payload: it would still report exit 1, four
+        # events, a session id and a digest. That is the header's advertised
+        # claim going unchecked on the only surface that runs on a real runner,
+        # so the staged bytes are read here directly.
         env:
           EXIT_CODE: ${{ steps.demo.outputs.command-exit-code }}
           EVENT_COUNT: ${{ steps.demo.outputs.event-count }}
           SESSION_ID: ${{ steps.demo.outputs.session-id }}
           DIGEST: ${{ steps.demo.outputs.evidence-digest }}
+          # report.md's absolute path inside this invocation's staging child.
+          # Its directory is where the three staged payloads live: nothing in
+          # the composite deletes them, and the upload step reads the same
+          # three names out of the same directory afterwards.
+          REPORT_PATH: ${{ steps.demo.outputs.report-path }}
         run: |
           set -euo pipefail
           echo "command-exit-code=$EXIT_CODE event-count=$EVENT_COUNT session-id=$SESSION_ID"
@@ -117,6 +134,20 @@ jobs:
           test "$EVENT_COUNT" = "4"
           test -n "$SESSION_ID"
           test -n "$DIGEST"
+          test -n "$DEMO_FAKE_SECRET"
+          test -f "$REPORT_PATH"
+          evidence_dir=$(dirname "$REPORT_PATH")
+          for payload in session.log report.md report.json; do
+            test -f "$evidence_dir/$payload"
+          done
+          grep -qF "[REDACTED]" "$evidence_dir/session.log"
+          for payload in session.log report.md report.json; do
+            if grep -qF "$DEMO_FAKE_SECRET" "$evidence_dir/$payload"; then
+              echo "FAIL: the fixture value reached $payload unredacted" >&2
+              exit 1
+            fi
+          done
+          echo "redaction proved on the staged bytes: the marker is present, the fixture value is in none of the three"
 
   # 2. THE REFUSAL, on a real hosted runner. This is the one claim in the
   # matrix that no unit test can make: every admission probe is stubbed in the
@@ -150,6 +181,21 @@ jobs:
           # Redirected so the probe's own step outputs never reach this step's
           # real ones, and so the emitted lines can be inspected below.
           GITHUB_OUTPUT: ${{ runner.temp }}/strict-probe-output
+        # WHAT THIS PROBE ESTABLISHES, AND WHAT IT CANNOT. It reads the
+        # process's output after the fact, so it can establish CONTENT and
+        # cannot establish ORDER: that the invocation nonce was published
+        # BEFORE admission was decided remains a source claim, pinned by the
+        # unit test 'start emits the invocation nonce and the staging directory
+        # as its first action, before any check that can fail', and nothing
+        # below adds to it.
+        #
+        # What it does establish is that ONE admission record was emitted and
+        # that a SINGLE anchored line of it carries this invocation's own
+        # nonce, the strict regime, the unestablished boundary and the
+        # diagnostic-only verdict together. The earlier form searched for four
+        # substrings separately, which four unrelated lines would also have
+        # satisfied - four facts, and nothing about whether they belonged to
+        # one coherent record.
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/strict-probe.log"
@@ -159,12 +205,12 @@ jobs:
           cat "$log"
           cat "$GITHUB_OUTPUT"
           test "$status" = "3"
-          grep -q "refusing to run the wrapped command" "$log"
-          grep -q "ADMISSION RECORD" "$log"
-          grep -q "evidence-trust=strict" "$log"
-          grep -q "in-process boundary=NOT established" "$log"
-          grep -q "sudo binary: present" "$log"
           test "$(grep -cE '^invocation-nonce=[A-Za-z0-9_-]+$' "$GITHUB_OUTPUT")" = "1"
+          nonce=$(grep -oE '^invocation-nonce=[A-Za-z0-9_-]+$' "$GITHUB_OUTPUT" | cut -d= -f2-)
+          test "$(grep -c 'ADMISSION RECORD' "$log")" = "1"
+          grep -qE "^debug-evidence-action: start: ADMISSION RECORD \(streamed by start before the wrapped command existed\): invocation=$nonce; evidence-trust=strict; in-process boundary=NOT established; admission=DIAGNOSTIC ONLY\.$" "$log"
+          grep -qE '^debug-evidence-action: start: Findings: .*sudo binary: present: [1-9][0-9]{0,9} at sha256=[0-9a-f]{64}[;.]' "$log"
+          grep -qE '^debug-evidence-action: start: refusing to run the wrapped command: ' "$log"
           evidence_dir=$(grep -m1 '^evidence-dir=' "$GITHUB_OUTPUT" | cut -d= -f2-)
           test -n "$evidence_dir"
           test ! -e "$evidence_dir"
@@ -230,6 +276,16 @@ jobs:
           # would report port_in_use and this invocation's start would fail.
           # The same reasoning the `port` input documents for self-hosted
           # runners sharing a host applies to two invocations in one job.
+          #
+          # AND WHAT DODGING THAT RACE COSTS, stated because it also dodges
+          # the evidence: distinct ports mean this job proves NOTHING about
+          # whether the first collector actually died. A first collector that
+          # ignored termination outright would still be listening on 8787
+          # while this invocation succeeded on 8788, so the only teardown fact
+          # established here is that teardown RETURNED. Establishing that the
+          # process EXITED needs bounded process-exit polling or a teardown
+          # that waits; neither is in this workflow, and neither is in scope
+          # for this task.
           port: "8788"
           artifact-name: debug-evidence-demo-namespacing-b
 
@@ -282,8 +338,7 @@ jobs:
           grep -q "invalid inputs: session-name" "$log"
           evidence_dir=$(grep -m1 '^evidence-dir=' "$GITHUB_OUTPUT" | cut -d= -f2-)
           test -n "$evidence_dir"
-          test ! -e "$evidence_dir/report.md"
-          test ! -e "$evidence_dir/session.log"
+          test ! -e "$evidence_dir"
           test "$evidence_dir" != "$(dirname "$SECOND_REPORT")"
           test -f "$SECOND_REPORT"
           after=$(node -e "$read_nonce")
