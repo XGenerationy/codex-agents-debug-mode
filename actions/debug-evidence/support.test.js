@@ -417,6 +417,47 @@ test('the ptrace policy is classified honestly: only mode 3 forbids attachment u
   }
   assert.equal(scope('3\n', 'win32'), 'unknown');
   assert.equal(scope('3\n', 'darwin'), 'unknown');
+  // The file's contents are host data, and a plain-object lookup resolves
+  // INHERITED properties for these three strings — returning a function or an
+  // object instead of falling through to 'unknown', which would then travel
+  // into state and into diagnostics (Codex T6 r7 #2). The refusal predicate
+  // would still refuse them, so this is a contract violation rather than a
+  // boundary bypass, and it is fixed at the lookup rather than relied on.
+  for (const inherited of ['__proto__', 'constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.equal(scope(inherited), 'unknown', `inherited key ${inherited} must not resolve`);
+  }
+});
+
+// Defaulting is BY ABSENCE, not by falsiness (Codex T6 r7 #3). `|| 'strict'`
+// rounded an explicitly empty input up to the safe literal, which sounds
+// harmless and is not: validateActionInputs promises that an unrecognised
+// evidence-trust is an input ERROR, and silently accepting one shape of
+// unrecognised value makes that promise untrue. Driven through the real entry
+// point, because main() is where the normalisation lives.
+test('evidence-trust defaults by absence and reports an explicitly empty value as the input error it is', () => {
+  const { spawnSync: spawnSyncChild } = require('node:child_process');
+  const start = (extra) => spawnSyncChild(process.execPath, [path.join(__dirname, 'support.js'), 'start'], {
+    env: {
+      DEBUG_ACTION_OUTPUT_DIR: makeTempDir(),
+      DEBUG_ACTION_RUN: 'true',
+      PATH: process.env.PATH,
+      SystemRoot: process.env.SystemRoot,
+      ...extra,
+    },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  // Explicit empty: the promised error, not a silent upgrade.
+  const empty = start({ DEBUG_ACTION_EVIDENCE_TRUST: '' });
+  assert.equal(empty.status, 1, 'an invalid input is an input failure');
+  assert.match(empty.stderr, /invalid inputs:.*evidence-trust: must be 'strict' or 'best-effort'/);
+  // Omitted: defaults to STRICT, which this host (no ptrace_scope 3) refuses —
+  // and the refusal is how the default proves itself. A default of
+  // best-effort would have captured instead.
+  const omitted = start({});
+  assert.equal(omitted.status, 3, 'strict is the default, and strict refuses here');
+  assert.match(omitted.stderr, /refusing to run the wrapped command/);
+  assert.equal(/invalid inputs/.test(omitted.stderr), false, 'an absent input is not an invalid one');
 });
 
 test('evidence-trust accepts exactly two literals and fails closed on anything else', () => {
@@ -494,8 +535,9 @@ test('the policy is read AFTER the identity outputs are published, never as a de
 
 test('best-effort proceeds and qualifies the evidence in all three places', async () => {
   // (i) start's step log, BEFORE the wrapped command exists. This is the
-  //     trustworthy copy: immutable once streamed, and no later process can
-  //     retract it.
+  //     copy the command cannot reach — immutable once streamed, and no later
+  //     process can retract it. It establishes that best-effort was chosen,
+  //     never that what follows is tamper-resistant.
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   const port = await getFreePort();
@@ -520,9 +562,11 @@ test('best-effort proceeds and qualifies the evidence in all three places', asyn
   }
 
   // (ii) run's own log, immediately before the digest line — beside the
-  //      authoritative trust-unit record rather than somewhere else in the job
-  //      (Codex T6 r6 ruling (b)) — and (iii) the report caveat, which is the
-  //      strippable copy that only helps on an honest run.
+  //      record a reader treats as the trust unit ON THE STRICT PATH, rather
+  //      than somewhere else in the job (Codex T6 r6 ruling (b)) — and
+  //      (iii) the report caveat. Both are written after the command ran, so
+  //      both are diagnostic here: they help on an honest run and can be
+  //      suppressed on a dishonest one.
   const runDir = makeTempDir();
   writeState(runDir, {
     nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
@@ -3935,7 +3979,8 @@ test('upload takes exactly the paths start advertises before the command runs, a
 
 test('every action output is produced by the run step, and the set is exactly these five', () => {
   // Capture happens in run, so run is the only step whose account of the
-  // session can be trusted; `report` publishes and produces nothing.
+  // session can be trusted — authenticated after a strict admission,
+  // diagnostic under best-effort; `report` publishes and produces nothing.
   // The upload step reads none of these: its guard and paths come from
   // `start`, before the wrapped command existed. Every output here is
   // availability-only — a wrapped command can suppress or garble them by
@@ -4044,6 +4089,27 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       required: /such a command can strip\s+the caveat that warns about it/i,
       forbidden: /the caveat (?:is|remains) sufficient|labeling alone is enough/i,
     },
+    // The trust contract is CONDITIONAL on the admission mode (Codex T6 r7).
+    // Adding a second regime left every claim written as if only strict
+    // existed; under best-effort the accepted threat is a command able to
+    // rewrite run itself, so run's account, its digest and the report
+    // authenticate nothing. Pinned by polarity because the unconditional form
+    // is the one that reads naturally and would drift back.
+    {
+      what: 'what a strict admission buys',
+      required: /after a\s+successful strict admission, run'?s account is authenticated: the artifact\s+plus the matching digest from its step log is the trust unit/i,
+      forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)(?![^.]*strict)/i,
+    },
+    {
+      what: 'what best-effort does NOT buy',
+      required: /under\s+`?evidence-trust: best-effort`? it is a diagnostic claim only/i,
+      forbidden: /best-effort (?:evidence )?(?:is|remains) (?:authenticated|tamper-resistant|trustworthy)/i,
+    },
+    {
+      what: 'that the digest authenticates only on the strict path',
+      required: /that log line is the authenticated copy only after a\s+successful strict admission/i,
+      forbidden: /the authoritative copy is that log line/i,
+    },
     {
       what: 'what an unestablished host costs',
       required: /attach to this process, or to the\s+collector whose pid is in the state file, and read or inject memory,\s+which defeats authenticated evidence/i,
@@ -4060,9 +4126,15 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       forbidden: /view of the world the command (?:it runs )?cannot influence/i,
     },
   ];
+  // Flowed over the WHOLE file, not just its comments: several of these claims
+  // are made in input/output `description:` blocks, which are the copy a
+  // consumer reads without opening the file. A reversal there counts.
+  const documentation = ACTION_YML().split(/\r?\n/)
+    .map((line) => line.trim().replace(/^#\s?/, ''))
+    .join(' ');
   for (const claim of platformClaims) {
-    assert.match(commentary, claim.required, `the run step must state ${claim.what}`);
-    assert.doesNotMatch(commentary, claim.forbidden, `the run step must not reverse ${claim.what}`);
+    assert.match(documentation, claim.required, `action.yml must state ${claim.what}`);
+    assert.doesNotMatch(documentation, claim.forbidden, `action.yml must not reverse ${claim.what}`);
   }
 });
 

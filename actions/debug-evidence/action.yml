@@ -69,16 +69,25 @@ inputs:
       'strict' (default): refuse to run the wrapped command at all unless the
       host positively establishes the in-process boundary this action's
       evidence depends on — Linux Yama ptrace_scope 3. 'best-effort': run
-      anyway and label the evidence as unverifiable-by-construction. NOTE that
-      strict REFUSES on standard GitHub-hosted runners, which ship ptrace_scope
-      1 plus passwordless sudo; hosted callers must opt in explicitly.
+      anyway, and treat the resulting evidence as a diagnostic claim rather
+      than an authenticated one. NOTE that strict refuses on the DEFAULT
+      GitHub-hosted configuration, which ships ptrace_scope 1 plus passwordless
+      sudo. Strict is still reachable there: an earlier trusted step can use
+      that same sudo to `sysctl -w kernel.yama.ptrace_scope=3`, which cannot
+      afterwards be lowered. So hosted callers on the default configuration
+      must either harden the runner first or opt in to best-effort.
     required: false
     default: "strict"
 
 # Every output is produced by the RUN step, because run is where capture
 # happens: it is the only process that spans the wrapped command's execution,
-# so it is the only one whose account of the session can be trusted. `report`
-# publishes and produces nothing.
+# so it is the only one whose account of the session CAN be trusted — and
+# whether it MAY be depends on how this invocation was admitted. After a
+# successful strict admission, run's account is authenticated: the artifact
+# plus the matching digest from its step log is the trust unit. Under
+# `evidence-trust: best-effort` it is a diagnostic claim only, because the
+# threat that mode accepts is precisely a command able to rewrite run.
+# `report` publishes and produces nothing under either mode.
 outputs:
   command-exit-code:
     description: "Exit code of the wrapped command; empty until the run step has run"
@@ -96,10 +105,11 @@ outputs:
     description: >-
       Convenience only, NOT the trust anchor: the SHA-256 digest line for the
       three staged payloads, byte-identical to the line the run step printed
-      to its own step log. The authoritative copy is that log line, which the
-      run step wrote before anything could touch the staged files; this output
-      exists so a workflow can compare an artifact without scraping logs.
-      Empty until the run step has captured a session.
+      to its own step log. That log line is the authenticated copy ONLY after a
+      successful strict admission; under best-effort both copies are diagnostic
+      claims, since a command that can rewrite the run process can forge either.
+      This output exists so a workflow can compare an artifact without scraping
+      logs. Empty until the run step has captured a session.
     value: ${{ steps.run.outputs.evidence-digest }}
 
 runs:
@@ -269,9 +279,12 @@ runs:
       #
       # 1. A hostile command can create files INSIDE this directory, so the
       #    artifact may carry payloads this action never staged. The trust unit
-      #    answers it: evidence is bytes whose SHA-256 matches a digest line
-      #    the trusted run process printed to its own step log. A planted file
-      #    has no backing digest, and a run that staged nothing prints none.
+      #    answers it, ON THE STRICT PATH: evidence is bytes whose SHA-256
+      #    matches a digest line the run process printed to its own step log,
+      #    and a planted file has no backing digest (a run that staged nothing
+      #    prints none). Under best-effort that answer degrades to a
+      #    diagnostic: the same command that plants a file may be able to
+      #    rewrite the process that prints the digest.
       # 2. The uploader offers no control over symlink following: v4.6.2
       #    declares seven inputs (name, path, if-no-files-found,
       #    retention-days, compression-level, overwrite, include-hidden-files)

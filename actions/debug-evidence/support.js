@@ -56,7 +56,17 @@ const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 // (a future mode, a typo), a file it could not read, and a platform with no
 // Yama at all, is `unknown`: never read in the host's favour.
 const PTRACE_SCOPE_PATH = '/proc/sys/kernel/yama/ptrace_scope';
-const PTRACE_MODES = { 0: 'permissive', 1: 'privilege-bypassable', 2: 'privilege-bypassable', 3: 'unconditional' };
+// A Map, not an object literal: the key here is HOST DATA read off a file, and
+// an object lookup resolves inherited properties — `__proto__`, `constructor`,
+// `toString` would each return something other than undefined and so never
+// reach the `unknown` fallback, putting a function or an object into state and
+// into diagnostics (Codex T6 r7 #2). A Map has no such keys to inherit.
+const PTRACE_MODES = new Map([
+  ['0', 'permissive'],
+  ['1', 'privilege-bypassable'],
+  ['2', 'privilege-bypassable'],
+  ['3', 'unconditional'],
+]);
 const readPtraceScope = ({ platform = process.platform, readFile = readFileSync } = {}) => {
   if (platform !== 'linux') return 'unknown';
   let raw;
@@ -70,7 +80,7 @@ const readPtraceScope = ({ platform = process.platform, readFile = readFileSync 
   // Number(), which would read an empty or truncated file as the weakest
   // policy and then report it as a fact; `4`/`999` are modes this code has
   // never heard of and must not guess at either way.
-  return PTRACE_MODES[text] ?? 'unknown';
+  return PTRACE_MODES.get(text) ?? 'unknown';
 };
 
 // The prerequisite is met at exactly one value. Written once, used everywhere,
@@ -617,10 +627,13 @@ const startSubcommand = async ({
       process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}). Only Linux Yama ptrace_scope 3 forbids same-UID attachment unconditionally — modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and GitHub-hosted runners grant workflow commands passwordless sudo, so a hostile command can elevate and attach to the collector or to the capturing step. Either run on a host with ptrace_scope 3, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
       return 3;
     }
-    // Opted in. This copy of the qualification is the TRUSTWORTHY one: it is
-    // streamed before the wrapped command exists, so nothing that command does
-    // afterwards can retract it. The other two copies (run's pre-digest line
-    // and the report caveat) are written after it has run.
+    // Opted in. This copy of the qualification is the only one the wrapped
+    // command cannot reach: it is streamed before that command exists, so
+    // nothing it does afterwards can retract it. What that buys is precisely
+    // one fact — that best-effort was consciously selected — and NOT that the
+    // capture which follows is tamper-resistant. The other two copies (run's
+    // pre-digest line and the report caveat) are written after the command has
+    // run, by a process it may have been able to rewrite.
     process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step, so the capture below cannot be treated as tamper-resistant. This line is written before the wrapped command runs and cannot be retracted by it.\n`);
   }
   // Containment layer 2 (Codex T3 #3): the check above compares the paths as
@@ -1173,7 +1186,19 @@ const RUNNER_COMMAND_FILE_VARS = [
   'GITHUB_STEP_SUMMARY',
 ];
 
-// run is the TRUSTED PROCESS, and that is the whole architecture.
+// run is the TRUSTED PROCESS on the strict path, and that is the whole
+// architecture. What "trusted" is worth depends on how the invocation was
+// admitted, so it is stated once, here, and every claim below inherits it:
+//
+//   - successful STRICT admission: the host positively establishes the
+//     boundary, so this process's decisions are authenticated. The artifact
+//     plus the matching digest from this step's log is the trust unit.
+//   - BEST-EFFORT: the caller accepted a host where the wrapped command may
+//     be able to rewrite this very process. Everything below still happens,
+//     and none of it authenticates anything — the capture, the digest, the
+//     report and the qualification are diagnostic claims. The only thing that
+//     survives that threat is `start`'s pre-command line, and all IT
+//     establishes is that best-effort was consciously selected.
 //
 // It is the only process in the job that spans the wrapped command's
 // execution: its environment was resolved by the runner before the command
@@ -1432,13 +1457,17 @@ const runSubcommand = async ({
   // the paths that go on to succeed — would leave exactly the failure windows
   // undocumented.
   // The qualification belongs BESIDE the digest, because the digest is the
-  // authoritative record of what this process staged and the two are read
-  // together (Codex T6 r6, ruling (b)). Printed even on the renderer-failure
-  // classes, where only session.log is staged and there is no report.md to
-  // carry a caveat — those are exactly the runs where the log copy is the only
-  // copy. `start` printed the trustworthy copy before the command existed;
-  // this one and the report caveat are both written after it ran, and a
-  // command that can rewrite this process could suppress either.
+  // record of what this process staged and the two are read together (Codex
+  // T6 r6, ruling (b)) — and because a reader who sees the digest must not be
+  // able to miss that, in this mode, the digest authenticates nothing.
+  //
+  // Printed even on the renderer-failure classes, where only session.log is
+  // staged and there is no report.md to carry a caveat — those are exactly the
+  // runs where the log copy is the only copy. `start` printed the copy the
+  // command cannot reach, before that command existed, and all that copy
+  // establishes is that best-effort was consciously selected. This one and the
+  // report caveat are both written after the command ran, by a process it may
+  // have been able to rewrite, so it could suppress either.
   for (const caveat of platformCaveats(state.ptraceScope)) writeStdout(`evidence-qualification ${caveat}\n`);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   // Ownership check and commit as ONE indivisible step. The snapshot in
@@ -1483,8 +1512,11 @@ const runSubcommand = async ({
     // as body. A post-command step output is therefore a convenience, never a
     // boundary — the upload step reads `start`'s pre-command outputs instead.
     // The digest below is the same kind of thing and is documented as such:
-    // its authoritative copy is the line printed to this step's log, which is
-    // immutable once streamed.
+    // its better copy is the line printed to this step's log, which is
+    // immutable once streamed. "Better", not "authoritative", is the whole of
+    // it under best-effort: immutability defends the line against later
+    // EDITING, never against a process that was able to choose what the line
+    // said in the first place.
     const outputs = {
       'command-exit-code': commandExitCode,
       'session-id': state.sessionId,
@@ -1669,9 +1701,12 @@ const main = async () => {
     maxBytes: env.DEBUG_ACTION_MAX_BYTES_INPUT || '',
     hypothesisId: env.DEBUG_ACTION_HYPOTHESIS_ID || '',
     hypothesisTitle: env.DEBUG_ACTION_HYPOTHESIS_TITLE || '',
-    // Defaulted to the SAFE literal, never to whatever the env happens to
-    // carry: an absent input means the caller has not opted out of anything.
-    evidenceTrust: env.DEBUG_ACTION_EVIDENCE_TRUST || 'strict',
+    // Defaulted BY ABSENCE to the safe literal: an unset variable means the
+    // caller has not opted out of anything. An explicitly EMPTY one is a
+    // different thing entirely — a value the contract does not recognise — and
+    // '??' lets it through to validateActionInputs, which says so. '||' rounded
+    // it up to 'strict' and quietly broke that promise (Codex T6 r7 #3).
+    evidenceTrust: env.DEBUG_ACTION_EVIDENCE_TRUST ?? 'strict',
   };
   try {
     if (subcommand === 'start') {
