@@ -258,8 +258,10 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
    process memory — it is never written to disk, so a same-user wrapped command has
    nothing to steal; after `start` returns, no credential capable of posting hypothesis
    lines exists anywhere in the job. The session token is the wrapped command's only
-   credential (env-injected; also recorded in state for `report`'s authenticated read —
-   the collector grants it same-session read scope). Neither token ever reaches
+   credential (env-injected; also recorded in state for `run`'s authenticated read
+   after the command exits — the collector grants it same-session read scope).
+   *(Corrected, Task 6 round 3: the authenticated read moved to `run` in Task 5
+   round 6.)* Neither token ever reaches
    outputs, Step Summary, logs, or the artifact; both are runner-masked at first
    existence.
 3. The collector inherits the full job env at start so redaction covers job secrets;
@@ -306,10 +308,21 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
    wrapped command exists and whose memory a child cannot rewrite. It never
    crosses a step boundary after the wrapped command has executed, because no
    post-command step's environment can be trusted (see invariant 10).
-10. *(Added, Task 5 round 6.)* A hostile wrapped command can poison every LATER
+10. *(Added, Task 5 round 6; SCOPE MADE EXPLICIT, Task 6 round 3.)* **The
+    integrity guarantees in this document hold for the FIRST — in practice, the
+    only — invocation of this action in a job.** A hostile wrapped command can
+    poison every LATER
     step of the job — it can reach the runner's command files and set `BASH_ENV`,
     which non-interactive bash sources at shell startup, after step-level `env:`
-    has been resolved. This is inherent to executing an arbitrary command in
+    has been resolved. That reaches a *second* invocation's `start` step too:
+    its bash shell sources the attacker's code before `start` runs, and that code
+    can append a last-wins `evidence-dir=` line to the second invocation's own
+    `GITHUB_OUTPUT`, so even pre-command step outputs stop being trustworthy once
+    an instrumented command has executed in the job. Per-instance step outputs
+    prevent accidental cross-invocation inheritance; they do NOT provide
+    adversarial isolation. Same-job secure reuse is not achievable through this
+    runner channel: run a second instrumented command in a SEPARATE JOB.
+    This is inherent to executing an arbitrary command in
     GitHub Actions and applies to every action sharing that job. The action's
     answer is structural rather than preventive: every evidence decision happens
     inside `run`, before any such poisoning can take effect, and an integrity

@@ -2642,6 +2642,61 @@ Minor ×2:
 Fix commit message:
 `fix(action): upload path from a pre-command start output, restore the defanged key test, tighten the structural reader (Codex T6 r2)`.
 
+#### Task 6 fix round 3 — Codex re-review decisions (recorded before code moves)
+
+Codex on `858e024`: **no Critical findings**; the single-invocation upload
+boundary is materially improved (neither the guard nor the paths depend on
+post-command outputs), the three formerly defanged branch tests reach their
+intended branches, and `assertNothingStaged` closes the wrong-directory vacuity.
+Rulings: (a) README disclosure ONLY, and KEEP `session-id` on `run` — moving it
+to `start` would advertise sessions even when the post-command ownership CAS
+rejects the invocation; document all five outputs as availability-only and
+attacker-suppressible. (b) Accepted, and a correction to our note: with
+`if-no-files-found: ignore` the pinned uploader reports that nothing matched and
+uploads NO artifact — it does not create an empty one. (c) Accumulation stays a
+documented tradeoff, no reaper; Task 7 tests two invocations for expression
+NAMESPACING and must NOT label that adversarial isolation. Important ×1, Minor ×2:
+
+1. **Scope the guarantee to the first/only invocation in a job (Important).**
+   Per-instance step outputs prevent ACCIDENTAL cross-invocation inheritance; they
+   do not stay trustworthy after an earlier hostile command in the same job.
+   Invocation A's command sets `BASH_ENV` via its `GITHUB_ENV` file; invocation
+   B's `start` step is `shell: bash`, so it sources that attacker code before
+   `start` runs, and the code appends a last-wins `evidence-dir=/foreign` to B's
+   own `GITHUB_OUTPUT` — B's upload then reads an attacker-selected path. Codex:
+   *either require separate jobs after an instrumented command, or explicitly
+   scope the security guarantee to the first/only invocation in a job; same-job
+   secure reuse is not achievable with this runner channel.* Decision: SCOPE IT,
+   explicitly, everywhere it is claimed.
+   - `action.yml`'s comment currently claims pre-command outputs are unreachable.
+     That OVERCLAIMS — correct it to state the scope: unreachable by THIS
+     invocation's wrapped command; a prior instrumented command in the same job
+     invalidates the guarantee.
+   - Spec invariant 10 rewritten by the coordinator in this same commit (done).
+   - T8 gains a prominent note: run a second instrumented command in a SEPARATE
+     JOB; the guarantees are stated for the first/only invocation.
+   - A structural/unit test pinning that the scope wording exists is fine, but no
+     behavioural change is expected here — the fix is honesty about the boundary.
+2. **The runner model accepts an impossible unterminated heredoc (Minor).** The
+   test-local model consumes through EOF, but the real runner THROWS when no
+   matching delimiter appears and marks the step failed, so the asserted multiline
+   `evidence-dir` is not what GitHub would parse; the attack also uses a delimiter
+   `run` no longer emits. Fix BOTH: make the model throw on an unterminated
+   heredoc (matching the runner), then re-close the attack with a delimiter the
+   child can PREDICT — Codex's suggestion, `session-id=${DEBUG_SESSION_ID}`, works
+   because the child holds `DEBUG_SESSION_ID` in its own env and can therefore
+   spell the exact line `run` will later write. The attack must still succeed
+   against the model (proving the channel is attacker-owned) before the
+   `action.yml` assertions prove the defence.
+3. **Stale text (Minor).** Spec line 261 fixed by the coordinator (done). The
+   implementer fixes the code-side stragglers that still assign the authenticated
+   read or key consumption to `report`: `support.js:577`, `support.js:1392`,
+   `support.test.js:3658`. Grep the whole action directory for the same shape
+   rather than fixing only those three.
+
+Fix commit message:
+`fix(action): scope the guarantee to the first invocation, correct the runner heredoc model, purge stale report-era comments (Codex T6 r3)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
