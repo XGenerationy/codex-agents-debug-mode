@@ -564,6 +564,44 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
     'a prototype cannot supply the readings');
 });
 
+test('a probe that cannot be called produces a denying record, never a crash', () => {
+  // evaluateAdmission invoked each selected seam immediately, so an explicit
+  // `undefined` probe threw TypeError instead of producing the unknown,
+  // denying reading the round-9 seam() fix promised everywhere else (Codex
+  // T6 r10 #3). A gate that throws is not a gate that denies: the throw
+  // escapes to main's catch and becomes exit 1, which reads as "the action
+  // crashed" rather than "this host was refused".
+  const probes = ['readPtrace', 'readEuid', 'detectSudo', 'readCapabilities'];
+  const fields = { readPtrace: 'ptrace', readEuid: 'uid', detectSudo: 'sudo', readCapabilities: 'capabilities' };
+  const clear = {
+    readPtrace: () => 'unconditional',
+    readEuid: () => 'non-root',
+    detectSudo: () => 'absent',
+    readCapabilities: () => 'clear',
+  };
+  for (const probe of probes) {
+    for (const [label, broken] of [
+      ['explicit undefined', undefined],
+      ['null', null],
+      ['not callable', 'unconditional'],
+      ['a throwing probe', () => { throw new Error('probe exploded'); }],
+      ['a probe returning nothing', () => undefined],
+      ['a probe returning a non-string', () => ({ ptrace: 'unconditional' })],
+    ]) {
+      const record = evaluateAdmission({ ...clear, [probe]: broken });
+      assert.equal(record[fields[probe]], 'unknown', `${probe}: ${label} reads as unknown`);
+      assert.equal(admissionEstablished(record), false, `${probe}: ${label} denies`);
+      // And only that one reading is affected — a broken probe must not
+      // silently poison the others.
+      assert.equal(record.blockers.length, 1, `${probe}: ${label} blocks on its own reading alone`);
+    }
+  }
+  // All four broken at once still yields a record rather than a throw.
+  const nothing = evaluateAdmission({ readPtrace: undefined, readEuid: undefined, detectSudo: undefined, readCapabilities: undefined });
+  assert.equal(admissionEstablished(nothing), false);
+  assert.equal(nothing.blockers.length, 4);
+});
+
 test('start streams a pre-command admission record on every regime', async () => {
   // AN ARTIFACT-ONLY STAMP IS NOT ENOUGH (Codex T6 r9 #3). A compromised
   // best-effort run can forge whatever stamp the artifact carries, so the
@@ -644,6 +682,53 @@ test('start streams a pre-command admission record on every regime', async () =>
     refused.written.indexOf('ADMISSION RECORD') < refused.written.indexOf('refusing to run the wrapped command'),
     'the record comes first',
   );
+
+  // (iv) THE RECORD NAMES ITS INVOCATION AND ITS OWN LIMITS (Codex T6 r10 #4).
+  //      The three pieces are compared by a human, and this action verifies
+  //      none of that correspondence — so the record has to say so, and it has
+  //      to carry the nonce, or a reader could pair a run's digest with a
+  //      DIFFERENT invocation's start record and believe they matched.
+  const nonceLine = strict.written.split('\n').find((line) => line.includes('ADMISSION RECORD'));
+  const nonce = /invocation=([A-Za-z0-9_-]{8,64})/.exec(nonceLine);
+  assert.ok(nonce, 'the record names the invocation it belongs to');
+  assert.match(strict.written, /this action verifies none of that correspondence/i);
+  assert.match(strict.written, /compare .{0,40}against the start record with the same invocation/i);
+});
+
+test('the authenticated wording requires a strict admission, not merely clear readings', async () => {
+  // BEST-EFFORT WITH NOTHING WRONG (Codex T6 r10 #2). The readings can come
+  // back clear on a host whose caller still chose best-effort — and the
+  // round-9 builder derived ESTABLISHED and the authenticated trust-unit
+  // sentence from the readings ALONE, so that run advertised itself as
+  // authenticated while action.yml and the spec both promise that nothing
+  // under best-effort is. The regime is half the answer; the readings are the
+  // other half, and the claim needs both.
+  const clear = ADMITTED();
+  const strict = admissionCaveats(clear, 'strict', 'n1').join('\n');
+  const bestEffort = admissionCaveats(clear, 'best-effort', 'n1').join('\n');
+  // The readings are reported identically — the host is the host.
+  assert.match(strict, /in-process boundary=ESTABLISHED/);
+  assert.match(bestEffort, /in-process boundary=ESTABLISHED/);
+  assert.match(bestEffort, /findings=every checked route clear/);
+  // The CLAIM is not.
+  assert.match(strict, /the trust unit is this admission record/i, 'a strict admission is authenticated');
+  assert.doesNotMatch(bestEffort, /the trust unit is this admission record/i,
+    'best-effort never claims an authenticated trust unit, however clean the host');
+  assert.match(bestEffort, /diagnostic claims only/i);
+  assert.match(bestEffort, /not admitted under strict/i, 'and it says which half is missing');
+  // Stated positively in the structured line too, so a machine reader sees it.
+  assert.match(strict, /admission=STRICT \(authenticated\)/);
+  assert.match(bestEffort, /admission=DIAGNOSTIC ONLY/);
+  // FAIL CLOSED on anything that is not the literal 'strict': a state file is
+  // same-user writable, and an unrecognised regime is not a strict one.
+  for (const regime of [undefined, null, '', 'STRICT', 'strict ', 'loose', 0]) {
+    const text = admissionCaveats(clear, regime, 'n1').join('\n');
+    assert.doesNotMatch(text, /the trust unit is this admission record/i,
+      `${JSON.stringify(regime) ?? 'undefined'} is not a strict admission`);
+    assert.match(text, /admission=DIAGNOSTIC ONLY/);
+  }
+  // The nonce travels in the record, whatever the regime.
+  assert.match(bestEffort, /invocation=n1/);
 });
 
 test('every probe denies strict when it cannot be evaluated', () => {
@@ -687,10 +772,14 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // admission while the real /usr/bin/sudo stayed reachable — a probe whose
   // failure mode is granting is worse than no probe at all.
   //
-  // So: a sudo binary EXISTING at a trusted absolute path denies, full stop. No
-  // execution, no PATH resolution, no interpretation of output.
-  const sudoAt = (present, { platform = 'linux', throws = null } = {}) => detectSudoBinary({
+  // So: a sudo binary EXISTING anywhere the inspection reaches denies, full
+  // stop — the conventional absolute paths and every candidate on the inherited
+  // PATH (round 10). No execution, no interpretation of output.
+  const sudoAt = (present, { platform = 'linux', throws = null, ...pathOption } = {}) => detectSudoBinary({
     platform,
+    // Absent by default, so a test that says nothing about PATH is testing the
+    // conventional paths alone.
+    ...(Object.hasOwn(pathOption, 'pathValue') ? { pathValue: pathOption.pathValue } : { pathValue: undefined }),
     statPath: (candidate) => {
       if (throws) throw throws;
       if (Object.hasOwn(present, candidate)) return present[candidate];
@@ -724,6 +813,64 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // route to root" — this action's boundary claim is Linux-only.
   assert.equal(sudoAt({}, { platform: 'win32' }), 'unknown');
   assert.equal(sudoAt({}, { platform: 'darwin' }), 'unknown');
+
+  // AND THE CONVENTIONAL PATHS ARE NOT THE WHOLE SURFACE (Codex T6 r10,
+  // Critical). A fixed three-path list reported `absent` on a NixOS-style
+  // layout where sudo lives in the system path — so a wrapped command could
+  // become root through a sudo this action had just certified as not there.
+  // THE PIN, in the exact shape Codex demonstrated:
+  assert.equal(
+    sudoAt({ '/run/current-system/sw/bin/sudo': 'present' }, { pathValue: '/run/current-system/sw/bin:/usr/bin' }),
+    'present: /run/current-system/sw/bin/sudo',
+    'a NixOS system-path sudo denies',
+  );
+  // The round-9 ruling forbade EXECUTING a PATH-resolved binary and trusting
+  // what it printed. Reading PATH and lstat-ing what it names executes
+  // nothing, and can only ever ADD candidates.
+  assert.equal(
+    sudoAt({ '/opt/vendor/bin/sudo': 'present' }, { pathValue: '/opt/vendor/bin' }),
+    'present: /opt/vendor/bin/sudo',
+    'any PATH entry is a candidate',
+  );
+  // A HOSTILE PATH CANNOT SHRINK THE CHECK. Empty, unset, stripped down to one
+  // harmless directory — the conventional paths are checked regardless.
+  for (const [label, pathValue] of [
+    ['unset', undefined],
+    ['empty', ''],
+    ['stripped', '/nowhere'],
+    ['not a string', 42],
+    ['null', null],
+  ]) {
+    assert.equal(sudoAt({ '/usr/bin/sudo': 'present' }, { pathValue }), 'present: /usr/bin/sudo',
+      `${label} PATH still checks the conventional locations`);
+    assert.equal(sudoAt({}, { pathValue }), 'absent',
+      `${label} PATH with nothing installed is still a clean reading`);
+  }
+  // Both lists at once, each named once — a directory that repeats, or that is
+  // also a conventional path, must not double-report.
+  assert.equal(
+    sudoAt({ '/usr/bin/sudo': 'present', '/opt/bin/sudo': 'present' }, { pathValue: '/usr/bin:/opt/bin:/usr/bin:/opt/bin/' }),
+    'present: /usr/bin/sudo, /opt/bin/sudo',
+  );
+  // A trailing slash names the same directory.
+  assert.equal(sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin///' }), 'present: /opt/bin/sudo');
+  assert.equal(sudoAt({ '/sudo': 'present' }, { pathValue: '/' }), 'present: /sudo');
+  // An entry this code cannot resolve to a stable absolute path is a candidate
+  // it could not check. POSIX reads an EMPTY entry as the working directory,
+  // and a relative entry is resolved against a cwd that is not this code's to
+  // reason about — so both deny rather than being quietly skipped.
+  for (const pathValue of ['/usr/bin:', ':/usr/bin', '/usr/bin::/bin', 'relative/bin', '/usr/bin:relative/bin', '.']) {
+    assert.equal(sudoAt({}, { pathValue }), 'unknown',
+      `${JSON.stringify(pathValue)}: an unresolvable entry is an unchecked candidate`);
+  }
+  // And an unstattable PATH candidate denies exactly like an unstattable
+  // conventional one.
+  assert.equal(sudoAt({ '/opt/bin/sudo': 'unreadable' }, { pathValue: '/opt/bin' }), 'unknown');
+  // A present binary still outranks an ambiguity, wherever each came from.
+  assert.equal(
+    sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin:relative/bin' }),
+    'present: /opt/bin/sudo',
+  );
 
   // OWN CAPABILITIES, from /proc/self/status. PERMITTED counts as much as
   // EFFECTIVE: a permitted-but-not-effective capability is one syscall away
@@ -1014,6 +1161,9 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
     writeState(outputDir, {
       nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
       projectRoot: makeTempDir(), failOnCommandFailure: 'true', admission: record,
+      // start always records the regime it ran under; a fixture that omitted it
+      // was modelling a state this action never writes.
+      evidenceTrust: 'strict',
     });
     const code = await captureViaRun({ outputDir, env: RUN_ENV, readLive: collectorAnswer(served) });
     assert.equal(code, 0, `${policy}: labeling is not refusing — the refusal already happened in start`);
@@ -4559,7 +4709,7 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     {
       what: 'that sudo is detected by existence, not behaviour',
       where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /any sudo binary at a trusted absolute path denies/i,
+      required: /any sudo binary at a conventional absolute path or anywhere on the inherited path denies/i,
       forbidden: /(?:probing|running|executing) [`']?sudo[`']?[^.]{0,40}(?:establishes|proves|shows|confirms|is enough|is sufficient)|no passwordless sudo(?![^.]*(?:cannot|does not|is not))/i,
     },
     {
@@ -4613,6 +4763,27 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
       required: /(?:these are )?the escalation routes (?:this action|it) checks, not a proof that no route exists/i,
       forbidden: /(?:proves|proved|establishes|confirms|guarantees|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
+    },
+    // THE INSPECTION IS NOT A FIXED PATH LIST (Codex T6 r10, Critical). Three
+    // conventional paths reported `absent` on a NixOS-style layout and would
+    // have GRANTED strict on a host where the wrapped command can become root.
+    // The forbidden half is the shape of that mistake — and of the coordinator's
+    // over-broad "never consults PATH" instruction that caused it.
+    {
+      what: 'that every PATH candidate is inspected',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /every sudo candidate on the inherited path, lstat-ed and never executed/i,
+      forbidden: /(?:checks|inspects|covers) (?:only|just) the (?:three )?conventional|path is (?:deliberately )?never (?:consulted|inspected)|the conventional paths are the whole surface/i,
+    },
+    // THE THREE PIECES ARE COMPARED BY A HUMAN (Codex T6 r10 #4). Nothing in
+    // this action checks that run's digest belongs with start's record, so the
+    // record says so itself — and carries the nonce, so the comparison cannot
+    // accidentally be made across invocations.
+    {
+      what: 'that the correspondence is verified by a human, not by the action',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /verifies none of that correspondence/i,
+      forbidden: /the action (?:verifies|checks|confirms|proves) (?:that )?(?:the )?(?:copies|records|three pieces) match|correspondence is verified automatically/i,
     },
     // Hosted execution stays best-effort, and the round-7 sysctl route is
     // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF

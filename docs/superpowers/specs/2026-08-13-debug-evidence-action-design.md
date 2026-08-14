@@ -255,9 +255,12 @@ under a successful strict admission.)* **The trust regime depends on
 `evidence-trust`:**
 
 - **After a successful `strict` admission** — every checked route clear: Yama
-  mode 3, effective uid ≠ 0, no `sudo` binary present at a trusted absolute path
-  (never "no *usable* route" — usability is precisely the judgement round 9
-  established cannot be made), and no privileged capability
+  mode 3, effective uid ≠ 0, no `sudo` binary found by the inspection — the
+  conventional absolute paths AND every candidate on the inherited `PATH`
+  *(widened, round 10; this line still said "at a trusted absolute path" after
+  the prerequisite block below was corrected)* — and never "no *usable* route",
+  since usability is precisely the judgement round 9
+  established cannot be made, and no privileged capability
   in the process's own set *(corrected, Task 6 round 9: the earlier "mode 3 or
   real isolation" shorthand both omitted the conjunction and implied an
   isolation-based admission route that is not implemented)* — the unit of trust is
@@ -267,7 +270,14 @@ under a successful strict admission.)* **The trust regime depends on
   cannot be forged after the fact, the digest binds the bytes, and the artifact
   carries them. Duplicate or conflicting `evidence-sha256` lines invalidate the
   artifact; the `evidence-digest` output is a convenience, not the trust anchor.
-  Every copy of the record carries the checked-routes limitation.
+  Every copy of the record carries the checked-routes limitation. *(Added, round
+  10.)* The action verifies NONE of the correspondence between the three pieces:
+  the comparison is external and manual, and is only meaningful between copies
+  carrying the same invocation nonce — which every copy of the record states, so
+  a digest cannot accidentally be paired with a different invocation's record.
+  The authenticated reading requires a successful `strict` admission, not merely
+  clear host readings: a `best-effort` run on a spotless host is still
+  diagnostic.
 - **In `best-effort` mode**, the artifact, the digest, the rendered report and the
   post-command qualification are **diagnostic claims only — none of them
   authenticates the evidence**. The stated threat in that mode is precisely that

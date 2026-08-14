@@ -113,7 +113,7 @@ const readPtraceScope = (options = {}) => {
 //
 //   1. Yama ptrace_scope 3            (classic attachment forbidden)
 //   2. effective uid != 0             (not already root)
-//   3. no sudo binary present       (checked by EXISTENCE, never behaviour)
+//   3. no sudo binary present       (EXISTENCE, conventional paths + PATH)
 //   4. no dangerous capability held (no route already granted)
 //
 // These are the escalation routes this action checks, not a proof that no
@@ -173,13 +173,59 @@ const readEffectiveUid = (options = {}) => {
 //      sudo could only deny was wrong.)
 //
 // So this asks one question with no interpretation in it: does a sudo binary
-// EXIST at a trusted absolute path? Any sudo binary at a trusted absolute path
-// denies strict admission. Nothing is executed, PATH is never consulted, and no
-// output is parsed. Establishing that a present sudo grants the principal
-// nothing would need an independently trusted account of the sudoers policy,
-// and nothing available here is one — so strict now means a genuinely locked
-// environment, which is what "real isolation" meant all along.
-const SUDO_BINARY_PATHS = ['/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo'];
+// EXIST? Any sudo binary at a conventional absolute path or anywhere on the
+// inherited PATH denies strict admission. Nothing is executed and no output is
+// parsed. Establishing that a present sudo grants the principal nothing would
+// need an independently trusted account of the sudoers policy, and nothing
+// available here is one — so strict now means a genuinely locked environment,
+// which is what "real isolation" meant all along.
+//
+// AND A FIXED LIST OF THREE IS NOT THE SURFACE (Codex T6 r10, Critical). Run
+// against a NixOS-style layout — sudo at /run/current-system/sw/bin/sudo — the
+// three-path version answered `absent`, which would have GRANTED strict
+// admission on a host where the wrapped command can simply become root.
+//
+// The round-9 ruling forbade EXECUTING a PATH-resolved binary and trusting what
+// it printed. It did not make PATH INSPECTION unsafe, and the two are not the
+// same act: reading the variable and lstat-ing what it names runs no code and
+// believes no output. So the inspection is the union of the conventional
+// absolute paths AND every sudo candidate on the inherited PATH, lstat-ed and
+// never executed.
+//
+// The union is the load-bearing part. A hostile PATH must only ever be able to
+// ADD candidates: empty, unset, or stripped to one harmless directory, the
+// conventional locations are still checked, so no manipulation of the variable
+// can shrink the inspection into a false `absent`.
+const SUDO_CONVENTIONAL_PATHS = ['/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo'];
+const SUDO_BINARY_NAME = 'sudo';
+
+// POSIX PATH semantics, and deliberately not path.join: this code runs its
+// tests on Windows, where path.join would turn '/usr/bin' into a backslashed
+// drive path and quietly stop matching anything.
+//
+// An entry this code cannot resolve to a stable absolute path is a candidate it
+// could NOT check, and is reported as such rather than skipped: POSIX reads an
+// EMPTY entry as the working directory, and a relative entry resolves against a
+// cwd this code has no business reasoning about. Both are real places a sudo
+// could sit, so both deny.
+const sudoCandidatePaths = (pathValue) => {
+  const candidates = [...SUDO_CONVENTIONAL_PATHS];
+  let unresolvable = false;
+  if (typeof pathValue === 'string' && pathValue !== '') {
+    for (const entry of pathValue.split(':')) {
+      if (!entry.startsWith('/')) {
+        unresolvable = true;
+        continue;
+      }
+      const directory = entry.replace(/\/+$/, '');
+      candidates.push(`${directory}/${SUDO_BINARY_NAME}`);
+    }
+  }
+  // A Set, because the same directory can appear on PATH twice, or once there
+  // and once in the conventional list, and a doubled finding reads as two
+  // sudos.
+  return { candidates: [...new Set(candidates)], unresolvable };
+};
 // lstat, not stat: a DANGLING symlink at /usr/bin/sudo makes stat throw ENOENT,
 // which would read as "absent" while the path is plainly rigged. lstat sees the
 // link itself.
@@ -194,12 +240,14 @@ const defaultSudoStat = (candidate) => {
 const detectSudoBinary = (options = {}) => {
   const platform = seam(options, 'platform', process.platform);
   const statPath = seam(options, 'statPath', defaultSudoStat);
+  const pathValue = seam(options, 'pathValue', process.env.PATH);
   // These paths are a Linux claim. Anywhere else this code has no idea what
   // the escalation surface looks like, and "no idea" denies.
   if (platform !== 'linux') return 'unknown';
+  const { candidates, unresolvable } = sudoCandidatePaths(pathValue);
   const found = [];
-  let ambiguous = false;
-  for (const candidate of SUDO_BINARY_PATHS) {
+  let ambiguous = unresolvable;
+  for (const candidate of candidates) {
     let reading;
     try {
       reading = statPath(candidate);
@@ -251,7 +299,7 @@ const readOwnCapabilities = (options = {}) => {
 // never clear.
 const PTRACE_VALUES = new Set(['unconditional', 'privilege-bypassable', 'permissive', 'unknown']);
 const UID_VALUES = new Set(['non-root', 'root', 'unknown']);
-const SUDO_PRESENT = /^present: \/\S+(?:, \/\S+)*$/;
+const SUDO_PRESENT = /^present: \/[^,]+(?:, \/[^,]+)*$/;
 const CAPABILITY_LIST = /^CAP_[A-Z0-9_]+(?:\+CAP_[A-Z0-9_]+)*$/;
 const ADMISSION_FIELDS = [
   { key: 'ptrace', label: 'same-UID ptrace policy', clear: 'unconditional', valid: (value) => PTRACE_VALUES.has(value) },
@@ -280,14 +328,33 @@ const admissionBlockers = (admission) => {
   });
 };
 
+// A PROBE THAT CANNOT BE CALLED IS A READING THIS CODE DOES NOT HAVE, not an
+// exception (Codex T6 r10 #3). The round-9 seam() fix made an explicit
+// `undefined` mean "absent" for the lower-level readers, but this aggregate
+// invoked whatever seam() handed back immediately — so an undefined probe threw
+// TypeError, escaped to main's catch, and surfaced as exit 1. That reads as
+// "the action crashed", not "this host was refused", and the difference matters
+// to whoever has to act on it. Anything that is not a callable returning a
+// string is 'unknown', which denies.
+const callProbe = (probe) => {
+  if (typeof probe !== 'function') return 'unknown';
+  let value;
+  try {
+    value = probe();
+  } catch {
+    return 'unknown';
+  }
+  return typeof value === 'string' ? value : 'unknown';
+};
+
 // ONE evaluator, ONE predicate, and every consumer reads them rather than
 // re-deriving the rule (the discipline that fixed the mode lookup in r7).
 const evaluateAdmission = (options = {}) => {
   const record = {
-    ptrace: seam(options, 'readPtrace', readPtraceScope)(),
-    uid: seam(options, 'readEuid', readEffectiveUid)(),
-    sudo: seam(options, 'detectSudo', detectSudoBinary)(),
-    capabilities: seam(options, 'readCapabilities', readOwnCapabilities)(),
+    ptrace: callProbe(seam(options, 'readPtrace', readPtraceScope)),
+    uid: callProbe(seam(options, 'readEuid', readEffectiveUid)),
+    sudo: callProbe(seam(options, 'detectSudo', detectSudoBinary)),
+    capabilities: callProbe(seam(options, 'readCapabilities', readOwnCapabilities)),
   };
   // Recorded for the diagnostics that quote it, and recomputed by every
   // consumer regardless — so the two can never disagree.
@@ -312,22 +379,47 @@ const describeAdmission = (admission) => {
 // run can forge whatever the artifact says. What makes the artifact's copy
 // mean something is that `start` streamed an identical one BEFORE the wrapped
 // command existed, where no later process can retract or rewrite it.
-const admissionCaveats = (admission, evidenceTrust) => {
+const admissionCaveats = (admission, evidenceTrust, nonce) => {
   const established = admissionEstablished(admission);
-  const mode = evidenceTrust === 'best-effort' ? 'best-effort' : 'strict';
+  const regime = evidenceTrust === 'strict' || evidenceTrust === 'best-effort' ? evidenceTrust : 'unrecognised';
+  // BOTH HALVES, and the strict half is checked against the literal (Codex T6
+  // r10 #2). The readings are a fact about the host; the REGIME is a decision
+  // the caller made, and an authenticated claim needs both. Deriving it from
+  // the readings alone let a best-effort run on a clean host advertise the
+  // authenticated trust unit — flatly contradicting action.yml and the spec,
+  // which promise that nothing under best-effort authenticates anything. An
+  // unrecognised regime (a rewritten state file, an older record) is not a
+  // strict one, so it fails closed to diagnostic.
+  const authenticated = evidenceTrust === 'strict' && established;
   return [
-    `ADMISSION RECORD (streamed by start before the wrapped command existed): evidence-trust=${mode};`
-    + ` in-process boundary=${established ? 'ESTABLISHED' : 'NOT established'};`
+    `ADMISSION RECORD (streamed by start before the wrapped command existed): invocation=${nonce ?? 'unrecorded'};`
+    + ` evidence-trust=${regime}; in-process boundary=${established ? 'ESTABLISHED' : 'NOT established'};`
+    + ` admission=${authenticated ? 'STRICT (authenticated)' : 'DIAGNOSTIC ONLY'};`
     + ` findings=${describeAdmission(admission)}.`,
-    'Checked: Yama ptrace mode, effective uid, sudo binary presence at trusted absolute paths, and this process\'s own permitted/effective capabilities.'
-    + ' Any sudo binary at a trusted absolute path denies strict admission, because sudoers rules are command-specific and no probe of one command can establish the absence of a rule for another.'
+    'Checked: Yama ptrace mode, effective uid, sudo binary presence, and this process\'s own permitted/effective capabilities.'
+    + ' The sudo check covers the conventional absolute paths and every sudo candidate on the inherited PATH, lstat-ed and never executed;'
+    + ' any sudo binary at a conventional absolute path or anywhere on the inherited PATH denies strict admission,'
+    + ' because sudoers rules are command-specific and no probe of one command can establish the absence of a rule for another.'
     + ' These are the escalation routes this action checks, not a proof that no route exists:'
     + ' a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved.',
-    established
+    authenticated
       ? 'The trust unit is this admission record, plus the matching digest from run\'s step log, plus the artifact — all three together, and none of them alone.'
-      : 'The in-process guarantees were NOT established on this host, so a same-user process may be able to attach to the collector or to the capturing step,'
-        + ' or to rewrite their memory without ptrace at all where it can reach root.'
-        + ' The capture, its digest and this report are diagnostic claims only; the copy of this record in start\'s own step log is the only one the wrapped command could not reach.',
+      : established
+        ? `The host readings came back clear, but this run was NOT admitted under strict (evidence-trust=${regime}), so nothing here is authenticated:`
+          + ' the capture, its digest and this report are diagnostic claims only, because the regime that was selected accepts a wrapped command able to rewrite the process that produced them.'
+        : 'The in-process guarantees were NOT established on this host, so a same-user process may be able to attach to the collector or to the capturing step,'
+          + ' or to rewrite their memory without ptrace at all where it can reach root.'
+          + ' This run was NOT admitted under strict, and the capture, its digest and this report are diagnostic claims only;'
+          + ' the copy of this record in start\'s own step log is the only one the wrapped command could not reach.',
+    // THE LIMIT OF THE UNIT ITSELF (Codex T6 r10 #4). Naming three pieces
+    // invites a reader to assume something checked that they belong together.
+    // This action verifies none of that correspondence: the comparison is
+    // external, manual, and only meaningful between copies carrying the SAME
+    // invocation — which is why the nonce is on the first line of every copy.
+    // Binding them here would need `start` to hand `run` something unforgeable,
+    // which is the very problem the platform prerequisite exists to solve.
+    `This action verifies none of that correspondence. Compare the copies by hand, and only against the start record with the same invocation=${nonce ?? 'unrecorded'};`
+    + ' a digest paired with a different invocation\'s admission record proves nothing at all.',
   ];
 };
 
@@ -855,7 +947,7 @@ const startSubcommand = async ({
   // wrapped command could have touched. This copy is the fixed point the
   // artifact's copy is compared against; it is streamed to the step log, where
   // it is immutable, and `run` and the report carry the identical text.
-  for (const line of admissionCaveats(admission, inputs.evidenceTrust)) {
+  for (const line of admissionCaveats(admission, inputs.evidenceTrust, nonce)) {
     process.stderr.write(`debug-evidence-action: start: ${line}\n`);
   }
   if (!admissionEstablished(admission)) {
@@ -1691,7 +1783,7 @@ const runSubcommand = async ({
       // to know the in-process guarantees were not established. An absent
       // record labels as `unknown`, never as met.
       rendered = renderReport(payloads['session.log'], state.sessionId, {
-        caveats: admissionCaveats(state.admission, state.evidenceTrust),
+        caveats: admissionCaveats(state.admission, state.evidenceTrust, state.nonce),
       });
     } catch (error) {
       process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
@@ -1732,7 +1824,7 @@ const runSubcommand = async ({
   // establishes is that best-effort was consciously selected. This one and the
   // report caveat are both written after the command ran, by a process it may
   // have been able to rewrite, so it could suppress either.
-  for (const caveat of admissionCaveats(state.admission, state.evidenceTrust)) writeStdout(`evidence-qualification ${caveat}\n`);
+  for (const caveat of admissionCaveats(state.admission, state.evidenceTrust, state.nonce)) writeStdout(`evidence-qualification ${caveat}\n`);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   // Ownership check and commit as ONE indivisible step. The snapshot in
   // `state` was read before a wrapped command that may have run for an hour,
