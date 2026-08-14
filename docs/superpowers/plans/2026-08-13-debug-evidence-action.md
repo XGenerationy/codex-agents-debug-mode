@@ -2740,6 +2740,64 @@ README must carry BOTH, in its own words but with the same meaning:
 Fix commit message:
 `fix(action): pin the scope claim by polarity, finish the stale-text sweep, make the README reference an obligation (Codex T6 r4)`.
 
+#### Task 6 fix round 5 — Codex re-review decisions (recorded before code moves)
+
+Codex on `07e0441`: the polarity pins catch the demonstrated reversals, the Task 8
+obligation wording is correct, invariant 10 and the `run` attribution read
+correctly, and *"no later step can un-fail a failed composite step"* is accurate
+within this action. Process rulings: when Task 8 lands, KEEP a positive/negative
+semantic pair and update it deliberately — never delete it; and do NOT hash the
+comment block (hashing detects formatting edits, not semantic reversals, and
+encourages mechanical checksum updates — new security claims get explicit polarity
+assertions instead). Important ×1, Minor ×1:
+
+1. **The parent-memory boundary is conditional, and nothing establishes it (the
+   Important).** `support.js:1074`, `action.yml:136` and spec:258 treat
+   parent-process memory as an UNCONDITIONAL boundary against the wrapped command.
+   That is false on supported Linux configurations permitting classic same-UID
+   `ptrace`: Yama mode 0 allows attaching to any dumpable same-UID process, and
+   the kernel documentation names arbitrary code injection as a consequence.
+   Neither `run` nor the collector is made non-dumpable, the collector's pid is
+   persisted in state (directly targetable), and the action neither verifies nor
+   documents the required policy. A hostile native command could interfere with
+   `run` or extract the collector's signing state — defeating authenticated
+   evidence outright. This prerequisite silently underwrites every in-process
+   guarantee built in Task 5 rounds 4–7. Codex accepts any ONE of: enforced
+   non-dumpability; a fail-closed check; or an explicit threat-model restriction.
+   **Decision — do the restriction, but make it OBSERVABLE rather than merely
+   stated (strictly stronger than the minimum):**
+   - `start` reads `/proc/sys/kernel/yama/ptrace_scope` once on Linux and records
+     the result in state: `restricted` (>= 1 — prerequisite met), `permissive`
+     (0), or `unknown` (file absent / unreadable / non-Linux).
+   - `permissive` and `unknown` print a prominent warning to the step log AND
+     stamp the rendered `report.md` / `report.json` with a line stating the
+     in-process guarantees were not established on this host. The evidence carries
+     its own caveat — the same doctrine as the labeled unreachable-collector
+     fallback, where the label travels with the artifact.
+   - Default behaviour stays PROCEED, not refuse: a permissive host is a weaker
+     platform, not a detected tampering event, and refusing would break legitimate
+     self-hosted callers with no escape hatch. **Ask Codex to rule** whether this
+     must escalate to a fail-closed refusal (exit 3) — the coordinator's judgement
+     is that labeling is proportionate and refusal is not, but the reviewer owns
+     this call.
+   - Spec: platform-prerequisite block added by the coordinator in this same
+     commit (done); a new invariant 11 describes the detection and labeling.
+   - **Wording, same finding:** *"a view of the world the command cannot
+     influence"* is too broad — the command plainly influences files, state,
+     collector availability and staging inputs. Only specifically protected
+     in-process values can carry that claim, and only under the prerequisite
+     above. Rewrite every site that overstates it, using the polarity discipline
+     from round 4.
+2. **`collector_boot.js:44` is factually wrong about inheritance (Minor).** It
+   says the wrapped process tree "inherits" the verifying step's environment. It
+   does not: `support.js:1142` copies the environment and strips every
+   `DEBUG_ACTION_*` entry before spawning. The intended argument is reading a
+   PARENT's environment through `/proc` where permissions allow — say that
+   instead.
+
+Fix commit message:
+`fix(action): detect and label the ptrace prerequisite, scope the in-process boundary claims (Codex T6 r5)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
