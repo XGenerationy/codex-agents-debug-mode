@@ -3328,11 +3328,50 @@ ASCII in `structurallyValid`; and Task 8 requirement #7 expands (below).
 **Task 8 requirement #7, expanded by ruling:** "exact recipe" must additionally
 specify deduplication, JavaScript's default UTF-16 code-unit sort, UTF-8 hashing
 of the NUL-joined string, and that the count represents matched candidate
-SPELLINGS rather than distinct binaries or inodes (two PATH entries resolving to
-the same file count twice).
+SPELLINGS rather than distinct binaries or inodes. *(Corrected, round 16 — the
+earlier gloss "two PATH entries resolving to the same file count twice" was
+misleading in one direction.)* Precisely: candidates are deduplicated by EXACT
+SPELLING before inspection, so `/usr/bin:/usr/bin` yields count 1; two DISTINCT
+spellings count separately even when they resolve to the same file, so `/a/sudo`
+and `/b/sudo` yield count 2 regardless of filesystem identity.
 
 Fix commit message:
 `fix(action): accept the producer's real count range and restrict readings to printable ASCII (Codex T6 r15)`.
+
+#### Task 6 fix round 16 — Codex re-review decisions on r15 (recorded before code moves)
+
+Codex on `69b262b`: the six-digit producer probe succeeds end to end, every tested
+Unicode case is rejected before vocabulary evaluation, and the spec's precision
+wording is confirmed correct. **Minor ×2 — both shipped precision defects, one of
+them the coordinator's.** Rulings:
+- **Residual (a) is PROVABLY CLOSED, not merely acceptable.** `found` is a
+  JavaScript Array, whose maximum length is 2³²−1 = `4294967295` — exactly TEN
+  digits. An 11-digit count cannot be formatted, because growing the array past
+  that throws first. The 10-digit vocabulary is therefore total, not "wide enough
+  for any real host". Record that reasoning where the range is defined, so nobody
+  later "tidies" it to a smaller bound.
+- **Residual (b) needs no authoring-time mechanism.** Runtime denial is the
+  authoritative control, and the existing producer sweep already fails if any
+  current producer yields a structurally rejected value. A direct printable-ASCII
+  assertion could improve the failure message but is not required.
+
+1. **The rejection diagnostic and two comments are factually wrong (Minor).**
+   `support.js:463` diagnoses EVERY structural rejection as "not a bounded
+   single-line string", but a value like `cléar` is bounded and single-line — it
+   is rejected for not being printable ASCII. Use "not a bounded printable-ASCII
+   string." AND the comments at `support.js:395` and `support.test.js:1326` say
+   the former gate excluded C1 while admitting `U+0085` NEL — **`U+0085` IS C1**.
+   The old gate excluded C0 plus DEL, not C1. Correct both; this is a factual
+   error in our own description of the thing we replaced, which is exactly the
+   class the now/history rule exists to catch.
+2. **Task 8 requirement #7 contradicted the implementation (Minor) — the
+   coordinator's text, fixed in this commit.** It said two PATH entries resolving
+   to the same file count twice. Candidates are deduplicated by EXACT SPELLING
+   before inspection: `/usr/bin:/usr/bin` yields count 1, while distinct `/a/sudo`
+   and `/b/sudo` yield count 2 even if they resolve to the same inode.
+
+Fix commit message:
+`fix(action): correct the structural-rejection diagnostic and the C0/C1 descriptions (Codex T6 r16)`.
 
 ---
 
