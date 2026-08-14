@@ -2189,8 +2189,53 @@ git commit -m "feat(action): report + finish — clean-by-construction capture a
 
 ### Task 6: `action.yml` — pure wiring, with structural pins
 
+> **TASK 5 CLOSED.** Codex approved `510a422` after eight fix rounds (five
+> Criticals, two Importants, all closed). Final architecture, for reference while
+> wiring: the launch token lives and dies in `start`'s memory; the collector
+> proves its identity with an Ed25519 signature over a canonical record binding
+> method + exact request target + challenge nonce + body hash; the verification
+> key travels as a PUBLIC step output and is consumed ONLY in `run`; capture,
+> validation, rendering, hashing and staging all happen inside `run`, which exits
+> 3 on any integrity failure or unreachable collector; `report` is publish-only
+> and key-free; `finish` keeps the command-exit mirror and honest belts.
+>
+> **ADAPTATION NOTE — supersedes every earlier T6 note in this plan.** The block
+> below was written before rounds 3–8 and is stale in exactly these ways. Apply
+> all of them:
+> 1. **Outputs move to `run`.** `event-count` and `report-path` must map to
+>    `steps.run.outputs.*`, NOT `steps.report.outputs.*` (capture happens in
+>    `run` now). ADD a fourth output `evidence-digest`, also from
+>    `steps.run.outputs.*`, described as a convenience — not the trust anchor
+>    (round-8 ruling (a)).
+> 2. **Verification key wired to `run` only.** The run step's env gains
+>    `DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}`.
+>    The report step must NOT receive it — that is the round-6 Critical, and a
+>    structural test must pin the key's absence from every step but `run`.
+> 3. **Nonce: inherit, never remap (Codex T6 ruling).** `start` writes
+>    `DEBUG_ACTION_INVOCATION_NONCE` to `GITHUB_ENV`, which GitHub makes
+>    available to subsequent steps automatically. Do NOT add
+>    `${{ env.DEBUG_ACTION_INVOCATION_NONCE }}` to any step's env: the expression
+>    `env` context excludes runner-inherited variables, so an explicit remap
+>    resolves to empty and breaks the wiring it was meant to create. A structural
+>    test pins that no such remap exists.
+> 4. **`report` fails closed without the nonce (Codex T6 ruling; small
+>    `support.js` change in this task).** When `report` finds no invocation nonce
+>    in its env, it must clear ALL staging, emit a diagnostic, and return 3 —
+>    never degrade to "state exists". Unit test + mutation (degrade-to-loose
+>    turns it red).
+> 5. **Reconcile the env blocks against the CODE, not this block.** `start` now
+>    owns mint/occupant-auth/OPEN-post, so read `validateActionInputs` and each
+>    subcommand's actual env reads and wire exactly what they consume. Report any
+>    variable in the block below that the code no longer reads.
+> 6. `run` can now exit 3, and the composite deliberately sets no
+>    `continue-on-error` — that is what makes a failed verdict unfixable by later
+>    steps (Codex verified). Keep `always()` on report/upload/teardown/finish so
+>    they still run after a failed `run`, and keep the ordering
+>    `run → report → upload` (round 8: `report` decides what upload sees).
+
 **Files:**
 - Create: `actions/debug-evidence/action.yml`
+- Modify: `actions/debug-evidence/support.js` (report's missing-nonce path, item 4)
 - Test: `actions/debug-evidence/support.test.js` (append structural tests)
 
 - [ ] **Step 1: Write the failing structural tests** — append to `support.test.js` (plain-text regex assertions, no YAML parser — repo convention):
