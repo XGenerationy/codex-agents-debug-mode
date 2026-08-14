@@ -3741,6 +3741,24 @@ Round 3 closed the reported Minor and found a THIRD hole of the same class unpro
 
 **Flagged, not fixed:** `runs-on: &r ubuntu-latest` is absorbed as a literal string rather than throwing, so the reader's "an unrecognised construct THROWS" doctrine is not literally true of YAML anchors. It is valid YAML rather than a GitHub-invalid document, and every assertion over such a value fails closed; a fix has a false-rejection edge on quoted scalars that would need its own tests. Recorded as a known limit rather than silently carried.
 
+#### Task 7 fix round 4 (Codex review of `10143b1`+`55dfadf`: 5 Minor) — AND A REVERSED COORDINATOR DECISION
+
+**Codex offered the same exit twice — "rename and explicitly bound this as a repository-specific structural reader" — and the coordinator declined it twice. That was wrong, and this round takes it.** The evidence that turned it: of five new findings, THREE (1, 2, 5 below) are defects only of the GENERAL claim rather than of anything this repository's own workflows do, and a fourth is a FALSE REJECTION introduced by chasing generality. When tightening a claim produces a regression against the real schema, the claim's ambition is the defect, not its implementation. **A reader that must agree with GitHub's schema everywhere is a YAML-schema project; this repo needs a reader that catches a typo in ITS OWN two workflows.**
+
+**DISSOLVED BY SCOPING — no code, claim change only:**
+- **(1) The structural/content split overclaims.** The claim says value TYPES are covered, then excludes `timeout-minutes: abc` and `continue-on-error: maybe` — which ARE number/boolean type errors, so the wording contradicts itself. It also admits `defaults:` with a typo'd child and a `uses` step carrying `shell:`/`working-directory:`, because only the outer mapping and `with` placement are checked while GitHub recursively constrains `defaults` and separates run-step keys from uses-step keys.
+- **(2) `on:` is presence-checked in every representation but null.** `on: ""`, `on: []` and `on: {}` all pass, so the round-3 null rule STILL admits a workflow that cannot trigger — the exact question the coordinator asked Codex to check, answered against us.
+- **(5, partly) Anchors.** `runs-on: *missing` stores a non-empty literal and passes the schema though GitHub's loader cannot resolve it.
+
+**MUST FIX REGARDLESS OF SCOPE — these are live against this repo's own files:**
+- **(4) `run: ""` IS A FALSE REJECTION, introduced by round 3.** GitHub's schema requires `uses` to be non-empty but `run` is only a required string, so the shipped rule asserts MORE than GitHub does and the test at `:5667` asserts a rejection GitHub would not make. The round-3 over-strict mutations missed it because they were aimed at this repo's workflows, not at GitHub's schema. **FIX: keep `uses` non-empty; allow an empty `run`. Null and mapping cases stay correctly rejected.**
+- **(3) Step-ID uniqueness is case-sensitive locally, case-insensitive in GitHub's runner.** The plain `Set` admits `first` and `FIRST` in one job; GitHub's `ReferenceNameBuilder` uses an ordinal case-insensitive set. A real collision risk in files this repo writes. **FIX: case-fold the uniqueness check and add the case-folded duplicate mutation.** Codex confirms the lexical regex itself is sound and `_ok-9` is a valid positive control.
+- **(5, the fail-closed half) Anchors must not pass silently.** The implementer's justification for flagging rather than fixing was that "every assertion over such a value fails closed" — **Codex refuted it: no demo assertion reads `runs-on` at all**, so an unresolvable alias sails through. **FIX: REJECT anchors and aliases outright.** This repo uses none, rejection is fail-closed and trivial, and it avoids the quote-aware resolution whose false-rejection edge was the reason for not fixing it before. Do NOT implement anchor resolution.
+
+**THE CLAIM, restated honestly:** the reader validates SELECTED workflow/job/step structural checks sufficient to catch a mis-spelled or mis-shaped key in THIS repository's own workflows. It does NOT implement GitHub's schema, and the excluded classes stay listed at the point of the claim. Every previously listed exclusion stands, plus recursive `defaults`, run-step-vs-uses-step key separation, and the `on:` representations above.
+
+**Standing lesson for Task 9 and beyond:** three consecutive rounds tightened this reader and each produced fresh divergence from a schema we do not implement. **A test's advertised scope must be no larger than the thing it is protecting** — here, two workflow files — and generality bought at the price of a false rejection is a net loss.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
