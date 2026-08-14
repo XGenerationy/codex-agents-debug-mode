@@ -2697,6 +2697,49 @@ NAMESPACING and must NOT label that adversarial isolation. Important ×1, Minor 
 Fix commit message:
 `fix(action): scope the guarantee to the first invocation, correct the runner heredoc model, purge stale report-era comments (Codex T6 r3)`.
 
+#### Task 6 fix round 4 — Codex re-review decisions (recorded before code moves)
+
+Codex on `c466664`: **no runtime wiring or security-boundary regression**; the
+corrected heredoc attack is valid (closes on the predictable `session-id` line,
+and the model now rejects a missing terminator consistently with the runner), and
+both coordinator spec fixes verified correct — invariant 10 accurately
+distinguishes namespacing from adversarial isolation and requires a separate job,
+invariant 2 correctly assigns the authenticated read to `run`. Minor ×3, all
+review-quality:
+
+1. **The scope pin fails open on the crucial negation.** The test checks keywords
+   plus the "THIS invocation" claim, so changing `does NOT survive` to
+   `DOES survive` leaves every assertion green — Codex reproduced that mutation in
+   memory. A pin that passes while the comment states the opposite of the truth is
+   worse than no pin. Fix: assert the NEGATIVE same-job limitation and the
+   separate-job requirement directly (match the polarity, not just the vocabulary),
+   and re-run Codex's mutation as a regression check.
+2. **The stale-text sweep missed two sites.** `collector_boot.js:44` still says a
+   symmetric secret would inhabit `report`'s environment (capture is in `run`);
+   `support.test.js:3661` still says upload takes the paths "`run` reports" (they
+   come from `start`). Fix both, then re-run the sweep with the polarity of the
+   claim in mind rather than the identifier alone.
+3. **Forward reference — Codex chose option (ii).** `action.yml:213` says the
+   README already contains the warning, but no tracked README does. Change it to
+   future/required language ("Task 8's README must say so"), so the comment states
+   an obligation rather than a false fact.
+
+**HARD TASK 8 REQUIREMENTS (recorded here so they cannot be lost).** Task 8's
+README must carry BOTH, in its own words but with the same meaning:
+- **The separate-job limitation.** The integrity guarantees hold for the first (or
+  only) invocation in a job; an earlier instrumented command in the same job can
+  poison a later invocation's `start` through `BASH_ENV`; run a second
+  instrumented command in a SEPARATE JOB.
+- **The five-output availability disclosure.** `command-exit-code`, `session-id`,
+  `event-count`, `report-path` and `evidence-digest` are availability-only and
+  attacker-suppressible (the wrapped command can blank or garble them through the
+  runner's file-command channel). Nothing security-critical rides on them: the
+  verdict is `run`'s exit code, and the digest's authoritative copy is the step
+  log.
+
+Fix commit message:
+`fix(action): pin the scope claim by polarity, finish the stale-text sweep, make the README reference an obligation (Codex T6 r4)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
