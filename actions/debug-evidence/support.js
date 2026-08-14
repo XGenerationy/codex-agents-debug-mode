@@ -574,7 +574,7 @@ const startSubcommand = async ({
   // harmless value belongs. What matters is where it travels, not who sees
   // it — see the step-output write below.
   if (typeof startLine.verify_key !== 'string' || startLine.verify_key === '') {
-    // Without it, `report` can never prove who served a log, and would fail
+    // Without it, `run` can never prove who served a log, and would fail
     // every capture. Better to stop here, while the collector can still be
     // killed cleanly, than to run a whole job that cannot produce evidence.
     throw abort('collector did not report a verification key; capture could never be verified');
@@ -1006,8 +1006,9 @@ const payloadDigestLine = (payloads) => {
   return parts.length === 0 ? null : `evidence-sha256 ${parts.join(' ')}`;
 };
 
-// One diagnostic is one line. The values interpolated into report's stderr
-// come from a state file and from OS/collector errors quoting it, so a raw
+// One diagnostic is one line. The values interpolated into run's capture
+// diagnostics come from a state file and from OS/collector errors quoting it,
+// so a raw
 // newline in either would split one message into what reads as two — the same
 // discipline debug_report.js applies to its own error line.
 const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
@@ -1021,7 +1022,7 @@ const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 //    run's official evidence (Codex T5 #1, Critical). Reading back through
 //    GET /sessions/:id/logs puts the collector's own checks in the path —
 //    dev/ino/birthtime/size identity, and since r2 a SHA-256 of every byte it
-//    appended — so a tampered log is a 409 rather than a report, including
+//    appended — so a tampered log is a 409 rather than an answer, including
 //    the same-length in-place rewrite metadata alone cannot see.
 // 2. Aliveness is the authenticated read itself. An unauthenticated /health
 //    answer only says SOMETHING is listening — exactly what a process that
@@ -1389,7 +1390,8 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
   // belong to OTHER invocations — possibly a live concurrent one. Their
   // evidence is not this step's to ship and not this step's to destroy, and
   // it cannot leak into this job's artifact either way, because the upload
-  // step is gated on THIS invocation's `run` outputs (Codex T6 r1 #3).
+  // step's guard and paths come from THIS invocation's `start` outputs, fixed
+  // before the wrapped command existed (Codex T6 r2 #1).
   if (requireInvocationNonce(env, 'report')) return 3;
   const evidenceDir = resolveEvidenceDir(outputDir, env.DEBUG_ACTION_INVOCATION_NONCE);
   const state = readState(outputDir);

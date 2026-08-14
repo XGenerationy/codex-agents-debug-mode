@@ -36,10 +36,10 @@ const main = () => {
   // this shim inherits the full job env from `start` — that inheritance is the
   // redaction guarantee for job secrets (spec Security invariant 3).
   // The RESPONDER KEYPAIR, minted fresh per boot so it cannot outlive the
-  // collector it identifies. It lets `report` check that a captured log came
-  // from THIS process rather than from a counterfeit listener a wrapped
-  // command stood up on a port it rewrote in the action's state file
-  // (Codex T5 r4 #1).
+  // collector it identifies. It lets `run` — the step that captures, since
+  // Task 5 round 6 — check that a served log came from THIS process rather
+  // than from a counterfeit listener a wrapped command stood up on a port it
+  // rewrote in the action's state file (Codex T5 r4 #1).
   //
   // Only the PUBLIC half is handed back. A shared secret would have to sit in
   // the report step's environment, where a surviving same-user child can read

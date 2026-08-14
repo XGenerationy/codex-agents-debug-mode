@@ -135,9 +135,11 @@ runs:
       # THE TRUSTED PROCESS. Its environment is resolved by the runner before
       # the wrapped command exists, and a child cannot rewrite its parent's
       # memory — so this is the only step whose view of the world the command
-      # it runs cannot influence. Capture, hypothesis validation, rendering,
+      # IT runs cannot influence. Capture, hypothesis validation, rendering,
       # hashing and staging all happen here, after the command returns, in
-      # this same process.
+      # this same process. (The emphasis is load-bearing: a command an EARLIER
+      # invocation ran in the same job reaches even this step's environment
+      # through BASH_ENV — see the scope note on the upload step.)
       #
       # DEBUG_ACTION_COLLECTOR_VERIFY_KEY is the collector's PUBLIC Ed25519
       # verification key, and it is wired HERE AND NOWHERE ELSE (spec Security
@@ -191,9 +193,24 @@ runs:
       # file. The command can claim any key run does not write, and for a key
       # run does write it can open a heredoc whose delimiter is the exact line
       # run is about to append, swallowing it as body and leaving an
-      # attacker-chosen multiline path set behind. Pre-command outputs are not
-      # reachable that way, which is the same argument that protects the
-      # verification key.
+      # attacker-chosen multiline path set behind. (The delimiter is
+      # predictable: `session-id=<id>` is a line run always writes, and the id
+      # is in the command's own environment.) A pre-command output is out of
+      # THIS invocation's wrapped command's reach, which is the same argument
+      # that protects the verification key.
+      #
+      # SCOPE OF THAT GUARANTEE — stated precisely, because it does not
+      # generalise (Codex T6 r3). It holds for the FIRST (or only) invocation
+      # of this action in a job. It does NOT survive an earlier instrumented
+      # command in the SAME job: that command's own GITHUB_ENV file can set
+      # BASH_ENV, which every later `shell: bash` step sources at shell startup
+      # — a second invocation's `start` included, before support.js runs — so
+      # attacker code can append a last-wins `evidence-dir=` to that start's
+      # own output file and redirect this path set after all. The same reach
+      # covers the verification key handed to the run step. Wrapping a second
+      # command after an instrumented one therefore belongs in a SEPARATE JOB;
+      # same-job reuse is not something this runner channel can be made to
+      # guarantee, and the README says so in the same words.
       #
       # `evidence-dir` is start's invocation-scoped staging child. It is empty
       # only when start never executed, which is exactly when there is nothing

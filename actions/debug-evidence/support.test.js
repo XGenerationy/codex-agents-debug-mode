@@ -1298,11 +1298,11 @@ test('run captures the session from the collector, renders md+json, emits output
     assert.equal(state.evidenceCopied, true);
     assert.equal(state.evidenceAuthentic, true, 'the staged bytes came from the collector, not a pathname');
     assert.equal(state.reportRendered, true);
-    // The capture flags are ADDED to whatever run recorded, never written
-    // from report's own pre-capture snapshot: the CAS re-reads the file under
-    // the lock and spreads THAT, so nothing run committed is rolled back
-    // (Codex T4 #3/r2, applied to report).
-    assert.ok(state.sessionId.startsWith('ci-debug-'), 'run\'s session id survives report\'s commit');
+    // The capture flags are ADDED to whatever start recorded, never written
+    // from run's own pre-command snapshot: the CAS re-reads the file under the
+    // lock and spreads THAT, so nothing start committed is rolled back
+    // (Codex T4 #3/r2, applied to run's commit).
+    assert.ok(state.sessionId.startsWith('ci-debug-'), 'the session id start minted survives run\'s commit');
     assert.equal(state.commandExitCode, 1, 'and so does the exit code it recorded');
   } finally {
     teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
@@ -3066,6 +3066,12 @@ test('staging is invocation-scoped: a second invocation neither sees, clears, no
 // `key<<DELIMITER` form: every following line is body until a line equal to the
 // delimiter closes it. Modelled here because the attack below turns exactly
 // that feature against a post-command writer.
+//
+// An UNTERMINATED heredoc throws, because that is what the runner does — it
+// raises "Matching delimiter not found" and fails the step (Codex T6 r3 #2).
+// A model that swallowed to EOF instead would let a test assert a parse GitHub
+// would never perform, and the attack it demonstrated would in reality only
+// have failed the run step rather than redirecting anything.
 const parseStepOutputs = (text) => {
   const values = {};
   const lines = text.split('\n');
@@ -3078,6 +3084,7 @@ const parseStepOutputs = (text) => {
         body.push(lines[index]);
         index += 1;
       }
+      if (index >= lines.length) throw new Error(`unterminated heredoc for ${heredoc[1]}`);
       values[heredoc[1]] = body.join('\n');
       continue;
     }
@@ -3086,6 +3093,15 @@ const parseStepOutputs = (text) => {
   }
   return values;
 };
+
+test('the step-output model matches the runner: an unterminated heredoc is an error, not a swallow', () => {
+  assert.deepEqual(parseStepOutputs('a=1\nb<<EOF\nline one\nline two\nEOF\nc=3\n'), {
+    a: '1',
+    b: 'line one\nline two',
+    c: '3',
+  });
+  assert.throws(() => parseStepOutputs('a=1\nb<<NEVER-CLOSED\nline one\n'), /unterminated heredoc for b/);
+});
 
 // Codex T6 r2 #1, and it is deterministic rather than a race. `run` writes its
 // step outputs AFTER the wrapped command has executed, and the runner does not
@@ -3101,7 +3117,9 @@ const parseStepOutputs = (text) => {
 // the verification key.
 test('a wrapped command that forges this step\'s output file cannot reach the upload path set', async () => {
   const served = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }];
-  const forge = async (payload) => {
+  // `payloadFor` receives the environment the wrapped command is given, which
+  // is how the child below learns the one thing it needs to close its heredoc.
+  const forge = async (payloadFor) => {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
     writeState(outputDir, {
@@ -3110,6 +3128,7 @@ test('a wrapped command that forges this step\'s output file cannot reach the up
     });
     const githubOutput = path.join(outputDir, 'github_output');
     writeFileSync(githubOutput, '');
+    let payload = null;
     const code = await captureViaRun({
       outputDir,
       env: { ...RUN_ENV, GITHUB_OUTPUT: githubOutput },
@@ -3117,7 +3136,8 @@ test('a wrapped command that forges this step\'s output file cannot reach the up
       // The child writes to the file directly. It is handed no path and no
       // variable; in production it enumerates the runner's command-file
       // directory, which this seam stands in for.
-      spawnCommand: () => {
+      spawnCommand: (command, { env }) => {
+        payload = payloadFor(env);
         appendFileSync(githubOutput, `${payload.join('\n')}\n`);
         return { status: 0 };
       },
@@ -3128,24 +3148,33 @@ test('a wrapped command that forges this step\'s output file cannot reach the up
 
   // 1. The plain form. Nothing `run` writes afterwards contests these keys,
   //    because `run` no longer emits them at all.
-  const plain = await forge(['evidence-staged=x', 'evidence-dir=C:/foreign']);
+  const plain = await forge(() => ['evidence-staged=x', 'evidence-dir=C:/foreign']);
   const plainValues = parseStepOutputs(plain.published);
   assert.equal(plainValues['evidence-dir'], 'C:/foreign', 'the channel really is attacker-writable');
   assert.equal(plainValues['evidence-staged'], 'x');
 
-  // 2. Codex's heredoc form, which is what made a post-command writer
-  //    unfixable: the delimiter is the exact line the trusted process was
-  //    going to write, so everything it appends is swallowed as body.
-  const heredoc = await forge([
+  // 2. The heredoc form, which is what makes a post-command writer unfixable
+  //    even for a key it DOES write: the delimiter is the exact line the
+  //    trusted process is about to append, so everything up to it becomes
+  //    body. The delimiter has to be one the child can spell in advance, and
+  //    it can: `session-id=<id>` is a line run always writes, and the id is
+  //    sitting in the child's own environment as DEBUG_SESSION_ID (Codex T6 r3
+  //    #2 — the earlier version of this test used a delimiter run no longer
+  //    emits, which the corrected model rejects as unterminated, exactly as
+  //    the runner would).
+  const heredoc = await forge((env) => [
     'evidence-staged=x',
-    'evidence-dir<<evidence-staged=session.log report.md report.json',
+    `evidence-dir<<session-id=${env.DEBUG_SESSION_ID}`,
     'C:/foreign/**',
   ]);
+  // It parses: this is a file GitHub would accept, not one it would reject.
   const heredocValues = parseStepOutputs(heredoc.published);
   assert.ok(heredocValues['evidence-dir'].includes('C:/foreign/**'),
     'an attacker-controlled MULTILINE path set, which is what a path: block consumes');
   assert.equal(heredocValues['command-exit-code'], undefined,
-    'and every trusted line run wrote afterwards was swallowed into that body');
+    'and the trusted line run wrote before the delimiter was swallowed into that body');
+  assert.equal(heredocValues['session-id'], undefined,
+    'the delimiter line itself is consumed as the terminator, so even that output is lost');
 
   // THE DEFENCE, asserted where it lives: nothing about the upload step reads
   // any of this. Its gate and its paths are `start` outputs, fixed before the
@@ -3264,8 +3293,8 @@ test('resolveEvidenceDir refuses any invocation nonce that is not a safe path se
 // directory it could clear belongs to some other invocation — possibly one
 // still running. Their evidence is not this step's to publish and not this
 // step's to destroy, and it cannot reach this job's artifact either way,
-// because the upload step is gated on THIS invocation's run outputs
-// (Codex T6 r1 #1/#3).
+// because the upload step's guard and paths come from THIS invocation's start
+// outputs, fixed before the wrapped command existed (Codex T6 r1 #1, r2 #1).
 test('report fails closed when no invocation nonce reached this step, and destroys nobody else\'s evidence', async () => {
   const outputDir = makeTempDir();
   const strangerDir = resolveEvidenceDir(outputDir, 'inv-stranger');
@@ -3655,9 +3684,10 @@ test('upload takes exactly the paths run reports staging into, and nothing else'
 test('every action output is produced by the run step, and the set is exactly these five', () => {
   // Capture happens in run, so run is the only step whose account of the
   // session can be trusted; `report` publishes and produces nothing.
-  // `evidence-dir`/`evidence-staged` are run's own STEP outputs, consumed by
-  // the upload step's guard and paths — deliberately not part of the action's
-  // public contract.
+  // The upload step reads none of these: its guard and paths come from
+  // `start`, before the wrapped command existed. Every output here is
+  // availability-only — a wrapped command can suppress or garble them by
+  // writing to the same step-output file (Codex T6 r2 #1/r3 (a)).
   assert.deepEqual(parseActionYml().outputs, {
     'command-exit-code': '${{ steps.run.outputs.command-exit-code }}',
     'session-id': '${{ steps.run.outputs.session-id }}',
@@ -3665,6 +3695,35 @@ test('every action output is produced by the run step, and the set is exactly th
     'report-path': '${{ steps.run.outputs.report-path }}',
     'evidence-digest': '${{ steps.run.outputs.evidence-digest }}',
   });
+});
+
+// The comments are part of the deliverable here, because the thing being
+// reviewed is a security CLAIM. "Pre-command outputs are out of the wrapped
+// command's reach" is true of THIS invocation's command and false of one an
+// earlier invocation in the same job already ran: that command's GITHUB_ENV
+// file can set BASH_ENV, and every `shell: bash` step afterwards — a later
+// invocation's `start` included — sources it before running, so it can append
+// a last-wins `evidence-dir=` to that start's own output file. Same-job reuse
+// after an instrumented command is outside the guarantee, and the file must
+// say so rather than let a reader generalise (Codex T6 r3 #1).
+test('action.yml states the scope of its integrity guarantee rather than overclaiming', () => {
+  // Flowed into one string: these notes wrap across lines, so a phrase can sit
+  // either side of a line break and its `# ` prefix.
+  const commentary = ACTION_YML().split(/\r?\n/)
+    .filter((line) => line.trim().startsWith('#'))
+    .map((line) => line.trim().replace(/^#\s?/, ''))
+    .join(' ');
+  // Case-insensitive: the emphasis in the file is a writer's choice, the
+  // presence of the scope is not.
+  for (const phrase of [
+    'first (or only) invocation',
+    'separate job',
+    'bash_env',
+  ]) {
+    assert.ok(commentary.toLowerCase().includes(phrase), `the scope note must name: ${phrase}`);
+  }
+  // And the claim it qualifies is stated as scoped, not absolute.
+  assert.match(commentary, /out of (?:the reach of|reach of)?\s*THIS invocation'?s? (?:wrapped )?command|unreachable by THIS invocation/i);
 });
 
 test('the output-dir default expression is byte-identical at every site, and there are exactly five', () => {
