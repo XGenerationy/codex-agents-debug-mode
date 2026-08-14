@@ -504,7 +504,22 @@ const startSubcommand = async ({
   //    EARLIER invocation's nonce, its state in a shared output-dir would then
   //    look owned, and the always() upload would publish that evidence under
   //    this run's artifact name (Codex T6 r1 #1).
-  if (env.GITHUB_OUTPUT) writeOutputs(env.GITHUB_OUTPUT, { 'invocation-nonce': nonce });
+  //
+  // The staging directory goes out in the same act, and for a second reason
+  // (Codex T6 r2 #1). The upload step has to be told where to look, and the
+  // only safe moment to tell it is before the wrapped command exists: a value
+  // published AFTER that command has run is not a boundary at all, because the
+  // command can write into the runner's step-output file directly — stripping
+  // GITHUB_OUTPUT from its environment hides the variable, not the file. So
+  // `run` publishes nothing the upload step consults; the path set is fixed
+  // here, in the same pre-command window that protects the verification key,
+  // and it is derived from the nonce on the line above rather than duplicated.
+  if (env.GITHUB_OUTPUT) {
+    writeOutputs(env.GITHUB_OUTPUT, {
+      'invocation-nonce': nonce,
+      'evidence-dir': resolveEvidenceDir(outputDir, nonce),
+    });
+  }
   const workspace = env.GITHUB_WORKSPACE || '';
   const errors = validateActionInputs({ ...inputs, outputDir, workspace });
   if (errors.length > 0) throw new Error(`invalid inputs: ${errors.join('; ')}`);
@@ -1306,24 +1321,19 @@ const runSubcommand = async ({
   // this invocation just declined to own would be advertising someone else's
   // run as its own.
   if (env.GITHUB_OUTPUT) {
+    // NOTHING here controls the upload step, and nothing here may (Codex T6
+    // r2 #1). These lines are written after the wrapped command has run, into
+    // a file that command can append to itself: it can claim any key this step
+    // does not, and for a key this step DOES write it can open a heredoc whose
+    // delimiter is the exact line this step is about to append, swallowing it
+    // as body. A post-command step output is therefore a convenience, never a
+    // boundary — the upload step reads `start`'s pre-command outputs instead.
+    // The digest below is the same kind of thing and is documented as such:
+    // its authoritative copy is the line printed to this step's log, which is
+    // immutable once streamed.
     const outputs = {
       'command-exit-code': commandExitCode,
       'session-id': state.sessionId,
-      // What the upload step needs, from the only process that can honestly
-      // say it (Codex T6 r1 #3). The upload step runs `always()`, cannot
-      // inspect the filesystem for a trustworthy answer, and must not simply
-      // point at a well-known path: by the time it runs, anything could be
-      // sitting there. So this step reports WHERE it staged — its own
-      // invocation-scoped child, which a stale sibling can never be inside —
-      // and exactly WHAT it put there. An empty `evidence-staged` closes the
-      // upload gate entirely.
-      //
-      // Deliberately not conditioned on the report rendering: a renderer
-      // failure still staged an authenticated session.log, and suppressing
-      // that would throw away evidence this process proved (Codex's explicit
-      // warning against gating upload on `report`).
-      'evidence-dir': evidenceDir,
-      'evidence-staged': stagedNames.join(' '),
     };
     if (reportRendered) {
       outputs['event-count'] = eventCount;

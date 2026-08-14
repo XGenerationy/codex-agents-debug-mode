@@ -124,10 +124,11 @@ Step chain (composite, `shell: bash` everywhere):
    successful `start`, the subcommand no-ops successfully (finish already owns the
    failure decision for a failed start).
 5. **upload-artifact** — pinned, `if-no-files-found: ignore`, uploads the three
-   enumerated payloads from `steps.run.outputs.evidence-dir` as `artifact-name`,
-   guarded by `always() && steps.run.outputs.evidence-staged != ''`. *(Rewritten,
-   Task 6 round 1: the guard and the paths both come from the trusted `run` step,
-   never from `output-dir` or from `report`'s outcome.)*
+   enumerated payloads from `steps.start.outputs.evidence-dir` as `artifact-name`,
+   guarded by `always() && steps.start.outputs.evidence-dir != ''`. *(Rewritten,
+   Task 6 round 2: both come from a PRE-COMMAND `start` output, never from
+   `output-dir`, from `report`'s outcome, or from any output written after the
+   wrapped command has run.)*
 6. **teardown** — `support.js teardown`, `if: always()`: kills the boot-shim PID from
    state; an already-dead process is success, a missing state file is success (start
    never ran). Never masks earlier failures.
@@ -196,13 +197,28 @@ everything downstream keys off three fixed filenames: one invocation's entry cle
 destroys another's evidence, a concurrent restage lands in exactly the names the
 upload step enumerates, and a stale entry that cannot be unlinked (a directory where
 `session.log` belongs) fails `report` while the `always()` upload still expands that
-directory into the artifact. The upload step is correspondingly gated on the trusted
-`run` step's own outputs rather than on the filesystem or on `report`: `run` reports
-`evidence-staged` (exactly which payloads it wrote — empty closes the gate and the
-step does not execute) and `evidence-dir` (the absolute staging path, which the
-`path:` entries are built from). It is deliberately NOT gated on `report` succeeding:
-a Step Summary failure must never suppress evidence `run` proved. Known and
-unprevented: `actions/upload-artifact` v4.6.2 exposes no symlink control — its seven
+directory into the artifact.
+
+*(Rewritten again, Task 6 round 2.)* The upload step's guard AND its `path:` entries
+both come from `start`'s `evidence-dir` step output — published, with the nonce it is
+derived from, before `start` validates anything and therefore before the wrapped
+command exists. A value published by `run` cannot serve here however carefully it is
+computed: `run` writes its step outputs AFTER the command has executed, into a file
+under `RUNNER_TEMP/_runner_file_commands` that the command can append to itself
+(removing `GITHUB_OUTPUT` from the child's environment hides the variable, not the
+file). The command can claim any key `run` does not write, and for a key `run` does
+write it can open a heredoc whose delimiter is the exact line `run` is about to
+append, swallowing it as body and leaving an attacker-chosen multiline path set with
+an open gate. `run` therefore publishes NO upload-controlling output at all; the gate
+is empty only when `start` never executed, and `if-no-files-found: ignore` covers the
+case where `start` ran but nothing was staged. It is deliberately NOT gated on
+`report` succeeding: a Step Summary failure must never suppress evidence `run` proved.
+A second residual follows from same-user staging and is documented rather than
+prevented: a hostile command can create files INSIDE the invocation-scoped directory,
+so the artifact may carry payloads this action never staged. The trust unit answers
+it — evidence is bytes whose SHA-256 matches a digest line the trusted `run` process
+printed to its own step log; a planted file has no backing digest, and a `run` that
+staged nothing prints none. Known and unprevented: `actions/upload-artifact` v4.6.2 exposes no symlink control — its seven
 inputs carry none, and its glob options hardcode `followSymbolicLinks: true` and
 `implicitDescendants: true` (verified against the pinned SHA) — so a hostile swap
 inside the staging window can substitute a symlink to an unrelated readable file and
@@ -312,8 +328,13 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
     job-global nonce lets a failed later invocation inherit an earlier one's
     identity and claim its evidence. Step outputs are per-invocation by
     construction. The staged evidence child is likewise invocation-scoped, and
-    the upload step is gated on a trusted `run` output naming what was actually
-    staged. *(Extended, Task 5 round 7.)*
+    the upload step's guard and paths come from that same PRE-COMMAND `start`
+    output. *(Corrected, Task 6 round 2: an earlier form of this note had the
+    upload step trusting `run`'s post-command outputs. It cannot — `run` writes
+    them after the wrapped command has executed, into a runner command file the
+    command can append to, so a heredoc whose delimiter is the exact line `run`
+    will write swallows it and leaves the attacker holding both the path set and
+    the gate. Only pre-command outputs are outside the command's reach.)* *(Extended, Task 5 round 7.)*
     EVERY evidence verdict — integrity failure, unreachable collector, and
     success — is decided inside `run`; none is deferred to a later step through
     state or env. `finish` retains only the command-failure mirror and teardown

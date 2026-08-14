@@ -182,41 +182,54 @@ runs:
       run: node "${{ github.action_path }}/support.js" report
 
     - name: Upload evidence artifact
-      # Everything here comes from the run step, because run is the only
-      # process that can honestly say what exists (Codex T6 r1 #3):
+      # Both the GUARD and the PATHS come from `start`, and specifically from
+      # BEFORE the wrapped command existed (Codex T6 r2 #1). A value published
+      # by the run step would be worthless here however carefully it were
+      # computed: run writes its outputs after the command has executed, into a
+      # file under RUNNER_TEMP that the command can append to itself — removing
+      # GITHUB_OUTPUT from the child's environment hides the variable, not the
+      # file. The command can claim any key run does not write, and for a key
+      # run does write it can open a heredoc whose delimiter is the exact line
+      # run is about to append, swallowing it as body and leaving an
+      # attacker-chosen multiline path set behind. Pre-command outputs are not
+      # reachable that way, which is the same argument that protects the
+      # verification key.
       #
-      # - the GUARD is `evidence-staged`, the list of payloads run actually
-      #   wrote. Empty means nothing was staged and this step does not run at
-      #   all. It is deliberately NOT gated on `report` succeeding: a Step
-      #   Summary failure must never suppress evidence run proved.
-      # - the PATHS come from `evidence-dir`, run's own invocation-scoped
-      #   staging child. A concurrent or earlier invocation stages under a
-      #   different name, so no sibling can ever be inside this step's path
-      #   set — which also means a stale entry that `report` could not clean
-      #   up cannot be expanded into this artifact by the uploader's
-      #   implicitDescendants behaviour.
+      # `evidence-dir` is start's invocation-scoped staging child. It is empty
+      # only when start never executed, which is exactly when there is nothing
+      # to upload — so the guard needs nothing else, and `if-no-files-found:
+      # ignore` covers the case where start ran but nothing was ever staged.
+      # Deliberately NOT gated on `report`: a Step Summary failure must never
+      # suppress evidence run proved.
       #
       # The filenames stay enumerated rather than uploading the directory, and
       # action-state.json — this run's session token — lives at the output-dir
       # ROOT, outside the staging child, so no path here can reach it.
       #
-      # The uploader offers no control over symlink following: v4.6.2 declares
-      # seven inputs (name, path, if-no-files-found, retention-days,
-      # compression-level, overwrite, include-hidden-files) and hardcodes
-      # `followSymbolicLinks: true` with `implicitDescendants: true` in its
-      # glob options — verified against the pinned SHA. So a hostile swap
-      # inside the staging window can still substitute a link to an unrelated
-      # readable file and pull its bytes into the artifact. That is detected
-      # after the fact, by the digest the run step printed to its own step log
-      # before staging; it is not prevented here (spec threat-model line).
-      if: ${{ always() && steps.run.outputs.evidence-staged != '' }}
+      # Two residuals, documented rather than prevented, both following from
+      # same-user staging:
+      #
+      # 1. A hostile command can create files INSIDE this directory, so the
+      #    artifact may carry payloads this action never staged. The trust unit
+      #    answers it: evidence is bytes whose SHA-256 matches a digest line
+      #    the trusted run process printed to its own step log. A planted file
+      #    has no backing digest, and a run that staged nothing prints none.
+      # 2. The uploader offers no control over symlink following: v4.6.2
+      #    declares seven inputs (name, path, if-no-files-found,
+      #    retention-days, compression-level, overwrite, include-hidden-files)
+      #    and hardcodes `followSymbolicLinks: true` with
+      #    `implicitDescendants: true` in its glob options — verified against
+      #    the pinned SHA. A swap inside the staging window can therefore
+      #    substitute a link to an unrelated readable file. Same answer: the
+      #    digest describes what run staged, not what the artifact carries.
+      if: ${{ always() && steps.start.outputs.evidence-dir != '' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ${{ inputs.artifact-name }}
         path: |
-          ${{ steps.run.outputs.evidence-dir }}/session.log
-          ${{ steps.run.outputs.evidence-dir }}/report.md
-          ${{ steps.run.outputs.evidence-dir }}/report.json
+          ${{ steps.start.outputs.evidence-dir }}/session.log
+          ${{ steps.start.outputs.evidence-dir }}/report.md
+          ${{ steps.start.outputs.evidence-dir }}/report.json
         if-no-files-found: ignore
 
     - name: Stop collector
