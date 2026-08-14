@@ -5406,9 +5406,35 @@ const STEP_KEYS = ['id', 'if', 'name', 'uses', 'run', 'working-directory', 'shel
 
 const isMapping = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
+// GitHub's OWN identifier rule, which job ids and step ids share: it must start
+// with a letter or `_` and hold only letters, digits, `-` and `_`. The reader's
+// line pattern is looser BY DESIGN — the same pattern also has to read
+// `runs-on` and `timeout-minutes` — so nothing rejected `9.bad:` as a job id,
+// and every Task 7 assertion below then answered for a file GitHub refuses
+// outright (Codex T7 r3).
+const GITHUB_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+// The keys GitHub types as a mapping wherever they appear. A scalar here is not
+// a slightly-wrong table, it is no table at all — `run-on:` one level down.
+// Keys that legitimately take EITHER form (`permissions: read-all`,
+// `concurrency: group`, `container: image`, `secrets: inherit`, `needs: job`)
+// are deliberately absent.
+const MAPPING_VALUED = ['env', 'with', 'defaults', 'outputs', 'strategy', 'services'];
+
 const assertWorkflowKeys = (where, mapping, allowed, required) => {
-  for (const key of Object.keys(mapping)) {
+  for (const [key, value] of Object.entries(mapping)) {
     if (!allowed.includes(key)) throw new Error(`${where}: '${key}' is not a key GitHub reads here`);
+    // AN EMPTY BLOCK IS NOT AN EMPTY SETTING, IT IS A MISSING ONE. `on:` with
+    // no events under it never triggers and `run:` with no command is not a
+    // step, yet both parse to null and both satisfied a schema that asked only
+    // whether the PROPERTY existed (Codex T7 r3). Null IS meaningful inside an
+    // `on:` block — `pull_request:` alone is a real trigger — and this function
+    // is never applied there; it runs at the workflow, job and step levels,
+    // where no key of GitHub's means anything without a value.
+    if (value === null) throw new Error(`${where}: '${key}' has no value`);
+    if (MAPPING_VALUED.includes(key) && !isMapping(value)) {
+      throw new Error(`${where}: '${key}' must be a mapping`);
+    }
   }
   for (const key of required) {
     if (!Object.hasOwn(mapping, key)) throw new Error(`${where}: missing required key '${key}'`);
@@ -5425,6 +5451,7 @@ const assertWorkflowSchema = (document) => {
   assertWorkflowKeys('workflow', document, WORKFLOW_KEYS, ['on', 'jobs']);
   if (!isMapping(document.jobs)) throw new Error('workflow: jobs must be a mapping of job ids');
   for (const [jobName, job] of Object.entries(document.jobs)) {
+    if (!GITHUB_IDENTIFIER.test(jobName)) throw new Error(`job ${jobName}: not a job id GitHub accepts`);
     if (!isMapping(job)) throw new Error(`job ${jobName}: not a mapping`);
     // `runs-on` and `steps` are required because every job in this repository's
     // workflows runs steps on a runner; a reusable-workflow call (job-level
@@ -5437,12 +5464,30 @@ const assertWorkflowSchema = (document) => {
     if (!Array.isArray(job.steps) || job.steps.length === 0) {
       throw new Error(`job ${jobName}: steps must be a non-empty sequence`);
     }
+    const stepIds = new Set();
     job.steps.forEach((step, index) => {
       const where = `job ${jobName} step ${index}`;
       if (!isMapping(step)) throw new Error(`${where}: not a mapping`);
       assertWorkflowKeys(where, step, STEP_KEYS, []);
-      if (Object.hasOwn(step, 'uses') === Object.hasOwn(step, 'run')) {
+      // A step id obeys the job-id rule and must additionally be unique within
+      // the job, because `steps.<id>.` is how every later expression names a
+      // step: two steps answering to one id resolve to whichever GitHub picked,
+      // which is why it refuses the file rather than choosing.
+      if (Object.hasOwn(step, 'id')) {
+        if (!GITHUB_IDENTIFIER.test(step.id)) throw new Error(`${where}: '${step.id}' is not a step id GitHub accepts`);
+        if (stepIds.has(step.id)) throw new Error(`${where}: duplicate step id '${step.id}'`);
+        stepIds.add(step.id);
+      }
+      // PRESENCE IS NOT A COMMAND. The XOR below used to read `Object.hasOwn`
+      // on both keys, so `run:` with an empty value — null once parsed — was
+      // counted as a step carrying a command (Codex T7 r3). What GitHub
+      // executes is the STRING, so the string is what has to be there.
+      const command = ['uses', 'run'].filter((key) => Object.hasOwn(step, key));
+      if (command.length !== 1) {
         throw new Error(`${where}: a step needs exactly one of 'uses' and 'run'`);
+      }
+      if (typeof step[command[0]] !== 'string' || step[command[0]] === '') {
+        throw new Error(`${where}: '${command[0]}' must be a non-empty string`);
       }
       if (Object.hasOwn(step, 'with') && !Object.hasOwn(step, 'uses')) {
         throw new Error(`${where}: 'with' belongs to a 'uses' step; the runner ignores it here`);
@@ -5533,6 +5578,46 @@ test('the workflow reader rejects documents GitHub would reject rather than stor
     /duplicate key/,
     'the last one does not silently win',
   );
+  // JOB IDS, which nothing validated at all (Codex T7 r3). GitHub's rule is
+  // explicit — a job id starts with a letter or `_` and holds only letters,
+  // digits, `-` and `_` — and the reader's line pattern is looser than that BY
+  // DESIGN, because the same pattern also has to read `runs-on` and
+  // `timeout-minutes`. So each of these parsed into a job that this file then
+  // made its Task 7 assertions about, on a file GitHub refuses outright.
+  for (const badId of ['9.bad', '9bad', 'bad.id', '-lead']) {
+    assert.throws(
+      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('  only:\n', `  ${badId}:\n`)),
+      /not a job id/,
+      `'${badId}' is not a job id GitHub would run`,
+    );
+  }
+  // …and the rule is NOT "reject anything unusual": an id exercising every
+  // character class GitHub allows still parses, or this check would be
+  // rejecting valid workflows rather than invalid ones.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('  only:\n', '  _ok-9:\n')));
+  // STEP IDS obey the same rule and must additionally be unique within the job:
+  // `steps.<id>.` is how every later expression names a step, so two steps
+  // answering to one id resolve to whichever GitHub picked — which is why it
+  // refuses the file instead.
+  assert.ok(real.includes('        id: first\n') && real.includes('        id: second\n'),
+    'the step-id mutation targets exist as written');
+  assert.throws(
+    () => parseWorkflowText(real.replace('        id: second\n', '        id: first\n')),
+    /duplicate step id/,
+  );
+  assert.throws(
+    () => parseWorkflowText(real.replace('        id: first\n', '        id: 1st\n')),
+    /not a step id/,
+  );
+  // Unique per JOB, not per workflow: `steps.setup` only ever resolves inside
+  // its own job, so two jobs may each name a step `setup`. Without this the
+  // uniqueness check could be hoisted a scope too far and reject a legal file
+  // with nothing here to notice.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '      - name: Do something\n        run: echo hello\n',
+    '      - name: Do something\n        id: setup\n        run: echo hello\n'
+      + '  other:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Do something else\n        id: setup\n        run: echo hi\n',
+  )));
   // Prototype keys are not workflow keys, and `map.__proto__ = value` would not
   // even become an own property — so neither the duplicate check nor any later
   // assertion could see it.
@@ -5550,6 +5635,48 @@ test('the workflow reader rejects documents GitHub would reject rather than stor
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '')),
     /exactly one of/,
   );
+  // PRESENCE IS NOT A COMMAND (Codex T7 r3). An empty `run:` parses to null,
+  // and a XOR asking only whether the PROPERTY was there counted that as a step
+  // with a command, so a step carrying nothing to run was admitted. What GitHub
+  // executes is the STRING, so the string is what has to be there — and these
+  // are three different values with one meaning: no command.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:\n')),
+    /'run' has no value/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: ""\n')),
+    /'run' must be a non-empty string/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:\n          echo: hello\n')),
+    /'run' must be a non-empty string/,
+  );
+  // The same for `uses`, whose empty form named no action while satisfying the
+  // very same XOR.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses:\n')),
+    /'uses' has no value/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses: ""\n')),
+    /'uses' must be a non-empty string/,
+  );
+  // A TABLE-VALUED KEY HOLDING A SCALAR is `run-on:` one level down: a step
+  // whose `env` is a scalar gets no variables and a `with:` with nothing under
+  // it gives the action no inputs. Both parsed clean.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: echo hello\n        env: nope\n')),
+    /'env' must be a mapping/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses: a/b@v1\n        with: nope\n')),
+    /'with' must be a mapping/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses: a/b@v1\n        with:\n')),
+    /'with' has no value/,
+  );
   assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    step:\n')),
     /step/,
@@ -5564,6 +5691,19 @@ test('the workflow reader rejects documents GitHub would reject rather than stor
   // Top level: a workflow with no trigger never runs, and one with no jobs
   // does nothing. Both parsed fine before.
   assert.throws(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', '')), /on/);
+  // A REQUIRED KEY PRESENT BUT EMPTY — the third hole of the same class as the
+  // two Codex named, found here rather than reported. `on:` with its events
+  // deleted still satisfied a required-key check written as `Object.hasOwn`, so
+  // a workflow that can never trigger parsed clean: the empty `run:` defect, at
+  // the top level. Null is meaningful INSIDE an `on:` block — `pull_request:`
+  // alone is a real trigger, which is why the reader stores it as null — but it
+  // is never meaningful AS the block.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', 'on:\n')),
+    /'on' has no value/,
+  );
+  // The scalar trigger form is legal GitHub and stays accepted.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', 'on: push\n')));
   assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace(/jobs:\n[\s\S]*$/, 'jobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - name: n\n        run: r\n').replace('jobs:', 'job:')),
     /job/,
