@@ -1272,16 +1272,25 @@ const runSubcommand = async ({
 const reportSubcommand = ({ outputDir, env = process.env }) => {
   const evidenceDir = resolveEvidenceDir(outputDir);
   const state = readState(outputDir);
-  // Nothing was captured — no state, someone else's state, or a run that
-  // failed before it staged anything. In every one of those cases the job's
-  // artifact must not contain evidence from an earlier invocation, so the
-  // staging slots are cleared rather than published.
-  const capturedHere = state !== null
-    && (!env.DEBUG_ACTION_INVOCATION_NONCE || state.nonce === env.DEBUG_ACTION_INVOCATION_NONCE)
-    && state.reportRendered === true;
+  // Is this invocation's own run what wrote these slots? Absent state and a
+  // foreign nonce both mean no, and in both cases whatever is sitting in the
+  // staging slots belongs to somebody else's run.
+  const ours = state !== null
+    && (!env.DEBUG_ACTION_INVOCATION_NONCE || state.nonce === env.DEBUG_ACTION_INVOCATION_NONCE);
+  const capturedHere = ours && state.reportRendered === true;
   if (!capturedHere) {
+    // A renderer failure is NOT "nothing was captured". On those classes run
+    // authenticated the collector's answer, staged it, and recorded
+    // evidenceCopied — deliberately, because partial evidence a human can read
+    // is worth uploading — and only the rendered surfaces are missing. This
+    // step runs BEFORE the upload step, so clearing session.log here would
+    // destroy authentic evidence on its way to the artifact, which is what
+    // round 8 caught. Clear only the surfaces that do not exist, and only when
+    // this invocation owns the slots (Codex T5 r8).
+    const preserveLog = ours && state.evidenceCopied === true;
+    const stale = preserveLog ? EVIDENCE_FILES.filter((name) => name !== 'session.log') : EVIDENCE_FILES;
     mkdirSync(evidenceDir, { recursive: true });
-    for (const name of EVIDENCE_FILES) {
+    for (const name of stale) {
       try {
         unlinkSync(path.join(evidenceDir, name));
       } catch (error) {
@@ -1290,7 +1299,9 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
     }
     if (state === null) return 0; // start never completed; finish owns that failure
     if (rejectForeignNonce(state, env, 'report')) return 3;
-    process.stderr.write('debug-evidence-action: report: the run step recorded no capture; there is nothing to publish.\n');
+    process.stderr.write(preserveLog
+      ? 'debug-evidence-action: report: the run step staged a session log but no report; publishing nothing and keeping the log for the artifact.\n'
+      : 'debug-evidence-action: report: the run step recorded no capture; there is nothing to publish.\n');
     return 0; // run already failed the action if this was an integrity failure
   }
   if (!env.GITHUB_STEP_SUMMARY) return 0;

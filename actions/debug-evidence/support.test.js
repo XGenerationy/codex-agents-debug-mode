@@ -1244,6 +1244,9 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
     assert.equal(state.evidenceCopied, true, 'unverifiable bytes are still worth uploading for a human to read');
     assert.equal(state.evidenceAuthentic, false, 'the artifact is labeled as coming off the filesystem');
     assert.equal(state.reportRendered, true);
+    // Through the publish step: "still worth a human's eyes" is a claim about
+    // what reaches the artifact, not about what run wrote (Codex T5 r8).
+    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: {} }), 0);
     const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'),
       'this really is the forged file — labeling it, not hiding it, is what makes this safe');
@@ -1356,7 +1359,11 @@ test('a wrapped command that kills the collector, forges the log and poisons the
     // The forged bytes ARE staged, labeled — that part is deliberate, and the
     // renderer had no trouble with them, so the 3 above is a verdict rather
     // than a parse accident.
+    // Through the publish step. The detached child may already have flipped
+    // `reportRendered`, but this class rendered fine, so the flag is true
+    // either way and report preserves what run staged regardless.
     const evidenceDir = resolveEvidenceDir(context.outputDir);
+    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: {} }), 0);
     const staged = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'), 'the forgery is staged for a human to read, not hidden');
     const rendered = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
@@ -1403,8 +1410,10 @@ test('a collector that merely died still stages the labeled partial log, still f
   assert.equal(state.evidenceCopied, true, 'partial evidence a human can read is the point of the fallback');
   assert.equal(state.evidenceAuthentic, false, 'the label is a reader\'s aid, never a gate');
   assert.equal(state.reportRendered, true, 'and it stays truthful about what was actually produced');
+  assert.equal(reportSubcommand({ outputDir, env: {} }), 0);
   assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8')
-    .includes('the last thing the collector wrote down'));
+    .includes('the last thing the collector wrote down'),
+    'and it is still there after the publish step, for the upload step to take');
   assert.match(written, /no collector on port 1 would serve session ci-debug-abc/);
   assert.match(written, /UNAUTHENTICATED partial evidence and failing this step/,
     'the step log says both what was staged and what it cost');
@@ -1642,6 +1651,9 @@ test('run records an unauthenticated collector without inventing evidence, and f
   assert.equal(state.evidenceCopied, true, 'whatever was readable is still staged');
   assert.equal(state.evidenceAuthentic, false, 'and it is labeled as unverified in the state file');
   assert.equal(state.reportRendered, true);
+  assert.equal(reportSubcommand({ outputDir, env: {} }), 0);
+  assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8').includes('last words'),
+    'and it survives the publish step, which is the only way the upload step can receive it');
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
     'finish agrees, as a belt over a job that is already red');
 });
@@ -1872,9 +1884,17 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   assert.equal(reportSubcommand({ outputDir: noState, env: {} }), 0);
   assertCleared(noStateEvidence, 'absent state');
 
+  // The predecessor's state says its capture SUCCEEDED — evidenceCopied and
+  // all — which is exactly the state that now buys a session log a reprieve
+  // from the cleanup. That reprieve is scoped to the invocation that earned it:
+  // preserving another run's log here would ship it under this run's artifact
+  // name (Codex T5 r8, guarding r2 #3).
   const foreign = makeTempDir();
   const foreignEvidence = plantStale(foreign);
-  writeState(foreign, { nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43) });
+  writeState(foreign, {
+    nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    evidenceCopied: true, evidenceAuthentic: true, collectorAlive: true,
+  });
   assert.equal(reportSubcommand({ outputDir: foreign, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3);
   assertCleared(foreignEvidence, 'foreign nonce');
 
@@ -1957,8 +1977,67 @@ test('a renderer that returns without producing a schema-1 report publishes noth
       assert.equal(published.includes(name), false, `${label}: ${name} is withheld`);
     }
     assert.equal(readFileSync(stepSummary, 'utf8'), '', label);
-    // The capture itself succeeded, and stays staged for a human.
+    // The capture itself succeeded, and stays staged for a human — through the
+    // publish step, which is where the upload step receives it from.
     assert.equal(readState(outputDir).evidenceCopied, true, label);
+    const kept = readFileSync(path.join(evidenceDir, 'session.log'));
+    assert.equal(reportSubcommand({ outputDir, env: { GITHUB_STEP_SUMMARY: stepSummary } }), 0, label);
+    assert.deepEqual(readFileSync(path.join(evidenceDir, 'session.log')), kept, `${label}: the authenticated log survives`);
+  }
+});
+
+// The publish step runs `if: always()`, so "staged" only means anything if it
+// survives report. Round 6 staged the authenticated log on the renderer-failure
+// classes deliberately — real evidence a human can read — and round 8 found
+// that report's entry cleanup then deleted it before the upload step could
+// receive it, because it read `reportRendered !== true` as "nothing was
+// captured". This test runs the actual sequence rather than asserting on run's
+// output and stopping there (Codex T5 r8).
+test('a renderer failure costs the report surfaces and nothing else: the authenticated log survives report, byte for byte', async () => {
+  for (const [label, renderReport] of [
+    ['a renderer that throws', () => { throw new Error('renderer exploded'); }],
+    ['a renderer that returns no schema-1 report', () => ({ markdown: '## Debug evidence report\n', json: '{}' })],
+  ]) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43),
+      sessionId: 'ci-debug-abc', projectRoot, failOnCommandFailure: 'true',
+    });
+    const stepSummary = path.join(outputDir, 'step_summary');
+    writeFileSync(stepSummary, '');
+    const served = [
+      { ts: '2026-08-14T00:00:00.000Z', msg: 'the events this session really recorded' },
+      { ts: '2026-08-14T00:00:01.000Z', msg: 'and the reason a human wants them' },
+    ];
+    const runCode = await captureViaRun({
+      outputDir,
+      env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: 'n1' },
+      readLive: collectorAnswer(served),
+      renderReport,
+    });
+    assert.equal(runCode, 3, `${label}: no report means no evidence product`);
+    const evidenceDir = resolveEvidenceDir(outputDir);
+    const captured = readFileSync(path.join(evidenceDir, 'session.log'));
+    assert.equal(captured.toString('utf8'), served.map((line) => `${JSON.stringify(line)}\n`).join(''),
+      `${label}: run staged the bytes the collector proved`);
+
+    // The step that runs next in production, with this invocation's nonce —
+    // exactly as action.yml wires it.
+    assert.equal(reportSubcommand({
+      outputDir,
+      env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', GITHUB_STEP_SUMMARY: stepSummary },
+    }), 0, `${label}: publishing nothing is not report's failure`);
+    assert.deepEqual(readFileSync(path.join(evidenceDir, 'session.log')), captured,
+      `${label}: the authenticated log reaches the upload step unchanged`);
+    for (const name of ['report.md', 'report.json']) {
+      assert.ok(!existsSync(path.join(evidenceDir, name)),
+        `${label}: the surfaces that do not exist are the ones cleared`);
+    }
+    assert.equal(readFileSync(stepSummary, 'utf8'), '',
+      `${label}: there is no report to append, so the summary is left alone`);
+    // And the job is red regardless, on run's verdict.
+    assert.equal(finishSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 3, label);
   }
 });
 
@@ -2543,7 +2622,7 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
   const classes = [
     ['no recorded state', { state: null, readLive: unreached }],
     ['a state carrying no session', { state: { sessionId: undefined, sessionToken: undefined }, readLive: unreached }],
-    ['another invocation\'s nonce', { env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: 'other' }, readLive: unreached }],
+    ['another invocation\'s nonce', { env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: 'other' }, reportCode: 3, readLive: unreached }],
     ['no verification key in this step\'s environment', { env: {}, readLive: unreached }],
     ['an answer signed by a key that is not the collector\'s', { readLive: collectorAnswer(served, { privateKey: IMPOSTOR_KEYS.privateKey }) }],
     ['a validly signed answer to a different question', { readLive: collectorAnswer(served, { target: '/sessions/ci-debug-abc/logs?type=event&limit=1' }) }],
@@ -2556,7 +2635,7 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
     ['a renderer that throws', { staged: ['session.log'], readLive: healthy(), renderReport: () => { throw new Error('renderer exploded'); } }],
     ['a renderer that returns no schema-1 report', { staged: ['session.log'], readLive: healthy(), renderReport: () => ({ markdown: '## Debug evidence report\n', json: '{}' }) }],
   ];
-  for (const [label, { state = {}, env = RUN_ENV, staged = [], ...seams }] of classes) {
+  for (const [label, { state = {}, env = RUN_ENV, staged = [], reportCode = 0, ...seams }] of classes) {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
     if (state !== null) {
@@ -2581,6 +2660,14 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
     for (const name of ['report-path', 'evidence-digest', 'event-count']) {
       assert.equal(published.includes(name), false, `${label}: ${name} must not be published`);
     }
+    // Through the publish step, because that is what runs before the upload
+    // step in production and it is allowed to clear stale slots (Codex T5 r8).
+    assert.equal(reportSubcommand({ outputDir, env }), reportCode, `${label}: report's own exit`);
+    assert.deepEqual(
+      ['session.log', 'report.md', 'report.json'].filter((name) => existsSync(path.join(evidenceDir, name))),
+      staged,
+      `${label}: and exactly these files are still there when the artifact is uploaded`,
+    );
   }
   // The contrast that defines the taxonomy. A wrapped command that fails is
   // not an integrity failure at all: run captures its session, stages the
