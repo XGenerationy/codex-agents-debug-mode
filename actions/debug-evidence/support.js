@@ -356,14 +356,20 @@ const UID_VALUES = new Set(['non-root', 'root', 'unknown']);
 // single-digit case mistaken for the widest, and an ordinary two-digit count
 // already exceeds it.)
 //
-// Ten digits, because the count is bounded only by how many candidates PATH can
-// name: a probe with 99,999 entries plus the three conventional paths produced
-// `present: 100002 …`, which a five-digit vocabulary then rejected as a value
-// this action does not produce (Codex T6 r15 #1). Fail-closed, but it broke the
-// producer/vocabulary closure the anchor exists to state, and degraded a
-// correct best-effort reading to "unreadable". Widened rather than CLAMPED: a
-// clamp would invent a semantics — what would "100002" mean if it were capped?
-// — that we would then have to document and defend.
+// Ten digits, because the count is the length of an Array — and TEN DIGITS IS
+// TOTAL, not merely generous. A JavaScript Array cannot exceed 2^32-1 =
+// 4294967295 elements, which is exactly ten digits, and pushing past that throws
+// before any count could be formatted. So there is no host, however contrived,
+// whose reading this vocabulary rejects: the producer and the vocabulary are
+// closed over each other, provably (Codex T6 r16). DO NOT "tidy" this to a
+// smaller bound — five digits was the previous tidy answer, and a probe with
+// 99,999 PATH entries plus the three conventional paths produced
+// `present: 100002 …`, which that vocabulary then rejected as a value this
+// action does not produce (Codex T6 r15 #1). Fail-closed, but it broke the
+// closure the anchor exists to state and degraded a correct best-effort reading
+// to "unreadable". Widened rather than CLAMPED: a clamp would invent a
+// semantics — what would "100002" mean if it were capped? — that we would then
+// have to document and defend.
 const SUDO_PRESENT = /^present: [1-9][0-9]{0,9} at sha256=[0-9a-f]{64}$/;
 const SUDO_VALUES = new Set(['absent', 'unknown', SUDO_PATH_UNRESOLVABLE]);
 // Derived from the SAME Map the producer joins, so the vocabulary cannot drift
@@ -394,9 +400,13 @@ const CAPABILITY_VALUES = (() => {
 //
 // Printable ASCII rather than "no control characters" (Codex T6 r15 #2). Round
 // 14 advertised "no control characters at all" and "true single-line" and
-// delivered neither: excluding C0/C1 and DEL still admits U+0085 NEL, the
-// U+2028/U+2029 line separators, the U+202E right-to-left override that
-// reverses how a record READS without changing what it says, and zero-width
+// delivered neither: its gate excluded C0 (U+0000-U+001F) plus DEL, and NOTHING
+// ELSE. C1 (U+0080-U+009F) was never covered — which is exactly why U+0085 NEL
+// got through, NEL being a C1 control rather than something beyond the control
+// characters. (Corrected in round 16: this comment said the old gate excluded
+// "C0/C1", which would have caught NEL and is not what the code did.) Also
+// admitted: the U+2028/U+2029 line separators, the U+202E right-to-left override
+// that reverses how a record READS without changing what it says, and zero-width
 // characters that hide differences between two records a human is asked to
 // compare. Current vocabularies happen to reject all of them, so this was never
 // an admission bypass — but a gate whose stated invariant is false is not
@@ -460,7 +470,7 @@ const admissionBlockers = (admission) => {
       // differ in the parenthetical because the remedy is not: one is a host
       // this action cannot read, the other is a value it did not produce.
       case 'malformed':
-        return [`${field.label}: unreadable record (malformed reading — not a bounded single-line string)`];
+        return [`${field.label}: unreadable record (malformed reading — not a bounded printable-ASCII string)`];
       case 'unrecognised':
         return [`${field.label}: unreadable record (outside this action's vocabulary)`];
       default:

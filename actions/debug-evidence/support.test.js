@@ -1323,12 +1323,15 @@ test('a reading is validated STRUCTURALLY before any vocabulary is consulted', (
     ['an escape sequence', 'clear\u001b[31m'],
     ['a DEL', 'clear\u007f'],
     ['a tab', 'clear\tsplit'],
-    // BEYOND C0/C1 AND DEL (Codex T6 r15 #2). Round 14 advertised "no control
-    // characters at all" and "single-line", and delivered neither: these five
-    // all passed. Today's vocabularies reject them, so this was never an
-    // admission bypass — but it defeats exactly the future-proofing the
-    // structural gate exists to provide, which is the whole reason that gate is
-    // not a lint. Readings are printable ASCII now.
+    // BEYOND C0 AND DEL (Codex T6 r15 #2). Round 14's gate excluded C0
+    // (U+0000-U+001F) plus DEL and nothing else, so it advertised "no control
+    // characters at all" and "single-line" while these all passed — U+0085 NEL
+    // among them, which is a C1 control the gate never covered. (Corrected in
+    // round 16: this note said "C0/C1", which would have caught NEL.) Today's
+    // vocabularies reject them, so this was never an admission bypass — but it
+    // defeats exactly the future-proofing the structural gate exists to
+    // provide, which is the whole reason that gate is not a lint. Readings are
+    // printable ASCII now.
     ['NEL, U+0085', 'clear\u0085FORGED'],
     ['LINE SEPARATOR, U+2028', 'clear\u2028FORGED'],
     ['PARAGRAPH SEPARATOR, U+2029', 'clear\u2029FORGED'],
@@ -1355,7 +1358,7 @@ test('a reading is validated STRUCTURALLY before any vocabulary is consulted', (
   const malformed = { ...ADMITTED(), capabilities: 'CAP_SYS_ADMIN\nFORGED-LINE' };
   assert.equal(admissionEstablished(malformed), false, 'a malformed reading denies');
   assert.deepEqual(admissionBlockers(malformed), [
-    'privileged capabilities: unreadable record (malformed reading — not a bounded single-line string)',
+    'privileged capabilities: unreadable record (malformed reading — not a bounded printable-ASCII string)',
   ]);
   // Distinct from a well-formed value that is simply not in the vocabulary.
   assert.deepEqual(admissionBlockers({ ...ADMITTED(), capabilities: 'CAP_MADE_UP' }), [
