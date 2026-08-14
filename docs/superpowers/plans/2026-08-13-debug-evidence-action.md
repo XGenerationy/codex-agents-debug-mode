@@ -3759,6 +3759,22 @@ Round 3 closed the reported Minor and found a THIRD hole of the same class unpro
 
 **Standing lesson for Task 9 and beyond:** three consecutive rounds tightened this reader and each produced fresh divergence from a schema we do not implement. **A test's advertised scope must be no larger than the thing it is protecting** — here, two workflow files — and generality bought at the price of a false rejection is a net loss.
 
+#### Task 7 round-4 outcome (`ab0938e`) — the scoping reversal, executed
+
+All three code fixes landed with **16 mutations, 16 killed**. The false rejection is gone: the single rule was split so `uses` must be a non-empty string while `run` need only BE a string, matching GitHub's schema (which gives `uses` a minimum length and types `run` only as `string`). Null and mapping cases stay rejected by the pre-existing empty-key and type rules.
+
+**AN ASSERTION WAS REMOVED, deliberately and reported:** `assert.throws(… 'run: ""' …)` is replaced by `assert.doesNotThrow` over the same input, because the old assertion **pinned a rejection GitHub does not make**. The case is still exercised with the opposite, correct expectation. The suppression scanner independently confirms no test-weakening finding.
+
+Step-ID uniqueness is now case-folded (`toLowerCase()` IS an ordinal fold here because `GITHUB_IDENTIFIER` has already confined ids to ASCII — recorded in the comment so nobody later "fixes" it toward locale-aware folding). Anchors and aliases are refused **in the reader, not the schema pass**, by testing the first character of the UNQUOTED value — the only position YAML reads a node property.
+
+**THE LEGAL-DOCUMENT MUTATION RULE PAID FOR ITSELF IMMEDIATELY.** Round 3's false rejection escaped because every mutation was aimed at this repo's own workflows. This round required at least one mutation per strictness rule aimed at a LEGAL document, and they caught real defects: an `includes()` anchor check died on `run: rm -rf build/*`; testing the QUOTED rather than unquoted scalar died on `run: "*.js && echo done"` — precisely the quoted-scalar false rejection that was the original reason for not fixing anchors; hoisting the step-id set to workflow scope died on a legal cross-job id reuse; and folding `-`/`_` died on three ids GitHub considers distinct. **Adopt this rule for every strictness check in Task 9 and beyond.**
+
+**THE SELF-AUDIT CAUGHT A FOURTH INACCURATE CLAIM BEFORE IT SHIPPED.** Asked to check the restated claim against what the code enforces, the implementer disabled each of the 16 rules in turn and found that **`runs-on` must be a non-empty scalar SURVIVED — nothing tested it.** It then declined the naive fix: there is no unambiguously-invalid value reaching that line, because null is caught upstream, `*alias` by the new anchor rule, and the two remaining shapes (`runs-on: {group: …}` and the block-sequence array form) are **legal GitHub this reader refuses anyway** — so a negative case would have pinned a FALSE REJECTION, the exact defect the round exists to remove. It reworded the claim instead and stated plainly that the rule is enforced, unpinned, and stricter than GitHub. A re-run sweep reports **UNPINNED rules named by the claim: none.**
+
+The claim now reads: *the reader validates selected workflow, job and step structural checks, sufficient to catch a mis-spelled or mis-shaped key in this repository's own two workflows; it does not implement GitHub's schema and no longer claims to.* All nine excluded cases were **verified empirically as ACCEPTED** before being written down. No `doesNotThrow` pins were added over them — deliberately, so today's gap does not become tomorrow's requirement.
+
+**Two new limits recorded, not fixed** (out of scope, not live against this repo, both needing schema work): `runs-on`'s non-empty-scalar rule is stricter than GitHub; and `runs-on: [self-hosted, linux]` is accepted **for the wrong reason** — flow sequences are not parsed, so it is stored as a literal string.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
