@@ -3145,6 +3145,40 @@ must be split first. **Critical ×1, Important ×1, Minor ×2.**
 Fix commit message:
 `fix(action): empty PATH denies, split the admission caveat so the limitation survives rendering (Codex T6 r11)`.
 
+#### Task 6 fix round 12 — coordinator decisions on the round-11 residuals (recorded before code moves)
+
+Both raised by the implementer at the end of round 11, both accepted: they are
+silent-drift hazards in the PERMISSIVE direction, which is the class this cycle
+has repeatedly found to be the dangerous one. No Codex finding is outstanding;
+these are pre-emptive, and go to review together with round 11.
+
+1. **The rendered-length assertion hardcodes `500`.** If `EXCERPT_CHAR_CAP` ever
+   changes, the action-side assertion drifts from the renderer silently — and if
+   the cap SHRINKS, it drifts permissively, exactly the direction that let the
+   truncation through in the first place. Decision: **export `EXCERPT_CHAR_CAP`
+   from `scripts/debug_report.js` and import it in the action test.** The
+   objection (adding an export to a payload file to serve an action test) does not
+   apply here: `support.js` already imports `buildReport`/`renderMarkdown`/
+   `renderJson` from that module (Task 5 round 4), and Task 6 round 1 added a
+   sentinel test pinning that export surface. Extending an already-pinned,
+   already-load-bearing surface by one constant is coherent; leaving a magic
+   number that can silently disagree with the renderer is not. Extend the sentinel
+   to cover the constant so its removal fails loudly.
+2. **369 characters of headroom is thin for prose that has grown every round.**
+   The renderer-level assertion catches an over-cap caveat only once it exists,
+   and reports it as a truncation hunt. Decision: **add a margin guard** —
+   every generated caveat must be ≤ 400 characters after escaping, failing with a
+   message that NAMES the offending caveat and states the remaining margin. This
+   is authoring-time feedback, not a second correctness check; the truncation
+   assertion remains the correctness one.
+
+Not adopted: encoding remediation advice in the `PATH=''` reading. The literal is
+fixed by Codex ruling (b) and must stay fixed; the "unset it rather than emptying
+it" guidance belongs in Task 8's README, and is added to the hard T8 requirements.
+
+Fix commit message:
+`fix(action): pin the render cap by import and guard caveat authoring margin (round-11 residuals)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
