@@ -5366,6 +5366,28 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
         : null;
       continue;
     }
+    // ANCHORS AND ALIASES ARE REFUSED, NOT RESOLVED (Codex T7 r4 #5). `&name`
+    // and `*name` are node PROPERTIES rather than text, so `runs-on: *missing`
+    // was absorbed as the literal `*missing` — a plausible, non-empty runner
+    // name that satisfied every check below while GitHub's loader could not
+    // resolve it at all. Round 3 recorded this as a tolerable limit on the
+    // grounds that assertions over such a value fail closed; they do not,
+    // because no assertion in this file reads `runs-on`.
+    //
+    // Resolution is deliberately NOT implemented. This repository's workflows
+    // use neither construct, so a flat refusal is fail-closed, needs no
+    // second pass, and avoids the quote-aware resolution whose own
+    // false-rejection edge was the reason for leaving this open.
+    //
+    // The test is the FIRST character of the UNQUOTED value, which is the only
+    // position YAML reads a node property in. Anywhere else `*` and `&` are
+    // ordinary text and must stay so, or this fix would introduce exactly the
+    // kind of false rejection round 4 exists to remove: `run: rm -rf build/*`,
+    // `run: "*.js"`, and every glob and `>&2` redirect inside a `run: |` body
+    // (which never reaches this line at all) are accepted unchanged.
+    if (rawValue[0] === '&' || rawValue[0] === '*') {
+      throw new Error(`workflow reader: '${key}' carries a YAML anchor or alias, which this reader refuses rather than resolves`);
+    }
     map[key] = unquoteScalar(rawValue);
   }
   return map;
@@ -5473,10 +5495,19 @@ const assertWorkflowSchema = (document) => {
       // the job, because `steps.<id>.` is how every later expression names a
       // step: two steps answering to one id resolve to whichever GitHub picked,
       // which is why it refuses the file rather than choosing.
+      //
+      // UNIQUE CASE-INSENSITIVELY (Codex T7 r4 #3). The runner's reference
+      // builder holds step ids in an ORDINAL CASE-INSENSITIVE set, so `first`
+      // and `FIRST` are one id there while a plain `Set` treats them as two —
+      // a file that passes here and fails on the runner. `toLowerCase()` is
+      // exactly an ordinal fold here because `GITHUB_IDENTIFIER` has already
+      // confined the id to ASCII letters, digits, `-` and `_`, on which
+      // Unicode's default case conversion and .NET's ordinal one agree.
       if (Object.hasOwn(step, 'id')) {
         if (!GITHUB_IDENTIFIER.test(step.id)) throw new Error(`${where}: '${step.id}' is not a step id GitHub accepts`);
-        if (stepIds.has(step.id)) throw new Error(`${where}: duplicate step id '${step.id}'`);
-        stepIds.add(step.id);
+        const folded = step.id.toLowerCase();
+        if (stepIds.has(folded)) throw new Error(`${where}: duplicate step id '${step.id}'`);
+        stepIds.add(folded);
       }
       // PRESENCE IS NOT A COMMAND. The XOR below used to read `Object.hasOwn`
       // on both keys, so `run:` with an empty value — null once parsed — was
@@ -5486,8 +5517,18 @@ const assertWorkflowSchema = (document) => {
       if (command.length !== 1) {
         throw new Error(`${where}: a step needs exactly one of 'uses' and 'run'`);
       }
-      if (typeof step[command[0]] !== 'string' || step[command[0]] === '') {
-        throw new Error(`${where}: '${command[0]}' must be a non-empty string`);
+      if (typeof step[command[0]] !== 'string') {
+        throw new Error(`${where}: '${command[0]}' must be a string`);
+      }
+      // AND `uses` — ONLY `uses` — MUST ALSO BE NON-EMPTY (Codex T7 r4 #4).
+      // Round 3 applied one non-empty rule to both keys and so asserted more
+      // than GitHub does: GitHub's schema gives `uses` a minimum length,
+      // because an empty one names no action to resolve, and gives `run` only
+      // the type `string`. `run: ""` is a step that runs an empty script —
+      // pointless, not invalid — so rejecting it was a FALSE REJECTION of a
+      // legal document, which is a worse defect than the hole it was chasing.
+      if (command[0] === 'uses' && step.uses === '') {
+        throw new Error(`${where}: 'uses' must be a non-empty string`);
       }
       if (Object.hasOwn(step, 'with') && !Object.hasOwn(step, 'uses')) {
         throw new Error(`${where}: 'with' belongs to a 'uses' step; the runner ignores it here`);
@@ -5550,26 +5591,89 @@ const MINIMAL_WORKFLOW = [
 // definition at all. A reader whose stated doctrine is that an unrecognised
 // construct THROWS rather than being skipped has to apply that doctrine to
 // keys, not only to shapes.
-// SCOPE OF THIS CLAIM, narrowed deliberately after round 3 proved the broad
-// version unreachable. "Structural" means everything this reader can decide
-// from the SHAPE of the document: which keys exist, whether they are spelled
-// as GitHub spells them, whether they are unique, whether their values have
-// the right type, and whether an identifier matches GitHub's documented
-// pattern. Every such invalidity is closed and pinned below.
+// SCOPE OF THIS CLAIM, restated in round 4 and deliberately SMALLER than
+// either version before it. THE READER VALIDATES SELECTED WORKFLOW, JOB AND
+// STEP STRUCTURAL CHECKS, SUFFICIENT TO CATCH A MIS-SPELLED OR MIS-SHAPED KEY
+// IN THIS REPOSITORY'S OWN TWO WORKFLOWS. IT DOES NOT IMPLEMENT GITHUB'S
+// SCHEMA AND NO LONGER CLAIMS TO.
 //
-// What this reader does NOT decide is scalar CONTENT and cross-references,
-// and the list is stated rather than left to be discovered: `timeout-minutes:
-// abc`, `continue-on-error: maybe`, a malformed `if:` expression, `uses:
-// hello world`, `uses:` with no `@ref`, `shell: nosuchshell`, `needs:` naming
-// a job that does not exist, an unknown event under `on:`, a broken cron, an
-// unknown `permissions` scope. Deciding those means implementing GitHub's
-// expression language, ref grammar, event and permission vocabularies and a
-// cron parser — none of which is reachable while this repository ships zero
-// dependencies, and a half-implemented one would be worse than an honest
-// boundary. Several of them ARE separately pinned for the two workflows this
-// suite actually asserts over (the `uses:` pin check requires a 40-hex SHA);
-// they are unpinned only for arbitrary documents.
-test('the workflow reader rejects documents GitHub would reject on structural grounds rather than storing them', () => {
+// Three consecutive rounds tightened this pass toward "rejects whatever GitHub
+// would reject", and each one produced fresh divergence from a schema this
+// repository does not implement — round 3's tightening produced an outright
+// FALSE REJECTION of `run: ""`, which GitHub accepts. The ambition was the
+// defect, not its implementation: a test's advertised scope must be no larger
+// than the thing it protects, and the thing this protects is two files.
+//
+// WHAT IT DECIDES — every rule named here is pinned by at least one case
+// below, and the list was audited against the code rather than written from
+// memory: which keys may appear at the workflow, job and step levels and
+// whether they are spelled as GitHub spells them; that no key is repeated in
+// one mapping; that `on:` and `jobs:` are present and that no key at these
+// three levels is null; that `jobs` is a mapping and each job a mapping; that
+// job ids and step ids match GitHub's identifier pattern, and that step ids
+// are unique within a job under the case-insensitive comparison the runner
+// uses; that `runs-on` and `steps` are PRESENT and that `steps` is a
+// non-empty sequence; that a step carries exactly one of `uses` and `run`,
+// that it is a string, that `uses` is additionally non-empty, and that `with`
+// accompanies a `uses`; that the six keys GitHub always types as tables hold
+// tables; and that YAML anchors and aliases are refused rather than absorbed.
+//
+// ONE RULE IS ENFORCED BUT DELIBERATELY NOT PINNED, and saying so is the
+// point of this round. `runs-on` must additionally be a NON-EMPTY SCALAR;
+// deleting that line leaves every case below green, and it is left unpinned
+// on purpose, because there is no unambiguously-invalid value that reaches
+// it. Everything that would is either caught earlier — null by the empty-key
+// rule, `*alias` by the anchor rule — or is LEGAL GitHub that this reader
+// nonetheless refuses:
+//
+//     runs-on:            # the `group`/`labels` mapping form: legal, refused
+//       group: ours
+//
+//     runs-on:            # the block-sequence array form: legal, refused
+//       - self-hosted     # (as an "unparsed workflow line")
+//
+// so a negative case here would pin a FALSE REJECTION rather than a rule.
+// (`runs-on: [self-hosted, linux]` is accepted, but only because flow
+// sequences are not parsed at all and it is stored as a literal string —
+// accepted for the wrong reason, which is worth knowing before relying on
+// it.) Every workflow in this repository names its runner as a plain string,
+// so none of this is wrong about anything here. Relaxing it means teaching
+// this reader the `group`/`labels` and array forms, which is schema work, and
+// the lesson of this round is that schema work does not belong here.
+//
+// WHAT IT DOES NOT DECIDE — listed at the point of the claim rather than left
+// to be rediscovered a fourth time. Each of these is ACCEPTED by this reader:
+//
+//   - VALUE TYPES, beyond the specific ones named above. The round-3 wording
+//     claimed value types generally and then excluded `timeout-minutes: abc`
+//     and `continue-on-error: maybe`, which ARE a number and a boolean type
+//     error — it contradicted itself (Codex T7 r4 #1). Every scalar this
+//     reader is not told about is stored exactly as written.
+//   - SCALAR CONTENT AND CROSS-REFERENCES: a malformed `if:` expression,
+//     `uses: hello world`, `uses:` with no `@ref`, `shell: nosuchshell`,
+//     `needs:` naming a job that does not exist, an unknown event under `on:`,
+//     a broken cron, an unknown `permissions` scope. Deciding those means
+//     implementing GitHub's expression language, ref grammar, event and
+//     permission vocabularies and a cron parser — none of which is reachable
+//     while this repository ships zero dependencies, and a half-implemented
+//     one would be worse than an honest boundary.
+//   - `defaults:` IS NOT RECURSIVELY CONSTRAINED. It must be a mapping, and
+//     that is all; a typo'd child inside it is admitted, where GitHub
+//     constrains the whole subtree.
+//   - RUN-STEP AND USES-STEP KEYS ARE NOT SEPARATED. `STEP_KEYS` is one flat
+//     allowlist, so a `uses` step carrying `shell:` or `working-directory:` is
+//     admitted; GitHub reads those two key sets apart.
+//   - `on:` IS ONLY CAUGHT EMPTY IN ITS NULL FORM. `on: ""`, `on: []` and
+//     `on: {}` all pass, so the round-3 null rule still admits three
+//     representations of a workflow that cannot trigger (Codex T7 r4 #2).
+//
+// None of the excluded cases is pinned as ACCEPTED, deliberately: an
+// `assert.doesNotThrow` over them would make today's gap tomorrow's
+// requirement and stand in the way of closing it. Several of them ARE pinned
+// for the two workflows this suite actually asserts over (the `uses:` pin
+// check requires a 40-hex SHA); they are unconstrained only for arbitrary
+// documents, which this reader is not in the business of judging.
+test("the workflow reader refuses the mis-spelled and mis-shaped keys this repository's own workflows could acquire, rather than storing them", () => {
   // The positive control first: the base each mutation below starts from is
   // one this reader accepts, so every red below is caused by the mutation.
   assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW));
@@ -5597,6 +5701,54 @@ test('the workflow reader rejects documents GitHub would reject on structural gr
     /duplicate key/,
     'the last one does not silently win',
   );
+  // ANCHORS AND ALIASES ARE REFUSED, NOT ABSORBED (Codex T7 r4 #5). Round 3
+  // recorded `&`/`*` as a known limit on the argument that "every assertion
+  // over such a value fails closed" — which was wrong, because NO assertion in
+  // this suite reads `runs-on` at all, so `runs-on: *missing` stored a
+  // plausible non-empty string and sailed through a schema whose whole job is
+  // to notice that a runner definition went missing. Refusal is the fix rather
+  // than resolution: this repository's workflows use neither construct, so a
+  // flat refusal is fail-closed and cannot mis-resolve anything.
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on: *missing\n')),
+    /anchor or alias/,
+    'an alias GitHub could not resolve is not a runner name',
+  );
+  assert.throws(
+    () => parseWorkflowText(real.replace('    runs-on: ubuntu-latest\n', '    runs-on: &runner ubuntu-latest\n')),
+    /anchor or alias/,
+    'an anchor definition is a node property, not part of the scalar',
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses: a/b@v1\n        with: *inputs\n')),
+    /anchor or alias/,
+  );
+  // …including where the SCHEMA pass never runs. `on:`'s contents are stored
+  // as written and never key-checked, so a refusal that lived in the schema
+  // instead of the reader would leave an unresolvable alias inside a trigger
+  // block untouched.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('  workflow_dispatch:\n', '  push: &trigger\n')),
+    /anchor or alias/,
+  );
+  // AND THE LEGAL CASES STAY LEGAL, which is the whole difficulty: `*` and `&`
+  // are node properties only as the first character of an unquoted scalar, and
+  // are ordinary text everywhere else. Rejecting a shell glob or a `>&2`
+  // redirect would be a new false rejection of exactly the kind fix (4) above
+  // exists to remove. (The real demo workflow, asserted at the top of this
+  // test, carries both inside its `run:` blocks and is the live control.)
+  for (const legal of [
+    '        run: rm -rf build/*\n',
+    '        run: "*.js && echo done"\n',
+    "        run: '&notananchor'\n",
+    '        run: echo a * b & c\n',
+    '        run: |\n          for f in *.js; do echo "$f" >&2; done\n',
+  ]) {
+    assert.doesNotThrow(
+      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal)),
+      `a '*' or '&' that is not a node property is ordinary text: ${legal.trim()}`,
+    );
+  }
   // JOB IDS, which nothing validated at all (Codex T7 r3). GitHub's rule is
   // explicit — a job id starts with a letter or `_` and holds only letters,
   // digits, `-` and `_` — and the reader's line pattern is looser than that BY
@@ -5628,6 +5780,30 @@ test('the workflow reader rejects documents GitHub would reject on structural gr
     () => parseWorkflowText(real.replace('        id: first\n', '        id: 1st\n')),
     /not a step id/,
   );
+  // …AND UNIQUENESS IS CASE-INSENSITIVE, because GitHub's is (Codex T7 r4 #3).
+  // The runner builds its step references through an ORDINAL CASE-INSENSITIVE
+  // set, so `first` and `FIRST` in one job collide there while a plain `Set`
+  // waves them through here — a file that passes locally and fails on the
+  // runner, which is the worst direction for this check to be wrong in.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '      - name: Do something\n        run: echo hello\n',
+      '      - name: Do something\n        id: first\n        run: echo hello\n'
+        + '      - name: Do something else\n        id: FIRST\n        run: echo hi\n',
+    )),
+    /duplicate step id/,
+    "`first` and `FIRST` are one id to the runner's reference builder",
+  );
+  // …and the fold is CASE, nothing more. `a_b`, `ab` and `a-b` are three
+  // distinct step ids to GitHub; a fold that also flattened `-` and `_` would
+  // reject a legal file, which is the same over-strictness as the `run: ""`
+  // rejection this round removes.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '      - name: Do something\n        run: echo hello\n',
+    '      - name: Do something\n        id: a_b\n        run: echo hello\n'
+      + '      - name: Two\n        id: ab\n        run: echo hi\n'
+      + '      - name: Three\n        id: a-b\n        run: echo ho\n',
+  )));
   // Unique per JOB, not per workflow: `steps.setup` only ever resolves inside
   // its own job, so two jobs may each name a step `setup`. Without this the
   // uniqueness check could be hoisted a scope too far and reject a legal file
@@ -5636,6 +5812,15 @@ test('the workflow reader rejects documents GitHub would reject on structural gr
     '      - name: Do something\n        run: echo hello\n',
     '      - name: Do something\n        id: setup\n        run: echo hello\n'
       + '  other:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Do something else\n        id: setup\n        run: echo hi\n',
+  )));
+  // …and the CASE-FOLDED set must not be hoisted a scope too far either: the
+  // pair above cannot catch that, since a workflow-wide PLAIN set collides on
+  // it while a workflow-wide FOLDED set is only visible against ids that
+  // differ by case alone.
+  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '      - name: Do something\n        run: echo hello\n',
+    '      - name: Do something\n        id: setup\n        run: echo hello\n'
+      + '  other:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Do something else\n        id: SETUP\n        run: echo hi\n',
   )));
   // Prototype keys are not workflow keys, and `map.__proto__ = value` would not
   // even become an own property — so neither the duplicate check nor any later
@@ -5657,22 +5842,27 @@ test('the workflow reader rejects documents GitHub would reject on structural gr
   // PRESENCE IS NOT A COMMAND (Codex T7 r3). An empty `run:` parses to null,
   // and a XOR asking only whether the PROPERTY was there counted that as a step
   // with a command, so a step carrying nothing to run was admitted. What GitHub
-  // executes is the STRING, so the string is what has to be there — and these
-  // are three different values with one meaning: no command.
+  // executes is the STRING, so the string is what has to be there.
   assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:\n')),
     /'run' has no value/,
   );
   assert.throws(
-    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: ""\n')),
-    /'run' must be a non-empty string/,
-  );
-  assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run:\n          echo: hello\n')),
-    /'run' must be a non-empty string/,
+    /'run' must be a string/,
   );
-  // The same for `uses`, whose empty form named no action while satisfying the
-  // very same XOR.
+  // …BUT `run: ""` IS LEGAL AND MUST BE ACCEPTED (Codex T7 r4 #4). Round 3
+  // extended the non-empty rule from `uses` to `run` and thereby asserted MORE
+  // than GitHub does: GitHub's schema gives `uses` a minimum length and gives
+  // `run` only the type `string`, so an empty command is a pointless step, not
+  // an invalid one. The round-3 mutations missed it because every one of them
+  // was aimed at THIS repository's workflows rather than at a legal document;
+  // this is the positive control that would have caught it.
+  assert.doesNotThrow(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: ""\n')),
+  );
+  // `uses`, by contrast, IS required to be non-empty, and its empty form named
+  // no action while satisfying the very same XOR.
   assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        uses:\n')),
     /'uses' has no value/,
@@ -5700,6 +5890,35 @@ test('the workflow reader rejects documents GitHub would reject on structural gr
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    step:\n')),
     /step/,
     'a mistyped `steps` leaves the job with nothing to run',
+  );
+  // THE ALLOWLIST AT STEP LEVEL, which nothing exercised: the pins above cover
+  // the workflow and job levels, so the step-level call could have been passed
+  // a superset — or dropped — with everything here still green.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: echo hello\n        runs-on: x\n')),
+    /'runs-on' is not a key GitHub reads here/,
+    'a job key written at step level is a key the runner never reads',
+  );
+  // THE COLLECTION SHAPES, likewise enforced but unpinned. Each is a scalar
+  // where GitHub requires a collection, and each was decided by a line no case
+  // below would have missed if it were deleted.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(/jobs:\n[\s\S]*$/, 'jobs: nope\n')),
+    /jobs must be a mapping/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '  only:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Do something\n        run: echo hello\n',
+      '  only: nope\n',
+    )),
+    /job only: not a mapping/,
+  );
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '    steps:\n      - name: Do something\n        run: echo hello\n',
+      '    steps: nope\n',
+    )),
+    /steps must be a non-empty sequence/,
   );
   // A `with:` on a `run:` step is silently ignored by the runner — the same
   // class of defect as the typo'd key, one level down.
