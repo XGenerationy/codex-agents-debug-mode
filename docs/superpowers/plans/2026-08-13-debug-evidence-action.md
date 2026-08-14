@@ -3695,6 +3695,18 @@ That falsely establishes this job's UNIQUE LIVE CLAIM — that the hosted runner
 
 Codex again could not execute Node or the scanner (`EPERM: lstat C:\Users\<user>`), so it did not independently confirm the suite counts; the coordinator re-ran `support.test.js` at `1c2e2a4` (122/121/0/1) and the scanner (exit 1, unchanged). Codex did verify `6c3a693` touches only the plan's final blank line and that both `git diff --check` invocations now pass.
 
+#### Task 7 round-2 outcome (`f10982b`) — three corrections to THIS PLAN
+
+Round 2 implemented Importants (1) and (2) and Minor (4); Important (3) was the owner's rollout call, recorded above. Suites: `support.test.js` 125/124/0/1 (coordinator-verified), `npm test` 1122/1081/0/41, `npm run validate` PASS, scanner exit 1 with findings byte-identical to before (the known finding). Three things the round found that this plan got wrong:
+
+**(a) The round-2 prescription for the redaction proof was itself insufficient.** The amendment above prescribes "require EXACTLY ONE event whose `msg` is EXACTLY `DEMO config dump: token=[REDACTED]`". That rule is **satisfied by a log carrying the correct event AND a partially-masked one beside it** — the correct event is present exactly once, and the whole-value sweep sees nothing. The implementer flagged this rather than silently adopting the weaker rule, and closed it with an additional count of events mentioning `token=` at all. **The lesson is the round's own theme applied to the plan: an exactly-one rule constrains the good event's multiplicity, not the bad event's existence.**
+
+**(b) The coordinator broke `npm run validate` in the round-2 amendment commit (`306da76`).** That commit wrote a literal personal Windows path into a tracked file, which `tools/validate_repository.js:156` forbids by the rule named `personal Windows path`. Baselines quoted to the implementer were therefore taken at `1c2e2a4`, not at HEAD. Repaired in-round with the placeholder form the validator's own regex permits. **Standing rule for every future amendment: quote sandbox and tool errors WITHOUT literal user paths.**
+
+**(c) `session.log`'s format was MEASURED, not inferred** — JSONL, one `JSON.stringify`'d event per LF-terminated line, staged byte-for-byte as the collector served it (`debug_server.js:1508` → `support.js:1925`). The real end-to-end lifecycle test now also runs the shipped step script against genuinely captured bytes, so a format change cannot leave the executor tests passing against a model of a format that no longer exists.
+
+**Open items carried to the re-review:** one mutation (M5) SURVIVED — deleting the record-count line in the strict-refusal probe — because the `record_line=` assignment below already fails closed through `pipefail`/`set -e`. It was kept and labelled deliberately redundant. Coordinator's lean is KEEP, because the emergent fail-closed behaviour is invisible to a reader and the label removes the misreading risk; a line that cannot fail is only a defect when it reads as load-bearing. **Residual bound explicitly NOT closed:** the msg-field equality plus the whole-value sweep do not catch a partial leak in a non-`msg` field (e.g. `data`), nor a value split across a line boundary in `report.md`. `repro.js` puts the secret only in `msg` and both reports render from `session.log`, so the demo cannot exercise those channels — flagged rather than implied as covered.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
