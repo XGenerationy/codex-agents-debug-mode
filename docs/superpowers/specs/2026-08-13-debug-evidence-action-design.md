@@ -255,7 +255,9 @@ under a successful strict admission.)* **The trust regime depends on
 `evidence-trust`:**
 
 - **After a successful `strict` admission** — every checked route clear: Yama
-  mode 3, effective uid ≠ 0, no usable `sudo` route, and no privileged capability
+  mode 3, effective uid ≠ 0, no `sudo` binary present at a trusted absolute path
+  (never "no *usable* route" — usability is precisely the judgement round 9
+  established cannot be made), and no privileged capability
   in the process's own set *(corrected, Task 6 round 9: the earlier "mode 3 or
   real isolation" shorthand both omitted the conjunction and implied an
   isolation-based admission route that is not implemented)* — the unit of trust is
@@ -309,8 +311,10 @@ sets it also opens the BPF route. Neither the `run` process nor the collector is
 made non-dumpable, and the collector's pid is recorded in state.
 
 The action therefore probes the escalation routes it can observe — Yama mode,
-effective uid, passwordless `sudo`, and dangerous capabilities in its own set —
-and admits `strict` only when ALL are clear. Those are the routes it CHECKS, not
+effective uid, the PRESENCE of a `sudo` binary at a trusted absolute path, and
+dangerous capabilities in its own set *(corrected, Task 6 round 9: this sentence
+still named the withdrawn `passwordless sudo` behavioural probe)* — and admits
+`strict` only when ALL are clear. Those are the routes it CHECKS, not
 a proof that no route exists: a setuid binary, a mounted container socket, or a
 writable privileged service can grant the same power unobserved. Hosted execution
 remains BEST-EFFORT.

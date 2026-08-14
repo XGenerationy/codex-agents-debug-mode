@@ -67,7 +67,17 @@ const PTRACE_MODES = new Map([
   ['2', 'privilege-bypassable'],
   ['3', 'unconditional'],
 ]);
-const readPtraceScope = ({ platform = process.platform, readFile = readFileSync } = {}) => {
+// A DEFAULT PARAMETER CANNOT MODEL "not available here" (Codex T6 r9 #4).
+// `{ getuid: undefined }` activates the default, so a caller meaning "this
+// platform has no geteuid" silently gets the live host's — green on Windows for
+// the wrong reason, and a failure on the Linux runner that matters. Reading the
+// key's PRESENCE makes an explicit undefined mean what every reader assumes it
+// means, while an omitted key still wires the real API.
+const seam = (options, key, fallback) => (Object.hasOwn(options, key) ? options[key] : fallback);
+
+const readPtraceScope = (options = {}) => {
+  const platform = seam(options, 'platform', process.platform);
+  const readFile = seam(options, 'readFile', readFileSync);
   if (platform !== 'linux') return 'unknown';
   let raw;
   try {
@@ -87,8 +97,13 @@ const readPtraceScope = ({ platform = process.platform, readFile = readFileSync 
 // the hardening advice round 7 shipped). Yama governs `ptrace`, and nothing
 // else. A principal that can reach ROOT does not need ptrace at all: it can
 // load a privileged tracing BPF program and overwrite another task's userspace
-// memory with `bpf_probe_write_user()`, or insert a kernel module, or read
-// /proc/<pid>/mem directly. So mode 3 is necessary, not sufficient, and the
+// memory with `bpf_probe_write_user()`, or insert a kernel module. (An earlier
+// draft of this comment also listed reading /proc/<pid>/mem directly. That was
+// WRONG and is removed rather than qualified: opening that file goes through
+// mm_access -> ptrace_may_access with PTRACE_MODE_ATTACH_FSCREDS, which is the
+// very check Yama hooks, so mode 3 does forbid it. A factual error inside a
+// security argument is the failure mode this review has been hunting since
+// round 4 — Codex T6 r9 #5.) So mode 3 is necessary, not sufficient, and the
 // round-7 advice — set ptrace_scope 3 with sudo and strict becomes reachable
 // — was FALSE: the same passwordless sudo that sets the sysctl opens the BPF
 // route. Hosted execution therefore stays best-effort.
@@ -98,8 +113,8 @@ const readPtraceScope = ({ platform = process.platform, readFile = readFileSync 
 //
 //   1. Yama ptrace_scope 3            (classic attachment forbidden)
 //   2. effective uid != 0             (not already root)
-//   3. passwordless sudo unavailable  (no trivial route to root)
-//   4. no dangerous capability held   (no route already granted)
+//   3. no sudo binary present       (checked by EXISTENCE, never behaviour)
+//   4. no dangerous capability held (no route already granted)
 //
 // These are the escalation routes this action checks, not a proof that no
 // route exists. A setuid binary on PATH, a mounted container socket, a
@@ -126,7 +141,8 @@ const DANGEROUS_CAPABILITY_MASK = [...DANGEROUS_CAPABILITIES.values()]
 // reading a loaded gun as unloaded.
 const CAPABILITY_FIELDS = ['CapPrm', 'CapEff'];
 
-const readEffectiveUid = ({ getuid = process.geteuid } = {}) => {
+const readEffectiveUid = (options = {}) => {
+  const getuid = seam(options, 'getuid', process.geteuid);
   // Absent on Windows, and absent is not "safe": it means this code cannot
   // tell, which denies.
   if (typeof getuid !== 'function') return 'unknown';
@@ -140,33 +156,69 @@ const readEffectiveUid = ({ getuid = process.geteuid } = {}) => {
   return uid === 0 ? 'root' : 'non-root';
 };
 
-// Only these say "the request was DENIED". Everything else — including a
-// missing sudo binary, which reads as reassuring and proves nothing about what
-// is installed elsewhere on PATH — is read as available.
-const SUDO_DENIED = /a password is required|not in the sudoers file|no passwd entry|is not allowed to (?:run|execute)|may not run/i;
-const defaultSudoProbe = () => spawnSync('sudo', ['-n', 'true'], {
-  encoding: 'utf8',
-  timeout: 5_000,
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-const probePasswordlessSudo = ({ run = defaultSudoProbe } = {}) => {
-  let result;
+// SUDO: DETECTED BY EXISTENCE, NEVER BY BEHAVIOUR (Codex T6 r9, Critical).
+//
+// Round 8 ran `sudo -n true` and read a denial as "no sudo route here". That
+// was unsound in two independent ways, and both of them fail in the granting
+// direction — the only direction that matters:
+//
+//   1. SUDOERS RULES ARE COMMAND-SPECIFIC. A principal holding
+//      `NOPASSWD: /usr/bin/env` is denied `true` and would have CLEARED
+//      admission, while retaining a perfectly good route to root. Probing one
+//      command can never establish the absence of a rule for another.
+//   2. THE PROBE ITSELF WAS FORGEABLE. A fake `sudo` earlier on PATH could
+//      print "a password is required", exit 1, and thereby GRANT strict
+//      admission — while the real /usr/bin/sudo stayed one absolute path away
+//      for the wrapped command to use. (The round-8 note claiming a spoofed
+//      sudo could only deny was wrong.)
+//
+// So this asks one question with no interpretation in it: does a sudo binary
+// EXIST at a trusted absolute path? Any sudo binary at a trusted absolute path
+// denies strict admission. Nothing is executed, PATH is never consulted, and no
+// output is parsed. Establishing that a present sudo grants the principal
+// nothing would need an independently trusted account of the sudoers policy,
+// and nothing available here is one — so strict now means a genuinely locked
+// environment, which is what "real isolation" meant all along.
+const SUDO_BINARY_PATHS = ['/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo'];
+// lstat, not stat: a DANGLING symlink at /usr/bin/sudo makes stat throw ENOENT,
+// which would read as "absent" while the path is plainly rigged. lstat sees the
+// link itself.
+const defaultSudoStat = (candidate) => {
   try {
-    result = run();
-  } catch {
-    return 'available';
+    lstatSync(candidate);
+    return 'present';
+  } catch (error) {
+    return error?.code === 'ENOENT' ? 'absent' : 'unreadable';
   }
-  if (result === null || typeof result !== 'object') return 'available';
-  // spawnSync reports ENOENT, ETIMEDOUT and friends HERE rather than throwing,
-  // and a probe that did not complete has answered nothing — whatever it
-  // managed to print before it died.
-  if (result.error) return 'available';
-  if (!Number.isInteger(result.status)) return 'available';
-  if (result.status === 0) return 'available';
-  return SUDO_DENIED.test(String(result.stderr ?? '')) ? 'unavailable' : 'available';
+};
+const detectSudoBinary = (options = {}) => {
+  const platform = seam(options, 'platform', process.platform);
+  const statPath = seam(options, 'statPath', defaultSudoStat);
+  // These paths are a Linux claim. Anywhere else this code has no idea what
+  // the escalation surface looks like, and "no idea" denies.
+  if (platform !== 'linux') return 'unknown';
+  const found = [];
+  let ambiguous = false;
+  for (const candidate of SUDO_BINARY_PATHS) {
+    let reading;
+    try {
+      reading = statPath(candidate);
+    } catch {
+      ambiguous = true;
+      continue;
+    }
+    if (reading === 'present') found.push(candidate);
+    else if (reading !== 'absent') ambiguous = true;
+  }
+  // A named binary beats a shrug: both deny, and the caller gets the better
+  // diagnostic.
+  if (found.length > 0) return `present: ${found.join(', ')}`;
+  return ambiguous ? 'unknown' : 'absent';
 };
 
-const readOwnCapabilities = ({ platform = process.platform, readFile = readFileSync } = {}) => {
+const readOwnCapabilities = (options = {}) => {
+  const platform = seam(options, 'platform', process.platform);
+  const readFile = seam(options, 'readFile', readFileSync);
   if (platform !== 'linux') return 'unknown';
   let raw;
   try {
@@ -194,51 +246,90 @@ const readOwnCapabilities = ({ platform = process.platform, readFile = readFileS
   return held.length === 0 ? 'clear' : held.join('+');
 };
 
-// ONE evaluator, ONE predicate, and every consumer reads them rather than
-// re-deriving the rule (the discipline that fixed the mode lookup in r7). The
-// blockers list is both the gate's answer and the caveat's wording, so a host
-// cannot be refused for one reason and labeled with another.
-const evaluateAdmission = ({
-  readPtrace = readPtraceScope,
-  readEuid = readEffectiveUid,
-  probeSudo = probePasswordlessSudo,
-  readCapabilities = readOwnCapabilities,
-} = {}) => {
-  const ptrace = readPtrace();
-  const uid = readEuid();
-  const sudo = probeSudo();
-  const capabilities = readCapabilities();
-  const blockers = [];
-  if (ptrace !== 'unconditional') blockers.push(`same-UID ptrace policy: ${ptrace}`);
-  if (uid !== 'non-root') blockers.push(`effective uid: ${uid}`);
-  if (sudo !== 'unavailable') blockers.push(`passwordless sudo: ${sudo}`);
-  if (capabilities !== 'clear') blockers.push(`privileged capabilities: ${capabilities}`);
-  return { ptrace, uid, sudo, capabilities, blockers };
+// THE FOUR READINGS, and the vocabulary each is allowed to speak. A value
+// outside its set is not a reading this code produced, so it is unreadable —
+// never clear.
+const PTRACE_VALUES = new Set(['unconditional', 'privilege-bypassable', 'permissive', 'unknown']);
+const UID_VALUES = new Set(['non-root', 'root', 'unknown']);
+const SUDO_PRESENT = /^present: \/\S+(?:, \/\S+)*$/;
+const CAPABILITY_LIST = /^CAP_[A-Z0-9_]+(?:\+CAP_[A-Z0-9_]+)*$/;
+const ADMISSION_FIELDS = [
+  { key: 'ptrace', label: 'same-UID ptrace policy', clear: 'unconditional', valid: (value) => PTRACE_VALUES.has(value) },
+  { key: 'uid', label: 'effective uid', clear: 'non-root', valid: (value) => UID_VALUES.has(value) },
+  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => value === 'absent' || value === 'unknown' || SUDO_PRESENT.test(value) },
+  { key: 'capabilities', label: 'privileged capabilities', clear: 'clear', valid: (value) => value === 'clear' || value === 'unknown' || CAPABILITY_LIST.test(value) },
+];
+
+// DERIVED FROM THE READINGS, NEVER READ OFF THE RECORD (Codex T6 r9 #2). The
+// admission record round-trips through a state file any same-user process can
+// rewrite, and the round-8 predicate asked that file exactly one question —
+// "is your blockers list empty?" — which it could simply answer. A forged
+// `{ptrace:'permissive', uid:'root', …, blockers: []}` was ADMITTED. So the
+// list is recomputed from the four fields every time it is consulted, the
+// fields are validated against the vocabularies above, and the persisted list
+// is never an input in either direction.
+const admissionBlockers = (admission) => {
+  if (admission === null || typeof admission !== 'object' || Array.isArray(admission)) {
+    return ADMISSION_FIELDS.map((field) => `${field.label}: no usable admission record`);
+  }
+  return ADMISSION_FIELDS.flatMap((field) => {
+    // hasOwn, so an inherited property cannot supply a reading.
+    const value = Object.hasOwn(admission, field.key) ? admission[field.key] : undefined;
+    if (typeof value !== 'string' || !field.valid(value)) return [`${field.label}: unreadable record`];
+    return value === field.clear ? [] : [`${field.label}: ${value}`];
+  });
 };
 
-// Established means: a record this code recognises, listing NO blockers.
-// Written defensively because the record makes a round trip through the state
-// file, and a value that cannot be recognised must deny rather than pass.
-const admissionEstablished = (admission) => Array.isArray(admission?.blockers)
-  && admission.blockers.length === 0;
+// ONE evaluator, ONE predicate, and every consumer reads them rather than
+// re-deriving the rule (the discipline that fixed the mode lookup in r7).
+const evaluateAdmission = (options = {}) => {
+  const record = {
+    ptrace: seam(options, 'readPtrace', readPtraceScope)(),
+    uid: seam(options, 'readEuid', readEffectiveUid)(),
+    sudo: seam(options, 'detectSudo', detectSudoBinary)(),
+    capabilities: seam(options, 'readCapabilities', readOwnCapabilities)(),
+  };
+  // Recorded for the diagnostics that quote it, and recomputed by every
+  // consumer regardless — so the two can never disagree.
+  return { ...record, blockers: admissionBlockers(record) };
+};
 
-const describeAdmission = (admission) => (
-  Array.isArray(admission?.blockers) && admission.blockers.length > 0
-    ? admission.blockers.join('; ')
-    : 'no usable admission record'
-);
+const admissionEstablished = (admission) => admissionBlockers(admission).length === 0;
 
-// The qualification, in the words used on all three surfaces. Empty when the
-// prerequisite holds, so an ordinary report is unchanged. Two entries, because
-// two different things have to be said: what was not established, and what the
-// check that decided it does not cover.
-const platformCaveats = (admission) => (admissionEstablished(admission) ? [] : [
-  `The in-process guarantees were NOT established on this host (${describeAdmission(admission)}).`
-  + ' A same-user process may be able to attach to the collector or to the capturing step and read or alter the memory this evidence depends on.',
-  'These are the escalation routes this action CHECKS'
-  + ' — Yama ptrace mode, effective uid, passwordless sudo, and its own permitted/effective capabilities —'
-  + ' not a proof that no route exists: a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved.',
-]);
+const describeAdmission = (admission) => {
+  const blockers = admissionBlockers(admission);
+  return blockers.length > 0 ? blockers.join('; ') : 'every checked route clear';
+};
+
+// THE ADMISSION RECORD, in one builder, used verbatim by all three surfaces:
+// `start`'s pre-command step log, `run`'s log beside the digest, and the
+// rendered report. One builder because the whole value of the record is that a
+// reader can COMPARE the copies — and copies that were assembled separately
+// would differ for innocent reasons and destroy that.
+//
+// Emitted on EVERY regime, admitted runs included (Codex T6 r9 #3). An
+// artifact-only stamp is worth nothing on its own: a compromised best-effort
+// run can forge whatever the artifact says. What makes the artifact's copy
+// mean something is that `start` streamed an identical one BEFORE the wrapped
+// command existed, where no later process can retract or rewrite it.
+const admissionCaveats = (admission, evidenceTrust) => {
+  const established = admissionEstablished(admission);
+  const mode = evidenceTrust === 'best-effort' ? 'best-effort' : 'strict';
+  return [
+    `ADMISSION RECORD (streamed by start before the wrapped command existed): evidence-trust=${mode};`
+    + ` in-process boundary=${established ? 'ESTABLISHED' : 'NOT established'};`
+    + ` findings=${describeAdmission(admission)}.`,
+    'Checked: Yama ptrace mode, effective uid, sudo binary presence at trusted absolute paths, and this process\'s own permitted/effective capabilities.'
+    + ' Any sudo binary at a trusted absolute path denies strict admission, because sudoers rules are command-specific and no probe of one command can establish the absence of a rule for another.'
+    + ' These are the escalation routes this action checks, not a proof that no route exists:'
+    + ' a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved.',
+    established
+      ? 'The trust unit is this admission record, plus the matching digest from run\'s step log, plus the artifact — all three together, and none of them alone.'
+      : 'The in-process guarantees were NOT established on this host, so a same-user process may be able to attach to the collector or to the capturing step,'
+        + ' or to rewrite their memory without ptrace at all where it can reach root.'
+        + ' The capture, its digest and this report are diagnostic claims only; the copy of this record in start\'s own step log is the only one the wrapped command could not reach.',
+  ];
+};
 
 // PATH SAFETY, not entropy. The invocation nonce is a directory-name segment
 // now, and it arrives from this step's environment: the unguessability comes
@@ -756,6 +847,17 @@ const startSubcommand = async ({
   // can change modes 0-2 at runtime, including after any check this code makes
   // (Codex T6 r6, ruling (c)). What the value is NOT is immutable.
   const admission = probeAdmission();
+  // THE PRE-COMMAND ADMISSION RECORD (Codex T6 r9 #3), and it goes out HERE:
+  // after the identity outputs, before the collector is spawned, and long
+  // before the wrapped command exists. Every regime gets one — an admitted run
+  // needs it as much as a refused one, because "which regime was in force" is
+  // precisely what a reader cannot establish afterwards from anything the
+  // wrapped command could have touched. This copy is the fixed point the
+  // artifact's copy is compared against; it is streamed to the step log, where
+  // it is immutable, and `run` and the report carry the identical text.
+  for (const line of admissionCaveats(admission, inputs.evidenceTrust)) {
+    process.stderr.write(`debug-evidence-action: start: ${line}\n`);
+  }
   if (!admissionEstablished(admission)) {
     // THE REFUSAL, and it happens here because here is the last moment that is
     // still before the wrapped command exists (Codex T6 r6).
@@ -770,7 +872,7 @@ const startSubcommand = async ({
     // The diagnostic has to leave the caller somewhere to go, so it names what
     // was found, why that is not a boundary, and both ways forward.
     if (inputs.evidenceTrust !== 'best-effort') {
-      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}). Strict admission requires ALL of: Linux Yama ptrace_scope 3, a non-root effective uid, no passwordless sudo, and none of CAP_SYS_ADMIN/CAP_BPF/CAP_SYS_PTRACE/CAP_SYS_MODULE in this process's own permitted or effective set. Mode 3 is necessary, not sufficient: it forbids classic same-UID ptrace attachment, but a command that can reach root rewrites another task's memory with a privileged BPF program (bpf_probe_write_user) or a kernel module without calling ptrace at all — and standard GitHub-hosted runners grant workflow commands passwordless sudo, so hosted execution stays best-effort. These are the escalation routes this action checks, not a proof that no route exists: a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved. Either run where the wrapped principal has no route to root, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
+      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}). Strict admission requires ALL of: Linux Yama ptrace_scope 3, a non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo or /usr/local/bin/sudo, and none of CAP_SYS_ADMIN/CAP_BPF/CAP_SYS_PTRACE/CAP_SYS_MODULE in this process's own permitted or effective set. Mode 3 is necessary, not sufficient: it forbids classic same-UID ptrace attachment, but a command that can reach root rewrites another task's memory with a privileged BPF program (bpf_probe_write_user) or a kernel module without calling ptrace at all — and standard GitHub-hosted runners ship sudo with a passwordless rule, so hosted execution stays best-effort. Either run where the wrapped principal has no route to root, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
       return 3;
     }
     // Opted in. This copy of the qualification is the only one the wrapped
@@ -780,7 +882,7 @@ const startSubcommand = async ({
     // capture which follows is tamper-resistant. The other two copies (run's
     // pre-digest line and the report caveat) are written after the command has
     // run, by a process it may have been able to rewrite.
-    process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step — or, where it can reach root, to rewrite their memory without ptrace at all — so the capture below cannot be treated as tamper-resistant. Those are the escalation routes this action checks, not a proof that no route exists. This line is written before the wrapped command runs and cannot be retracted by it.\n`);
+    process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step — or, where it can reach root, to rewrite their memory without ptrace at all — so the capture below cannot be treated as tamper-resistant. This line and the admission record above it are written before the wrapped command runs and cannot be retracted by it.\n`);
   }
   // Containment layer 2 (Codex T3 #3): the check above compares the paths as
   // WRITTEN, so an output-dir that merely RESOLVES into the workspace — a
@@ -911,10 +1013,13 @@ const startSubcommand = async ({
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
-      // Detected here, consumed by `run` when it qualifies and renders: the
-      // label belongs on the evidence, and only this step is in a position to
-      // have looked before the wrapped command existed. Reaching this line
-      // with anything but `unconditional` means the caller opted in.
+      // The four readings, recorded here and consumed by `run` when it
+      // qualifies and renders: only this step is in a position to have looked
+      // before the wrapped command existed. Reaching this line with any
+      // blocker at all means the caller opted in to best-effort — strict
+      // returned 3 above. The persisted `blockers` list is a diagnostic
+      // convenience; every consumer re-derives it from the four fields, so a
+      // rewritten state file cannot launder a failing reading (Codex T6 r9 #2).
       admission,
       evidenceTrust: inputs.evidenceTrust,
     }));
@@ -1337,8 +1442,12 @@ const RUNNER_COMMAND_FILE_VARS = [
 // admitted, so it is stated once, here, and every claim below inherits it:
 //
 //   - successful STRICT admission: the host positively establishes the
-//     boundary, so this process's decisions are authenticated. The artifact
-//     plus the matching digest from this step's log is the trust unit.
+//     boundary, so this process's decisions are authenticated. The trust unit
+//     is the pre-command admission record start streamed to its own step log,
+//     plus the matching digest from this step's log, plus the artifact — all
+//     three together (Codex T6 r9 #3). Not the artifact and digest alone: a
+//     compromised run can produce both, and it is start's pre-command copy,
+//     which no later process can retract, that says which regime was in force.
 //   - BEST-EFFORT: the caller accepted a host where the wrapped command may
 //     be able to rewrite this very process. Everything below still happens,
 //     and none of it authenticates anything — the capture, the digest, the
@@ -1359,17 +1468,26 @@ const RUNNER_COMMAND_FILE_VARS = [
 // kill the collector, and authors every event in the log. What it cannot
 // reach is the copy this process read before the command started.
 //
-// And that much is CONDITIONAL on the platform (Codex T6 r5, corrected r6). It
-// holds only where the host refuses same-UID ptrace attachment, and only Linux
-// Yama ptrace_scope 3 does that unconditionally: modes 1 and 2 are bypassable
-// with CAP_SYS_PTRACE, and GitHub-hosted runners ship mode 1 together with
-// passwordless sudo. Where attachment is reachable, a hostile native command
-// can attach to this process, or to the collector whose pid is in state, and
-// read or inject memory; no in-process argument survives that. `start` refuses
-// to run the wrapped command at all unless the policy is positively
-// established, and a caller who sets `evidence-trust: best-effort` gets
-// evidence labeled as unverifiable-by-construction instead. The action
-// classifies the platform; it does not create the boundary on it.
+// And that much is CONDITIONAL on the platform (Codex T6 r5, corrected r6 and
+// again r9). It holds only where the host refuses same-UID ptrace attachment
+// AND the wrapped principal has no route to root — because a principal that
+// reaches root rewrites this process's memory with a privileged BPF program or
+// a kernel module and never calls ptrace at all. So the condition is all four
+// readings: Yama ptrace_scope 3 (modes 1 and 2 are bypassable with
+// CAP_SYS_PTRACE), a non-root effective uid, no sudo binary at a trusted
+// absolute path, and no CAP_SYS_ADMIN / CAP_BPF / CAP_SYS_PTRACE /
+// CAP_SYS_MODULE in this process's own set. Any sudo binary at a trusted
+// absolute path denies strict admission: sudoers rules are command-specific,
+// so no probe of one command can establish the absence of a rule for another,
+// and a PATH-planted fake could fabricate a denial that GRANTED admission.
+// Where any of that is open, a hostile native command can reach this process,
+// or the collector whose pid is in state, and read or inject memory; no
+// in-process argument survives that. `start` refuses to run the wrapped
+// command at all unless the prerequisite is positively established, and a
+// caller who sets `evidence-trust: best-effort` gets evidence labeled as
+// unverifiable-by-construction instead. The action classifies the platform; it
+// does not create the boundary on it. These are the escalation routes it
+// checks, not a proof that no route exists.
 //
 // This also means the verification key is read BEFORE the command runs. It is
 // public, so a child reading /proc/<ppid>/environ learns nothing it can use;
@@ -1573,7 +1691,7 @@ const runSubcommand = async ({
       // to know the in-process guarantees were not established. An absent
       // record labels as `unknown`, never as met.
       rendered = renderReport(payloads['session.log'], state.sessionId, {
-        caveats: platformCaveats(state.admission),
+        caveats: admissionCaveats(state.admission, state.evidenceTrust),
       });
     } catch (error) {
       process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
@@ -1614,7 +1732,7 @@ const runSubcommand = async ({
   // establishes is that best-effort was consciously selected. This one and the
   // report caveat are both written after the command ran, by a process it may
   // have been able to rewrite, so it could suppress either.
-  for (const caveat of platformCaveats(state.admission)) writeStdout(`evidence-qualification ${caveat}\n`);
+  for (const caveat of admissionCaveats(state.admission, state.evidenceTrust)) writeStdout(`evidence-qualification ${caveat}\n`);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   // Ownership check and commit as ONE indivisible step. The snapshot in
   // `state` was read before a wrapped command that may have run for an hour,
@@ -1886,15 +2004,17 @@ if (require.main === module) void main();
 
 module.exports = {
   actionInputsFromEnv,
+  admissionBlockers,
+  admissionCaveats,
   admissionEstablished,
   defaultRenderReport,
   defaultSpawnCommand,
   defaultSpawnShim,
   finishSubcommand,
   httpRequestJson,
+  detectSudoBinary,
   evaluateAdmission,
   maskValue,
-  probePasswordlessSudo,
   readEffectiveUid,
   readOwnCapabilities,
   readPtraceScope,

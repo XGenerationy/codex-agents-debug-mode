@@ -69,19 +69,25 @@ inputs:
       'strict' (default): refuse to run the wrapped command at all unless this
       host positively establishes the in-process boundary this action's
       evidence depends on. That takes ALL of: Linux Yama ptrace_scope 3, a
-      non-root effective uid, no passwordless sudo, and none of CAP_SYS_ADMIN,
-      CAP_BPF, CAP_SYS_PTRACE or CAP_SYS_MODULE held by this process.
-      'best-effort': run anyway, and treat the resulting evidence as a
-      diagnostic claim rather than an authenticated one. Mode 3 is necessary,
-      not sufficient — it forbids ptrace attachment, but a principal that can
-      reach root rewrites another task's memory with a privileged BPF program
-      or a kernel module without ptrace at all — so a runner that grants
-      passwordless sudo cannot reach strict by setting the sysctl. GitHub-hosted
-      runners grant exactly that, so hosted execution stays best-effort and
-      hosted callers must opt in. And these are the escalation routes this
+      non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo or
+      /usr/local/bin/sudo, and none of CAP_SYS_ADMIN, CAP_BPF, CAP_SYS_PTRACE
+      or CAP_SYS_MODULE held by this process. 'best-effort': run anyway, and
+      treat the resulting evidence as a diagnostic claim rather than an
+      authenticated one. Mode 3 is necessary, not sufficient — it forbids
+      ptrace attachment, but a principal that can reach root rewrites another
+      task's memory with a privileged BPF program or a kernel module without
+      ptrace at all — so a runner carrying sudo cannot reach strict by setting
+      the sysctl. Any sudo binary at a trusted absolute path denies strict
+      admission, because sudoers rules are command-specific: no probe of one
+      command can establish the absence of a rule for another, and a
+      PATH-planted fake could fabricate a denial that GRANTED admission.
+      GitHub-hosted runners ship sudo, so hosted execution stays best-effort
+      and hosted callers must opt in. And these are the escalation routes this
       action checks, not a proof that no route exists: a setuid binary, a
       mounted container socket or a writable privileged service grants the same
-      power unobserved.
+      power unobserved. On a strict admission the trust unit is the pre-command
+      admission record in start's step log, plus the matching digest from run's
+      step log, plus the artifact — all three together.
     required: false
     default: "strict"
 
@@ -89,14 +95,18 @@ inputs:
 # happens: it is the only process that spans the wrapped command's execution,
 # so it is the only one whose account of the session CAN be trusted — and
 # whether it MAY be depends on how this invocation was admitted. After a
-# successful strict admission, run's account is authenticated: the artifact
-# plus the matching digest from its step log is the trust unit. Under
-# `evidence-trust: best-effort` it is a diagnostic claim only, because the
-# threat that mode accepts is precisely a command able to rewrite run.
-# `report` publishes and produces nothing under either mode. And "successful
-# strict admission" means the escalation routes this action checks came back
-# clear, not a proof that no route exists — the trust unit is only ever as
-# good as that.
+# successful strict admission, run's account is authenticated, and the trust
+# unit is the pre-command admission record start streamed to its own step log,
+# plus the matching digest from run's step log, plus the artifact — all three
+# together (Codex T6 r9). The artifact and digest alone are not it: a
+# compromised run produces both, and only start's pre-command copy, which
+# nothing afterwards can retract, establishes which regime was in force. Under
+# `evidence-trust: best-effort` it is a diagnostic claim only,
+# because the threat that mode accepts is precisely a command able to rewrite
+# run. `report` publishes and produces nothing under either mode. And
+# "successful strict admission" means the escalation routes this action checks
+# came back clear, not a proof that no route exists — the trust unit is only
+# ever as good as that.
 outputs:
   command-exit-code:
     description: "Exit code of the wrapped command; empty until the run step has run"
@@ -193,17 +203,28 @@ runs:
       # privileged tracing BPF program — bpf_probe_write_user() — or with a
       # kernel module, and never calls ptrace. So mode 3 is necessary, not
       # sufficient, and `sysctl -w kernel.yama.ptrace_scope=3` does NOT turn a
-      # hosted runner into an authenticated one, because the same passwordless
-      # sudo that sets it opens the BPF route. Hosted execution stays
-      # best-effort.
+      # hosted runner into an authenticated one, because the same sudo that
+      # sets it opens the BPF route. Hosted execution stays best-effort.
       #
       # Strict admission is therefore a conjunction: mode 3, a non-root
-      # effective uid, no passwordless sudo, and no CAP_SYS_ADMIN / CAP_BPF /
-      # CAP_SYS_PTRACE / CAP_SYS_MODULE in this process's own set. Those are
-      # the escalation routes this action checks, not a proof that no route
+      # effective uid, no sudo binary at a trusted absolute path, and no
+      # CAP_SYS_ADMIN / CAP_BPF / CAP_SYS_PTRACE / CAP_SYS_MODULE in this
+      # process's own set. Any sudo binary at a trusted absolute path denies,
+      # detected by EXISTENCE at /usr/bin/sudo, /bin/sudo and
+      # /usr/local/bin/sudo and never by behaviour (Codex T6 r9): sudoers
+      # rules are command-specific, so `sudo -n <cmd>` cannot establish the
+      # absence of a rule for a different command, and a PATH-planted fake
+      # could fabricate a denial that GRANTED admission. Those are the
+      # escalation routes this action checks, not a proof that no route
       # exists — a setuid binary, a mounted container socket or a writable
       # privileged service grants the same power and none of them is visible
       # from here. Read the guarantee above with that bound on it.
+      #
+      # `start` streams an ADMISSION RECORD to its own step log before the
+      # wrapped command exists, on every regime, and `run` and the report
+      # carry the identical text. That is what makes the artifact's copy worth
+      # anything: the trust unit is the admission record, plus run's digest,
+      # plus the artifact, and a reader compares the copies.
       #
       # `start` therefore REFUSES to run the wrapped command at all unless the
       # prerequisite is positively established, which takes all four readings.

@@ -25,9 +25,11 @@ const {
   httpRequestJson,
   maskValue,
   actionInputsFromEnv,
+  admissionBlockers,
+  admissionCaveats,
   admissionEstablished,
   evaluateAdmission,
-  probePasswordlessSudo,
+  detectSudoBinary,
   readEffectiveUid,
   readOwnCapabilities,
   readPtraceScope,
@@ -407,11 +409,11 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // asked the machine for its policy would fail on precisely the hardened runner
 // strict mode exists for (Codex T6 r8 #3).
 const admissionOf = ({
-  ptrace = 'unconditional', uid = 'non-root', sudo = 'unavailable', capabilities = 'clear',
+  ptrace = 'unconditional', uid = 'non-root', sudo = 'absent', capabilities = 'clear',
 } = {}) => evaluateAdmission({
   readPtrace: () => ptrace,
   readEuid: () => uid,
-  probeSudo: () => sudo,
+  detectSudo: () => sudo,
   readCapabilities: () => capabilities,
 });
 const ADMITTED = () => admissionOf();
@@ -421,6 +423,19 @@ const ADMITTED = () => admissionOf();
 // reader who sees the digest must not be able to miss either — so the pin is
 // that the lines immediately preceding it are all qualification, and that both
 // claims are among them.
+// Exactly one digest line, and everything else run wrote to its own log is an
+// admission-record line — so a stray write cannot hide among them.
+const assertOneDigest = (printed, expected = null) => {
+  const digests = printed.filter((text) => text.startsWith('evidence-sha256'));
+  assert.equal(digests.length, 1, 'exactly one digest line');
+  if (expected !== null) assert.deepEqual(digests, [`${expected}\n`], 'over the expected bytes');
+  for (const text of printed) {
+    assert.ok(text.startsWith('evidence-sha256') || text.startsWith('evidence-qualification'),
+      `run wrote something that is neither a digest nor a qualification: ${text}`);
+  }
+  return digests[0];
+};
+
 const assertQualifiedDigest = (printed, digestIndex) => {
   const preceding = [];
   for (let index = digestIndex - 1; index >= 0 && printed[index].startsWith('evidence-qualification'); index -= 1) {
@@ -431,6 +446,8 @@ const assertQualifiedDigest = (printed, digestIndex) => {
     'the non-establishment is stated');
   assert.ok(preceding.some((line) => /not a proof that no route exists/i.test(line)),
     'and so is the limit of the check that decided it');
+  assert.ok(preceding.some((line) => line.includes('ADMISSION RECORD')),
+    'and the admission record itself, which is what start\'s copy is compared against');
 };
 
 test('the ptrace policy is classified honestly: only mode 3 forbids attachment unconditionally', () => {
@@ -483,7 +500,7 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
     ['ptrace', 'unknown'],
     ['uid', 'root'],
     ['uid', 'unknown'],
-    ['sudo', 'available'],
+    ['sudo', 'present: /usr/bin/sudo'],
     ['sudo', 'unknown'],
     ['capabilities', 'unknown'],
     ['capabilities', 'CAP_BPF'],
@@ -498,7 +515,7 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
   // Mode 3 is NECESSARY, NEVER SUFFICIENT (the r8 Critical). Each of these has
   // the ptrace boundary and still denies, because the wrapped principal can
   // reach root and rewrite another task's memory without ptrace at all.
-  for (const rootRoute of [{ uid: 'root' }, { sudo: 'available' }, { capabilities: 'CAP_BPF' }]) {
+  for (const rootRoute of [{ uid: 'root' }, { sudo: 'present: /usr/bin/sudo' }, { capabilities: 'CAP_BPF' }]) {
     const record = admissionOf(rootRoute);
     assert.equal(record.ptrace, 'unconditional', 'mode 3 is present');
     assert.equal(admissionEstablished(record), false, `${JSON.stringify(rootRoute)}: mode 3 does not rescue it`);
@@ -509,6 +526,124 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
   for (const junk of [undefined, null, {}, { blockers: null }, { blockers: 'none' }, { blockers: 0 }, 'clear', []]) {
     assert.equal(admissionEstablished(junk), false, `${JSON.stringify(junk) ?? 'undefined'} is not an admission`);
   }
+  // THE PERSISTED blockers ARRAY IS NOT AN INPUT (Codex T6 r9 #2). The record
+  // makes a round trip through a same-user-writable state file, and the
+  // round-8 predicate asked it one question — "is your blockers list empty?"
+  // — which the record could simply answer. Every verdict is now DERIVED from
+  // the four readings, and the four readings are validated against the values
+  // this code actually produces.
+  const forged = {
+    ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_BPF',
+    blockers: [],
+  };
+  assert.equal(admissionEstablished(forged), false, 'an empty blockers list cannot launder four failing readings');
+  assert.equal(admissionBlockers(forged).length, 4, 'and every one of them is still reported');
+  assert.equal(admissionEstablished({ blockers: [] }), false, 'a bare blockers list establishes nothing');
+  assert.deepEqual(
+    admissionBlockers({ blockers: [] }).map((blocker) => blocker.split(':')[0]),
+    ['same-UID ptrace policy', 'effective uid', 'sudo binary', 'privileged capabilities'],
+    'a record with no readings at all fails every condition, by name',
+  );
+  // Derivation runs the other way too: a persisted list that CLAIMS blockers
+  // over four clear readings does not deny, because the list is not consulted.
+  assert.equal(admissionEstablished({ ...ADMITTED(), blockers: ['invented'] }), true);
+  // Values outside the vocabularies this code produces are unreadable, not
+  // clear — including the shapes a forger would reach for first.
+  for (const bad of [
+    { ptrace: 'unconditional ' }, { ptrace: 'UNCONDITIONAL' }, { ptrace: true },
+    { uid: 0 }, { uid: 'nonroot' }, { sudo: 'unavailable' }, { sudo: 'absent ' },
+    { capabilities: '' }, { capabilities: 'clear!' }, { capabilities: ['clear'] },
+  ]) {
+    const record = { ...ADMITTED(), ...bad };
+    assert.equal(admissionEstablished(record), false, `${JSON.stringify(bad)} is not a reading this code produced`);
+    assert.ok(admissionBlockers(record).some((blocker) => /unreadable record/.test(blocker)),
+      `${JSON.stringify(bad)} is reported as unreadable`);
+  }
+  // Inherited properties are not readings either.
+  assert.equal(admissionEstablished(Object.create({ ptrace: 'unconditional', uid: 'non-root', sudo: 'absent', capabilities: 'clear' })), false,
+    'a prototype cannot supply the readings');
+});
+
+test('start streams a pre-command admission record on every regime', async () => {
+  // AN ARTIFACT-ONLY STAMP IS NOT ENOUGH (Codex T6 r9 #3). A compromised
+  // best-effort run can forge whatever stamp the artifact carries, so the
+  // stamp is only worth something when there is an unforgeable copy to
+  // compare it against. That copy is this one: written by `start`, into its
+  // own step log, before the wrapped command exists. It is emitted on EVERY
+  // regime — an admitted run needs it as much as a refused one, because
+  // "which regime was in force" is exactly what a reader cannot otherwise
+  // establish after the fact.
+  const recordFrom = (written) => written.split('\n').filter((line) => line.includes('ADMISSION RECORD'));
+
+  // (i) STRICT, ADMITTED — and streamed BEFORE the collector is spawned, so
+  //     nothing the job goes on to do can be its cause.
+  const outputDir = makeTempDir();
+  const port = await getFreePort();
+  let writtenAtSpawn = null;
+  const strict = await captureStderr(async (soFar) => {
+    assert.equal(await startSubcommand({
+      inputs: baseInputs({ port: String(port) }),
+      outputDir,
+      projectRoot: makeTempDir(),
+      env: {},
+      probeAdmission: ADMITTED,
+      spawnShim: (args, options) => {
+        writtenAtSpawn = soFar();
+        return defaultSpawnShim(args, options);
+      },
+    }), 0);
+  });
+  try {
+    assert.equal(recordFrom(strict.written).length, 1, 'exactly one record, on the admitted path too');
+    assert.match(strict.written, /evidence-trust=strict/);
+    assert.match(strict.written, /boundary=ESTABLISHED/);
+    assert.match(strict.written, /not a proof that no route exists/i, 'the limitation rides in every copy');
+    assert.ok(writtenAtSpawn !== null && writtenAtSpawn.includes('ADMISSION RECORD'),
+      'the record was already streamed when the collector was spawned');
+  } finally {
+    teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
+  }
+
+  // (ii) BEST-EFFORT — the record names the regime and every failing reading.
+  const bestEffortDir = makeTempDir();
+  const bestEffortPort = await getFreePort();
+  const bestEffort = await captureStderr(async () => {
+    assert.equal(await startSubcommand({
+      inputs: baseInputs({ port: String(bestEffortPort), evidenceTrust: 'best-effort' }),
+      outputDir: bestEffortDir,
+      projectRoot: makeTempDir(),
+      env: {},
+      probeAdmission: () => admissionOf({ ptrace: 'privilege-bypassable', sudo: 'present: /usr/bin/sudo' }),
+    }), 0);
+  });
+  try {
+    assert.equal(recordFrom(bestEffort.written).length, 1);
+    assert.match(bestEffort.written, /evidence-trust=best-effort/);
+    assert.match(bestEffort.written, /boundary=NOT established/);
+    assert.match(bestEffort.written, /same-UID ptrace policy: privilege-bypassable/);
+    assert.match(bestEffort.written, /sudo binary: present: \/usr\/bin\/sudo/);
+  } finally {
+    teardownSubcommand({ outputDir: bestEffortDir, env: invocationEnv(bestEffortDir) });
+  }
+
+  // (iii) STRICT, REFUSED — the record precedes the refusal, so even a run
+  //       that produced no evidence leaves an account of why.
+  const refusedDir = makeTempDir();
+  const refused = await captureStderr(() => startSubcommand({
+    inputs: baseInputs({ evidenceTrust: 'strict' }),
+    outputDir: refusedDir,
+    projectRoot: makeTempDir(),
+    env: {},
+    probeAdmission: () => admissionOf({ uid: 'root' }),
+    spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
+  }));
+  assert.equal(refused.result, 3);
+  assert.equal(recordFrom(refused.written).length, 1, 'a refusal is a run too');
+  assert.match(refused.written, /boundary=NOT established/);
+  assert.ok(
+    refused.written.indexOf('ADMISSION RECORD') < refused.written.indexOf('refusing to run the wrapped command'),
+    'the record comes first',
+  );
 });
 
 test('every probe denies strict when it cannot be evaluated', () => {
@@ -523,33 +658,72 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // EFFECTIVE UID.
   assert.equal(readEffectiveUid({ getuid: () => 1001 }), 'non-root');
   assert.equal(readEffectiveUid({ getuid: () => 0 }), 'root');
-  assert.equal(readEffectiveUid({ getuid: undefined }), 'unknown', 'a platform with no geteuid at all');
+  // NULL, not undefined (Codex T6 r9 #4). `{ getuid: undefined }` ACTIVATES a
+  // default parameter, so the round-8 version of this line asked the LIVE host
+  // for its uid: green on Windows because geteuid is genuinely absent, and a
+  // FAILURE on the Ubuntu matrix — on precisely the hardened Linux runner
+  // strict mode exists for.
+  assert.equal(readEffectiveUid({ getuid: null }), 'unknown', 'a platform with no geteuid at all');
+  // And the hazard is closed at the seam rather than routed around: an
+  // explicitly passed undefined now means "absent" too, because that is what
+  // every reader assumes it means.
+  assert.equal(readEffectiveUid({ getuid: undefined }), 'unknown', 'explicit undefined is absence, not "use the default"');
+  // Omitting the key entirely still wires up the real API — asserted as a
+  // contract, not as a claim about this machine's uid.
+  assert.ok(['root', 'non-root', 'unknown'].includes(readEffectiveUid()), 'the production default is still wired');
+  assert.ok(['root', 'non-root', 'unknown'].includes(readEffectiveUid({})), 'and an empty options object is not a seam');
   assert.equal(readEffectiveUid({ getuid: () => { throw new Error('EPERM'); } }), 'unknown');
   for (const junk of [null, undefined, '0', '1001', 1.5, NaN, Infinity, -0.5, {}]) {
     assert.equal(readEffectiveUid({ getuid: () => junk }), 'unknown', `${JSON.stringify(junk) ?? 'undefined'} is not a uid`);
   }
 
-  // PASSWORDLESS SUDO. Fail closed: 'unavailable' is claimed ONLY for an
-  // outcome that positively says the request was denied. Everything else —
-  // including a missing binary, which looks reassuring and proves nothing
-  // about what a hostile command could install or find on PATH — reads as
-  // available.
-  const sudo = (result) => probePasswordlessSudo({
-    run: () => { if (result instanceof Error) throw result; return result; },
+  // SUDO, BY EXISTENCE AND NEVER BY BEHAVIOUR (Codex T6 r9, Critical).
+  //
+  // The round-8 probe ran `sudo -n true` and read a denial as "no sudo here".
+  // That was unsound twice over. Sudoers rules are COMMAND-SPECIFIC, so a
+  // principal holding `NOPASSWD: /usr/bin/env` is denied `true` and cleared
+  // admission while retaining a usable route to root. And a fake `sudo` earlier
+  // on PATH could print "a password is required", exit 1, and GRANT strict
+  // admission while the real /usr/bin/sudo stayed reachable — a probe whose
+  // failure mode is granting is worse than no probe at all.
+  //
+  // So: a sudo binary EXISTING at a trusted absolute path denies, full stop. No
+  // execution, no PATH resolution, no interpretation of output.
+  const sudoAt = (present, { platform = 'linux', throws = null } = {}) => detectSudoBinary({
+    platform,
+    statPath: (candidate) => {
+      if (throws) throw throws;
+      if (Object.hasOwn(present, candidate)) return present[candidate];
+      return 'absent';
+    },
   });
-  assert.equal(sudo({ status: 1, stderr: 'sudo: a password is required\n' }), 'unavailable');
-  assert.equal(sudo({ status: 1, stderr: 'ci is not in the sudoers file.  This incident will be reported.\n' }), 'unavailable');
-  assert.equal(sudo({ status: 0, stderr: '' }), 'available', 'it worked — that is the dangerous case');
-  assert.equal(sudo({ status: 1, stderr: 'sudo: a terminal is required to read the password\n' }), 'available', 'non-zero but ambiguous');
-  assert.equal(sudo({ status: 1, stderr: '' }), 'available', 'non-zero with no explanation at all');
-  assert.equal(sudo({ status: 7, stderr: 'something else entirely\n' }), 'available');
-  assert.equal(sudo({ error: Object.assign(new Error('spawn sudo ENOENT'), { code: 'ENOENT' }), status: null, stderr: '' }), 'available', 'no sudo binary is not proof of no sudo');
-  assert.equal(sudo({ error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }), status: null, stderr: 'sudo: a password is required\n' }), 'available', 'a timed-out probe answers nothing, whatever it managed to print');
-  assert.equal(sudo({ status: null, signal: 'SIGKILL', stderr: '' }), 'available', 'killed mid-probe');
-  assert.equal(sudo(new Error('spawn threw')), 'available', 'a throwing probe');
-  for (const junk of [undefined, null, 'nope', 0, { status: '1', stderr: 'sudo: a password is required' }]) {
-    assert.equal(sudo(junk), 'available', `${JSON.stringify(junk) ?? 'undefined'} is not a denial`);
+  // Each trusted path denies on its own.
+  for (const candidate of ['/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo']) {
+    assert.equal(sudoAt({ [candidate]: 'present' }), `present: ${candidate}`, `${candidate} denies`);
   }
+  // All of them, named, so the diagnostic is not a guess.
+  assert.equal(
+    sudoAt({ '/usr/bin/sudo': 'present', '/bin/sudo': 'present' }),
+    'present: /usr/bin/sudo, /bin/sudo',
+  );
+  // The only clearing reading: every trusted path positively absent.
+  assert.equal(sudoAt({}), 'absent');
+  // Anything unreadable is a reading this code does not have.
+  assert.equal(sudoAt({ '/usr/bin/sudo': 'unreadable' }), 'unknown', 'an unstattable path denies');
+  assert.equal(sudoAt({ '/bin/sudo': 'unreadable' }), 'unknown');
+  assert.equal(sudoAt({}, { throws: new Error('EACCES') }), 'unknown', 'a throwing stat denies');
+  assert.equal(sudoAt({ '/usr/bin/sudo': 'nonsense' }), 'unknown', 'a reading this code does not recognise denies');
+  // A present binary still reports as present even when another path is
+  // unreadable: the more specific finding is the more useful diagnostic, and
+  // both deny anyway.
+  assert.equal(
+    sudoAt({ '/usr/bin/sudo': 'present', '/bin/sudo': 'unreadable' }),
+    'present: /usr/bin/sudo',
+  );
+  // Non-Linux has no such thing as these paths, and "not Linux" is not "no
+  // route to root" — this action's boundary claim is Linux-only.
+  assert.equal(sudoAt({}, { platform: 'win32' }), 'unknown');
+  assert.equal(sudoAt({}, { platform: 'darwin' }), 'unknown');
 
   // OWN CAPABILITIES, from /proc/self/status. PERMITTED counts as much as
   // EFFECTIVE: a permitted-but-not-effective capability is one syscall away
@@ -624,7 +798,7 @@ test('the default reaches the refusal on a host that establishes nothing', async
     outputDir,
     projectRoot: makeTempDir(),
     env: {},
-    probeAdmission: () => admissionOf({ sudo: 'available' }),
+    probeAdmission: () => admissionOf({ sudo: 'present: /usr/bin/sudo' }),
     spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
   }));
   assert.equal(result, 3, 'the default refused');
@@ -636,7 +810,7 @@ test('the default reaches the refusal on a host that establishes nothing', async
     outputDir: makeTempDir(),
     projectRoot: makeTempDir(),
     env: {},
-    probeAdmission: () => admissionOf({ sudo: 'available' }),
+    probeAdmission: () => admissionOf({ sudo: 'present: /usr/bin/sudo' }),
     // Reaching the collector is exactly how far this half needs to go: the
     // gate let it through, which is the property under test.
     spawnShim: () => { throw new Error('past the gate'); },
@@ -677,7 +851,8 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
     // boundary, and both ways forward.
     assert.match(written, new RegExp(`same-UID ptrace policy: ${policy}`), `${policy}: names what it found`);
     assert.match(written, /refusing to run the wrapped command/);
-    assert.match(written, /passwordless sudo/, 'the hosted-runner reason is stated, not implied');
+    assert.match(written, /NO sudo binary at \/usr\/bin\/sudo/, 'the sudo policy is stated as existence, not behaviour');
+    assert.match(written, /hosted execution stays best-effort/, 'the hosted-runner consequence is stated, not implied');
     assert.match(written, /bpf_probe_write_user/, 'and the non-ptrace route root opens (Codex T6 r8)');
     assert.match(written, /not a proof that no route exists/i, 'the check states its own limits');
     assert.match(written, /evidence-trust: best-effort/, 'the opt-out is named');
@@ -699,9 +874,9 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
   // diagnostic names the condition that actually blocked (Codex T6 r8 #1).
   for (const [route, blocked] of [
     [{ uid: 'root' }, 'effective uid: root'],
-    [{ sudo: 'available' }, 'passwordless sudo: available'],
+    [{ sudo: 'present: /usr/bin/sudo' }, 'sudo binary: present: /usr/bin/sudo'],
     [{ capabilities: 'CAP_BPF' }, 'privileged capabilities: CAP_BPF'],
-    [{ ptrace: 'permissive', uid: 'root', sudo: 'available', capabilities: 'CAP_SYS_ADMIN' }, 'privileged capabilities: CAP_SYS_ADMIN'],
+    [{ ptrace: 'permissive', uid: 'root', sudo: 'present: /bin/sudo', capabilities: 'CAP_SYS_ADMIN' }, 'privileged capabilities: CAP_SYS_ADMIN'],
   ]) {
     const outputDir = makeTempDir();
     const { result, written } = await captureStderr(() => startSubcommand({
@@ -830,7 +1005,7 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
     ['ptrace permissive', admissionOf({ ptrace: 'permissive' }), true],
     ['ptrace unknown', admissionOf({ ptrace: 'unknown' }), true],
     ['root', admissionOf({ uid: 'root' }), true],
-    ['passwordless sudo', admissionOf({ sudo: 'available' }), true],
+    ['a sudo binary', admissionOf({ sudo: 'present: /usr/bin/sudo' }), true],
     ['CAP_BPF', admissionOf({ capabilities: 'CAP_BPF' }), true],
     ['no record at all', undefined, true],
   ]) {
@@ -855,16 +1030,21 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
     // The caveat names the condition that actually blocked, so a reader can
     // tell "this host permits ptrace" from "this host handed the job root".
     if (expectStamp) {
-      const blockers = record?.blockers ?? ['no usable admission record'];
-      for (const blocker of blockers) {
+      for (const blocker of admissionBlockers(record)) {
         assert.ok(json.caveats[0].includes(blocker), `${label}: the caveat names ${blocker}`);
       }
-      // And the limit of the check travels with it, on every surface.
-      assert.ok(json.caveats.some((caveat) => /not a proof that no route exists/i.test(caveat)),
-        `${label}: json states what the check does not prove`);
-      assert.match(markdown, /> \*\*Caveat:\*\*[^\n]*not a proof that no route exists/i,
-        `${label}: and so does the markdown`);
     }
+    // The ADMISSION RECORD and the limits of the check are mirrored on EVERY
+    // run, admitted ones included (Codex T6 r9 #3). The artifact's copy is
+    // only meaningful because start streamed an identical one before the
+    // command existed; a reader compares the two, and cannot compare what the
+    // artifact does not carry.
+    assert.ok(json.caveats.some((caveat) => caveat.includes('ADMISSION RECORD')),
+      `${label}: the record is mirrored into the report`);
+    assert.ok(json.caveats.some((caveat) => /not a proof that no route exists/i.test(caveat)),
+      `${label}: json states what the check does not prove`);
+    assert.match(markdown, /> \*\*Caveat:\*\*[^\n]*ADMISSION RECORD/,
+      `${label}: and the markdown carries it too`);
   }
 });
 
@@ -1436,8 +1616,15 @@ test('run re-registers the session token with the runner before handing it to a 
   // has come and gone — which is the shape of the whole step.
   assert.equal(ledger[0], `::add-mask::${sessionToken}\n`);
   assert.equal(ledger[1], 'spawn');
-  assert.match(ledger[2], /^evidence-sha256 session\.log=[0-9a-f]{64} /);
-  assert.equal(ledger.length, 3);
+  const digestEntry = ledger.findIndex((entry) => entry.startsWith('evidence-sha256'));
+  assert.ok(digestEntry > 1, 'the digest comes after the spawn, not before it');
+  assert.match(ledger[digestEntry], /^evidence-sha256 session\.log=[0-9a-f]{64} /);
+  // The only thing between them is the admission record run mirrors beside the
+  // digest, and nothing follows it.
+  for (const entry of ledger.slice(2, digestEntry)) {
+    assert.ok(entry.startsWith('evidence-qualification'), `unexpected ledger entry: ${entry}`);
+  }
+  assert.equal(ledger.length, digestEntry + 1);
 });
 
 test('httpRequestJson always settles: a lying Content-Length, a trickling peer, and an over-cap body all reject', async () => {
@@ -1802,7 +1989,7 @@ test('run captures the session from the collector, renders md+json, emits output
     const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
       .map((file) => `${file}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, file))).digest('hex')}`)
       .join(' ')}`;
-    assert.deepEqual(printed, [`${expected}\n`], 'exactly one digest line, over the bytes actually staged');
+    assertOneDigest(printed, expected, 'over the bytes actually staged');
     assert.ok(outputs.includes(`evidence-digest=${expected}\n`),
       'and the same content on the machine surface, so either can be compared against the artifact');
     assert.equal(state.collectorAlive, true, 'the collector answered an authenticated challenge');
@@ -1959,7 +2146,7 @@ const captureStderr = async (body) => {
   const original = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
   try {
-    const result = await body();
+    const result = await body(() => written.join(''));
     return { result, written: written.join('') };
   } finally {
     process.stderr.write = original;
@@ -2962,7 +3149,7 @@ test('render and digest never re-read the staged path: the payload is one immuta
   const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
     .map((file) => `${file}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, file))).digest('hex')}`)
     .join(' ')}`;
-  assert.deepEqual(printed, [`${expected}\n`]);
+  assertOneDigest(printed, expected);
   assert.ok(readFileSync(githubOutput, 'utf8').includes(`evidence-digest=${expected}\n`));
 });
 
@@ -2978,7 +3165,7 @@ test('a swap after staging is DETECTABLE: the logged digests still describe what
     });
     assert.equal(code, 0);
     const evidenceDir = evidenceDirOf(context.outputDir);
-    const logged = printed[0].trim();
+    const logged = assertOneDigest(printed).trim();
     // The window this cannot close: staging and upload are separate steps of
     // one composite action, same user, so a detached child can still rewrite
     // these files. What it CAN do is make that rewrite visible — the step log
@@ -3026,8 +3213,7 @@ test('the digests are computed from the payload, not from the sink: a lossy writ
     writeStdout: (text) => printed.push(text),
   });
   assert.equal(code, 0);
-  assert.equal(printed.length, 1);
-  const logged = printed[0].trim();
+  const logged = assertOneDigest(printed).trim();
   assert.ok(logged.includes(`session.log=${createHash('sha256').update(captured, 'utf8').digest('hex')}`),
     'the logged digest is the one over the captured bytes');
   for (const name of ['session.log', 'report.md', 'report.json']) {
@@ -4351,8 +4537,30 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     // is the one that reads naturally and would drift back.
     {
       what: 'what a strict admission buys',
-      required: /after a\s+successful strict admission, run'?s account is authenticated: the artifact\s+plus the matching digest from its step log is the trust unit/i,
+      required: /after a\s+successful strict admission, run'?s account is authenticated/i,
       forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)(?![^.]*strict)/i,
+    },
+    // THE TRUST UNIT HAS THREE PARTS (Codex T6 r9 #3). An artifact plus a
+    // digest is forgeable end to end by a command that can rewrite the process
+    // producing both; what makes the pair mean anything is the pre-command
+    // admission record streamed by `start`, which no later process can retract.
+    // The two-part wording is the exact form rounds 7 and 8 shipped, so it is
+    // the forbidden half.
+    {
+      what: 'that the trust unit has three parts',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /admission record[^.]{0,80}digest[^.]{0,80}artifact/i,
+      forbidden: /the artifact plus the matching digest from its step log is the trust unit|the artifact plus the matching digest is the (?:trust unit|unit of trust)/i,
+    },
+    // SUDO IS DETECTED BY EXISTENCE, NEVER BY BEHAVIOUR (the r9 Critical).
+    // Probing one command cannot establish absence — sudoers rules are
+    // command-specific — and a PATH-planted fake can fabricate a denial that
+    // GRANTS admission. The forbidden half names the round-8 design.
+    {
+      what: 'that sudo is detected by existence, not behaviour',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /any sudo binary at a trusted absolute path denies/i,
+      forbidden: /(?:probing|running|executing) [`']?sudo[`']?[^.]{0,40}(?:establishes|proves|shows|confirms|is enough|is sufficient)|no passwordless sudo(?![^.]*(?:cannot|does not|is not))/i,
     },
     {
       what: 'what best-effort does NOT buy',
