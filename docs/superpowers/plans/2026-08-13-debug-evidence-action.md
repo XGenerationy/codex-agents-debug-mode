@@ -3179,6 +3179,66 @@ it" guidance belongs in Task 8's README, and is added to the hard T8 requirement
 Fix commit message:
 `fix(action): pin the render cap by import and guard caveat authoring margin (round-11 residuals)`.
 
+#### Task 6 fix round 13 — Codex re-review decisions on r11+r12 (recorded before code moves)
+
+Codex on `fbaf8d6` + `f2c3ef6`: empty `PATH` is correctly denied and distinct from
+an unset one; the static caveat split, regime gate, nonce wording, cap export and
+margin concept all work FOR THE ENUMERATED FIXTURES; the `PATH=''` remediation
+belongs in Task 8's README (placement confirmed); no duplicate test is needed in
+`debug_report.test.js` — the cross-component action test is the correct owner; and
+the record volume plus a rendered README example remain acceptable **once
+producer-derived findings are bounded**. Important ×1, Minor ×1.
+
+1. **The truncation class is still reachable: the sudo finding embeds raw,
+   unbounded, unsanitised PATH bytes (Important).** `detectSudoBinary` joins every
+   matching candidate verbatim into the reading, the vocabulary accepts arbitrary
+   length and multiline values, and `admissionCaveats` inserts that value into the
+   admission record. Codex's two production probes: a legitimate 362-character
+   nested absolute candidate produced a **579-character caveat**, truncated by
+   `report.md` at the 500 cap; and a candidate containing a **newline** produced
+   `present: /tmp/evil\nFORGED-LINE/sudo`, which PASSED admission validation and
+   split the supposedly single-line record. The round-11/12 guards only exercised
+   short hand-written findings, so "every generated caveat stays below the cap" —
+   and the spec's "each generated caveat is one short statement" — are false for
+   values the real detector produces. **Note the proximate cause is ours:** round
+   10 widened the sudo vocabulary from `\/\S+` to `\/[^,]+` to accommodate
+   directories containing spaces, and that widening is what admitted unbounded,
+   multiline content. Decisions:
+   - **The persisted sudo reading becomes fixed-size and single-line.** No raw
+     PATH bytes enter the admission record, the refusal diagnostic, or any
+     caveat — anywhere. Vocabulary: `absent`; `present: <count> at
+     sha256=<64 hex>`; `unknown: empty-or-relative PATH entry`; `unknown`. The
+     hash is SHA-256 over the sorted, NUL-joined matched candidate paths, so two
+     hosts with the same sudo set hash identically and an operator can recompute
+     it from their own listing without us disclosing anything.
+   - **The vocabulary regexes become strict and anchored** — that is what makes
+     "fixed-size, single-line" enforceable rather than aspirational. Anything not
+     matching is an unreadable record ⇒ deny. Round 10's lesson applies directly:
+     a vocabulary widened for a display convenience is a hole.
+   - **We deliberately do NOT emit the matched paths anywhere.** The actionable
+     fact is "sudo exists on this host, so strict is impossible here"; the
+     operator does not need our list to act, and Task 8 documents where the
+     inspection looks. Emitting them sanitised would rebuild the injection surface
+     for no decision-relevant gain.
+   - **Sweep every other reading for the same property.** `ptrace`, `uid` and
+     `capabilities` are believed bounded (fixed labels / a fixed capability set),
+     but that must be PROVEN at the field level, not assumed: each reading gets an
+     anchored vocabulary and a test that a producer-derived value cannot exceed
+     it.
+   - **Tests must run through the real producer chain**, which is the gap that
+     hid this: `detectSudoBinary → evaluateAdmission → admissionCaveats →
+     renderMarkdown`, with a long-absolute-path case and a newline-path case,
+     asserting a single line, within the authoring margin, no raw bytes present,
+     no truncation marker, and vocabulary accepted. Mutation: interpolate the raw
+     paths again ⇒ both the length and the injection assertions go red.
+2. **The sentinel's comment contradicts the observed mutation (Minor).** It says
+   an undefined cap makes every length silently pass; in fact `length <= NaN` is
+   false, so the guard fails loudly but incoherently — which is the round-12
+   finding, and the comment predates it. Rewrite the comment to match.
+
+Fix commit message:
+`fix(action): bound the sudo reading to fixed-size single-line metadata (Codex T6 r13)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

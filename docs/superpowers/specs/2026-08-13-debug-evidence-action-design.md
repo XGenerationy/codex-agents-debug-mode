@@ -277,7 +277,13 @@ under a successful strict admission.)* **The trust regime depends on
   deleting the limitation from the human surface while the JSON and the logs
   still carried it. Each generated caveat is therefore one short statement, and
   the guarantee is asserted against RENDERED Markdown rather than against the
-  caveat strings)*. *(Added, round
+  caveat strings)* *(tightened, round 13: "short" has to be structural, not
+  editorial. A caveat is built only from fixed vocabulary and BOUNDED metadata —
+  producer-derived values are never interpolated into a record. Raw matched
+  `sudo` paths were, and a legitimate 362-character path produced a 579-character
+  caveat the renderer truncated, while a path containing a newline split the
+  single-line record entirely. Each reading now has an anchored, fixed-size
+  vocabulary; anything outside it is an unreadable record and denies)*. *(Added, round
   10.)* The action verifies NONE of the correspondence between the three pieces:
   the comparison is external and manual, and is only meaningful between copies
   carrying the same invocation nonce — which every copy of the record states.
