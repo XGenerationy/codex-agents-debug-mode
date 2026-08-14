@@ -3384,6 +3384,73 @@ Fix commit message:
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
 
+> **TASK 6 CLOSED.** Codex approved `1c65825` after SIXTEEN fix rounds (four
+> Criticals, five Importants, plus the round-14 structural generalisation). It
+> independently reconstructed the digest byte-for-byte. Task 6 final state: the
+> composite wires `setup-node → start → run → report → upload → teardown →
+> finish`; strict admission is a four-way conjunction (Yama mode 3, non-root
+> euid, no `sudo` binary at any conventional path or on the inherited `PATH`, no
+> dangerous capability) with every unevaluable probe denying; `evidence-trust`
+> defaults to `strict` and REFUSES on the default hosted configuration; the
+> admission record streams from `start` before the wrapped command exists and is
+> mirrored beside the digest and into the artifact; every reading passes one
+> structural gate (printable ASCII, ≤ 128 chars) before any vocabulary is
+> consulted.
+>
+> **TASK 9 GATES — Codex's cross-cutting checks, with its allocation. Recorded
+> here because Tasks 7 and 8 must BUILD toward them rather than discover them
+> late.**
+> 1. **Live runner semantics** *(Task 7 absorbs)* — run the best-effort dogfood
+>    and the benign two-invocation namespacing scenario on real GitHub Actions;
+>    confirm per-call `steps.start.outputs.*`, `GITHUB_OUTPUT`, `always()`
+>    guards, artifact paths, teardown, and output isolation on the real runner.
+> 2. **Consumer-side trust-unit reconstruction** *(Task 8 absorbs)* — from a real
+>    run's logs and downloaded artifact, manually select exactly one start
+>    admission record and one run digest block SHARING A NONCE, reject
+>    duplicate/conflicting records or digest lines, recompute every staged-file
+>    SHA-256, and confirm the five action outputs are unnecessary and
+>    attacker-suppressible.
+> 3. **End-to-end failure matrix** *(live portion → Task 7; rest → Task 9)* —
+>    invalid input, strict refusal, collector loss, authentication failure,
+>    renderer failure, ordinary non-zero exit, signal termination, and
+>    `fail-on-command-failure: false`. Verify no later step turns an integrity
+>    failure green and that partial artifacts match the documented rules.
+> 4. **Credential and artifact census** *(Task 8 absorbs)* — inspect child
+>    environment, state, logs, Step Summary and the uploaded archive TOGETHER:
+>    no launch token, session token, private signing material, verification-key
+>    fallback, or `action-state.json` crosses an unauthorised boundary, and the
+>    archive contains only the three enumerated payload names.
+> 5. **Cross-module byte contract** *(Task 9)* — collector response bytes,
+>    Ed25519 proof verification, in-memory rendering, report JSON/Markdown,
+>    printed digests and uploaded bytes verified as ONE chain, including
+>    escaping, caveat caps, malformed events and maximum-size captures.
+> 6. **Documentation reconciliation** *(Task 8 absorbs)* — semantically compare
+>    `action.yml`, the action README, the repo README, `SKILL.md`, the design
+>    spec, the demo and the log grammar; Task 8's strict/best-effort claims need
+>    their own positive-and-negative polarity pins, covering all seven hard
+>    requirements.
+> 7. **Residuals stay explicit** *(Task 8 absorbs)* — documentation must still
+>    disclose same-job adversarial reuse, staging accumulation, command-planted
+>    files, uploader symlink following, the staging race, manually compared
+>    admission records, and the checked-routes-not-proof limitation.
+>
+> **TASK 7 ADAPTATION NOTES — the block below predates Task 6.**
+> 1. The demo workflow MUST set `evidence-trust: best-effort` with a comment
+>    saying why (hosted runners ship `sudo`, so strict refuses). The round-7
+>    "harden with `sysctl` and demonstrate strict" scenario is WITHDRAWN — round
+>    8 established mode 3 does not survive passwordless `sudo`, so a sysctl-only
+>    strict demo would advertise a false guarantee.
+> 2. Add a **two-invocation namespacing job**: two calls in one job sharing an
+>    output directory with DISTINCT artifact names, one of them with a failing
+>    `start`. Label it NAMESPACING ONLY — expression scoping, explicitly NOT
+>    adversarial isolation (Codex ruling, Task 6 round 2).
+> 3. The wrapped command's env contract is unchanged, but `run` now strips the
+>    runner control plane (`GITHUB_ENV`/`PATH`/`OUTPUT`/`STATE`/`STEP_SUMMARY`)
+>    in addition to `DEBUG_ACTION_*` — the demo must not depend on any of them.
+> 4. The demo's exit-1 seeded failure now interacts with `evidence-trust`: the
+>    job stays green only via `fail-on-command-failure: "false"`, and the
+>    admission record will appear in the Step Summary and artifact. Expect it.
+
 **Files:**
 - Create: `actions/debug-evidence/demo/repro.js`
 - Create: `.github/workflows/debug-evidence-demo.yml`
