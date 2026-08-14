@@ -267,3 +267,35 @@ test('CLI failure stays ONE line even when the ref (and the OS error quoting it)
   assert.ok(!result.stderr.slice(0, -1).includes('\n'), 'no embedded newline survives the collapse');
   assert.ok(result.stderr.startsWith('debug_report: cannot read session (forged line.log)'), 'newline became a space');
 });
+
+// A caveat is a label that must travel WITH the evidence. The action stamps one
+// on every report rendered on a host where the in-process guarantees its
+// capture rests on were not established (Codex T6 r5), the same doctrine as the
+// labeled unreachable-collector fallback: a reader who has the artifact and not
+// the job must still see it. Absent by default, so an ordinary report is
+// unchanged.
+test('caveats travel with the report: absent by default, verbatim in JSON, capped and prominent in the human surfaces', () => {
+  const entries = [{ raw: line({ msg: 'e' }), parsed: { msg: 'e' } }];
+  const plain = buildReport(entries, { sessionId: 'ci-debug-abc' });
+  assert.deepEqual(plain.caveats, [], 'no caveat unless one is passed');
+  assert.equal(renderMarkdown(plain).includes('Caveat'), false);
+  assert.equal(renderText(plain).includes('caveat'), false);
+
+  const caveat = 'in-process guarantees were NOT established on this host';
+  const flagged = buildReport(entries, { sessionId: 'ci-debug-abc', caveats: [caveat, '', 42, null] });
+  assert.deepEqual(flagged.caveats, [caveat], 'only non-empty strings survive');
+  assert.deepEqual(JSON.parse(renderJson(flagged)).caveats, [caveat]);
+  // Prominent: above the evidence, not buried under it.
+  const markdown = renderMarkdown(flagged);
+  assert.ok(markdown.includes(`> **Caveat:** ${caveat}`));
+  assert.ok(markdown.indexOf('Caveat') < markdown.indexOf('Last events'), 'ahead of the evidence it qualifies');
+  assert.ok(renderText(flagged).includes(`caveat: ${caveat}`));
+
+  // Same discipline as every other rendered value: escaped, capped on the
+  // human surfaces, whole on the machine one.
+  const hostile = buildReport(entries, { caveats: [`${'x'.repeat(600)}<script>`] });
+  assert.equal(JSON.parse(renderJson(hostile)).caveats[0].length, 608, 'the machine surface is never capped');
+  const hostileMarkdown = renderMarkdown(hostile);
+  assert.equal(hostileMarkdown.includes('<script>'), false, 'rendered caveats are escaped like any other text');
+  assert.ok(hostileMarkdown.includes('…'), 'and the truncation is announced');
+});

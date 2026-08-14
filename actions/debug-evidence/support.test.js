@@ -24,6 +24,7 @@ const {
   finishSubcommand,
   httpRequestJson,
   maskValue,
+  readPtraceScope,
   readState,
   redactKnownSecrets,
   reportSubcommand,
@@ -163,7 +164,9 @@ const servedEntry = (line) => ({ raw: JSON.stringify(line), parsed: line });
 
 // Capture happens inside `run` now: it is the only process whose environment
 // was resolved before the wrapped command existed, so it is the only one whose
-// view of the verification key that command cannot rewrite (Codex T5 r6).
+// view of the verification key that command cannot rewrite through any
+// ordinary interface, on a host that refuses same-UID ptrace attachment
+// (Codex T5 r6, scoped T6 r5).
 // Every capture test therefore drives run, with a wrapped command that does
 // nothing unless the test needs it to.
 const captureViaRun = (options) => runSubcommand({
@@ -368,6 +371,102 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // missing identity must mean "do not read, do not act" (Codex T6 r1 #2).
 // `finish` takes the same posture: it reads the same state file, and an exit
 // code it cannot show belongs to this invocation is not this job's verdict.
+// THE PLATFORM PREREQUISITE (Codex T6 r5). Every in-process guarantee this
+// action rests on — the trusted run process, the verification key held in
+// memory, the collector's private signing key — assumes the host REFUSES
+// classic same-UID ptrace attachment. Under Linux Yama ptrace_scope 0 a
+// same-user process may attach to any dumpable process of the same user and,
+// per the kernel documentation, inject code: a hostile native wrapped command
+// could then rewrite `run`'s memory or read the collector's signing state
+// (its pid is in the state file), and authenticated evidence would mean
+// nothing. The action cannot create that boundary. It detects the policy,
+// records it, and labels the evidence when it is not established.
+test('the ptrace policy is read once, classified conservatively, and never guessed in favour of the host', () => {
+  const scope = (raw, platform = 'linux') => readPtraceScope({
+    platform,
+    readFile: () => {
+      if (raw instanceof Error) throw raw;
+      return raw;
+    },
+  });
+  // The prerequisite is met at 1 (restricted), 2 (admin-only) and 3 (no
+  // attach), and only at those.
+  assert.equal(scope('1\n'), 'restricted');
+  assert.equal(scope('2\n'), 'restricted');
+  assert.equal(scope('3'), 'restricted');
+  // Classic same-UID attachment permitted: the guarantees do not hold here.
+  assert.equal(scope('0\n'), 'permissive');
+  // Everything else is UNKNOWN, never "met": a policy this action could not
+  // read is not a policy it may assume in the host's favour.
+  for (const unreadable of [Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), '', '  ', 'yes', '-1', '1x']) {
+    assert.equal(scope(unreadable), 'unknown', `unreadable input ${JSON.stringify(String(unreadable))}`);
+  }
+  // A host with no Yama at all is unknown too, whatever a file at that path
+  // might happen to say.
+  assert.equal(scope('1\n', 'win32'), 'unknown');
+  assert.equal(scope('1\n', 'darwin'), 'unknown');
+});
+
+test('start records the ptrace policy in state and warns prominently when the prerequisite is not met', async () => {
+  for (const [policy, expectWarning] of [['restricted', false], ['permissive', true], ['unknown', true]]) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    const port = await getFreePort();
+    const { written } = await captureStderr(async () => {
+      const code = await startSubcommand({
+        inputs: baseInputs({ port: String(port) }),
+        outputDir,
+        projectRoot,
+        env: {},
+        ptraceScope: policy,
+      });
+      assert.equal(code, 0, `${policy}: a weaker platform is not a failure`);
+    });
+    try {
+      assert.equal(readState(outputDir).ptraceScope, policy, `${policy}: recorded for the steps that label the evidence`);
+      assert.equal(
+        /WARNING: the in-process guarantees this action's evidence rests on are NOT established/.test(written),
+        expectWarning,
+        `${policy}: the step log warns exactly when the prerequisite is unmet`,
+      );
+      if (expectWarning) assert.match(written, new RegExp(`same-UID ptrace policy: ${policy}`));
+    } finally {
+      teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
+    }
+  }
+});
+
+test('run stamps the rendered evidence with the platform caveat, and omits it only when the prerequisite is met', async () => {
+  const served = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }];
+  for (const [policy, expectStamp] of [['restricted', false], ['permissive', true], ['unknown', true], [undefined, true]]) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    writeState(outputDir, {
+      nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+      projectRoot, failOnCommandFailure: 'true', ptraceScope: policy,
+    });
+    const code = await captureViaRun({ outputDir, env: RUN_ENV, readLive: collectorAnswer(served) });
+    assert.equal(code, 0, `${policy}: labeling is not refusing`);
+    const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
+    const markdown = readFileSync(path.join(evidenceDir, 'report.md'), 'utf8');
+    const json = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    // The label travels WITH the artifact, on both surfaces — a reader who has
+    // the evidence and not the job log must still see it.
+    assert.equal(/> \*\*Caveat:\*\*[^\n]*in-process guarantees were NOT established/.test(markdown), expectStamp,
+      `${policy}: markdown stamp`);
+    assert.equal(
+      json.caveats.some((caveat) => caveat.includes('in-process guarantees were NOT established')),
+      expectStamp,
+      `${policy}: json stamp`,
+    );
+    if (expectStamp) {
+      // An absent record is labeled as UNKNOWN rather than silently trusted:
+      // state written by an older start, or by anything else, may not carry it.
+      assert.ok(json.caveats[0].includes(`same-UID ptrace policy: ${policy ?? 'unknown'}`), `${policy}: names what was found`);
+    }
+  }
+});
+
 test('teardown and finish refuse to touch recorded state when no invocation nonce reached the step', async () => {
   const outputDir = makeTempDir();
   writeState(outputDir, {
@@ -2725,8 +2824,11 @@ test('a wrapped command that poisons every later step\'s environment changes not
     };
     for (const file of [files.envFile, files.githubOutput, files.stepSummary]) writeFileSync(file, '');
     // The environment the runner resolved for the RUN step, before the wrapped
-    // command existed. A child cannot rewrite its parent's memory, so this is
-    // the one view of the key the command below cannot touch. The nonce is in
+    // command existed. An ordinary child has no interface for writing into
+    // its parent's address space, so this is the one view of the key the
+    // command below cannot touch — on a host that refuses same-UID ptrace
+    // attachment, which is the prerequisite start detects and labels. The
+    // nonce is in
     // here because the runner injects it into every step after `start`, and
     // the poisoned later-step environment below is derived from this one.
     const runStepEnv = {
@@ -3760,6 +3862,36 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   // tracked README already carries the warning — there is none (Codex T6 r4 #3).
   assert.match(commentary, /task 8'?s? readme must say so/i);
   assert.doesNotMatch(commentary, /the readme (?:says|already says) so/i);
+  // The platform prerequisite, pinned the same way (Codex T6 r5). Three rounds
+  // running, the same shape has surfaced: a conditional guarantee written as an
+  // absolute one. So the condition is pinned by polarity too — its presence,
+  // and the absence of the unconditional forms it replaced.
+  const platformClaims = [
+    {
+      what: 'the ptrace prerequisite',
+      required: /it holds only where the host refuses classic same-uid ptrace attachment/i,
+      forbidden: /(?:regardless of|whatever) the host'?s? ptrace|on any host/i,
+    },
+    {
+      what: 'what a permissive host costs',
+      required: /can attach to this process[^.]*and read or inject memory, which defeats\s+authenticated evidence/i,
+      forbidden: /(?:ptrace|attachment) (?:is|remains) (?:irrelevant|not a concern|out of scope entirely)/i,
+    },
+    {
+      what: 'the labeling behaviour, not a claim to have created the boundary',
+      required: /the action labels that platform; it cannot\s+create the boundary on it/i,
+      forbidden: /the action (?:creates|establishes|enforces) (?:that|the) boundary/i,
+    },
+    {
+      what: 'the scope of the in-process claim',
+      required: /that claim is about those values and nothing else/i,
+      forbidden: /view of the world the command (?:it runs )?cannot influence/i,
+    },
+  ];
+  for (const claim of platformClaims) {
+    assert.match(commentary, claim.required, `the run step must state ${claim.what}`);
+    assert.doesNotMatch(commentary, claim.forbidden, `the run step must not reverse ${claim.what}`);
+  }
 });
 
 test('the output-dir default expression is byte-identical at every site, and there are exactly five', () => {

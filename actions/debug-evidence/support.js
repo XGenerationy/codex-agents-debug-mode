@@ -27,6 +27,49 @@ const EVIDENCE_SUBDIR = 'debug-evidence-files';
 const BOOT_SHIM = path.join(__dirname, 'collector_boot.js');
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
+// THE PLATFORM PREREQUISITE, detected rather than assumed (Codex T6 r5).
+//
+// Every in-process guarantee this action rests on — the trusted `run` process,
+// the verification key held only in its memory, the collector's private
+// signing key — assumes the host REFUSES classic same-UID ptrace attachment.
+// Under Linux Yama `ptrace_scope = 0` a same-user process may attach to any
+// dumpable process of the same user, and the kernel documentation names
+// arbitrary code injection as a consequence: a hostile native wrapped command
+// could rewrite `run`'s memory or read the collector's signing state (its pid
+// is in the state file), and "authenticated evidence" would mean nothing.
+//
+// The action cannot create that boundary — making the processes non-dumpable
+// would not stop a caller who granted CAP_SYS_PTRACE — so it does the next
+// honest thing: read the policy once, record it, and label the evidence when
+// it is not established. Classification is conservative in one direction only.
+// `restricted` requires a value this code positively understood; EVERYTHING
+// else, including a file it could not read, a value it could not parse and a
+// platform with no Yama at all, is `unknown` and labels the evidence. A policy
+// that could not be read is never a policy assumed in the host's favour.
+const PTRACE_SCOPE_PATH = '/proc/sys/kernel/yama/ptrace_scope';
+const readPtraceScope = ({ platform = process.platform, readFile = readFileSync } = {}) => {
+  if (platform !== 'linux') return 'unknown';
+  let raw;
+  try {
+    raw = readFile(PTRACE_SCOPE_PATH, 'utf8');
+  } catch {
+    return 'unknown';
+  }
+  const text = String(raw).trim();
+  // Digits only: '' parses to 0 under Number(), which would read an empty or
+  // truncated file as the WEAKEST policy and then report it as a fact.
+  if (!/^\d+$/.test(text)) return 'unknown';
+  return Number(text) >= 1 ? 'restricted' : 'permissive';
+};
+
+// The label that travels with the evidence. Empty when the prerequisite holds,
+// so an ordinary report is unchanged; otherwise one line naming exactly what
+// was found, rendered above the evidence it qualifies.
+const platformCaveats = (ptraceScope) => (ptraceScope === 'restricted' ? [] : [
+  `The in-process guarantees were NOT established on this host (same-UID ptrace policy: ${ptraceScope ?? 'unknown'}).`
+  + ' A same-user process may be able to attach to the collector or to the capturing step and read or alter the memory this evidence depends on.',
+]);
+
 // PATH SAFETY, not entropy. The invocation nonce is a directory-name segment
 // now, and it arrives from this step's environment: the unguessability comes
 // from randomUUID in `start`, while this pattern is what stops a '..', a
@@ -484,6 +527,7 @@ const startSubcommand = async ({
   request = httpRequestJson, probeToken = probeLaunchToken,
   writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
+  ptraceScope = readPtraceScope(),
 }) => {
   // THE FIRST THING THIS PROCESS DOES, ahead of validation and ahead of any
   // filesystem work: publish this invocation's identity as a STEP OUTPUT.
@@ -519,6 +563,17 @@ const startSubcommand = async ({
       'invocation-nonce': nonce,
       'evidence-dir': resolveEvidenceDir(outputDir, nonce),
     });
+  }
+  // Read once, here, and carried in state from now on: the policy cannot
+  // change under a running kernel, and every later step needs the same answer
+  // to label the same way. Warned about immediately — the step log is where an
+  // operator looks when a job's evidence turns out to be qualified — and NOT
+  // treated as a failure. A permissive host is a weaker platform, not a
+  // detected attack, and refusing would strand legitimate self-hosted callers
+  // with no way forward (Codex T6 r5; escalation to a refusal is the
+  // reviewer's call, not this code's assumption).
+  if (ptraceScope !== 'restricted') {
+    process.stderr.write(`debug-evidence-action: start: WARNING: the in-process guarantees this action's evidence rests on are NOT established on this host (same-UID ptrace policy: ${ptraceScope}). A same-user process may be able to attach to the collector or to the capturing step. The rendered evidence will carry this caveat.\n`);
   }
   const workspace = env.GITHUB_WORKSPACE || '';
   const errors = validateActionInputs({ ...inputs, outputDir, workspace });
@@ -652,6 +707,9 @@ const startSubcommand = async ({
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
+      // Detected here, consumed by `run` when it renders: the label belongs on
+      // the evidence, and only this step is in a position to have looked.
+      ptraceScope,
     }));
   } catch (error) {
     // Covers a failed lock acquisition too, and must: a collector whose state
@@ -812,8 +870,8 @@ const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', 
 // the report carry the real session id, which the CLI could only derive from
 // a filename — the staged copy is called session.log, so the CLI rendered
 // every report as "(file)".
-const defaultRenderReport = (sessionText, sessionId) => {
-  const report = buildReport(parseSessionText(sessionText), { sessionId });
+const defaultRenderReport = (sessionText, sessionId, { caveats = [] } = {}) => {
+  const report = buildReport(parseSessionText(sessionText), { sessionId, caveats });
   return { markdown: renderMarkdown(report), json: renderJson(report) };
 };
 
@@ -1071,10 +1129,25 @@ const RUNNER_COMMAND_FILE_VARS = [
 //
 // It is the only process in the job that spans the wrapped command's
 // execution: its environment was resolved by the runner before the command
-// existed, and a child cannot rewrite its parent's memory. So every decision
-// that must not be influenced by the command — which collector to believe,
-// whether an answer is authentic, what gets staged — is made here, on either
-// side of the command rather than in a later step the command can poison.
+// existed, and an ordinary child has no interface for writing into its
+// parent's address space. So every decision that must not be influenced by
+// the command — which collector to believe, whether an answer is authentic,
+// what gets staged — is made here, on either side of the command rather than
+// in a later step the command can poison.
+//
+// The claim is about THIS PROCESS'S OWN VALUES, and only about them. The
+// command influences plenty: it writes files, rewrites the state file, can
+// kill the collector, and authors every event in the log. What it cannot
+// reach is the copy this process read before the command started.
+//
+// And that much is CONDITIONAL on the platform (Codex T6 r5). It holds where
+// the host refuses classic same-UID ptrace attachment — Linux Yama
+// ptrace_scope >= 1, the default on GitHub-hosted runners. Where such
+// attachment is permitted, a hostile native command can attach to this
+// process, or to the collector whose pid is in state, and read or inject
+// memory; no in-process argument survives that. `start` detects the policy
+// and records it, and the evidence rendered below carries a caveat when it is
+// not established. The action labels the platform; it does not create it.
 //
 // This also means the verification key is read BEFORE the command runs. It is
 // public, so a child reading /proc/<ppid>/environ learns nothing it can use;
@@ -1128,7 +1201,9 @@ const runSubcommand = async ({
   // secrecy does not matter, but its INTEGRITY is everything — a same-user
   // process that could substitute its own public key would then sign answers
   // with the matching private one. This process's own memory, populated before
-  // the wrapped command exists, is the one channel that command cannot reach,
+  // the wrapped command exists, is the one channel that command cannot reach
+  // through any ordinary interface (and, where the host permits same-UID
+  // ptrace attachment, not even that holds — see the platform prerequisite),
   // so state and every other file on disk are excluded as sources by
   // construction (Codex T5 r5 #2, r6 #1). It is THIS invocation's command that
   // cannot reach it: a command an earlier invocation ran in the same job can
@@ -1269,7 +1344,15 @@ const runSubcommand = async ({
   if (evidenceCopied) {
     let rendered = null;
     try {
-      rendered = renderReport(payloads['session.log'], state.sessionId);
+      // The platform label is stamped ON the evidence, not merely logged
+      // beside it (Codex T6 r5) — the same doctrine as the labeled
+      // unreachable-collector fallback: whoever ends up holding report.md or
+      // report.json, with no access to the job that produced them, still has
+      // to know the in-process guarantees were not established. An absent
+      // record labels as `unknown`, never as met.
+      rendered = renderReport(payloads['session.log'], state.sessionId, {
+        caveats: platformCaveats(state.ptraceScope),
+      });
     } catch (error) {
       process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
     }
@@ -1557,6 +1640,7 @@ module.exports = {
   finishSubcommand,
   httpRequestJson,
   maskValue,
+  readPtraceScope,
   readShimStartLine,
   readState,
   redactKnownSecrets,

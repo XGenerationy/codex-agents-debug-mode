@@ -133,13 +133,34 @@ runs:
 
     - name: Run wrapped command
       # THE TRUSTED PROCESS. Its environment is resolved by the runner before
-      # the wrapped command exists, and a child cannot rewrite its parent's
-      # memory — so this is the only step whose view of the world the command
-      # IT runs cannot influence. Capture, hypothesis validation, rendering,
-      # hashing and staging all happen here, after the command returns, in
-      # this same process. (The emphasis is load-bearing: a command an EARLIER
-      # invocation ran in the same job reaches even this step's environment
-      # through BASH_ENV — see the scope note on the upload step.)
+      # the wrapped command exists, and an ordinary child has no interface for
+      # writing into its parent's address space — so the IN-PROCESS VALUES this
+      # step holds (the verification key it read at entry, the captured buffer,
+      # the verdict it reaches) are out of the reach of the command IT runs.
+      # Capture, hypothesis validation, rendering, hashing and staging all
+      # happen here, after the command returns, in this same process.
+      #
+      # That claim is about those values and nothing else. The command plainly
+      # influences the world around them: it writes files, rewrites state, can
+      # kill the collector, and authors every event that reaches the log. What
+      # it cannot do — under the prerequisite below — is change this process's
+      # own copy of what it read before the command started.
+      #
+      # PLATFORM PREREQUISITE, because the claim is conditional and the file
+      # must say so (Codex T6 r5): it holds only where the host REFUSES classic
+      # same-UID ptrace attachment (Linux Yama ptrace_scope >= 1, the default
+      # on GitHub-hosted runners). Where same-UID attachment is permitted
+      # (ptrace_scope = 0, or a container granted CAP_SYS_PTRACE) a hostile
+      # native command can attach to this process — or to the collector, whose
+      # pid is in the state file — and read or inject memory, which defeats
+      # authenticated evidence outright. `start` detects the policy and records
+      # it; when it is not established, the rendered report.md and report.json
+      # carry a caveat saying so. The action labels that platform; it cannot
+      # create the boundary on it.
+      #
+      # (One more limit, load-bearing: a command an EARLIER invocation ran in
+      # the same job reaches even this step's environment through BASH_ENV —
+      # see the scope note on the upload step.)
       #
       # DEBUG_ACTION_COLLECTOR_VERIFY_KEY is the collector's PUBLIC Ed25519
       # verification key, and it is wired HERE AND NOWHERE ELSE (spec Security

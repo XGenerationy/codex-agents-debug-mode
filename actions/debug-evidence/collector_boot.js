@@ -43,12 +43,15 @@ const main = () => {
   //
   // Only the PUBLIC half is handed back. A shared secret would have to sit in
   // the environment of the step that verifies — the `run` step since Task 5
-  // round 6 — which is the environment the wrapped command's own process tree
-  // inherits and a same-user child can read out of procfs. Whoever can read a
-  // symmetric key can sign with it, and signing is the whole capability this
-  // withholds (Codex T5 r5 #2). A public verification key gives a reader
-  // nothing. The private half is passed straight into the server and never
-  // serialized: it appears in no startup line, no state file, no output, no log.
+  // round 6. The wrapped command does NOT inherit that environment (run copies
+  // it and strips every DEBUG_ACTION_* entry before spawning), but it runs as
+  // a child of that step, and where the host's permissions allow it a child
+  // can read a parent's environment out of /proc/<ppid>/environ. Whoever can
+  // read a symmetric key can sign with it, and signing is the whole capability
+  // this withholds (Codex T5 r5 #2); a public verification key gives such a
+  // reader nothing. The private half is passed straight into the server and
+  // never serialized: it appears in no startup line, no state file, no output,
+  // no log.
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const server = createDebugServer({
     projectRoot,

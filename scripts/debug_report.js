@@ -56,7 +56,7 @@ const parseArgs = (args) => {
   return { positional, format };
 };
 
-const buildReport = (entries, { sessionId = null } = {}) => {
+const buildReport = (entries, { sessionId = null, caveats = [] } = {}) => {
   const folded = foldHypotheses(entries);
   let events = 0;
   let hypothesisLines = 0;
@@ -113,6 +113,12 @@ const buildReport = (entries, { sessionId = null } = {}) => {
     session: {
       id: sessionId, entries: entries.length, events, hypothesisLines, otherTypedLines,
     },
+    // Labels that have to travel WITH the evidence rather than living only in
+    // whatever log produced it: a reader holding the artifact and not the job
+    // must still see them. Callers pass the wording; this only guarantees the
+    // shape (non-empty strings, verbatim — the machine surface is never
+    // capped, exactly as for excerpts and hypothesis fields).
+    caveats: caveats.filter((caveat) => typeof caveat === 'string' && caveat !== ''),
     hypotheses,
     untaggedEvents,
     excerpts,
@@ -150,6 +156,12 @@ const renderMarkdown = (report) => {
   const id = report.session.id === null ? '(file)' : escapeMarkdownText(report.session.id);
   lines.push(`_session ${id} · ${report.session.events} events · ${report.session.hypothesisLines} hypothesis lines_`);
   lines.push('');
+  // Above the evidence, never below it: a caveat qualifies everything that
+  // follows, so a reader must meet it first.
+  for (const caveat of report.caveats ?? []) {
+    lines.push(`> **Caveat:** ${capped(escapeMarkdownText(caveat), EXCERPT_CHAR_CAP)}`);
+    lines.push('');
+  }
   for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
     const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
     lines.push(`**${capped(escapeMarkdownText(h.id), FIELD_CHAR_CAP)}${title}**  ${statusOr(h.status)}`);
@@ -182,6 +194,9 @@ const renderText = (report) => {
   const id = report.session.id === null ? '(file)' : escapeMarkdownText(report.session.id);
   lines.push(`Debug evidence report — session ${id}`);
   lines.push(`entries ${report.session.entries} · events ${report.session.events} · hypothesis lines ${report.session.hypothesisLines} · untagged ${report.untaggedEvents}`);
+  for (const caveat of report.caveats ?? []) {
+    lines.push(`caveat: ${capped(escapeMarkdownText(caveat), EXCERPT_CHAR_CAP)}`);
+  }
   lines.push('');
   for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
     const title = h.title ? ` — ${capped(escapeMarkdownText(h.title), FIELD_CHAR_CAP)}` : '';
