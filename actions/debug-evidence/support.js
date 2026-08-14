@@ -805,6 +805,23 @@ const parseRenderedReport = (text) => {
 // belong to THIS invocation.
 const EVIDENCE_FILES = ['session.log', 'report.md', 'report.json'];
 
+// Empty the staging slots this invocation does not own (or has not filled
+// yet). Anything other than "it was not there" is left to throw: a staging
+// slot that cannot be cleared cannot be scoped either. One implementation
+// because all three callers must fail the same way — run clearing on entry,
+// report clearing what it will not publish, and report refusing an invocation
+// it cannot identify.
+const clearStagedEvidence = (evidenceDir, names = EVIDENCE_FILES) => {
+  mkdirSync(evidenceDir, { recursive: true });
+  for (const name of names) {
+    try {
+      unlinkSync(path.join(evidenceDir, name));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+};
+
 // The action is the ONLY legitimate holder of the launch token in the
 // wrap-one-command model, and POST /hypothesis is a launch-token capability
 // the wrapped command is never given. That makes a captured session's
@@ -998,17 +1015,8 @@ const runSubcommand = async ({
   // which is why the clear precedes them (Codex T5 r2 #3, hoisted in r3, and
   // hoisted again with capture in r6). Clearing here also means a run that
   // dies mid-command leaves nothing behind to be mistaken for its own output.
-  // Anything other than "it was not there" is left to throw: a staging slot
-  // that cannot be cleared cannot be scoped either.
   const evidenceDir = resolveEvidenceDir(outputDir);
-  mkdirSync(evidenceDir, { recursive: true });
-  for (const name of EVIDENCE_FILES) {
-    try {
-      unlinkSync(path.join(evidenceDir, name));
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-  }
+  clearStagedEvidence(evidenceDir);
   const state = readState(outputDir);
   if (!state) {
     process.stderr.write('debug-evidence-action: run: no recorded state; the start step never completed.\n');
@@ -1271,12 +1279,29 @@ const runSubcommand = async ({
 // wrapped command failed.
 const reportSubcommand = ({ outputDir, env = process.env }) => {
   const evidenceDir = resolveEvidenceDir(outputDir);
+  // No nonce, no publish — decided before state is even read (Codex T6
+  // ruling). `start` writes DEBUG_ACTION_INVOCATION_NONCE to GITHUB_ENV and
+  // the runner injects it into every later step, so its absence means `start`
+  // never reached that line or the wiring that carries it was cut. Either way
+  // this step cannot show that the staged bytes belong to this invocation,
+  // and "a state file exists" is not a substitute: an output-dir is reusable
+  // across steps and across jobs on a self-hosted runner, so a PREVIOUS
+  // invocation's state and evidence sit at exactly these paths. Degrading to
+  // that check would append somebody else's report to this job's summary and
+  // hand their session.log to this job's upload step under this job's
+  // artifact name. Clearing is part of the refusal for the same reason it is
+  // in the foreign-nonce path below: this step runs BEFORE the upload step,
+  // so leaving unowned files staged is publishing them.
+  if (!env.DEBUG_ACTION_INVOCATION_NONCE) {
+    clearStagedEvidence(evidenceDir);
+    process.stderr.write('debug-evidence-action: report: this step received no invocation nonce, so nothing staged here can be shown to belong to this run; publishing nothing and clearing the staged evidence.\n');
+    return 3;
+  }
   const state = readState(outputDir);
   // Is this invocation's own run what wrote these slots? Absent state and a
   // foreign nonce both mean no, and in both cases whatever is sitting in the
   // staging slots belongs to somebody else's run.
-  const ours = state !== null
-    && (!env.DEBUG_ACTION_INVOCATION_NONCE || state.nonce === env.DEBUG_ACTION_INVOCATION_NONCE);
+  const ours = state !== null && state.nonce === env.DEBUG_ACTION_INVOCATION_NONCE;
   const capturedHere = ours && state.reportRendered === true;
   if (!capturedHere) {
     // A renderer failure is NOT "nothing was captured". On those classes run
@@ -1288,15 +1313,10 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
     // round 8 caught. Clear only the surfaces that do not exist, and only when
     // this invocation owns the slots (Codex T5 r8).
     const preserveLog = ours && state.evidenceCopied === true;
-    const stale = preserveLog ? EVIDENCE_FILES.filter((name) => name !== 'session.log') : EVIDENCE_FILES;
-    mkdirSync(evidenceDir, { recursive: true });
-    for (const name of stale) {
-      try {
-        unlinkSync(path.join(evidenceDir, name));
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-    }
+    clearStagedEvidence(
+      evidenceDir,
+      preserveLog ? EVIDENCE_FILES.filter((name) => name !== 'session.log') : EVIDENCE_FILES,
+    );
     if (state === null) return 0; // start never completed; finish owns that failure
     if (rejectForeignNonce(state, env, 'report')) return 3;
     process.stderr.write(preserveLog

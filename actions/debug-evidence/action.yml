@@ -1,0 +1,220 @@
+name: "Debug Evidence Session"
+description: >-
+  Wrap one failing command in an instrumented debug-collector session:
+  capture evidence, render a Step Summary report, upload the evidence
+  artifact, and tear the collector down. All logic lives in support.js;
+  this file is wiring only.
+
+inputs:
+  run:
+    description: "Command to execute under instrumentation (bash -c)"
+    required: true
+  working-directory:
+    description: "Directory the wrapped command runs in"
+    required: false
+    default: "."
+  session-name:
+    description: "Session label ([A-Za-z0-9_-]+); the session id derives from it"
+    required: false
+    default: "ci-debug"
+  fail-on-command-failure:
+    description: >-
+      'true' (default): the action fails when the wrapped command exits
+      non-zero. 'false': the failure is reported in the summary/outputs only.
+      Evidence capture, artifact upload, and teardown happen regardless.
+    required: false
+    default: "true"
+  output-dir:
+    description: "Evidence staging dir (MUST be outside the workspace); becomes the artifact"
+    required: false
+    default: ""
+  artifact-name:
+    description: "Uploaded evidence artifact name"
+    required: false
+    default: "debug-evidence"
+  node-version:
+    description: "Node.js version for the collector and renderer"
+    required: false
+    default: "24"
+  port:
+    description: "Collector port (loopback only). Self-hosted runners sharing a host must pick distinct ports."
+    required: false
+    default: "8787"
+  redact-names:
+    description: "Comma-separated extra env-var names to always redact (extends DEBUG_REDACT_NAMES)"
+    required: false
+    default: ""
+  max-events:
+    description: "Per-session event limit override (collector default 2000)"
+    required: false
+    default: ""
+  max-bytes:
+    description: "Total evidence byte limit override (collector default 16MB)"
+    required: false
+    default: ""
+  hypothesis-id:
+    description: >-
+      Optional: when set, the action posts one status OPEN hypothesis line
+      (a launch-token capability the wrapped command does not hold) and
+      injects DEBUG_HYPOTHESIS_ID into the wrapped command's environment.
+      The action never posts any other status — verdicts stay with you.
+    required: false
+    default: ""
+  hypothesis-title:
+    description: "Optional title for the hypothesis line; ignored without hypothesis-id"
+    required: false
+    default: ""
+
+# Every output is produced by the RUN step, because run is where capture
+# happens: it is the only process that spans the wrapped command's execution,
+# so it is the only one whose account of the session can be trusted. `report`
+# publishes and produces nothing.
+outputs:
+  command-exit-code:
+    description: "Exit code of the wrapped command; empty until the run step has run"
+    value: ${{ steps.run.outputs.command-exit-code }}
+  session-id:
+    description: "Collector session id; empty until the run step has run"
+    value: ${{ steps.run.outputs.session-id }}
+  event-count:
+    description: "Events captured in the session; empty until the run step has captured one"
+    value: ${{ steps.run.outputs.event-count }}
+  report-path:
+    description: "Absolute path of report.md in the staged evidence; empty until the run step has captured one"
+    value: ${{ steps.run.outputs.report-path }}
+  evidence-digest:
+    description: >-
+      Convenience only, NOT the trust anchor: the SHA-256 digest line for the
+      three staged payloads, byte-identical to the line the run step printed
+      to its own step log. The authoritative copy is that log line, which the
+      run step wrote before anything could touch the staged files; this output
+      exists so a workflow can compare an artifact without scraping logs.
+      Empty until the run step has captured a session.
+    value: ${{ steps.run.outputs.evidence-digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Start collector
+      # The collector inherits THIS step's full environment: its redaction
+      # snapshot must include the job's secrets so anything the wrapped
+      # command logs is scrubbed (spec Security invariant 3). Do not strip
+      # the env here.
+      #
+      # This step also writes DEBUG_ACTION_INVOCATION_NONCE to GITHUB_ENV, and
+      # the runner injects that variable into the PROCESS environment of every
+      # later step by itself. Nothing below re-declares it: the expression
+      # `env` context does not contain runner-inherited variables, so
+      # `${{ env.DEBUG_ACTION_INVOCATION_NONCE }}` would resolve to the empty
+      # string and OVERRIDE the value the runner supplied — breaking the
+      # ownership check it looks like it establishes (Codex T6 ruling).
+      id: start
+      shell: bash
+      env:
+        DEBUG_ACTION_RUN: ${{ inputs.run }}
+        DEBUG_ACTION_SESSION_NAME: ${{ inputs.session-name }}
+        DEBUG_ACTION_WORKDIR: ${{ inputs.working-directory }}
+        DEBUG_ACTION_FAIL_ON_COMMAND_FAILURE: ${{ inputs.fail-on-command-failure }}
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_PORT: ${{ inputs.port }}
+        DEBUG_ACTION_REDACT_NAMES: ${{ inputs.redact-names }}
+        DEBUG_ACTION_MAX_EVENTS_INPUT: ${{ inputs.max-events }}
+        DEBUG_ACTION_MAX_BYTES_INPUT: ${{ inputs.max-bytes }}
+        DEBUG_ACTION_HYPOTHESIS_ID: ${{ inputs.hypothesis-id }}
+        DEBUG_ACTION_HYPOTHESIS_TITLE: ${{ inputs.hypothesis-title }}
+      run: node "${{ github.action_path }}/support.js" start
+
+    - name: Run wrapped command
+      # THE TRUSTED PROCESS. Its environment is resolved by the runner before
+      # the wrapped command exists, and a child cannot rewrite its parent's
+      # memory — so this is the only step whose view of the world the command
+      # it runs cannot influence. Capture, hypothesis validation, rendering,
+      # hashing and staging all happen here, after the command returns, in
+      # this same process.
+      #
+      # DEBUG_ACTION_COLLECTOR_VERIFY_KEY is the collector's PUBLIC Ed25519
+      # verification key, and it is wired HERE AND NOWHERE ELSE (spec Security
+      # invariant 9, extended round 6). Its secrecy does not matter; its
+      # INTEGRITY is everything. Delivered as a step output it exists only in
+      # runner memory until this step's env is resolved, which is the one
+      # channel a same-user process cannot reach — whereas a key read from
+      # state, or handed to a step that starts AFTER the wrapped command has
+      # run, could be swapped for one whose private half the attacker holds.
+      #
+      # There is deliberately no continue-on-error anywhere in this file: this
+      # step exits 3 on any integrity failure, and a failed composite step is
+      # precisely what no later step can un-fail.
+      id: run
+      shell: bash
+      env:
+        DEBUG_ACTION_RUN: ${{ inputs.run }}
+        DEBUG_ACTION_WORKDIR: ${{ inputs.working-directory }}
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}
+      run: node "${{ github.action_path }}/support.js" run
+
+    - name: Render evidence report
+      # Publish-only and key-free, and it runs BEFORE the upload step because
+      # it decides what the upload step finds staged: it appends the staged
+      # report to the Step Summary when this invocation's run captured one,
+      # and otherwise clears the staging slots (keeping session.log when run
+      # authenticated it but the renderer failed). It verifies nothing and
+      # decides nothing, so there is nothing here worth poisoning.
+      #
+      # `steps.start.outcome != 'skipped'` keeps it off the path where an
+      # earlier step (Set up Node.js) failed and `start` never ran at all: it
+      # would then find neither this invocation's nonce nor its state, and a
+      # reused output-dir's leftovers are not this run's evidence.
+      id: report
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+      run: node "${{ github.action_path }}/support.js" report
+
+    - name: Upload evidence artifact
+      # The three evidence filenames are enumerated rather than uploading the
+      # directory: a caller may point output-dir at a broad shared path, and a
+      # bare directory upload would publish whatever else is already there as
+      # if it were this run's evidence. Every glob points INSIDE the fixed
+      # debug-evidence-files child (EVIDENCE_SUBDIR in support.js), which is
+      # also what keeps action-state.json — this run's session token — out of
+      # the artifact: it lives at the output-dir root, deliberately outside
+      # that child.
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}/debug-evidence-files/session.log
+          ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}/debug-evidence-files/report.md
+          ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}/debug-evidence-files/report.json
+        if-no-files-found: ignore
+
+    - name: Stop collector
+      # The collector is detached and outlives the start step, so nothing else
+      # in the job will stop it. Hosted runners reap the process tree at job
+      # end; self-hosted runners rely on this step (and on the collector's own
+      # idle timeout as a backstop).
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+      run: node "${{ github.action_path }}/support.js" teardown
+
+    - name: Apply verdict
+      # The exit taxonomy: mirrors the wrapped command's own exit code (unless
+      # fail-on-command-failure is 'false') and applies the honest belts over a
+      # job that is by then already red if run failed. Every EVIDENCE verdict
+      # was already made inside run, which is why nothing here can turn a
+      # failed capture green.
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+      run: node "${{ github.action_path }}/support.js" finish

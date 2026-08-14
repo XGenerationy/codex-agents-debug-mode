@@ -39,6 +39,18 @@ const {
 
 const makeTempDir = () => mkdtempSync(path.join(os.tmpdir(), 'debug-evidence-action-'));
 
+// The environment the runner hands every step AFTER `start`: `start` wrote
+// this invocation's nonce to GITHUB_ENV, and the runner injects it into each
+// later step's process environment by itself. A test that calls one of those
+// subcommands directly has to stand in for that hand-off — exactly as
+// `runEnv` stands in for the verification-key one — because `report` fails
+// closed without it. Read from the state file rather than passed in, so the
+// tests that let `start` mint its own random nonce work unchanged.
+const invocationEnv = (outputDir, extra = {}) => ({
+  DEBUG_ACTION_INVOCATION_NONCE: readState(outputDir)?.nonce,
+  ...extra,
+});
+
 const getFreePort = () => new Promise((resolve) => {
   const srv = net.createServer();
   srv.listen(0, '127.0.0.1', () => {
@@ -1079,7 +1091,7 @@ test('run captures the session from the collector, renders md+json, emits output
     // report's whole remaining job: publish what run already committed.
     assert.equal(reportSubcommand({
       outputDir: context.outputDir,
-      env: { GITHUB_STEP_SUMMARY: context.stepSummary },
+      env: invocationEnv(context.outputDir, { GITHUB_STEP_SUMMARY: context.stepSummary }),
     }), 0);
     const evidenceDir = resolveEvidenceDir(context.outputDir);
     const state = readState(context.outputDir);
@@ -1246,7 +1258,7 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
     assert.equal(state.reportRendered, true);
     // Through the publish step: "still worth a human's eyes" is a claim about
     // what reaches the artifact, not about what run wrote (Codex T5 r8).
-    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: {} }), 0);
+    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0);
     const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'),
       'this really is the forged file — labeling it, not hiding it, is what makes this safe');
@@ -1363,7 +1375,7 @@ test('a wrapped command that kills the collector, forges the log and poisons the
     // `reportRendered`, but this class rendered fine, so the flag is true
     // either way and report preserves what run staged regardless.
     const evidenceDir = resolveEvidenceDir(context.outputDir);
-    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: {} }), 0);
+    assert.equal(reportSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0);
     const staged = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
     assert.ok(staged.includes('CONFIRMED'), 'the forgery is staged for a human to read, not hidden');
     const rendered = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
@@ -1410,7 +1422,7 @@ test('a collector that merely died still stages the labeled partial log, still f
   assert.equal(state.evidenceCopied, true, 'partial evidence a human can read is the point of the fallback');
   assert.equal(state.evidenceAuthentic, false, 'the label is a reader\'s aid, never a gate');
   assert.equal(state.reportRendered, true, 'and it stays truthful about what was actually produced');
-  assert.equal(reportSubcommand({ outputDir, env: {} }), 0);
+  assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
   assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8')
     .includes('the last thing the collector wrote down'),
     'and it is still there after the publish step, for the upload step to take');
@@ -1547,7 +1559,7 @@ test('run refuses outright when there is no state and when the state carries no 
   assert.equal(await captureViaRun({ outputDir, env: RUN_ENV }), 3, 'no sessionId — start never completed its mint');
   // And report, holding no key and making no decision, simply publishes
   // nothing.
-  assert.equal(reportSubcommand({ outputDir, env: {} }), 0);
+  assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
 });
 
 test('a state carrying another invocation\'s nonce is refused before anything touches the collector — in run, and again in report', async () => {
@@ -1651,7 +1663,7 @@ test('run records an unauthenticated collector without inventing evidence, and f
   assert.equal(state.evidenceCopied, true, 'whatever was readable is still staged');
   assert.equal(state.evidenceAuthentic, false, 'and it is labeled as unverified in the state file');
   assert.equal(state.reportRendered, true);
-  assert.equal(reportSubcommand({ outputDir, env: {} }), 0);
+  assert.equal(reportSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
   assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8').includes('last words'),
     'and it survives the publish step, which is the only way the upload step can receive it');
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
@@ -1881,7 +1893,7 @@ test('staging is invocation-scoped on EVERY entry path, including the ones that 
   // behind either.
   const noState = makeTempDir();
   const noStateEvidence = plantStale(noState);
-  assert.equal(reportSubcommand({ outputDir: noState, env: {} }), 0);
+  assert.equal(reportSubcommand({ outputDir: noState, env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' } }), 0);
   assertCleared(noStateEvidence, 'absent state');
 
   // The predecessor's state says its capture SUCCEEDED — evidenceCopied and
@@ -1981,7 +1993,10 @@ test('a renderer that returns without producing a schema-1 report publishes noth
     // publish step, which is where the upload step receives it from.
     assert.equal(readState(outputDir).evidenceCopied, true, label);
     const kept = readFileSync(path.join(evidenceDir, 'session.log'));
-    assert.equal(reportSubcommand({ outputDir, env: { GITHUB_STEP_SUMMARY: stepSummary } }), 0, label);
+    assert.equal(reportSubcommand({
+      outputDir,
+      env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', GITHUB_STEP_SUMMARY: stepSummary },
+    }), 0, label);
     assert.deepEqual(readFileSync(path.join(evidenceDir, 'session.log')), kept, `${label}: the authenticated log survives`);
   }
 });
@@ -2538,8 +2553,15 @@ test('a wrapped command that poisons every later step\'s environment changes not
     for (const file of [files.envFile, files.githubOutput, files.stepSummary]) writeFileSync(file, '');
     // The environment the runner resolved for the RUN step, before the wrapped
     // command existed. A child cannot rewrite its parent's memory, so this is
-    // the one view of the key the command below cannot touch.
-    const runStepEnv = { ...RUN_ENV, GITHUB_ENV: files.envFile, GITHUB_OUTPUT: files.githubOutput };
+    // the one view of the key the command below cannot touch. The nonce is in
+    // here because the runner injects it into every step after `start`, and
+    // the poisoned later-step environment below is derived from this one.
+    const runStepEnv = {
+      ...RUN_ENV,
+      DEBUG_ACTION_INVOCATION_NONCE: 'n1',
+      GITHUB_ENV: files.envFile,
+      GITHUB_OUTPUT: files.githubOutput,
+    };
     return { outputDir, runStepEnv, ...files };
   };
   try {
@@ -2623,7 +2645,7 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
     ['no recorded state', { state: null, readLive: unreached }],
     ['a state carrying no session', { state: { sessionId: undefined, sessionToken: undefined }, readLive: unreached }],
     ['another invocation\'s nonce', { env: { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: 'other' }, reportCode: 3, readLive: unreached }],
-    ['no verification key in this step\'s environment', { env: {}, readLive: unreached }],
+    ['no verification key in this step\'s environment', { env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' }, readLive: unreached }],
     ['an answer signed by a key that is not the collector\'s', { readLive: collectorAnswer(served, { privateKey: IMPOSTOR_KEYS.privateKey }) }],
     ['a validly signed answer to a different question', { readLive: collectorAnswer(served, { target: '/sessions/ci-debug-abc/logs?type=event&limit=1' }) }],
     ['an answer with no proof at all', { readLive: collectorAnswer(served, { proof: null }) }],
@@ -2635,7 +2657,12 @@ test('run exit taxonomy: every evidence-integrity class is a 3 that publishes no
     ['a renderer that throws', { staged: ['session.log'], readLive: healthy(), renderReport: () => { throw new Error('renderer exploded'); } }],
     ['a renderer that returns no schema-1 report', { staged: ['session.log'], readLive: healthy(), renderReport: () => ({ markdown: '## Debug evidence report\n', json: '{}' }) }],
   ];
-  for (const [label, { state = {}, env = RUN_ENV, staged = [], reportCode = 0, ...seams }] of classes) {
+  // The default env is the one action.yml wires for the run step, plus the
+  // nonce the runner injects into every step after `start` — the same
+  // environment `report` is handed a moment later, which is why the same
+  // object drives both calls below.
+  const defaultEnv = { ...RUN_ENV, DEBUG_ACTION_INVOCATION_NONCE: 'n1' };
+  for (const [label, { state = {}, env = defaultEnv, staged = [], reportCode = 0, ...seams }] of classes) {
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
     if (state !== null) {
@@ -2708,7 +2735,10 @@ test('report publishes only what run committed, and holds nothing worth poisonin
   }
   const stepSummary = path.join(outputDir, 'step_summary');
   writeFileSync(stepSummary, '');
-  assert.equal(reportSubcommand({ outputDir, env: { GITHUB_STEP_SUMMARY: stepSummary } }), 0);
+  assert.equal(reportSubcommand({
+    outputDir,
+    env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', GITHUB_STEP_SUMMARY: stepSummary },
+  }), 0);
   for (const name of ['session.log', 'report.md', 'report.json']) {
     assert.ok(!existsSync(path.join(evidenceDir, name)),
       `${name} from an earlier invocation is never shipped as this run's evidence`);
@@ -2722,6 +2752,7 @@ test('report publishes only what run committed, and holds nothing worth poisonin
   mkdirSync(evidenceDir, { recursive: true });
   writeFileSync(path.join(evidenceDir, 'report.md'), '## Debug evidence report\nstaged by run\n');
   const poisoned = {
+    DEBUG_ACTION_INVOCATION_NONCE: 'n1',
     GITHUB_STEP_SUMMARY: stepSummary,
     BASH_ENV: '/tmp/attacker.sh',
     DEBUG_ACTION_COLLECTOR_VERIFY_KEY: IMPOSTOR_KEYS.publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
@@ -2804,4 +2835,249 @@ test('the renderer export surface capture depends on is pinned', () => {
   assert.equal(report.session.events, 1);
   assert.equal(typeof renderer.renderMarkdown(report), 'string');
   assert.equal(JSON.parse(renderer.renderJson(report)).schema, 1);
+});
+
+// Codex's T6 ruling, and the same fail-closed posture `run` already takes.
+// This step is handed the invocation nonce because `start` wrote it to
+// GITHUB_ENV and the runner injects it into every later step. Its ABSENCE
+// means `start` never reached that line, or the wiring that carries it was
+// cut — and in neither case can this step show that the staged bytes belong
+// to this invocation. "A state file exists" proves nothing on its own: an
+// output-dir is reusable across steps and across jobs on a self-hosted
+// runner, so a PREVIOUS invocation's state and evidence sit at exactly these
+// paths. Degrading to that check would publish someone else's report into
+// this job's summary and hand their session.log to this job's upload step
+// under this job's artifact name.
+test('report fails closed when no invocation nonce reached this step, instead of degrading to "state exists"', async () => {
+  const outputDir = makeTempDir();
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  mkdirSync(evidenceDir, { recursive: true });
+  const stepSummary = path.join(outputDir, 'step_summary');
+  writeFileSync(stepSummary, '');
+  // The most favourable state that can exist: a complete, successful,
+  // authenticated capture. None of it may buy a publish without the nonce.
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    commandExitCode: 0, collectorAlive: true, evidenceAuthentic: true, evidenceCopied: true,
+    reportRendered: true, failOnCommandFailure: 'true',
+  });
+  for (const name of ['session.log', 'report.md', 'report.json']) {
+    writeFileSync(path.join(evidenceDir, name), `staged ${name}\n`);
+  }
+  const { result, written } = await captureStderr(() => reportSubcommand({
+    outputDir,
+    env: { GITHUB_STEP_SUMMARY: stepSummary },
+  }));
+  assert.equal(result, 3, 'no nonce is an infra failure, never a licence to publish');
+  for (const name of ['session.log', 'report.md', 'report.json']) {
+    assert.equal(
+      existsSync(path.join(evidenceDir, name)),
+      false,
+      `${name} must be cleared: unowned staging must never reach the upload step`,
+    );
+  }
+  assert.equal(readFileSync(stepSummary, 'utf8'), '', 'and nothing may reach the step summary');
+  assert.match(written, /report: this step received no invocation nonce/);
+});
+
+// ---------------------------------------------------------------------------
+// action.yml — structural pins (Task 6).
+//
+// Plain-text assertions over the YAML source, with no YAML-parser dependency:
+// the same approach actions/closeout/support.test.js takes to its own
+// action.yml and tools/workflow_checks.js takes to workflow files. What these
+// pin is WIRING — which value reaches which step — because that routing is
+// where this action's security properties live, and none of it is reachable
+// from a unit test of support.js.
+const ACTION_YML = () => readFileSync(path.join(__dirname, 'action.yml'), 'utf8');
+// Comment lines are stripped before every "this must NOT appear" assertion.
+// Several pins below are also DOCUMENTED in the file — the nonce one quotes
+// the exact expression that must never be used — and a prose mention of a
+// variable must never be mistaken for a wiring of it.
+const withoutComments = (text) => text.split('\n').filter((line) => !line.trim().startsWith('#')).join('\n');
+const ACTION_YML_CODE = () => withoutComments(ACTION_YML());
+const OUTPUT_DIR_EXPR = "${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}";
+// The composite's step list ONLY. `inputs:` declares a key literally named
+// `run`, so scanning the whole file for lines beginning `run:` reads that
+// input declaration as a step body (the plan's draft of the wiring-only test
+// did exactly that, and would have failed against its own YAML).
+const ACTION_YML_STEPS = () => {
+  const text = ACTION_YML();
+  const index = text.search(/^runs:$/m);
+  assert.notEqual(index, -1, 'action.yml must declare a runs: block');
+  return text.slice(index);
+};
+// One chunk per composite step, each starting at its own `- name:` line, so a
+// test can ask which STEP carries a value rather than merely whether the file
+// contains it anywhere.
+const compositeSteps = () => ACTION_YML_STEPS().split(/\n(?= {4}- name: )/).slice(1).map((text) => ({
+  name: /^ {4}- name: (.+)$/m.exec(text)[1].trim(),
+  text,
+}));
+
+test('action.yml is wiring-only: every step body invokes support.js with a known subcommand', () => {
+  const runLines = ACTION_YML_STEPS().split('\n').map((line) => line.trim()).filter((line) => line.startsWith('run:'));
+  assert.ok(runLines.length >= 5, 'start/run/report/teardown/finish steps exist');
+  for (const lineText of runLines) {
+    assert.match(
+      lineText,
+      /^run: node "\$\{\{ github\.action_path \}\}\/support\.js" (start|run|report|teardown|finish)$/,
+      `wiring-only violated: ${lineText}`,
+    );
+  }
+  // Each subcommand exactly once: a duplicated step would run a second
+  // capture or a second teardown against the same state.
+  assert.deepEqual(
+    runLines.map((line) => line.split(' ').pop()).sort(),
+    ['finish', 'report', 'run', 'start', 'teardown'],
+  );
+});
+
+test('action.yml pins third-party actions to the closeout SHAs', () => {
+  const text = ACTION_YML();
+  assert.ok(text.includes('uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0'));
+  assert.ok(text.includes('uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2'));
+  assert.ok(!/uses:\s+[^.@\s]+\/[^@\s]+@(?![0-9a-f]{40})/.test(text), 'no unpinned remote uses');
+});
+
+test('action.yml repeats the output-dir default expression identically at every use site', () => {
+  const text = ACTION_YML();
+  const occurrences = text.split(OUTPUT_DIR_EXPR).length - 1;
+  assert.ok(
+    occurrences >= 6,
+    `expected the default expression in start/run/report/upload/teardown/finish env + upload paths, found ${occurrences}`,
+  );
+  assert.ok(!text.includes("format('{0}/debug-evidence',runner.temp"), 'no whitespace variant of the expression');
+});
+
+test('action.yml uploads only enumerated evidence files — never the bare dir, never action-state.json', () => {
+  const text = ACTION_YML();
+  const uploadIndex = text.indexOf('Upload evidence artifact');
+  assert.notEqual(uploadIndex, -1);
+  const pathBlock = /path:\s*\|\r?\n((?:[ \t]+\S.*\r?\n?)+)/.exec(text.slice(uploadIndex));
+  assert.ok(pathBlock, 'path: must be a multi-line block scalar');
+  const lines = pathBlock[1].split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const name of ['session.log', 'report.md', 'report.json']) {
+    assert.ok(lines.some((line) => line.endsWith(`/debug-evidence-files/${name}`)), `enumerates ${name}`);
+  }
+  for (const line of lines) {
+    assert.ok(!line.includes('action-state.json'), 'the state file (session token) must never be uploaded');
+    assert.notEqual(line, OUTPUT_DIR_EXPR, 'never the bare output dir');
+  }
+});
+
+// Scoped to each step's own chunk rather than to a fixed window of characters
+// after its name (the plan's draft used a 400-character slice, which the
+// documenting comments these steps carry push the `if:` line straight out of),
+// and to a real `if:` KEY line rather than to the text appearing anywhere.
+test('action.yml guards report/upload/teardown/finish with always()', () => {
+  for (const name of ['Render evidence report', 'Upload evidence artifact', 'Stop collector', 'Apply verdict']) {
+    const step = compositeSteps().find((candidate) => candidate.name === name);
+    assert.ok(step, `step ${name} exists`);
+    assert.match(withoutComments(step.text), /^ {6}if: \$\{\{ always\(\)/m, `${name} runs on failure paths too`);
+  }
+  // And the step that must NOT be guarded: a skipped or soft-guarded run step
+  // would leave the evidence verdict to a later one.
+  const run = compositeSteps().find((candidate) => candidate.name === 'Run wrapped command');
+  assert.ok(!/^ {6}if:/m.test(withoutComments(run.text)), 'the run step is unconditional');
+});
+
+// The round-6 Critical, as a property of the FILE. Capture must happen in the
+// one process the wrapped command cannot reach, and it can only happen there
+// if the verification key is delivered there and nowhere else. A later step's
+// environment is attacker-influenceable (spec invariant 10), so handing the
+// key to `report` — which is what this action did before round 6 — would put
+// the trust anchor exactly where it can be swapped.
+test('action.yml hands the collector verification key to the run step and to no other step', () => {
+  const code = ACTION_YML_CODE();
+  assert.equal(
+    code.split('DEBUG_ACTION_COLLECTOR_VERIFY_KEY').length - 1,
+    1,
+    'the verification key must be wired exactly once',
+  );
+  assert.ok(
+    code.includes('DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}'),
+    'the key must come from start\'s step output — runner memory, never a file',
+  );
+  assert.equal(
+    code.split('steps.start.outputs.collector-verify-key').length - 1,
+    1,
+    'start\'s key output must be consumed exactly once',
+  );
+  const carriers = compositeSteps()
+    .filter((step) => withoutComments(step.text).includes('DEBUG_ACTION_COLLECTOR_VERIFY_KEY'))
+    .map((step) => step.name);
+  assert.deepEqual(carriers, ['Run wrapped command'], 'only the trusted process may hold the key');
+});
+
+// Codex's T6 ruling. `start` writes DEBUG_ACTION_INVOCATION_NONCE to
+// GITHUB_ENV, and the runner injects it into every LATER step's process
+// environment. The expression `env` context does NOT include such
+// runner-inherited variables, so an explicit `${{ env.… }}` remap resolves to
+// the empty string — it would not merely be redundant, it would OVERRIDE the
+// inherited value with nothing and break exactly the wiring it looks like it
+// creates. Every subcommand after `start` reads the nonce from its own
+// process env; nothing may re-declare it.
+test('action.yml never remaps the invocation nonce into a step env', () => {
+  const code = ACTION_YML_CODE();
+  assert.ok(
+    !code.includes('env.DEBUG_ACTION_INVOCATION_NONCE'),
+    'an ${{ env.… }} remap of a GITHUB_ENV variable resolves to empty',
+  );
+  assert.ok(
+    !/^\s*DEBUG_ACTION_INVOCATION_NONCE\s*:/m.test(code),
+    'no step may re-declare the nonce under any expression',
+  );
+  // And the reason stays IN the file, so the next reader does not "fix" the
+  // apparent omission. This also makes the comment-stripping above
+  // load-bearing: the documented rationale quotes the forbidden expression.
+  assert.match(ACTION_YML(), /^\s*#.*DEBUG_ACTION_INVOCATION_NONCE/m, 'the omission must be documented');
+});
+
+// Adaptation item 1. Capture moved into `run` in round 6, so `run` is the only
+// step that can report what was captured; `report` writes no outputs at all
+// (it holds no credential and makes no decision).
+test('action.yml sources every output from the run step, and no later step produces one', () => {
+  const code = ACTION_YML_CODE();
+  for (const name of ['command-exit-code', 'session-id', 'event-count', 'report-path', 'evidence-digest']) {
+    assert.match(code, new RegExp(`^ {2}${name}:$`, 'm'), `declares the ${name} output`);
+    assert.ok(code.includes(`value: \${{ steps.run.outputs.${name} }}`), `${name} must be produced by the run step`);
+  }
+  const producers = [...code.matchAll(/value: \$\{\{ steps\.([a-z]+)\.outputs\./g)].map((match) => match[1]);
+  assert.deepEqual([...new Set(producers)], ['run'], 'every output comes from the step that captured the evidence');
+});
+
+// Adaptation item 6. `run` can exit 3, and nothing may soften that: a failed
+// composite step is what no later step can un-fail, which is the whole reason
+// the verdict was moved into `run`. The order is equally load-bearing —
+// `report` decides what the upload step finds staged (round 8).
+test('action.yml keeps the run -> report -> upload order and gives no step a continue-on-error escape', () => {
+  const text = ACTION_YML();
+  let previous = -1;
+  for (const name of ['Run wrapped command', 'Render evidence report', 'Upload evidence artifact', 'Stop collector', 'Apply verdict']) {
+    const index = text.indexOf(`- name: ${name}`);
+    assert.ok(index > previous, `${name} must appear after the step before it`);
+    previous = index;
+  }
+  assert.ok(!ACTION_YML_CODE().includes('continue-on-error'), 'a failed run step must stay failed');
+});
+
+// `report`, `teardown` and `finish` run AFTER the wrapped command, so their
+// environments are the ones an attacker can influence. Each therefore carries
+// exactly one variable — where to look — and nothing that could be turned into
+// a capability. Everything else they need is in the state file `run` committed.
+test('action.yml gives every post-command step nothing but the output dir', () => {
+  for (const name of ['Render evidence report', 'Stop collector', 'Apply verdict']) {
+    const step = compositeSteps().find((candidate) => candidate.name === name);
+    assert.ok(step, `step ${name} exists`);
+    const declared = [...withoutComments(step.text).matchAll(/^ {8}([A-Z][A-Z0-9_]*):/gm)].map((match) => match[1]);
+    assert.deepEqual(declared, ['DEBUG_ACTION_OUTPUT_DIR'], `${name} must carry only the output dir`);
+  }
+});
+
+test('every support.js step declares shell: bash', () => {
+  for (const step of compositeSteps()) {
+    if (!withoutComments(step.text).includes('support.js')) continue;
+    assert.match(step.text, /^ {6}shell: bash$/m, `${step.name} must declare shell: bash`);
+  }
 });
