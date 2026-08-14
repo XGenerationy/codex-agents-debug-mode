@@ -291,12 +291,19 @@ That is positively established only when:
 - Linux Yama `ptrace_scope = 3` (attachment forbidden unconditionally, and the
   mode cannot be lowered again at runtime), **AND** the wrapped principal has no
   route to root: not already uid 0, no privileged capability in its own set, and
-  **no `sudo` binary present at all** *(tightened, Task 6 round 9 — probing
+  **no `sudo` binary found by inspection** *(tightened, Task 6 round 9 — probing
   `sudo -n <cmd>` cannot establish absence, because sudoers rules are
   COMMAND-SPECIFIC: a principal may hold `NOPASSWD` for one command while another
   is denied, and a `PATH`-planted fake `sudo` can fabricate a denial to GRANT
-  admission while the real binary remains reachable. Any host where `sudo` exists
-  is denied.)*
+  admission while the real binary remains reachable. CORRECTED, round 10: the
+  inspection covers the conventional absolute paths AND every `sudo` candidate on
+  the inherited `PATH`, each `lstat`ed and never executed — a fixed three-path
+  list falsely reported `absent` on layouts such as NixOS's
+  `/run/current-system/sw/bin`, which would have GRANTED strict admission on a
+  host where the wrapped command can become root. Any candidate present, or any
+  candidate that cannot be evaluated, denies. Inspecting `PATH` without executing
+  anything is fail-closed; what the round-9 ruling forbade was EXECUTING a
+  `PATH`-resolved binary and trusting its behaviour.)*
 
 `ptrace_scope` 1 or 2 is NOT sufficient: both are bypassable by
 `CAP_SYS_PTRACE`. **Mode 3 alone is not sufficient either** *(corrected, Task 6
@@ -311,9 +318,11 @@ sets it also opens the BPF route. Neither the `run` process nor the collector is
 made non-dumpable, and the collector's pid is recorded in state.
 
 The action therefore probes the escalation routes it can observe — Yama mode,
-effective uid, the PRESENCE of a `sudo` binary at a trusted absolute path, and
+effective uid, the PRESENCE of a `sudo` binary at any conventional absolute path
+or anywhere on the inherited `PATH`, and
 dangerous capabilities in its own set *(corrected, Task 6 round 9: this sentence
-still named the withdrawn `passwordless sudo` behavioural probe)* — and admits
+still named the withdrawn `passwordless sudo` behavioural probe; round 10 widened
+the sudo inspection beyond a fixed path list)* — and admits
 `strict` only when ALL are clear. Those are the routes it CHECKS, not
 a proof that no route exists: a setuid binary, a mounted container socket, or a
 writable privileged service can grant the same power unobserved. Hosted execution

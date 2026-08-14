@@ -3042,6 +3042,62 @@ acceptable, and an absolute path alone does not fix it.
 Fix commit message:
 `fix(action): deny strict when any sudo binary exists, derive admission from validated fields, pre-command admission record (Codex T6 r9)`.
 
+#### Task 6 fix round 10 — Codex re-review decisions (recorded before code moves)
+
+Codex on `57d3f7b`: the forged-`blockers` path and the behavioural sudo probe are
+both closed, and the artifact/trust-unit section is now correctly
+regime-conditional. **RULING ON THE DEFAULT — KEEP `strict`**, and the reasoning
+is better than the coordinator's request to reverse it: *a pre-command warning is
+disclosure, not enforcement; most consumers will not inspect logs before trusting
+a green job. Requiring explicit `best-effort` is the correct auditable decision
+point.* The input lives in the workflow file, where review and history see it; a
+log line does not survive a glance at a green check. Other rulings: fixed sudo
+paths are NOT acceptable as the sole check; the human-comparison limit must be
+stated in the record and the README; leaving `kill`/`env`/`projectRoot` as
+ordinary injectable defaults is reasonable, since explicit `undefined` there does
+not silently substitute live host security evidence. **Critical ×1, Important ×1,
+Minor ×2.**
+
+1. **The fixed sudo allow-list can FALSELY GRANT strict (CRITICAL).** Codex ran
+   the detector directly with `/run/current-system/sw/bin/sudo` present — a normal
+   NixOS system-path location — and got `{"result":"absent"}`. A wrapped command
+   could invoke that `sudo`, become root, rewrite `run`, and still receive
+   `boundary=ESTABLISHED`. **The round-9 Critical forbade EXECUTING a
+   `PATH`-resolved binary and interpreting its behaviour; it did NOT make
+   fail-closed `PATH` INSPECTION unsafe** — the coordinator read it too broadly
+   when instructing "never consults PATH". Fix: parse the inherited `PATH` in
+   Node and `lstat` every `sudo` candidate, executing nothing; any candidate
+   present, or any candidate that cannot be evaluated, denies. Keep the
+   conventional absolute paths as well, so an empty or stripped `PATH` cannot
+   shrink the check. Spec contradiction (line 294 said "no sudo binary present at
+   all"/"any host where sudo exists is denied" while 313–316 admitted only three
+   paths were checked) fixed by the coordinator in this commit.
+2. **`best-effort` can emit an authenticated STRICT record (Important).**
+   `admissionCaveats` derives `ESTABLISHED` and the trust-unit sentence solely
+   from the host readings, independently of `evidenceTrust` — so clear readings
+   plus `best-effort` produce
+   `evidence-trust=best-effort; in-process boundary=ESTABLISHED` followed by the
+   authenticated trust-unit claim, contradicting `action.yml` and the spec, which
+   both say everything under best-effort stays diagnostic. Fix: the authenticated
+   wording requires `evidenceTrust === 'strict' && admissionEstablished(admission)`.
+   Add the missing best-effort-plus-clear-admission test.
+3. **The aggregate evaluator does not honour explicit `undefined` (Minor).**
+   `evaluateAdmission` immediately invokes each selected seam, so an explicit
+   `undefined` probe throws `TypeError: seam(...) is not a function` instead of
+   producing an unknown, denying record — the round-9 `seam()` fix covered the
+   lower-level readers but not this aggregate path, and no test covers it. Use a
+   probe wrapper that validates each value is callable and catches, mapping any
+   failure to `unknown` ⇒ deny.
+4. **The record must state its own limits (Minor).** It names the three pieces but
+   not that the action verifies NONE of their correspondence — comparison is
+   external and manual, and must be against the `start` record FROM THE SAME
+   INVOCATION. Include the invocation nonce in the record so accidental
+   cross-invocation pairing is impossible, and state the manual-comparison limit
+   in the record text itself (Task 8's README repeats it).
+
+Fix commit message:
+`fix(action): inspect PATH for sudo candidates, gate authenticated wording on strict admission (Codex T6 r10)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
