@@ -3282,6 +3282,58 @@ Without the recipe the digest is a number nobody can check.
 Fix commit message:
 `fix(action): validate every admission reading structurally, not by enumeration (round-13 residual)`.
 
+#### Task 6 fix round 15 — Codex re-review decisions on r13+r14 (recorded before code moves)
+
+Codex on `9f44c3b` + `4635a8b`: **no Critical, no Important — four Minors.** The
+fixed-size sudo representation is called a real improvement and the implementation
+is fail-closed throughout; what remains is that two advertised invariants are not
+yet literally true. Rulings: keep `present: <count>` (bounded, and it makes the
+fingerprint interpretable); keep genuinely historical comments; require printable
+ASCII in `structurallyValid`; and Task 8 requirement #7 expands (below).
+
+1. **The producer can emit a count the vocabulary rejects, and our stated maximum
+   was wrong.** A probe with 99,999 PATH candidates plus the three conventional
+   paths produced `present: 100002…`, which `admissionBlockers` then classified as
+   outside the vocabulary — fail-closed, but it breaks the producer/vocabulary
+   closure we claimed and degrades the best-effort record. Separately the
+   arithmetic in our own report was wrong: `present: ` (9) + digits +
+   ` at sha256=` (11) + 64 hex = **84 + digits**, so 85 holds only for a
+   single-digit count and an ordinary two-digit count already yields 86. Fix:
+   widen the anchored vocabulary to the producer's real range (1–10 digits, giving
+   a 94-character worst case, comfortably inside the 128 bound) with NO clamping —
+   a clamp would invent a semantics to explain. Correct every stated maximum in
+   code, comments and tests, and cover one-, two-, six- and ten-digit counts.
+2. **`structurallyValid` does not enforce what round 14 advertised.** It rejects
+   C0/C1 and DEL but accepts `U+0085`, `U+2028`/`U+2029` line separators,
+   `U+202E` bidi override, and zero-width characters — so "no control characters
+   at all" and "true single-line" are both false as written. Current vocabularies
+   happen to reject them, so this is not an admission bypass today, but it defeats
+   precisely the future-proofing round 14 existed to provide. **Ruling: restrict
+   readings to PRINTABLE ASCII now** (`\x20`–`\x7E`); every current reading is
+   ASCII by construction, so there is no compatibility cost. Extend the synthetic
+   fifth-field cases to cover `U+0085`, `U+2028`, `U+2029`, `U+202E` and a
+   zero-width character.
+3. **Two shipped explanations are still inaccurate.** `support.js:1710` describes
+   the CURRENT admission condition as checking sudo only at a "trusted absolute
+   path" — this is not one of the historical references, it is a live contract
+   statement omitting the PATH-union mechanism, and it must be corrected. (The
+   four genuinely historical comments stay: Codex confirms they are accurate as
+   history and are the record of why the design is what it is.)
+4. **Spec precision (fixed by the coordinator in this commit).** The round-13
+   wording said producer-derived values are never interpolated, while the retained
+   count and digest plainly are producer-derived. It now says raw
+   producer-CONTROLLED BYTES are never interpolated; only bounded, validated
+   metadata is.
+
+**Task 8 requirement #7, expanded by ruling:** "exact recipe" must additionally
+specify deduplication, JavaScript's default UTF-16 code-unit sort, UTF-8 hashing
+of the NUL-joined string, and that the count represents matched candidate
+SPELLINGS rather than distinct binaries or inodes (two PATH entries resolving to
+the same file count twice).
+
+Fix commit message:
+`fix(action): accept the producer's real count range and restrict readings to printable ASCII (Codex T6 r15)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

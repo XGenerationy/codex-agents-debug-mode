@@ -279,7 +279,11 @@ under a successful strict admission.)* **The trust regime depends on
   the guarantee is asserted against RENDERED Markdown rather than against the
   caveat strings)* *(tightened, round 13: "short" has to be structural, not
   editorial. A caveat is built only from fixed vocabulary and BOUNDED metadata —
-  producer-derived values are never interpolated into a record. Raw matched
+  raw producer-CONTROLLED BYTES are never interpolated into a record; only
+  bounded, validated metadata is *(precision fixed, round 15: the earlier wording
+  said "producer-derived values are never interpolated", which the retained sudo
+  count and digest plainly are — both are producer-derived, and both are safe
+  precisely because they are bounded and validated rather than raw)*. Raw matched
   `sudo` paths were, and a legitimate 362-character path produced a 579-character
   caveat the renderer truncated, while a path containing a newline split the
   single-line record entirely. Each reading now has an anchored, fixed-size
