@@ -1895,7 +1895,16 @@ const startReal = async (overrides = {}) => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   const port = await getFreePort();
-  const inputs = baseInputs({ port: String(port), ...overrides });
+  // `__env` is NOT an action input: it is extra environment for the START
+  // step, and it exists because the collector's redaction snapshot IS start's
+  // environment (spec Security invariant 3 — the collector inherits the job
+  // env by design, which is what lets it scrub a job secret out of an event
+  // the wrapped command logged). A test that wants to prove redaction has to
+  // put the value where the collector will see it, and that is here. Filtered
+  // out of `inputs` so it can never be mistaken for one; absent by default, so
+  // every existing caller's start environment is byte-for-byte what it was.
+  const { __env: startEnv = {}, ...inputOverrides } = overrides;
+  const inputs = baseInputs({ port: String(port), ...inputOverrides });
   // The responder key reaches `run` exactly the way action.yml will route it:
   // start writes it to GITHUB_OUTPUT, the runner parses that file when the step
   // ends, and the value is interpolated into the RUN step's env. The harness
@@ -1904,7 +1913,7 @@ const startReal = async (overrides = {}) => {
   // shortcut through state or the filesystem.
   const startOutput = path.join(outputDir, 'start_output');
   writeFileSync(startOutput, '');
-  const code = await startSubcommand({ probeAdmission: ADMITTED, inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
+  const code = await startSubcommand({ probeAdmission: ADMITTED, inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput, ...startEnv } });
   assert.equal(code, 0);
   const emitted = readFileSync(startOutput, 'utf8');
   const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-verify-key='));
@@ -5294,4 +5303,561 @@ test('the output-dir default expression is byte-identical at every site, and the
   assert.equal(text.split(OUTPUT_DIR_EXPR).length - 1, 5,
     'start/run/report/teardown/finish env, and nowhere else');
   assert.equal(text.includes("format('{0}/debug-evidence',runner.temp"), false, 'no whitespace variant');
+});
+
+// --- Task 7: the demo repro, the dogfood workflow, the gate forwarder ------
+
+const REPO_ROOT = path.join(__dirname, '..', '..');
+const REPRO_PATH = path.join(__dirname, 'demo', 'repro.js');
+// The workflow wraps `node <repo-relative path>`; a test that runs the file
+// must run THAT file, so the path is built once and the workflow assertion
+// below resolves its own literal against this constant rather than repeating
+// it. A demo that drifted into two different repros would otherwise pass both.
+const REPRO_COMMAND = `node "${REPRO_PATH}"`;
+
+// A structural reader for a workflow file, on exactly the doctrine
+// parseActionYml is built on: indentation IS the structure, and a construct
+// this reader does not understand THROWS rather than being skipped, because
+// skipping is failing open — a job that silently stopped passing
+// `evidence-trust: best-effort` would otherwise still satisfy every assertion
+// below. The subset is the one this repo's workflows are written in: nested
+// block mappings, sequences of mappings (`- name: …`), plain scalars and
+// `run: |` block scalars. No anchors, no flow mappings, no multi-document
+// files, no scalar sequences.
+//
+// Block-scalar bodies are joined with '\n' after their own indentation is
+// trimmed: what the assertions below read out of a `run:` script is which
+// lines it contains, never how deeply they were indented.
+const parseWorkflowMapping = (lines, cursor, indent) => {
+  const map = {};
+  while (cursor.i < lines.length) {
+    const line = lines[cursor.i];
+    if (line.indent < indent) break;
+    if (line.indent > indent) throw new Error(`unexpected indentation ${line.indent}: ${line.body}`);
+    if (line.item) break; // the next sequence element starts here
+    const entry = /^([A-Za-z0-9_.-]+):(?:\s(.*))?$/.exec(line.body);
+    if (!entry) throw new Error(`unparsed workflow line: ${line.body}`);
+    const [, key, rawValue] = entry;
+    cursor.i += 1;
+    if (rawValue === '|') {
+      const body = [];
+      while (cursor.i < lines.length && lines[cursor.i].indent > indent) {
+        body.push(lines[cursor.i].body);
+        cursor.i += 1;
+      }
+      map[key] = body.join('\n');
+      continue;
+    }
+    if (rawValue === undefined || rawValue === '') {
+      const next = lines[cursor.i];
+      // `pull_request:` with nothing under it is a real, meaningful trigger —
+      // null, not an empty mapping, so an assertion can tell the two apart.
+      map[key] = next && next.indent > indent
+        ? parseWorkflowBlock(lines, cursor, next.indent)
+        : null;
+      continue;
+    }
+    map[key] = unquoteScalar(rawValue);
+  }
+  return map;
+};
+
+function parseWorkflowBlock(lines, cursor, indent) {
+  if (!lines[cursor.i].item) return parseWorkflowMapping(lines, cursor, indent);
+  const items = [];
+  while (cursor.i < lines.length && lines[cursor.i].indent === indent && lines[cursor.i].item) {
+    // Consume the marker, then read the item as an ordinary mapping: its first
+    // key sits on the dash line and the rest follow at the same indent.
+    lines[cursor.i].item = false;
+    items.push(parseWorkflowMapping(lines, cursor, indent));
+  }
+  return items;
+}
+
+const workflowPath = (name) => path.join(REPO_ROOT, '.github', 'workflows', name);
+const workflowText = (name) => readFileSync(workflowPath(name), 'utf8');
+// The same stripper the reader uses, applied to the whole file: a rule about
+// what must NOT appear in the WIRING has to be read against wiring, or the
+// prose explaining the rule trips it. (It did: a comment saying this workflow
+// deliberately references no `secrets.` value failed a raw-text scan for
+// exactly that string.)
+const workflowCode = (name) => workflowText(name).split(/\r?\n/).map(stripYamlComment).join('\n');
+
+const parseWorkflow = (name) => {
+  const lines = [];
+  for (const raw of workflowText(name).split(/\r?\n/)) {
+    const text = stripYamlComment(raw).replace(/\s+$/, '');
+    if (text.trim() === '') continue;
+    const indent = text.length - text.trimStart().length;
+    const body = text.trim();
+    // A sequence element is re-indented to where its keys actually sit, which
+    // is what makes an item's mapping parse like any other mapping.
+    lines.push(body.startsWith('- ')
+      ? { indent: indent + 2, body: body.slice(2), item: true }
+      : { indent, body, item: false });
+  }
+  const cursor = { i: 0 };
+  const document = parseWorkflowMapping(lines, cursor, 0);
+  if (cursor.i !== lines.length) throw new Error(`workflow reader stopped at line ${cursor.i}: ${lines[cursor.i].body}`);
+  return document;
+};
+
+const DEMO_WORKFLOW = 'debug-evidence-demo.yml';
+const DEMO_ACTION_REF = './actions/debug-evidence';
+const actionInvocations = (job) => job.steps.filter((step) => step.uses === DEMO_ACTION_REF);
+
+test('demo/repro.js reads exactly the injected session contract and nothing the run step strips', () => {
+  const source = readFileSync(REPRO_PATH, 'utf8');
+  // Every environment variable this file names, in source order. The wrapped
+  // command's contract is four names (three always, DEBUG_HYPOTHESIS_ID when a
+  // hypothesis-id was configured) plus the demo's own redaction fixture — and
+  // the run step DELETES the runner's command-file variables from the child
+  // env (adaptation note 3), so a demo that reached for GITHUB_OUTPUT or
+  // GITHUB_ENV would work in no CI at all.
+  const named = [...source.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((match) => match[1]);
+  assert.deepEqual([...new Set(named)].sort(), [
+    'DEBUG_HYPOTHESIS_ID',
+    'DEBUG_LOG_URL',
+    'DEBUG_SESSION_ID',
+    'DEBUG_SESSION_TOKEN',
+    'DEMO_FAKE_SECRET',
+  ]);
+  // The computed forms are the way PAST the scan above, so they are pinned
+  // rather than banned: the demo checks that the stripped variables are
+  // ABSENT, which needs a dynamic read and consumes no value through one. A
+  // computed read that fed a value into an event would be a dependency the
+  // enumeration could not see.
+  const computed = [...source.matchAll(/process\.env\[[^\]]*\][^\n]*/g)].map((match) => match[0]);
+  assert.equal(computed.length, 1, 'exactly one computed read');
+  assert.match(computed[0], /^process\.env\[name\] !== undefined\)/, 'a presence test, not a value');
+  const enumerated = [...source.matchAll(/Object\.keys\(process\.env\)[^\n]*/g)].map((match) => match[0]);
+  assert.equal(enumerated.length, 1, 'exactly one enumeration of the environment');
+  assert.match(enumerated[0], /startsWith\('DEBUG_ACTION_'\)/, 'and it looks for what must not be there');
+});
+
+test('demo/repro.js refuses to run without its redaction fixture instead of logging "undefined"', () => {
+  // The redaction proof is the demo's whole point, and its failure mode is
+  // SILENT: with DEMO_FAKE_SECRET unset the third event reads
+  // "token=undefined", the artifact contains no [REDACTED] marker, and a human
+  // skimming a green job learns nothing. The exit code below is what turns
+  // that into a red demo job.
+  const { spawnSync: spawnSyncChild } = require('node:child_process');
+  const result = spawnSyncChild(process.execPath, [REPRO_PATH], {
+    env: { ...process.env, DEMO_FAKE_SECRET: '' },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 99, 'the infrastructure code, reached before any event is posted');
+  assert.match(result.stderr, /DEMO_FAKE_SECRET/);
+});
+
+test('demo repro drives the full lifecycle: seeded exit 1, redacted secret, deterministic report content', async () => {
+  // Assembled from parts so this file never contains a contiguous
+  // secret-shaped literal, and so the value is visibly a fixture.
+  const secret = ['demo-fake-', 'secret-value-', '0123456789'].join('');
+  const context = await startReal({
+    hypothesisId: 'DEMO-H1',
+    hypothesisTitle: 'seeded demo failure',
+    redactNames: 'DEMO_FAKE_SECRET',
+    // The regime the dogfood workflow actually runs under: a hosted runner
+    // ships sudo, so strict REFUSES there and the workflow opts in. The
+    // caveat assertions below are the two facts that hold whatever the host
+    // readings say.
+    evidenceTrust: 'best-effort',
+    __env: { DEMO_FAKE_SECRET: secret },
+  });
+  const stdout = [];
+  try {
+    const githubOutput = path.join(context.outputDir, 'github_output');
+    const stepSummary = path.join(context.outputDir, 'step_summary');
+    for (const file of [githubOutput, stepSummary]) writeFileSync(file, '');
+    const runCode = await runSubcommand({
+      inputs: { ...context.inputs, runCommand: REPRO_COMMAND },
+      outputDir: context.outputDir,
+      env: {
+        ...context.runEnv,
+        DEMO_FAKE_SECRET: secret,
+        GITHUB_OUTPUT: githubOutput,
+        // THE RUNNER CONTROL PLANE, present in RUN's own environment and
+        // stripped from the child's (adaptation note 3). Passing them here is
+        // the point: the demo must produce the same evidence with them present
+        // as without, or it is depending on something CI takes away.
+        GITHUB_ENV: path.join(context.outputDir, 'github_env'),
+        GITHUB_PATH: path.join(context.outputDir, 'github_path'),
+        GITHUB_STATE: path.join(context.outputDir, 'github_state'),
+        GITHUB_STEP_SUMMARY: stepSummary,
+      },
+      writeStdout: (text) => stdout.push(text),
+    });
+    assert.equal(runCode, 0, 'authenticated capture and a rendered report');
+    const state = readState(context.outputDir);
+    assert.equal(state.commandExitCode, 1, 'the seeded failure, not the 98/99 demo-infrastructure codes');
+    assert.equal(state.evidenceAuthentic, true);
+    const reportCode = reportSubcommand({
+      outputDir: context.outputDir,
+      env: invocationEnv(context.outputDir, { GITHUB_STEP_SUMMARY: stepSummary }),
+    });
+    assert.equal(reportCode, 0);
+    const evidenceDir = evidenceDirOf(context.outputDir);
+    const sessionLog = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
+    assert.ok(sessionLog.includes('[REDACTED]'), 'redaction marker present');
+    assert.ok(sessionLog.includes('DEMO render: userId=null on first render'), 'the seeded bug is in the evidence');
+    // ALL THREE staged payloads, plus the Step Summary the human reads: the
+    // demo's claim is about what leaves the runner, not about one file of it.
+    for (const name of ['session.log', 'report.md', 'report.json']) {
+      assert.equal(readFileSync(path.join(evidenceDir, name), 'utf8').includes(secret), false,
+        `${name} carries no copy of the fixture value`);
+    }
+    const summary = readFileSync(stepSummary, 'utf8');
+    assert.equal(summary.includes(secret), false, 'the Step Summary carries no copy either');
+    assert.ok(summary.includes('DEMO-H1'), 'the report reached the Step Summary');
+    const reportJson = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    assert.equal(reportJson.hypotheses.length, 1);
+    assert.equal(reportJson.hypotheses[0].id, 'DEMO-H1');
+    assert.equal(reportJson.hypotheses[0].status, 'OPEN');
+    assert.equal(reportJson.hypotheses[0].events, 3);
+    assert.equal(reportJson.untaggedEvents, 1);
+    assert.equal(reportJson.session.events, 4, 'the count the workflow asserts on the live runner');
+    // The regime travels WITH the evidence, and says what it is worth. Both
+    // strings are branch-independent: `admission=DIAGNOSTIC ONLY` is what
+    // best-effort produces on a clean host and on a hosted one alike.
+    const caveats = reportJson.caveats.join(' ');
+    assert.ok(caveats.includes('evidence-trust=best-effort'), 'the artifact states the regime');
+    assert.ok(caveats.includes('admission=DIAGNOSTIC ONLY'), 'and what that regime is worth');
+    assert.ok(caveats.includes(`invocation=${context.invocationNonce}`), 'and which invocation it belongs to');
+    // The qualification is printed BESIDE the digest in run's own step log —
+    // the copy a reader compares against start's pre-command record.
+    const printed = stdout.join('');
+    assert.ok(printed.includes('evidence-qualification ADMISSION RECORD'), 'run repeats the record beside its digest');
+    // Recomputed from the STAGED BYTES, so the demo's artifact and the line a
+    // reader compares it against are checked as one chain rather than by
+    // shape. The action hashes in memory before writing; equality here says
+    // the two agree for this session.
+    const digestLine = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
+      .map((name) => `${name}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex')}`)
+      .join(' ')}`;
+    assert.ok(printed.includes(`${digestLine}\n`), 'the printed digest describes the bytes this run staged');
+    const outputs = readFileSync(githubOutput, 'utf8');
+    assert.match(outputs, /command-exit-code=1/);
+    assert.match(outputs, /event-count=4/);
+    assert.ok(outputs.includes(`evidence-digest=${digestLine}`), 'the convenience output is byte-identical to the log line');
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 1,
+      'the default mirrors the seeded failure');
+    writeState(context.outputDir, { ...readState(context.outputDir), failOnCommandFailure: 'false' });
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) }), 0,
+      'the dogfood toggle waives it');
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: invocationEnv(context.outputDir) });
+  }
+});
+
+test('the demo workflow is a dogfood, not a gate: read-only, pinned, and no step allowed to fail', () => {
+  const workflow = parseWorkflow(DEMO_WORKFLOW);
+  // The display name the gate's forwarder list has to match, byte for byte.
+  assert.equal(workflow.name, 'Debug evidence demo');
+  assert.deepEqual(workflow.permissions, { contents: 'read' });
+  assert.deepEqual(workflow.on, { pull_request: null, workflow_dispatch: null });
+  // Cancellation is safe here and NOT on the enforcing gate: a cancelled
+  // advisory demo costs a demo, a cancelled gate costs a verdict.
+  assert.equal(workflow.concurrency['cancel-in-progress'], 'true');
+  assert.deepEqual(Object.keys(workflow.jobs), ['demo', 'strict-refusal', 'namespacing']);
+  // Nothing in this workflow may reference a secret: it executes PR-controlled
+  // code (the action and the repro come out of the checkout under test), and
+  // the only thing keeping that ordinary is that there is nothing to steal.
+  assert.equal(/secrets\./.test(workflowCode(DEMO_WORKFLOW)), false, 'no secret is referenced');
+  // NO STEP HERE IS ALLOWED TO FAIL, and that is a design constraint rather
+  // than an accident. `continue-on-error` is how a workflow demonstrates an
+  // expected failure, and this repo's own suppression scan classifies it as
+  // gate weakening in any touched workflow (CONFIG_SILENCING in
+  // scripts/pr_closeout_core.js) — correctly, because nothing in the YAML says
+  // whether the failure is re-asserted afterwards. The refusal paths are
+  // `support.js` probes that capture and assert an exit status instead.
+  // Read against the WIRING, not the prose that explains the rule — the same
+  // stripper the `secrets.` check above uses, and for the same reason.
+  assert.equal(/continue-on-error/.test(workflowCode(DEMO_WORKFLOW)), false,
+    'expected failures are probed and asserted, never tolerated');
+  // The scanner's own trigger shape is absent even from the prose: the
+  // suppression scan reads raw text, so a comment spelling the construct out
+  // in full would fail this repo's CI on this very file.
+  assert.equal(/continue-on-error["']?\s*[:=]\s*true/i.test(workflowText(DEMO_WORKFLOW)), false,
+    'not even in a comment');
+  const uses = [...workflowText(DEMO_WORKFLOW).matchAll(/uses: (\S+)/g)].map((match) => match[1]);
+  for (const reference of uses) {
+    if (reference === DEMO_ACTION_REF) continue;
+    assert.match(reference, /^[^@\s]+@[0-9a-f]{40}$/, `${reference} must be SHA-pinned`);
+  }
+  assert.ok(uses.includes('actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10'), 'the repo-wide checkout pin');
+  for (const pin of [
+    'uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3',
+    'uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0',
+  ]) {
+    assert.ok(workflowText(DEMO_WORKFLOW).includes(pin), `version comment included: ${pin}`);
+  }
+  // ARTIFACT NAMES ARE A NAMESPACE, and upload-artifact v4 REFUSES a duplicate
+  // name inside one workflow run — a collision would fail whichever job
+  // uploaded second, and the two-invocation job below exists precisely to show
+  // the naming working.
+  const artifactNames = Object.values(workflow.jobs)
+    .flatMap((job) => actionInvocations(job).map((step) => step.with['artifact-name']));
+  assert.equal(artifactNames.length, 3, 'three action invocations across the workflow');
+  assert.equal(artifactNames.every((name) => typeof name === 'string' && name !== ''), true, 'every invocation names its artifact');
+  assert.equal(new Set(artifactNames).size, artifactNames.length, 'and no two invocations share a name');
+  // PER JOB, because that is the scope that matters: each job gets its own
+  // runner, so two jobs may both take the default port, while two invocations
+  // in ONE job must not contend for it — teardown signals its collector and
+  // returns without waiting for it to exit, so a shared port is a race the
+  // second start would lose (port_in_use, and a red demo).
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    const ports = actionInvocations(job).map((step) => step.with.port ?? parseActionYml().inputs.port.default);
+    assert.equal(new Set(ports).size, ports.length, `${jobName}: no two invocations bind the same port`);
+  }
+});
+
+test('every demo-workflow invocation passes the action\'s own input validator', () => {
+  const declared = parseActionYml().inputs;
+  const workflow = parseWorkflow(DEMO_WORKFLOW);
+  // The `with:` key -> validateActionInputs field map. Anything absent from a
+  // `with:` block is filled from action.yml's OWN default, so this test also
+  // pins that the workflow depends only on defaults the action really declares.
+  const fields = {
+    run: 'runCommand',
+    'session-name': 'sessionName',
+    'working-directory': 'workingDirectory',
+    'fail-on-command-failure': 'failOnCommandFailure',
+    port: 'port',
+    'redact-names': 'redactNames',
+    'max-events': 'maxEvents',
+    'max-bytes': 'maxBytes',
+    'hypothesis-id': 'hypothesisId',
+    'hypothesis-title': 'hypothesisTitle',
+    'evidence-trust': 'evidenceTrust',
+  };
+  const inputsOf = (step) => {
+    const resolved = {};
+    for (const [key, field] of Object.entries(fields)) {
+      resolved[field] = Object.hasOwn(step.with, key) ? step.with[key] : declared[key].default;
+    }
+    // The runner resolves the expression; validateActionInputs only ever sees
+    // a path, so the literal text stands in for one. `output-dir: ""` means
+    // the action's runner.temp default, which is outside the workspace by
+    // construction — the empty `workspace` below says "not asserting
+    // containment here", which is action.yml's own job.
+    return { ...resolved, outputDir: step.with['output-dir'] ?? '', workspace: '' };
+  };
+  let invocations = 0;
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    for (const step of actionInvocations(job)) {
+      invocations += 1;
+      // A `with:` key the action never declared is silently IGNORED by the
+      // runner — a typo'd `artifact_name` would leave the artifact under the
+      // default name and no error anywhere.
+      for (const key of Object.keys(step.with)) {
+        assert.ok(Object.hasOwn(declared, key), `${jobName}/${step.name}: '${key}' is not an input of this action`);
+      }
+      assert.deepEqual(validateActionInputs(inputsOf(step)), [],
+        `${jobName}/${step.name}: the action would reject these inputs`);
+    }
+  }
+  assert.equal(invocations, 3);
+});
+
+test('the demo job wraps the seeded repro under best-effort and waives its exit code', () => {
+  const job = parseWorkflow(DEMO_WORKFLOW).jobs.demo;
+  assert.equal(actionInvocations(job).length, 1);
+  const [invocation] = actionInvocations(job);
+  // The command, resolved against this checkout: the workflow wraps the same
+  // file the lifecycle test above runs, not a second demo that drifted.
+  assert.match(invocation.with.run, /^node \S+$/);
+  assert.equal(path.resolve(REPO_ROOT, invocation.with.run.slice('node '.length)), REPRO_PATH);
+  // ADAPTATION NOTE 1: strict REFUSES on a hosted runner (it ships sudo), and
+  // the sysctl-hardening route is withdrawn — mode 3 does not survive
+  // passwordless sudo, so hardening that way would advertise a guarantee the
+  // host does not provide.
+  assert.equal(invocation.with['evidence-trust'], 'best-effort');
+  // ADAPTATION NOTE 4: the seeded exit 1 leaves the job green ONLY through
+  // this toggle. Its default is 'true' (pinned in the action.yml test above),
+  // so a dropped line here turns the dogfood red for the wrong reason.
+  assert.equal(invocation.with['fail-on-command-failure'], 'false');
+  assert.equal(invocation.with['redact-names'], 'DEMO_FAKE_SECRET');
+  assert.equal(invocation.with['hypothesis-id'], 'DEMO-H1');
+  // The fixture value the redaction proof depends on has to be in the env of
+  // the step that starts the collector, because the collector's redaction
+  // snapshot is that environment.
+  const workflow = parseWorkflow(DEMO_WORKFLOW);
+  assert.equal(typeof workflow.env.DEMO_FAKE_SECRET, 'string');
+  assert.ok(workflow.env.DEMO_FAKE_SECRET.length >= 8, 'long enough to be a needle, fixed so the demo is deterministic');
+  // The live assertions, which are what makes this a check rather than a
+  // demonstration: the action's own outputs, compared to the seeded values.
+  const assertion = job.steps[job.steps.length - 1];
+  assert.equal(assertion.env.EXIT_CODE, '${{ steps.demo.outputs.command-exit-code }}');
+  assert.equal(assertion.env.EVENT_COUNT, '${{ steps.demo.outputs.event-count }}');
+  assert.ok(assertion.run.includes('test "$EXIT_CODE" = "1"'), 'the seeded failure is asserted, not just reported');
+  assert.ok(assertion.run.includes('test "$EVENT_COUNT" = "4"'), 'four events, exactly as the lifecycle test counts them');
+});
+
+// The two refusal probes, read as what they are: `support.js start` invoked
+// with the same DEBUG_ACTION_* environment action.yml's own Start collector
+// step sets. Each is checked against the action's REAL env->inputs mapping
+// (actionInputsFromEnv) and its REAL validator, so "this probe reaches the
+// admission refusal" and "this probe is rejected at input validation" are
+// facts about the shipped code rather than about this test's expectations.
+const probeStep = (job, name) => {
+  const step = job.steps.find((candidate) => candidate.name === name);
+  assert.ok(step, `no step named ${name}`);
+  return step;
+};
+
+test('the strict-refusal probe reaches the admission refusal, not an input error', () => {
+  const job = parseWorkflow(DEMO_WORKFLOW).jobs['strict-refusal'];
+  assert.equal(actionInvocations(job).length, 0, 'a probe job, deliberately not an action invocation');
+  // The probe must run the runtime the ACTION would have chosen; a drifting
+  // node-version would make this a probe of something else.
+  const setup = job.steps.find((step) => String(step.uses).startsWith('actions/setup-node@'));
+  assert.ok(setup, 'the probe job sets up node itself — no action invocation does it here');
+  assert.equal(setup.with['node-version'], parseActionYml().inputs['node-version'].default);
+  const probe = probeStep(job, 'Probe the start subcommand at the default evidence-trust');
+  const inputs = actionInputsFromEnv(probe.env);
+  // THE DEFAULT BY ABSENCE. An explicitly empty DEBUG_ACTION_EVIDENCE_TRUST is
+  // a value the contract does not recognise and would fail validation instead
+  // — a distinction support.js pins deliberately, and one this probe would
+  // silently lose if the variable were spelled out as ''.
+  assert.equal(Object.hasOwn(probe.env, 'DEBUG_ACTION_EVIDENCE_TRUST'), false);
+  assert.equal(inputs.evidenceTrust, 'strict');
+  assert.deepEqual(
+    validateActionInputs({ ...inputs, outputDir: probe.env.DEBUG_ACTION_OUTPUT_DIR, workspace: '' }),
+    [],
+    'the inputs are valid, so exit 3 can only be the admission refusal',
+  );
+  // Redirected so the probe's emissions never become this step's real outputs.
+  assert.match(probe.env.GITHUB_OUTPUT, /^\$\{\{ runner\.temp \}\}\//);
+  for (const line of [
+    'test "$status" = "3"',
+    'grep -q "refusing to run the wrapped command" "$log"',
+    'grep -q "ADMISSION RECORD" "$log"',
+    'grep -q "evidence-trust=strict" "$log"',
+    'grep -q "in-process boundary=NOT established" "$log"',
+    // The live half no stubbed unit test can establish: a hosted runner ships
+    // sudo, which is why hosted execution stays best-effort.
+    'grep -q "sudo binary: present" "$log"',
+    // Identity FIRST, before validation and before any filesystem work…
+    'test "$(grep -cE \'^invocation-nonce=[A-Za-z0-9_-]+$\' "$GITHUB_OUTPUT")" = "1"',
+    // …and nothing created: the refusal precedes the staging directory and
+    // the state file, so neither exists.
+    'test ! -e "$evidence_dir"',
+    'test ! -e "$RUNNER_TEMP/strict-probe/action-state.json"',
+    'test ! -e "$RUNNER_TEMP/strict-probe"',
+  ]) {
+    assert.ok(probe.run.includes(line), `the strict probe must check: ${line}`);
+  }
+});
+
+test('the failing-start probe is rejected at input validation and takes nothing from its neighbours', () => {
+  const job = parseWorkflow(DEMO_WORKFLOW).jobs.namespacing;
+  const probe = probeStep(job, 'A third start that fails, against the same shared output dir');
+  const inputs = actionInputsFromEnv(probe.env);
+  // DELIBERATELY INVALID, proven deliberate by the action's own validator
+  // rather than by this test's belief about it.
+  assert.deepEqual(
+    validateActionInputs({ ...inputs, outputDir: probe.env.DEBUG_ACTION_OUTPUT_DIR, workspace: '' }),
+    ['session-name: must match [A-Za-z0-9_-]+'],
+  );
+  // The SHARED directory: this probe's whole point is that it fails against
+  // the output-dir two live invocations just used.
+  const [first, second] = actionInvocations(job);
+  assert.equal(probe.env.DEBUG_ACTION_OUTPUT_DIR, first.with['output-dir']);
+  assert.equal(probe.env.DEBUG_ACTION_OUTPUT_DIR, second.with['output-dir']);
+  for (const line of [
+    // 1, not 3: the exit taxonomy separates "this host was refused" from
+    // "these inputs are not usable".
+    'test "$status" = "1"',
+    'grep -q "invalid inputs: session-name" "$log"',
+    // Its own staging child, named from its own pre-validation identity, and
+    // empty — never the neighbours' evidence.
+    'test ! -e "$evidence_dir/report.md"',
+    'test ! -e "$evidence_dir/session.log"',
+    // A DIFFERENT directory from the neighbour's, whose staged report is
+    // still there afterwards: neither adopted nor destroyed.
+    'test "$evidence_dir" != "$(dirname "$SECOND_REPORT")"',
+    'test -f "$SECOND_REPORT"',
+    // And the shared state file still belongs to whoever owned it before.
+    'test "$before" = "$after"',
+  ]) {
+    assert.ok(probe.run.includes(line), `the failing-start probe must check: ${line}`);
+  }
+});
+
+test('the two-invocation job demonstrates NAMESPACING ONLY, and says so in the file', () => {
+  const workflow = parseWorkflow(DEMO_WORKFLOW);
+  const job = workflow.jobs.namespacing;
+  const [first, second] = actionInvocations(job);
+  assert.equal(actionInvocations(job).length, 2, 'two invocations, one job');
+  // ONE output-dir, shared, which is the whole point: the staging children and
+  // the step outputs are what keep them apart, not the directory.
+  assert.equal(first.with['output-dir'], second.with['output-dir']);
+  assert.match(first.with['output-dir'], /^\$\{\{ runner\.temp \}\}\//, 'outside the workspace by construction');
+  assert.notEqual(first.with['artifact-name'], second.with['artifact-name']);
+  assert.notEqual(first.with.port ?? parseActionYml().inputs.port.default, second.with.port);
+  assert.equal(first.id, 'first');
+  assert.equal(second.id, 'second');
+  const assertion = probeStep(job, 'Assert each invocation answered for itself');
+  // Each invocation answers for ITSELF: its own session, its own staged
+  // report — and the second one's arrival neither renamed nor cleared the
+  // first one's evidence, which is still on disk when this step runs.
+  for (const line of [
+    'test "$FIRST_SESSION" != "$SECOND_SESSION"',
+    'test "$FIRST_EXIT" = "1"',
+    'test "$SECOND_EXIT" = "1"',
+    'test "$FIRST_REPORT" != "$SECOND_REPORT"',
+    'test -f "$FIRST_REPORT"',
+    'test -f "$SECOND_REPORT"',
+  ]) {
+    assert.ok(assertion.run.includes(line), `the assertion step must check: ${line}`);
+  }
+  // THE LABEL, pinned by polarity because the claim it makes is a security
+  // claim and the flattering reading of this job is the wrong one (Codex T6
+  // r2 ruling, carried into Task 7's adaptation note 2). Two invocations in
+  // one job show expression SCOPING; they show nothing about isolation,
+  // because an earlier instrumented command reaches a later invocation's
+  // start through BASH_ENV.
+  const commentary = workflowText(DEMO_WORKFLOW).split(/\r?\n/)
+    .filter((line) => line.trim().startsWith('#'))
+    .map((line) => line.trim().replace(/^#\s?/, ''))
+    .join(' ');
+  assert.match(commentary, /namespacing only/i);
+  assert.match(commentary, /not adversarial isolation/i);
+  assert.match(commentary, /separate job/i);
+  assert.doesNotMatch(commentary, /(?:demonstrates|proves|shows) (?:adversarial )?isolation|isolated from each other|safe to reuse in the same job/i);
+});
+
+test('the closeout gate forwards a retry for the demo workflow, and still excludes itself', () => {
+  const text = workflowText('closeout-gate.yml');
+  // The trigger list, exactly: a fourth entry (or a reordering) is a change to
+  // which siblings can unblock a gate that BLOCKED on a pending check.
+  assert.match(text, /^ {4}workflows: \["Validate", "Closeout preview", "Debug evidence demo"\]$/m);
+  // The invariant the list exists to preserve: the gate must never watch for
+  // its OWN completion, or every run re-triggers another.
+  assert.doesNotMatch(text, /workflows: \[[^\]]*"Closeout gate"/);
+  const commentary = text.split(/\r?\n/)
+    .filter((line) => line.trim().startsWith('#'))
+    .map((line) => line.trim().replace(/^#\s?/, ''))
+    .join(' ');
+  // The comment names what it scopes to, and still explains the exclusion.
+  assert.match(commentary, /"Validate", "Closeout preview", "Debug evidence demo"/);
+  assert.doesNotMatch(commentary, /ONLY these two sibling/i);
+  assert.match(commentary, /NOT "Closeout gate" itself/);
+  assert.match(commentary, /no retrigger loop/i);
+  // AND the structural fact the gate's own blast-radius note asserts about its
+  // siblings, which the demo workflow CHANGES: it uploads an evidence
+  // artifact, so the old "neither uploads an artifact" sentence became false
+  // the moment this task shipped. Pinned by polarity: a comment that is wrong
+  // about the repository is worse than one that says nothing.
+  assert.doesNotMatch(commentary, /neither uploads an artifact/i);
+  assert.match(commentary, /"Debug evidence demo" (?:does )?upload/i);
+  // And the COUNT it states is the count the demo workflow actually produces.
+  // A number in a comment is a claim about the repository like any other, and
+  // this one drifts the moment a job is added or removed.
+  const claimed = /upload evidence\s+artifacts \((\d+) per run/.exec(commentary);
+  assert.ok(claimed, 'the note states how many artifacts the demo produces');
+  const invocations = Object.values(parseWorkflow(DEMO_WORKFLOW).jobs)
+    .flatMap((job) => actionInvocations(job));
+  assert.equal(Number(claimed[1]), invocations.length);
 });

@@ -1,0 +1,291 @@
+name: Debug evidence demo
+
+# DOGFOOD, not a gate. Two jobs wrap a deterministic seeded failure
+# (actions/debug-evidence/demo/repro.js) in `./actions/debug-evidence`; the
+# third probes the `start` subcommand behind that action directly, because what
+# it demonstrates is a REFUSAL (see below). Every one of them then ASSERTS what
+# happened, so a change that breaks the live runner contract shows up as a red
+# demo here rather than as a surprise in a consumer's workflow. Nothing in this
+# file blocks a merge on its own; the closeout gate blocks on it as a sibling
+# check, exactly as it does on "Validate" and "Closeout preview".
+#
+# WHY EVERY CAPTURING INVOCATION SETS `evidence-trust: best-effort`. Strict
+# admission is a four-way conjunction — Yama ptrace_scope 3, a non-root
+# effective uid, NO sudo binary at a conventional absolute path or anywhere on
+# the inherited PATH, and no dangerous capability — and GitHub-hosted runners
+# ship /usr/bin/sudo with a passwordless rule, so `start` REFUSES on the
+# default hosted configuration. That refusal is itself demonstrated below, in
+# the strict-refusal job. Hardening the runner with `sysctl -w
+# kernel.yama.ptrace_scope=3` would NOT make strict reachable and this workflow
+# deliberately does not try: the same passwordless sudo that sets the sysctl
+# opens the privileged-BPF route that Yama does not govern, so a sysctl-only
+# "strict" demo would advertise a guarantee this host does not provide.
+# Best-effort evidence is a diagnostic claim, and the admission record stamped
+# on every artifact here says exactly that.
+#
+# WHY THE NEGATIVE CASES ARE `support.js` PROBES RATHER THAN ACTION STEPS.
+# A step that is EXPECTED to fail needs `continue-on-error`, and this
+# repository's own suppression scan (tools/scan_touched_suppressions.js, via
+# CONFIG_SILENCING in scripts/pr_closeout_core.js) classifies that as gate
+# weakening in any touched workflow — correctly, since nothing in the YAML
+# tells a reader whether the failure is really re-asserted afterwards. So the
+# refusal paths below invoke the same `support.js` subcommand action.yml
+# invokes, with the same DEBUG_ACTION_* environment the composite hands it,
+# and CAPTURE the exit status explicitly. Nothing is silenced: each probe
+# fails the step unless the exit code, the diagnostic and the filesystem state
+# are all exactly what the refusal is supposed to produce. What that cannot
+# cover is the runner-level consequence (a failed composite step failing the
+# job, and later steps' guards firing) — that stays a unit-test claim.
+#
+# THIS WORKFLOW EXECUTES PR-CONTROLLED CODE — `./actions/debug-evidence` and
+# demo/repro.js both come out of the checkout under test, which for a
+# pull_request run is the PR's own commit. That is the same posture "Validate"
+# already has (it runs the PR's `npm test`), and the bound on it is structural:
+# the permissions block below is read-only, and this file references no secret
+# at all. DEMO_FAKE_SECRET is a FIXED DUMMY committed in the clear — its only
+# job is to prove redaction end to end, and a real secret would defeat the
+# purpose of showing the value in the file.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Advisory demo — cancellation on a new push is safe (unlike the enforcing
+# gate, which must never cancel-then-skip an in-flight verdict).
+concurrency:
+  group: debug-evidence-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A fixed dummy value whose ONLY job is to prove redaction end-to-end: the
+  # collector's redaction snapshot is the environment of the step that starts
+  # it, so this has to be in the job env — not merely in the wrapped command's
+  # — and the artifact's session.log must then read [REDACTED] where repro.js
+  # logged it. Deliberately not a real secret, and deliberately not a
+  # `secrets.` reference: a demo that cannot be read is not a demo.
+  DEMO_FAKE_SECRET: demo-fake-secret-value-0123456789
+
+jobs:
+  # 1. THE DOGFOOD. A seeded failure, captured, published, and WAIVED.
+  demo:
+    name: Seeded failure, waived
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The action needs no git history — shallow is enough.
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Debug evidence demo session
+        id: demo
+        uses: ./actions/debug-evidence
+        with:
+          run: node actions/debug-evidence/demo/repro.js
+          session-name: demo
+          hypothesis-id: DEMO-H1
+          hypothesis-title: seeded demo failure
+          redact-names: DEMO_FAKE_SECRET
+          evidence-trust: best-effort
+          # The demo fails BY DESIGN (seeded exit 1); the action must stay
+          # green so this job reads as "the action works", not "the repo is
+          # broken". With the default this step would fail and the job would
+          # be red, which is the whole difference this input names.
+          fail-on-command-failure: "false"
+          artifact-name: debug-evidence-demo
+
+      - name: Assert the action reported the seeded failure without failing the job
+        # Through env, never interpolated into the script body: a `${{ }}`
+        # expression is substituted into the shell source TEXT before bash
+        # parses it. These particular values are the action's own outputs, but
+        # keeping every expression out of the script text is the rule that does
+        # not need re-auditing when a value's provenance changes.
+        env:
+          EXIT_CODE: ${{ steps.demo.outputs.command-exit-code }}
+          EVENT_COUNT: ${{ steps.demo.outputs.event-count }}
+          SESSION_ID: ${{ steps.demo.outputs.session-id }}
+          DIGEST: ${{ steps.demo.outputs.evidence-digest }}
+        run: |
+          set -euo pipefail
+          echo "command-exit-code=$EXIT_CODE event-count=$EVENT_COUNT session-id=$SESSION_ID"
+          echo "$DIGEST"
+          test "$EXIT_CODE" = "1"
+          test "$EVENT_COUNT" = "4"
+          test -n "$SESSION_ID"
+          test -n "$DIGEST"
+
+  # 2. THE REFUSAL, on a real hosted runner. This is the one claim in the
+  # matrix that no unit test can make: every admission probe is stubbed in the
+  # suite, so only a live runner can establish that the default configuration
+  # of a GitHub-hosted VM does NOT satisfy strict admission. If GitHub ever
+  # shipped a runner without sudo, this job goes red and says so.
+  strict-refusal:
+    name: Strict refuses an unhardened hosted runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Probe the start subcommand at the default evidence-trust
+        env:
+          # Exactly the variables action.yml's `Start collector` step sets,
+          # minus DEBUG_ACTION_EVIDENCE_TRUST: its ABSENCE is what selects the
+          # 'strict' default, and an empty string would be an input error
+          # instead (a distinction support.js pins deliberately).
+          DEBUG_ACTION_RUN: node actions/debug-evidence/demo/repro.js
+          DEBUG_ACTION_SESSION_NAME: demo-strict
+          DEBUG_ACTION_OUTPUT_DIR: ${{ runner.temp }}/strict-probe
+          # Redirected so the probe's own step outputs never reach this step's
+          # real ones, and so the emitted lines can be inspected below.
+          GITHUB_OUTPUT: ${{ runner.temp }}/strict-probe-output
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/strict-probe.log"
+          printf '' > "$GITHUB_OUTPUT"
+          status=0
+          node actions/debug-evidence/support.js start > "$log" 2>&1 || status=$?
+          cat "$log"
+          cat "$GITHUB_OUTPUT"
+          test "$status" = "3"
+          grep -q "refusing to run the wrapped command" "$log"
+          grep -q "ADMISSION RECORD" "$log"
+          grep -q "evidence-trust=strict" "$log"
+          grep -q "in-process boundary=NOT established" "$log"
+          grep -q "sudo binary: present" "$log"
+          test "$(grep -cE '^invocation-nonce=[A-Za-z0-9_-]+$' "$GITHUB_OUTPUT")" = "1"
+          evidence_dir=$(grep -m1 '^evidence-dir=' "$GITHUB_OUTPUT" | cut -d= -f2-)
+          test -n "$evidence_dir"
+          test ! -e "$evidence_dir"
+          test ! -e "$RUNNER_TEMP/strict-probe/action-state.json"
+          test ! -e "$RUNNER_TEMP/strict-probe"
+
+  # 3. NAMESPACING ONLY. Two invocations in ONE job, sharing ONE output
+  # directory, with DISTINCT artifact names — plus a third `start` that fails
+  # against the same directory and must take nothing from either of them.
+  #
+  # WHAT THIS SHOWS: expression scoping. `steps.<id>.outputs.*` resolves per
+  # action instance, so each invocation's report/upload/teardown/finish read
+  # THEIR OWN start — their own invocation nonce, their own staging child under
+  # the shared output-dir, their own artifact name. The failing start publishes
+  # its identity before it validates anything, so it names a staging directory
+  # of its own that stays empty rather than inheriting a neighbour's.
+  #
+  # WHAT THIS IS EXPLICITLY NOT: it is not adversarial isolation (Codex ruling,
+  # Task 6 round 2). A command an EARLIER invocation ran in the same job can
+  # write BASH_ENV through its own GITHUB_ENV file, and every later
+  # `shell: bash` step sources that before support.js runs — a later
+  # invocation's `start` included — so it can append a last-wins
+  # `evidence-dir=` to that start's own output file. Wrapping a second command
+  # after an instrumented one therefore belongs in a SEPARATE JOB; the
+  # invocations here are the repo's own trusted demo, not hostile commands, and
+  # this job proves nothing about what a hostile one could reach.
+  namespacing:
+    name: Two invocations, one job (namespacing only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: First invocation, capturing into the shared output dir
+        id: first
+        uses: ./actions/debug-evidence
+        with:
+          run: node actions/debug-evidence/demo/repro.js
+          session-name: demo-first
+          redact-names: DEMO_FAKE_SECRET
+          evidence-trust: best-effort
+          fail-on-command-failure: "false"
+          output-dir: ${{ runner.temp }}/shared-evidence
+          artifact-name: debug-evidence-demo-namespacing-a
+
+      - name: Second invocation, sharing that output dir
+        id: second
+        uses: ./actions/debug-evidence
+        with:
+          run: node actions/debug-evidence/demo/repro.js
+          session-name: demo-second
+          redact-names: DEMO_FAKE_SECRET
+          evidence-trust: best-effort
+          fail-on-command-failure: "false"
+          output-dir: ${{ runner.temp }}/shared-evidence
+          # A DISTINCT PORT, and it is load-bearing rather than decorative:
+          # the first invocation's teardown sends its collector a signal and
+          # returns without waiting for it to die, so reusing 8787 here is a
+          # race against a listener that may still hold the port — the shim
+          # would report port_in_use and this invocation's start would fail.
+          # The same reasoning the `port` input documents for self-hosted
+          # runners sharing a host applies to two invocations in one job.
+          port: "8788"
+          artifact-name: debug-evidence-demo-namespacing-b
+
+      - name: Assert each invocation answered for itself
+        env:
+          FIRST_SESSION: ${{ steps.first.outputs.session-id }}
+          SECOND_SESSION: ${{ steps.second.outputs.session-id }}
+          FIRST_EXIT: ${{ steps.first.outputs.command-exit-code }}
+          SECOND_EXIT: ${{ steps.second.outputs.command-exit-code }}
+          FIRST_REPORT: ${{ steps.first.outputs.report-path }}
+          SECOND_REPORT: ${{ steps.second.outputs.report-path }}
+        run: |
+          set -euo pipefail
+          echo "first:  session=$FIRST_SESSION exit=$FIRST_EXIT report=$FIRST_REPORT"
+          echo "second: session=$SECOND_SESSION exit=$SECOND_EXIT report=$SECOND_REPORT"
+          test -n "$FIRST_SESSION"
+          test -n "$SECOND_SESSION"
+          test "$FIRST_SESSION" != "$SECOND_SESSION"
+          test "$FIRST_EXIT" = "1"
+          test "$SECOND_EXIT" = "1"
+          test "$FIRST_REPORT" != "$SECOND_REPORT"
+          test -f "$FIRST_REPORT"
+          test -f "$SECOND_REPORT"
+
+      - name: A third start that fails, against the same shared output dir
+        env:
+          # DELIBERATELY INVALID: [A-Za-z0-9_-]+ is the whole session-name
+          # vocabulary, so `start` refuses at input validation — AFTER it has
+          # published this invocation's own identity, which is the ordering
+          # this step exists to check.
+          DEBUG_ACTION_RUN: node actions/debug-evidence/demo/repro.js
+          DEBUG_ACTION_SESSION_NAME: not a valid session name
+          DEBUG_ACTION_EVIDENCE_TRUST: best-effort
+          DEBUG_ACTION_OUTPUT_DIR: ${{ runner.temp }}/shared-evidence
+          GITHUB_OUTPUT: ${{ runner.temp }}/third-start-output
+          STATE_FILE: ${{ runner.temp }}/shared-evidence/action-state.json
+          # The neighbour this probe must neither adopt nor destroy.
+          SECOND_REPORT: ${{ steps.second.outputs.report-path }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/third-start.log"
+          printf '' > "$GITHUB_OUTPUT"
+          read_nonce='process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.STATE_FILE,"utf8")).nonce)'
+          before=$(node -e "$read_nonce")
+          status=0
+          node actions/debug-evidence/support.js start > "$log" 2>&1 || status=$?
+          cat "$log"
+          cat "$GITHUB_OUTPUT"
+          test "$status" = "1"
+          grep -q "invalid inputs: session-name" "$log"
+          evidence_dir=$(grep -m1 '^evidence-dir=' "$GITHUB_OUTPUT" | cut -d= -f2-)
+          test -n "$evidence_dir"
+          test ! -e "$evidence_dir/report.md"
+          test ! -e "$evidence_dir/session.log"
+          test "$evidence_dir" != "$(dirname "$SECOND_REPORT")"
+          test -f "$SECOND_REPORT"
+          after=$(node -e "$read_nonce")
+          test "$before" = "$after"
+          echo "shared state still belongs to the second invocation: $after"

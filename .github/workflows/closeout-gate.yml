@@ -28,12 +28,15 @@ on:
         default: ""
   # Re-run once a sibling check that was still pending when the gate last
   # ran has settled (CodeRabbit PR7 #6YW9UP): an approval submitted while
-  # "Validate" or "Closeout preview" is still queued/in-progress makes
+  # "Validate", "Closeout preview" or "Debug evidence demo" is still
+  # queued/in-progress makes
   # readLivePrState correctly BLOCK on that pending check, but nothing else
   # re-triggers the gate once it later completes — none of the pull_request/
   # pull_request_review activity above fires for another workflow's check
-  # completion. Deliberately named-scoped to ONLY these two sibling
-  # workflows, NOT "Closeout gate" itself: neither of them has a
+  # completion. Deliberately name-scoped to ONLY these sibling
+  # workflows ("Validate", "Closeout preview", "Debug evidence demo" — the
+  # cycle 4 demo is a per-PR sibling check the gate can block on, exactly
+  # like the other two), NOT "Closeout gate" itself: none of them has a
   # workflow_run trigger watching for "Closeout gate" completions, so the
   # gate's own run can never re-trigger itself through this path — there is
   # no retrigger loop to guard against here, by construction.
@@ -67,7 +70,7 @@ on:
   # do; the rerun approach depends only on already-established, already-
   # working SHA-association for the pull_request_review trigger path).
   workflow_run:
-    workflows: ["Validate", "Closeout preview"]
+    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]
     types: [completed]
   # Base-branch-drift discovery (chatgpt-codex-connector PR7 #6YbMwY):
   # RESOLVED for the trigger-coverage gap where none of the events above
@@ -243,14 +246,23 @@ jobs:
       #      additionally hard-caps the token to read-only server-side
       #      regardless of what a fork-supplied workflow file requests, which
       #      is the actual threat model this trigger runs under.
-      #   2. Neither sibling workflow (validate.yml, closeout-preview.yml)
-      #      references any secret beyond the implicit GITHUB_TOKEN, and
-      #      neither uploads an artifact -- checked directly (`grep -n
+      #   2. No sibling workflow (validate.yml, closeout-preview.yml,
+      #      debug-evidence-demo.yml) references any secret beyond the
+      #      implicit GITHUB_TOKEN -- checked directly (`grep -n
       #      'secrets\.' .github/workflows/*.yml`) rather than assumed, so
       #      `actions: read` in a compromised run cannot currently reach any
-      #      OTHER workflow's secret or artifact in this repo. It can still
-      #      list/read this workflow's OWN past runs' evidence artifacts
-      #      (chatgpt-codex-connector's stated concern) via the Actions API.
+      #      OTHER workflow's secret in this repo. Artifacts are a different
+      #      matter as of cycle 4: "Debug evidence demo" DOES upload evidence
+      #      artifacts (3 per run, one per action invocation), so
+      #      `actions: read` here can read them. Bounded rather than
+      #      prevented, and bounded by what those artifacts contain: three
+      #      files per invocation (session.log, report.md, report.json) from
+      #      a deterministic demo repro whose only secret-shaped value is
+      #      DEMO_FAKE_SECRET -- a fixed dummy committed in the clear in that
+      #      workflow, and redacted out of the evidence anyway. It can also
+      #      still list/read this workflow's OWN past runs' evidence
+      #      artifacts (chatgpt-codex-connector's stated concern) via the
+      #      Actions API.
       #
       # A COMPLETE fix means never executing PR-controlled code with any live
       # token -- e.g. referencing this action by a pinned, trusted remote ref
