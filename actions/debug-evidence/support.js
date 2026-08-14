@@ -706,90 +706,6 @@ const httpRequestJson = ({
 // stdio: 'inherit' — the wrapped command's output belongs in the step log.
 const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', command], { cwd, env, stdio: 'inherit' });
 
-const runSubcommand = async ({
-  inputs, outputDir, env = process.env,
-  spawnCommand = defaultSpawnCommand, writeStdout = defaultStdoutWrite,
-}) => {
-  const state = readState(outputDir);
-  if (!state) {
-    process.stderr.write('debug-evidence-action: run: no recorded state; the start step never completed.\n');
-    return 3;
-  }
-  if (rejectForeignNonce(state, env, 'run')) return 3;
-  // The session was minted in start, while the launch token still existed.
-  // This step talks to no one: it injects what start recorded, runs the
-  // command, and records how it went. Nothing here holds a credential that
-  // could mint a session or post a hypothesis, because no such credential
-  // survives into this process (Codex T5 r3).
-  if (!state.sessionId || !state.sessionToken) {
-    process.stderr.write('debug-evidence-action: run: recorded state carries no session; the start step never completed its mint.\n');
-    return 3;
-  }
-  // Re-registering a value the runner already masks in start is a no-op for
-  // Actions and cheap insurance for this step's own log, which is where the
-  // token is about to be put into a child process's environment.
-  maskValue(env, state.sessionToken, writeStdout);
-  const commandEnv = {
-    ...env,
-    DEBUG_LOG_URL: `http://127.0.0.1:${state.port}/log`,
-    DEBUG_SESSION_ID: state.sessionId,
-    DEBUG_SESSION_TOKEN: state.sessionToken,
-  };
-  // The action's own wiring is not part of the contract the wrapped command
-  // is promised, and DEBUG_ACTION_OUTPUT_DIR points straight at
-  // action-state.json — which no longer carries a launch token, but does
-  // carry the session token and this invocation's nonce. The wrapped command
-  // runs as the same OS user, so the file's 0600 mode is no boundary against
-  // it; handing over the path is (Codex T5 r2 #1). Stripping the whole prefix
-  // rather than one name keeps the rule stable as more wiring vars appear.
-  for (const key of Object.keys(commandEnv)) {
-    if (key.startsWith('DEBUG_ACTION_')) delete commandEnv[key];
-  }
-  if (state.hypothesisId) {
-    commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
-  } else {
-    // The `...env` spread above would otherwise let a job-level
-    // DEBUG_HYPOTHESIS_ID through, and every event the wrapped command logged
-    // would be attributed to a hypothesis THIS action never opened — evidence
-    // filed under a claim nobody made (Codex T4 #5). Delete rather than set to
-    // '', because an empty string is still a present variable.
-    delete commandEnv.DEBUG_HYPOTHESIS_ID;
-  }
-  // Awaited so a seam can be asynchronous; defaultSpawnCommand is spawnSync
-  // and resolves immediately.
-  const result = await spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
-  const commandExitCode = result.error ? 127 : (result.status ?? 128);
-  // Ownership check and commit as ONE indivisible step. The snapshot in
-  // `state` was read before a wrapped command that may have run for an hour,
-  // and the write below is a blind whole-file overwrite: if another
-  // invocation claimed this output-dir meanwhile, it would restore OUR stale
-  // pid/port/session over theirs and strand their live collector. Re-reading
-  // first was not enough on its own — between the compare and the rename a
-  // second invocation could still commit, and this one would clobber it
-  // anyway (Codex T4 #3, then r2). Under the lock the re-read and the write
-  // cannot be split, so whoever the compare saw is still who is there.
-  const committed = await withStateLock(outputDir, () => {
-    const current = readState(outputDir);
-    if (!current || current.nonce !== state.nonce) return false;
-    writeState(outputDir, {
-      ...current,
-      commandExitCode,
-      commandSignal: result.signal ?? null,
-      commandError: result.error ? String(result.error.message) : null,
-    });
-    return true;
-  });
-  // Refuse completely: no state write, and no outputs either, since a
-  // session-id emitted from state we just declined to own would be a lie.
-  if (!committed) {
-    process.stderr.write('debug-evidence-action: run: recorded state changed while the wrapped command ran (another invocation now owns this output-dir); refusing to overwrite it.\n');
-    return 3;
-  }
-  if (env.GITHUB_OUTPUT) {
-    writeOutputs(env.GITHUB_OUTPUT, { 'command-exit-code': commandExitCode, 'session-id': state.sessionId });
-  }
-  return 0; // command failure is finish's decision, never run's
-};
 
 // Render both surfaces from bytes ALREADY IN MEMORY.
 //
@@ -999,11 +915,7 @@ const payloadDigestLine = (payloads) => {
 // discipline debug_report.js applies to its own error line.
 const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 
-// Capture: stage the session log and both rendered surfaces into the evidence
-// child, record what actually happened, and leave every VERDICT to finish.
-//
-// Three decisions here are load-bearing:
-//
+// The three capture decisions that moved here with it, unchanged:
 // 1. Evidence is captured FROM THE COLLECTOR, never by pathname. The wrapped
 //    command is handed DEBUG_SESSION_ID and shares the filesystem, so it can
 //    overwrite .debug/debug-<id>.log with whatever NDJSON it likes — including
@@ -1027,21 +939,67 @@ const oneLine = (value) => String(value).replace(/\r?\n|\r/g, ' ');
 //    commit is then a compare-and-set under that lock, exactly as run's is:
 //    re-read, compare nonces, and spread the CURRENT state rather than the
 //    snapshot this function opened with (Codex T4 #3/r2).
-const reportSubcommand = async ({
-  outputDir, env = process.env,
+
+// Runner command-file variables. Stripped from the wrapped command's
+// environment as DEFENCE IN DEPTH, and explicitly not as a boundary.
+//
+// GITHUB_ENV is the sharp one: it names a file whose contents the runner
+// applies to every SUBSEQUENT step. A wrapped command that appends
+// `BASH_ENV=/tmp/theirs.sh` to it gets that script sourced by the
+// non-interactive bash of every later step — after the runner has already
+// resolved those steps' `env:` — which is how a later step's view of any
+// variable can be rewritten by an earlier step's child (Codex T5 r6).
+//
+// Removing the names raises the bar; it does not close the channel, because a
+// determined child can still enumerate the runner's command files under
+// RUNNER_TEMP. What actually closes it is that no security decision is left
+// for a later step to make: capture happens in THIS process, whose
+// environment was resolved before the wrapped command existed.
+const RUNNER_COMMAND_FILE_VARS = [
+  'GITHUB_ENV',
+  'GITHUB_PATH',
+  'GITHUB_OUTPUT',
+  'GITHUB_STATE',
+  'GITHUB_STEP_SUMMARY',
+];
+
+// run is the TRUSTED PROCESS, and that is the whole architecture.
+//
+// It is the only process in the job that spans the wrapped command's
+// execution: its environment was resolved by the runner before the command
+// existed, and a child cannot rewrite its parent's memory. So every decision
+// that must not be influenced by the command — which collector to believe,
+// whether an answer is authentic, what gets staged — is made here, on either
+// side of the command rather than in a later step the command can poison.
+//
+// This also means the verification key is read BEFORE the command runs. It is
+// public, so a child reading /proc/<ppid>/environ learns nothing it can use;
+// that is exactly what round 5's asymmetric switch bought, and it is what
+// makes hosting the key in this long-lived process safe.
+//
+// And run FAILS CLOSED: any integrity failure returns 3 with nothing staged.
+// A composite step that fails fails the action, and no later step can undo
+// that — so even a completely poisoned report or finish cannot turn a failed
+// verification green. Only the wrapped command's own exit code stays deferred
+// to finish, which is not security-critical: a hostile command can always
+// choose what to exit with.
+const runSubcommand = async ({
+  inputs, outputDir, env = process.env,
+  spawnCommand = defaultSpawnCommand, writeStdout = defaultStdoutWrite,
   renderReport = defaultRenderReport, readLive = readSessionLive,
-  stageFile = defaultStageFile, writeStdout = defaultStdoutWrite,
+  stageFile = defaultStageFile,
 }) => {
-  // FIRST, before state is even read. Staging is invocation-scoped: an
-  // output-dir can be reused — across steps, across jobs on a self-hosted
-  // runner — and the upload step enumerates three fixed filenames, so a
-  // previous invocation's report left sitting there ships as this run's
-  // evidence under this run's artifact name. A failed start, an absent state
-  // file and a foreign nonce are exactly the paths that used to return
-  // without clearing, and they are the ones where stale evidence is most
-  // plausible (Codex T5 r2 #3, hoisted in r3). Anything other than "it was
-  // not there" is left to throw: a staging slot that cannot be cleared cannot
-  // be scoped either.
+  // Invocation-scoped staging, cleared FIRST — before state is even read, and
+  // long before the command runs. An output-dir can be reused — across steps,
+  // across jobs on a self-hosted runner — and the upload step enumerates three
+  // fixed filenames, so a previous invocation's report left sitting there
+  // ships as this run's evidence under this run's artifact name. The refusals
+  // just below are exactly the paths where stale evidence is most plausible,
+  // which is why the clear precedes them (Codex T5 r2 #3, hoisted in r3, and
+  // hoisted again with capture in r6). Clearing here also means a run that
+  // dies mid-command leaves nothing behind to be mistaken for its own output.
+  // Anything other than "it was not there" is left to throw: a staging slot
+  // that cannot be cleared cannot be scoped either.
   const evidenceDir = resolveEvidenceDir(outputDir);
   mkdirSync(evidenceDir, { recursive: true });
   for (const name of EVIDENCE_FILES) {
@@ -1052,19 +1010,70 @@ const reportSubcommand = async ({
     }
   }
   const state = readState(outputDir);
-  if (!state) return 0; // start never completed; finish owns that failure
-  if (rejectForeignNonce(state, env, 'report')) return 3;
-  if (!state.sessionId || !state.sessionToken) {
-    process.stderr.write('debug-evidence-action: report: recorded state carries no session; nothing to capture.\n');
-    return 0; // finish fails on the missing commandExitCode
+  if (!state) {
+    process.stderr.write('debug-evidence-action: run: no recorded state; the start step never completed.\n');
+    return 3;
   }
+  if (rejectForeignNonce(state, env, 'run')) return 3;
+  // The session was minted in start, while the launch token still existed.
+  // Nothing here holds a credential that could mint a session or post a
+  // hypothesis, because no such credential survives into this process
+  // (Codex T5 r3).
+  if (!state.sessionId || !state.sessionToken) {
+    process.stderr.write('debug-evidence-action: run: recorded state carries no session; the start step never completed its mint.\n');
+    return 3;
+  }
+  // Read from THIS process's environment, before the wrapped command exists.
+  // From the environment only, never from state: the key is public, so its
+  // secrecy does not matter, but its INTEGRITY is everything — a same-user
+  // process that could substitute its own public key would then sign answers
+  // with the matching private one. Runner memory is the one channel such a
+  // process cannot reach, so state and every other file on disk are excluded
+  // as sources by construction (Codex T5 r5 #2, r6 #1).
+  const verifyKey = responderVerifyKey(env.DEBUG_ACTION_COLLECTOR_VERIFY_KEY);
+  // Re-registering a value the runner already masks in start is a no-op for
+  // Actions and cheap insurance for this step's own log, which is where the
+  // token is about to be put into a child process's environment.
+  maskValue(env, state.sessionToken, writeStdout);
+  const commandEnv = {
+    ...env,
+    DEBUG_LOG_URL: `http://127.0.0.1:${state.port}/log`,
+    DEBUG_SESSION_ID: state.sessionId,
+    DEBUG_SESSION_TOKEN: state.sessionToken,
+  };
+  // The action's own wiring is not part of the contract the wrapped command
+  // is promised, and DEBUG_ACTION_OUTPUT_DIR points straight at
+  // action-state.json — which no longer carries a launch token, but does
+  // carry the session token and this invocation's nonce. The wrapped command
+  // runs as the same OS user, so the file's 0600 mode is no boundary against
+  // it; handing over the path is (Codex T5 r2 #1). Stripping the whole prefix
+  // rather than one name keeps the rule stable as more wiring vars appear.
+  // The runner's own command files go with them (see above).
+  for (const key of Object.keys(commandEnv)) {
+    if (key.startsWith('DEBUG_ACTION_') || RUNNER_COMMAND_FILE_VARS.includes(key)) delete commandEnv[key];
+  }
+  if (state.hypothesisId) {
+    commandEnv.DEBUG_HYPOTHESIS_ID = state.hypothesisId;
+  } else {
+    // The `...env` spread above would otherwise let a job-level
+    // DEBUG_HYPOTHESIS_ID through, and every event the wrapped command logged
+    // would be attributed to a hypothesis THIS action never opened — evidence
+    // filed under a claim nobody made (Codex T4 #5). Delete rather than set to
+    // '', because an empty string is still a present variable.
+    delete commandEnv.DEBUG_HYPOTHESIS_ID;
+  }
+  // Awaited so a seam can be asynchronous; defaultSpawnCommand is spawnSync
+  // and resolves immediately.
+  const result = await spawnCommand(inputs.runCommand, { cwd: inputs.workingDirectory, env: commandEnv });
+  const commandExitCode = result.error ? 127 : (result.status ?? 128);
+
+  // ---- capture, in the same process, with the key it already held ----
+
   // Aliveness is a PROVEN read succeeding. An authenticated read alone is not
-  // enough any more: Bearer proves this caller to the listener, and the port,
-  // session id and token it used all came out of a file the wrapped command
-  // can rewrite — so a counterfeit listener serving contract-shaped NDJSON
-  // would have satisfied every check (Codex T5 r4 #1). The responder key
-  // closes the loop in the other direction, and it reaches this process
-  // through runner memory rather than through anything on disk.
+  // enough: Bearer proves this caller to the listener, and the port, session
+  // id and token it used all came out of a file the wrapped command can
+  // rewrite — so a counterfeit listener serving contract-shaped NDJSON would
+  // have satisfied every check (Codex T5 r4 #1).
   let collectorAlive = false;
   // Did the staged bytes come from the collector, or off a filesystem the
   // wrapped command can write? Recorded either way, so the artifact's
@@ -1073,13 +1082,6 @@ const reportSubcommand = async ({
   let entries = null;
   let capturedText = null;
   let readFailure = null;
-  // From the ENVIRONMENT only, never from state. The key's secrecy no longer
-  // matters — it is public — but its INTEGRITY is everything: a same-user
-  // process that could substitute its own public key could then sign answers
-  // with the matching private one. Runner memory is the only channel here
-  // that such a process cannot rewrite, so state and every other file on disk
-  // are excluded as sources by construction (Codex T5 r5 #2).
-  const verifyKey = responderVerifyKey(env.DEBUG_ACTION_COLLECTOR_VERIFY_KEY);
   if (verifyKey === null) {
     // Valid state, no usable key: the wiring that carries it from start's
     // step output into this step's env is broken or absent. That is an
@@ -1087,7 +1089,7 @@ const reportSubcommand = async ({
     // anything, so it must not fall back to the on-disk log and call the
     // result evidence.
     readFailure = 'responder_key_missing';
-    process.stderr.write('debug-evidence-action: report: no usable collector verification key in this step\'s environment; capture cannot verify who it is talking to.\n');
+    process.stderr.write('debug-evidence-action: run: no usable collector verification key in this step\'s environment; capture cannot verify who it is talking to.\n');
   } else {
     // Fresh per capture. A nonce reused across captures would let a recorded
     // answer be replayed by anything that saw it.
@@ -1108,7 +1110,7 @@ const reportSubcommand = async ({
         verifyKey, sessionId: state.sessionId, challenge, text: answer.text, proof: answer.proof,
       })) {
         readFailure = 'responder_proof_invalid';
-        process.stderr.write(oneLine(`debug-evidence-action: report: whatever served session ${state.sessionId} on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
+        process.stderr.write(oneLine(`debug-evidence-action: run: whatever served session ${state.sessionId} on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
       } else {
         entries = answer.entries;
         // The bytes the proof covers, and the only copy anything downstream
@@ -1131,7 +1133,7 @@ const reportSubcommand = async ({
       // hypothesis line survives start, so this should now be unreachable —
       // which is exactly why it stays: if it ever fires, something about that
       // invariant is wrong and the evidence must not be published.
-      process.stderr.write(oneLine(`debug-evidence-action: report: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
+      process.stderr.write(oneLine(`debug-evidence-action: run: the captured session's hypothesis lines are not the set this action posted (${deviation}); refusing to stage evidence carrying a verdict it never made.`) + '\n');
     } else {
       payloads['session.log'] = capturedText;
       evidenceAuthentic = true;
@@ -1143,11 +1145,11 @@ const reportSubcommand = async ({
     // finish refuses the run on collectorAlive, so unverifiable bytes can be
     // inspected but can never ride a green build. Read into memory like every
     // other payload — a copyFileSync would put the render back on a pathname.
-    process.stderr.write(oneLine(`debug-evidence-action: report: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
+    process.stderr.write(oneLine(`debug-evidence-action: run: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
     try {
       payloads['session.log'] = readFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
     } catch (error) {
-      process.stderr.write(`debug-evidence-action: report: session log unreadable (${error?.code ?? error}).\n`);
+      process.stderr.write(`debug-evidence-action: run: session log unreadable (${error?.code ?? error}).\n`);
     }
   } else {
     // The collector answered us and refused — session_log_tampered or
@@ -1155,28 +1157,26 @@ const reportSubcommand = async ({
     // session, a torn line, an unprovable responder. Falling back to the file
     // on disk would stage precisely the bytes nothing will vouch for, so this
     // is an evidence-integrity failure and nothing else.
-    process.stderr.write(oneLine(`debug-evidence-action: report: the collector refused to serve session ${state.sessionId} (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
+    process.stderr.write(oneLine(`debug-evidence-action: run: the collector refused to serve session ${state.sessionId} (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
   }
   const evidenceCopied = payloads['session.log'] !== undefined;
   let reportRendered = false;
-  let markdownText = '';
   let eventCount = '';
   if (evidenceCopied) {
     let rendered = null;
     try {
       rendered = renderReport(payloads['session.log'], state.sessionId);
     } catch (error) {
-      process.stderr.write(oneLine(`debug-evidence-action: report: renderer failed (${error?.message ?? error}).`) + '\n');
+      process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
     }
     if (rendered !== null) {
       const validated = parseRenderedReport(rendered.json);
       if (validated === null) {
-        process.stderr.write('debug-evidence-action: report: the renderer returned no schema-1 report; refusing to publish it.\n');
+        process.stderr.write('debug-evidence-action: run: the renderer returned no schema-1 report; refusing to publish it.\n');
       } else {
         payloads['report.md'] = rendered.markdown;
         payloads['report.json'] = rendered.json;
         reportRendered = true;
-        markdownText = rendered.markdown;
         eventCount = String(validated.session.events);
       }
     }
@@ -1195,34 +1195,105 @@ const reportSubcommand = async ({
   // the paths that go on to succeed — would leave exactly the failure windows
   // undocumented.
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
+  // Ownership check and commit as ONE indivisible step. The snapshot in
+  // `state` was read before a wrapped command that may have run for an hour,
+  // and the write below is a blind whole-file overwrite: if another
+  // invocation claimed this output-dir meanwhile, it would restore OUR stale
+  // pid/port/session over theirs and strand their live collector. Re-reading
+  // first was not enough on its own — between the compare and the rename a
+  // second invocation could still commit, and this one would clobber it
+  // anyway (Codex T4 #3, then r2). Under the lock the re-read and the write
+  // cannot be split, so whoever the compare saw is still who is there.
   const committed = await withStateLock(outputDir, () => {
     const current = readState(outputDir);
     if (!current || current.nonce !== state.nonce) return false;
-    writeState(outputDir, { ...current, collectorAlive, evidenceAuthentic, evidenceCopied, reportRendered });
+    writeState(outputDir, {
+      ...current,
+      commandExitCode,
+      commandSignal: result.signal ?? null,
+      commandError: result.error ? String(result.error.message) : null,
+      collectorAlive,
+      evidenceAuthentic,
+      evidenceCopied,
+      reportRendered,
+    });
     return true;
   });
+  // Refuse completely: no state write, and no outputs either, since a
+  // session-id emitted from state we just declined to own would be a lie.
   if (!committed) {
-    process.stderr.write('debug-evidence-action: report: recorded state changed while evidence was captured (another invocation now owns this output-dir); refusing to overwrite it.\n');
+    process.stderr.write('debug-evidence-action: run: recorded state changed while the wrapped command ran (another invocation now owns this output-dir); refusing to overwrite it.\n');
     return 3;
   }
-  // Published only AFTER the commit succeeds. The staged files are already on
-  // disk — they have to be, since the render runs outside the lock — but a
-  // report-path or a step summary announced from state this invocation just
-  // declined to own would be advertising someone else's run as its own, the
-  // same lie run refuses to tell with a session-id.
-  if (reportRendered) {
-    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${markdownText}\n`);
-    if (env.GITHUB_OUTPUT) {
-      writeOutputs(env.GITHUB_OUTPUT, {
-        'event-count': eventCount,
-        'report-path': path.join(evidenceDir, 'report.md'),
-        // Byte-identical to the stdout line, so a consumer can compare the
-        // artifact against either surface.
-        'evidence-digest': digestLine ?? '',
-      });
+  // Published only AFTER the commit succeeds: outputs announced from state
+  // this invocation just declined to own would be advertising someone else's
+  // run as its own.
+  if (env.GITHUB_OUTPUT) {
+    const outputs = { 'command-exit-code': commandExitCode, 'session-id': state.sessionId };
+    if (reportRendered) {
+      outputs['event-count'] = eventCount;
+      outputs['report-path'] = path.join(evidenceDir, 'report.md');
+      // Byte-identical to the stdout line, so a consumer can compare the
+      // artifact against either surface.
+      outputs['evidence-digest'] = digestLine ?? '';
     }
+    writeOutputs(env.GITHUB_OUTPUT, outputs);
   }
-  return evidenceCopied && reportRendered ? 0 : 3; // capture is the product — fail closed
+  // Capture is the product, so its failure is this step's failure — and a
+  // failed composite step is one no later step can un-fail. The wrapped
+  // command's own exit code is deliberately NOT consulted here; that verdict
+  // belongs to finish.
+  return evidenceCopied && reportRendered ? 0 : 3;
+};
+
+// report is now PUBLISH-ONLY, and holds no credential at all.
+//
+// It used to perform capture, which put a verification key in the environment
+// of a step that runs AFTER the wrapped command — a step whose environment
+// that command can poison through the runner's env-file channel (Codex T5
+// r6). Moving capture into run left this step with nothing an attacker would
+// want: it verifies nothing, decides nothing, and publishes only what run
+// already committed to state and staged on disk.
+//
+// It still runs with `if: always()` so a human gets the summary even when the
+// wrapped command failed.
+const reportSubcommand = ({ outputDir, env = process.env }) => {
+  const evidenceDir = resolveEvidenceDir(outputDir);
+  const state = readState(outputDir);
+  // Nothing was captured — no state, someone else's state, or a run that
+  // failed before it staged anything. In every one of those cases the job's
+  // artifact must not contain evidence from an earlier invocation, so the
+  // staging slots are cleared rather than published.
+  const capturedHere = state !== null
+    && (!env.DEBUG_ACTION_INVOCATION_NONCE || state.nonce === env.DEBUG_ACTION_INVOCATION_NONCE)
+    && state.reportRendered === true;
+  if (!capturedHere) {
+    mkdirSync(evidenceDir, { recursive: true });
+    for (const name of EVIDENCE_FILES) {
+      try {
+        unlinkSync(path.join(evidenceDir, name));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+    if (state === null) return 0; // start never completed; finish owns that failure
+    if (rejectForeignNonce(state, env, 'report')) return 3;
+    process.stderr.write('debug-evidence-action: report: the run step recorded no capture; there is nothing to publish.\n');
+    return 0; // run already failed the action if this was an integrity failure
+  }
+  if (!env.GITHUB_STEP_SUMMARY) return 0;
+  // Read back from the staged file rather than from state, because the
+  // summary is the human surface and the staged bytes are what the artifact
+  // will carry. That the file could have been swapped since run staged it is
+  // the known, accepted staging window — and the digest run printed to the
+  // step log is precisely how such a swap is detected.
+  try {
+    appendFileSync(env.GITHUB_STEP_SUMMARY, `${readFileSync(path.join(evidenceDir, 'report.md'), 'utf8')}\n`);
+  } catch (error) {
+    process.stderr.write(`debug-evidence-action: report: staged report is unreadable (${error?.code ?? error}).\n`);
+    return 3;
+  }
+  return 0;
 };
 
 // The exit taxonomy, and the only place the action turns evidence into a
@@ -1303,7 +1374,7 @@ const main = async () => {
     } else if (subcommand === 'run') {
       process.exitCode = await runSubcommand({ inputs, outputDir, env });
     } else if (subcommand === 'report') {
-      process.exitCode = await reportSubcommand({ outputDir, env });
+      process.exitCode = reportSubcommand({ outputDir, env });
     } else if (subcommand === 'teardown') {
       process.exitCode = teardownSubcommand({ outputDir, env });
     } else if (subcommand === 'finish') {
