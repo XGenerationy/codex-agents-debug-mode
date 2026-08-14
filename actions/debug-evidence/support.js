@@ -1141,11 +1141,11 @@ const runSubcommand = async ({
   } else if (UNREACHABLE_READ.test(readFailure)) {
     // Nothing answered, or what answered is not our collector. There is no
     // authoritative source to prefer, so the on-disk log is read best-effort
-    // and LABELED: whatever is readable is still worth a human's eyes, and
-    // finish refuses the run on collectorAlive, so unverifiable bytes can be
-    // inspected but can never ride a green build. Read into memory like every
-    // other payload — a copyFileSync would put the render back on a pathname.
-    process.stderr.write(oneLine(`debug-evidence-action: run: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence.`) + '\n');
+    // and LABELED: whatever is readable is still worth a human's eyes, while
+    // the step itself fails below, so unverifiable bytes can be inspected but
+    // can never ride a green build. Read into memory like every other payload
+    // — a copyFileSync would put the render back on a pathname.
+    process.stderr.write(oneLine(`debug-evidence-action: run: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence and failing this step.`) + '\n');
     try {
       payloads['session.log'] = readFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
     } catch (error) {
@@ -1243,7 +1243,19 @@ const runSubcommand = async ({
   // failed composite step is one no later step can un-fail. The wrapped
   // command's own exit code is deliberately NOT consulted here; that verdict
   // belongs to finish.
-  return evidenceCopied && reportRendered ? 0 : 3;
+  //
+  // Exit 0 requires evidence this process PROVED, not merely evidence it
+  // found, which is why the gate is evidenceAuthentic rather than
+  // evidenceCopied. The labeled on-disk fallback above is still staged and
+  // still worth a human's eyes — that has not changed — but it can no longer
+  // ride a 0. Returning 0 there would have left the verdict to finish, reading
+  // collectorAlive out of a state file any co-resident process can rewrite
+  // after this commit: kill the collector, forge the log, and have a detached
+  // child flip the flags to green. That is the round-6 Critical in a different
+  // suit, and the answer is the same one — the deciding process is the one
+  // that spans the command (Codex T5 r7). The exit table's outcome is
+  // unchanged; only the process that raises it moved.
+  return evidenceAuthentic && reportRendered ? 0 : 3;
 };
 
 // report is now PUBLISH-ONLY, and holds no credential at all.
@@ -1296,11 +1308,19 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
   return 0;
 };
 
-// The exit taxonomy, and the only place the action turns evidence into a
-// verdict. Read-only by construction, so it takes no lock (recorded
+// The exit taxonomy. Read-only by construction, so it takes no lock (recorded
 // decision: lock-free read paths). Every failure mode of the machinery is a
 // 3; only a wrapped command's own non-zero exit is mirrored, so a consumer
 // can always tell "your build failed" from "this action failed".
+//
+// It no longer DECIDES anything about the evidence. Every evidence verdict —
+// integrity failure, unreachable collector, success — is made inside run, and
+// a failed run is already a failed action (Codex T5 r7). The evidence checks
+// below are kept as a belt over a job that is by then red anyway; they read a
+// state file a co-resident process can rewrite after run commits, so they can
+// be defeated, and defeating them buys nothing. What remains genuinely this
+// step's is the command-failure mirror, which is not security-critical: a
+// hostile wrapped command chooses its own exit code regardless.
 const finishSubcommand = ({ outputDir, env = process.env }) => {
   const state = readState(outputDir);
   if (!state) {

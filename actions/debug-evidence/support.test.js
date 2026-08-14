@@ -1238,10 +1238,10 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
       // never the thing on that port), so the filesystem is all there is.
       readLive: unreachableRead,
     });
-    assert.equal(code, 0, 'unverifiable bytes are still worth uploading for a human to read');
+    assert.equal(code, 3, 'nothing could prove it owns the port, and that verdict is run\'s to make (Codex T5 r7)');
     const state = readState(context.outputDir);
     assert.equal(state.collectorAlive, false);
-    assert.equal(state.evidenceCopied, true);
+    assert.equal(state.evidenceCopied, true, 'unverifiable bytes are still worth uploading for a human to read');
     assert.equal(state.evidenceAuthentic, false, 'the artifact is labeled as coming off the filesystem');
     assert.equal(state.reportRendered, true);
     const staged = readFileSync(path.join(resolveEvidenceDir(context.outputDir), 'session.log'), 'utf8');
@@ -1252,6 +1252,163 @@ test('with nothing able to prove it owns the port, a forged log is staged as lab
   } finally {
     teardownSubcommand({ outputDir: context.outputDir, env: {} });
   }
+});
+
+// Poll rather than sleep: the detached child below races run's commit, and a
+// fixed wait would either be flaky or slow.
+const waitUntil = async (predicate, timeoutMs = 20000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+};
+
+// The only way to assert on a diagnostic that goes to the step log. Restored in
+// a finally, so a failure inside cannot silence the rest of the suite.
+const captureStderr = async (body) => {
+  const written = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    const result = await body();
+    return { result, written: written.join('') };
+  } finally {
+    process.stderr.write = original;
+  }
+};
+
+// THE round-7 test, and the round-6 Critical in its other suit. Everything here
+// is done by a process running as the same OS user: kill the collector, write a
+// forged session log at the derivable path, and leave a detached child to
+// rewrite the state record to all-green in the window between run's commit and
+// any later step reading it. The only thing that survives that is a verdict
+// already made — which is why the unreachable class fails IN run.
+test('a wrapped command that kills the collector, forges the log and poisons the state afterwards still cannot go green', async () => {
+  const context = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
+  try {
+    const before = readState(context.outputDir);
+    const statePath = path.join(context.outputDir, 'action-state.json');
+    // The detached child. It waits for run's CAS commit — `collectorAlive`
+    // appears in the state file at that moment and never before — and only then
+    // rewrites the record, so it cannot be clobbered by the commit it is
+    // hiding from. This is exactly the window a post-command verdict would be
+    // decided in.
+    const poisoner = path.join(context.outputDir, 'poisoner.js');
+    writeFileSync(poisoner, [
+      "const fs = require('node:fs');",
+      "const target = process.env.POISON_STATE_PATH;",
+      "const deadline = Date.now() + 20000;",
+      "const tick = () => {",
+      "  let state = null;",
+      "  try { state = JSON.parse(fs.readFileSync(target, 'utf8')); } catch { state = null; }",
+      "  if (state && Object.prototype.hasOwnProperty.call(state, 'collectorAlive')) {",
+      "    fs.writeFileSync(target, JSON.stringify({",
+      "      ...state, collectorAlive: true, evidenceAuthentic: true, evidenceCopied: true, reportRendered: true,",
+      "    }));",
+      "    return;",
+      "  }",
+      "  if (Date.now() < deadline) setTimeout(tick, 10);",
+      "};",
+      "tick();",
+      '',
+    ].join('\n'));
+    // 90 names the one way this could pass without the attack running.
+    const attack = 'node -e "' + [
+      'const fs = require(\'node:fs\');',
+      'const cp = require(\'node:child_process\');',
+      'const p = require(\'node:path\');',
+      'if (!process.env.COLLECTOR_PID) process.exit(90);',
+      // Same OS user, so the collector is killable by pid. The pid is handed
+      // over rather than searched for (it is discoverable from the port) so the
+      // test measures the defence, not the attacker's reconnaissance.
+      'process.kill(Number(process.env.COLLECTOR_PID));',
+      // A CONVINCING session, so nothing below can be explained away as a parse
+      // failure: well-formed NDJSON, plausible events, and the verdict this
+      // action never posted.
+      'const lines = [',
+      '{ ts: \'2026-08-14T00:00:00.000Z\', msg: \'npm test: 128 passing, 0 failing\' },',
+      '{ ts: \'2026-08-14T00:00:01.000Z\', msg: \'no regressions detected in the affected paths\' },',
+      '{ ts: \'2026-08-14T00:00:02.000Z\', type: \'hypothesis\', hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'resolved by the fix\' },',
+      '];',
+      'fs.writeFileSync(p.join(process.env.FORGE_DEBUG_DIR, \'debug-\' + process.env.DEBUG_SESSION_ID + \'.log\'), lines.map((line) => JSON.stringify(line)).join(\'\\n\') + \'\\n\');',
+      'const child = cp.spawn(process.execPath, [process.env.POISONER], { detached: true, stdio: \'ignore\' });',
+      'child.unref();',
+      'process.exit(0);',
+    ].join('') + '"';
+    const runCode = await runSubcommand({
+      inputs: { ...context.inputs, runCommand: attack },
+      outputDir: context.outputDir,
+      env: {
+        ...context.runEnv,
+        FORGE_DEBUG_DIR: path.join(context.projectRoot, '.debug'),
+        COLLECTOR_PID: String(before.pid),
+        POISONER: poisoner,
+        POISON_STATE_PATH: statePath,
+      },
+    });
+    assert.equal(runCode, 3,
+      'no collector could be proved, and that verdict belongs to the one process the command cannot revise');
+    assert.equal(readState(context.outputDir).commandExitCode, 0,
+      '90 = the pid was never handed over, so the collector was never killed and the attack did not run');
+
+    // The forged bytes ARE staged, labeled — that part is deliberate, and the
+    // renderer had no trouble with them, so the 3 above is a verdict rather
+    // than a parse accident.
+    const evidenceDir = resolveEvidenceDir(context.outputDir);
+    const staged = readFileSync(path.join(evidenceDir, 'session.log'), 'utf8');
+    assert.ok(staged.includes('CONFIRMED'), 'the forgery is staged for a human to read, not hidden');
+    const rendered = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    assert.equal(rendered.schema, 1);
+    assert.equal(rendered.session.events, 2, 'a perfectly renderable session — the forgery is convincing');
+
+    // And the poisoning worked completely. This is the whole argument: the
+    // record a later step would read is attacker-authored, so no later step can
+    // be trusted with the verdict.
+    assert.ok(await waitUntil(() => readState(context.outputDir)?.collectorAlive === true),
+      'the detached child rewrote the state after run committed');
+    const poisoned = readState(context.outputDir);
+    assert.equal(poisoned.evidenceAuthentic, true, 'the state now claims the forgery is authenticated');
+    assert.equal(finishSubcommand({ outputDir: context.outputDir, env: {} }), 0,
+      'finish, reading that record, is fooled completely — which is exactly why it is no longer the one deciding');
+    // The job is red regardless, because run already failed and a failed
+    // composite step cannot be un-failed.
+  } finally {
+    teardownSubcommand({ outputDir: context.outputDir, env: {} });
+  }
+});
+
+// The same class with nobody attacking: the collector simply died. The outcome
+// is identical — that is the point of a where-not-what change. Only the process
+// making the call moved.
+test('a collector that merely died still stages the labeled partial log, still fails the step, and still says why', async () => {
+  const outputDir = makeTempDir();
+  const projectRoot = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
+    projectRoot, failOnCommandFailure: 'true',
+  });
+  writeSessionLog(projectRoot, 'ci-debug-abc', [
+    { ts: '2026-08-14T00:00:00.000Z', msg: 'the last thing the collector wrote down' },
+  ]);
+  const { result: code, written } = await captureStderr(() => captureViaRun({
+    outputDir,
+    env: RUN_ENV,
+    readLive: unreachableRead,
+  }));
+  assert.equal(code, 3, 'the exit table always said a collector dying before capture fails the job');
+  const state = readState(outputDir);
+  assert.equal(state.collectorAlive, false);
+  assert.equal(state.evidenceCopied, true, 'partial evidence a human can read is the point of the fallback');
+  assert.equal(state.evidenceAuthentic, false, 'the label is a reader\'s aid, never a gate');
+  assert.equal(state.reportRendered, true, 'and it stays truthful about what was actually produced');
+  assert.ok(readFileSync(path.join(resolveEvidenceDir(outputDir), 'session.log'), 'utf8')
+    .includes('the last thing the collector wrote down'));
+  assert.match(written, /no collector on port 1 would serve session ci-debug-abc/);
+  assert.match(written, /UNAUTHENTICATED partial evidence and failing this step/,
+    'the step log says both what was staged and what it cost');
+  assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'finish agrees; the job was already red');
 });
 
 test('the wrapped command is handed no DEBUG_ACTION_* wiring and none of the runner\'s command files', async () => {
@@ -1459,7 +1616,7 @@ test('run stages evidence outside the lock but refuses to commit over a newer in
   assert.ok(!existsSync(path.join(outputDir, 'action-state.lock')), 'the critical section released behind it');
 });
 
-test('run records an unauthenticated collector without inventing evidence, and finish is what fails on it', async () => {
+test('run records an unauthenticated collector without inventing evidence, and fails the step itself', async () => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
   writeState(outputDir, {
@@ -1475,14 +1632,18 @@ test('run records an unauthenticated collector without inventing evidence, and f
     // authoritative source for this session's bytes.
     readLive: unreachableRead,
   });
-  assert.equal(code, 0, 'a collector that cannot be reached is not an integrity failure — the labeled fallback is still worth a human\'s eyes');
+  // A collector that cannot be reached is not an INTEGRITY failure — the
+  // labeled fallback is still staged — but it is still this step's failure,
+  // because the alternative is handing the verdict to a later step whose view
+  // of state a co-resident process can rewrite (Codex T5 r7).
+  assert.equal(code, 3);
   const state = readState(outputDir);
   assert.equal(state.collectorAlive, false);
   assert.equal(state.evidenceCopied, true, 'whatever was readable is still staged');
   assert.equal(state.evidenceAuthentic, false, 'and it is labeled as unverified in the state file');
   assert.equal(state.reportRendered, true);
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3,
-    'the collector being unverifiable at capture time is finish\'s verdict to make');
+    'finish agrees, as a belt over a job that is already red');
 });
 
 test('run returns 3 when there is nothing to stage at all — evidence is the product, so its absence fails closed', async () => {
@@ -1751,11 +1912,11 @@ test('a foreign occupant answering 401 fails liveness and licenses only labeled 
     // is there to distinguish (Codex T5 r3).
     readLive: async () => { throw new Error('live_read_unauthorized'); },
   });
-  assert.equal(code, 0, 'the on-disk log is still worth a human\'s eyes');
+  assert.equal(code, 3, 'a step that could not reach its own collector has not produced evidence');
   const state = readState(outputDir);
   assert.equal(state.collectorAlive, false, 'a stranger on the port is not our collector');
   assert.equal(state.evidenceAuthentic, false);
-  assert.equal(state.evidenceCopied, true);
+  assert.equal(state.evidenceCopied, true, 'the on-disk log is still worth a human\'s eyes');
   assert.equal(finishSubcommand({ outputDir, env: {} }), 3, 'and it can never ride a green run');
 });
 
