@@ -3651,6 +3651,43 @@ git commit -m "feat(dogfood): deterministic demo session workflow + gate retry-f
 
 Codex could not re-run the Node suite (sandbox denied Node's parent-path `lstat` with `EPERM`) or reach GitHub; the coordinator re-ran `support.test.js` independently at `a320b7e` — 121 tests, 120 pass, 0 fail, 1 skip, matching the implementer's report.
 
+#### Task 7 fix round 2 (Codex review of `1c2e2a4`: 3 Important, 1 Minor)
+
+**Round 1 fixed the advertised-claim gap; round 2 is about assertions that are bound to the wrong SUBJECT — each one passes on a log or a file that is genuinely broken.** Two of the three Importants are the same shape as round 1's, one level deeper: the check exists, but what it checks is not what makes the claim true.
+
+**(1) Important — the live redaction proof still fails open, two ways.** `debug-evidence-demo.yml:143` requires only that `[REDACTED]` occurs SOMEWHERE, and `:145` rejects only the COMPLETE original value. Both of these broken cases pass:
+- **Partial masking**: `token=[REDACTED]secret-value-0123456789` — the marker is present and the full fixture is absent, yet most of the secret leaked.
+- **A `grep` read error**: because `grep` is the CONDITION of an `if`, statuses 1 AND 2 both take the success path, and `set -e` does not rescue it. Codex REPRODUCED a status-2 error while the script continued successfully. The preceding `test -f` neither guarantees continued readability nor eliminates a check/use race — so round 1's claim that the exit-2 fail-open was "unreachable" was too strong.
+
+FIX: parse `session.log` and require EXACTLY ONE event whose `msg` is EXACTLY `DEMO config dump: token=[REDACTED]` — an equality check on the whole field, which no partial mask satisfies. For every negative grep, capture the status and require exactly `1`: `0` means leakage, `>1` means the assertion itself failed and must not read as success.
+
+**(2) Important — the sudo finding is still not bound to the admission record.** `:210` counts admission-record headlines and `:212` independently searches every `Findings:` line, so a log with one headline plus an unrelated second findings line still passes:
+
+```text
+ADMISSION RECORD ... boundary=NOT established ...
+Findings: ... sudo binary: absent.
+Findings: unrelated ... sudo binary: present: 1 at sha256=...
+refusing to run ...
+```
+
+That falsely establishes this job's UNIQUE LIVE CLAIM — that the hosted runner's actual record found sudo. FIX: require exactly one findings line AND require it immediately after the matched admission headline, preferably by parsing the two-line block together. **Codex answered the over-fitting question directly: the exact headline wording is NOT over-fitted — it is an intentional byte contract, so a legitimate builder change SHOULD require updating this probe.**
+
+**(3) Important — the branch still fails its required scanner, and BOTH proposed dispositions are rejected.**
+- **(ii) a fifth allowlist helper is REJECTED.** A line-only `workflows:` helper cannot establish that the key is specifically `on.workflow_run.workflows`; it could bless a strict-superset change to an unrelated action input where ADDING entries weakens policy. `VALIDATION_REMOVAL_PATTERNS` does not repair that missing YAML-context proof. (This refutes exactly the reasoning the coordinator flagged as wanting checked.)
+- **(iii) demo-first split is REJECTED — it MOVES both problems rather than resolving them.** The follow-up PR makes the identical old-line/new-line replacement, so its scan still fails; and its own completion is still evaluated by the default-branch listener that lacks the new name, so the bootstrap hole survives. The coordinator's round-1 reversal was wrong on both halves.
+- **RULED: the REVERSE SPLIT.** Land the tiny forwarder amendment FIRST, with an explicit audited maintainer clearance for this known scanner false positive, THEN land the demo once the listener is already active on the default branch — which removes the bootstrap re-run entirely, because main's listener already names the demo when the demo's first run completes. If demo-first is chosen anyway, the BOOTSTRAP documentation and its tests MOVE with the forwarder amendment and must be RETAINED, because the cost remains real.
+- **This is a merge-workflow decision with a manual security-gate clearance in it, so it is the repo owner's call, not the coordinator's.**
+
+**(4) Minor — the custom workflow reader can accept a GitHub-invalid workflow.** `support.test.js:5339` accepts any key matching its lexical pattern and `:5361` assigns it with no schema or duplicate-key check. **Renaming a job's `runs-on` to `run-on` leaves every current Task 7 assertion satisfied while GitHub has no runner definition at all.** FIX: assert the required job/step keys structurally and reject duplicate keys. Codex confirmed the parsed `uses` checks DID close the commented-checkout hole and found no remaining SHA-pin bypass — this is a broader schema gap, not a pinning defect.
+
+**CONFIRMED SOUND, no further work:** both `repro.js` guards, the cross-module list contract, the invalid-directory assertion, the teardown wording, and the amended artifact-bound comment. Distinct ports are operationally correct and the workflow now honestly says they prove nothing about collector exit.
+
+**RULING RE-CONFIRMED — the no-`continue-on-error` trade is correct and the search is closed.** `always()` can make later jobs or steps execute but does NOT erase the preceding failure. A separate deliberately-failing workflow plus a `workflow_run` observer could demonstrate the runner behaviour, but it would leave a red producer check or require a privileged dispatch arrangement. **There is no missed same-workflow construct that stays green, demonstrates a genuinely failed composite step, and honours this scanner policy.**
+
+**STANDING CAVEAT for Task 9:** the PR-controlled artifact-upload posture is acceptable ONLY under the stated read-only / no-real-secret threat model, and the artifact BYTES themselves remain unverified until a live download inspection.
+
+Codex again could not execute Node or the scanner (`EPERM: lstat C:\Users\Mrmah`), so it did not independently confirm the suite counts; the coordinator re-ran `support.test.js` at `1c2e2a4` (122/121/0/1) and the scanner (exit 1, unchanged). Codex did verify `6c3a693` touches only the plan's final blank line and that both `git diff --check` invocations now pass.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
