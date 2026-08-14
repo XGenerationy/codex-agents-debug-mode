@@ -209,15 +209,18 @@ inside the staging window can substitute a symlink to an unrelated readable file
 pull its bytes into the artifact. As with every other post-staging swap, the defence
 is detection: the digest `run` printed to its own step log before staging does not
 match what the artifact then carries. `action-state.json` lives at the
-`output-dir` root — outside the evidence child — because it carries the launch token;
-it is never enumerated in the upload path block. The collector's `.debug/` internals
+`output-dir` root — outside the evidence child — and is never enumerated in the
+upload path block. *(Corrected, Task 6 round 2: it no longer carries the launch
+token — that token has lived only in `start`'s memory since Task 5 round 3 — but
+it does carry the session token and the invocation nonce, so it stays out of the
+artifact.)* The collector's `.debug/` internals
 (claim, port, salt, any token files) are never copied, so the token-exfiltration hazard
 is closed structurally. `support.test.js` pins that the staged evidence child contains
 no token byte-sequence and that the upload path block never references
 `action-state.json` or a bare directory. *(Added, Task 5 round 3; hardened round 4.)*
 Because upload happens in a later step of the same job, a hostile wrapped command's
 detached child could rewrite staged files in the window — inherent to same-user
-composite staging and outside the prevention boundary. `report` therefore validates,
+composite staging and outside the prevention boundary. `run` therefore validates,
 renders, and SHA-256-hashes all three payloads from one immutable in-memory buffer
 (the live read is bounded: absolute deadline, byte cap, idle timeout), writes the
 staged files only afterwards as write-only sinks, and prints the digests to the step
@@ -268,12 +271,13 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
    not in the handshake line, not in state, not in any output), and `start` emits
    the PUBLIC verification key as a step output — parsed into runner memory from
    `start`'s `GITHUB_OUTPUT` before the wrapped command ever runs, and delivered to
-   `report`'s env by the runner itself. The channel guards the key's INTEGRITY, not
+   `run`'s env by the runner itself. *(Corrected, Task 6 round 2: `report` never
+   receives or consumes it — see the round-6 restructure in the step chain.)* The channel guards the key's INTEGRITY, not
    its secrecy: disclosure of a verification key is harmless, but only runner memory
    prevents a same-user process from substituting its own keypair — the key is never
    read from state or any attacker-writable file. The collector signs a
    domain-separated canonical record — method, the exact request target as received,
-   the challenge nonce, and the SHA-256 of the served bytes — and `report` verifies
+   the challenge nonce, and the SHA-256 of the served bytes — and `run` verifies
    the signature over the record it INTENDED: the unfiltered full-session target,
    its own fresh nonce, the hash of the received bytes. A counterfeit cannot sign
    (no private key); a filtered relay through the real collector signs a different

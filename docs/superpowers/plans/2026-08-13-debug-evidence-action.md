@@ -2563,6 +2563,85 @@ child is invocation-scoped and that upload is gated on a trusted `run` output;
 invariant 10 notes that invocation identity travels as a step output, never
 through `GITHUB_ENV` (with the corrected `env`-context fact).
 
+#### Task 6 fix round 2 — Codex re-review decisions (recorded before code moves)
+
+Codex on `763a2b1`: the nonce/staging flow closes last round's stale-invocation
+upload path; rulings (a) document accumulation, do NOT add a sibling reaper —
+cleanup belongs to callers who can prove no concurrent invocation exists;
+(b) keep `evidence-dir`/`evidence-staged` internal, not public outputs;
+(c) correct that `report` must not delete foreign invocation data;
+(d) nonce/path discoverability is fine — the nonce is routing, not authority;
+(e) deferral to Task 7 is supported by the runner source, but Task 7 MUST
+explicitly test two invocations sharing an output directory with distinct
+artifact names, INCLUDING a second invocation whose `start` fails. Important ×2,
+Minor ×2:
+
+1. **Post-command step outputs are not a security boundary either (Important
+   #1 — deterministic, no race).** `run` publishes `evidence-dir`/`evidence-staged`
+   AFTER executing the wrapped command, and `upload` trusts both. The child can
+   enumerate the CURRENT step's output file under
+   `RUNNER_TEMP/_runner_file_commands` (stripping the env var hides the variable,
+   not the file — `support.js` already says so), pre-write `evidence-staged=x`,
+   then open a heredoc whose delimiter is the exact line `run` will later write:
+   `evidence-dir<<evidence-staged=session.log report.md report.json`. Every
+   trusted line `run` appends afterwards is swallowed as heredoc body until that
+   known line closes it, leaving an attacker-controlled multiline upload path AND
+   an open gate. The runner creates these files under `_runner_file_commands`,
+   processes them only after the handler returns, and supports multiline outputs
+   exactly this way. Codex: *derive upload paths from a pre-command `start`
+   output; do not use post-command outputs as a security boundary.* Fix:
+   - `start` (which mints the nonce) emits `evidence-dir` as a step output —
+     pre-command, therefore trusted by the same argument as the verification key.
+   - `action.yml`'s upload step takes its `path:` entries from
+     `steps.start.outputs.evidence-dir` and is guarded by
+     `if: ${{ always() && steps.start.outputs.evidence-dir != '' }}` — an
+     entirely pre-command gate that still closes when `start` died early.
+     `if-no-files-found: ignore` covers "nothing was staged".
+   - `run`'s `evidence-dir`/`evidence-staged` outputs are REMOVED (not demoted):
+     per ruling (b) they are internal, and leaving them would imply a trust they
+     do not carry. `run` keeps `evidence-digest`, which is already documented as
+     convenience, never the trust anchor.
+   - Residual, to be DOCUMENTED not prevented (it follows from same-user
+     staging): a hostile command can plant files inside the invocation-scoped
+     directory, so the artifact may contain payloads this action never staged.
+     The already-ruled trust unit answers it — only bytes whose SHA-256 matches a
+     digest line printed by the trusted `run` process are evidence; a planted
+     file has no backing digest, and a `run` that staged nothing prints none.
+   - Tests: a wrapped command that writes the heredoc payload into the real
+     step-output file must NOT influence the upload path set (assert the parsed
+     `action.yml` takes its paths from `steps.start.outputs.*` only, and that no
+     `steps.run.outputs.evidence-*` reference survives anywhere); `start`
+     emitting `evidence-dir` before validation; the gate closing when `start`
+     fails early.
+2. **The test migration silently defanged a security test (Important #2).**
+   `support.test.js:2601` (state-key fallback) still passes `env: {}`, so it now
+   exits at the nonce gate BEFORE testing whether a planted verification key can
+   be used — a regression to `env key || state key` would pass it. Fix: supply a
+   VALID nonce and omit only the verification key, so the test reaches the branch
+   it advertises. Mutation: reintroduce the state fallback ⇒ red. Also re-check
+   the tests at 688–705, which no longer reach their advertised no-state/no-session
+   branches (duplicate matrix coverage exists elsewhere, but the names must stop
+   lying). SWEEP the whole file for the same shape: any test whose env was
+   mechanically updated this round and which now short-circuits before its
+   advertised branch.
+3. **The semantic reader still fails open outside its selected fields (Minor
+   #1).** It ignores the entire `inputs:` section and every `runs:` key at indent
+   2, so changing `fail-on-command-failure`'s default to `"false"` or
+   `using: composite` to `using: docker` leaves the parsed structure unchanged —
+   the "unfamiliar structure throws" claim is false as written. Fix: parse and
+   assert `runs.using`, and parse `inputs:` with exact assertions on the
+   security-relevant defaults (at minimum `fail-on-command-failure: "true"`);
+   make unknown indent-2 keys under `runs:` throw. Re-run both mutations as
+   regression checks.
+4. **Spec contradictions (Minor #2) — FIXED BY THE COORDINATOR** in the same
+   commit as this amendment, not by the implementer: state no longer described as
+   carrying the launch token (it carries the session token and nonce); `report`
+   no longer described as validating/rendering/hashing; the verification key
+   described as delivered to and verified by `run`.
+
+Fix commit message:
+`fix(action): upload path from a pre-command start output, restore the defanged key test, tighten the structural reader (Codex T6 r2)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
