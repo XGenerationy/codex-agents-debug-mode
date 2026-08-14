@@ -275,6 +275,6 @@ if (require.main === module) {
 // rendered here, and its tests compared them to a hardcoded 500 — a copy that
 // would disagree with this file the moment the cap moved, permissively if it
 // shrank. The action's sentinel test pins this name alongside the three
-// functions it calls, so removing it fails loudly rather than leaving that
-// measurement comparing against undefined.
+// functions it calls, so removing it fails with a sentence naming the cause
+// rather than with the NaN comparison the measurement would otherwise report.
 module.exports = { EXCERPT_CHAR_CAP, buildReport, parseArgs, renderJson, renderMarkdown, renderText };

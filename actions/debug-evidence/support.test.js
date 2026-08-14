@@ -17,7 +17,7 @@ const { escapeMarkdownText } = require(path.join(__dirname, '..', '..', 'scripts
 // silently disagrees with debug_report.js the moment the cap moves, and if it
 // SHRINKS the disagreement is permissive — the same direction that let a
 // truncated caveat reach report.md in the first place.
-const { EXCERPT_CHAR_CAP } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
+const { EXCERPT_CHAR_CAP, buildReport, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
 const {
   canonicalResponderRecord,
@@ -424,6 +424,14 @@ const admissionOf = ({
 });
 const ADMITTED = () => admissionOf();
 
+// The detector's `present` reading for a given matched set, recomputed HERE
+// from node:crypto rather than by calling the action's own helper: a test that
+// shared the implementation's arithmetic would agree with a broken one. Sorted
+// and NUL-joined, so the reading depends on the SET of matched candidates and
+// not on the order PATH happened to list them (Codex T6 r13).
+const sudoPresent = (...paths) => `present: ${paths.length} at sha256=${
+  createHash('sha256').update([...paths].sort().join('\0')).digest('hex')}`;
+
 // The qualification is a BLOCK of lines now, not one line: the non-establishment
 // and the limits of the check that found it. Both belong beside the digest — a
 // reader who sees the digest must not be able to miss either — so the pin is
@@ -506,7 +514,7 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
     ['ptrace', 'unknown'],
     ['uid', 'root'],
     ['uid', 'unknown'],
-    ['sudo', 'present: /usr/bin/sudo'],
+    ['sudo', sudoPresent('/usr/bin/sudo')],
     ['sudo', 'unknown'],
     ['capabilities', 'unknown'],
     ['capabilities', 'CAP_BPF'],
@@ -521,7 +529,7 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
   // Mode 3 is NECESSARY, NEVER SUFFICIENT (the r8 Critical). Each of these has
   // the ptrace boundary and still denies, because the wrapped principal can
   // reach root and rewrite another task's memory without ptrace at all.
-  for (const rootRoute of [{ uid: 'root' }, { sudo: 'present: /usr/bin/sudo' }, { capabilities: 'CAP_BPF' }]) {
+  for (const rootRoute of [{ uid: 'root' }, { sudo: sudoPresent('/usr/bin/sudo') }, { capabilities: 'CAP_BPF' }]) {
     const record = admissionOf(rootRoute);
     assert.equal(record.ptrace, 'unconditional', 'mode 3 is present');
     assert.equal(admissionEstablished(record), false, `${JSON.stringify(rootRoute)}: mode 3 does not rescue it`);
@@ -539,7 +547,7 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
   // the four readings, and the four readings are validated against the values
   // this code actually produces.
   const forged = {
-    ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_BPF',
+    ptrace: 'permissive', uid: 'root', sudo: sudoPresent('/usr/bin/sudo'), capabilities: 'CAP_BPF',
     blockers: [],
   };
   assert.equal(admissionEstablished(forged), false, 'an empty blockers list cannot launder four failing readings');
@@ -560,6 +568,27 @@ test('strict admission is a conjunction, and each condition alone denies it', ()
     { uid: 0 }, { uid: 'nonroot' }, { sudo: 'unavailable' }, { sudo: 'absent ' },
     { sudo: 'unknown: some other reason' }, { sudo: 'unknown:' },
     { capabilities: '' }, { capabilities: 'clear!' }, { capabilities: ['clear'] },
+    // THE ANCHORS THEMSELVES (Codex T6 r13). The producers are bounded, so a
+    // widened vocabulary breaks nothing until something feeds it a value the
+    // producer would never emit — which is exactly what a rewritten state file
+    // is. Each case below passes the round-10 pattern this round replaced, and
+    // must not pass the anchored one.
+    { sudo: 'present: /usr/bin/sudo' }, // the round-10 form, unbounded and path-carrying
+    { sudo: 'present: /tmp/evil\nFORGED-LINE/sudo' }, // and the newline it admitted
+    { sudo: `present: 1 at sha256=${'a'.repeat(63)}` }, // digest too short
+    { sudo: `present: 1 at sha256=${'a'.repeat(65)}` }, // too long
+    { sudo: `present: 1 at sha256=${'A'.repeat(64)}` }, // not lower-case hex
+    { sudo: `present: 1 at sha256=${'g'.repeat(64)}` }, // not hex at all
+    { sudo: `present: 0 at sha256=${'a'.repeat(64)}` }, // present means at least one
+    { sudo: `present: 1 at sha256=${'a'.repeat(64)}\nFORGED` }, // a second line
+    { sudo: ` present: 1 at sha256=${'a'.repeat(64)}` }, // unanchored at the front
+    { capabilities: 'CAP_MADE_UP' }, // a name this action does not check for
+    { capabilities: 'CAP_SYS_ADMIN+CAP_MADE_UP' },
+    { capabilities: 'CAP_BPF+CAP_SYS_ADMIN' }, // real names, an order the producer never emits
+    { capabilities: `CAP_${'X'.repeat(400)}` }, // unbounded length
+    { capabilities: 'CAP_SYS_ADMIN\nCAP_BPF' },
+    { ptrace: 'unconditional\nFORGED' },
+    { uid: 'non-root\nFORGED' },
   ]) {
     const record = { ...ADMITTED(), ...bad };
     assert.equal(admissionEstablished(record), false, `${JSON.stringify(bad)} is not a reading this code produced`);
@@ -665,7 +694,7 @@ test('start streams a pre-command admission record on every regime', async () =>
       outputDir: bestEffortDir,
       projectRoot: makeTempDir(),
       env: {},
-      probeAdmission: () => admissionOf({ ptrace: 'privilege-bypassable', sudo: 'present: /usr/bin/sudo' }),
+      probeAdmission: () => admissionOf({ ptrace: 'privilege-bypassable', sudo: sudoPresent('/usr/bin/sudo') }),
     }), 0);
   });
   try {
@@ -673,7 +702,11 @@ test('start streams a pre-command admission record on every regime', async () =>
     assert.match(bestEffort.written, /evidence-trust=best-effort/);
     assert.match(bestEffort.written, /boundary=NOT established/);
     assert.match(bestEffort.written, /same-UID ptrace policy: privilege-bypassable/);
-    assert.match(bestEffort.written, /sudo binary: present: \/usr\/bin\/sudo/);
+    // The finding, and NOT the path it was found at: the record carries a
+    // count and a digest, so nothing the host supplied reaches the step log.
+    assert.match(bestEffort.written, /sudo binary: present: 1 at sha256=[0-9a-f]{64}/);
+    assert.equal(bestEffort.written.includes('/usr/bin/sudo'), false,
+      'the matched candidate is never echoed into the record');
   } finally {
     teardownSubcommand({ outputDir: bestEffortDir, env: invocationEnv(bestEffortDir) });
   }
@@ -723,7 +756,7 @@ test('the authenticated wording requires a strict admission, not merely clear re
   // The readings are reported identically — the host is the host.
   assert.match(strict, /in-process boundary=ESTABLISHED/);
   assert.match(bestEffort, /in-process boundary=ESTABLISHED/);
-  assert.match(bestEffort, /findings=every checked route clear/);
+  assert.match(bestEffort, /Findings: every checked route clear/);
   // The CLAIM is not.
   assert.match(strict, /the trust unit is this admission record/i, 'a strict admission is authenticated');
   assert.doesNotMatch(bestEffort, /the trust unit is this admission record/i,
@@ -802,12 +835,12 @@ test('every probe denies strict when it cannot be evaluated', () => {
   });
   // Each trusted path denies on its own.
   for (const candidate of ['/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo']) {
-    assert.equal(sudoAt({ [candidate]: 'present' }), `present: ${candidate}`, `${candidate} denies`);
+    assert.equal(sudoAt({ [candidate]: 'present' }), sudoPresent(candidate), `${candidate} denies`);
   }
   // All of them, named, so the diagnostic is not a guess.
   assert.equal(
     sudoAt({ '/usr/bin/sudo': 'present', '/bin/sudo': 'present' }),
-    'present: /usr/bin/sudo, /bin/sudo',
+    sudoPresent('/usr/bin/sudo', '/bin/sudo'),
   );
   // The only clearing reading: every trusted path positively absent.
   assert.equal(sudoAt({}), 'absent');
@@ -821,7 +854,7 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // both deny anyway.
   assert.equal(
     sudoAt({ '/usr/bin/sudo': 'present', '/bin/sudo': 'unreadable' }),
-    'present: /usr/bin/sudo',
+    sudoPresent('/usr/bin/sudo'),
   );
   // Non-Linux has no such thing as these paths, and "not Linux" is not "no
   // route to root" — this action's boundary claim is Linux-only.
@@ -835,7 +868,7 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // THE PIN, in the exact shape Codex demonstrated:
   assert.equal(
     sudoAt({ '/run/current-system/sw/bin/sudo': 'present' }, { pathValue: '/run/current-system/sw/bin:/usr/bin' }),
-    'present: /run/current-system/sw/bin/sudo',
+    sudoPresent('/run/current-system/sw/bin/sudo'),
     'a NixOS system-path sudo denies',
   );
   // The round-9 ruling forbade EXECUTING a PATH-resolved binary and trusting
@@ -843,7 +876,7 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // nothing, and can only ever ADD candidates.
   assert.equal(
     sudoAt({ '/opt/vendor/bin/sudo': 'present' }, { pathValue: '/opt/vendor/bin' }),
-    'present: /opt/vendor/bin/sudo',
+    sudoPresent('/opt/vendor/bin/sudo'),
     'any PATH entry is a candidate',
   );
   // A HOSTILE PATH CANNOT SHRINK THE CHECK. Unset, or stripped down to one
@@ -861,7 +894,7 @@ test('every probe denies strict when it cannot be evaluated', () => {
     ['stripped', '/nowhere'],
     ['not a string', 42],
   ]) {
-    assert.equal(sudoAt({ '/usr/bin/sudo': 'present' }, { pathValue }), 'present: /usr/bin/sudo',
+    assert.equal(sudoAt({ '/usr/bin/sudo': 'present' }, { pathValue }), sudoPresent('/usr/bin/sudo'),
       `${label} PATH still checks the conventional locations`);
     assert.equal(sudoAt({}, { pathValue }), 'absent',
       `${label} PATH with nothing installed is still a clean reading`);
@@ -893,11 +926,18 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // also a conventional path, must not double-report.
   assert.equal(
     sudoAt({ '/usr/bin/sudo': 'present', '/opt/bin/sudo': 'present' }, { pathValue: '/usr/bin:/opt/bin:/usr/bin:/opt/bin/' }),
-    'present: /usr/bin/sudo, /opt/bin/sudo',
+    sudoPresent('/usr/bin/sudo', '/opt/bin/sudo'),
+  );
+  // The reading is over the SET, so the same two candidates reached by a
+  // differently ordered PATH are indistinguishable — which is what lets an
+  // operator recompute the digest from their own listing.
+  assert.equal(
+    sudoAt({ '/usr/bin/sudo': 'present', '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin:/usr/bin' }),
+    sudoAt({ '/usr/bin/sudo': 'present', '/opt/bin/sudo': 'present' }, { pathValue: '/usr/bin:/opt/bin' }),
   );
   // A trailing slash names the same directory.
-  assert.equal(sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin///' }), 'present: /opt/bin/sudo');
-  assert.equal(sudoAt({ '/sudo': 'present' }, { pathValue: '/' }), 'present: /sudo');
+  assert.equal(sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin///' }), sudoPresent('/opt/bin/sudo'));
+  assert.equal(sudoAt({ '/sudo': 'present' }, { pathValue: '/' }), sudoPresent('/sudo'));
   // (The unresolvable-entry cases live in the null-component table above, which
   // is the single place all of them are pinned — the round-10 version of this
   // loop asserted the bare 'unknown' and sat one table away from the '' case
@@ -910,7 +950,7 @@ test('every probe denies strict when it cannot be evaluated', () => {
   // A present binary still outranks an ambiguity, wherever each came from.
   assert.equal(
     sudoAt({ '/opt/bin/sudo': 'present' }, { pathValue: '/opt/bin:relative/bin' }),
-    'present: /opt/bin/sudo',
+    sudoPresent('/opt/bin/sudo'),
   );
 
   // OWN CAPABILITIES, from /proc/self/status. PERMITTED counts as much as
@@ -986,7 +1026,7 @@ test('the default reaches the refusal on a host that establishes nothing', async
     outputDir,
     projectRoot: makeTempDir(),
     env: {},
-    probeAdmission: () => admissionOf({ sudo: 'present: /usr/bin/sudo' }),
+    probeAdmission: () => admissionOf({ sudo: sudoPresent('/usr/bin/sudo') }),
     spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
   }));
   assert.equal(result, 3, 'the default refused');
@@ -998,7 +1038,7 @@ test('the default reaches the refusal on a host that establishes nothing', async
     outputDir: makeTempDir(),
     projectRoot: makeTempDir(),
     env: {},
-    probeAdmission: () => admissionOf({ sudo: 'present: /usr/bin/sudo' }),
+    probeAdmission: () => admissionOf({ sudo: sudoPresent('/usr/bin/sudo') }),
     // Reaching the collector is exactly how far this half needs to go: the
     // gate let it through, which is the property under test.
     spawnShim: () => { throw new Error('past the gate'); },
@@ -1063,9 +1103,9 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
   // diagnostic names the condition that actually blocked (Codex T6 r8 #1).
   for (const [route, blocked] of [
     [{ uid: 'root' }, 'effective uid: root'],
-    [{ sudo: 'present: /usr/bin/sudo' }, 'sudo binary: present: /usr/bin/sudo'],
+    [{ sudo: sudoPresent('/usr/bin/sudo') }, `sudo binary: ${sudoPresent('/usr/bin/sudo')}`],
     [{ capabilities: 'CAP_BPF' }, 'privileged capabilities: CAP_BPF'],
-    [{ ptrace: 'permissive', uid: 'root', sudo: 'present: /bin/sudo', capabilities: 'CAP_SYS_ADMIN' }, 'privileged capabilities: CAP_SYS_ADMIN'],
+    [{ ptrace: 'permissive', uid: 'root', sudo: sudoPresent('/bin/sudo'), capabilities: 'CAP_SYS_ADMIN' }, 'privileged capabilities: CAP_SYS_ADMIN'],
   ]) {
     const outputDir = makeTempDir();
     const { result, written } = await captureStderr(() => startSubcommand({
@@ -1186,6 +1226,120 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
   assertQualifiedDigest(printed, digestIndex);
 });
 
+// A PATH entry long enough to be legitimate and still blow the render cap on
+// its own, and one carrying a newline. Both are what the REAL detector can be
+// handed; neither could be reached by the hand-written findings the round-11
+// and round-12 guards were built from, which is precisely why those guards
+// passed while report.md was being truncated in production (Codex T6 r13).
+const LONG_DIRECTORY = `/opt/${'nested-vendor-directory/'.repeat(14)}bin`;
+const NEWLINE_DIRECTORY = '/tmp/evil\nFORGED-LINE';
+
+test('no reading can carry producer bytes: every field is bounded and single-line', () => {
+  // THE FIELD-LEVEL SWEEP (Codex T6 r13). "Bounded" was assumed for three
+  // readings and false for the fourth, so each is now driven with hostile
+  // PRODUCER input — the bytes the host actually supplies — and checked
+  // against the vocabulary the record validates, not against a hand-written
+  // sample of what the producer usually says.
+  const boundedReading = (label, value, cap) => {
+    assert.equal(typeof value, 'string', `${label}: a reading is a string`);
+    assert.equal(/[\r\n]/.test(value), false, `${label}: single line, got ${JSON.stringify(value)}`);
+    assert.ok(value.length <= cap, `${label}: ${value.length} chars exceeds the ${cap}-character bound`);
+    // And it must be a value the record accepts — an unbounded reading that
+    // merely happens to be short is still a hole.
+    assert.deepEqual(
+      admissionBlockers({ ...ADMITTED(), [label]: value }).filter((blocker) => /unreadable record/.test(blocker)),
+      [],
+      `${label}: ${JSON.stringify(value)} is outside the vocabulary`,
+    );
+  };
+
+  // 1. PTRACE. The producer is the contents of a /proc file, and the lookup is
+  //    a Map miss away from 'unknown' — no file byte is ever interpolated.
+  for (const raw of ['3\n', '1', 'a'.repeat(9000), 'evil\nFORGED', '\u0000', '3; rm -rf /', '']) {
+    boundedReading('ptrace', readPtraceScope({ platform: 'linux', readFile: () => raw }), 21);
+  }
+
+  // 2. UID. The producer returns a number; the reading is one of three labels.
+  for (const uid of [0, 1001, 4294967295, -1, 1.5, Number.NaN]) {
+    boundedReading('uid', readEffectiveUid({ getuid: () => uid }), 8);
+  }
+
+  // 3. SUDO. The producer supplies PATHS, and this is the reading that carried
+  //    them verbatim. A 362-character candidate produced a 579-character
+  //    caveat; a candidate with a newline split the record in two.
+  for (const pathValue of [LONG_DIRECTORY, NEWLINE_DIRECTORY, `${LONG_DIRECTORY}:${NEWLINE_DIRECTORY}`, '/usr/bin']) {
+    boundedReading('sudo', detectSudoBinary({
+      platform: 'linux',
+      pathValue,
+      statPath: () => 'present',
+    }), 90);
+  }
+
+  // 4. CAPABILITIES. The producer is a hex mask; the reading is a join over a
+  //    FIXED four-name set, so the widest possible value is all four.
+  for (const mask of ['000000ffffffffff', 'ffffffffffffffff', '0000000000000000', '0000008000000000']) {
+    boundedReading('capabilities', readOwnCapabilities({
+      platform: 'linux',
+      readFile: () => `CapPrm:\t${mask}\nCapEff:\t${mask}\n`,
+    }), 60);
+  }
+
+  // The matched paths are NOT in the reading at all — not raw, not sanitised.
+  // The actionable fact is "sudo exists here"; a list would rebuild the
+  // injection surface for no decision the operator cannot already make.
+  const present = detectSudoBinary({ platform: 'linux', pathValue: NEWLINE_DIRECTORY, statPath: () => 'present' });
+  assert.match(present, /^present: [0-9]+ at sha256=[0-9a-f]{64}$/);
+  assert.equal(present.includes('FORGED-LINE'), false, 'no raw candidate bytes in the reading');
+  assert.equal(present.includes('/tmp'), false, 'not even a fragment of one');
+  // The digest is over the SORTED, NUL-JOINED matched set, so an operator can
+  // recompute it from their own listing without this action disclosing one.
+  assert.equal(
+    detectSudoBinary({ platform: 'linux', pathValue: undefined, statPath: () => 'present' }),
+    sudoPresent('/usr/bin/sudo', '/bin/sudo', '/usr/local/bin/sudo'),
+  );
+});
+
+test('the whole producer chain stays inside the record contract, not just hand-written findings', async () => {
+  // THE GAP THAT HID THE DEFECT. Every earlier guard started from a fixture a
+  // human typed. This one starts where the bytes do — detectSudoBinary reading
+  // a hostile PATH — and follows them through evaluateAdmission, into
+  // admissionCaveats, and out through the renderer a consumer actually reads.
+  for (const [label, pathValue] of [
+    ['a long legitimate candidate', LONG_DIRECTORY],
+    ['a candidate carrying a newline', NEWLINE_DIRECTORY],
+    ['both at once', `${LONG_DIRECTORY}:${NEWLINE_DIRECTORY}`],
+  ]) {
+    const admission = evaluateAdmission({
+      readPtrace: () => 'unconditional',
+      readEuid: () => 'non-root',
+      detectSudo: () => detectSudoBinary({ platform: 'linux', pathValue, statPath: () => 'present' }),
+      readCapabilities: () => 'clear',
+    });
+    assert.equal(admissionEstablished(admission), false, `${label}: a present sudo denies`);
+    // The record, and then the report a human is shown.
+    const caveats = admissionCaveats(admission, 'best-effort', 'n1');
+    const markdown = renderMarkdown(buildReport(
+      [{ raw: '{"msg":"e"}', parsed: { ts: '2026-08-14T00:00:00.000Z', msg: 'e' } }],
+      { sessionId: 'ci-debug-abc', caveats },
+    ));
+    for (const caveat of caveats) {
+      assert.equal(/[\r\n]/.test(caveat), false, `${label}: the record stays single-line`);
+      assert.ok(escapeMarkdownText(caveat).length <= EXCERPT_CHAR_CAP - 100,
+        `${label}: ${escapeMarkdownText(caveat).length} escaped characters is outside the authoring margin`);
+    }
+    // Nothing the host supplied reaches the artifact, and nothing was cut off
+    // on the way there.
+    assert.equal(markdown.includes('FORGED-LINE'), false, `${label}: no injected bytes in the rendered report`);
+    assert.equal(markdown.includes('nested-vendor-directory'), false, `${label}: no raw path fragments either`);
+    for (const line of markdown.split('\n').filter((entry) => entry.startsWith('> **Caveat:**'))) {
+      assert.equal(line.includes('…'), false, `${label}: a caveat was truncated: ${line.slice(-60)}`);
+    }
+    // A forged line cannot appear as its own blockquote, which is what the
+    // newline case produced before the reading was bounded.
+    assert.equal(markdown.includes('\nFORGED-LINE'), false, `${label}: the record was not split`);
+  }
+});
+
 test('generated caveats keep an authoring margin under the render cap', () => {
   // AUTHORING-TIME FEEDBACK, not a second correctness check. The truncation
   // assertion below is the correctness one: it renders the report and proves
@@ -1204,7 +1358,7 @@ test('generated caveats keep an authoring margin under the render cap', () => {
     ['admitted', ADMITTED(), 'strict'],
     ['clear but best-effort', ADMITTED(), 'best-effort'],
     ['every route blocked', admissionOf({
-      ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
+      ptrace: 'permissive', uid: 'root', sudo: sudoPresent('/usr/bin/sudo'), capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
     }), 'best-effort'],
     ['an unresolvable PATH', admissionOf({ sudo: 'unknown: empty-or-relative PATH entry' }), 'best-effort'],
     ['no usable record', undefined, 'strict'],
@@ -1249,7 +1403,7 @@ test('every security statement in the admission record survives Markdown renderi
     ['admitted', ADMITTED(), 'strict'],
     ['clear but best-effort', ADMITTED(), 'best-effort'],
     ['every route blocked', admissionOf({
-      ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
+      ptrace: 'permissive', uid: 'root', sudo: sudoPresent('/usr/bin/sudo'), capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
     }), 'best-effort'],
     ['an unresolvable PATH', admissionOf({ sudo: 'unknown: empty-or-relative PATH entry' }), 'best-effort'],
   ]) {
@@ -1299,7 +1453,7 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
     ['ptrace permissive', admissionOf({ ptrace: 'permissive' }), true],
     ['ptrace unknown', admissionOf({ ptrace: 'unknown' }), true],
     ['root', admissionOf({ uid: 'root' }), true],
-    ['a sudo binary', admissionOf({ sudo: 'present: /usr/bin/sudo' }), true],
+    ['a sudo binary', admissionOf({ sudo: sudoPresent('/usr/bin/sudo') }), true],
     ['CAP_BPF', admissionOf({ capabilities: 'CAP_BPF' }), true],
     ['no record at all', undefined, true],
   ]) {
@@ -1328,7 +1482,7 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
     // tell "this host permits ptrace" from "this host handed the job root".
     if (expectStamp) {
       for (const blocker of admissionBlockers(record)) {
-        assert.ok(json.caveats[0].includes(blocker), `${label}: the caveat names ${blocker}`);
+        assert.ok(json.caveats.some((caveat) => caveat.includes(blocker)), `${label}: the record names ${blocker}`);
       }
     }
     // The ADMISSION RECORD and the limits of the check are mirrored on EVERY
@@ -3998,10 +4152,14 @@ test('the renderer export surface capture depends on is pinned', () => {
     assert.equal(typeof renderer[name], 'function', `debug_report.js must export ${name}`);
   }
   // And EXCERPT_CHAR_CAP, which the action's tests measure generated caveats
-  // against (round 12). Dropping the export would leave that measurement
-  // comparing against `undefined` — every length silently "passing" — so the
-  // removal has to fail HERE, loudly, rather than un-pinning an assertion
-  // somewhere else in the file.
+  // against (round 12). Dropping the export leaves that measurement comparing
+  // against `undefined`, and the arithmetic degrades to NaN — so the margin
+  // guard does NOT pass silently, it fails with `NaN over the NaN authoring
+  // cap`, which is true and useless. (Corrected in round 13: this comment
+  // originally claimed every length would silently pass, which the round-12
+  // mutation had already disproved. `length <= NaN` is false.) The point of
+  // pinning the name HERE is to turn that incoherent failure into a sentence
+  // naming the actual cause.
   assert.equal(typeof renderer.EXCERPT_CHAR_CAP, 'number', 'debug_report.js must export EXCERPT_CHAR_CAP');
   assert.ok(renderer.EXCERPT_CHAR_CAP > 0, 'a cap of zero or less would truncate everything');
   // And the shapes support.js relies on: buildReport takes entries plus a

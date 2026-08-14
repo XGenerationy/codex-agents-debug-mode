@@ -273,9 +273,33 @@ const detectSudoBinary = (options = {}) => {
     if (reading === 'present') found.push(candidate);
     else if (reading !== 'absent') unreadable = true;
   }
-  // A named binary beats a shrug: both deny, and the caller gets the better
-  // diagnostic.
-  if (found.length > 0) return `present: ${found.join(', ')}`;
+  // FIXED-SIZE, SINGLE-LINE METADATA — never the paths themselves (Codex T6
+  // r13). This reading is producer-derived: every byte of `found` came from
+  // the inherited PATH, and it travels into the admission record, the refusal
+  // diagnostic, the step log and the uploaded artifact. Joined verbatim it was
+  // unbounded and could contain anything: a legitimate 362-character nested
+  // candidate produced a 579-character caveat that report.md truncated at the
+  // render cap, and a candidate containing a NEWLINE produced
+  // `present: /tmp/evil\nFORGED-LINE/sudo`, which passed validation and split
+  // the supposedly single-line record into two.
+  //
+  // The proximate cause was ours: round 10 widened this reading's vocabulary
+  // from `\/\S+` to `\/[^,]+` so directories containing spaces would validate.
+  // A vocabulary widened for a display convenience is a hole, and this is the
+  // second time raw PATH bytes have had to be taken back out of the evidence
+  // (the `unknown` reason was the first, in round 11).
+  //
+  // So the reading carries a COUNT and a DIGEST and nothing else. The digest is
+  // SHA-256 over the sorted, NUL-joined matched candidates: two hosts with the
+  // same sudo set hash identically, and an operator can recompute it from their
+  // own listing — without this action disclosing a list, which would rebuild
+  // the injection surface for no decision they cannot already make. The
+  // actionable fact is "sudo exists here, so strict is impossible on this
+  // host"; Task 8 documents where the inspection looks.
+  if (found.length > 0) {
+    const fingerprint = createHash('sha256').update([...found].sort().join('\0')).digest('hex');
+    return `present: ${found.length} at sha256=${fingerprint}`;
+  }
   // An unreadable candidate outranks an unresolvable entry only because it is
   // the more specific failure; both deny, so the order costs nothing.
   if (unreadable) return 'unknown';
@@ -315,15 +339,37 @@ const readOwnCapabilities = (options = {}) => {
 // THE FOUR READINGS, and the vocabulary each is allowed to speak. A value
 // outside its set is not a reading this code produced, so it is unreadable —
 // never clear.
+//
+// ANCHORED AND FIXED-SIZE, all four (Codex T6 r13). Three of these were
+// bounded by their producers already; that was believed rather than enforced,
+// and the fourth was neither. A vocabulary is the only place "fixed-size,
+// single-line" can be made true rather than aspirational, so each one below
+// admits an ENUMERATED set or an anchored pattern with a bounded length, and
+// nothing else. Every regex is anchored at both ends, which is also what
+// excludes embedded newlines: with no multiline flag set, the end anchor
+// matches end of INPUT, never end of line.
 const PTRACE_VALUES = new Set(['unconditional', 'privilege-bypassable', 'permissive', 'unknown']);
 const UID_VALUES = new Set(['non-root', 'root', 'unknown']);
-const SUDO_PRESENT = /^present: \/[^,]+(?:, \/[^,]+)*$/;
-const CAPABILITY_LIST = /^CAP_[A-Z0-9_]+(?:\+CAP_[A-Z0-9_]+)*$/;
+// Count then digest — the whole reading is at most 84 characters.
+const SUDO_PRESENT = /^present: [1-9][0-9]{0,4} at sha256=[0-9a-f]{64}$/;
+const SUDO_VALUES = new Set(['absent', 'unknown', SUDO_PATH_UNRESOLVABLE]);
+// Derived from the SAME Map the producer joins, so the vocabulary cannot drift
+// wider than what can actually be produced: every non-empty subset, in the
+// Map's own order, plus the two scalar readings. Fifteen combinations, the
+// longest 51 characters.
+const CAPABILITY_VALUES = (() => {
+  const names = [...DANGEROUS_CAPABILITIES.keys()];
+  const values = new Set(['clear', 'unknown']);
+  for (let mask = 1; mask < (1 << names.length); mask += 1) {
+    values.add(names.filter((_, index) => (mask & (1 << index)) !== 0).join('+'));
+  }
+  return values;
+})();
 const ADMISSION_FIELDS = [
   { key: 'ptrace', label: 'same-UID ptrace policy', clear: 'unconditional', valid: (value) => PTRACE_VALUES.has(value) },
   { key: 'uid', label: 'effective uid', clear: 'non-root', valid: (value) => UID_VALUES.has(value) },
-  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => value === 'absent' || value === 'unknown' || value === SUDO_PATH_UNRESOLVABLE || SUDO_PRESENT.test(value) },
-  { key: 'capabilities', label: 'privileged capabilities', clear: 'clear', valid: (value) => value === 'clear' || value === 'unknown' || CAPABILITY_LIST.test(value) },
+  { key: 'sudo', label: 'sudo binary', clear: 'absent', valid: (value) => SUDO_VALUES.has(value) || SUDO_PRESENT.test(value) },
+  { key: 'capabilities', label: 'privileged capabilities', clear: 'clear', valid: (value) => CAPABILITY_VALUES.has(value) },
 ];
 
 // DERIVED FROM THE READINGS, NEVER READ OFF THE RECORD (Codex T6 r9 #2). The
@@ -410,10 +456,15 @@ const admissionCaveats = (admission, evidenceTrust, nonce) => {
   // strict one, so it fails closed to diagnostic.
   const authenticated = evidenceTrust === 'strict' && established;
   return [
+    // Identity and regime on one line, FINDINGS on the next. The findings are
+    // the only part whose length depends on the host — four bounded readings
+    // rather than one, but still enough, with the identity prefix, to crowd the
+    // authoring margin. Splitting them keeps each statement short by
+    // construction instead of by luck (Codex T6 r13).
     `ADMISSION RECORD (streamed by start before the wrapped command existed): invocation=${nonce ?? 'unrecorded'};`
     + ` evidence-trust=${regime}; in-process boundary=${established ? 'ESTABLISHED' : 'NOT established'};`
-    + ` admission=${authenticated ? 'STRICT (authenticated)' : 'DIAGNOSTIC ONLY'};`
-    + ` findings=${describeAdmission(admission)}.`,
+    + ` admission=${authenticated ? 'STRICT (authenticated)' : 'DIAGNOSTIC ONLY'}.`,
+    `Findings: ${describeAdmission(admission)}.`,
     // SPLIT, because a single caveat of this length did not survive being
     // rendered (Codex T6 r11 #2). debug_report.js caps each rendered caveat at
     // 500 characters, so the 676-character version reached report.md ending
