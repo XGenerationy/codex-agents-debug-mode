@@ -270,4 +270,11 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildReport, parseArgs, renderJson, renderMarkdown, renderText };
+// EXCERPT_CHAR_CAP is exported because a CONSUMER has to be able to measure
+// against it. actions/debug-evidence generates caveats that must survive being
+// rendered here, and its tests compared them to a hardcoded 500 — a copy that
+// would disagree with this file the moment the cap moved, permissively if it
+// shrank. The action's sentinel test pins this name alongside the three
+// functions it calls, so removing it fails loudly rather than leaving that
+// measurement comparing against undefined.
+module.exports = { EXCERPT_CHAR_CAP, buildReport, parseArgs, renderJson, renderMarkdown, renderText };

@@ -13,6 +13,11 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { escapeMarkdownText } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
+// THE RENDERER'S OWN CAP, imported rather than copied. A literal 500 here
+// silently disagrees with debug_report.js the moment the cap moves, and if it
+// SHRINKS the disagreement is permissive — the same direction that let a
+// truncated caveat reach report.md in the first place.
+const { EXCERPT_CHAR_CAP } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
 const {
   canonicalResponderRecord,
@@ -1181,11 +1186,46 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
   assertQualifiedDigest(printed, digestIndex);
 });
 
+test('generated caveats keep an authoring margin under the render cap', () => {
+  // AUTHORING-TIME FEEDBACK, not a second correctness check. The truncation
+  // assertion below is the correctness one: it renders the report and proves
+  // nothing a human is shown was cut short. This one fires EARLIER and for a
+  // different reason — it tells whoever is editing this prose that they are
+  // running out of room, before the sentence they add crosses the cap and
+  // turns into a truncation hunt. Delete either and the other does not cover
+  // it: this one never renders anything, and that one cannot warn in advance.
+  //
+  // 400 is EXCERPT_CHAR_CAP minus a deliberate 100-character margin. The
+  // record has grown in most rounds of this review, and a caveat sitting at
+  // 490 is one clause away from being silently cut.
+  const MARGIN = 100;
+  const authoringCap = EXCERPT_CHAR_CAP - MARGIN;
+  for (const [label, admission, evidenceTrust] of [
+    ['admitted', ADMITTED(), 'strict'],
+    ['clear but best-effort', ADMITTED(), 'best-effort'],
+    ['every route blocked', admissionOf({
+      ptrace: 'permissive', uid: 'root', sudo: 'present: /usr/bin/sudo', capabilities: 'CAP_SYS_MODULE+CAP_SYS_PTRACE+CAP_SYS_ADMIN+CAP_BPF',
+    }), 'best-effort'],
+    ['an unresolvable PATH', admissionOf({ sudo: 'unknown: empty-or-relative PATH entry' }), 'best-effort'],
+    ['no usable record', undefined, 'strict'],
+  ]) {
+    for (const caveat of admissionCaveats(admission, evidenceTrust, 'n1')) {
+      const rendered = escapeMarkdownText(caveat).length;
+      assert.ok(
+        rendered <= authoringCap,
+        `${label}: this caveat is ${rendered} escaped characters, ${rendered - authoringCap} over the ${authoringCap} authoring cap`
+        + ` (EXCERPT_CHAR_CAP ${EXCERPT_CHAR_CAP} minus a ${MARGIN} margin) — split it into shorter statements rather than raising the cap: "${caveat.slice(0, 60)}…"`,
+      );
+    }
+  }
+});
+
 test('every security statement in the admission record survives Markdown rendering intact', async () => {
   // ASSERTED ON THE RENDERED OUTPUT, NEVER ON THE INPUT (Codex T6 r11 #2).
   // The record was correct in every copy the action produced and still reached
-  // report.md truncated: debug_report.js caps each rendered caveat at 500
-  // characters, and one generated caveat was 676 — so the human artifact ended
+  // report.md truncated: debug_report.js caps each rendered caveat at
+  // EXCERPT_CHAR_CAP characters, and one generated caveat was 676 — so the
+  // human artifact ended
   // "These are the escala…", silently deleting "not a proof that no route
   // exists" and the examples of routes this action cannot see. report.md read
   // STRONGER than report.json and the step logs, which is the exact inversion
@@ -1245,7 +1285,7 @@ test('every security statement in the admission record survives Markdown renderi
     // reading report.md.
     const json = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
     for (const caveat of json.caveats) {
-      assert.ok(escapeMarkdownText(caveat).length <= 500,
+      assert.ok(escapeMarkdownText(caveat).length <= EXCERPT_CHAR_CAP,
         `${label}: a caveat is too long to render whole: ${caveat.length} chars`);
     }
   }
@@ -3957,6 +3997,13 @@ test('the renderer export surface capture depends on is pinned', () => {
   for (const name of ['buildReport', 'renderMarkdown', 'renderJson']) {
     assert.equal(typeof renderer[name], 'function', `debug_report.js must export ${name}`);
   }
+  // And EXCERPT_CHAR_CAP, which the action's tests measure generated caveats
+  // against (round 12). Dropping the export would leave that measurement
+  // comparing against `undefined` — every length silently "passing" — so the
+  // removal has to fail HERE, loudly, rather than un-pinning an assertion
+  // somewhere else in the file.
+  assert.equal(typeof renderer.EXCERPT_CHAR_CAP, 'number', 'debug_report.js must export EXCERPT_CHAR_CAP');
+  assert.ok(renderer.EXCERPT_CHAR_CAP > 0, 'a cap of zero or less would truncate everything');
   // And the shapes support.js relies on: buildReport takes entries plus a
   // session id, and the two renderers turn its result into strings.
   const report = renderer.buildReport(
