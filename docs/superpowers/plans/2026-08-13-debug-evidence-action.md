@@ -2993,6 +2993,55 @@ round-7 hardening suggestion — plus Important ×1 and Minor ×2:
 Fix commit message:
 `fix(action): strict admission requires no route to root, not merely Yama mode 3 (Codex T6 r8)`.
 
+#### Task 6 fix round 9 — Codex re-review decisions (recorded before code moves)
+
+Codex on `09a377c`: the per-surface polarity rewrite is sound. **Critical ×1,
+Important ×3, Minor ×3.** Ruling (b): the PATH-dependent `sudo` probe is NOT
+acceptable, and an absolute path alone does not fix it.
+
+1. **`sudo -n true` cannot establish that sudo is unavailable (CRITICAL).**
+   Sudoers rules are COMMAND-SPECIFIC: a principal can hold
+   `NOPASSWD: /usr/bin/env` while `true` is denied or prompts, so the probe clears
+   and the wrapped command then escalates through the allowed command. And the
+   coordinator's round-8 claim that a spoofed `sudo` could only DENY was wrong: a
+   `PATH`-planted fake exiting 1 with "a password is required" GRANTS strict
+   admission while the command later calls the real `/usr/bin/sudo`. Codex's sound
+   policy, adopted: **deny strict whenever a `sudo` binary exists at all**, unless
+   an independently trusted mechanism establishes the principal has no usable
+   rule (nothing here is such a mechanism). Detection must use absolute trusted
+   paths (`/usr/bin/sudo`, `/bin/sudo`, `/usr/local/bin/sudo`) and check
+   EXISTENCE, never behaviour; any error or ambiguity ⇒ deny. Strict therefore
+   means a genuinely locked environment — which is what "real isolation" meant.
+2. **`admissionEstablished` trusts the persisted `blockers` array (Important).**
+   It validates only `blockers.length === 0`, so a forged
+   `{ptrace:'permissive', uid:'root', sudo:'available', capabilities:'CAP_BPF',
+   blockers:[]}` — or bare `{blockers: []}` — is ADMITTED after the state
+   round-trip. Fix: validate all four fields against their allowed values and
+   DERIVE blockers from them; never trust the persisted array. Add the exact
+   malformed shapes the current test omits.
+3. **Ruling (a), sharpened: an artifact-only stamp is insufficient (Important).**
+   A compromised best-effort `run` can forge the same stamp. Instead: `start`
+   emits an IMMUTABLE PRE-COMMAND ADMISSION RECORD on EVERY run (step log, before
+   the command exists), mirrored into the artifact/report. The trust unit becomes
+   **admission record + `run` digest + artifact**, and the checked-routes
+   limitation appears in EVERY copy. Spec updated by the coordinator (done).
+4. **The live-host dependency is still live on Linux (Important).**
+   `support.test.js:526` passes `{getuid: undefined}`, which ACTIVATES the
+   parameter default `process.geteuid` instead of simulating an absent API — so on
+   the Ubuntu CI matrix it returns the live uid and the test FAILS. Pass `null`.
+   Sweep for every other `undefined`-as-absence seam with the same defect.
+5. **Minors.** (i) Spec line 257's "Yama mode 3 or real isolation" shorthand —
+   fixed by the coordinator in this commit, along with the prerequisite block's
+   sudo clause. (ii) `support.js:917` still describes the admission record as the
+   old scalar `unconditional`, and lines 1362–1372 retain the ptrace-only
+   prerequisite explanation. (iii) `support.js:92` wrongly lists direct
+   `/proc/<pid>/mem` as bypassing mode 3 — that file is guarded by a
+   `PTRACE_MODE_ATTACH_FSCREDS` check; BPF and kernel modules remain correct
+   examples, so drop the `/proc/<pid>/mem` claim rather than qualifying it.
+
+Fix commit message:
+`fix(action): deny strict when any sudo binary exists, derive admission from validated fields, pre-command admission record (Codex T6 r9)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment

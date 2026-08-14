@@ -254,11 +254,18 @@ authoritative. *(Made conditional, Task 6 round 7 — the claim below holds only
 under a successful strict admission.)* **The trust regime depends on
 `evidence-trust`:**
 
-- **After a successful `strict` admission** (the platform prerequisite was
-  positively established — Yama mode 3 or real isolation), the unit of trust is
-  **the artifact plus the matching digest from the trusted `run` process's step
-  log**. Duplicate or conflicting `evidence-sha256` lines invalidate the artifact;
-  the `evidence-digest` output is a convenience, not the trust anchor.
+- **After a successful `strict` admission** — every checked route clear: Yama
+  mode 3, effective uid ≠ 0, no usable `sudo` route, and no privileged capability
+  in the process's own set *(corrected, Task 6 round 9: the earlier "mode 3 or
+  real isolation" shorthand both omitted the conjunction and implied an
+  isolation-based admission route that is not implemented)* — the unit of trust is
+  **the pre-command admission record `start` streamed to its own step log, plus
+  the matching digest from the `run` process's step log, plus the artifact**. All
+  three, together: the admission record establishes which regime was in force and
+  cannot be forged after the fact, the digest binds the bytes, and the artifact
+  carries them. Duplicate or conflicting `evidence-sha256` lines invalidate the
+  artifact; the `evidence-digest` output is a convenience, not the trust anchor.
+  Every copy of the record carries the checked-routes limitation.
 - **In `best-effort` mode**, the artifact, the digest, the rendered report and the
   post-command qualification are **diagnostic claims only — none of them
   authenticates the evidence**. The stated threat in that mode is precisely that
@@ -281,10 +288,13 @@ That is positively established only when:
 
 - Linux Yama `ptrace_scope = 3` (attachment forbidden unconditionally, and the
   mode cannot be lowered again at runtime), **AND** the wrapped principal has no
-  route to root — no passwordless `sudo`, not already uid 0, and no
-  privileged capability in its own set; or
-- real process/user isolation between the trusted processes and the wrapped
-  command.
+  route to root: not already uid 0, no privileged capability in its own set, and
+  **no `sudo` binary present at all** *(tightened, Task 6 round 9 — probing
+  `sudo -n <cmd>` cannot establish absence, because sudoers rules are
+  COMMAND-SPECIFIC: a principal may hold `NOPASSWD` for one command while another
+  is denied, and a `PATH`-planted fake `sudo` can fabricate a denial to GRANT
+  admission while the real binary remains reachable. Any host where `sudo` exists
+  is denied.)*
 
 `ptrace_scope` 1 or 2 is NOT sufficient: both are bypassable by
 `CAP_SYS_PTRACE`. **Mode 3 alone is not sufficient either** *(corrected, Task 6
