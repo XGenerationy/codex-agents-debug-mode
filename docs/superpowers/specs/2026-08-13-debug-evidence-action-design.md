@@ -305,9 +305,11 @@ a proof that no route exists: a setuid binary, a mounted container socket, or a
 writable privileged service can grant the same power unobserved. Hosted execution
 remains BEST-EFFORT.
 
-The action therefore treats the prerequisite as established ONLY for mode 3, and
-refuses to launch the wrapped command otherwise unless the caller explicitly
-selects best-effort operation (invariant 11). Post-command labeling alone is not
+The action therefore treats the prerequisite as established ONLY when all four
+readings are clear — mode 3 is necessary, not sufficient *(corrected, Task 6
+round 8; this sentence still said "ONLY for mode 3" after the block above was
+rewritten)* — and refuses to launch the wrapped command otherwise unless the
+caller explicitly selects best-effort operation (invariant 11). Post-command labeling alone is not
 a control: on a platform where the command can rewrite `run`, it can also remove
 the caveat — which is why the qualification is emitted BEFORE the command runs,
 into `start`'s step log, where it is immutable once streamed.

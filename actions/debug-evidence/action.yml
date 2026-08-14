@@ -66,16 +66,22 @@ inputs:
     default: ""
   evidence-trust:
     description: >-
-      'strict' (default): refuse to run the wrapped command at all unless the
+      'strict' (default): refuse to run the wrapped command at all unless this
       host positively establishes the in-process boundary this action's
-      evidence depends on — Linux Yama ptrace_scope 3. 'best-effort': run
-      anyway, and treat the resulting evidence as a diagnostic claim rather
-      than an authenticated one. NOTE that strict refuses on the DEFAULT
-      GitHub-hosted configuration, which ships ptrace_scope 1 plus passwordless
-      sudo. Strict is still reachable there: an earlier trusted step can use
-      that same sudo to `sysctl -w kernel.yama.ptrace_scope=3`, which cannot
-      afterwards be lowered. So hosted callers on the default configuration
-      must either harden the runner first or opt in to best-effort.
+      evidence depends on. That takes ALL of: Linux Yama ptrace_scope 3, a
+      non-root effective uid, no passwordless sudo, and none of CAP_SYS_ADMIN,
+      CAP_BPF, CAP_SYS_PTRACE or CAP_SYS_MODULE held by this process.
+      'best-effort': run anyway, and treat the resulting evidence as a
+      diagnostic claim rather than an authenticated one. Mode 3 is necessary,
+      not sufficient — it forbids ptrace attachment, but a principal that can
+      reach root rewrites another task's memory with a privileged BPF program
+      or a kernel module without ptrace at all — so a runner that grants
+      passwordless sudo cannot reach strict by setting the sysctl. GitHub-hosted
+      runners grant exactly that, so hosted execution stays best-effort and
+      hosted callers must opt in. And these are the escalation routes this
+      action checks, not a proof that no route exists: a setuid binary, a
+      mounted container socket or a writable privileged service grants the same
+      power unobserved.
     required: false
     default: "strict"
 
@@ -87,7 +93,10 @@ inputs:
 # plus the matching digest from its step log is the trust unit. Under
 # `evidence-trust: best-effort` it is a diagnostic claim only, because the
 # threat that mode accepts is precisely a command able to rewrite run.
-# `report` publishes and produces nothing under either mode.
+# `report` publishes and produces nothing under either mode. And "successful
+# strict admission" means the escalation routes this action checks came back
+# clear, not a proof that no route exists — the trust unit is only ever as
+# good as that.
 outputs:
   command-exit-code:
     description: "Exit code of the wrapped command; empty until the run step has run"
@@ -164,8 +173,9 @@ runs:
       # That claim is about those values and nothing else. The command plainly
       # influences the world around them: it writes files, rewrites state, can
       # kill the collector, and authors every event that reaches the log. What
-      # it cannot do — under the prerequisite below — is change this process's
-      # own copy of what it read before the command started.
+      # it cannot do — under the prerequisite below, and only as far as the
+      # checks below can see — is change this process's own copy of what it
+      # read before the command started.
       #
       # PLATFORM PREREQUISITE, because the claim is conditional and the file
       # must say so (Codex T6 r5, corrected r6): it holds only where the host
@@ -177,8 +187,26 @@ runs:
       # collector whose pid is in the state file, and read or inject memory,
       # which defeats authenticated evidence outright.
       #
+      # AND MODE 3 IS NOT ENOUGH ON ITS OWN (Codex T6 r8, and it reverses what
+      # round 7 wrote here). Yama governs ptrace and nothing else: a principal
+      # that can reach ROOT overwrites another task's userspace memory with a
+      # privileged tracing BPF program — bpf_probe_write_user() — or with a
+      # kernel module, and never calls ptrace. So mode 3 is necessary, not
+      # sufficient, and `sysctl -w kernel.yama.ptrace_scope=3` does NOT turn a
+      # hosted runner into an authenticated one, because the same passwordless
+      # sudo that sets it opens the BPF route. Hosted execution stays
+      # best-effort.
+      #
+      # Strict admission is therefore a conjunction: mode 3, a non-root
+      # effective uid, no passwordless sudo, and no CAP_SYS_ADMIN / CAP_BPF /
+      # CAP_SYS_PTRACE / CAP_SYS_MODULE in this process's own set. Those are
+      # the escalation routes this action checks, not a proof that no route
+      # exists — a setuid binary, a mounted container socket or a writable
+      # privileged service grants the same power and none of them is visible
+      # from here. Read the guarantee above with that bound on it.
+      #
       # `start` therefore REFUSES to run the wrapped command at all unless the
-      # policy is positively established, which is mode 3 and nothing else.
+      # prerequisite is positively established, which takes all four readings.
       # `evidence-trust: best-effort` opts out and takes clearly labeled
       # evidence instead. Labeling alone could not be the control: the hazard
       # is a command able to rewrite this process, and such a command can strip

@@ -24,6 +24,12 @@ const {
   finishSubcommand,
   httpRequestJson,
   maskValue,
+  actionInputsFromEnv,
+  admissionEstablished,
+  evaluateAdmission,
+  probePasswordlessSudo,
+  readEffectiveUid,
+  readOwnCapabilities,
   readPtraceScope,
   readState,
   redactKnownSecrets,
@@ -261,7 +267,7 @@ test('start boots a real collector, mints the session, and records state that ca
   writeFileSync(githubEnv, '');
   writeFileSync(githubOutput, '');
   const code = await startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ port: String(port) }),
     outputDir,
     projectRoot,
@@ -320,7 +326,7 @@ test('start emits the invocation nonce and the staging directory as its first ac
   writeFileSync(githubEnv, '');
   const refuse = (label) => () => { throw new Error(`a refused start must never ${label}`); };
   await assert.rejects(startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ runCommand: '' }),
     outputDir,
     env: { GITHUB_OUTPUT: githubOutput, GITHUB_ENV: githubEnv },
@@ -349,7 +355,7 @@ test('start emits the invocation nonce and the staging directory as its first ac
   const secondOutput = path.join(second, 'github_output');
   writeFileSync(secondOutput, '');
   await assert.rejects(startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ runCommand: '' }),
     outputDir: second,
     env: { GITHUB_OUTPUT: secondOutput },
@@ -386,10 +392,46 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // defeat authentication outright. Calling mode 1 "restricted" was therefore the
 // action's core guarantee silently failing on its principal platform.
 //
-// So: the prerequisite is POSITIVELY ESTABLISHED only at mode 3, and anything
-// less is refused before the wrapped command exists unless the caller has
-// consciously opted into best-effort evidence.
-const ESTABLISHED = () => 'unconditional';
+// So: mode 3 is NECESSARY. It is not sufficient (Codex T6 r8): it blocks
+// ptrace, but a principal that can reach root rewrites another task's memory
+// with a privileged BPF program or a kernel module without ever calling
+// ptrace. Strict admission is therefore a CONJUNCTION — mode 3, a non-root
+// euid, no passwordless sudo, no dangerous capability in this process's own
+// set — and anything less is refused before the wrapped command exists unless
+// the caller has consciously opted into best-effort evidence.
+//
+// Records are built by the REAL evaluator with its probes injected, never
+// hand-written. A hand-written fixture would keep passing after the
+// conjunction lost a term, which is exactly the drift this round closes. And
+// injecting every probe is what keeps these tests off THIS host: a test that
+// asked the machine for its policy would fail on precisely the hardened runner
+// strict mode exists for (Codex T6 r8 #3).
+const admissionOf = ({
+  ptrace = 'unconditional', uid = 'non-root', sudo = 'unavailable', capabilities = 'clear',
+} = {}) => evaluateAdmission({
+  readPtrace: () => ptrace,
+  readEuid: () => uid,
+  probeSudo: () => sudo,
+  readCapabilities: () => capabilities,
+});
+const ADMITTED = () => admissionOf();
+
+// The qualification is a BLOCK of lines now, not one line: the non-establishment
+// and the limits of the check that found it. Both belong beside the digest — a
+// reader who sees the digest must not be able to miss either — so the pin is
+// that the lines immediately preceding it are all qualification, and that both
+// claims are among them.
+const assertQualifiedDigest = (printed, digestIndex) => {
+  const preceding = [];
+  for (let index = digestIndex - 1; index >= 0 && printed[index].startsWith('evidence-qualification'); index -= 1) {
+    preceding.unshift(printed[index]);
+  }
+  assert.ok(preceding.length > 0, 'the qualification sits immediately before the digest it qualifies');
+  assert.ok(preceding.some((line) => /the in-process guarantees were NOT established/i.test(line)),
+    'the non-establishment is stated');
+  assert.ok(preceding.some((line) => /not a proof that no route exists/i.test(line)),
+    'and so is the limit of the check that decided it');
+};
 
 test('the ptrace policy is classified honestly: only mode 3 forbids attachment unconditionally', () => {
   const scope = (raw, platform = 'linux') => readPtraceScope({
@@ -428,6 +470,113 @@ test('the ptrace policy is classified honestly: only mode 3 forbids attachment u
   }
 });
 
+test('strict admission is a conjunction, and each condition alone denies it', () => {
+  // The one admitting combination.
+  assert.deepEqual(ADMITTED().blockers, []);
+  assert.equal(admissionEstablished(ADMITTED()), true);
+  // Every condition, failing ALONE. A conjunction that quietly lost a term
+  // would still admit each of these — which is the whole point of testing them
+  // one at a time rather than all-clear vs all-bad.
+  for (const [probe, value] of [
+    ['ptrace', 'privilege-bypassable'],
+    ['ptrace', 'permissive'],
+    ['ptrace', 'unknown'],
+    ['uid', 'root'],
+    ['uid', 'unknown'],
+    ['sudo', 'available'],
+    ['sudo', 'unknown'],
+    ['capabilities', 'unknown'],
+    ['capabilities', 'CAP_BPF'],
+    ['capabilities', 'CAP_SYS_ADMIN+CAP_BPF'],
+  ]) {
+    const record = admissionOf({ [probe]: value });
+    assert.equal(admissionEstablished(record), false, `${probe}=${value} must deny strict`);
+    assert.equal(record.blockers.length, 1, `${probe}=${value} is the only blocker`);
+    assert.ok(record.blockers[0].includes(value), `${probe}=${value}: the blocker names what it found`);
+    assert.equal(record[probe], value, 'and the record keeps the raw reading for diagnostics');
+  }
+  // Mode 3 is NECESSARY, NEVER SUFFICIENT (the r8 Critical). Each of these has
+  // the ptrace boundary and still denies, because the wrapped principal can
+  // reach root and rewrite another task's memory without ptrace at all.
+  for (const rootRoute of [{ uid: 'root' }, { sudo: 'available' }, { capabilities: 'CAP_BPF' }]) {
+    const record = admissionOf(rootRoute);
+    assert.equal(record.ptrace, 'unconditional', 'mode 3 is present');
+    assert.equal(admissionEstablished(record), false, `${JSON.stringify(rootRoute)}: mode 3 does not rescue it`);
+  }
+  // A record that is missing, malformed, or forged-looking is not established.
+  // The predicate is the ONLY thing that decides, and it reads a record it
+  // cannot verify — so anything it does not positively recognise is a denial.
+  for (const junk of [undefined, null, {}, { blockers: null }, { blockers: 'none' }, { blockers: 0 }, 'clear', []]) {
+    assert.equal(admissionEstablished(junk), false, `${JSON.stringify(junk) ?? 'undefined'} is not an admission`);
+  }
+});
+
+test('every probe denies strict when it cannot be evaluated', () => {
+  // The rule for all four: only a POSITIVE, recognised reading clears a
+  // condition. Missing files, absent APIs, throwing calls, timeouts and values
+  // this code has never seen are all denials — never read in the host's
+  // favour, because the cost of guessing wrong is a false authentication
+  // claim (Codex T6 r8 #1).
+  //
+  // (ptrace has its own classification test above.)
+
+  // EFFECTIVE UID.
+  assert.equal(readEffectiveUid({ getuid: () => 1001 }), 'non-root');
+  assert.equal(readEffectiveUid({ getuid: () => 0 }), 'root');
+  assert.equal(readEffectiveUid({ getuid: undefined }), 'unknown', 'a platform with no geteuid at all');
+  assert.equal(readEffectiveUid({ getuid: () => { throw new Error('EPERM'); } }), 'unknown');
+  for (const junk of [null, undefined, '0', '1001', 1.5, NaN, Infinity, -0.5, {}]) {
+    assert.equal(readEffectiveUid({ getuid: () => junk }), 'unknown', `${JSON.stringify(junk) ?? 'undefined'} is not a uid`);
+  }
+
+  // PASSWORDLESS SUDO. Fail closed: 'unavailable' is claimed ONLY for an
+  // outcome that positively says the request was denied. Everything else —
+  // including a missing binary, which looks reassuring and proves nothing
+  // about what a hostile command could install or find on PATH — reads as
+  // available.
+  const sudo = (result) => probePasswordlessSudo({
+    run: () => { if (result instanceof Error) throw result; return result; },
+  });
+  assert.equal(sudo({ status: 1, stderr: 'sudo: a password is required\n' }), 'unavailable');
+  assert.equal(sudo({ status: 1, stderr: 'ci is not in the sudoers file.  This incident will be reported.\n' }), 'unavailable');
+  assert.equal(sudo({ status: 0, stderr: '' }), 'available', 'it worked — that is the dangerous case');
+  assert.equal(sudo({ status: 1, stderr: 'sudo: a terminal is required to read the password\n' }), 'available', 'non-zero but ambiguous');
+  assert.equal(sudo({ status: 1, stderr: '' }), 'available', 'non-zero with no explanation at all');
+  assert.equal(sudo({ status: 7, stderr: 'something else entirely\n' }), 'available');
+  assert.equal(sudo({ error: Object.assign(new Error('spawn sudo ENOENT'), { code: 'ENOENT' }), status: null, stderr: '' }), 'available', 'no sudo binary is not proof of no sudo');
+  assert.equal(sudo({ error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }), status: null, stderr: 'sudo: a password is required\n' }), 'available', 'a timed-out probe answers nothing, whatever it managed to print');
+  assert.equal(sudo({ status: null, signal: 'SIGKILL', stderr: '' }), 'available', 'killed mid-probe');
+  assert.equal(sudo(new Error('spawn threw')), 'available', 'a throwing probe');
+  for (const junk of [undefined, null, 'nope', 0, { status: '1', stderr: 'sudo: a password is required' }]) {
+    assert.equal(sudo(junk), 'available', `${JSON.stringify(junk) ?? 'undefined'} is not a denial`);
+  }
+
+  // OWN CAPABILITIES, from /proc/self/status. PERMITTED counts as much as
+  // EFFECTIVE: a permitted-but-not-effective capability is one syscall away
+  // from being effective.
+  const caps = (text, platform = 'linux') => readOwnCapabilities({
+    platform,
+    readFile: () => { if (text instanceof Error) throw text; return text; },
+  });
+  const status = (prm, eff) => `Name:\tnode\nUid:\t1001\t1001\t1001\t1001\nCapPrm:\t${prm}\nCapEff:\t${eff}\nSeccomp:\t2\n`;
+  assert.equal(caps(status('0000000000000000', '0000000000000000')), 'clear');
+  assert.equal(caps(status('0000000000010000', '0000000000000000')), 'CAP_SYS_MODULE', 'bit 16, permitted only');
+  assert.equal(caps(status('0000000000000000', '0000000000080000')), 'CAP_SYS_PTRACE', 'bit 19, effective only');
+  assert.equal(caps(status('0000000000200000', '0000000000000000')), 'CAP_SYS_ADMIN', 'bit 21');
+  assert.equal(caps(status('0000008000000000', '0000000000000000')), 'CAP_BPF', 'bit 39 — the r8 route, and the one a 32-bit mask silently drops');
+  assert.equal(caps(status('000000ffffffffff', '000000ffffffffff')).split('+').length, 4, 'a full set names every one');
+  // Capabilities this action does not consider dangerous do not deny.
+  assert.equal(caps(status('0000000000000400', '0000000000000400')), 'clear', 'CAP_NET_BIND_SERVICE is not one of them');
+  // Unevaluable in any way => unknown => denies.
+  assert.equal(caps(status('0000000000000000', '0000000000000000').replace(/CapEff:[^\n]*\n/, '')), 'unknown', 'a missing field is not a clear one');
+  assert.equal(caps(status('0000000000000000', '0000000000000000').replace(/CapPrm:[^\n]*\n/, '')), 'unknown');
+  assert.equal(caps(status('zzzz', '0')), 'unknown', 'unparseable is not zero');
+  assert.equal(caps(status('', '0')), 'unknown', 'empty is not zero');
+  assert.equal(caps(new Error('ENOENT')), 'unknown', 'no /proc/self/status to read');
+  assert.equal(caps(status('0', '0'), 'win32'), 'unknown', 'no /proc at all');
+  assert.equal(caps(status('0', '0'), 'darwin'), 'unknown');
+});
+
 // Defaulting is BY ABSENCE, not by falsiness (Codex T6 r7 #3). `|| 'strict'`
 // rounded an explicitly empty input up to the safe literal, which sounds
 // harmless and is not: validateActionInputs promises that an unrecognised
@@ -451,13 +600,48 @@ test('evidence-trust defaults by absence and reports an explicitly empty value a
   const empty = start({ DEBUG_ACTION_EVIDENCE_TRUST: '' });
   assert.equal(empty.status, 1, 'an invalid input is an input failure');
   assert.match(empty.stderr, /invalid inputs:.*evidence-trust: must be 'strict' or 'best-effort'/);
-  // Omitted: defaults to STRICT, which this host (no ptrace_scope 3) refuses —
-  // and the refusal is how the default proves itself. A default of
-  // best-effort would have captured instead.
-  const omitted = start({});
-  assert.equal(omitted.status, 3, 'strict is the default, and strict refuses here');
-  assert.match(omitted.stderr, /refusing to run the wrapped command/);
-  assert.equal(/invalid inputs/.test(omitted.stderr), false, 'an absent input is not an invalid one');
+  // Omitted: the default is read off the ENVIRONMENT-BUILDING SEAM, not off
+  // this machine (Codex T6 r8 #3). The previous version asserted that an
+  // omitted input produced a REFUSAL, which is only true on a host that fails
+  // the prerequisite — so it would have failed on exactly the hardened runner
+  // strict mode exists for, and a green run here meant "this box is not
+  // hardened" as much as it meant "the default is strict".
+  assert.equal(actionInputsFromEnv({}).evidenceTrust, 'strict', 'absent means strict');
+  assert.equal(actionInputsFromEnv({ DEBUG_ACTION_EVIDENCE_TRUST: '' }).evidenceTrust, '',
+    'and an explicit empty value is passed through to be rejected, not rounded up');
+  assert.equal(actionInputsFromEnv({ DEBUG_ACTION_EVIDENCE_TRUST: 'best-effort' }).evidenceTrust, 'best-effort');
+});
+
+test('the default reaches the refusal on a host that establishes nothing', async () => {
+  // The other half of the property above, with the host injected rather than
+  // consulted: inputs built by the real env seam with evidence-trust ABSENT,
+  // driven through the real start, against a denied admission.
+  const outputDir = makeTempDir();
+  const inputs = actionInputsFromEnv({ DEBUG_ACTION_RUN: 'true' });
+  assert.equal(inputs.evidenceTrust, 'strict');
+  const { result, written } = await captureStderr(() => startSubcommand({
+    inputs,
+    outputDir,
+    projectRoot: makeTempDir(),
+    env: {},
+    probeAdmission: () => admissionOf({ sudo: 'available' }),
+    spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
+  }));
+  assert.equal(result, 3, 'the default refused');
+  assert.match(written, /refusing to run the wrapped command/);
+  // And best-effort, built the same way, does not refuse — so the assertion
+  // above is about the DEFAULT and not about the host.
+  const permissive = await captureStderr(() => assert.rejects(startSubcommand({
+    inputs: actionInputsFromEnv({ DEBUG_ACTION_RUN: 'true', DEBUG_ACTION_EVIDENCE_TRUST: 'best-effort' }),
+    outputDir: makeTempDir(),
+    projectRoot: makeTempDir(),
+    env: {},
+    probeAdmission: () => admissionOf({ sudo: 'available' }),
+    // Reaching the collector is exactly how far this half needs to go: the
+    // gate let it through, which is the property under test.
+    spawnShim: () => { throw new Error('past the gate'); },
+  }), /past the gate/));
+  assert.match(permissive.written, /BEST-EFFORT/, 'the opt-in got past the gate');
 });
 
 test('evidence-trust accepts exactly two literals and fails closed on anything else', () => {
@@ -473,6 +657,7 @@ test('evidence-trust accepts exactly two literals and fails closed on anything e
 
 test('strict refuses before the wrapped command exists, and nothing downstream can run it', async () => {
   for (const policy of ['privilege-bypassable', 'permissive', 'unknown']) {
+    // (the non-ptrace conditions get the same treatment below)
     const outputDir = makeTempDir();
     const projectRoot = makeTempDir();
     const githubOutput = path.join(outputDir, 'github_output');
@@ -482,7 +667,7 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
       outputDir,
       projectRoot,
       env: { GITHUB_OUTPUT: githubOutput },
-      readPtrace: () => policy,
+      probeAdmission: () => admissionOf({ ptrace: policy }),
       // The refusal happens BEFORE the collector exists, so there is nothing
       // to tear down and nothing listening on the port.
       spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
@@ -490,9 +675,11 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
     assert.equal(result, 3, `${policy}: 3 is the machinery-failure class`);
     // The diagnostic has to be actionable: what was found, why it is not a
     // boundary, and both ways forward.
-    assert.match(written, new RegExp(`detected policy: ${policy}`), `${policy}: names what it found`);
+    assert.match(written, new RegExp(`same-UID ptrace policy: ${policy}`), `${policy}: names what it found`);
     assert.match(written, /refusing to run the wrapped command/);
     assert.match(written, /passwordless sudo/, 'the hosted-runner reason is stated, not implied');
+    assert.match(written, /bpf_probe_write_user/, 'and the non-ptrace route root opens (Codex T6 r8)');
+    assert.match(written, /not a proof that no route exists/i, 'the check states its own limits');
     assert.match(written, /evidence-trust: best-effort/, 'the opt-out is named');
     assert.equal(readState(outputDir), null, `${policy}: no state, so no collector to strand`);
     // And the wrapped command cannot run afterwards either. In production the
@@ -508,6 +695,27 @@ test('strict refuses before the wrapped command exists, and nothing downstream c
     });
     assert.equal(runCode, 3, `${policy}: run refuses too`);
   }
+  // Mode 3 present, a route to root open: refused just the same, and the
+  // diagnostic names the condition that actually blocked (Codex T6 r8 #1).
+  for (const [route, blocked] of [
+    [{ uid: 'root' }, 'effective uid: root'],
+    [{ sudo: 'available' }, 'passwordless sudo: available'],
+    [{ capabilities: 'CAP_BPF' }, 'privileged capabilities: CAP_BPF'],
+    [{ ptrace: 'permissive', uid: 'root', sudo: 'available', capabilities: 'CAP_SYS_ADMIN' }, 'privileged capabilities: CAP_SYS_ADMIN'],
+  ]) {
+    const outputDir = makeTempDir();
+    const { result, written } = await captureStderr(() => startSubcommand({
+      inputs: baseInputs({ evidenceTrust: 'strict' }),
+      outputDir,
+      projectRoot: makeTempDir(),
+      env: {},
+      probeAdmission: () => admissionOf(route),
+      spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
+    }));
+    assert.equal(result, 3, `${JSON.stringify(route)}: refused`);
+    assert.ok(written.includes(blocked), `${JSON.stringify(route)}: names "${blocked}"`);
+    assert.equal(readState(outputDir), null, 'no state, so no collector to strand');
+  }
 });
 
 test('the policy is read AFTER the identity outputs are published, never as a default parameter', async () => {
@@ -520,9 +728,9 @@ test('the policy is read AFTER the identity outputs are published, never as a de
     outputDir,
     projectRoot: makeTempDir(),
     env: { GITHUB_OUTPUT: githubOutput },
-    readPtrace: () => {
+    probeAdmission: () => {
       publishedWhenRead = readFileSync(githubOutput, 'utf8');
-      return 'permissive';
+      return admissionOf({ ptrace: 'permissive' });
     },
     spawnShim: () => { throw new Error('a refused start must never spawn a collector'); },
   }));
@@ -547,15 +755,17 @@ test('best-effort proceeds and qualifies the evidence in all three places', asyn
       outputDir,
       projectRoot,
       env: {},
-      readPtrace: () => 'privilege-bypassable',
+      probeAdmission: () => admissionOf({ ptrace: 'privilege-bypassable' }),
     });
     assert.equal(code, 0, 'an opted-in caller proceeds');
   });
   try {
     assert.match(written, /BEST-EFFORT/);
-    assert.match(written, /detected policy: privilege-bypassable/);
+    assert.match(written, /same-UID ptrace policy: privilege-bypassable/);
+    assert.match(written, /not a proof that no route exists/i, 'and states what the check does not cover');
     const state = readState(outputDir);
-    assert.equal(state.ptraceScope, 'privilege-bypassable');
+    assert.equal(state.admission.ptrace, 'privilege-bypassable');
+    assert.equal(admissionEstablished(state.admission), false, 'and the record says so as one predicate');
     assert.equal(state.evidenceTrust, 'best-effort');
   } finally {
     teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
@@ -571,7 +781,7 @@ test('best-effort proceeds and qualifies the evidence in all three places', asyn
   writeState(runDir, {
     nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
     projectRoot: makeTempDir(), failOnCommandFailure: 'true',
-    ptraceScope: 'privilege-bypassable', evidenceTrust: 'best-effort',
+    admission: admissionOf({ ptrace: 'privilege-bypassable' }), evidenceTrust: 'best-effort',
   });
   const printed = [];
   const code = await captureViaRun({
@@ -583,8 +793,7 @@ test('best-effort proceeds and qualifies the evidence in all three places', asyn
   assert.equal(code, 0);
   const digestIndex = printed.findIndex((text) => text.startsWith('evidence-sha256'));
   assert.ok(digestIndex > 0, 'the digest line was printed');
-  assert.match(printed[digestIndex - 1], /the in-process guarantees were NOT established/i,
-    'the qualification sits immediately before the digest it qualifies');
+  assertQualifiedDigest(printed, digestIndex);
   const report = JSON.parse(readFileSync(path.join(resolveEvidenceDir(runDir, 'n1'), 'report.json'), 'utf8'));
   assert.ok(report.caveats.some((caveat) => caveat.includes('privilege-bypassable')));
 });
@@ -596,7 +805,7 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
   writeState(outputDir, {
     nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
     projectRoot: makeTempDir(), failOnCommandFailure: 'true',
-    ptraceScope: 'permissive', evidenceTrust: 'best-effort',
+    admission: admissionOf({ ptrace: 'permissive' }), evidenceTrust: 'best-effort',
   });
   const printed = [];
   const code = await captureViaRun({
@@ -610,22 +819,26 @@ test('a renderer failure still gets the qualification: it belongs to the log, no
   assert.equal(existsSync(path.join(resolveEvidenceDir(outputDir, 'n1'), 'report.json')), false);
   const digestIndex = printed.findIndex((text) => text.startsWith('evidence-sha256'));
   assert.ok(digestIndex > 0, 'session.log still has a digest');
-  assert.match(printed[digestIndex - 1], /the in-process guarantees were NOT established/i);
+  assertQualifiedDigest(printed, digestIndex);
 });
 
 test('run stamps the rendered evidence with the platform caveat, and omits it only when the prerequisite is established', async () => {
   const served = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'served event' }];
-  for (const [policy, expectStamp] of [
-    ['unconditional', false],
-    ['privilege-bypassable', true],
-    ['permissive', true],
-    ['unknown', true],
-    [undefined, true],
+  for (const [label, record, expectStamp] of [
+    ['admitted', ADMITTED(), false],
+    ['ptrace bypassable', admissionOf({ ptrace: 'privilege-bypassable' }), true],
+    ['ptrace permissive', admissionOf({ ptrace: 'permissive' }), true],
+    ['ptrace unknown', admissionOf({ ptrace: 'unknown' }), true],
+    ['root', admissionOf({ uid: 'root' }), true],
+    ['passwordless sudo', admissionOf({ sudo: 'available' }), true],
+    ['CAP_BPF', admissionOf({ capabilities: 'CAP_BPF' }), true],
+    ['no record at all', undefined, true],
   ]) {
+    const policy = label;
     const outputDir = makeTempDir();
     writeState(outputDir, {
       nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43), sessionId: 'ci-debug-abc',
-      projectRoot: makeTempDir(), failOnCommandFailure: 'true', ptraceScope: policy,
+      projectRoot: makeTempDir(), failOnCommandFailure: 'true', admission: record,
     });
     const code = await captureViaRun({ outputDir, env: RUN_ENV, readLive: collectorAnswer(served) });
     assert.equal(code, 0, `${policy}: labeling is not refusing — the refusal already happened in start`);
@@ -639,8 +852,19 @@ test('run stamps the rendered evidence with the platform caveat, and omits it on
       expectStamp,
       `${policy}: json stamp`,
     );
-    // An absent record labels as unknown rather than being silently trusted.
-    if (expectStamp) assert.ok(json.caveats[0].includes(`same-UID ptrace policy: ${policy ?? 'unknown'}`));
+    // The caveat names the condition that actually blocked, so a reader can
+    // tell "this host permits ptrace" from "this host handed the job root".
+    if (expectStamp) {
+      const blockers = record?.blockers ?? ['no usable admission record'];
+      for (const blocker of blockers) {
+        assert.ok(json.caveats[0].includes(blocker), `${label}: the caveat names ${blocker}`);
+      }
+      // And the limit of the check travels with it, on every surface.
+      assert.ok(json.caveats.some((caveat) => /not a proof that no route exists/i.test(caveat)),
+        `${label}: json states what the check does not prove`);
+      assert.match(markdown, /> \*\*Caveat:\*\*[^\n]*not a proof that no route exists/i,
+        `${label}: and so does the markdown`);
+    }
   }
 });
 
@@ -676,7 +900,7 @@ test('a shim that never reports startup times out AND is killed, not left runnin
   const silent = fakeChild();
   await assert.rejects(
     () => startSubcommand({
-      readPtrace: ESTABLISHED,
+      probeAdmission: ADMITTED,
       inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
       spawnShim: () => silent, readyTimeoutMs: 200,
     }),
@@ -689,7 +913,7 @@ test('start surfaces the shim error line: a structured stderr reason reaches the
   const outputDir = makeTempDir();
   const child = fakeChild();
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child, readyTimeoutMs: 5_000,
   });
@@ -707,7 +931,7 @@ test('a spawn failure rejects instead of escaping as an uncaught error event', a
   const outputDir = makeTempDir();
   const child = fakeChild();
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child, readyTimeoutMs: 5_000,
   });
@@ -724,7 +948,7 @@ test('start kills the collector when its state cannot be recorded, leaving no un
   const child = fakeChild();
   const killed = [];
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -749,7 +973,7 @@ test('a healthy start records state first, then RELEASES the shim pipes instead 
     child[name].unref = () => released.push(`${name}:unref`);
   }
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -827,7 +1051,7 @@ test('start refuses an output-dir that only lands inside the workspace once syml
     'lexically this path is outside the workspace — only realpath can tell');
   await assert.rejects(
     () => startSubcommand({
-      readPtrace: ESTABLISHED,
+      probeAdmission: ADMITTED,
       inputs: baseInputs(), outputDir: link, projectRoot: makeTempDir(),
       env: { GITHUB_WORKSPACE: workspace }, spawnShim,
     }),
@@ -842,7 +1066,7 @@ test('start refuses an output-dir that only lands inside the workspace once syml
   assert.deepEqual(validateActionInputs({ ...baseInputs(), outputDir: nested, workspace: workspaceLink }), []);
   await assert.rejects(
     () => startSubcommand({
-      readPtrace: ESTABLISHED,
+      probeAdmission: ADMITTED,
       inputs: baseInputs(), outputDir: nested, projectRoot: makeTempDir(),
       env: { GITHUB_WORKSPACE: workspaceLink }, spawnShim,
     }),
@@ -864,7 +1088,7 @@ test('the shim splits redact-names on whitespace as well as commas, so "A B,C" i
     CHARLIE_VALUE: 'charlie3333cccc',
   };
   const code = await startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ port: String(port), redactNames: 'ALPHA_VALUE BRAVO_VALUE,CHARLIE_VALUE' }),
     outputDir,
     projectRoot,
@@ -913,7 +1137,7 @@ const startReal = async (overrides = {}) => {
   // shortcut through state or the filesystem.
   const startOutput = path.join(outputDir, 'start_output');
   writeFileSync(startOutput, '');
-  const code = await startSubcommand({ readPtrace: ESTABLISHED, inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
+  const code = await startSubcommand({ probeAdmission: ADMITTED, inputs, outputDir, projectRoot, env: { GITHUB_OUTPUT: startOutput } });
   assert.equal(code, 0);
   const emitted = readFileSync(startOutput, 'utf8');
   const keyLine = emitted.split('\n').find((line) => line.startsWith('collector-verify-key='));
@@ -1047,7 +1271,7 @@ test('a session-mint failure kills the collector in start, so nothing is left ho
   const killed = [];
   let requests = 0;
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -1073,7 +1297,7 @@ test('start challenges the port occupant before the launch token is ever put on 
   const killed = [];
   let requests = 0;
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
     spawnShim: () => child,
     probeReady: async () => ({ project_hash: 'hash', ready: true }),
@@ -1143,7 +1367,7 @@ test('start masks each token the moment it exists and in the order it is used, b
   // through wide open (Codex T4 #1).
   const ledger = [];
   const starting = startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' }),
     outputDir,
     projectRoot: makeTempDir(),
@@ -1186,7 +1410,7 @@ test('run re-registers the session token with the runner before handing it to a 
   const outputDir = makeTempDir();
   const sessionToken = 'z'.repeat(43);
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', admission: ADMITTED(),
     sessionId: 'ci-debug-abc', sessionToken,
     hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
   });
@@ -2699,7 +2923,7 @@ test('render and digest never re-read the staged path: the payload is one immuta
   ];
   const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', admission: ADMITTED(),
     sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
     hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo',
     commandExitCode: 0, failOnCommandFailure: 'true',
@@ -2781,7 +3005,7 @@ test('the digests are computed from the payload, not from the sink: a lossy writ
   const lines = [{ ts: '2026-08-14T00:00:00.000Z', msg: 'the bytes this run captured' }];
   const captured = lines.map((line) => `${JSON.stringify(line)}\n`).join('');
   writeState(outputDir, {
-    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', ptraceScope: 'unconditional',
+    nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug', admission: ADMITTED(),
     sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), projectRoot,
     commandExitCode: 0, failOnCommandFailure: 'true',
   });
@@ -3242,7 +3466,7 @@ test('the boot handshake and the state file carry no private key material', asyn
   const startOutput = path.join(outputDir, 'start_output');
   writeFileSync(startOutput, '');
   const code = await startSubcommand({
-    readPtrace: ESTABLISHED,
+    probeAdmission: ADMITTED,
     inputs: baseInputs({ port: String(port) }),
     outputDir,
     projectRoot,
@@ -3771,6 +3995,36 @@ const parseActionYml = () => {
 // stripper is exactly what Codex's third mutation walked straight through.
 const ACTION_YML_CODE = () => ACTION_YML().split(/\r?\n/).map(stripYamlComment).join('\n');
 
+// The input/output `description:` text, flowed — the copy GitHub renders in the
+// marketplace and in a consumer's editor, which is where most callers meet this
+// action's claims and where `parseActionYml` deliberately drops the folded
+// continuations. Comments cannot appear inside a block scalar, so the lines are
+// taken as written.
+const actionDescriptionText = () => {
+  const collected = [];
+  let section = null;
+  let capturing = false;
+  for (const raw of ACTION_YML().split(/\r?\n/)) {
+    const text = raw.replace(/\s+$/, '');
+    if (text.trim() === '') continue;
+    const indent = text.length - text.trimStart().length;
+    if (indent === 0) {
+      section = { 'inputs:': 'inputs', 'outputs:': 'outputs' }[text.trim()] ?? null;
+      capturing = false;
+      continue;
+    }
+    if (section === null) continue;
+    if (indent <= 4) capturing = false;
+    if (indent === 4 && /^description:/.test(text.trim())) {
+      capturing = true;
+      collected.push(text.trim().replace(/^description:\s*/, '').replace(/^["'>|-]+\s*/, ''));
+      continue;
+    }
+    if (capturing && indent >= 6) collected.push(text.trim());
+  }
+  return collected.join(' ');
+};
+
 const actionStepsByName = () => Object.fromEntries(parseActionYml().steps.map((step) => [step.name, step]));
 
 test('action.yml declares a composite action with exactly these inputs and defaults', () => {
@@ -4081,7 +4335,7 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     },
     {
       what: 'that the action refuses rather than merely labels',
-      required: /refuses to run the wrapped command at all unless the\s+policy is positively established/i,
+      required: /refuses to run the wrapped command at all unless the\s+prerequisite is positively established/i,
       forbidden: /proceeds anyway and labels the evidence(?! instead)/i,
     },
     {
@@ -4107,6 +4361,7 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     },
     {
       what: 'that the digest authenticates only on the strict path',
+      where: ['action.yml input/output descriptions'],
       required: /that log line is the authenticated copy only after a\s+successful strict admission/i,
       forbidden: /the authoritative copy is that log line/i,
     },
@@ -4125,16 +4380,77 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       required: /that claim is about those values and nothing else/i,
       forbidden: /view of the world the command (?:it runs )?cannot influence/i,
     },
+    // Mode 3 is NECESSARY, NOT SUFFICIENT (the r8 Critical). It blocks ptrace;
+    // it does not block a principal that can reach root from rewriting another
+    // task's memory with a privileged BPF program or a kernel module. Two
+    // rounds of text were written as if mode 3 settled the question, so the
+    // correction is pinned on both sides.
+    {
+      what: 'that Yama mode 3 is necessary and not sufficient',
+      where: ['action.yml comments', 'support.js comments'],
+      required: /mode 3 is necessary,? (?:but )?not sufficient/i,
+      forbidden: /mode 3 (?:alone )?is (?:enough|sufficient)|ptrace_scope 3 is all (?:that is |it )?(?:required|needed)/i,
+    },
+    {
+      what: 'the non-ptrace route root opens',
+      where: ['action.yml comments', 'support.js comments'],
+      required: /bpf_probe_write_user/i,
+      forbidden: /ptrace is the only (?:way|route|mechanism)/i,
+    },
+    // The routes CHECKED, never a proof that none exists (r8 #2). This is the
+    // same overclaim shape as rounds 4-7 — a partial control described as a
+    // total one — and it is stated on every surface a consumer reads.
+    {
+      what: 'that the check names its own limits',
+      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+      required: /(?:these are )?the escalation routes (?:this action|it) checks, not a proof that no route exists/i,
+      forbidden: /(?:proves|proved|establishes|confirms|guarantees|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
+    },
+    // Hosted execution stays best-effort, and the round-7 sysctl route is
+    // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF
+    // route, so hardening that way would have demonstrated a FALSE guarantee.
+    // The forbidden half is the exact sentence round 7 asked for.
+    {
+      what: 'that hosted execution stays best-effort',
+      where: ['action.yml comments', 'action.yml input/output descriptions'],
+      required: /hosted execution (?:therefore )?(?:stays|remains) best-effort/i,
+      forbidden: /strict is still reachable|harden the runner first|sysctl -w kernel\.yama\.ptrace_scope=3[^.]*(?:strict|reachable)/i,
+    },
   ];
-  // Flowed over the WHOLE file, not just its comments: several of these claims
-  // are made in input/output `description:` blocks, which are the copy a
-  // consumer reads without opening the file. A reversal there counts.
-  const documentation = ACTION_YML().split(/\r?\n/)
-    .map((line) => line.trim().replace(/^#\s?/, ''))
+  // SURFACES, asserted separately (Codex T6 r8 #4). The round-7 version flowed
+  // the whole action file into ONE haystack and never looked at support.js at
+  // all — so a claim could vanish from the `description:` a consumer reads
+  // while a duplicate comment elsewhere in the file kept the assertion green,
+  // and the report that said it protected both files was simply wrong.
+  //
+  // Three surfaces, because they have three different audiences: the comments
+  // are read by whoever edits the wiring, the descriptions are the copy GitHub
+  // renders to a consumer who never opens the file, and support.js is where
+  // the behaviour actually lives.
+  const flow = (text, prefix) => text.split(/\r?\n/)
+    .filter((line) => line.trim().startsWith(prefix))
+    .map((line) => line.trim().slice(prefix.length).trim())
     .join(' ');
+  const surfaces = {
+    'action.yml comments': flow(ACTION_YML(), '#'),
+    'action.yml input/output descriptions': actionDescriptionText(),
+    'support.js comments': flow(readFileSync(path.join(__dirname, 'support.js'), 'utf8'), '//'),
+  };
+  for (const [name, text] of Object.entries(surfaces)) {
+    assert.ok(text.length > 400, `${name}: the surface extractor found nothing to check`);
+  }
   for (const claim of platformClaims) {
-    assert.match(documentation, claim.required, `action.yml must state ${claim.what}`);
-    assert.doesNotMatch(documentation, claim.forbidden, `action.yml must not reverse ${claim.what}`);
+    // A claim states which surfaces MUST carry it — and must carry it in each
+    // of them independently.
+    for (const where of claim.where ?? ['action.yml comments']) {
+      assert.match(surfaces[where], claim.required, `${where} must state ${claim.what}`);
+    }
+    // Its reversal is forbidden EVERYWHERE. A claim that is only required of
+    // one surface can still be contradicted on another, and a contradiction
+    // anywhere in the shipped text is the failure this pins.
+    for (const [name, text] of Object.entries(surfaces)) {
+      assert.doesNotMatch(text, claim.forbidden, `${name} must not reverse ${claim.what}`);
+    }
   }
 });
 

@@ -83,15 +83,161 @@ const readPtraceScope = ({ platform = process.platform, readFile = readFileSync 
   return PTRACE_MODES.get(text) ?? 'unknown';
 };
 
-// The prerequisite is met at exactly one value. Written once, used everywhere,
-// so no caller can drift into treating a bypassable mode as a boundary.
-const ptraceBoundaryEstablished = (ptraceScope) => ptraceScope === 'unconditional';
+// AND MODE 3 IS NOT SUFFICIENT EITHER (Codex T6 r8, Critical — this reverses
+// the hardening advice round 7 shipped). Yama governs `ptrace`, and nothing
+// else. A principal that can reach ROOT does not need ptrace at all: it can
+// load a privileged tracing BPF program and overwrite another task's userspace
+// memory with `bpf_probe_write_user()`, or insert a kernel module, or read
+// /proc/<pid>/mem directly. So mode 3 is necessary, not sufficient, and the
+// round-7 advice — set ptrace_scope 3 with sudo and strict becomes reachable
+// — was FALSE: the same passwordless sudo that sets the sysctl opens the BPF
+// route. Hosted execution therefore stays best-effort.
+//
+// Strict admission is consequently a CONJUNCTION of four readings, all of
+// which must be positively clear:
+//
+//   1. Yama ptrace_scope 3            (classic attachment forbidden)
+//   2. effective uid != 0             (not already root)
+//   3. passwordless sudo unavailable  (no trivial route to root)
+//   4. no dangerous capability held   (no route already granted)
+//
+// These are the escalation routes this action checks, not a proof that no
+// route exists. A setuid binary on PATH, a mounted container socket, a
+// writable privileged service or an unpatched local kernel bug grants the same
+// power and none of them is visible from here. What the conjunction buys is
+// that the OBSERVABLE routes are closed; what it cannot buy is a guarantee,
+// which is why the wording on every surface says "checked" and never "proved".
+const PROC_SELF_STATUS_PATH = '/proc/self/status';
+
+// Bit positions from the kernel's capability.h. CAP_BPF is 39 — above bit 32,
+// which is why the masks here are BigInt: a Number bitwise op truncates to 32
+// bits and would silently read CAP_BPF as absent, i.e. would miss precisely the
+// capability this round is about.
+const DANGEROUS_CAPABILITIES = new Map([
+  ['CAP_SYS_MODULE', 16n],
+  ['CAP_SYS_PTRACE', 19n],
+  ['CAP_SYS_ADMIN', 21n],
+  ['CAP_BPF', 39n],
+]);
+const DANGEROUS_CAPABILITY_MASK = [...DANGEROUS_CAPABILITIES.values()]
+  .reduce((mask, bit) => mask | (1n << bit), 0n);
+// PERMITTED as well as EFFECTIVE: a permitted-but-not-effective capability is
+// one `capset` away from being effective, so treating it as absent would be
+// reading a loaded gun as unloaded.
+const CAPABILITY_FIELDS = ['CapPrm', 'CapEff'];
+
+const readEffectiveUid = ({ getuid = process.geteuid } = {}) => {
+  // Absent on Windows, and absent is not "safe": it means this code cannot
+  // tell, which denies.
+  if (typeof getuid !== 'function') return 'unknown';
+  let uid;
+  try {
+    uid = getuid.call(process);
+  } catch {
+    return 'unknown';
+  }
+  if (!Number.isInteger(uid) || uid < 0) return 'unknown';
+  return uid === 0 ? 'root' : 'non-root';
+};
+
+// Only these say "the request was DENIED". Everything else — including a
+// missing sudo binary, which reads as reassuring and proves nothing about what
+// is installed elsewhere on PATH — is read as available.
+const SUDO_DENIED = /a password is required|not in the sudoers file|no passwd entry|is not allowed to (?:run|execute)|may not run/i;
+const defaultSudoProbe = () => spawnSync('sudo', ['-n', 'true'], {
+  encoding: 'utf8',
+  timeout: 5_000,
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+const probePasswordlessSudo = ({ run = defaultSudoProbe } = {}) => {
+  let result;
+  try {
+    result = run();
+  } catch {
+    return 'available';
+  }
+  if (result === null || typeof result !== 'object') return 'available';
+  // spawnSync reports ENOENT, ETIMEDOUT and friends HERE rather than throwing,
+  // and a probe that did not complete has answered nothing — whatever it
+  // managed to print before it died.
+  if (result.error) return 'available';
+  if (!Number.isInteger(result.status)) return 'available';
+  if (result.status === 0) return 'available';
+  return SUDO_DENIED.test(String(result.stderr ?? '')) ? 'unavailable' : 'available';
+};
+
+const readOwnCapabilities = ({ platform = process.platform, readFile = readFileSync } = {}) => {
+  if (platform !== 'linux') return 'unknown';
+  let raw;
+  try {
+    raw = readFile(PROC_SELF_STATUS_PATH, 'utf8');
+  } catch {
+    return 'unknown';
+  }
+  const text = String(raw);
+  const held = [];
+  for (const field of CAPABILITY_FIELDS) {
+    const match = new RegExp(`^${field}:\\s*([0-9a-fA-F]+)\\s*$`, 'm').exec(text);
+    // A field this code could not find or could not parse is a reading it does
+    // not have, never a zero.
+    if (match === null) return 'unknown';
+    let bits;
+    try {
+      bits = BigInt(`0x${match[1]}`);
+    } catch {
+      return 'unknown';
+    }
+    for (const [name, bit] of DANGEROUS_CAPABILITIES) {
+      if ((bits & (1n << bit)) !== 0n && !held.includes(name)) held.push(name);
+    }
+  }
+  return held.length === 0 ? 'clear' : held.join('+');
+};
+
+// ONE evaluator, ONE predicate, and every consumer reads them rather than
+// re-deriving the rule (the discipline that fixed the mode lookup in r7). The
+// blockers list is both the gate's answer and the caveat's wording, so a host
+// cannot be refused for one reason and labeled with another.
+const evaluateAdmission = ({
+  readPtrace = readPtraceScope,
+  readEuid = readEffectiveUid,
+  probeSudo = probePasswordlessSudo,
+  readCapabilities = readOwnCapabilities,
+} = {}) => {
+  const ptrace = readPtrace();
+  const uid = readEuid();
+  const sudo = probeSudo();
+  const capabilities = readCapabilities();
+  const blockers = [];
+  if (ptrace !== 'unconditional') blockers.push(`same-UID ptrace policy: ${ptrace}`);
+  if (uid !== 'non-root') blockers.push(`effective uid: ${uid}`);
+  if (sudo !== 'unavailable') blockers.push(`passwordless sudo: ${sudo}`);
+  if (capabilities !== 'clear') blockers.push(`privileged capabilities: ${capabilities}`);
+  return { ptrace, uid, sudo, capabilities, blockers };
+};
+
+// Established means: a record this code recognises, listing NO blockers.
+// Written defensively because the record makes a round trip through the state
+// file, and a value that cannot be recognised must deny rather than pass.
+const admissionEstablished = (admission) => Array.isArray(admission?.blockers)
+  && admission.blockers.length === 0;
+
+const describeAdmission = (admission) => (
+  Array.isArray(admission?.blockers) && admission.blockers.length > 0
+    ? admission.blockers.join('; ')
+    : 'no usable admission record'
+);
 
 // The qualification, in the words used on all three surfaces. Empty when the
-// prerequisite holds, so an ordinary report is unchanged.
-const platformCaveats = (ptraceScope) => (ptraceBoundaryEstablished(ptraceScope) ? [] : [
-  `The in-process guarantees were NOT established on this host (same-UID ptrace policy: ${ptraceScope ?? 'unknown'}).`
+// prerequisite holds, so an ordinary report is unchanged. Two entries, because
+// two different things have to be said: what was not established, and what the
+// check that decided it does not cover.
+const platformCaveats = (admission) => (admissionEstablished(admission) ? [] : [
+  `The in-process guarantees were NOT established on this host (${describeAdmission(admission)}).`
   + ' A same-user process may be able to attach to the collector or to the capturing step and read or alter the memory this evidence depends on.',
+  'These are the escalation routes this action CHECKS'
+  + ' — Yama ptrace mode, effective uid, passwordless sudo, and its own permitted/effective capabilities —'
+  + ' not a proof that no route exists: a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved.',
 ]);
 
 // PATH SAFETY, not entropy. The invocation nonce is a directory-name segment
@@ -559,11 +705,11 @@ const startSubcommand = async ({
   request = httpRequestJson, probeToken = probeLaunchToken,
   writeStdout = defaultStdoutWrite,
   nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
-  // A SEAM, not a default value: evaluating `readPtraceScope()` as a default
+  // A SEAM, not a default value: evaluating `evaluateAdmission()` as a default
   // parameter would run it before this function's body, and therefore before
   // the identity outputs below — contradicting the "first act" invariant those
   // outputs are pinned by (Codex T6 r6, ordering).
-  readPtrace = readPtraceScope,
+  probeAdmission = evaluateAdmission,
 }) => {
   // THE FIRST THING THIS PROCESS DOES, ahead of validation and ahead of any
   // filesystem work: publish this invocation's identity as a STEP OUTPUT.
@@ -609,8 +755,8 @@ const startSubcommand = async ({
   // would be defense in depth at best, never a fix, because a privileged actor
   // can change modes 0-2 at runtime, including after any check this code makes
   // (Codex T6 r6, ruling (c)). What the value is NOT is immutable.
-  const ptraceScope = readPtrace();
-  if (!ptraceBoundaryEstablished(ptraceScope)) {
+  const admission = probeAdmission();
+  if (!admissionEstablished(admission)) {
     // THE REFUSAL, and it happens here because here is the last moment that is
     // still before the wrapped command exists (Codex T6 r6).
     //
@@ -624,7 +770,7 @@ const startSubcommand = async ({
     // The diagnostic has to leave the caller somewhere to go, so it names what
     // was found, why that is not a boundary, and both ways forward.
     if (inputs.evidenceTrust !== 'best-effort') {
-      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}). Only Linux Yama ptrace_scope 3 forbids same-UID attachment unconditionally — modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and GitHub-hosted runners grant workflow commands passwordless sudo, so a hostile command can elevate and attach to the collector or to the capturing step. Either run on a host with ptrace_scope 3, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
+      process.stderr.write(`debug-evidence-action: start: refusing to run the wrapped command: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}). Strict admission requires ALL of: Linux Yama ptrace_scope 3, a non-root effective uid, no passwordless sudo, and none of CAP_SYS_ADMIN/CAP_BPF/CAP_SYS_PTRACE/CAP_SYS_MODULE in this process's own permitted or effective set. Mode 3 is necessary, not sufficient: it forbids classic same-UID ptrace attachment, but a command that can reach root rewrites another task's memory with a privileged BPF program (bpf_probe_write_user) or a kernel module without calling ptrace at all — and standard GitHub-hosted runners grant workflow commands passwordless sudo, so hosted execution stays best-effort. These are the escalation routes this action checks, not a proof that no route exists: a setuid binary, a mounted container socket, or a writable privileged service grants the same power unobserved. Either run where the wrapped principal has no route to root, or set 'evidence-trust: best-effort' to accept clearly labeled best-effort evidence.\n`);
       return 3;
     }
     // Opted in. This copy of the qualification is the only one the wrapped
@@ -634,7 +780,7 @@ const startSubcommand = async ({
     // capture which follows is tamper-resistant. The other two copies (run's
     // pre-digest line and the report caveat) are written after the command has
     // run, by a process it may have been able to rewrite.
-    process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (detected policy: ${ptraceScope}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step, so the capture below cannot be treated as tamper-resistant. This line is written before the wrapped command runs and cannot be retracted by it.\n`);
+    process.stderr.write(`debug-evidence-action: start: BEST-EFFORT EVIDENCE: this host does not establish the in-process boundary this action's evidence depends on (${describeAdmission(admission)}), and 'evidence-trust: best-effort' was set. A same-user process may be able to attach to the collector or to the capturing step — or, where it can reach root, to rewrite their memory without ptrace at all — so the capture below cannot be treated as tamper-resistant. Those are the escalation routes this action checks, not a proof that no route exists. This line is written before the wrapped command runs and cannot be retracted by it.\n`);
   }
   // Containment layer 2 (Codex T3 #3): the check above compares the paths as
   // WRITTEN, so an output-dir that merely RESOLVES into the workspace — a
@@ -769,7 +915,7 @@ const startSubcommand = async ({
       // label belongs on the evidence, and only this step is in a position to
       // have looked before the wrapped command existed. Reaching this line
       // with anything but `unconditional` means the caller opted in.
-      ptraceScope,
+      admission,
       evidenceTrust: inputs.evidenceTrust,
     }));
   } catch (error) {
@@ -1427,7 +1573,7 @@ const runSubcommand = async ({
       // to know the in-process guarantees were not established. An absent
       // record labels as `unknown`, never as met.
       rendered = renderReport(payloads['session.log'], state.sessionId, {
-        caveats: platformCaveats(state.ptraceScope),
+        caveats: platformCaveats(state.admission),
       });
     } catch (error) {
       process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
@@ -1468,7 +1614,7 @@ const runSubcommand = async ({
   // establishes is that best-effort was consciously selected. This one and the
   // report caveat are both written after the command ran, by a process it may
   // have been able to rewrite, so it could suppress either.
-  for (const caveat of platformCaveats(state.ptraceScope)) writeStdout(`evidence-qualification ${caveat}\n`);
+  for (const caveat of platformCaveats(state.admission)) writeStdout(`evidence-qualification ${caveat}\n`);
   if (digestLine !== null) writeStdout(`${digestLine}\n`);
   // Ownership check and commit as ONE indivisible step. The snapshot in
   // `state` was read before a wrapped command that may have run for an hour,
@@ -1685,29 +1831,36 @@ const finishSubcommand = ({ outputDir, env = process.env }) => {
 // here to redact out of a terminal diagnostic.
 const collectStateSecrets = (state) => [state?.sessionToken].filter(Boolean);
 
+// The env -> inputs mapping, lifted out of main so a test can assert what an
+// ABSENT input defaults to without asking this machine what its ptrace policy
+// is (Codex T6 r8 #3). The old test inferred the default from a refusal, which
+// made it a statement about the host as much as about the default — and would
+// have failed on exactly the hardened runner strict mode exists for.
+const actionInputsFromEnv = (env) => ({
+  runCommand: env.DEBUG_ACTION_RUN || '',
+  sessionName: env.DEBUG_ACTION_SESSION_NAME || 'ci-debug',
+  workingDirectory: env.DEBUG_ACTION_WORKDIR || '.',
+  failOnCommandFailure: env.DEBUG_ACTION_FAIL_ON_COMMAND_FAILURE || 'true',
+  port: env.DEBUG_ACTION_PORT || '8787',
+  redactNames: env.DEBUG_ACTION_REDACT_NAMES || '',
+  maxEvents: env.DEBUG_ACTION_MAX_EVENTS_INPUT || '',
+  maxBytes: env.DEBUG_ACTION_MAX_BYTES_INPUT || '',
+  hypothesisId: env.DEBUG_ACTION_HYPOTHESIS_ID || '',
+  hypothesisTitle: env.DEBUG_ACTION_HYPOTHESIS_TITLE || '',
+  // Defaulted BY ABSENCE to the safe literal: an unset variable means the
+  // caller has not opted out of anything. An explicitly EMPTY one is a
+  // different thing entirely — a value the contract does not recognise — and
+  // '??' lets it through to validateActionInputs, which says so. '||' rounded
+  // it up to 'strict' and quietly broke that promise (Codex T6 r7 #3).
+  evidenceTrust: env.DEBUG_ACTION_EVIDENCE_TRUST ?? 'strict',
+});
+
 const main = async () => {
   const [subcommand] = process.argv.slice(2);
   const env = process.env;
   const outputDir = env.DEBUG_ACTION_OUTPUT_DIR
     || path.join(env.RUNNER_TEMP || os.tmpdir(), 'debug-evidence');
-  const inputs = {
-    runCommand: env.DEBUG_ACTION_RUN || '',
-    sessionName: env.DEBUG_ACTION_SESSION_NAME || 'ci-debug',
-    workingDirectory: env.DEBUG_ACTION_WORKDIR || '.',
-    failOnCommandFailure: env.DEBUG_ACTION_FAIL_ON_COMMAND_FAILURE || 'true',
-    port: env.DEBUG_ACTION_PORT || '8787',
-    redactNames: env.DEBUG_ACTION_REDACT_NAMES || '',
-    maxEvents: env.DEBUG_ACTION_MAX_EVENTS_INPUT || '',
-    maxBytes: env.DEBUG_ACTION_MAX_BYTES_INPUT || '',
-    hypothesisId: env.DEBUG_ACTION_HYPOTHESIS_ID || '',
-    hypothesisTitle: env.DEBUG_ACTION_HYPOTHESIS_TITLE || '',
-    // Defaulted BY ABSENCE to the safe literal: an unset variable means the
-    // caller has not opted out of anything. An explicitly EMPTY one is a
-    // different thing entirely — a value the contract does not recognise — and
-    // '??' lets it through to validateActionInputs, which says so. '||' rounded
-    // it up to 'strict' and quietly broke that promise (Codex T6 r7 #3).
-    evidenceTrust: env.DEBUG_ACTION_EVIDENCE_TRUST ?? 'strict',
-  };
+  const inputs = actionInputsFromEnv(env);
   try {
     if (subcommand === 'start') {
       process.exitCode = await startSubcommand({ inputs, outputDir, env, projectRoot: env.GITHUB_WORKSPACE || process.cwd() });
@@ -1732,12 +1885,18 @@ const main = async () => {
 if (require.main === module) void main();
 
 module.exports = {
+  actionInputsFromEnv,
+  admissionEstablished,
   defaultRenderReport,
   defaultSpawnCommand,
   defaultSpawnShim,
   finishSubcommand,
   httpRequestJson,
+  evaluateAdmission,
   maskValue,
+  probePasswordlessSudo,
+  readEffectiveUid,
+  readOwnCapabilities,
   readPtraceScope,
   readShimStartLine,
   readState,
