@@ -3239,6 +3239,49 @@ producer-derived findings are bounded**. Important ×1, Minor ×1.
 Fix commit message:
 `fix(action): bound the sudo reading to fixed-size single-line metadata (Codex T6 r13)`.
 
+#### Task 6 fix round 14 — coordinator decision on the round-13 residual (recorded before code moves)
+
+Raised by the implementer at the end of round 13 and adopted: **three of the four
+readings were bounded by luck of construction, not by design.** The anchored
+vocabularies enforce the shape of the readings that exist today, but nothing in
+the code states the invariant — a fifth reading could be added tomorrow with an
+unbounded value AND a matching unbounded vocabulary, and the field sweep would
+only catch it if someone remembered to extend the loop. That is an ENUMERATED
+defence against a class this cycle has now hit twice (round 11's `unknown` reason,
+round 13's `present:` value). Make it STRUCTURAL:
+
+1. **Every reading passes through one validator before its vocabulary is
+   consulted.** A reading must be a string, ≤ 128 characters, and contain NO
+   control characters at all — not merely no `\r`/`\n`, since NUL and escape
+   sequences also corrupt logs, terminals and the rendered record. Today's
+   maxima are ptrace 21, uid 8, sudo 85, capabilities 51, so 128 is generous
+   headroom while still making an interpolated path impossible.
+2. **A rejected reading becomes `unknown` and DENIES**, and is recorded as a
+   distinct blocker naming the field — so an operator can tell "this host failed
+   the check" from "our own reading was malformed", which are different problems
+   with different fixes. It must never throw.
+3. **The validator is the gate, not a lint:** the vocabulary check runs only on
+   values that already passed it, so a future unbounded vocabulary cannot
+   reintroduce the class on its own.
+4. **Tests:** a synthetic fifth reading carrying 9000 producer bytes, one with an
+   embedded newline, one with a NUL, and one non-string — each must deny, name
+   its field, and never reach the vocabulary. Mutation: remove the validator ⇒
+   the synthetic-reading tests go red, proving the guard rather than the
+   enumerated vocabularies is what stops the class.
+
+Also recorded from round 13, not implemented: the `present: <count>` cardinality
+is producer-derived and decision-irrelevant (one sudo is enough to deny). KEPT —
+it makes the digest interpretable and the vocabulary is Codex-specified; the leak
+is a small integer, bounded by construction.
+
+**Task 8 hard requirement #7** *(from round 13)*: document the EXACT digest
+recipe — sort the matched candidates, join with NUL, SHA-256, lower hex, and the
+candidate spelling this action derives (trailing slashes stripped, `<dir>/sudo`).
+Without the recipe the digest is a number nobody can check.
+
+Fix commit message:
+`fix(action): validate every admission reading structurally, not by enumeration (round-13 residual)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
