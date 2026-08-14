@@ -253,18 +253,31 @@ the trust anchor. Output existence likewise does not imply authenticity — a re
 
 ## Security invariants
 
-**Platform prerequisite (added, Task 6 round 5).** Every in-process guarantee
-below — the trusted `run` process, the memory-held verification key, the
-collector's private key — assumes the host RESTRICTS same-UID `ptrace`
-attachment (Linux Yama `ptrace_scope >= 1`, the default on GitHub-hosted
-runners). On a host permitting classic same-UID attachment (`ptrace_scope = 0`,
-or a container granted `CAP_SYS_PTRACE`), a hostile native wrapped command can
-attach to the `run` process or to the collector — whose pid is recorded in state
-— and inject code or read signing state, defeating authenticated evidence
-outright. Neither process is made non-dumpable. The action DETECTS the policy and
-labels the evidence when the prerequisite is not met (see invariant 11); it does
-not create the boundary. Self-hosted configurations permitting same-UID
-attachment are OUTSIDE the supported threat model.
+**Platform prerequisite (added, Task 6 round 5; CORRECTED, round 6 — the earlier
+`ptrace_scope >= 1` wording was wrong).** Every in-process guarantee below — the
+trusted `run` process, the memory-held verification key, the collector's private
+key — assumes the wrapped command CANNOT attach to another same-user process.
+That is positively established only when:
+
+- Linux Yama `ptrace_scope = 3` (attachment forbidden unconditionally, and the
+  mode cannot be lowered again at runtime); or
+- real process/user isolation between the trusted processes and the wrapped
+  command.
+
+`ptrace_scope` 1 or 2 is NOT sufficient: both are bypassable by
+`CAP_SYS_PTRACE`, and **standard VM-based GitHub-hosted Linux runners grant
+workflow commands passwordless `sudo`** — so on the action's principal platform a
+hostile command can elevate, attach to `run` or to the collector (whose pid is
+recorded in state), and defeat authenticated evidence outright. Neither process
+is made non-dumpable, and no check of the current process's capabilities would
+help, because the escalation path is `sudo`, not an inherited capability.
+
+The action therefore treats the prerequisite as established ONLY for mode 3, and
+refuses to launch the wrapped command otherwise unless the caller explicitly
+selects best-effort operation (invariant 11). Post-command labeling alone is not
+a control: on a platform where the command can rewrite `run`, it can also remove
+the caveat — which is why the qualification is emitted BEFORE the command runs,
+into `start`'s step log, where it is immutable once streamed.
 
 1. Collector binds `127.0.0.1` only; no CI service container, no exposed port.
 2. *(Rewritten, Task 5 round 3.)* The launch token exists ONLY in the `start` step's

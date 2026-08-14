@@ -2798,6 +2798,80 @@ assertions instead). Important ×1, Minor ×1:
 Fix commit message:
 `fix(action): detect and label the ptrace prerequisite, scope the in-process boundary claims (Codex T6 r5)`.
 
+#### Task 6 fix round 6 — Codex re-review decisions (recorded before code moves)
+
+Codex on `cb4fa89`: the `collector_boot.js` inheritance wording is now accurate and
+the narrowed in-process prose is materially better — but **Critical ×1** plus two
+Minors, and the Critical invalidates last round's central assumption.
+
+1. **The detector marks the principal platform as protected when it is not
+   (CRITICAL).** Yama modes 1 and 2 are bypassable via `CAP_SYS_PTRACE`; only
+   mode 3 forbids attachment unconditionally. **Standard VM-based GitHub-hosted
+   Linux runners give workflow commands passwordless `sudo`.** So on the action's
+   principal platform a hostile wrapped command can elevate, attach to the
+   waiting `run` process or to the collector, and defeat the authentication
+   boundary — while the detector records `restricted` and emits no warning at all.
+   Codex: *this is the action's core authentication guarantee failing on its
+   principal platform.* Checking the current process's effective capabilities
+   would not help: the escalation path is `sudo`, not an inherited capability.
+   The classifier also contradicts its own test — `"4"` or `"999"` returns
+   `restricted`; unknown numeric values must stay `unknown`.
+2. **RULING — refuse, do not merely label.** Refuse BEFORE launching the wrapped
+   command whenever the prerequisite is not positively established — both
+   `permissive` AND `unknown`. An explicit opt-out may allow clearly labeled
+   best-effort evidence. The reasoning that settles it: *post-command labeling
+   cannot itself be trusted on a platform where that command can rewrite `run`* —
+   the adversary the caveat warns about can strip the caveat. My round-5
+   judgement (labeling is proportionate) was wrong for exactly that reason.
+
+**Decisions.**
+- **Honest classification.** `readPtraceScope` returns `unconditional` (mode 3
+  only), `privilege-bypassable` (1 or 2), `permissive` (0), or `unknown`
+  (anything else — non-numeric, out-of-range including `4`/`999`, unreadable,
+  non-Linux). The prerequisite is POSITIVELY ESTABLISHED only for
+  `unconditional`. No vocabulary anywhere may call 1 or 2 "restricted",
+  "protected" or "met".
+- **New input `evidence-trust`, default `strict`.** `strict`: when the
+  prerequisite is not positively established, `start` REFUSES before the wrapped
+  command runs (exit 3) with a diagnostic naming the detected policy, the reason
+  (modes 1/2 are bypassable and hosted runners grant passwordless `sudo`), and
+  the two ways forward. `best-effort`: proceed, and emit the qualification in
+  THREE places — (i) `start`'s step log BEFORE the command runs (the trustworthy
+  copy: immutable once streamed, and the command cannot retract it), (ii) `run`'s
+  own log immediately before its digest line (ruling (b): the qualification
+  belongs beside the authoritative trust-unit record, including renderer-failure
+  cases where only `session.log` is uploaded), and (iii) the report caveat as
+  today — documented as the strippable copy, useful for honest runs only.
+- **Consequence, stated plainly and put back to Codex for confirmation:**
+  default `strict` means the action REFUSES on a standard GitHub-hosted VM runner
+  (`ptrace_scope` 1 + passwordless `sudo`), which is the documented principal
+  platform. Every hosted-runner caller — including this repo's own Task 7 demo —
+  must set `evidence-trust: best-effort`. The coordinator follows Codex's ruling
+  because silent over-trust is a worse failure than a loud, documented refusal,
+  and a caller who sets `best-effort` has consciously accepted the model. Codex
+  is asked to confirm the default given that consequence.
+- **Ordering (Minor).** `readPtraceScope()` currently evaluates as a DEFAULT
+  PARAMETER, i.e. before the function body and therefore before the nonce and
+  evidence-directory outputs — contradicting `start`'s own "ahead of any
+  filesystem work" invariant and the tests that pin it. Move detection AFTER
+  publishing the two identity outputs, through an injected reader so the ordering
+  is testable.
+- **Ruling (c).** Re-reading in `run` is defense-in-depth only, never a fix, and
+  the comment claiming the policy "cannot change" is FALSE — a privileged actor
+  can change modes 0–2 at runtime, including after any pre-command re-read. Fix
+  that comment; do not add the re-read as a security measure.
+- **Ruling (a).** The `caveats` JSON field is acceptable as additive, provided
+  Task 8 documents it. **Added to the hard Task 8 requirements**, alongside the
+  separate-job limitation and the five-output availability disclosure: Task 8
+  must document `evidence-trust`, why `strict` refuses on hosted runners, and
+  what `best-effort` costs.
+- **Task 7 note:** the demo workflow must set `evidence-trust: best-effort` and
+  say why in a comment — the repo's own dogfood becomes the worked example of the
+  limitation.
+
+Fix commit message:
+`fix(action): refuse unless the ptrace boundary is positively established, honest mode classification (Codex T6 r6)`.
+
 ---
 
 ### Task 7: Demo repro, dogfood workflow, gate forwarder amendment
