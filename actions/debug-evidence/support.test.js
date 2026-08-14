@@ -5550,7 +5550,26 @@ const MINIMAL_WORKFLOW = [
 // definition at all. A reader whose stated doctrine is that an unrecognised
 // construct THROWS rather than being skipped has to apply that doctrine to
 // keys, not only to shapes.
-test('the workflow reader rejects documents GitHub would reject rather than storing them', () => {
+// SCOPE OF THIS CLAIM, narrowed deliberately after round 3 proved the broad
+// version unreachable. "Structural" means everything this reader can decide
+// from the SHAPE of the document: which keys exist, whether they are spelled
+// as GitHub spells them, whether they are unique, whether their values have
+// the right type, and whether an identifier matches GitHub's documented
+// pattern. Every such invalidity is closed and pinned below.
+//
+// What this reader does NOT decide is scalar CONTENT and cross-references,
+// and the list is stated rather than left to be discovered: `timeout-minutes:
+// abc`, `continue-on-error: maybe`, a malformed `if:` expression, `uses:
+// hello world`, `uses:` with no `@ref`, `shell: nosuchshell`, `needs:` naming
+// a job that does not exist, an unknown event under `on:`, a broken cron, an
+// unknown `permissions` scope. Deciding those means implementing GitHub's
+// expression language, ref grammar, event and permission vocabularies and a
+// cron parser — none of which is reachable while this repository ships zero
+// dependencies, and a half-implemented one would be worse than an honest
+// boundary. Several of them ARE separately pinned for the two workflows this
+// suite actually asserts over (the `uses:` pin check requires a 40-hex SHA);
+// they are unpinned only for arbitrary documents.
+test('the workflow reader rejects documents GitHub would reject on structural grounds rather than storing them', () => {
   // The positive control first: the base each mutation below starts from is
   // one this reader accepts, so every red below is caused by the mutation.
   assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW));
