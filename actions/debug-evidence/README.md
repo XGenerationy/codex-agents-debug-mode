@@ -250,6 +250,11 @@ four-way conjunction, and **every probe that cannot be evaluated denies**:
 | `sudo` binary | absent at `/usr/bin/sudo`, `/bin/sudo`, `/usr/local/bin/sudo` **and** at `<dir>/sudo` for every directory on the inherited `PATH` |
 | this process's own permitted/effective capabilities (`/proc/self/status`) | none of `CAP_SYS_ADMIN`, `CAP_BPF`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE` |
 
+Three of those four readings are Linux-only claims: off Linux, the ptrace, `sudo` and
+capability probes each return `unknown`, and `unknown` denies. **`strict` therefore
+refuses on every non-Linux runner** — macOS and Windows included — whatever else is true
+of the host.
+
 Every `sudo` candidate is `lstat`-ed and **never executed**: sudoers rules are
 command-specific, so probing one command could never establish the absence of a rule for
 another, and a `PATH`-planted fake could fabricate a denial that *granted* admission. The
@@ -550,10 +555,11 @@ permissions:
 That is exactly what this repository's demo workflow declares, and its dogfood job
 uploads the evidence artifact under those permissions.
 
-Two pinned third-party steps run inside the composite and talk to the runner's own
-services rather than to the API on your behalf: `actions/setup-node` may fetch a Node
-build if the requested version is not in the runner's tool cache, and
-`actions/upload-artifact` uploads through the runner's artifact service.
+Two pinned third-party steps run inside the composite — `actions/setup-node` and
+`actions/upload-artifact`. Neither is handed a `token:` input by this action, and neither
+is given anything beyond the `node-version` and the artifact name/paths. What they do
+otherwise is their own contract, not something this file can vouch for; both are pinned
+by SHA so it is at least a contract you can read.
 
 **Fork pull requests:** nothing in this action is token-gated, so a fork PR is not
 restricted by anything the action does. Whatever *your* workflow does with the evidence
