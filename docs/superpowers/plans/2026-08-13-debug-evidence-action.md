@@ -4074,6 +4074,20 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 fix round 2 (Codex review of `d495db2`: 2 Important, 2 Minor)
+
+**(1) IMPORTANT — the teardown contract contradicts itself on runner death.** `README.md:615` and `action.yml:406` say that case is covered by the `always()` teardown step. **It cannot be: if the runner process dies before that step, neither the step nor the runner's finalization cleanup executes** — `FinalizeJob` also requires a functioning runner process. Because the collector is detached and **its idle timeout never exits**, that failure can leave it listening indefinitely. The four-point contract's own bullet says cleanup is unavailable when the runner dies, and then the prose beside it says `always()` covers it. FIX, stated exactly: **the `always()` step covers preceding step failures WHILE THE RUNNER SURVIVES; normal runner finalization is a SEPARATE backstop; runner death can defeat BOTH.**
+
+**(2) IMPORTANT — the byte-level upload overclaim survives on a third surface, and in the test commentary.** The round-1 fix corrected the two README sites and the pin but **missed `action.yml:359`** ("no path here can reach" `action-state.json`) — whose *immediately following residual* admits unconditional symlink following. Direct counterexample: replace `session.log` with a symlink to `../action-state.json` and the enumerated path reaches the state bytes. **And `support.test.js:5161`'s assertion commentary repeats the overclaim while its assertions prove only LEXICAL NON-ENUMERATION.** FIX: use the README's now-correct wording — **"no enumerated path names it"** — on both. The two rewritten README statements themselves are confirmed correctly scoped.
+
+**(3) Minor — THE WIDENED FORBIDDEN HALVES NOW REJECT TRUTHFUL PROSE, exactly as warned.** The round-1 brief said a forbidden half that fires on legitimate prose is its own defect and that this cycle had already paid for over-tightening twice. It happened anyway. Four confirmed counterexamples, each verified to match its guard: `support.test.js:8834` rejects "**`report.md` is NOT verbatim**"; `:8884` rejects "the demo demonstrates that secrets can ever leak"; `:8920` rejects **any unrelated file** described as "not uploaded by this action"; `:8692` rejects **any unrelated rule** that "holds for every invocation." FIX: **bind each inverse to its SUBJECT and account for NEGATION.** A pin that forbids the true statement of its own claim is the mirror image of one that requires the false statement — and this task has now produced both.
+
+**(4) Minor — RULING ON THE MODE-1 ASSERTION: REMOVE IT.** `action.yml:215`, **`support.js:47`** (a third site round 1 did not name) and `support.test.js:5315` fossilize a moving image property the live job does not measure. **"Implementer-facing commentary is not exempt from factual drift."** KEEP the general fact that modes 1 and 2 are bypassable, and the independently documented passwordless-sudo fact — which is already sufficient for the hosted best-effort conclusion. REMOVE only the claim that current hosted images use mode 1, and its required pin.
+
+**CONFIRMED:** the `report-path` wording is now consistent with **no remaining surface promising unconditional absolute output**; the gate-2 procedure is workable for a complete rendered artifact and **fails closed when `report.json` is absent**.
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
