@@ -5772,7 +5772,25 @@ const assertWorkflowSchema = (document) => {
 // in a way GitHub would reject — can be pushed through the very same reader the
 // assertions below rely on. Reading only from disk left the reader's own
 // tolerances untestable.
-const parseWorkflowText = (text) => {
+//
+// SYNTAX AND SCHEMA ARE TWO QUESTIONS AND ARE NOW ASKED SEPARATELY (Codex T7
+// r9). This half answers only "is this YAML this reader can read, and what
+// document does it denote"; no key of GitHub's is consulted here. The half
+// below then asks "is that document a workflow GitHub would run". Fusing them
+// made every caller inherit the schema's verdict whether it wanted a workflow
+// or only a parse — and the round-trip property below was exactly the caller
+// that wanted only a parse. Reading each refusal as a false rejection, it would
+// have reported a future CORRECT schema rule (`on:` must name supported trigger
+// events) as a parser regression, and so PINNED the very gaps the property's
+// own claim states are deliberately not pinned.
+//
+// THE GENERAL RULE, third appearance in this task and each time one level up:
+// AN ASSERTION THAT SOMETHING IS ACCEPTED IS A REQUIREMENT. Round 4 added no
+// `doesNotThrow` over the disclosed exclusions because "today's gap does not
+// become tomorrow's requirement"; round 6 found absence scans that would have
+// certified an empty string; asserting acceptance across a generated corpus the
+// schema does not model converts every known gap into a contract wholesale.
+const parseWorkflowSyntaxText = (text) => {
   const lines = yamlLines(text).map(({ indent, body, inScalar }) => (
     // A sequence element is re-indented to where its keys actually sit, which
     // is what makes an item's mapping parse like any other mapping — but ONLY
@@ -5787,8 +5805,17 @@ const parseWorkflowText = (text) => {
   const cursor = { i: 0 };
   const document = parseWorkflowMapping(lines, cursor, 0);
   if (cursor.i !== lines.length) throw new Error(`workflow reader stopped at line ${cursor.i}: ${lines[cursor.i].body}`);
-  return assertWorkflowSchema(document);
+  return document;
 };
+
+// THE READER EVERY ASSERTION BELOW USES: syntax, then schema. Every caller that
+// wants a WORKFLOW wants this one, and all of them get exactly what they got
+// before the split — `assertWorkflowSchema` returns the document it was given.
+// The round-trip property, which wants a PARSER, is the only caller of the
+// syntax half; the test right beside it pins that boundary in both directions,
+// so neither re-fusing the schema into the syntax half nor dropping it from
+// here can pass unnoticed.
+const parseWorkflowText = (text) => assertWorkflowSchema(parseWorkflowSyntaxText(text));
 
 const parseWorkflow = (name) => parseWorkflowText(workflowText(name));
 
@@ -6782,13 +6809,23 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
 // not about the reader. Every assertion above is a case somebody had already
 // thought of — which is exactly the set a defect has to avoid to survive.
 //
+// WHAT IS UNDER TEST: `parseWorkflowSyntaxText` — the reader's SYNTAX half,
+// tokenizer and structural parser, with NO GitHub schema (Codex T7 r9). The
+// property is about the PARSER, so "legal" below means LEGAL YAML IN THE
+// GENERATOR'S SUBSET and never "a workflow GitHub would run". It cannot mean
+// the latter: the corpus hangs arbitrary maps, sequences and block scalars
+// under `on:`, which GitHub requires to identify supported trigger events.
+// Asserting acceptance through the SCHEMA — which is what this test did when it
+// was written — would freeze every gap this claim discloses as a requirement;
+// the argument is at `parseWorkflowSyntaxText`.
+//
 // THE INVARIANT. For a document D:
 //
-//   EITHER the reader refuses D, OR the document it returns, reprinted onto
+//   EITHER the parser refuses D, OR the document it returns, reprinted onto
 //   the skeleton D was written from, reproduces D's LINE PARTITION — the
 //   ordered list of (content column, text) pairs of the lines D is made of.
 //
-// AND, separately: a document the generator wrote as LEGAL must not be
+// AND, separately: a document the generator wrote as LEGAL YAML must not be
 // refused. Refusal is only an acceptable answer to a document YAML rejects;
 // refusing a legal one is the false rejection round 4 exists to remove.
 //
@@ -6865,14 +6902,32 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
 // searched space. It does NOT say the reader is correct. Anything outside the
 // alphabet above — the three disclosed limits first among them — is not
 // searched, and a document is only as legal as the generator's own model says
-// it is. That last claim was checked rather than assumed: OFF-LINE, WITH A
-// REAL YAML LOADER (PyYAML 6.0.3, run once during development and NOT a test
-// dependency — this repo ships zero), a corpus of 24,168 legal documents (the
+// it is. That last claim was checked rather than assumed, WITHIN THE ONE DOMAIN
+// A YAML LOADER CAN SPEAK FOR: off-line, with a real loader (PyYAML 6.0.3, run
+// once during development and NOT a test dependency — this repo ships zero, and
+// an off-line cross-check adds none), a corpus of 24,168 legal documents (the
 // whole enumerated family plus the first 3,000 random ones) loaded without a
 // single error, all 648 perturbed documents were REJECTED, and on the 10,584
-// of them where the reader's three normalizations do not bite, the loader's
-// value agreed exactly with the model's. So "legal" and "YAML rejects this"
-// are both checked claims rather than the generator's opinion of itself.
+// LEGAL documents where the reader's three normalizations do not bite, the
+// loader's value agreed exactly with the model's.
+//
+// WHAT THAT ESTABLISHES, EXACTLY: YAML GRAMMAR — this text parses, that text
+// does not, and this is the value it denotes. IT IS NOT A GITHUB-WORKFLOW
+// ORACLE and cannot be made into one (Codex T7 r9): PyYAML knows nothing of
+// trigger events, job ids or `runs-on`, so it has nothing to say about whether
+// these documents are workflows, and it could not have caught the domain error
+// the syntax/schema split above fixes. "Legal YAML" and "YAML rejects this" are
+// checked claims rather than the generator's opinion of itself; "GitHub would
+// run this" is not claimed, and of this corpus it is not true.
+//
+// AND THE CAVEAT, recorded so nobody re-derives it the hard way: PyYAML's
+// default resolver implements YAML 1.1, in which the PLAIN KEY `on` IS A
+// BOOLEAN. `yaml.safe_load('on:\n  alpha: 1\n')` returns the key `True`, not
+// the string `"on"` — verified against 6.0.3. The agreement above therefore
+// required a loader customized to keep `on` a string, which round 8 did not
+// record; a re-run with the DEFAULT resolver disagrees with the model at the
+// top-level `on` key of every document, and that disagreement is the loader's
+// tag resolution, not a defect in this reader.
 //
 // COST: about 1.2 seconds of the file's 21, for 41,816 documents.
 
@@ -6982,11 +7037,15 @@ function genValue(random, depth) {
   }
 }
 
-// The generated subtree hangs under `on:`, whose contents this reader's schema
-// deliberately does not constrain — so the document stays one GitHub would
-// accept while the subtree is free to be any shape in the subset. The step's
-// `run:` is the second generated site, and it is the one whose geometry
-// matches the real files: a header at column 8 with its body at 10.
+// The generated subtree hangs under `on:` because that is the one site where an
+// arbitrary shape can hang without colliding with the skeleton the reprint
+// needs — NOT because it leaves a document GitHub would accept. It does not:
+// GitHub requires `on` to identify supported trigger events, so `alpha:` with a
+// block scalar under it is not a workflow at all (Codex T7 r9). THAT is why the
+// property runs against the syntax half. These documents are parser inputs, and
+// calling one legal is a claim about YAML and nothing else. The step's `run:` is
+// the second generated site, and it is the one whose geometry matches the real
+// files: a header at column 8 with its body at 10.
 const generatedWorkflow = (onValue, runValue) => ({
   kind: 'map',
   delta: 0,
@@ -7269,10 +7328,19 @@ const violationReport = (label, text, reason, parts = {}) => [
   parts.actual ? `--- the partition the reader reprints ---\n${renderPartition(parts.actual)}` : '',
 ].filter(Boolean).join('\n');
 
+// AGAINST THE SYNTAX HALF, NOT THE WHOLE READER (Codex T7 r9). "Legal" here
+// means legal YAML in the generator's subset — it has never meant "a workflow
+// GitHub would run", and it cannot: the corpus hangs arbitrary maps, sequences
+// and block scalars under `on:`, which GitHub requires to name trigger events.
+// Through `parseWorkflowText` this function read a schema refusal as a false
+// rejection, which made a test that exists to find PARSER defects hold the
+// SCHEMA to a corpus of documents GitHub rejects. Against the parser the corpus
+// is exactly what it always was: arbitrary YAML subtrees, which are legitimate
+// parser inputs, and no GitHub-schema gap is frozen by accepting them.
 const checkAccepted = (label, model, text) => {
   let document;
   try {
-    document = parseWorkflowText(text);
+    document = parseWorkflowSyntaxText(text);
   } catch (error) {
     return violationReport(label, text, `the reader REFUSED a legal document: ${error.message}`);
   }
@@ -7295,10 +7363,15 @@ const checkAccepted = (label, model, text) => {
   ].join('\n'), { expected, actual });
 };
 
+// The same half, for the same reason and one of its own: the refusal this
+// family demands is the PARSER's. Through the whole reader a schema refusal
+// would satisfy it, so a perturbed document the parser wrongly accepted could
+// still be certified as refused by a rule that never looked at the block
+// scalar. The parser has to be the one that says no.
 const checkRefused = (label, model, text, reason) => {
   let document;
   try {
-    document = parseWorkflowText(text);
+    document = parseWorkflowSyntaxText(text);
   } catch (error) {
     return null;
   }
@@ -7510,6 +7583,44 @@ test('the workflow reader round-trips every document a generator can write in it
   }
   assert.equal(failures.length, 0, failures.length === 0 ? undefined
     : `${failures.length} of ${documents} generated documents violate the round-trip property. The first:\n\n${failures[0]}`);
+});
+
+// THE SPLIT ITSELF, PINNED IN BOTH DIRECTIONS — because without this the split
+// is a latent correction that nothing observes, and the property test above
+// would pass just as green if somebody re-fused the two halves tomorrow
+// (Codex T7 r9). The document below is legal YAML the SCHEMA refuses, for the
+// round-1 reason the schema was added: a top-level key GitHub does not read.
+// It is not one of the disclosed gaps, so nothing here freezes one — what is
+// asserted is only that the parser reads a mapping key without consulting
+// GitHub, which is the parser's job and will never stop being true.
+test('the round-trip property is run against the PARSER: the schema belongs to parseWorkflowText and to nothing the property calls', () => {
+  const model = generatedWorkflow(
+    { kind: 'map', delta: 2, entries: [{ key: 'alpha', value: { kind: 'plain', text: 'not an event' } }] },
+    { kind: 'plain', text: 'echo ok' },
+  );
+  model.entries.push({ key: 'epsilon', value: { kind: 'plain', text: 'a key GitHub does not read' } });
+  const text = emitDocument(model, emitContext());
+
+  // 1. The workflow reader still applies the schema. Deleting the
+  //    `assertWorkflowSchema` call from `parseWorkflowText` reds this line and
+  //    every schema test above it.
+  assert.throws(() => parseWorkflowText(text), /'epsilon' is not a key GitHub reads here/);
+  // 2. The syntax half does NOT, and returns the document the parser read.
+  assert.equal(parseWorkflowSyntaxText(text).epsilon, 'a key GitHub does not read');
+  // 3. The property's accept-check runs against the syntax half. Point
+  //    `checkAccepted` back at `parseWorkflowText` and this reports the schema
+  //    refusal as "the reader REFUSED a legal document" — which is exactly the
+  //    defect: a correct schema rule reported as a parser regression.
+  assert.equal(checkAccepted('the boundary', model, text), null);
+  // 4. And its refuse-check does too, so a schema refusal can never be mistaken
+  //    for the parser refusing a document YAML rejects. This document is legal
+  //    YAML, so the parser ACCEPTS it and `checkRefused` must report that;
+  //    through the whole reader the schema would answer first and certify a
+  //    refusal the parser never made.
+  assert.match(
+    checkRefused('the boundary', model, text, 'it is not, in fact, illegal'),
+    /the reader ACCEPTED a document YAML rejects/,
+  );
 });
 
 test('demo/repro.js reads exactly the injected session contract and nothing the run step strips', () => {
