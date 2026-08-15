@@ -4663,6 +4663,29 @@ const START_GUARD = "${{ always() && steps.start.outcome != 'skipped' }}";
 // same reason. Quote state is per line: this file has no multi-line quoted
 // scalars, and introducing one would break the exact assertions below loudly
 // rather than silently.
+//
+// THIS FUNCTION IS ONLY HALF THE RULE, and applying it alone was a real
+// content-corruption bug (Codex T7 r6 #1). The other half — that a `#` inside
+// a BLOCK SCALAR is content and not a comment at all — is not a property of a
+// line, so it cannot live here; it lives in `yamlLines` below, which is the
+// only thing that knows whether a block scalar is open. Call this directly
+// only where the intent really is "strip every comment in this text", and say
+// so at the call site.
+//
+// ITS OWN REMAINING LIMIT, named rather than fixed: quote state starts fresh
+// at column 0 of every line, so an APOSTROPHE IN UNQUOTED TEXT opens a quote
+// that never closes and a real comment after it survives as content —
+// `run: don't # a real comment` reads as `don't # a real comment`. Getting it
+// right means knowing where a NODE begins (a `'` is an indicator only there),
+// which is the same "reach one construct further" trade that has cost this
+// reader a false rejection every time it took it, so it is not taken. Neither
+// workflow nor `action.yml` contains such a line, every value they produce is
+// pinned exactly, and the failure direction is a value that is too LONG —
+// visible to an exact pin rather than silent under one. Also not pinned as
+// accepted, for the reason the claim below gives for every other exclusion.
+// MULTI-LINE QUOTED SCALARS, the construct where this would matter most, are
+// refused outright: their continuation lines are more indented than the key
+// and trip `unexpected indentation`, verified in both quote styles.
 const stripYamlComment = (line) => {
   let quote = null;
   for (let index = 0; index < line.length; index += 1) {
@@ -4676,6 +4699,70 @@ const stripYamlComment = (line) => {
     }
   }
   return line;
+};
+
+// A BLOCK SCALAR HEADER, as YAML defines one: `|` or `>` at the start of a
+// value, with any chomping/indentation indicators after it. Deliberately WIDER
+// than the set `parseWorkflowMapping` agrees to READ (`|`, `|-`, `>`, `>-`):
+// `|+` and `|2` open a block scalar too, and their bodies must be tokenised as
+// bodies even though the header is refused a moment later. A plain scalar may
+// never begin with `|` or `>` — they are indicators — so `run: echo hi > out`
+// and a quoted `"> out"` are not headers and are not matched here.
+const BLOCK_SCALAR_HEADER = /^(?:- )?[A-Za-z0-9_.-]+:[ \t]+[|>]/;
+
+// THE TOKENISING PASS FOR BOTH READERS IN THIS FILE, and the reason it is one
+// function rather than two loops: the order these transformations run in IS
+// the semantics, and the two loops had drifted into running them in the wrong
+// order (Codex T7 r6 #1).
+//
+// Comment stripping used to happen here, line by line, with block scalars
+// recognised LATER by the mapping parser — so a body line beginning with `#`
+// was deleted as a comment before anything knew a block scalar was open. That
+// is not a missing rule, it is an ORDERING bug, and its signature is the worst
+// kind: nothing throws, the document parses, and a value comes out quietly
+// short. `.github/workflows/closeout-gate.yml` carried exactly that case (a
+// folded `description:` wrapping onto a `#6Yd4Qs). Leave empty…` line) and the
+// demo workflow carried 27 more, every one of them a line of a shell script
+// this reader then made assertions about.
+//
+// So the decision "is this line inside a block scalar?" is made ONCE, here,
+// before any transformation that could depend on it, and the two that do are:
+//
+//   - COMMENT STRIPPING. Inside a block scalar every `#` is content.
+//   - THE `- ` SEQUENCE MARKER. Inside a block scalar `- one` is a line of
+//     script, not a sequence item; the old pass re-indented it and dropped the
+//     marker, which is the same corruption one token over.
+//
+// A block scalar runs from its header to the first NON-EMPTY line indented no
+// further than the header — the same test `parseWorkflowMapping`'s body loop
+// applies, so the tokeniser and the parser agree on where a body ends by
+// construction rather than by coincidence. A blank line does not close it.
+// `- run: |` puts the header's key two columns right of the dash, which is
+// where the body must clear, so item lines contribute the same `+ 2` here that
+// they do below.
+//
+// STILL NOT MODELLED, and both are pre-existing, disclosed limits rather than
+// anything this pass changed: blank lines inside a body are dropped, and a
+// body line's own indentation is trimmed. What an assertion reads out of a
+// `run:` script is WHICH LINES it contains, never their spacing.
+const yamlLines = (text) => {
+  const lines = [];
+  let scalarIndent = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const kept = raw.replace(/\s+$/, '');
+    const indent = kept.length - kept.trimStart().length;
+    const inScalar = scalarIndent !== null && kept.trim() !== '' && indent > scalarIndent;
+    const content = inScalar ? kept : stripYamlComment(raw).replace(/\s+$/, '');
+    if (content.trim() === '') continue;
+    const body = content.trim();
+    if (!inScalar) {
+      scalarIndent = BLOCK_SCALAR_HEADER.test(body)
+        ? indent + (body.startsWith('- ') ? 2 : 0)
+        : null;
+    }
+    lines.push({ indent, body, inScalar });
+  }
+  return lines;
 };
 
 // `key: value`, `key:`, or the `- key: value` that opens a sequence item.
@@ -4699,12 +4786,12 @@ const unquoteScalar = (value) => (/^(".*"|'.*')$/.test(value) ? value.slice(1, -
 // change (Codex T6 r2 #3). An unknown key directly under `runs:` now throws for
 // the same reason.
 const parseActionYml = () => {
-  const lines = [];
-  for (const raw of ACTION_YML().split(/\r?\n/)) {
-    const text = stripYamlComment(raw).replace(/\s+$/, '');
-    if (text.trim() === '') continue;
-    lines.push({ indent: text.length - text.trimStart().length, body: text.trim() });
-  }
+  // Block-scalar-aware, like the workflow reader and for the same reason: this
+  // file's `path: |` upload block happens to contain no `#` today, so the
+  // ordering bug that corrupted the workflows was LATENT here rather than
+  // absent. A shared tokeniser is what stops it being fixed in one reader and
+  // left in the other.
+  const lines = yamlLines(ACTION_YML());
   const inputs = {};
   const outputs = {};
   const steps = [];
@@ -4892,6 +4979,11 @@ test('action.yml is wiring-only: each subcommand exactly once, with its exact sh
     'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38',
     'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
   ]);
+  // AN ABSENCE SCAN NEEDS A PRESENCE CONTROL (Codex T7 r6): a stripper that
+  // over-reached, or an `ACTION_YML()` reading the wrong path, hands this an
+  // empty string and it passes saying nothing at all.
+  assert.ok(ACTION_YML_CODE().includes('using: composite'),
+    'the stripped text is still the action, not an empty string');
   assert.equal(ACTION_YML_CODE().includes('continue-on-error'), false, 'a failed run step must stay failed');
 });
 
@@ -4979,6 +5071,11 @@ test('invocation identity travels as start\'s step output, to every step that re
   for (const step of carriers) {
     assert.equal(step.env.DEBUG_ACTION_INVOCATION_NONCE, NONCE_EXPR, `${step.name} reads this invocation's start`);
   }
+  // Presence control first, for the same reason as the scan in the wiring test
+  // above (Codex T7 r6): an absence assertion certifies its own input going
+  // blank unless something proves the input is still there.
+  assert.ok(ACTION_YML_CODE().includes('${{ inputs.run }}'),
+    'the stripped text is still the action, not an empty string');
   assert.equal(ACTION_YML_CODE().includes('${{ env.'), false,
     'nothing is sourced from the expression env context, which carries job-global GITHUB_ENV values');
 });
@@ -5582,18 +5679,14 @@ const assertWorkflowSchema = (document) => {
 // assertions below rely on. Reading only from disk left the reader's own
 // tolerances untestable.
 const parseWorkflowText = (text) => {
-  const lines = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const text = stripYamlComment(raw).replace(/\s+$/, '');
-    if (text.trim() === '') continue;
-    const indent = text.length - text.trimStart().length;
-    const body = text.trim();
+  const lines = yamlLines(text).map(({ indent, body, inScalar }) => (
     // A sequence element is re-indented to where its keys actually sit, which
-    // is what makes an item's mapping parse like any other mapping.
-    lines.push(body.startsWith('- ')
+    // is what makes an item's mapping parse like any other mapping — but ONLY
+    // outside a block scalar, where `- ` is a marker rather than the first two
+    // characters of a line of script (Codex T7 r6 #1).
+    !inScalar && body.startsWith('- ')
       ? { indent: indent + 2, body: body.slice(2), item: true }
-      : { indent, body, item: false });
-  }
+      : { indent, body, item: false }));
   const cursor = { i: 0 };
   const document = parseWorkflowMapping(lines, cursor, 0);
   if (cursor.i !== lines.length) throw new Error(`workflow reader stopped at line ${cursor.i}: ${lines[cursor.i].body}`);
@@ -5648,6 +5741,15 @@ const MINIMAL_WORKFLOW = [
 // `unexpected indentation` on its own body. That was fail-closed and therefore
 // silent, which is exactly how a reader nobody points at a file stays green.
 //
+// AND GOING THROUGH IT IS NOT THE SAME AS COMING OUT RIGHT, which round 6 had
+// to establish separately (Codex T7 r6 #1). Round 5 pushed the gate through
+// this reader and asserted only that the push did not throw — so the gate
+// parsed, the claim above became true, and the folded `description:` it had
+// just learned to read came out with a line MISSING, silently, for another
+// round. The gate is now read for a VALUE. Every positive control in this
+// file's workflow tests should be read the same way before it is trusted: if
+// nothing but an exception can make it red, it is testing the exception.
+//
 // Three consecutive rounds tightened this pass toward "rejects whatever GitHub
 // would reject", and each one produced fresh divergence from a schema this
 // repository does not implement — round 3's tightening produced an outright
@@ -5670,8 +5772,23 @@ const MINIMAL_WORKFLOW = [
 // that `uses` is additionally non-empty, and that `with` accompanies a `uses`;
 // that the six keys GitHub always types as tables hold tables; that a block
 // scalar is read as `|` or `>` says and any other header is refused rather
-// than stored; and that YAML anchors and aliases are refused rather than
-// absorbed, wherever this reader reads a scalar.
+// than stored; that a `#` and a `- ` INSIDE a block scalar are content while a
+// `#` outside one is still a comment; and that YAML anchors and aliases are
+// refused rather than absorbed, at the start of a non-flow scalar token.
+//
+// THAT COMMENT RULE IS THE ONE ENTRY HERE THAT IS NOT A REFUSAL, and it is on
+// this list because it is a DECISION the reader makes about content (Codex T7
+// r6 #1). It was made wrongly for five rounds, by ORDERING rather than by any
+// rule anybody wrote: comment stripping ran in the line-tokenising pass, which
+// is before block scalars exist, so a body line beginning `#` was deleted as a
+// comment. Nothing threw. The gate's folded `description:` lost a line, the
+// demo's `run:` scripts lost 27, and every control was green throughout —
+// because the gate control asserted only that parsing did not throw, and the
+// constructed folding case contained no comment-looking text. THE LESSON IS
+// NOT ABOUT COMMENTS. "Does not throw" is not a value assertion, and a
+// constructed input that cannot exercise the rule it sits next to is not a
+// control. Both are now value assertions, on the real gate and on constructed
+// input, in both directions.
 //
 // THE `runs-on` NON-EMPTY RULE IS NOW PINNED, and how it came to be unpinned
 // is the most useful thing in this comment (Codex T7 r5 #1). Round 4 declined
@@ -5709,7 +5826,11 @@ const MINIMAL_WORKFLOW = [
 //     item after a complete mapping and a dedent to an unaligned column were
 //     all tried: each is refused earlier, by the indentation rule or by
 //     `unparsed workflow line`. It stays because it is the assertion that
-//     would catch a future relaxation of the indentation rule.
+//     would catch a future relaxation of the indentation rule. Round 6
+//     NARROWED the set of item lines rather than widening it — a `- ` inside a
+//     block scalar is no longer marked as an item at all, and is consumed by
+//     the body loop before the top-level loop can see it — so the enumeration
+//     holds with one fewer way to reach the exit than it had.
 //   - `step: not a mapping`. `job.steps` is only ever what the block reader
 //     built, which is a mapping (refused by `!Array.isArray`), a scalar
 //     (refused likewise), null (refused as `'steps' has no value`), or an
@@ -5718,6 +5839,55 @@ const MINIMAL_WORKFLOW = [
 //     nothing else. A scalar sequence element (`- plain`), a nested sequence
 //     and an empty item are all refused earlier as unparsed lines. It mirrors
 //     the job-level check one scope down and costs one line.
+//
+// THE ORDERING AUDIT THIS ROUND OWES, written out because two consecutive
+// rounds found an ORDER rather than a missing rule — round 5's separator
+// consumption feeding the anchor check, round 6's comment stripping running
+// ahead of block-scalar recognition — and naming the remaining hazards once is
+// cheaper than meeting them one round at a time. The pipeline is: split lines
+// → strip trailing space → DECIDE BLOCK-SCALAR MEMBERSHIP → strip comments
+// (outside a block scalar only) → drop blank lines → trim indentation → split
+// the `- ` marker (outside only) → match the key/value entry → detect a
+// block-scalar header → refuse anchors → unquote → schema. Every step that
+// DEPENDS on an earlier one now runs after it:
+//
+//   - comment stripping and `- ` splitting depend on block-scalar membership.
+//     Both ran BEFORE it until round 6; both are now downstream of one shared
+//     decision made in `yamlLines`, and both are pinned in both directions.
+//   - the anchor check depends on separation having been consumed AND on the
+//     value not yet having been unquoted. Both hold: the entry pattern eats
+//     all separation (round 5) and `unquoteScalar` runs strictly after, so
+//     `runs-on: *x` is an alias while `runs-on: "*x"` is text.
+//   - the block-scalar header check depends on the entry pattern having split
+//     the value off; `/^[|>]/` is applied to `rawValue` and never to the line.
+//   - the tokeniser's end-of-body test and the parser's body loop are the SAME
+//     test (`indent > the header's indent`) over the same numbers, so they
+//     cannot disagree about where a body ends. This is the ordering pair most
+//     worth watching: they are written in two places.
+//
+// STILL ORDER-DEPENDENT AND ACCEPTED, each with its reason:
+//
+//   - BLANK LINES ARE DROPPED BEFORE BLOCK SCALARS ARE READ, so a `|` body
+//     loses its blank lines and a `>` body loses its paragraph breaks. It is
+//     content-changing and disclosed above; it cannot change WHICH lines a
+//     script contains, and every assertion over a `run:` body is line-wise.
+//   - TRAILING WHITESPACE IS STRIPPED at the same point, on body lines too.
+//     Same class, smaller: no assertion and no shell depends on it.
+//   - A BODY LINE'S OWN INDENTATION IS TRIMMED, so a heredoc inside a `run:`
+//     script loses its relative indentation. Disclosed above; it is the reason
+//     bodies are read for which lines they contain.
+//   - QUOTE STATE IS PER LINE inside `stripYamlComment`, which is a SCOPING
+//     limit rather than an ordering one and is written out at that function.
+//     Its worst case (a multi-line quoted scalar) is refused by the
+//     indentation rule, not silently mis-read.
+//   - `workflowCode` and `ACTION_YML_CODE` STRIP COMMENTS WITH NO BLOCK-SCALAR
+//     AWARENESS, deliberately and not by omission. They answer "does the
+//     WIRING mention this string", and a shell comment inside a `run:` naming
+//     `secrets.` is not a secret reference. They are text scans over the file,
+//     not this tokeniser. Every absence scan over either of them now sits
+//     beside a PRESENCE control over the same stripped text, so neither can
+//     certify an empty string — which is this round's lesson one scope out: an
+//     assertion that survives its input disappearing is not an assertion.
 //
 // WHAT IT DOES NOT DECIDE — listed at the point of the claim rather than left
 // to be rediscovered a fourth time. Each of these is ACCEPTED by this reader:
@@ -5746,7 +5916,10 @@ const MINIMAL_WORKFLOW = [
 //     representations of a workflow that cannot trigger (Codex T7 r4 #2).
 //   - FLOW COLLECTIONS ARE NOT PARSED, so nothing INSIDE one is judged — and
 //     that includes anchors and aliases, which is why the rule above is worded
-//     "wherever this reader reads a scalar" (Codex T7 r5 #2). `runs-on:
+//     "at the start of a non-flow scalar token" (Codex T7 r5 #2, wording
+//     sharpened in r6: the old "wherever this reader reads a scalar" made the
+//     scope sound like a property of the reader's attention rather than of the
+//     token, which is what it actually is). `runs-on:
 //     [*missing]` is stored as the opaque literal string `[*missing]` and
 //     accepted, exactly as `runs-on: [self-hosted, linux]` is accepted for the
 //     wrong reason. This is ONE limit with two faces, not two limits: an
@@ -5789,6 +5962,22 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // largest real workflow this repository owns, and a rule that rejects a legal
   // construct is far likelier to meet one here than in MINIMAL_WORKFLOW.
   assert.doesNotThrow(() => parseWorkflowText(workflowText(GATE_WORKFLOW)));
+  // …AND IT READS THE GATE CORRECTLY, WHICH THE LINE ABOVE DOES NOT SAY.
+  // "DOES NOT THROW" IS NOT A VALUE ASSERTION (Codex T7 r6 #1), and the gap
+  // between the two hid a content-corruption bug for a whole round. Round 5
+  // made the two-workflow claim true by pushing the gate through the reader;
+  // the gate came out CORRUPTED and the control stayed green, because comment
+  // stripping ran BEFORE anything knew a block scalar was open and the gate's
+  // folded `description:` wraps onto a line whose first character is `#`. That
+  // line was deleted as a comment. So the gate is now read for a VALUE, and
+  // the value chosen is the one the defect destroyed: `#6Yd4Qs). Leave empty`
+  // is the fragment that only survives if `#` inside a block scalar is
+  // content, and the fold either side of it is what joins the six body lines.
+  assert.equal(
+    parseWorkflow(GATE_WORKFLOW).on.workflow_dispatch.inputs['pr-number'].description,
+    "PR number to gate (required for a fork PR, or when dispatching from a ref other than the PR's own branch — without this, `gh pr view` falls back to guessing from the checked-out branch, which is wrong or fails outright in those cases; chatgpt-codex-connector PR7 #6Yd4Qs). Leave empty when manually dispatching against a same-repo branch you have already selected as the run's ref above.",
+    'the gate parses to the text the gate actually carries, `#` and all',
+  );
   const real = workflowText(DEMO_WORKFLOW);
   assert.ok(real.includes('    runs-on: ubuntu-latest\n'), 'the mutation target exists as written');
   // CODEX'S EXACT CASE, on the real file: one job loses its runner definition
@@ -5854,10 +6043,16 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // the false rejection lurking one step past this rule and the reason round 4
   // was right to be careful. An expression is the ordinary way to write a
   // matrix job's runner, and this is a legal document end to end.
-  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+  // Read for its value, not merely survived (Codex T7 r6): a reader that
+  // accepted the expression and stored `${{ matrix.os` would satisfy
+  // `doesNotThrow` and every rule after it.
+  const matrixJob = parseWorkflowText(MINIMAL_WORKFLOW.replace(
     '    runs-on: ubuntu-latest\n',
     '    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n',
-  )), 'a matrix expression is a runner declaration, not a missing one');
+  )).jobs.only;
+  assert.equal(matrixJob['runs-on'], '${{ matrix.os }}',
+    'a matrix expression is a runner declaration, not a missing one');
+  assert.deepEqual(matrixJob.strategy, { matrix: { os: '[ubuntu-latest, windows-latest]' } });
   // ANCHORS AND ALIASES ARE REFUSED, NOT ABSORBED (Codex T7 r4 #5). Round 3
   // recorded `&`/`*` as a known limit on the argument that "every assertion
   // over such a value fails closed" — which was wrong, because NO assertion in
@@ -5867,8 +6062,8 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // than resolution: this repository's workflows use neither construct, so a
   // flat refusal is fail-closed and cannot mis-resolve anything.
   //
-  // SCOPED TO WHERE THIS READER READS A SCALAR, and the claim above says so
-  // (Codex T7 r5 #2). `runs-on: [*missing]` is NOT refused: flow collections
+  // SCOPED TO THE START OF A NON-FLOW SCALAR TOKEN, and the claim above says
+  // so (Codex T7 r5 #2). `runs-on: [*missing]` is NOT refused: flow collections
   // are stored as opaque literals, so no element of one is ever a scalar this
   // rule sees. That exclusion is recorded rather than closed — see the claim
   // for why reaching inside a collection this reader does not parse costs more
@@ -5935,15 +6130,24 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // redirect would be a new false rejection of exactly the kind fix (4) above
   // exists to remove. (The real demo workflow, asserted at the top of this
   // test, carries both inside its `run:` blocks and is the live control.)
-  for (const legal of [
-    '        run: rm -rf build/*\n',
-    '        run: "*.js && echo done"\n',
-    "        run: '&notananchor'\n",
-    '        run: echo a * b & c\n',
-    '        run: |\n          for f in *.js; do echo "$f" >&2; done\n',
+  //
+  // AND EACH ONE IS READ FOR ITS VALUE, not merely survived (Codex T7 r6).
+  // These were `assert.doesNotThrow` alone until round 6, which is the same
+  // shape as the gate control that let a corrupted document through for a
+  // round: "not refused" is the property under test, but a reader that accepts
+  // a legal line and then mangles it is not a reader that got it right, and
+  // nothing here would have said so.
+  for (const [legal, expected] of [
+    ['        run: rm -rf build/*\n', 'rm -rf build/*'],
+    ['        run: "*.js && echo done"\n', '*.js && echo done'],
+    ["        run: '&notananchor'\n", '&notananchor'],
+    ['        run: echo a * b & c\n', 'echo a * b & c'],
+    ['        run: |\n          for f in *.js; do echo "$f" >&2; done\n', 'for f in *.js; do echo "$f" >&2; done'],
   ]) {
-    assert.doesNotThrow(
-      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal)),
+    const document = parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal));
+    assert.equal(
+      document.jobs.only.steps[0].run,
+      expected,
       `a '*' or '&' that is not a node property is ordinary text: ${legal.trim()}`,
     );
   }
@@ -5970,6 +6174,109 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
     '        run: |-\n          echo one\n          echo two\n',
   ));
   assert.equal(chomped.jobs.only.steps[0].run, 'echo one\necho two');
+  // A `#` INSIDE A BLOCK SCALAR IS CONTENT, NOT A COMMENT — AN ORDERING BUG,
+  // not a missing rule (Codex T7 r6 #1). Comment stripping ran in the
+  // line-tokenising pass, which is strictly BEFORE the header above is ever
+  // matched, so a body line beginning with `#` was deleted before anything
+  // knew a block scalar was open. Nothing threw: the document parsed, the key
+  // existed, and its value was quietly missing a line. The gate carries
+  // exactly this case and BOTH controls that should have caught it were blind
+  // — the gate control asserted only that parsing did not throw (fixed at the
+  // top of this test), and the folded case three lines up contains no
+  // comment-looking text. A constructed case that cannot fail is not a
+  // control, and the two together are why this shipped.
+  const foldedHash = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: >-\n          a folded body may wrap onto a line that starts with\n          #6Yd4Qs) and that is CONTENT\n',
+  ));
+  assert.equal(
+    foldedHash.jobs.only.steps[0].run,
+    'a folded body may wrap onto a line that starts with #6Yd4Qs) and that is CONTENT',
+    'a folded continuation beginning with `#` is text the fold keeps',
+  );
+  // …and in a `run:` script the same rule has teeth: EVERY `#` in a shell
+  // script is script, so a reader that strips them answers with a program the
+  // runner would never execute. An inline one loses a line's tail; a
+  // whole-line one loses the line and its neighbours close up around the hole.
+  const shellComments = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          echo one # trailing shell comment\n          # a whole-line shell comment\n          echo two\n',
+  ));
+  assert.equal(
+    shellComments.jobs.only.steps[0].run,
+    'echo one # trailing shell comment\n# a whole-line shell comment\necho two',
+    'a shell comment inside `run:` is script, not a YAML comment',
+  );
+  // THE SAME ORDERING HAZARD ONE TOKEN OVER, found while fixing the first and
+  // fixed with it because it is the same state: `- ` opens a sequence item
+  // only OUTSIDE a block scalar. The tokeniser re-indented every line
+  // beginning `- ` and dropped the marker, so a heredoc or a printed list
+  // inside a `run:` script silently lost its dashes — corruption of exactly
+  // the same shape, with exactly the same silence.
+  const dashedBody = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          cat <<EOF\n          - one\n          - two\n          EOF\n',
+  ));
+  assert.equal(
+    dashedBody.jobs.only.steps[0].run,
+    'cat <<EOF\n- one\n- two\nEOF',
+    'a `- ` inside a block scalar is script, not a sequence marker',
+  );
+  // AND COMMENTS ARE STILL STRIPPED EVERYWHERE A COMMENT CAN APPEAR, which is
+  // the false-rejection edge of the three cases above and is pinned in its own
+  // right rather than assumed. A stripper made block-scalar-aware carelessly
+  // stores `ubuntu-latest # the default runner` as a runner name — non-empty,
+  // so no rule in this reader would notice — and meets the first full-line
+  // comment as an `unparsed workflow line`, which is a FALSE REJECTION of a
+  // document GitHub runs. Both directions, on a legal document.
+  const commented = parseWorkflowText(MINIMAL_WORKFLOW
+    .replace('    runs-on: ubuntu-latest\n', '    runs-on: ubuntu-latest # the default runner\n')
+    .replace('    steps:\n', '    # the steps this job runs\n    steps:\n'));
+  assert.equal(commented.jobs.only['runs-on'], 'ubuntu-latest',
+    'an inline comment after an ordinary scalar is still a comment');
+  assert.deepEqual(Object.keys(commented.jobs.only), ['runs-on', 'steps'],
+    'and a full-line comment between keys is neither a key nor an unparsed line');
+  // …AND STRIPPING RESUMES ON THE LINE THE BLOCK SCALAR ENDS ON. A fix that
+  // opened a block scalar and never closed it would swallow the rest of the
+  // file's comments as content: the same defect with its polarity reversed,
+  // and one an `assert.doesNotThrow` would never see either.
+  const afterScalar = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          echo one # kept\n        shell: bash # stripped\n',
+  ));
+  assert.equal(afterScalar.jobs.only.steps[0].run, 'echo one # kept');
+  assert.equal(afterScalar.jobs.only.steps[0].shell, 'bash',
+    'the block scalar ends at the dedent, and so does the exemption');
+  // …AND THE LIVE CONTROL FOR BOTH DIRECTIONS AT ONCE IS THE DEMO WORKFLOW,
+  // whose `run:` scripts carried 27 shell-comment lines this reader used to
+  // DELETE from scripts it then made assertions about — while the same file's
+  // ordinary YAML comments (including the two that say `secrets.` and
+  // `continue-on-error`, which two scans below require to be absent from the
+  // WIRING) must still go. Constructed cases prove the rule; this proves it on
+  // the file the suite actually reasons about.
+  const demoScripts = Object.values(parseWorkflow(DEMO_WORKFLOW).jobs)
+    .flatMap((job) => job.steps)
+    .map((step) => step.run ?? '')
+    .join('\n');
+  // Two scripts in two different jobs, so a half-fix that handled the first
+  // block scalar in a file and not the rest is red here rather than green.
+  assert.match(demoScripts, /^# THE PROOF ITSELF IS A WHOLE-FIELD EQUALITY over the parsed log, not a$/m);
+  assert.match(demoScripts, /^# Deliberately redundant with the lookup two lines down, which already$/m);
+  // AND THE COUNT, because two named survivors do not say that the other 25
+  // came back. 27 is exactly what the ordering bug deleted; a number that
+  // drifts is a script this reader started or stopped reading in full, which
+  // is worth a moment's attention either way.
+  assert.equal((demoScripts.match(/^#/gm) ?? []).length, 27,
+    'every whole-line shell comment in the demo scripts survives the reader');
+  // …AND THE OTHER DIRECTION ON THE SAME REAL FILE, which the constructed case
+  // above cannot give: a YAML comment OUTSIDE a block scalar is still absent
+  // from the parsed document. Both halves have to be read off one file, or a
+  // stripper that simply stopped stripping would satisfy everything above.
+  const demoComment = 'a demo that cannot be read is not a demo';
+  assert.ok(workflowText(DEMO_WORKFLOW).includes(`# \`secrets.\` reference: ${demoComment}`),
+    'the control comment exists in the file, outside every block scalar');
+  assert.equal(JSON.stringify(parseWorkflow(DEMO_WORKFLOW)).includes(demoComment), false,
+    'and no part of it reaches the document');
   // …and the headers it does NOT implement are refused rather than stored as
   // scalars. `|+` keeps trailing blank lines, which this reader drops before it
   // ever sees them, and `|2` sets an explicit indentation this reader does not
@@ -5985,9 +6292,19 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // AND A QUOTED SCALAR THAT MERELY STARTS WITH ONE IS ORDINARY TEXT, which is
   // the same false-rejection edge the anchor rule has: `|` and `>` are
   // indicators only where a value begins unquoted, and a redirect is neither.
-  for (const legal of ['        run: "> out.txt"\n', "        run: '|'\n", '        run: echo hi > out.txt\n']) {
-    assert.doesNotThrow(
-      () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal)),
+  // Read for their VALUES for the same reason as the `*`/`&` cases above: a
+  // quoted `'|'` accepted and then stored as the empty string, or as `'|'`
+  // with its quotes still on, is a reader that survived the case rather than
+  // one that read it.
+  for (const [legal, expected] of [
+    ['        run: "> out.txt"\n', '> out.txt'],
+    ["        run: '|'\n", '|'],
+    ['        run: echo hi > out.txt\n', 'echo hi > out.txt'],
+  ]) {
+    const document = parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', legal));
+    assert.equal(
+      document.jobs.only.steps[0].run,
+      expected,
       `a '|' or '>' that is not a block header is ordinary text: ${legal.trim()}`,
     );
   }
@@ -6004,8 +6321,15 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
     'a key indented past its siblings is a key of no mapping',
   );
   // …and the same key at the right column is an ordinary job key, or this
-  // would be a reader that refuses nesting rather than one that reads it.
-  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    timeout-minutes: 5\n    steps:\n')));
+  // would be a reader that refuses nesting rather than one that reads it. Read
+  // for WHERE IT LANDED, not merely for acceptance (Codex T7 r6): "absorbed
+  // into the job above" is the failure this rule exists to stop, and only a
+  // value assertion can tell absorption from correct nesting.
+  assert.equal(
+    parseWorkflowText(MINIMAL_WORKFLOW.replace('    steps:\n', '    timeout-minutes: 5\n    steps:\n'))
+      .jobs.only['timeout-minutes'],
+    '5',
+  );
   // JOB IDS, which nothing validated at all (Codex T7 r3). GitHub's rule is
   // explicit — a job id starts with a letter or `_` and holds only letters,
   // digits, `-` and `_` — and the reader's line pattern is looser than that BY
@@ -6115,8 +6439,13 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   // an invalid one. The round-3 mutations missed it because every one of them
   // was aimed at THIS repository's workflows rather than at a legal document;
   // this is the positive control that would have caught it.
-  assert.doesNotThrow(
-    () => parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: ""\n')),
+  // Accepted AND stored as the empty string, not as `""` with its quotes still
+  // attached: `doesNotThrow` alone passes either way, and only one of them is
+  // the script GitHub would run (Codex T7 r6).
+  assert.equal(
+    parseWorkflowText(MINIMAL_WORKFLOW.replace('        run: echo hello\n', '        run: ""\n'))
+      .jobs.only.steps[0].run,
+    '',
   );
   // `uses`, by contrast, IS required to be non-empty, and its empty form named
   // no action while satisfying the very same XOR.
@@ -6197,8 +6526,9 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', 'on:\n')),
     /'on' has no value/,
   );
-  // The scalar trigger form is legal GitHub and stays accepted.
-  assert.doesNotThrow(() => parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', 'on: push\n')));
+  // The scalar trigger form is legal GitHub and stays accepted — as the STRING
+  // `push`, which is the half `doesNotThrow` alone does not say (Codex T7 r6).
+  assert.equal(parseWorkflowText(MINIMAL_WORKFLOW.replace('on:\n  workflow_dispatch:\n', 'on: push\n')).on, 'push');
   assert.throws(
     () => parseWorkflowText(MINIMAL_WORKFLOW.replace(/jobs:\n[\s\S]*$/, 'jobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - name: n\n        run: r\n').replace('jobs:', 'job:')),
     /job/,
@@ -6375,6 +6705,13 @@ test('the demo workflow is a dogfood, not a gate: read-only, pinned, and no step
   // Nothing in this workflow may reference a secret: it executes PR-controlled
   // code (the action and the repro come out of the checkout under test), and
   // the only thing keeping that ordinary is that there is nothing to steal.
+  // AN ABSENCE SCAN NEEDS A PRESENCE CONTROL, or it certifies its own input
+  // going blank (Codex T7 r6, the round's transferable lesson one scope over).
+  // `workflowCode` strips comments from the whole text, so a stripper that
+  // over-reached — or a `workflowText` that read the wrong path — would hand
+  // both scans below an empty string and both would pass saying nothing.
+  assert.ok(workflowCode(DEMO_WORKFLOW).includes('uses: ./actions/debug-evidence'),
+    'the stripped text is still the workflow, not an empty string');
   assert.equal(/secrets\./.test(workflowCode(DEMO_WORKFLOW)), false, 'no secret is referenced');
   // NO STEP HERE IS ALLOWED TO FAIL, and that is a design constraint rather
   // than an accident. `continue-on-error` is how a workflow demonstrates an
