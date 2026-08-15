@@ -399,8 +399,10 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
 // and standard VM-based GitHub-hosted Linux runners hand workflow commands
 // PASSWORDLESS SUDO, so a hostile native command there can elevate, attach to
 // the waiting run process or to the collector (whose pid is in state), and
-// defeat authentication outright. Calling mode 1 "restricted" was therefore the
-// action's core guarantee silently failing on its principal platform.
+// defeat authentication outright. Calling either of them "restricted" was
+// therefore the action's core guarantee resting on a boundary one `sudo`
+// removes. Which mode a current image ships is deliberately not asserted
+// anywhere (Codex T8 r2 #4): nothing in this job measures it.
 //
 // So: mode 3 is NECESSARY. It is not sufficient (Codex T6 r8): it blocks
 // ptrace, but a principal that can reach root rewrites another task's memory
@@ -5159,8 +5161,15 @@ test('upload takes exactly the paths start advertises before the command runs, a
     '${{ steps.start.outputs.evidence-dir }}/session.log',
   ]);
   // The state file carries this run's session token and lives at the
-  // output-dir ROOT, outside the invocation-scoped child, so no path here can
-  // reach it. Asserted as well as arranged.
+  // output-dir ROOT, outside the invocation-scoped child, so NO ENUMERATED
+  // PATH NAMES IT. Asserted as well as arranged — and that is the whole of
+  // what the loop below proves: LEXICAL NON-ENUMERATION (Codex T8 r2 #2,
+  // correcting commentary here that claimed no path could reach the file).
+  // It is not a claim about bytes and no assertion in this test could make
+  // it one: the pinned uploader follows symlinks unconditionally, so
+  // replacing session.log with a link to ../action-state.json puts the state
+  // bytes into the archive under one of the very names asserted below, and
+  // every assertion here still passes.
   for (const entry of upload.with.path) {
     assert.equal(entry.includes('action-state.json'), false);
     assert.notEqual(entry, OUTPUT_DIR_EXPR);
@@ -5307,13 +5316,32 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       what: 'that only mode 3 establishes it',
       required: /only linux yama\s+ptrace_scope 3 does that unconditionally/i,
       // The exact overclaim the r6 Critical was: modes 1 and 2 counted as a
-      // boundary, which is the hosted-runner default.
+      // boundary.
       forbidden: /ptrace_scope >= 1|modes? 1 and 2 (?:are|is) (?:enough|sufficient|a boundary)/i,
     },
+    // THE MODE-1 IMAGE ASSERTION IS GONE (Codex T8 r2 #4, ruling). This
+    // required half used to mandate "standard GitHub-hosted runners ship mode
+    // 1 with passwordless sudo" — a moving external property of somebody
+    // else's images that this job never measures, fossilized by a REQUIRED
+    // pin, which is the shape that fights whoever tries to correct it. What
+    // survives is what the conclusion actually rests on and what this repo
+    // does observe: modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and
+    // hosted runners hand workflow commands passwordless sudo (the live sudo
+    // reading denies on exactly that, dogfooded by the demo). Neither needs
+    // to know which mode an image ships.
     {
       what: 'why modes 1 and 2 are not a boundary here',
-      required: /bypassable with cap_sys_ptrace, and standard\s+github-hosted runners ship mode 1 with passwordless sudo/i,
+      required: /modes? 1 and 2 restrict\s+attachment but are bypassable with cap_sys_ptrace/i,
       forbidden: /cap_sys_ptrace (?:is|remains) (?:theoretical|unreachable)/i,
+    },
+    {
+      what: 'that passwordless sudo is what makes the bypass reachable',
+      where: ['action.yml comments', 'support.js comments'],
+      required: /hosted (?:linux )?runners (?:give|hand) workflow commands passwordless\s+sudo/i,
+      // NOT a pin on any mode number: an image property this job never reads
+      // is exactly what round 2 removed, and re-adding it as an inverse would
+      // reintroduce it by the back door.
+      forbidden: /(?:hosted runners?|hosted images?|the hosted default) (?:ships?|use[sd]?|defaults? to) (?:yama )?mode [0-9]/i,
     },
     {
       what: 'that the action refuses rather than merely labels',
@@ -5465,6 +5493,44 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       what: 'that the idle timeout is not a teardown backstop',
       required: /the collector's idle timeout never terminates the process/i,
       forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
+    },
+    // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 fixed
+    // WHERE the reaping lives and left the contract self-contradictory: the
+    // bullet said cleanup is unavailable when the runner dies, and the prose
+    // beside it called that the case the always() step covers. It cannot be.
+    // Finalization is work the runner process does, so a dead runner runs
+    // neither — while disabled process tracking defeats finalization only.
+    // Both halves pinned, because either one alone reads as reassurance.
+    {
+      what: 'that the always() step is scoped to a runner that survives to run it',
+      required: /only while the runner survives to run it/i,
+      // Its OWN inverse — the step still running through a dead runner — and
+      // not merely the two topics co-occurring. A first draft of this pin
+      // forbade "always() step covers ... runner death", which rejected the
+      // true "the always() step covers a preceding step failing, not the
+      // runner dying"; the two-directional probe caught it before it shipped.
+      // The retracted sentence itself is caught by the claim below, where it
+      // belongs.
+      forbidden: /always\(\) (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
+    },
+    {
+      what: 'that runner death defeats both backstops',
+      required: /two separate backstops, and runner death defeats both/i,
+      forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}(?:this|the) always\(\) step covers|(?:covered|handled) by (?:this|the) always\(\) step/i,
+    },
+    // THE UPLOAD CLAIM IS ABOUT PATH NAMES, NEVER BYTES — pinned on these
+    // surfaces because it has now needed correcting FOUR times across two
+    // rounds (Codex T8 r1 #1, r2 #2): both README sites, action.yml's upload
+    // comment, and support.js's own header. Every categorical form is false
+    // (the pinned uploader follows symlinks unconditionally) and every one of
+    // them reads more naturally than the true one, which is why it keeps
+    // coming back. The forbidden half is subject-bound so that unrelated
+    // reachability prose on these surfaces is not caught by it.
+    {
+      what: 'that the state file is excluded by path NAME, not by byte-level prevention',
+      where: ['action.yml comments', 'support.js comments'],
+      required: /no enumerated path names it/i,
+      forbidden: /(?:state file|action-state\.json)[^.]{0,160}(?:no path (?:here |in this list )?can reach it|must never be uploaded|can never be uploaded|cannot reach the (?:artifact|archive))/i,
     },
     // The same two descriptions as the README pins, on the surface GitHub
     // actually renders to a consumer who never opens this file.
@@ -8688,8 +8754,15 @@ const README_CLAIMS = [
     required: /scoped to the first \(or only\) invocation in a job/i,
     // `appl(?:y|ies)` since T8 r1: the round-1 audit paraphrased this as "the
     // guarantees apply to any invocation" and the pin, which knew only
-    // "applies", let it through.
-    forbidden: /(?:holds|hold|appl(?:ies|y)) (?:for|to) (?:every|any|each|all) invocations?/i,
+    // "applies", let it through. THE WIDENING THEN OVERSHOT (Codex T8 r2 #3):
+    // dropping the subject left a bare predicate that rejected any unrelated
+    // rule which really is unconditional — "One invocation at a time per
+    // output directory: that rule holds for every invocation" — and, with no
+    // account of negation, rejected this very claim stated plainly ("the
+    // guarantee does not hold for every invocation"). Bound to the subject
+    // and to the affirmative verb: the copula sits next to the predicate, so
+    // an interposed "does not" no longer matches.
+    forbidden: /(?:the |these )?guarantees? (?:holds?|appl(?:ies|y)) (?:for|to) (?:every|any|each|all) invocations?|\bit (?:holds|applies) (?:for|to) (?:every|any|each|all) invocations?/i,
   },
   {
     what: 'that an earlier instrumented command in the same job breaks it',
@@ -8831,7 +8904,16 @@ const README_CLAIMS = [
     // keeps the match inside one sentence (which was the real intent) and
     // still does not match this README's own row, whose next 60 characters
     // after `report.md` are "(and the Step Summary) | Markdown-**escaped**…".
-    forbidden: /compare (?:the copies|them) against `?report\.md`?|`report\.md`[^.]{0,60}verbatim/i,
+    //
+    // AND THAT WINDOW THEN REJECTED THE TRUTH (Codex T8 r2 #3): "`report.md`
+    // is NOT verbatim" is a true statement about this very system, and the
+    // sentence-wide window swallowed the negation on its way to the noun.
+    // Both halves are now TEMPERED — each of the ≤60 characters must not
+    // begin a negation word — so the window still crosses a table cell but
+    // stops dead at "not"/"never". The first half gets the same treatment
+    // from the other side, because "never compare the copies against
+    // `report.md`" is the instruction this README actually gives.
+    forbidden: /(?<!\b(?:never|not|rather than|instead of) )compare (?:the copies|them) against `?report\.md`?|`report\.md`(?:(?!\b(?:not|never|nor|neither|unlike|isn['’]t|aren['’]t)\b)[^.]){0,60}verbatim/i,
   },
   // (6) THE EMPTY-PATH REMEDIATION.
   {
@@ -8880,8 +8962,14 @@ const README_CLAIMS = [
     section: SECTION_DEMO,
     required: /the demo proves the exact\s*`DEMO_FAKE_SECRET` -> `\[REDACTED\]` fixture/i,
     // `can ever` added T8 r1: "demonstrates that no secret can ever leak" is
-    // the same over-claim and the alternation did not carry it.
-    forbidden: /(?:proves|demonstrates|establishes) that (?:arbitrary |any |no )?secrets? (?:cannot|can never|can ever|will never|could ever) leak/i,
+    // the same over-claim and the alternation did not carry it. BUT `no` was
+    // OPTIONAL, so the widening also matched the affirmative proposition —
+    // "the demo demonstrates that secrets can ever leak" — which is a
+    // different claim entirely and not this over-claim at all (Codex T8 r2
+    // #3). `can ever` only reverses the claim when a negative subject
+    // precedes it, so it now lives in a branch that REQUIRES `no secret(s)`;
+    // the subjectless branch keeps only the inherently negative modals.
+    forbidden: /(?:proves|demonstrates|establishes) that (?:(?:arbitrary |any |the )?secrets? (?:cannot|can never|will never|could never) leak|no secrets? (?:can|could|will) ever leak)/i,
   },
   {
     what: 'that the demo does NOT generalise to arbitrary secrets',
@@ -8917,7 +9005,16 @@ const README_CLAIMS = [
     // whichever of the two files it is about.
     // The apostrophe class is both spellings on purpose: a curly one is an
     // ordinary editor artefact and would otherwise walk the pin.
-    forbidden: /the state file cannot reach the artifact|`action-state\.json` can never be uploaded|not uploaded by this action|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
+    //
+    // THE `not uploaded by this action` ALTERNATIVE WAS SUBJECTLESS (Codex T8
+    // r2 #3), so it rejected any unrelated file truthfully described that way
+    // — a checkout's `package-lock.json`, a consumer's build outputs. It is
+    // now bound to the subject in the order the retracted sentence actually
+    // used: "Not uploaded by this action: the collector's own session log",
+    // subject after the colon. The subject-first branch stays scoped to
+    // `never`, because "the state file is not uploaded *by name*" is TRUE and
+    // is the sentence a careful editor writes.
+    forbidden: /the state file cannot reach the artifact|`?action-state\.json`? can never be uploaded|\bnot uploaded by this action[^.]{0,30}(?:state file|action-state|collector(?:['’]s)? (?:own )?(?:session )?log)|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
   },
   // The same claim as it reaches a reader of the EXIT TAXONOMY, where the
   // over-claim actually shipped. The signal name is absent from what the
@@ -8944,6 +9041,33 @@ const README_CLAIMS = [
     section: SECTION_SELF_HOSTED,
     required: /the collector's idle timeout never terminates the process/i,
     forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
+  },
+  // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 corrected
+  // WHERE the reaping lives and left the contract contradicting itself: this
+  // section's own bullet said cleanup is unavailable when the runner dies,
+  // and the sentence beside it called that the case the `always()` step
+  // covers. It cannot be — finalizing a job is work the runner process does,
+  // so a dead runner runs neither the step nor the cleanup, while disabled
+  // process tracking defeats the cleanup alone. With a detached collector
+  // whose idle timeout never exits (the claim above), that is the path that
+  // can leave a listener behind, and a reader who believes `always()` covers
+  // it will not go looking.
+  {
+    what: 'that the always() teardown step is scoped to a runner that survives to run it',
+    section: SECTION_SELF_HOSTED,
+    required: /only while the runner survives\s+to run it/i,
+    // Its OWN inverse — the step still running through a dead runner. Pinning
+    // the two topics' co-occurrence instead rejected the true sentence "the
+    // `always()` step covers a preceding step failing, not the runner dying",
+    // which the two-directional probe caught before it shipped. The retracted
+    // sentence is caught by the claim below, where it belongs.
+    forbidden: /`?always\(\)`? (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
+  },
+  {
+    what: 'that runner death defeats both backstops',
+    section: SECTION_SELF_HOSTED,
+    required: /two separate backstops, and runner death defeats\s+both/i,
+    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}(?:which is )?(?:exactly )?the case the `?always\(\)`? step[^.]{0,10}covers|(?:covered|handled) by the `?always\(\)`? step/i,
   },
 ];
 

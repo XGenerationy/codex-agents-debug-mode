@@ -212,10 +212,13 @@ runs:
       # refuses classic same-UID ptrace attachment, and ONLY Linux Yama
       # ptrace_scope 3 does that unconditionally. Modes 1 and 2 restrict
       # attachment but are bypassable with CAP_SYS_PTRACE, and standard
-      # GitHub-hosted runners ship mode 1 WITH passwordless sudo — so a hostile
-      # native command there can elevate and attach to this process, or to the
-      # collector whose pid is in the state file, and read or inject memory,
-      # which defeats authenticated evidence outright.
+      # GitHub-hosted runners give workflow commands PASSWORDLESS SUDO — so a
+      # hostile native command there can elevate and attach to this process,
+      # or to the collector whose pid is in the state file, and read or inject
+      # memory, which defeats authenticated evidence outright. Which mode a
+      # current hosted image ships is deliberately NOT recorded (Codex T8 r2
+      # #4): it is a moving external property this job never measures, and it
+      # is not needed — the sudo fact makes 1 and 2 bypassable either way.
       #
       # AND MODE 3 IS NOT ENOUGH ON ITS OWN (Codex T6 r8, and it reverses what
       # round 7 wrote here). Yama governs ptrace and nothing else: a principal
@@ -358,7 +361,14 @@ runs:
       #
       # The filenames stay enumerated rather than uploading the directory, and
       # action-state.json — this run's session token — lives at the output-dir
-      # ROOT, outside the staging child, so no path here can reach it.
+      # ROOT, outside the staging child, so NO ENUMERATED PATH NAMES IT.
+      # Note the shape of that claim, which is the README's (Codex T8 r2 #2 —
+      # this comment was the THIRD surface still making the byte-level
+      # promise after round 1 corrected the other two): it is about the path
+      # NAMES, never about the bytes. Residual 2 below is this same step
+      # following symlinks unconditionally, so replacing session.log with a
+      # link to ../action-state.json puts the state bytes into the archive
+      # under one of these very names. The names are what this list controls.
       #
       # Two residuals, documented rather than prevented, both following from
       # same-user staging:
@@ -403,9 +413,18 @@ runs:
       # finalization terminates tracked orphans. The previous hosted/
       # self-hosted split was simply wrong about where the behaviour lives.
       #
-      # It is a backstop, not a guarantee: it is unavailable if process
-      # tracking was disabled or altered on that runner, or if the runner
-      # process itself died — which is the case this always() step covers.
+      # TWO SEPARATE BACKSTOPS, AND RUNNER DEATH DEFEATS BOTH (Codex T8 r2 #1,
+      # correcting what this comment said). Neither is a guarantee and neither
+      # covers the other. This always() step covers an EARLIER STEP of the job
+      # failing — but only while the runner survives to run it. Runner
+      # finalization covers this step never running or failing — but only
+      # while the runner survives to finalize, since terminating tracked
+      # orphans is work that same runner process does. So process tracking
+      # disabled or altered on that runner defeats finalization alone, while
+      # the runner process dying defeats BOTH — this comment previously
+      # credited this step's own guard with that case, and it never could.
+      # With the collector detached and the timeout below never exiting it,
+      # that is the case which can leave a listener behind.
       #
       # AND THE COLLECTOR'S IDLE TIMEOUT NEVER TERMINATES THE PROCESS. The
       # 15-minute timeout retires IN-MEMORY SESSION CREDENTIALS

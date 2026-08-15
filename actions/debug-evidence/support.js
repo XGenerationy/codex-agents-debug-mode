@@ -4,7 +4,12 @@
 // Subcommands: start | run | report | teardown | finish, driven by
 // DEBUG_ACTION_* env vars. State travels via action-state.json at the
 // OUTPUT-DIR ROOT — deliberately outside the evidence child, because it
-// carries this run's session token and must never be uploaded.
+// carries this run's session token and NO ENUMERATED PATH NAMES IT. That is
+// a claim about the upload step's path NAMES, never about the bytes (Codex
+// T8 r2 #2, replacing the categorical promise this header used to make): the
+// pinned uploader follows symlinks unconditionally, so a swap inside the
+// staging window can still put these bytes into the archive under one of the
+// enumerated payload names.
 
 const {
   appendFileSync, closeSync, constants, fstatSync, lstatSync, mkdirSync,
@@ -44,10 +49,18 @@ const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 // VM-based GitHub-hosted Linux runners give workflow commands PASSWORDLESS
 // SUDO. A command that can `sudo` can grant itself the capability and attach.
 // Reading the current process's own capabilities would not detect this: the
-// escalation path is sudo, not an inherited capability. So mode 1 — the
-// hosted-runner default — is `privilege-bypassable`, and calling it
-// "restricted" (as this code did) was the action's core authentication
-// guarantee silently failing on its principal platform.
+// escalation path is sudo, not an inherited capability. So modes 1 and 2 are
+// `privilege-bypassable`, and calling either "restricted" (as this code did)
+// rested the action's core authentication guarantee on a boundary that one
+// `sudo` removes.
+//
+// DELIBERATELY NOT RECORDED HERE: which Yama mode any current runner image
+// ships (Codex T8 r2 #4, which removed exactly that assertion from this
+// comment). It is a moving external property this job never measures, and
+// the conclusion does not need it — passwordless sudo is what makes 1 and 2
+// bypassable, whichever of them a given host is in, and the live sudo
+// reading below denies strict on such a host without consulting the mode
+// at all.
 //
 // The action cannot create the boundary. It classifies honestly, and
 // `startSubcommand` refuses to run the wrapped command at all unless the

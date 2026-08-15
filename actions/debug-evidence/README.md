@@ -605,16 +605,22 @@ afterwards (commenting, uploading elsewhere) may still be.
 ## Self-hosted runners
 
 - **`Stop collector` is this action's own teardown.** The collector is detached and
-  outlives the `start` step, so no other step of this action stops it.
+  outlives the `start` step, so no other step of this action stops it. Its `always()`
+  guard covers an *earlier step of this job* failing — but only while the runner survives
+  to run it.
 - **Normal runner job cleanup also attempts to kill the tracked collector, on hosted and
   self-hosted runners alike.** That is *runner* behaviour, not a property of the hosted
   images, and this action does nothing to opt out of it: the runner exports
   `RUNNER_TRACKING_ID` into every step's environment, `start` hands its step's **complete**
   environment to the detached shim and never clears that variable, so the collector stays
-  a tracked process and the runner's job finalization terminates tracked orphans. Treat it
-  as a backstop and not as a guarantee — it is unavailable if process tracking was
-  disabled or altered on that runner, or if the runner process itself died, which is
-  exactly the case the `always()` step above covers.
+  a tracked process and the runner's job finalization terminates tracked orphans.
+- **Those are two separate backstops, and runner death defeats both.** Treat neither as a
+  guarantee, and do not read either as covering the other. Job finalization is unavailable
+  if process tracking was disabled or altered on that runner — there the `always()` step is
+  all you have. And if the runner *process* itself dies, **neither** runs: the step never
+  executes, and finalizing the job is work that same dead process would have had to do. The
+  `always()` step does not cover that case. Nothing in this action does, and together with
+  the next bullet, that is the path which can leave a listener behind.
 - **The collector's idle timeout never terminates the process.** Be precise about this:
   the 15-minute idle timeout retires *in-memory session credentials* (a later `POST /log`
   then gets `unknown_session`) and does nothing else. If neither `Stop collector` nor the
