@@ -3885,6 +3885,23 @@ Both cases fixed. `yamlLines` now holds `{ headerIndent, contentIndent }`: the f
 >
 > **THE REMAINING FIX IS SCOPED TO ONE FUNCTION:** `stripYamlComment` needs the single piece of context it lacks — where the value token begins on this line — which its caller in `yamlLines` already knows (after `key:` plus separation, or after `- `). **The design decision to name before anyone starts: it CANNOT be the same function used by `workflowCode`/`ACTION_YML_CODE`, which are deliberately structure-free text scans with no node start to compute.** That split is the whole of the change.
 
+#### Task 7 fix round 9 (Codex review of `4a572f7`+`c7fc1ab`: 1 Important) — THE LAST ROUND
+
+**(1) Important — the property's "legal document" domain is wrong, and it FREEZES THE EXCLUSIONS AS REQUIREMENTS.** `generatedWorkflow` places arbitrary maps, sequences, block scalars and keys such as `alpha` beneath `on:` and calls them legal, but GitHub requires `on` to identify supported trigger events. **This is not a prose problem: `checkAccepted` treats EVERY refusal — including a future CORRECT schema refusal — as a false rejection, so the property test pins exactly the gaps the claim states are deliberately NOT pinned** (unknown events, arbitrary `on` shapes).
+
+**THIS IS THE THIRD APPEARANCE OF ONE DEFECT CLASS, now one level up.** Round 4 deliberately added no `doesNotThrow` pins over the disclosed exclusions, on the explicit ground that "today's gap does not become tomorrow's requirement." Round 6 found three absence scans that would have certified an empty string. **Round 8's accept-check reintroduces the same hazard wholesale — an assertion that something is ACCEPTED is a requirement, and a generator that asserts acceptance over a schema-invalid corpus silently converts every known gap into a contract.** A test built to avoid asserting things asserted the biggest thing of all.
+
+**FIX — separate syntax from schema, which is the right decomposition anyway:**
+- `parseWorkflowSyntaxText(text)` → tokenizer and structural parser ONLY.
+- `parseWorkflowText(text)` → `assertWorkflowSchema(parseWorkflowSyntaxText(text))`.
+- **Run the generated-YAML property against the SYNTAX function.** The property is about the PARSER; running it through the schema was the category error. Then arbitrary YAML subtrees are legitimate parser inputs without freezing GitHub-schema gaps.
+
+**ALSO CORRECTED — the PyYAML oracle claim was overstated.** PyYAML establishes YAML GRAMMAR, not GitHub Actions validity, so it cannot repair the domain error. And its default resolver treats `on` as BOOLEAN, so the reported "exact model agreement" required undocumented loader customization. **Offline PyYAML is legitimate corroboration for YAML syntax with no dependency-policy impact — it is NOT a GitHub-workflow oracle**, and the claim must say so.
+
+**RULED — CLOSE TASK 7 AFTER THIS, DO NOT OPEN A ROUND FOR NODE-START.** Codex: *"I would NOT require the apostrophe/node-start fix before closeout. It is absent from the real files, explicitly excluded, and fixing it risks interaction with the still-unparsed flow-collection domain. After correcting the property's parser/schema boundary, close Task 7 rather than opening round 9 for that limit."* The coordinator's lean to close was correct; the acceptance test round 8 built (82/4,000) stays as the ready-made driver if that limit is ever taken up.
+
+**RULED SOUND, no further work:** `4a572f7` correctly closes both boundary cases and removes the duplicate predicates. **The round-trip invariant is valuable and worth its 1.2 s — the structural-column reprint, the key/type/order checks and the injected regressions make it materially stronger than example tests.** The coverage floors are meaningful, and roughly half the measured counts is a reasonable disappearance alarm.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
