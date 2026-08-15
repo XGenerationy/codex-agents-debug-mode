@@ -8583,3 +8583,320 @@ test('the demo repro checks exactly the control-plane variables the run step del
   // And the repro no longer advertises an eyeball contract it does not need.
   assert.doesNotMatch(readFileSync(REPRO_PATH, 'utf8'), /by eye/i);
 });
+
+// --- Task 8: the consumer documentation's own polarity pins ----------------
+//
+// Documentation is nothing but claims, so it gets the same treatment every
+// other security claim in this action got (Codex T6 r5 process ruling, r8 #4):
+// a REQUIRED form and a FORBIDDEN inverse, asserted per surface, each half
+// shown capable of failing on its own. Round 8 ruled a LIGHTER check
+// sufficient here — per-SECTION rather than whole-file, and no hash of the
+// document (hashing detects formatting edits, not semantic reversals, and
+// encourages mechanical checksum updates).
+//
+// Why per-section: a claim that drifts out of the section a reader consults,
+// and survives in a paragraph elsewhere, has failed at its job. The required
+// half therefore names the section that must carry it, while the forbidden
+// half is checked against EVERY documentation surface, because a contradiction
+// anywhere in what ships is the failure being pinned (Task 9 gate 6).
+//
+// MUTATIONS, run at authoring time, each half independently (Codex T6 r8, the
+// fourth-mutation standard): for every claim below, deleting the matched text
+// from the README turned its required half red while the forbidden half stayed
+// green, and appending the inverse sentence to the same section turned its
+// forbidden half red while the required half stayed green. A required half
+// whose mutation does not actually remove the matched text proves nothing,
+// which is why the mutation replaced the matched substring everywhere it
+// occurred rather than editing one occurrence by hand.
+const ACTION_README = () => readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+
+// Whitespace-normalised so a claim can wrap across lines in the source and
+// still be one string here; `## ` headings open a section and `### ` ones fold
+// into their parent, which is where several of these claims live.
+const readmeSections = (text) => {
+  const sections = new Map();
+  let current = null;
+  for (const line of text.split(/\r?\n/)) {
+    const heading = /^##[ \t]+(.*\S)[ \t]*$/.exec(line);
+    if (heading) {
+      current = heading[1];
+      sections.set(current, []);
+      continue;
+    }
+    if (current !== null) sections.get(current).push(line);
+  }
+  return new Map([...sections].map(([name, lines]) => [name, lines.join(' ').replace(/\s+/g, ' ').trim()]));
+};
+
+const SECTION_OUTPUTS = 'Outputs';
+const SECTION_ARTIFACT = 'The evidence artifact';
+const SECTION_REDACTION = 'Redaction invariant';
+const SECTION_TRUST = 'Evidence trust: `strict` and `best-effort`';
+const SECTION_LOGS = 'Reading the step logs';
+const SECTION_VERIFY = 'Verifying a run by hand';
+const SECTION_EXITS = 'Exit semantics';
+const SECTION_DEMO = 'Demo';
+const SECTION_RESIDUALS = 'Scope, limitations, and residual risks';
+
+// The eight hard requirements, each as a required form plus the inverse that
+// must appear nowhere. The inverses are not invented: every one of them is
+// either a sentence this project actually wrote and had to take back, or the
+// shape of the over-claim a reader would most naturally drift into.
+const README_CLAIMS = [
+  // (1) THE SEPARATE-JOB LIMITATION.
+  {
+    what: 'that the guarantee is scoped to the first (or only) invocation',
+    section: SECTION_RESIDUALS,
+    required: /scoped to the first \(or only\) invocation in a job/i,
+    forbidden: /(?:holds|hold|applies) (?:for|to) (?:every|any|each|all) invocations?/i,
+  },
+  {
+    what: 'that an earlier instrumented command in the same job breaks it',
+    section: SECTION_RESIDUALS,
+    required: /do [*_]*not[*_]* survive an earlier instrumented command in the same job/i,
+    forbidden: /(?:does survive|survives) an earlier instrumented command/i,
+  },
+  {
+    what: 'the separate-job requirement',
+    section: SECTION_RESIDUALS,
+    required: /belongs in a\s*[*_]*separate job[*_]*/i,
+    forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|reuse (?:it|the action) safely in the same job/i,
+  },
+  {
+    what: 'the refusal to guarantee same-job reuse',
+    section: SECTION_RESIDUALS,
+    required: /same-job reuse is not something this runner channel can be made to guarantee/i,
+    forbidden: /same-job reuse is something this runner channel can be made to guarantee/i,
+  },
+  // (2) THE FIVE-OUTPUT AVAILABILITY DISCLOSURE.
+  {
+    what: 'that all five outputs are availability-only and attacker-suppressible',
+    section: SECTION_OUTPUTS,
+    required: /all five outputs are availability-only, and all five are attacker-suppressible/i,
+    forbidden: /(?:these|the five|the) outputs? (?:are|is) (?:authoritative|trustworthy|tamper-resistant|reliable)|outputs? cannot be (?:suppressed|forged)/i,
+  },
+  {
+    what: 'that the verdict is the run step exit code, not an output',
+    section: SECTION_OUTPUTS,
+    required: /the verdict is the run step's exit code/i,
+    forbidden: /digest[^.]{0,30}is the (?:trust anchor|authoritative copy)/i,
+  },
+  // (3) EVIDENCE-TRUST: THE REFUSAL, ITS COST, ITS REACH, AND THE SYSCTL ROUTE.
+  {
+    what: 'that strict refuses on the default hosted configuration',
+    section: SECTION_TRUST,
+    required: /GitHub-hosted runner images ship `sudo`, so the sudo reading is not clear and `start` returns 3/i,
+    forbidden: /strict (?:works|is available|is reachable|is fine) on (?:a |the )?(?:default )?hosted runners?/i,
+  },
+  {
+    what: 'that the refusal precedes the wrapped command',
+    section: SECTION_TRUST,
+    required: /before the collector is booted and before your command exists/i,
+    forbidden: /labell?ing (?:alone )?is (?:enough|sufficient)|the label (?:is|remains) sufficient/i,
+  },
+  {
+    what: 'that mode 3 is necessary and not sufficient',
+    section: SECTION_TRUST,
+    required: /mode 3 is [*_]*necessary, not sufficient[*_]*/i,
+    forbidden: /mode 3 (?:alone )?is (?:enough|sufficient)|ptrace_scope 3 is all (?:that is |it )?(?:required|needed)/i,
+  },
+  {
+    what: 'that the sysctl route does not buy strict on a hosted runner',
+    section: SECTION_TRUST,
+    required: /does not make hosted\s*execution strict-admissible/i,
+    forbidden: /sysctl[^.]{0,90}(?:makes|make|turns) (?:it|hosted execution|the runner|a hosted runner) strict|harden the runner first(?![^.]*not)/i,
+  },
+  {
+    what: 'what best-effort costs',
+    section: SECTION_TRUST,
+    required: /diagnostic claims only; none of them authenticates\s*anything/i,
+    forbidden: /best-effort (?:evidence )?(?:is|remains) (?:authenticated|tamper-resistant|trustworthy)/i,
+  },
+  {
+    what: 'that strict is reachable only where there is no route to root',
+    section: SECTION_TRUST,
+    required: /reachable only where the wrapped principal has\s*[*_]*no route to root[*_]*/i,
+    forbidden: /strict is reachable on (?:any|most|ordinary) (?:hosts?|runners?)/i,
+  },
+  {
+    what: 'that the admission check names routes rather than their absence',
+    section: SECTION_TRUST,
+    required: /not a proof that no route\s*exists/i,
+    forbidden: /(?:proves|establishes|guarantees|confirms|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
+  },
+  {
+    what: 'that the action verifies no correspondence between the three pieces',
+    section: SECTION_TRUST,
+    required: /verifies none of that correspondence/i,
+    forbidden: /(?:the action|it) (?:verifies|checks|confirms|proves) (?:that )?(?:the )?(?:copies|records|three pieces) (?:match|belong together)/i,
+  },
+  // (4) THE LOG-LINE GRAMMAR: PROVENANCE, REGIME, DUPLICATES.
+  {
+    what: 'the diagnostic prefix and its step provenance',
+    section: SECTION_LOGS,
+    required: /debug-evidence-action: <step>: <text>[^|]*\| stderr \|/,
+    forbidden: /the prefix (?:tells|says|shows|distinguishes)[^.]{0,60}(?:strict|best-effort)/i,
+  },
+  {
+    what: 'that the regime is distinguished inside the record, not by the prefix',
+    section: SECTION_LOGS,
+    required: /distinguished inside the record, not by the prefix/i,
+    forbidden: /a (?:separate|different|dedicated) prefix (?:for|marks|identifies) best-effort/i,
+  },
+  {
+    what: 'that duplicate or conflicting lines make the set unusable',
+    section: SECTION_LOGS,
+    required: /if you find duplicates, or two lines that disagree, [*_]*reject the set[*_]*/i,
+    forbidden: /(?:the action|it|support\.js) (?:de-?duplicates|arbitrates|resolves|reconciles) (?:the )?(?:duplicate|conflicting)/i,
+  },
+  // (5) THE RENDERED ADMISSION RECORD, AND WHICH COPY IS COMPARABLE.
+  {
+    what: 'a rendered admission record',
+    section: SECTION_LOGS,
+    required: /ADMISSION RECORD \(streamed by start before the wrapped command existed\): invocation=/,
+    forbidden: /the record is (?:identical|byte-identical) (?:on|across) (?:all )?(?:three )?surfaces/i,
+  },
+  {
+    what: 'that report.md is escaped and capped while report.json is the comparable copy',
+    section: SECTION_LOGS,
+    required: /The copies are not\s*byte-identical across surfaces/i,
+    forbidden: /compare (?:the copies|them) against `?report\.md`?|`report\.md`[^|]{0,60}verbatim/i,
+  },
+  // (6) THE EMPTY-PATH REMEDIATION.
+  {
+    what: 'the unset-rather-than-empty PATH remediation',
+    section: SECTION_TRUST,
+    required: /unset `PATH` rather than emptying it/i,
+    forbidden: /`?PATH=""`?[^.]{0,60}(?:is fine|is safe|clears|counts as absent)|(?:set|setting) `?PATH`? to (?:an )?empty (?:string )?(?:is|to) (?:fine|safe|equivalent)/i,
+  },
+  {
+    what: 'that only an ABSENT PATH means conventional locations only',
+    section: SECTION_TRUST,
+    required: /An absent variable means\s*"conventional locations only"/i,
+    forbidden: /an empty `?PATH`? means "?conventional locations only"?/i,
+  },
+  // (7) THE EXACT DIGEST RECIPE, INCLUDING THE DERIVED-CANDIDATE DEDUP CLAUSE.
+  {
+    what: 'the sort/join/hash/case of the sudo fingerprint',
+    section: SECTION_VERIFY,
+    required: /[*_]*sorted[*_]* with JavaScript's default comparison \(UTF-16 code-unit order\)[^.]*joined with a single NUL byte[^.]*hashed as [*_]*UTF-8[*_]*, printed as [*_]*lowercase hex/i,
+    forbidden: /joined with (?:a )?(?:colon|comma|newline|space)|printed as (?:upper|UPPER)case hex/i,
+  },
+  {
+    what: 'that dedup happens on the DERIVED candidate',
+    section: SECTION_VERIFY,
+    required: /Deduplicate by exact spelling, on the derived candidate/i,
+    forbidden: /deduplicat\w+ (?:the |on the )?raw `?PATH`? entr/i,
+  },
+  {
+    what: 'that the count is matched spellings, not distinct binaries or inodes',
+    section: SECTION_VERIFY,
+    required: /matched candidate [*_]*spellings[*_]*, not distinct binaries or inodes/i,
+    forbidden: /resolving to the same file count(?:s|ed)? twice/i,
+  },
+  {
+    what: 'that the payload digests are recomputable from the downloaded artifact',
+    section: SECTION_VERIFY,
+    required: /lowercase hex SHA-256 of that payload's [*_]*UTF-8 bytes[*_]*, computed\s*from memory [*_]*before[*_]* the file was written/i,
+    forbidden: /hashed (?:back )?(?:off|from) disk after staging/i,
+  },
+  // (8) THE DEMO WORDING BOUNDARY (the reviewer's ruling, and the same
+  // over-claim nine rounds of Task 7 were about). The forbidden half uses the
+  // third-person forms only, so the required sentence's own "does not prove
+  // that arbitrary secrets cannot leak" cannot satisfy it.
+  {
+    what: 'that the demo proves the exact fixture',
+    section: SECTION_DEMO,
+    required: /the demo proves the exact\s*`DEMO_FAKE_SECRET` -> `\[REDACTED\]` fixture/i,
+    forbidden: /(?:proves|demonstrates|establishes) that (?:arbitrary |any |no )?secrets? (?:cannot|can never|will never) leak/i,
+  },
+  {
+    what: 'that the demo does NOT generalise to arbitrary secrets',
+    section: SECTION_DEMO,
+    required: /It does not\s*prove that arbitrary secrets cannot leak/i,
+    forbidden: /the demo (?:therefore )?proves redaction (?:in general|generally|for any secret)/i,
+  },
+  // AND THE TWO INVARIANTS A CONSUMER ACTS ON DIRECTLY.
+  {
+    what: 'why the collector inherits the job environment',
+    section: SECTION_REDACTION,
+    required: /A collector that inherits less is a collector that redacts less/i,
+    forbidden: /start(?:ing)? the collector with a (?:clean|stripped|minimal) environment (?:is|would be) (?:safer|better|recommended)/i,
+  },
+  {
+    what: 'that the state file is excluded by PATH, not by byte-level prevention',
+    section: SECTION_ARTIFACT,
+    required: /no path the upload step enumerates names it/i,
+    forbidden: /the state file cannot reach the artifact|`action-state\.json` can never be uploaded/i,
+  },
+];
+
+test('the action README states each hard requirement in the required form, and no surface reverses it', () => {
+  const sections = readmeSections(ACTION_README());
+  // The extractor is load-bearing: a renamed heading would otherwise turn
+  // every per-section assertion below into a lookup of undefined, and the
+  // failure would read as a missing claim rather than a missing section.
+  for (const name of [
+    SECTION_OUTPUTS, SECTION_ARTIFACT, SECTION_REDACTION, SECTION_TRUST,
+    SECTION_LOGS, SECTION_VERIFY, SECTION_EXITS, SECTION_DEMO, SECTION_RESIDUALS,
+  ]) {
+    const body = sections.get(name);
+    assert.ok(typeof body === 'string' && body.length > 200, `README section '${name}' is missing or empty`);
+  }
+  // Every documentation surface a consumer or an agent reads. The forbidden
+  // halves sweep all three: a contradiction in the repo README or in SKILL.md
+  // is a contradiction in what ships.
+  const surfaces = {
+    'the action README': ACTION_README().replace(/\s+/g, ' '),
+    'the repository README': readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8').replace(/\s+/g, ' '),
+    'SKILL.md': readFileSync(path.join(REPO_ROOT, 'SKILL.md'), 'utf8').replace(/\s+/g, ' '),
+  };
+  for (const [name, text] of Object.entries(surfaces)) {
+    assert.ok(text.length > 1000, `${name}: the surface reader found nothing to check`);
+  }
+  for (const claim of README_CLAIMS) {
+    assert.match(sections.get(claim.section), claim.required,
+      `the '${claim.section}' section must state ${claim.what}`);
+    for (const [name, text] of Object.entries(surfaces)) {
+      assert.doesNotMatch(text, claim.forbidden, `${name} must not reverse ${claim.what}`);
+    }
+  }
+});
+
+// The residual disclosures, as a presence sweep rather than a polarity pair:
+// these are FACTS THAT MUST STILL BE PUBLISHED (Task 9 gate 7), and the way
+// they fail is by quietly disappearing during a tidy-up, not by being reversed.
+test('the action README keeps disclosing every residual this action does not prevent', () => {
+  const residuals = readmeSections(ACTION_README()).get(SECTION_RESIDUALS);
+  for (const [what, pattern] of [
+    ['same-job adversarial reuse', /`BASH_ENV`/],
+    ['command-planted files in the staging directory', /plant files in the staging directory/i],
+    ['the uploader following symlinks', /follows symlinks, unconditionally/i],
+    ['the staging race', /detectable, not prevented/i],
+    ['the manually compared trust unit', /compared by a human/i],
+    ['checked routes, not a proof', /names routes, not their absence/i],
+    ['staging accumulation on a reused output-dir', /accumulates staging children/i],
+  ]) {
+    assert.match(residuals, pattern, `the residuals section must still disclose ${what}`);
+  }
+});
+
+// The exit taxonomy a consumer branches on, pinned by the distinction that is
+// easy to get wrong and expensive to get wrong: invalid input is a REFUSAL
+// that exits 1, because it raises rather than returns.
+test('the action README documents the three exit classes, the signal convention, and the one-invocation rule', () => {
+  const exits = readmeSections(ACTION_README()).get(SECTION_EXITS);
+  assert.match(exits, /a [*_]*returned[*_]* refusal is `3`, a [*_]*thrown[*_]* error is `1`/i);
+  assert.match(exits, /Input validation[^.]*exits [*_]*1[*_]*/i);
+  assert.match(exits, /killed by a signal is recorded as exit [*_]*128[*_]*/i);
+  // The signal NAME never leaves the runner, so a reader must not go looking
+  // for it in the artifact.
+  assert.match(exits, /signal name is recorded in the state file only[*_]*, which is never uploaded/i);
+  assert.match(exits, /could not be spawned at all is recorded as [*_]*127[*_]*/i);
+  assert.match(exits, /One invocation at a time per output directory/i);
+  // Staging is invocation-scoped since T6 r1 #3, so the honest form of the old
+  // "staged bytes are not arbitrated" disposition is that invocations do not
+  // collide there at all — the exposure is any same-user process, not a
+  // neighbouring invocation.
+  assert.match(exits, /each invocation stages into its own\s*`debug-evidence-files-<nonce>` child, so invocations do not collide there/i);
+});

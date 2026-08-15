@@ -561,7 +561,19 @@ node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT"
 node /path/to/debug/scripts/debug_diff.js <before-id> <after-id> "$PROJECT" --format=md
 ```
 
-Guarantees both tools keep (enforced by tests):
+Single-session report (CI or local) — summarize one session without a baseline:
+
+```bash
+# Human summary on a TTY; markdown when piped (Step Summary ready)
+node /path/to/debug/scripts/debug_report.js <session-id> "$PROJECT"
+# Machine surface (stable schema: 1)
+node /path/to/debug/scripts/debug_report.js <session-id> "$PROJECT" --format=json
+```
+
+In CI, the `actions/debug-evidence` composite action wraps a failing command in a session
+and renders this report into the Step Summary automatically.
+
+Guarantees all three tools keep (enforced by tests):
 
 - Agent-mode viewer output is byte-verbatim stored NDJSON; `--live` reads the running
   collector (bare session ids only — `.log` paths are file-mode) with filter semantics
@@ -578,6 +590,11 @@ Guarantees both tools keep (enforced by tests):
   `schema: 1` JSON) carry source values unmodified. Malformed (non-string) hypothesis ids are
   excluded, counted in `summary.ignoredMalformedIds`, with their events excluded from totals
   and counted in `summary.ignoredMalformedEvents` — the decision-relevant number.
+- The report keeps the same three: its human surfaces (TTY text and markdown) escape log
+  text through that shared helper and cap each rendered value with an announced ellipsis,
+  its `--format=json` surface is verbatim and uncapped, it renders recorded hypothesis
+  statuses only — never a severity or an inferred verdict — and identical input bytes
+  produce identical output (no timestamps, no ordering by chance).
 
 ## Troubleshooting
 
