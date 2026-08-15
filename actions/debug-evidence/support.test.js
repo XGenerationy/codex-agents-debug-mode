@@ -6772,6 +6772,746 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   );
 });
 
+// ===========================================================================
+// THE ROUND-TRIP PROPERTY, and the first thing in this suite that can find a
+// parser defect WITHOUT somebody reading the code first.
+//
+// Seven review rounds have found defects in this reader. Every one of them was
+// found by a human reading it; nothing in this file has ever found one on its
+// own, so "the last two rounds were clean" is a statement about the reviewers,
+// not about the reader. Every assertion above is a case somebody had already
+// thought of — which is exactly the set a defect has to avoid to survive.
+//
+// THE INVARIANT. For a document D:
+//
+//   EITHER the reader refuses D, OR the document it returns, reprinted onto
+//   the skeleton D was written from, reproduces D's LINE PARTITION — the
+//   ordered list of (content column, text) pairs of the lines D is made of.
+//
+// AND, separately: a document the generator wrote as LEGAL must not be
+// refused. Refusal is only an acceptable answer to a document YAML rejects;
+// refusing a legal one is the false rejection round 4 exists to remove.
+//
+// WHAT "MODULO" COVERS, stated exactly rather than "modulo whitespace". The
+// three lossy normalizations are the three the claim above discloses, in its
+// own words: BLANK LINES ARE DROPPED, TRAILING WHITESPACE IS STRIPPED, and A
+// BODY LINE'S OWN INDENTATION IS TRIMMED (so a body line comes back at its
+// scalar's content indentation, not at its own column). Three further
+// differences are the reader's SEMANTICS rather than losses, and are named
+// here so the list cannot be mistaken for a shorter one: a comment outside a
+// block scalar is not a line of the document at all; a quoted scalar comes
+// back unquoted; and a `>` body is folded to one line, which is what `>`
+// means. Everything else must survive, columns included.
+//
+// WHY THIS INVARIANT AND NOT ANOTHER: BOTH KNOWN DEFECTS VIOLATE IT, and that
+// was verified by REINTRODUCING them rather than argued from the code.
+//
+//   - Round 6 (comment stripping ahead of block-scalar recognition): a body
+//     line reading `# looks like a comment` is deleted, so it VANISHES from
+//     the reprint and the partition is one line short. 19,345 of the 41,816
+//     documents below fail. Its second half — the `- ` marker split running
+//     on body lines — costs the marker instead of the line: 11,162 fail.
+//   - Round 7 (the boundary measured against the header's column instead of
+//     the content's): 6,164 fail — 812 random, 4,704 enumerated, and ALL 648
+//     of the perturbation family, which are ACCEPTED when they must be
+//     refused. There the dedented line comes back at the content indentation
+//     instead of its own column, which is the exact shape the plan predicted,
+//     "column 10 instead of 9" (the smallest case reports a line written at
+//     column 3 reprinted at column 4). On legal documents it shows up as a
+//     trailing comment one column short of the content, absorbed into the
+//     script.
+//
+// A property test that would not have caught the two defects we know about is
+// not worth shipping, so this is the first thing that was checked. Each defect
+// was reintroduced into THIS FILE, the counts above observed, and the file
+// restored and verified byte-identical by SHA-256 — a reintroduction made
+// against a copy would only have proved something about the copy.
+//
+// THE ALPHABET, and the exclusions that are deliberate. Documents are built
+// from block mappings, sequences of mappings, plain and quoted scalars, keys
+// with no value, block scalars under all four headers this reader reads
+// (`|`, `|-`, `>`, `>-`), indent deltas of 1 to 4 columns, full-line comments
+// at every legal column, trailing comments, blank and whitespace-only lines,
+// sequence dashes both aligned with and indented past their key, and body
+// lines that LOOK like comments, like sequence items, like `key: value`, and
+// like shell with a `#` in it. THE THREE DISCLOSED LIMITS ARE EXCLUDED FROM
+// GENERATION, because generating them would produce noise rather than signal:
+// no apostrophe in an UNQUOTED scalar (per-line quote state — inside a block
+// scalar apostrophes ARE generated, since the stripper never runs there), no
+// flow collections, and no multi-line quoted scalars. They are still limits;
+// this round does not fix them and does not pretend to search them.
+//
+// DETERMINISM, because a flaky property test is worse than none. The random
+// family is driven by a mulberry32 PRNG written here — seeds 1..N, one seed
+// per document, no clock and no entropy — and the other two families are
+// exhaustive enumerations. A failure names its seed or its parameter tuple
+// and reproduces on the next run.
+//
+// THE BOUND, and why it is enough. The exhaustive family is complete over
+// 3 placements (a key at column 2, one nested at column 4, one on a sequence
+// dash at column 6) x 4 headers x 3 content indentations x 7 first body lines
+// x 7 second body lines x 2 second-line indentations x 6 followers = 21,168
+// documents. The perturbation family is complete over the illegal dedents and
+// the block-ending comments of the same neighbourhood: 648. That
+// neighbourhood is where the last two rounds of parser defects landed, and the
+// plan's own reading of the seven is that every parser defect has been
+// LEXICAL rather than structural — so a complete search of it is a stronger
+// statement than any number of samples. The random family adds
+// 20,000 documents of shape the enumeration does not reach (deeper nesting,
+// sequences, empty keys, quoted scalars, decorations in every position);
+// their texts are pairwise distinct.
+//
+// WHAT A GREEN RUN LICENSES, and what it does not. It says: no defect in the
+// searched space. It does NOT say the reader is correct. Anything outside the
+// alphabet above — the three disclosed limits first among them — is not
+// searched, and a document is only as legal as the generator's own model says
+// it is. That last claim was checked rather than assumed: OFF-LINE, WITH A
+// REAL YAML LOADER (PyYAML 6.0.3, run once during development and NOT a test
+// dependency — this repo ships zero), a corpus of 24,168 legal documents (the
+// whole enumerated family plus the first 3,000 random ones) loaded without a
+// single error, all 648 perturbed documents were REJECTED, and on the 10,584
+// of them where the reader's three normalizations do not bite, the loader's
+// value agreed exactly with the model's. So "legal" and "YAML rejects this"
+// are both checked claims rather than the generator's opinion of itself.
+//
+// COST: about 1.2 seconds of the file's 21, for 41,816 documents.
+
+// mulberry32, written here because `"dependencies": 0` is load-bearing and a
+// property-testing library is still a dependency. Any deterministic generator
+// would do; what matters is that a failing document is reproducible from its
+// seed and that CI never sees a different corpus than a developer does.
+const seededRandom = (seed) => {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+  };
+};
+const pick = (random, list) => list[Math.floor(random() * list.length)];
+const chance = (random, probability) => random() < probability;
+
+const GEN_KEYS = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'a.b', 'c-d'];
+// No `'`, no `#`, no `|`/`>`/`&`/`*` in first position, no `:` — an apostrophe
+// in an unquoted scalar is the ONE disclosed limit of `stripYamlComment`, and
+// generating it would assert the known-wrong answer rather than search.
+const GEN_PLAIN = ['ubuntu-latest', 'echo ok', 'a b c', '1.2.3', 'v2'];
+// Quoted scalars ARE allowed to carry a `#` and an apostrophe: quote state is
+// correct WITHIN a line, and the disclosed limit is that it does not carry
+// ACROSS lines. `""` is here because an empty quoted scalar is a scalar.
+const GEN_QUOTED = [['"', 'a # b'], ["'", 'a b'], ['"', "don't"], ["'", 'x-y z'], ['"', '']];
+const GEN_HEADERS = ['|', '|-', '>', '>-'];
+// The body alphabet is where round 6 lived: inside a block scalar `#` opens
+// nothing, `- ` marks nothing, `:` separates nothing and an apostrophe quotes
+// nothing, because the stripper and the marker split never run on these lines.
+const GEN_BODY = [
+  'echo ok',
+  '# looks like a comment',
+  '- looks like an item',
+  'echo hi # trailing hash',
+  "echo don't quote me",
+  'key: not-an-entry',
+  'cat <<EOF',
+];
+
+// A model node, which is the SOURCE the document is printed from — not a parse
+// of it. `delta` is how far a block scalar's content, or a nested mapping's
+// keys, sit to the right of the key that owns them.
+const blockNode = (header, delta, lines) => ({
+  kind: 'block',
+  header,
+  delta,
+  lines: lines.map((line) => (typeof line === 'string' ? { text: line, extra: 0 } : line)),
+});
+
+const genBlockScalar = (random) => blockNode(
+  pick(random, GEN_HEADERS),
+  pick(random, [1, 2, 3, 4]),
+  Array.from({ length: Math.floor(random() * 4) }, (unusedValue, index) => ({
+    text: pick(random, GEN_BODY),
+    // Only lines after the first: the first body line IS the content
+    // indentation, so it has no room to be deeper than itself.
+    extra: index === 0 ? 0 : pick(random, [0, 0, 2, 4]),
+  })),
+);
+
+// Duplicate keys are refused by the reader BY DESIGN (Codex T7 r2 #4), so a
+// generator that emitted them would be testing that rule and nothing else.
+const uniqueKeys = (random, count) => {
+  const chosen = [];
+  while (chosen.length < count) {
+    const key = pick(random, GEN_KEYS);
+    if (!chosen.includes(key)) chosen.push(key);
+  }
+  return chosen;
+};
+
+const genMapping = (random, depth) => ({
+  kind: 'map',
+  delta: pick(random, [1, 2, 2, 3, 4]),
+  entries: uniqueKeys(random, 1 + Math.floor(random() * 3))
+    .map((key) => ({ key, value: genValue(random, depth) })),
+});
+
+const genSequence = (random, depth) => ({
+  kind: 'seq',
+  // A dash aligned with its key and a dash indented past it are both legal
+  // YAML and both appear in real workflows.
+  dashDelta: pick(random, [0, 2]),
+  items: Array.from({ length: 1 + Math.floor(random() * 2) }, () => ({
+    kind: 'map',
+    entries: uniqueKeys(random, 1 + Math.floor(random() * 2))
+      .map((key) => ({ key, value: genValue(random, depth - 1) })),
+  })),
+});
+
+function genValue(random, depth) {
+  const kinds = ['plain', 'quoted', 'empty', 'block', 'block'];
+  if (depth > 0) kinds.push('map', 'seq');
+  switch (pick(random, kinds)) {
+    case 'plain': return { kind: 'plain', text: pick(random, GEN_PLAIN) };
+    case 'quoted': {
+      const [quote, text] = pick(random, GEN_QUOTED);
+      return { kind: 'quoted', quote, text };
+    }
+    case 'empty': return { kind: 'empty' };
+    case 'block': return genBlockScalar(random);
+    case 'map': return genMapping(random, depth - 1);
+    default: return genSequence(random, depth - 1);
+  }
+}
+
+// The generated subtree hangs under `on:`, whose contents this reader's schema
+// deliberately does not constrain — so the document stays one GitHub would
+// accept while the subtree is free to be any shape in the subset. The step's
+// `run:` is the second generated site, and it is the one whose geometry
+// matches the real files: a header at column 8 with its body at 10.
+const generatedWorkflow = (onValue, runValue) => ({
+  kind: 'map',
+  delta: 0,
+  entries: [
+    { key: 'name', value: { kind: 'plain', text: 'Generated' } },
+    { key: 'on', value: onValue },
+    {
+      key: 'jobs',
+      value: {
+        kind: 'map',
+        delta: 2,
+        entries: [{
+          key: 'probe',
+          value: {
+            kind: 'map',
+            delta: 2,
+            entries: [
+              { key: 'runs-on', value: { kind: 'plain', text: 'ubuntu-latest' } },
+              {
+                key: 'steps',
+                value: {
+                  kind: 'seq',
+                  dashDelta: 2,
+                  items: [{
+                    kind: 'map',
+                    entries: [
+                      { key: 'name', value: { kind: 'plain', text: 'Generated step' } },
+                      { key: 'run', value: runValue },
+                    ],
+                  }],
+                },
+              },
+            ],
+          },
+        }],
+      },
+    },
+  ],
+});
+
+// What the model MEANS, which is the answer the reader has to produce. This is
+// the only place the folding rule and the trimming rule are applied to the
+// expectation, and they are applied because the reader DISCLOSES them, not
+// because it happens to do them.
+const denoteNode = (node) => {
+  switch (node.kind) {
+    case 'map': return Object.fromEntries(node.entries.map((entry) => [entry.key, denoteNode(entry.value)]));
+    case 'seq': return node.items.map(denoteNode);
+    case 'plain': case 'quoted': return node.text;
+    case 'empty': return null;
+    default: return node.lines.map((line) => line.text).join(node.header[0] === '|' ? '\n' : ' ');
+  }
+};
+
+// --- printing a model as a document, decorations and all --------------------
+const atColumn = (column, text) => ({ column, text: `${' '.repeat(column)}${text}` });
+
+const emitEntry = (entry, column, dashed, out, context) => {
+  // `- key:` puts the key two columns right of the dash, which is the column
+  // every rule below is measured from — the same `+ 2` `yamlLines` applies.
+  const keyColumn = dashed ? column + 2 : column;
+  const prefix = dashed ? '- ' : '';
+  const value = entry.value;
+  for (const line of context.decorate(context)) out.push(line);
+  const push = (text) => {
+    out.push(atColumn(column, `${text}${context.suffix()}`));
+    context.openContent = null;
+  };
+  if (value.kind === 'plain') { push(`${prefix}${entry.key}: ${value.text}`); return; }
+  if (value.kind === 'quoted') { push(`${prefix}${entry.key}: ${value.quote}${value.text}${value.quote}`); return; }
+  if (value.kind === 'empty') { push(`${prefix}${entry.key}:`); return; }
+  if (value.kind === 'block') {
+    push(`${prefix}${entry.key}: ${value.header}`);
+    const contentIndent = keyColumn + value.delta;
+    context.tally.blockScalars += 1;
+    if (dashed) context.tally.headersOnDashLines += 1;
+    value.lines.forEach((bodyLine, index) => {
+      for (const line of context.bodyDecorate(index, contentIndent, keyColumn)) out.push(line);
+      const bodyColumn = context.bodyColumn(index, contentIndent + (index === 0 ? 0 : bodyLine.extra));
+      if (bodyLine.extra > 0) context.tally.deeperBodyLines += 1;
+      if (bodyLine.text.startsWith('#')) context.tally.commentShapedBodyLines += 1;
+      if (bodyLine.text.startsWith('- ')) context.tally.dashShapedBodyLines += 1;
+      out.push(atColumn(bodyColumn, bodyLine.text));
+    });
+    // With no body at all there is no content indentation yet, and the header's
+    // own column is what the next line has to clear — so a decoration placed
+    // here has to stay at or left of the key or it BECOMES the body.
+    context.openContent = value.lines.length ? contentIndent : keyColumn + 1;
+    context.openKey = keyColumn;
+    return;
+  }
+  if (value.kind === 'map') {
+    push(`${prefix}${entry.key}:`);
+    emitMapping(value, keyColumn + value.delta, out, context);
+    return;
+  }
+  push(`${prefix}${entry.key}:`);
+  const dashColumn = keyColumn + value.dashDelta;
+  for (const item of value.items) {
+    item.entries.forEach((child, index) => emitEntry(
+      child, index === 0 ? dashColumn : dashColumn + 2, index === 0, out, context,
+    ));
+  }
+};
+
+function emitMapping(node, column, out, context) {
+  for (const entry of node.entries) emitEntry(entry, column, false, out, context);
+}
+
+const emitContext = () => ({
+  openContent: null,
+  openKey: 0,
+  decorate: () => [],
+  bodyDecorate: () => [],
+  bodyColumn: (index, column) => column,
+  suffix: () => '',
+  tally: {
+    blockScalars: 0,
+    headersOnDashLines: 0,
+    deeperBodyLines: 0,
+    commentShapedBodyLines: 0,
+    dashShapedBodyLines: 0,
+    commentsInTheGap: 0,
+    commentsAtOrLeftOfTheKey: 0,
+    blankLinesInsideBodies: 0,
+    trailingComments: 0,
+    trailingWhitespace: 0,
+  },
+});
+
+// A comment is legal at any column, but a comment at or past an OPEN block
+// scalar's content indentation is not a comment at all — it is a body line.
+// So while a scalar is open the column is drawn from below the content, which
+// is precisely the region round 7's second sub-case got wrong.
+const randomContext = (random) => Object.assign(emitContext(), {
+  decorate(context) {
+    const extra = [];
+    if (chance(random, 0.12)) extra.push(atColumn(0, chance(random, 0.5) ? '' : ' '.repeat(3)));
+    if (chance(random, 0.22)) {
+      const limit = context.openContent === null ? 4 : context.openContent;
+      const column = Math.floor(random() * limit);
+      if (context.openContent !== null) {
+        if (column > context.openKey) context.tally.commentsInTheGap += 1;
+        else context.tally.commentsAtOrLeftOfTheKey += 1;
+      }
+      extra.push(atColumn(column, '# generated comment'));
+      // The comment ENDS the block, so the next decoration is unconstrained.
+      context.openContent = null;
+    }
+    return extra;
+  },
+  // A blank line inside a body is the one line that closes nothing, at any
+  // column — and it is dropped, which is the first of the three disclosed
+  // normalizations the reprint has to allow for.
+  bodyDecorate() {
+    if (!chance(random, 0.1)) return [];
+    this.tally.blankLinesInsideBodies += 1;
+    return [atColumn(0, '')];
+  },
+  suffix() {
+    if (chance(random, 0.18)) { this.tally.trailingComments += 1; return ' # trailing note'; }
+    if (chance(random, 0.18)) {
+      this.tally.trailingWhitespace += 1;
+      return ' '.repeat(1 + Math.floor(random() * 2));
+    }
+    return '';
+  },
+});
+
+const emitDocument = (model, context) => {
+  const out = [];
+  emitMapping(model, 0, out, context);
+  return `${out.map((line) => line.text).join('\n')}\n`;
+};
+
+// --- reprinting the reader's answer onto the same skeleton ------------------
+// The reprint takes its SHAPE from the model and its CONTENT from the reader,
+// and lays every line out at a STRUCTURAL column — a mapping's keys at the
+// mapping's column, a body line at its scalar's content indentation, never at
+// the column the line was written in. That is what makes a mis-assigned line
+// visible: it comes back where the node it was absorbed into lives, not where
+// the document put it.
+class PropertyError extends Error {}
+
+const describeValue = (value) => (Array.isArray(value) ? 'a sequence'
+  : value === null ? 'null'
+    : isMapping(value) ? 'a mapping' : `the scalar ${JSON.stringify(value)}`);
+
+const assertSameKeys = (node, value, path) => {
+  const got = Object.keys(value);
+  const want = node.entries.map((entry) => entry.key);
+  if (got.length !== want.length || got.some((key, index) => key !== want[index])) {
+    throw new PropertyError(`${path}: written with keys [${want}], read back with [${got}]`);
+  }
+};
+
+const reprintEntry = (entry, value, column, dashed, out, path) => {
+  const keyColumn = dashed ? column + 2 : column;
+  const prefix = dashed ? '- ' : '';
+  const node = entry.value;
+  const where = `${path}.${entry.key}`;
+  if (node.kind === 'plain' || node.kind === 'quoted') {
+    if (typeof value !== 'string') throw new PropertyError(`${where}: written as a scalar, read back as ${describeValue(value)}`);
+    out.push({ column, text: `${prefix}${entry.key}: ${value}` });
+    return;
+  }
+  if (node.kind === 'empty') {
+    if (value !== null) throw new PropertyError(`${where}: written as a key with no value, read back as ${describeValue(value)}`);
+    out.push({ column, text: `${prefix}${entry.key}:` });
+    return;
+  }
+  if (node.kind === 'block') {
+    if (typeof value !== 'string') throw new PropertyError(`${where}: written as a block scalar, read back as ${describeValue(value)}`);
+    out.push({ column, text: `${prefix}${entry.key}: ${node.header}` });
+    const contentIndent = keyColumn + node.delta;
+    // A folded body is one line by definition of `>`; a literal body splits
+    // back into the lines it was joined from. An empty scalar has no body
+    // lines at all, which is not the same as one empty line.
+    const body = value === '' ? [] : (node.header[0] === '|' ? value.split('\n') : [value]);
+    for (const line of body) out.push({ column: contentIndent, text: line });
+    return;
+  }
+  if (node.kind === 'map') {
+    out.push({ column, text: `${prefix}${entry.key}:` });
+    reprintMapping(node, value, keyColumn + node.delta, out, where);
+    return;
+  }
+  out.push({ column, text: `${prefix}${entry.key}:` });
+  if (!Array.isArray(value)) throw new PropertyError(`${where}: written as a sequence, read back as ${describeValue(value)}`);
+  if (value.length !== node.items.length) {
+    throw new PropertyError(`${where}: written with ${node.items.length} items, read back with ${value.length}`);
+  }
+  const dashColumn = keyColumn + node.dashDelta;
+  node.items.forEach((item, index) => {
+    if (!isMapping(value[index])) throw new PropertyError(`${where}[${index}]: written as a mapping, read back as ${describeValue(value[index])}`);
+    assertSameKeys(item, value[index], `${where}[${index}]`);
+    item.entries.forEach((child, position) => reprintEntry(
+      child, value[index][child.key], position === 0 ? dashColumn : dashColumn + 2,
+      position === 0, out, `${where}[${index}]`,
+    ));
+  });
+};
+
+function reprintMapping(node, value, column, out, path) {
+  if (!isMapping(value)) throw new PropertyError(`${path}: written as a mapping, read back as ${describeValue(value)}`);
+  assertSameKeys(node, value, path);
+  for (const entry of node.entries) reprintEntry(entry, value[entry.key], column, false, out, path);
+}
+
+const reprintDocument = (model, document) => {
+  const out = [];
+  reprintMapping(model, document, 0, out, 'document');
+  return out;
+};
+
+// --- the report, because a property test you cannot diagnose is a liability -
+const renderPartition = (lines) => lines
+  .map((line, index) => `${String(index).padStart(3)} | col ${String(line.column).padStart(2)} | ${line.text}`)
+  .join('\n');
+
+const renderDocument = (text) => text.replace(/\n$/, '').split('\n')
+  .map((line, index) => `${String(index).padStart(3)} | ${line.replace(/ +$/, (run) => '·'.repeat(run.length))}`)
+  .join('\n');
+
+const partitionDifference = (expected, actual) => {
+  for (let index = 0; index < Math.max(expected.length, actual.length); index += 1) {
+    const want = expected[index];
+    const got = actual[index];
+    if (!want || !got || want.column !== got.column || want.text !== got.text) return index;
+  }
+  return -1;
+};
+
+const violationReport = (label, text, reason, parts = {}) => [
+  `PROPERTY VIOLATION (${label})`,
+  reason,
+  '--- the generated document (· marks a trailing space) ---',
+  renderDocument(text),
+  parts.expected ? `--- the partition the document was written with ---\n${renderPartition(parts.expected)}` : '',
+  parts.actual ? `--- the partition the reader reprints ---\n${renderPartition(parts.actual)}` : '',
+].filter(Boolean).join('\n');
+
+const checkAccepted = (label, model, text) => {
+  let document;
+  try {
+    document = parseWorkflowText(text);
+  } catch (error) {
+    return violationReport(label, text, `the reader REFUSED a legal document: ${error.message}`);
+  }
+  const expected = reprintDocument(model, denoteNode(model));
+  let actual;
+  try {
+    actual = reprintDocument(model, document);
+  } catch (error) {
+    if (!(error instanceof PropertyError)) throw error;
+    return violationReport(label, text, error.message, { expected });
+  }
+  const index = partitionDifference(expected, actual);
+  if (index === -1) return null;
+  const want = expected[index];
+  const got = actual[index];
+  return violationReport(label, text, [
+    `the reprint does not reproduce the document's line partition; first difference at line ${index}:`,
+    `  written : ${want ? `col ${String(want.column).padStart(2)} | ${want.text}` : '<the document has no such line>'}`,
+    `  reprint : ${got ? `col ${String(got.column).padStart(2)} | ${got.text}` : '<the reprint has no such line>'}`,
+  ].join('\n'), { expected, actual });
+};
+
+const checkRefused = (label, model, text, reason) => {
+  let document;
+  try {
+    document = parseWorkflowText(text);
+  } catch (error) {
+    return null;
+  }
+  let actual = null;
+  try {
+    actual = reprintDocument(model, document);
+  } catch (error) {
+    if (!(error instanceof PropertyError)) throw error;
+  }
+  return violationReport(label, text, `the reader ACCEPTED a document YAML rejects: ${reason}`, { actual });
+};
+
+// --- the two enumerated families -------------------------------------------
+// Three placements for one block scalar, each followed by a sibling key so the
+// block has to END and the reader has to resume: at column 2 under `on:`, at
+// column 4 one mapping deeper, and at column 6 on a sequence dash — the `+ 2`
+// case neither workflow on disk writes.
+const PLACEMENTS = {
+  'at column 2': (value) => ({
+    subtree: {
+      kind: 'map',
+      delta: 2,
+      entries: [{ key: 'alpha', value }, { key: 'zeta', value: { kind: 'plain', text: 'after' } }],
+    },
+    keyColumn: 2,
+  }),
+  'at column 4': (value) => ({
+    subtree: {
+      kind: 'map',
+      delta: 2,
+      entries: [{
+        key: 'outer',
+        value: {
+          kind: 'map',
+          delta: 2,
+          entries: [{ key: 'alpha', value }, { key: 'zeta', value: { kind: 'plain', text: 'after' } }],
+        },
+      }],
+    },
+    keyColumn: 4,
+  }),
+  'on a dash at column 6': (value) => ({
+    subtree: {
+      kind: 'map',
+      delta: 2,
+      entries: [{
+        key: 'outer',
+        value: {
+          kind: 'seq',
+          dashDelta: 2,
+          items: [{
+            kind: 'map',
+            entries: [{ key: 'alpha', value }, { key: 'zeta', value: { kind: 'plain', text: 'after' } }],
+          }],
+        },
+      }],
+    },
+    keyColumn: 6,
+  }),
+};
+
+// What sits between the last body line and the sibling key that ends the
+// block. Every one of these is LEGAL: a comment is legal at any column, and
+// one indented less than the content is a TRAILING comment that closes the
+// scalar. Followers 3 to 5 are round 7's second sub-case written as a legal
+// document — under the round-6 tokeniser they are absorbed as script.
+const FOLLOWERS = [
+  () => [],
+  () => [atColumn(0, '')],
+  () => [atColumn(0, '# a comment at column 0')],
+  (keyColumn) => [atColumn(keyColumn, '# a comment at the key column')],
+  (keyColumn, contentIndent) => [atColumn(contentIndent - 1, '# a comment one column short of the content')],
+  (keyColumn, contentIndent) => [
+    atColumn(0, ''),
+    atColumn(Math.min(keyColumn + 1, contentIndent - 1), '# a comment between the key and the content'),
+  ],
+];
+
+const enumeratedDocuments = function* () {
+  for (const [place, build] of Object.entries(PLACEMENTS)) {
+    for (const header of GEN_HEADERS) {
+      for (const delta of [1, 2, 3]) {
+        for (const first of GEN_BODY) {
+          for (const second of GEN_BODY) {
+            for (const extra of [0, 2]) {
+              for (let follower = 0; follower < FOLLOWERS.length; follower += 1) {
+                const scalar = blockNode(header, delta, [{ text: first, extra: 0 }, { text: second, extra }]);
+                const { subtree, keyColumn } = build(scalar);
+                const model = generatedWorkflow(subtree, { kind: 'plain', text: 'echo ok' });
+                const context = Object.assign(emitContext(), {
+                  decorate: (state) => (state.openContent === null
+                    ? [] : FOLLOWERS[follower](keyColumn, keyColumn + delta)),
+                });
+                yield {
+                  label: `${place} / ${header} / content +${delta} / ${first} | ${second} +${extra} / follower ${follower}`,
+                  model,
+                  text: emitDocument(model, context),
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+// A body line that is ITSELF comment-shaped becomes a real comment once it is
+// dedented out of the block, so the document stays legal and the reader is
+// right to accept it. Those belong to the family above, not here.
+const PERTURBED_BODY = GEN_BODY.filter((line) => !line.startsWith('#'));
+
+// The illegal neighbours of the same geometry, each one a document YAML
+// rejects and this reader must refuse. Round 7's two sub-cases are the two
+// generators: a body line dedented into the gap between the key column and
+// the content indentation, and a comment dedented out of the middle of a body
+// (which ends the block and orphans everything after it).
+const perturbedDocuments = function* () {
+  for (const [place, build] of Object.entries(PLACEMENTS)) {
+    for (const header of GEN_HEADERS) {
+      for (const delta of [2, 3]) {
+        for (const second of PERTURBED_BODY) {
+          const scalar = blockNode(header, delta, ['echo first', second]);
+          const { subtree, keyColumn } = build(scalar);
+          const model = generatedWorkflow(subtree, { kind: 'plain', text: 'echo ok' });
+          const contentIndent = keyColumn + delta;
+          for (let column = keyColumn + 1; column < contentIndent; column += 1) {
+            const context = Object.assign(emitContext(), {
+              bodyColumn: (index, natural) => (index === 1 ? column : natural),
+            });
+            yield {
+              label: `dedent ${place} / ${header} / content +${delta} / ${second} / to column ${column}`,
+              model,
+              text: emitDocument(model, context),
+              reason: `the second body line sits at column ${column}, left of the content indentation ${contentIndent} its own first body line established, so YAML ends the block scalar there — and the line then belongs to no mapping, the enclosing one being at column ${keyColumn}. Accepting it puts the line back at column ${contentIndent}, in a script nobody wrote.`,
+            };
+          }
+          for (const column of [0, keyColumn, keyColumn + 1]) {
+            if (column >= contentIndent) continue;
+            const context = Object.assign(emitContext(), {
+              bodyDecorate: (index) => (index === 1 ? [atColumn(column, '# dedented out of the body')] : []),
+            });
+            yield {
+              label: `comment ${place} / ${header} / content +${delta} / ${second} / at column ${column}`,
+              model,
+              text: emitDocument(model, context),
+              reason: `a comment at column ${column} is indented less than the content indentation ${contentIndent}, so YAML reads it as a trailing comment that ENDS the block scalar; the body line after it then belongs to no mapping.`,
+            };
+          }
+        }
+      }
+    }
+  }
+};
+
+const RANDOM_DOCUMENTS = 20000;
+
+test('the workflow reader round-trips every document a generator can write in its subset: what it reads back reprints to the line partition it was given', () => {
+  const failures = [];
+  const coverage = emitContext().tally;
+  const texts = new Set();
+  let documents = 0;
+  const record = (failure) => {
+    documents += 1;
+    if (failure) failures.push(failure);
+  };
+  for (let seed = 1; seed <= RANDOM_DOCUMENTS; seed += 1) {
+    const random = seededRandom(seed);
+    const subtree = chance(random, 0.25) ? genSequence(random, 1) : genMapping(random, 2);
+    const runValue = chance(random, 0.55) ? genBlockScalar(random) : { kind: 'plain', text: 'echo ok' };
+    const model = generatedWorkflow(subtree, runValue);
+    const context = randomContext(random);
+    const text = emitDocument(model, context);
+    for (const key of Object.keys(coverage)) coverage[key] += context.tally[key];
+    texts.add(text);
+    record(checkAccepted(`random seed ${seed}`, model, text));
+  }
+  for (const { label, model, text } of enumeratedDocuments()) {
+    record(checkAccepted(label, model, text));
+  }
+  for (const { label, model, text, reason } of perturbedDocuments()) {
+    record(checkRefused(label, model, text, reason));
+  }
+  // THE PRESENCE CONTROL, which is round 6's lesson applied to this test
+  // itself: "no violations" over a corpus nobody measured is the same empty
+  // assertion as an absence scan over a string nobody proved was non-empty.
+  // A generator that quietly stopped producing block scalars would report a
+  // clean search of nothing, and nothing above would notice. The counts are
+  // deterministic, so these could be exact pins; they are floors at roughly
+  // half the measured value instead, so that widening the alphabet does not
+  // mean re-pinning ten numbers while a shape DISAPPEARING still fails. As
+  // measured at the seeds below: 32,492 block scalars, 6,310 headers on a
+  // dash line, 12,173 body lines indented past the content, 6,986
+  // comment-shaped and 7,023 item-shaped body lines, 831 comments in the gap
+  // between a key column and its content indentation, 3,869 at or left of the
+  // key, 4,848 blank lines inside bodies, 40,408 trailing comments and 33,390
+  // lines with trailing whitespace.
+  assert.equal(documents, RANDOM_DOCUMENTS + 21168 + 648,
+    'the enumerated families are complete: 21,168 legal documents and 648 perturbed ones');
+  assert.equal(texts.size, RANDOM_DOCUMENTS, 'the random documents are pairwise distinct');
+  for (const [feature, floor] of [
+    ['blockScalars', 16000], ['headersOnDashLines', 3000], ['deeperBodyLines', 6000],
+    ['commentShapedBodyLines', 3000], ['dashShapedBodyLines', 3000],
+    ['commentsInTheGap', 400], ['commentsAtOrLeftOfTheKey', 1900],
+    ['blankLinesInsideBodies', 2400], ['trailingComments', 20000], ['trailingWhitespace', 16000],
+  ]) {
+    assert.ok(coverage[feature] >= floor,
+      `the random corpus contained only ${coverage[feature]} ${feature}, under the floor of ${floor}`);
+  }
+  assert.equal(failures.length, 0, failures.length === 0 ? undefined
+    : `${failures.length} of ${documents} generated documents violate the round-trip property. The first:\n\n${failures[0]}`);
+});
+
 test('demo/repro.js reads exactly the injected session contract and nothing the run step strips', () => {
   const source = readFileSync(REPRO_PATH, 'utf8');
   // Every environment variable this file names, in source order. The wrapped
