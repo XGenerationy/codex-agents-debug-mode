@@ -4733,13 +4733,37 @@ const BLOCK_SCALAR_HEADER = /^(?:- )?[A-Za-z0-9_.-]+:[ \t]+[|>]/;
 //     script, not a sequence item; the old pass re-indented it and dropped the
 //     marker, which is the same corruption one token over.
 //
-// A block scalar runs from its header to the first NON-EMPTY line indented no
-// further than the header — the same test `parseWorkflowMapping`'s body loop
-// applies, so the tokeniser and the parser agree on where a body ends by
-// construction rather than by coincidence. A blank line does not close it.
-// `- run: |` puts the header's key two columns right of the dash, which is
-// where the body must clear, so item lines contribute the same `+ 2` here that
-// they do below.
+// A block scalar runs from its header to the first NON-EMPTY line indented
+// LESS THAN ITS CONTENT — and the content indentation is established by the
+// FIRST non-empty body line, never by the header (Codex T7 r7). Round 6
+// measured both ends against the HEADER's column, which is up to one column
+// short of the boundary for every body: with `run: |` at column 8 and a body
+// at column 10, a line at column 9 was absorbed as script. YAML ends the block
+// construct at any non-empty line less indented than the content, so such a
+// document is invalid and this reader answered for it with a program nobody
+// wrote. The header's column is still what the FIRST body line must clear —
+// until it arrives there is no content indentation to compare against — and
+// `- run: |` puts the header's key two columns right of the dash, so item
+// lines contribute the same `+ 2` here that they do below.
+//
+// A BLANK LINE IS THE ONE LINE THAT CHANGES NOTHING: it neither closes a block
+// scalar nor establishes its content indentation, at any column. EVERY OTHER
+// line outside a scalar clears the state, INCLUDING ONE THIS PASS IS ABOUT TO
+// ERASE — the second half of the same defect. A comment dedented out of a body
+// is a TRAILING comment in YAML's grammar and ends the block, but it left this
+// loop through the blank-line `continue` below with the scalar's indentation
+// still stored, so the next indented line RESUMED a scalar YAML had already
+// closed and glued itself onto the script.
+//
+// AND THIS IS NOW THE ONLY PLACE THAT DECIDES MEMBERSHIP. `parseWorkflowMapping`'s
+// body loop consumes the lines this pass marked `inScalar` instead of
+// re-deriving the boundary from indentation, and `parseActionYml` does the
+// same rather than keeping its own hard-coded column. Round 6 left the test
+// written in two places and named that as the coupling most likely to break
+// silently; what happened is worse than drift and is the argument for one
+// source of truth over two agreeing ones — they never disagreed, they agreed
+// on the WRONG boundary, and no check comparing them to each other could have
+// said so.
 //
 // STILL NOT MODELLED, and both are pre-existing, disclosed limits rather than
 // anything this pass changed: blank lines inside a body are dropped, and a
@@ -4747,17 +4771,27 @@ const BLOCK_SCALAR_HEADER = /^(?:- )?[A-Za-z0-9_.-]+:[ \t]+[|>]/;
 // `run:` script is WHICH LINES it contains, never their spacing.
 const yamlLines = (text) => {
   const lines = [];
-  let scalarIndent = null;
+  // `headerIndent` is the column the FIRST body line has to clear;
+  // `contentIndent` is the column every line after it has to reach, and is
+  // learned from that first body line rather than assumed from the header.
+  let scalar = null;
   for (const raw of text.split(/\r?\n/)) {
     const kept = raw.replace(/\s+$/, '');
     const indent = kept.length - kept.trimStart().length;
-    const inScalar = scalarIndent !== null && kept.trim() !== '' && indent > scalarIndent;
+    const blank = kept === '';
+    const inScalar = !blank && scalar !== null && (scalar.contentIndent === null
+      ? indent > scalar.headerIndent
+      : indent >= scalar.contentIndent);
+    if (inScalar && scalar.contentIndent === null) scalar.contentIndent = indent;
+    // Cleared HERE and not below, because the `continue` below is reached by a
+    // line comment stripping has erased — and that line still ended the block.
+    if (!inScalar && !blank) scalar = null;
     const content = inScalar ? kept : stripYamlComment(raw).replace(/\s+$/, '');
     if (content.trim() === '') continue;
     const body = content.trim();
     if (!inScalar) {
-      scalarIndent = BLOCK_SCALAR_HEADER.test(body)
-        ? indent + (body.startsWith('- ') ? 2 : 0)
+      scalar = BLOCK_SCALAR_HEADER.test(body)
+        ? { headerIndent: indent + (body.startsWith('- ') ? 2 : 0), contentIndent: null }
         : null;
     }
     lines.push({ indent, body, inScalar });
@@ -4785,13 +4819,21 @@ const unquoteScalar = (value) => (/^(".*"|'.*')$/.test(value) ? value.slice(1, -
 // so tests that claimed to pin this file's structure could not see either
 // change (Codex T6 r2 #3). An unknown key directly under `runs:` now throws for
 // the same reason.
-const parseActionYml = () => {
+//
+// TEXT IN, DOCUMENT OUT, for exactly the reason `parseWorkflowText` is written
+// that way (Codex T7 r7): reading only from disk leaves this reader's own
+// tolerances untestable, and its block-scalar boundary is one of them. The
+// default keeps every caller below unchanged; the parameter is what lets a
+// CONSTRUCTED document — one whose body sits at a column the real file does
+// not happen to use — say whether the boundary is the tokeniser's answer or a
+// number this function guessed.
+const parseActionYml = (text = ACTION_YML()) => {
   // Block-scalar-aware, like the workflow reader and for the same reason: this
   // file's `path: |` upload block happens to contain no `#` today, so the
   // ordering bug that corrupted the workflows was LATENT here rather than
   // absent. A shared tokeniser is what stops it being fixed in one reader and
   // left in the other.
-  const lines = yamlLines(ACTION_YML());
+  const lines = yamlLines(text);
   const inputs = {};
   const outputs = {};
   const steps = [];
@@ -4827,7 +4869,11 @@ const parseActionYml = () => {
       continue;
     }
     if (section !== 'runs') continue;
-    if (blockScalar && line.indent >= blockScalar.indent) {
+    // MEMBERSHIP IS THE TOKENISER'S ANSWER, not a column re-derived here
+    // (Codex T7 r7). This loop used to test `indent >= 10`, which is where the
+    // one block scalar this file carries happens to put its body — a third
+    // copy of a boundary rule that has now been wrong twice.
+    if (blockScalar && line.inScalar) {
       blockScalar.items.push(line.body);
       continue;
     }
@@ -4858,7 +4904,7 @@ const parseActionYml = () => {
       const entry = splitEntry(line.body);
       if (!entry || !nested) throw new Error(`unparsed nested line: ${line.body}`);
       if (entry.value === '|') {
-        blockScalar = { items: [], indent: 10 };
+        blockScalar = { items: [] };
         step[nested][entry.key] = blockScalar.items;
       } else {
         step[nested][entry.key] = entry.value;
@@ -5120,6 +5166,48 @@ test('upload takes exactly the paths start advertises before the command runs, a
     assert.notEqual(entry, OUTPUT_DIR_EXPR);
     assert.equal(entry.startsWith('${{ steps.start.outputs.evidence-dir }}/'), true);
   }
+  // AND THE LIST IS DELIMITED BY THE TOKENISER, not by a column this reader
+  // remembered (Codex T7 r7). Until this round the loop that collects these
+  // entries tested `indent >= 10` — which is where THIS file happens to put
+  // the body of its one block scalar, so the number was right by coincidence
+  // and unfalsifiable by anything on disk. It is a third copy of a boundary
+  // rule that has now been wrong twice, and the constructed documents below
+  // are what make replacing it with the shared decision observable.
+  //
+  // A body at column 9 is legal YAML and is the case the two disagree on: the
+  // first body line establishes the content indentation wherever it lands, and
+  // only a hard-coded 10 refuses it.
+  const constructed = (body) => [
+    'name: constructed',
+    'runs:',
+    '  using: composite',
+    '  steps:',
+    '    - name: upload',
+    '      uses: a/b@v1',
+    '      with:',
+    '        path: |',
+    ...body,
+    '',
+  ].join('\n');
+  assert.deepEqual(
+    parseActionYml(constructed(['         one', '         two'])).steps[0].with.path,
+    ['one', 'two'],
+    'the body starts wherever its first line starts, not at column 10',
+  );
+  // …and the same boundary closes it: a second body line dedented below the
+  // first ends the block, and lands at a column this reader has no rule for.
+  assert.throws(
+    () => parseActionYml(constructed(['          one', '         two'])),
+    /unexpected indentation 9: two/,
+    'a dedented body line is not content here either',
+  );
+  // The control that keeps the two above honest: the shape they are built on
+  // is one this reader reads, so their reds come from the body and not from
+  // the scaffolding around it.
+  assert.deepEqual(
+    parseActionYml(constructed(['          one', '          two'])).steps[0].with.path,
+    ['one', 'two'],
+  );
 });
 
 test('every action output is produced by the run step, and the set is exactly these five', () => {
@@ -5469,7 +5557,13 @@ const parseWorkflowMapping = (lines, cursor, indent) => {
     const blockScalar = rawValue === undefined ? null : /^([|>])(-?)$/.exec(rawValue);
     if (blockScalar) {
       const body = [];
-      while (cursor.i < lines.length && lines[cursor.i].indent > indent) {
+      // THE BODY IS WHAT THE TOKENISER MARKED, not what this loop would work
+      // out for itself (Codex T7 r7). It used to re-derive the boundary as
+      // `indent > this mapping's indent`, which is the same test `yamlLines`
+      // applied — and being the same test written twice is what let both of
+      // them measure against the header's column instead of the content's for
+      // a whole round, with nothing able to notice because they agreed.
+      while (cursor.i < lines.length && lines[cursor.i].inScalar) {
         body.push(lines[cursor.i].body);
         cursor.i += 1;
       }
@@ -5684,9 +5778,12 @@ const parseWorkflowText = (text) => {
     // is what makes an item's mapping parse like any other mapping — but ONLY
     // outside a block scalar, where `- ` is a marker rather than the first two
     // characters of a line of script (Codex T7 r6 #1).
+    // `inScalar` is carried through rather than consumed here: the body loop in
+    // `parseWorkflowMapping` reads it, which is what makes `yamlLines` the one
+    // place that decides where a block scalar ends (Codex T7 r7).
     !inScalar && body.startsWith('- ')
-      ? { indent: indent + 2, body: body.slice(2), item: true }
-      : { indent, body, item: false }));
+      ? { indent: indent + 2, body: body.slice(2), item: true, inScalar }
+      : { indent, body, item: false, inScalar }));
   const cursor = { i: 0 };
   const document = parseWorkflowMapping(lines, cursor, 0);
   if (cursor.i !== lines.length) throw new Error(`workflow reader stopped at line ${cursor.i}: ${lines[cursor.i].body}`);
@@ -5773,8 +5870,13 @@ const MINIMAL_WORKFLOW = [
 // that the six keys GitHub always types as tables hold tables; that a block
 // scalar is read as `|` or `>` says and any other header is refused rather
 // than stored; that a `#` and a `- ` INSIDE a block scalar are content while a
-// `#` outside one is still a comment; and that YAML anchors and aliases are
-// refused rather than absorbed, at the start of a non-flow scalar token.
+// `#` outside one is still a comment; that a block scalar's body BEGINS past
+// the header's key — the dash's column plus two when the header sits on a
+// sequence-item line — and ENDS at the first non-empty line indented less than
+// the content that first body line established, a dedented comment included,
+// while a more-indented line and a blank line at any column end nothing; and
+// that YAML anchors and aliases are refused rather than absorbed, at the start
+// of a non-flow scalar token.
 //
 // THAT COMMENT RULE IS THE ONE ENTRY HERE THAT IS NOT A REFUSAL, and it is on
 // this list because it is a DECISION the reader makes about content (Codex T7
@@ -5811,6 +5913,16 @@ const MINIMAL_WORKFLOW = [
 // A CLAIM AND NEEDS THE SAME EXHAUSTIVE ENUMERATION AS ANY OTHER — a round
 // that reasons its way out of writing a test must show its enumeration so
 // somebody can find the missing row, which is what happened here.
+//
+// AND ROUND 7'S SWEEP FOUND ONE MORE, which is the argument for re-running it
+// every round rather than carrying the previous round's answer forward. The
+// `+ 2` a block-scalar header contributes when it sits on a SEQUENCE-ITEM line
+// (`- run: |`) was enforced and unpinned: neither workflow writes a header that
+// way, so nothing on disk distinguishes the key's column from the dash's, and
+// deleting the `+ 2` left every case in this file green while a body line at
+// column 7 — which belongs to no mapping in the document — became script. Now
+// pinned in both directions, refusal and legal form. That is two rounds running
+// in which the sweep, not the review, produced the finding.
 //
 // TWO RULES REMAIN ENFORCED AND UNPINNED, and the enumeration for each is
 // written out so it can be checked rather than taken on trust. Both are
@@ -5860,10 +5972,17 @@ const MINIMAL_WORKFLOW = [
 //     `runs-on: *x` is an alias while `runs-on: "*x"` is text.
 //   - the block-scalar header check depends on the entry pattern having split
 //     the value off; `/^[|>]/` is applied to `rawValue` and never to the line.
-//   - the tokeniser's end-of-body test and the parser's body loop are the SAME
-//     test (`indent > the header's indent`) over the same numbers, so they
-//     cannot disagree about where a body ends. This is the ordering pair most
-//     worth watching: they are written in two places.
+//   - BLOCK-SCALAR MEMBERSHIP IS DECIDED IN EXACTLY ONE PLACE (Codex T7 r7).
+//     Round 6 left the tokeniser's end-of-body test and the parser's body loop
+//     as the same test written twice and named that as the coupling most
+//     likely to break silently. It did not break by drifting apart: BOTH
+//     compared against the HEADER's indentation rather than the content
+//     indentation the first body line establishes, so they agreed with each
+//     other and were both wrong, and nothing that checked one against the
+//     other could have seen it. Two copies of a rule are not a cross-check.
+//     The parser's body loop now consumes the lines `yamlLines` marked
+//     `inScalar`, and `parseActionYml`'s hard-coded column-10 test does too;
+//     the boundary rule is stated once, in `yamlLines`.
 //
 // STILL ORDER-DEPENDENT AND ACCEPTED, each with its reason:
 //
@@ -6247,6 +6366,124 @@ test("the workflow reader refuses the mis-spelled and mis-shaped keys this repos
   assert.equal(afterScalar.jobs.only.steps[0].run, 'echo one # kept');
   assert.equal(afterScalar.jobs.only.steps[0].shell, 'bash',
     'the block scalar ends at the dedent, and so does the exemption');
+  // …AND "THE DEDENT" IS MEASURED AGAINST THE CONTENT, NOT AGAINST THE HEADER
+  // (Codex T7 r7). A block scalar's content indentation is established by its
+  // FIRST non-empty body line, and YAML ends the block at the first non-empty
+  // line indented less than THAT. Round 6 tested both ends against the
+  // HEADER's column — `run: |` at 8, body at 10 — so a line at column 9 was
+  // absorbed as script by the tokeniser AND by the parser's body loop, which
+  // agreed with it. The document is invalid YAML and a real loader rejects it;
+  // this reader accepted it and answered with a program nobody wrote,
+  // `echo first\necho dedented`. Nothing threw, which is exactly why the case
+  // above — written against the header's column — could not see it.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '        run: echo hello\n',
+      '        run: |\n          echo first\n         echo dedented\n',
+    )),
+    /unexpected indentation 9: echo dedented/,
+    'a body line dedented below the first body line ends the block and belongs to no mapping',
+  );
+  // …AND A DEDENTED COMMENT ENDS IT TOO, WITHOUT LEAVING THE STATE BEHIND.
+  // YAML reads a comment indented less than the content as a TRAILING comment,
+  // outside the scalar, so the block ends there. This line computed
+  // `inScalar === false` correctly and then left the tokeniser through comment
+  // stripping's `continue` WITH THE SCALAR'S INDENTATION STILL STORED — so the
+  // next indented line resumed a scalar YAML had already closed and
+  // `echo resumed` was glued onto the script as `echo first\necho resumed`.
+  // The state has to be cleared on every non-empty line outside a scalar,
+  // including the ones this pass is about to erase entirely.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '        run: echo hello\n',
+      '        run: |\n          echo first\n    # dedented out of the block\n          echo resumed\n',
+    )),
+    /unexpected indentation 10: echo resumed/,
+    'a dedented comment closes the block scalar rather than pausing it',
+  );
+  // AND THE LEGAL SIDE OF THE SAME BOUNDARY, which is where tightening one
+  // turns into a false rejection — the failure round 3 shipped and round 4 had
+  // to remove. A body line indented PAST the first is content: its extra
+  // spaces are the script's own indentation, which is how every conditional,
+  // loop and heredoc in a `run:` block is written.
+  const deeperBody = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          if true; then\n            echo deeper\n          fi\n',
+  ));
+  assert.equal(deeperBody.jobs.only.steps[0].run, 'if true; then\necho deeper\nfi',
+    'a line indented past the first body line is content, not the end of the block');
+  // …and a comment line inside the body, at or past the content indentation,
+  // is script like any other line: the clearing rule above must not reach it.
+  const deepComment = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n          echo first\n            # indented past the content, still script\n          echo second\n',
+  ));
+  assert.equal(
+    deepComment.jobs.only.steps[0].run,
+    'echo first\n# indented past the content, still script\necho second',
+    'a comment indented into the body is not a comment at all',
+  );
+  // …and a BLANK line closes nothing, at any column. It is the one line that
+  // changes no state: a rule that cleared the scalar on every line it did not
+  // mark as content would cut every multi-paragraph script in half, and a
+  // whitespace-only line is blank after trailing space is stripped.
+  for (const [label, blank] of [['an empty', ''], ['a whitespace-only', '   ']]) {
+    const document = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '        run: echo hello\n',
+      `        run: |\n          echo first\n${blank}\n          echo second\n`,
+    ));
+    assert.equal(document.jobs.only.steps[0].run, 'echo first\necho second',
+      `${label} line does not close a block scalar`);
+  }
+  // …nor does a blank line BEFORE the first body line establish the content
+  // indentation: YAML takes it from the first NON-EMPTY line, and a rule that
+  // took it from a blank one would set it to column 0 and swallow the rest of
+  // the file — `shell:` here included — as script.
+  const leadingBlank = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n\n          echo first\n        shell: bash\n',
+  ));
+  assert.equal(leadingBlank.jobs.only.steps[0].run, 'echo first');
+  assert.equal(leadingBlank.jobs.only.steps[0].shell, 'bash',
+    'the content indentation is the first NON-EMPTY body line, and the block still ends at the dedent');
+  // …and the HEADER's column is still the test the first body line has to
+  // pass, which is the half of the rule that survives from round 6. A block
+  // scalar with no body is an empty scalar — legal, and the same shape as the
+  // `run: ""` GitHub accepts — not a header that takes its own sibling with it.
+  const emptyBlock = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '        run: echo hello\n',
+    '        run: |\n        shell: bash\n',
+  ));
+  assert.equal(emptyBlock.jobs.only.steps[0].run, '');
+  assert.equal(emptyBlock.jobs.only.steps[0].shell, 'bash',
+    'a key at the header\'s own column was never the body\'s first line');
+  // …and that column is the KEY's, not the DASH's — the `+ 2` a header on a
+  // sequence-item line contributes. THIS ROUND'S SWEEP FOUND IT ENFORCED AND
+  // UNPINNED, which is the same discovery round 5's sweep made about the
+  // indentation rule and the same reason for running the sweep rather than
+  // reasoning about it: neither workflow writes a block-scalar header on a
+  // dash line, so nothing on disk could tell the two columns apart. Measured
+  // from the dash, a body line at column 7 is content; measured from the key
+  // it belongs to no mapping in the document, because the item's own keys sit
+  // at 8 — and YAML agrees, since a block scalar's content must be indented
+  // past the mapping that contains it.
+  assert.throws(
+    () => parseWorkflowText(MINIMAL_WORKFLOW.replace(
+      '      - name: Do something\n        run: echo hello\n',
+      '      - run: |\n       echo one\n',
+    )),
+    /unexpected indentation 7: echo one/,
+    "the body of `- run: |` clears the key's column, not the dash's",
+  );
+  // …and the refusal is not blanket: the same shape written legally still
+  // reads, body and sibling key both.
+  const dashHeader = parseWorkflowText(MINIMAL_WORKFLOW.replace(
+    '      - name: Do something\n        run: echo hello\n',
+    '      - run: |\n          echo one\n        shell: bash\n',
+  ));
+  assert.equal(dashHeader.jobs.only.steps[0].run, 'echo one');
+  assert.equal(dashHeader.jobs.only.steps[0].shell, 'bash',
+    'a block-scalar header on the dash line is still a block-scalar header');
   // …AND THE LIVE CONTROL FOR BOTH DIRECTIONS AT ONCE IS THE DEMO WORKFLOW,
   // whose `run:` scripts carried 27 shell-comment lines this reader used to
   // DELETE from scripts it then made assertions about — while the same file's
