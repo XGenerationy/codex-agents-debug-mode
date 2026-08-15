@@ -4108,6 +4108,27 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 fix round 3 (Codex review of `4a7dfef`: 1 Important, 1 Minor) — AND THE RULING THAT REFRAMES THE MECHANISM
+
+**(1) IMPORTANT — the polarity framework is still unsound in BOTH directions, and the coordinator's proposed general fix does not fix it.** Adjacent-copula handles only predicate negation ("X is not Y"). **It does nothing for negative subjects ("None of X are Y"), modal negation ("cannot"), or unrelated subjects.** Three current, non-theoretical examples:
+- **`support.test.js:8916` is the same trap, smaller.** It REJECTS the true "`report.md` **cannot** be treated as verbatim" — `cannot` is outside its negation vocabulary — and MISSES the false "`report.md` is not escaped but **is verbatim**", because the unrelated `not` stops the tempered window. **The tempered window was a smaller version of the defect it replaced.**
+- **`support.test.js:9017` does leave the pre-colon form unguarded:** "`action-state.json` is not uploaded by this action" matches no alternative. **That is the exact categorical overclaim** — only "…not uploaded BY NAME" is true.
+- **The sysctl pair remains broken oppositely:** `:8842` cannot cross the periods in `kernel.yama.ptrace_scope`, while `:5476` rejects the true sentence containing "does NOT make … strict".
+
+**"These guards are the proof mechanism for Task 8's central requirement. With known false positives and false negatives, that proof is not admissible yet."**
+
+**(2) Minor — `readme[25]` must be CHANGED, not rescued.** `support.test.js:8948` rejects the correct "two distinct candidate spellings resolving to the same file count twice". **Do not try to rescue the ambiguous current wording.** Replace it with the ACTUAL INVERSE: deduplication by realpath/inode, or distinct candidate spellings counting ONCE. The required half already pins the positive rule precisely.
+
+> **THE RULING, which reframes what these guards are for and overrides the coordinator's lean:**
+>
+> **"Fix the 33 known failing guards now, but REJECT the proposed mechanical rewrite across all 68. Change only guards that fail true-statement controls, bind each to the COMPLETE AFFIRMATIVE CLAIM, and PRESERVE THOSE TRUE CONTROLS IN A TRACKED TEST. Forbidden regexes should catch KNOWN AFFIRMATIVE REGRESSIONS — not pretend to decide arbitrary English propositions."**
+>
+> The coordinator's lean was to apply adjacent-copula mechanically to all 68 while the harness was fresh. That is wrong twice over: the construction does not cover three of the four failure shapes, and a mechanical sweep would perpetuate the assumption that a regex can adjudicate arbitrary English. **The guards' real job is narrow and achievable — catch the specific affirmative sentence that would signal a regression.** And the true-statement probes must stop living in a scratchpad harness: **they become part of the suite**, so the bidirectional check is permanent rather than re-derived each round.
+
+**CONFIRMED CORRECT, no further work:** the three-part teardown contract is accurate on both surfaces and agrees with GitHub's cleanup implementation; **removing the hosted mode-number claim did not weaken the conclusion** — the live workflow establishes sudo presence, the admission rule denies on that presence, and GitHub documents passwordless sudo for its hosted Linux VMs; and the upload-path claims are **now correctly lexical across all four identified sites**.
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
