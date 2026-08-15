@@ -5245,6 +5245,373 @@ test('every action output is produced by the run step, and the set is exactly th
 // a last-wins `evidence-dir=` to that start's own output file. Same-job reuse
 // after an instrumented command is outside the guarantee, and the file must
 // say so rather than let a reader generalise (Codex T6 r3 #1).
+
+// THE CLAIM TABLES LIVE AT MODULE SCOPE so the polarity-control test at the
+// end of this file can reach every one of them. Round 2 proved these guards
+// in both directions from a scratchpad harness that then evaporated, and the
+// 33 rejected true statements it found had to be re-derived from scratch a
+// round later. The controls are tracked now (Codex T8 r3, the ruling).
+// ONE REGEX FOR ONE FACT, shared by the `action.yml` pin and the README pin
+// below. Round 2 shipped this fact guarded WRONGLY IN OPPOSITE DIRECTIONS on
+// the two surfaces (Codex T8 r3 #1): the README's window could not cross the
+// periods inside `kernel.yama.ptrace_scope`, so it was structurally blind to
+// the very sentence it guards, while `action.yml`'s `[^.]*` swallowed the
+// negation and rejected that same true sentence. A fact stated on two surfaces
+// gets one guard, so the two cannot drift apart again.
+//
+// The construction is INFLECTIONAL, not a negation vocabulary: the reversal an
+// editor writes is "…MAKES hosted execution strict-admissible", and the true
+// sentence is "…does NOT MAKE hosted execution strict-admissible". Requiring
+// the affirmative inflection (`makes`, `does make`, `turns`) separates them
+// without the regex having to know what "not" means. The window tolerates a
+// period followed by a word character, because `kernel.yama.ptrace_scope` is an
+// identifier and not the end of a sentence — the round-1 finding-#2 shape,
+// which had by then recurred three times.
+const SYSCTL_BUYS_STRICT = new RegExp([
+  // The README's own sentence, reverted.
+  '(?:hardening the runner|the sysctl|sysctl -w kernel\\.yama\\.ptrace_scope=3)'
+    + '(?:[^.]|\\.(?=\\w)){0,90}'
+    + '(?:\\bmakes|\\bdoes make|\\bturns) (?:it|hosted execution|the runner|a hosted runner|hosted runners)'
+    + ' (?:into )?(?:an? )?(?:strict|authenticated)',
+  // Round 7's withdrawn conclusion, in the two forms it was actually written.
+  'strict is still reachable on (?:a |the )?hosted',
+  '(?:must|should|can|may|opt[- ]?in or) harden the runner first',
+  'harden the runner first(?:[^.]|\\.(?=\\w)){0,60}(?:becomes?|is|are) strict',
+].join('|'), 'i');
+
+// POLARITY, not vocabulary (Codex T6 r4 #1). The checks above pass on
+// keywords, so flipping "does NOT survive" to "DOES survive" left every one
+// of them green while the comment asserted the opposite of the truth — a pin
+// that stays green through a reversal is worse than no pin. Each claim below
+// is therefore pinned twice: the form it MUST take, and the absence of its
+// inverse.
+const SCOPE_CLAIMS = [
+  {
+    what: 'the same-job limitation',
+    required: /it does not survive an earlier instrumented command in the same job/i,
+    // Same shape as the README sibling (T8 r3): the bare `survives` branch was
+    // subjectless and rejected every negative-subject sentence — "no guarantee
+    // here survives an earlier instrumented command" — so it is bound to a
+    // named subject in affirmative position, beside the auxiliary form.
+    forbidden: /it does survive an earlier instrumented command|(?:^|[.;:!?] )(?:the )?guarantees? survives? an earlier instrumented command/i,
+  },
+  {
+    what: 'the separate-job requirement',
+    required: /belongs in a separate job/i,
+    forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|can be reused safely in the same job/i,
+  },
+  {
+    what: 'the refusal to guarantee same-job reuse',
+    required: /same-job reuse is not something this runner channel can be made to guarantee/i,
+    forbidden: /same-job reuse is something this runner channel can be made to guarantee/i,
+  },
+  {
+    what: 'the invocation the guarantee is scoped to',
+    required: /it holds for the first \(or only\) invocation of this action in a job/i,
+    // Same widening as the README pin of this claim (T8 r1 audit): the
+    // paraphrase "the guarantee applies to any invocation" reversed it
+    // without using the word "holds".
+    forbidden: /it holds for (?:every|any|each|all) invocations?|(?:guarantees?|it) appl(?:ies|y) to (?:every|any|each|all) invocations?/i,
+  },
+];
+
+// The platform prerequisite, pinned the same way (Codex T6 r5). Three rounds
+// running, the same shape has surfaced: a conditional guarantee written as an
+// absolute one. So the condition is pinned by polarity too — its presence,
+// and the absence of the unconditional forms it replaced.
+const PLATFORM_CLAIMS = [
+  {
+    what: 'the ptrace prerequisite',
+    required: /it holds only where the host\s+refuses classic same-uid ptrace attachment/i,
+    // Bound to the affirmative verb, T8 r3. `on any host` was a bare predicate
+    // that rejected every true sentence using the phrase — "the prerequisite is
+    // not established on any host that ships sudo", "strict is refused on any
+    // host whose sudo reading is not clear" — and `regardless of the host's
+    // ptrace` caught the plain denial of this very claim.
+    // The apostrophe class is both spellings, as elsewhere in this file: a
+    // curly one is an ordinary editor artefact and would otherwise walk the pin.
+    forbidden: /(?:\bholds|\bapplies|is established|is guaranteed) (?:regardless of|whatever) the host(?:['’]s|s)? ptrace|(?:\bholds|\bapplies|\bworks) on any host/i,
+  },
+  {
+    what: 'that only mode 3 establishes it',
+    required: /only linux yama\s+ptrace_scope 3 does that unconditionally/i,
+    // The exact overclaim the r6 Critical was: modes 1 and 2 counted as a
+    // boundary.
+    // `ptrace_scope >= 1` was a bare token: "a reading of `ptrace_scope >= 1`
+    // is not enough" is the sentence this file WANTS someone to write, and the
+    // pin rejected it (T8 r3). Bound to the assertion instead.
+    forbidden: /ptrace_scope >= 1 (?:is|are) (?:enough|sufficient|the boundary|a boundary)|(?:boundary|prerequisite) is `?ptrace_scope >= 1|modes? 1 and 2 (?:are|is) (?:enough|sufficient|a boundary)/i,
+  },
+  // THE MODE-1 IMAGE ASSERTION IS GONE (Codex T8 r2 #4, ruling). This
+  // required half used to mandate "standard GitHub-hosted runners ship mode
+  // 1 with passwordless sudo" — a moving external property of somebody
+  // else's images that this job never measures, fossilized by a REQUIRED
+  // pin, which is the shape that fights whoever tries to correct it. What
+  // survives is what the conclusion actually rests on and what this repo
+  // does observe: modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and
+  // hosted runners hand workflow commands passwordless sudo (the live sudo
+  // reading denies on exactly that, dogfooded by the demo). Neither needs
+  // to know which mode an image ships.
+  {
+    what: 'why modes 1 and 2 are not a boundary here',
+    required: /modes? 1 and 2 restrict\s+attachment but are bypassable with cap_sys_ptrace/i,
+    forbidden: /cap_sys_ptrace (?:is|remains) (?:theoretical|unreachable)/i,
+  },
+  {
+    what: 'that passwordless sudo is what makes the bypass reachable',
+    where: ['action.yml comments', 'support.js comments'],
+    required: /hosted (?:linux )?runners (?:give|hand) workflow commands passwordless\s+sudo/i,
+    // NOT a pin on any mode number: an image property this job never reads
+    // is exactly what round 2 removed, and re-adding it as an inverse would
+    // reintroduce it by the back door.
+    forbidden: /(?:hosted runners?|hosted images?|the hosted default) (?:ships?|use[sd]?|defaults? to) (?:yama )?mode [0-9]/i,
+  },
+  {
+    what: 'that the action refuses rather than merely labels',
+    required: /refuses to run the wrapped command at all unless the\s+prerequisite is positively established/i,
+    // The ` instead` lookahead was a FAIL-OPEN, not a scoping (T8 r3): no
+    // surface contains the phrase it excused, and "the action proceeds anyway
+    // and labels the evidence instead of refusing" is precisely the reversal.
+    // The inflection carries the polarity on its own — the denial is "does not
+    // proceed anyway and label the evidence", without the `s`.
+    forbidden: /proceeds anyway and labels the evidence/i,
+  },
+  {
+    what: 'why labeling alone cannot be the control',
+    required: /such a command can strip\s+the caveat that warns about it/i,
+    forbidden: /the caveat (?:is|remains) sufficient|labeling alone is enough/i,
+  },
+  // The trust contract is CONDITIONAL on the admission mode (Codex T6 r7).
+  // Adding a second regime left every claim written as if only strict
+  // existed; under best-effort the accepted threat is a command able to
+  // rewrite run itself, so run's account, its digest and the report
+  // authenticate nothing. Pinned by polarity because the unconditional form
+  // is the one that reads naturally and would drift back.
+  {
+    what: 'what a strict admission buys',
+    required: /after a\s+successful strict admission, run'?s account is authenticated/i,
+    forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)(?![^.]*strict)/i,
+  },
+  // THE TRUST UNIT HAS THREE PARTS (Codex T6 r9 #3). An artifact plus a
+  // digest is forgeable end to end by a command that can rewrite the process
+  // producing both; what makes the pair mean anything is the pre-command
+  // admission record streamed by `start`, which no later process can retract.
+  // The two-part wording is the exact form rounds 7 and 8 shipped, so it is
+  // the forbidden half.
+  {
+    what: 'that the trust unit has three parts',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /admission record[^.]{0,80}digest[^.]{0,80}artifact/i,
+    forbidden: /the artifact plus the matching digest from its step log is the trust unit|the artifact plus the matching digest is the (?:trust unit|unit of trust)/i,
+  },
+  // SUDO IS DETECTED BY EXISTENCE, NEVER BY BEHAVIOUR (the r9 Critical).
+  // Probing one command cannot establish absence — sudoers rules are
+  // command-specific — and a PATH-planted fake can fabricate a denial that
+  // GRANTS admission. The forbidden half names the round-8 design.
+  {
+    what: 'that sudo is detected by existence, not behaviour',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /any sudo binary at a conventional absolute path or anywhere on the inherited path denies/i,
+    // Two windows replaced by adjacency, T8 r3. The 40-character one rejected
+    // "probing `sudo` never proves the absence of a rule", and the negative
+    // lookahead rejected every true sentence that mentions the phrase without
+    // one of three exact negators ("the action never concludes no passwordless
+    // sudo from a probe"). What is forbidden is the CONCLUSION being asserted.
+    forbidden: /(?:probing|running|executing) [`']?sudo[`']?(?: -n)? (?:establishes|proves|shows|confirms|is enough|is sufficient)|(?:shows|showed|establishes|established|proves|proved|confirms|means) (?:there is )?no passwordless sudo/i,
+  },
+  {
+    what: 'what best-effort does NOT buy',
+    required: /under\s+`?evidence-trust: best-effort`? it is a diagnostic claim only/i,
+    forbidden: /best-effort (?:evidence )?(?:is|remains) (?:authenticated|tamper-resistant|trustworthy)/i,
+  },
+  {
+    what: 'that the digest authenticates only on the strict path',
+    where: ['action.yml input/output descriptions'],
+    required: /that log line is the authenticated copy only after a\s+successful strict admission/i,
+    forbidden: /the authoritative copy is that log line/i,
+  },
+  {
+    what: 'what an unestablished host costs',
+    required: /attach to this process, or to the\s+collector whose pid is in the state file, and read or inject memory,\s+which defeats authenticated evidence/i,
+    forbidden: /(?:ptrace|attachment) (?:is|remains) (?:irrelevant|not a concern|out of scope entirely)/i,
+  },
+  {
+    what: 'the labeling behaviour, not a claim to have created the boundary',
+    required: /the action labels that platform; it cannot\s+create the boundary on it/i,
+    forbidden: /the action (?:creates|establishes|enforces) (?:that|the) boundary/i,
+  },
+  {
+    what: 'the scope of the in-process claim',
+    required: /that claim is about those values and nothing else/i,
+    // Subject-bound and affirmative, T8 r3. The bare noun phrase rejected the
+    // denial this file exists to make — "it does not give you a view of the
+    // world the command cannot influence" — and every negative-subject form of
+    // it ("nothing here IS a view of the world the command it runs cannot
+    // influence"). Only an asserted subject claiming to hold that view fires.
+    forbidden: /(?:this step|the action|`?run`?|it) (?:gives|provides|offers|holds|has) (?:you )?a view of the world the command (?:it runs )?cannot influence/i,
+  },
+  // Mode 3 is NECESSARY, NOT SUFFICIENT (the r8 Critical). It blocks ptrace;
+  // it does not block a principal that can reach root from rewriting another
+  // task's memory with a privileged BPF program or a kernel module. Two
+  // rounds of text were written as if mode 3 settled the question, so the
+  // correction is pinned on both sides.
+  {
+    what: 'that Yama mode 3 is necessary and not sufficient',
+    where: ['action.yml comments', 'support.js comments'],
+    required: /mode 3 is necessary,? (?:but )?not sufficient/i,
+    forbidden: /mode 3 (?:alone )?is (?:enough|sufficient)|ptrace_scope 3 is all (?:that is |it )?(?:required|needed)/i,
+  },
+  {
+    what: 'the non-ptrace route root opens',
+    where: ['action.yml comments', 'support.js comments'],
+    required: /bpf_probe_write_user/i,
+    forbidden: /ptrace is the only (?:way|route|mechanism)/i,
+  },
+  // The routes CHECKED, never a proof that none exists (r8 #2). This is the
+  // same overclaim shape as rounds 4-7 — a partial control described as a
+  // total one — and it is stated on every surface a consumer reads.
+  {
+    what: 'that the check names its own limits',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /(?:these are )?the escalation routes (?:this action|it) checks, not a proof that no route exists/i,
+    // SUBJECT-BOUND, T8 r3. The subjectless form rejected the sentence this
+    // whole claim is about — "NOTHING HERE proves that no escalation route
+    // exists" — the negative-subject shape adjacent-copula cannot touch. A
+    // regression names the thing doing the proving.
+    forbidden: /(?:this action|the action|the check|the reading|the admission check|`?start`?|it) (?:proves|establishes|confirms|guarantees|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
+  },
+  // THE INSPECTION IS NOT A FIXED PATH LIST (Codex T6 r10, Critical). Three
+  // conventional paths reported `absent` on a NixOS-style layout and would
+  // have GRANTED strict on a host where the wrapped command can become root.
+  // The forbidden half is the shape of that mistake — and of the coordinator's
+  // over-broad "never consults PATH" instruction that caused it.
+  {
+    what: 'that every PATH candidate is inspected',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /every sudo candidate on the inherited path, lstat-ed and never executed/i,
+    forbidden: /(?:checks|inspects|covers) (?:only|just) the (?:three )?conventional|path is (?:deliberately )?never (?:consulted|inspected)|the conventional paths are the whole surface/i,
+  },
+  // THE THREE PIECES ARE COMPARED BY A HUMAN (Codex T6 r10 #4). Nothing in
+  // this action checks that run's digest belongs with start's record, so the
+  // record says so itself — and carries the nonce, so the comparison cannot
+  // accidentally be made across invocations.
+  {
+    what: 'that the correspondence is verified by a human, not by the action',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /verifies none of that correspondence/i,
+    forbidden: /the action (?:verifies|checks|confirms|proves) (?:that )?(?:the )?(?:copies|records|three pieces) match|correspondence is verified automatically/i,
+  },
+  {
+    what: 'that the nonce lets a reader detect a mismatch rather than preventing one',
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    required: /lets a reader detect (?:a|any) mismatch/i,
+    forbidden: /cannot accidentally be paired|cannot be paired with|prevents (?:a |any )?(?:cross-invocation|mismatched) pairing|makes (?:a |any )?mismatch impossible/i,
+  },
+  // Hosted execution stays best-effort, and the round-7 sysctl route is
+  // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF
+  // route, so hardening that way would have demonstrated a FALSE guarantee.
+  // The forbidden half is the exact sentence round 7 asked for.
+  {
+    what: 'that hosted execution stays best-effort',
+    where: ['action.yml comments', 'action.yml input/output descriptions'],
+    required: /hosted execution (?:therefore )?(?:stays|remains) best-effort/i,
+    // The shared regex — see SYSCTL_BUYS_STRICT. The `[^.]*` form here rejected
+    // "`sysctl -w kernel.yama.ptrace_scope=3` does NOT make hosted execution
+    // strict-admissible", which is this repository's own sentence, while the
+    // README's sibling could not see that sentence at all.
+    forbidden: SYSCTL_BUYS_STRICT,
+  },
+  // THE TEARDOWN CONTRACT (Codex T8 r1 #2), pinned here because the two
+  // sentences it replaces were both false and both shipped: this file said
+  // hosted runners reap the process tree while self-hosted ones do not
+  // (a category error — RUNNER_TRACKING_ID is set by the RUNNER, and `start`
+  // hands its complete environment to the detached shim without clearing
+  // it, so the collector is tracked on both), and it credited the
+  // collector's idle timeout as a teardown backstop (it retires in-memory
+  // session credentials and never exits the process). The forbidden halves
+  // are those two exact shapes.
+  {
+    what: 'that runner job cleanup kills the tracked collector on hosted AND self-hosted runners',
+    required: /on hosted and self-hosted runners alike/i,
+    forbidden: /hosted runners reap the process tree[^.]{0,60}self-hosted runners rely on this step|self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
+  },
+  {
+    what: 'that the idle timeout is not a teardown backstop',
+    required: /the collector's idle timeout never terminates the process/i,
+    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
+  },
+  // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 fixed
+  // WHERE the reaping lives and left the contract self-contradictory: the
+  // bullet said cleanup is unavailable when the runner dies, and the prose
+  // beside it called that the case the always() step covers. It cannot be.
+  // Finalization is work the runner process does, so a dead runner runs
+  // neither — while disabled process tracking defeats finalization only.
+  // Both halves pinned, because either one alone reads as reassurance.
+  {
+    what: 'that the always() step is scoped to a runner that survives to run it',
+    required: /only while the runner survives to run it/i,
+    // Its OWN inverse — the step still running through a dead runner — and
+    // not merely the two topics co-occurring. A first draft of this pin
+    // forbade "always() step covers ... runner death", which rejected the
+    // true "the always() step covers a preceding step failing, not the
+    // runner dying"; the two-directional probe caught it before it shipped.
+    // The retracted sentence itself is caught by the claim below, where it
+    // belongs.
+    forbidden: /always\(\) (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
+  },
+  {
+    what: 'that runner death defeats both backstops',
+    required: /two separate backstops, and runner death defeats both/i,
+    // Both halves made affirmative, T8 r3. The window let the DENIALS through
+    // to the predicate: "runner death is NOT the case the always() step
+    // covers" and "a dead runner is NOT handled by the always() step" are the
+    // sentences this claim asserts, and the pin rejected both of them.
+    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}\bis (?:exactly |precisely )?(?:this|the) case (?:this|the) always\(\) step covers|runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}which (?:this|the) always\(\) step covers|(?:is|are) (?:covered|handled) by (?:this|the) always\(\) step/i,
+  },
+  // THE UPLOAD CLAIM IS ABOUT PATH NAMES, NEVER BYTES — pinned on these
+  // surfaces because it has now needed correcting FOUR times across two
+  // rounds (Codex T8 r1 #1, r2 #2): both README sites, action.yml's upload
+  // comment, and support.js's own header. Every categorical form is false
+  // (the pinned uploader follows symlinks unconditionally) and every one of
+  // them reads more naturally than the true one, which is why it keeps
+  // coming back. The forbidden half is subject-bound so that unrelated
+  // reachability prose on these surfaces is not caught by it.
+  {
+    what: 'that the state file is excluded by path NAME, not by byte-level prevention',
+    where: ['action.yml comments', 'support.js comments'],
+    required: /no enumerated path names it/i,
+    // The 160-character window swallowed the DENIAL of the over-claim (T8 r3):
+    // "no enumerated path names the state file, which is not the same as
+    // saying it cannot reach the artifact" is the distinction this claim
+    // exists to draw, and the pin rejected it. This is the one shape adjacent
+    // copula cannot help with — the forbidden proposition is itself negative —
+    // so the subject is bound TIGHT to its predicate instead: an asserted
+    // "the state file cannot reach the artifact" fires, a sentence that
+    // mentions the phrase in order to deny it does not.
+    forbidden: /(?:state file|`?action-state\.json`?)(?: itself)? (?:cannot|can never) reach the (?:artifact|archive)|(?:state file|action-state\.json)[^.]{0,160}(?:no path (?:here |in this list )?can reach it|must never be uploaded|can never be uploaded)/i,
+  },
+  // The same two descriptions as the README pins, on the surface GitHub
+  // actually renders to a consumer who never opens this file.
+  {
+    what: 'that report-path is absolute only when output-dir is',
+    where: ['action.yml input/output descriptions'],
+    required: /absolute exactly when output-dir is/i,
+    // Both bound to an asserted subject, T8 r3. As bare phrases they rejected
+    // the claims themselves — "it is NOT the absolute path of report.md when
+    // output-dir is relative", "output-dir NEVER becomes the artifact". A
+    // reversal that drops the subject as well (a description reverting to the
+    // bare noun phrase "Absolute path of report.md") turns the REQUIRED half
+    // red, which is where that regression is caught.
+    forbidden: /(?:is|are) (?:always )?the absolute path (?:of|to) report\.md|(?:always|unconditionally) absolute/i,
+  },
+  {
+    what: 'that output-dir is the staging root rather than the artifact',
+    where: ['action.yml input/output descriptions'],
+    required: /it is the STAGING\s+ROOT, not the artifact/i,
+    forbidden: /(?:output-dir|it|this directory|the directory|the staging (?:root|directory)) becomes the artifact/i,
+  },
+];
+
 test('action.yml states the scope of its integrity guarantee rather than overclaiming', () => {
   // Flowed into one string: these notes wrap across lines, so a phrase can sit
   // either side of a line break and its `# ` prefix.
@@ -5263,38 +5630,7 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   }
   // And the claim it qualifies is stated as scoped, not absolute.
   assert.match(commentary, /out of (?:the reach of|reach of)?\s*THIS invocation'?s? (?:wrapped )?command|unreachable by THIS invocation/i);
-  // POLARITY, not vocabulary (Codex T6 r4 #1). The checks above pass on
-  // keywords, so flipping "does NOT survive" to "DOES survive" left every one
-  // of them green while the comment asserted the opposite of the truth — a pin
-  // that stays green through a reversal is worse than no pin. Each claim below
-  // is therefore pinned twice: the form it MUST take, and the absence of its
-  // inverse.
-  const claims = [
-    {
-      what: 'the same-job limitation',
-      required: /it does not survive an earlier instrumented command in the same job/i,
-      forbidden: /it does survive an earlier instrumented command|survives an earlier instrumented command/i,
-    },
-    {
-      what: 'the separate-job requirement',
-      required: /belongs in a separate job/i,
-      forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|can be reused safely in the same job/i,
-    },
-    {
-      what: 'the refusal to guarantee same-job reuse',
-      required: /same-job reuse is not something this runner channel can be made to guarantee/i,
-      forbidden: /same-job reuse is something this runner channel can be made to guarantee/i,
-    },
-    {
-      what: 'the invocation the guarantee is scoped to',
-      required: /it holds for the first \(or only\) invocation of this action in a job/i,
-      // Same widening as the README pin of this claim (T8 r1 audit): the
-      // paraphrase "the guarantee applies to any invocation" reversed it
-      // without using the word "holds".
-      forbidden: /it holds for (?:every|any|each|all) invocations?|(?:guarantees?|it) appl(?:ies|y) to (?:every|any|each|all) invocations?/i,
-    },
-  ];
-  for (const claim of claims) {
+  for (const claim of SCOPE_CLAIMS) {
     assert.match(commentary, claim.required, `the scope note must state ${claim.what}`);
     assert.doesNotMatch(commentary, claim.forbidden, `the scope note must not reverse ${claim.what}`);
   }
@@ -5302,251 +5638,6 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   // tracked README already carries the warning — there is none (Codex T6 r4 #3).
   assert.match(commentary, /task 8'?s? readme must say so/i);
   assert.doesNotMatch(commentary, /the readme (?:says|already says) so/i);
-  // The platform prerequisite, pinned the same way (Codex T6 r5). Three rounds
-  // running, the same shape has surfaced: a conditional guarantee written as an
-  // absolute one. So the condition is pinned by polarity too — its presence,
-  // and the absence of the unconditional forms it replaced.
-  const platformClaims = [
-    {
-      what: 'the ptrace prerequisite',
-      required: /it holds only where the host\s+refuses classic same-uid ptrace attachment/i,
-      forbidden: /(?:regardless of|whatever) the host'?s? ptrace|on any host/i,
-    },
-    {
-      what: 'that only mode 3 establishes it',
-      required: /only linux yama\s+ptrace_scope 3 does that unconditionally/i,
-      // The exact overclaim the r6 Critical was: modes 1 and 2 counted as a
-      // boundary.
-      forbidden: /ptrace_scope >= 1|modes? 1 and 2 (?:are|is) (?:enough|sufficient|a boundary)/i,
-    },
-    // THE MODE-1 IMAGE ASSERTION IS GONE (Codex T8 r2 #4, ruling). This
-    // required half used to mandate "standard GitHub-hosted runners ship mode
-    // 1 with passwordless sudo" — a moving external property of somebody
-    // else's images that this job never measures, fossilized by a REQUIRED
-    // pin, which is the shape that fights whoever tries to correct it. What
-    // survives is what the conclusion actually rests on and what this repo
-    // does observe: modes 1 and 2 are bypassable with CAP_SYS_PTRACE, and
-    // hosted runners hand workflow commands passwordless sudo (the live sudo
-    // reading denies on exactly that, dogfooded by the demo). Neither needs
-    // to know which mode an image ships.
-    {
-      what: 'why modes 1 and 2 are not a boundary here',
-      required: /modes? 1 and 2 restrict\s+attachment but are bypassable with cap_sys_ptrace/i,
-      forbidden: /cap_sys_ptrace (?:is|remains) (?:theoretical|unreachable)/i,
-    },
-    {
-      what: 'that passwordless sudo is what makes the bypass reachable',
-      where: ['action.yml comments', 'support.js comments'],
-      required: /hosted (?:linux )?runners (?:give|hand) workflow commands passwordless\s+sudo/i,
-      // NOT a pin on any mode number: an image property this job never reads
-      // is exactly what round 2 removed, and re-adding it as an inverse would
-      // reintroduce it by the back door.
-      forbidden: /(?:hosted runners?|hosted images?|the hosted default) (?:ships?|use[sd]?|defaults? to) (?:yama )?mode [0-9]/i,
-    },
-    {
-      what: 'that the action refuses rather than merely labels',
-      required: /refuses to run the wrapped command at all unless the\s+prerequisite is positively established/i,
-      forbidden: /proceeds anyway and labels the evidence(?! instead)/i,
-    },
-    {
-      what: 'why labeling alone cannot be the control',
-      required: /such a command can strip\s+the caveat that warns about it/i,
-      forbidden: /the caveat (?:is|remains) sufficient|labeling alone is enough/i,
-    },
-    // The trust contract is CONDITIONAL on the admission mode (Codex T6 r7).
-    // Adding a second regime left every claim written as if only strict
-    // existed; under best-effort the accepted threat is a command able to
-    // rewrite run itself, so run's account, its digest and the report
-    // authenticate nothing. Pinned by polarity because the unconditional form
-    // is the one that reads naturally and would drift back.
-    {
-      what: 'what a strict admission buys',
-      required: /after a\s+successful strict admission, run'?s account is authenticated/i,
-      forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)(?![^.]*strict)/i,
-    },
-    // THE TRUST UNIT HAS THREE PARTS (Codex T6 r9 #3). An artifact plus a
-    // digest is forgeable end to end by a command that can rewrite the process
-    // producing both; what makes the pair mean anything is the pre-command
-    // admission record streamed by `start`, which no later process can retract.
-    // The two-part wording is the exact form rounds 7 and 8 shipped, so it is
-    // the forbidden half.
-    {
-      what: 'that the trust unit has three parts',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /admission record[^.]{0,80}digest[^.]{0,80}artifact/i,
-      forbidden: /the artifact plus the matching digest from its step log is the trust unit|the artifact plus the matching digest is the (?:trust unit|unit of trust)/i,
-    },
-    // SUDO IS DETECTED BY EXISTENCE, NEVER BY BEHAVIOUR (the r9 Critical).
-    // Probing one command cannot establish absence — sudoers rules are
-    // command-specific — and a PATH-planted fake can fabricate a denial that
-    // GRANTS admission. The forbidden half names the round-8 design.
-    {
-      what: 'that sudo is detected by existence, not behaviour',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /any sudo binary at a conventional absolute path or anywhere on the inherited path denies/i,
-      forbidden: /(?:probing|running|executing) [`']?sudo[`']?[^.]{0,40}(?:establishes|proves|shows|confirms|is enough|is sufficient)|no passwordless sudo(?![^.]*(?:cannot|does not|is not))/i,
-    },
-    {
-      what: 'what best-effort does NOT buy',
-      required: /under\s+`?evidence-trust: best-effort`? it is a diagnostic claim only/i,
-      forbidden: /best-effort (?:evidence )?(?:is|remains) (?:authenticated|tamper-resistant|trustworthy)/i,
-    },
-    {
-      what: 'that the digest authenticates only on the strict path',
-      where: ['action.yml input/output descriptions'],
-      required: /that log line is the authenticated copy only after a\s+successful strict admission/i,
-      forbidden: /the authoritative copy is that log line/i,
-    },
-    {
-      what: 'what an unestablished host costs',
-      required: /attach to this process, or to the\s+collector whose pid is in the state file, and read or inject memory,\s+which defeats authenticated evidence/i,
-      forbidden: /(?:ptrace|attachment) (?:is|remains) (?:irrelevant|not a concern|out of scope entirely)/i,
-    },
-    {
-      what: 'the labeling behaviour, not a claim to have created the boundary',
-      required: /the action labels that platform; it cannot\s+create the boundary on it/i,
-      forbidden: /the action (?:creates|establishes|enforces) (?:that|the) boundary/i,
-    },
-    {
-      what: 'the scope of the in-process claim',
-      required: /that claim is about those values and nothing else/i,
-      forbidden: /view of the world the command (?:it runs )?cannot influence/i,
-    },
-    // Mode 3 is NECESSARY, NOT SUFFICIENT (the r8 Critical). It blocks ptrace;
-    // it does not block a principal that can reach root from rewriting another
-    // task's memory with a privileged BPF program or a kernel module. Two
-    // rounds of text were written as if mode 3 settled the question, so the
-    // correction is pinned on both sides.
-    {
-      what: 'that Yama mode 3 is necessary and not sufficient',
-      where: ['action.yml comments', 'support.js comments'],
-      required: /mode 3 is necessary,? (?:but )?not sufficient/i,
-      forbidden: /mode 3 (?:alone )?is (?:enough|sufficient)|ptrace_scope 3 is all (?:that is |it )?(?:required|needed)/i,
-    },
-    {
-      what: 'the non-ptrace route root opens',
-      where: ['action.yml comments', 'support.js comments'],
-      required: /bpf_probe_write_user/i,
-      forbidden: /ptrace is the only (?:way|route|mechanism)/i,
-    },
-    // The routes CHECKED, never a proof that none exists (r8 #2). This is the
-    // same overclaim shape as rounds 4-7 — a partial control described as a
-    // total one — and it is stated on every surface a consumer reads.
-    {
-      what: 'that the check names its own limits',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /(?:these are )?the escalation routes (?:this action|it) checks, not a proof that no route exists/i,
-      forbidden: /(?:proves|proved|establishes|confirms|guarantees|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
-    },
-    // THE INSPECTION IS NOT A FIXED PATH LIST (Codex T6 r10, Critical). Three
-    // conventional paths reported `absent` on a NixOS-style layout and would
-    // have GRANTED strict on a host where the wrapped command can become root.
-    // The forbidden half is the shape of that mistake — and of the coordinator's
-    // over-broad "never consults PATH" instruction that caused it.
-    {
-      what: 'that every PATH candidate is inspected',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /every sudo candidate on the inherited path, lstat-ed and never executed/i,
-      forbidden: /(?:checks|inspects|covers) (?:only|just) the (?:three )?conventional|path is (?:deliberately )?never (?:consulted|inspected)|the conventional paths are the whole surface/i,
-    },
-    // THE THREE PIECES ARE COMPARED BY A HUMAN (Codex T6 r10 #4). Nothing in
-    // this action checks that run's digest belongs with start's record, so the
-    // record says so itself — and carries the nonce, so the comparison cannot
-    // accidentally be made across invocations.
-    {
-      what: 'that the correspondence is verified by a human, not by the action',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /verifies none of that correspondence/i,
-      forbidden: /the action (?:verifies|checks|confirms|proves) (?:that )?(?:the )?(?:copies|records|three pieces) match|correspondence is verified automatically/i,
-    },
-    {
-      what: 'that the nonce lets a reader detect a mismatch rather than preventing one',
-      where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-      required: /lets a reader detect (?:a|any) mismatch/i,
-      forbidden: /cannot accidentally be paired|cannot be paired with|prevents (?:a |any )?(?:cross-invocation|mismatched) pairing|makes (?:a |any )?mismatch impossible/i,
-    },
-    // Hosted execution stays best-effort, and the round-7 sysctl route is
-    // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF
-    // route, so hardening that way would have demonstrated a FALSE guarantee.
-    // The forbidden half is the exact sentence round 7 asked for.
-    {
-      what: 'that hosted execution stays best-effort',
-      where: ['action.yml comments', 'action.yml input/output descriptions'],
-      required: /hosted execution (?:therefore )?(?:stays|remains) best-effort/i,
-      forbidden: /strict is still reachable|harden the runner first|sysctl -w kernel\.yama\.ptrace_scope=3[^.]*(?:strict|reachable)/i,
-    },
-    // THE TEARDOWN CONTRACT (Codex T8 r1 #2), pinned here because the two
-    // sentences it replaces were both false and both shipped: this file said
-    // hosted runners reap the process tree while self-hosted ones do not
-    // (a category error — RUNNER_TRACKING_ID is set by the RUNNER, and `start`
-    // hands its complete environment to the detached shim without clearing
-    // it, so the collector is tracked on both), and it credited the
-    // collector's idle timeout as a teardown backstop (it retires in-memory
-    // session credentials and never exits the process). The forbidden halves
-    // are those two exact shapes.
-    {
-      what: 'that runner job cleanup kills the tracked collector on hosted AND self-hosted runners',
-      required: /on hosted and self-hosted runners alike/i,
-      forbidden: /hosted runners reap the process tree[^.]{0,60}self-hosted runners rely on this step|self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
-    },
-    {
-      what: 'that the idle timeout is not a teardown backstop',
-      required: /the collector's idle timeout never terminates the process/i,
-      forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
-    },
-    // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 fixed
-    // WHERE the reaping lives and left the contract self-contradictory: the
-    // bullet said cleanup is unavailable when the runner dies, and the prose
-    // beside it called that the case the always() step covers. It cannot be.
-    // Finalization is work the runner process does, so a dead runner runs
-    // neither — while disabled process tracking defeats finalization only.
-    // Both halves pinned, because either one alone reads as reassurance.
-    {
-      what: 'that the always() step is scoped to a runner that survives to run it',
-      required: /only while the runner survives to run it/i,
-      // Its OWN inverse — the step still running through a dead runner — and
-      // not merely the two topics co-occurring. A first draft of this pin
-      // forbade "always() step covers ... runner death", which rejected the
-      // true "the always() step covers a preceding step failing, not the
-      // runner dying"; the two-directional probe caught it before it shipped.
-      // The retracted sentence itself is caught by the claim below, where it
-      // belongs.
-      forbidden: /always\(\) (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
-    },
-    {
-      what: 'that runner death defeats both backstops',
-      required: /two separate backstops, and runner death defeats both/i,
-      forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}(?:this|the) always\(\) step covers|(?:covered|handled) by (?:this|the) always\(\) step/i,
-    },
-    // THE UPLOAD CLAIM IS ABOUT PATH NAMES, NEVER BYTES — pinned on these
-    // surfaces because it has now needed correcting FOUR times across two
-    // rounds (Codex T8 r1 #1, r2 #2): both README sites, action.yml's upload
-    // comment, and support.js's own header. Every categorical form is false
-    // (the pinned uploader follows symlinks unconditionally) and every one of
-    // them reads more naturally than the true one, which is why it keeps
-    // coming back. The forbidden half is subject-bound so that unrelated
-    // reachability prose on these surfaces is not caught by it.
-    {
-      what: 'that the state file is excluded by path NAME, not by byte-level prevention',
-      where: ['action.yml comments', 'support.js comments'],
-      required: /no enumerated path names it/i,
-      forbidden: /(?:state file|action-state\.json)[^.]{0,160}(?:no path (?:here |in this list )?can reach it|must never be uploaded|can never be uploaded|cannot reach the (?:artifact|archive))/i,
-    },
-    // The same two descriptions as the README pins, on the surface GitHub
-    // actually renders to a consumer who never opens this file.
-    {
-      what: 'that report-path is absolute only when output-dir is',
-      where: ['action.yml input/output descriptions'],
-      required: /absolute exactly when output-dir is/i,
-      forbidden: /absolute path of report\.md/i,
-    },
-    {
-      what: 'that output-dir is the staging root rather than the artifact',
-      where: ['action.yml input/output descriptions'],
-      required: /it is the STAGING\s+ROOT, not the artifact/i,
-      forbidden: /becomes the artifact/i,
-    },
-  ];
   // SURFACES, asserted separately (Codex T6 r8 #4). The round-7 version flowed
   // the whole action file into ONE haystack and never looked at support.js at
   // all — so a claim could vanish from the `description:` a consumer reads
@@ -5569,7 +5660,7 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   for (const [name, text] of Object.entries(surfaces)) {
     assert.ok(text.length > 400, `${name}: the surface extractor found nothing to check`);
   }
-  for (const claim of platformClaims) {
+  for (const claim of PLATFORM_CLAIMS) {
     // A claim states which surfaces MUST carry it — and must carry it in each
     // of them independently.
     for (const where of claim.where ?? ['action.yml comments']) {
@@ -8742,6 +8833,16 @@ const SECTION_DEMO = 'Demo';
 const SECTION_SELF_HOSTED = 'Self-hosted runners';
 const SECTION_RESIDUALS = 'Scope, limitations, and residual risks';
 
+// A SUBJECT IN AFFIRMATIVE POSITION: leading a sentence, a list item or a table
+// cell. Some reversals have no copula for the polarity to sit beside — "The
+// prefix tells you the regime" — and the true denial of those puts a NEGATIVE
+// SUBJECT in front of the identical words: "nothing in the prefix distinguishes
+// strict from best-effort". Where the subject leads, the claim is being
+// asserted; where something else leads, it is being talked about. That is a
+// position test, not a negation vocabulary, which is the distinction this round
+// exists to draw (Codex T8 r3, the ruling).
+const SUBJECT_LEADS = '(?:^|[.;:!?] |\\| |[-*+] )[*_>"\'“]*';
+
 // The eight hard requirements, each as a required form plus the inverse that
 // must appear nowhere. The inverses are not invented: every one of them is
 // either a sentence this project actually wrote and had to take back, or the
@@ -8768,13 +8869,20 @@ const README_CLAIMS = [
     what: 'that an earlier instrumented command in the same job breaks it',
     section: SECTION_RESIDUALS,
     required: /do [*_]*not[*_]* survive an earlier instrumented command in the same job/i,
-    forbidden: /(?:does survive|survives) an earlier instrumented command/i,
+    // The bare `survives` branch is SUBJECT-BOUND now (T8 r3): unbound it
+    // rejected any negative-subject sentence ("no same-job guarantee survives
+    // an earlier instrumented command"), and on its own the auxiliary branch
+    // missed the bare plural reversal this README would actually be given.
+    // Both forms, each tied to something that carries the polarity.
+    forbidden: /(?:does|do) survive an earlier instrumented command|(?:^|[.;:!?] )(?:the )?guarantees? survives? an earlier instrumented command/i,
   },
   {
     what: 'the separate-job requirement',
     section: SECTION_RESIDUALS,
     required: /belongs in a\s*[*_]*separate job[*_]*/i,
-    forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|reuse (?:it|the action) safely in the same job/i,
+    // `can` added T8 r3: the bare "reuse it safely in the same job" rejected
+    // "you CANNOT reuse it safely in the same job", which is the instruction.
+    forbidden: /same-job reuse is (?:safe|fine|supported|guaranteed)|(?:can|may) reuse (?:it|the action) safely in the same job/i,
   },
   {
     what: 'the refusal to guarantee same-job reuse',
@@ -8787,7 +8895,10 @@ const README_CLAIMS = [
     what: 'that all five outputs are availability-only and attacker-suppressible',
     section: SECTION_OUTPUTS,
     required: /all five outputs are availability-only, and all five are attacker-suppressible/i,
-    forbidden: /(?:these|the five|the) outputs? (?:are|is) (?:authoritative|trustworthy|tamper-resistant|reliable)|outputs? cannot be (?:suppressed|forged)/i,
+    // The bare `the` determiner made this a negative-subject trap (T8 r3):
+    // "NONE OF the outputs are trustworthy on their own" is the claim, and the
+    // pin rejected it. A reversal counts them.
+    forbidden: /(?:these|all five|the five) outputs? (?:are|is) (?:authoritative|trustworthy|tamper-resistant|reliable)|outputs? cannot be (?:suppressed|forged)/i,
   },
   {
     what: 'that the verdict is the run step exit code, not an output',
@@ -8808,13 +8919,15 @@ const README_CLAIMS = [
     what: 'that report-path is absolute only when output-dir is',
     section: SECTION_OUTPUTS,
     required: /absolute exactly when `output-dir` is/i,
-    forbidden: /absolute path of `?report\.md`?/i,
+    // Bound as on the action.yml surface (T8 r3) — the bare noun phrases
+    // rejected the claims stated plainly.
+    forbidden: /(?:is|are) (?:always )?the absolute path (?:of|to) `?report\.md`?|(?:always|unconditionally) absolute/i,
   },
   {
     what: 'that output-dir is the staging root rather than the artifact',
     section: SECTION_INPUTS,
     required: /it is the [*_]*staging root[*_]*, not the artifact/i,
-    forbidden: /becomes the artifact/i,
+    forbidden: /(?:`?output-dir`?|it|this directory|the directory|the staging (?:root|directory)) becomes the artifact/i,
   },
   // (3) EVIDENCE-TRUST: THE REFUSAL, ITS COST, ITS REACH, AND THE SYSCTL ROUTE.
   {
@@ -8839,7 +8952,12 @@ const README_CLAIMS = [
     what: 'that the sysctl route does not buy strict on a hosted runner',
     section: SECTION_TRUST,
     required: /does not make hosted\s*execution strict-admissible/i,
-    forbidden: /sysctl[^.]{0,90}(?:makes|make|turns) (?:it|hosted execution|the runner|a hosted runner) strict|harden the runner first(?![^.]*not)/i,
+    // The shared regex — see SYSCTL_BUYS_STRICT. This half could not cross the
+    // periods in `kernel.yama.ptrace_scope`, so it was blind to the reversal of
+    // the very sentence above it, while still rejecting the shorter true "no
+    // sysctl makes hosted execution strict". Its sibling on `action.yml` was
+    // broken the other way. One fact, one regex.
+    forbidden: SYSCTL_BUYS_STRICT,
   },
   {
     what: 'what best-effort costs',
@@ -8857,7 +8975,9 @@ const README_CLAIMS = [
     what: 'that the admission check names routes rather than their absence',
     section: SECTION_TRUST,
     required: /not a proof that no route\s*exists/i,
-    forbidden: /(?:proves|establishes|guarantees|confirms|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
+    // Subject-bound, as on the `action.yml` surface (T8 r3): "NOTHING HERE
+    // establishes that there is no privilege path" is this claim, stated.
+    forbidden: /(?:this action|the action|the check|the reading|the admission check|`?start`?|it) (?:proves|establishes|guarantees|confirms|verifies) (?:that )?(?:no|there is no) (?:escalation |privilege )?(?:route|path)/i,
   },
   {
     what: 'that the action verifies no correspondence between the three pieces',
@@ -8870,19 +8990,25 @@ const README_CLAIMS = [
     what: 'the diagnostic prefix and its step provenance',
     section: SECTION_LOGS,
     required: /debug-evidence-action: <step>: <text>[^|]*\| stderr \|/,
-    forbidden: /the prefix (?:tells|says|shows|distinguishes)[^.]{0,60}(?:strict|best-effort)/i,
+    forbidden: new RegExp(`${SUBJECT_LEADS}(?:the )?prefix (?:tells|says|shows|distinguishes)[^.]{0,60}(?:strict|best-effort)`, 'i'),
   },
   {
     what: 'that the regime is distinguished inside the record, not by the prefix',
     section: SECTION_LOGS,
     required: /distinguished inside the record, not by the prefix/i,
-    forbidden: /a (?:separate|different|dedicated) prefix (?:for|marks|identifies) best-effort/i,
+    // A bare noun phrase rejected its own denial (T8 r3): "a dedicated prefix
+    // for best-effort does not exist" says exactly what this claim says. What
+    // is forbidden is the EXISTENCE being asserted.
+    forbidden: /there(?:'s| is| are) an? (?:separate|different|dedicated) prefix for best-effort|an? (?:separate|different|dedicated) prefix (?:marks|identifies|signals|flags) best-effort/i,
   },
   {
     what: 'that duplicate or conflicting lines make the set unusable',
     section: SECTION_LOGS,
     required: /if you find duplicates, or two lines that disagree, [*_]*reject the set[*_]*/i,
-    forbidden: /(?:the action|it|support\.js) (?:de-?duplicates|arbitrates|resolves|reconciles) (?:the )?(?:duplicate|conflicting)/i,
+    // Subject in affirmative position (T8 r3): "nothing in `support.js`
+    // reconciles duplicate records" is the claim, and the unanchored form
+    // rejected it.
+    forbidden: new RegExp(`${SUBJECT_LEADS}(?:the action|it|\`?support\\.js\`?) (?:de-?duplicates|arbitrates|resolves|reconciles) (?:the )?(?:duplicate|conflicting)`, 'i'),
   },
   // (5) THE RENDERED ADMISSION RECORD, AND WHICH COPY IS COMPARABLE.
   {
@@ -8905,15 +9031,28 @@ const README_CLAIMS = [
     // still does not match this README's own row, whose next 60 characters
     // after `report.md` are "(and the Step Summary) | Markdown-**escaped**…".
     //
-    // AND THAT WINDOW THEN REJECTED THE TRUTH (Codex T8 r2 #3): "`report.md`
-    // is NOT verbatim" is a true statement about this very system, and the
-    // sentence-wide window swallowed the negation on its way to the noun.
-    // Both halves are now TEMPERED — each of the ≤60 characters must not
-    // begin a negation word — so the window still crosses a table cell but
-    // stops dead at "not"/"never". The first half gets the same treatment
-    // from the other side, because "never compare the copies against
-    // `report.md`" is the instruction this README actually gives.
-    forbidden: /(?<!\b(?:never|not|rather than|instead of) )compare (?:the copies|them) against `?report\.md`?|`report\.md`(?:(?!\b(?:not|never|nor|neither|unlike|isn['’]t|aren['’]t)\b)[^.]){0,60}verbatim/i,
+    // AND THE TEMPERED WINDOW THAT REPLACED IT WAS THE SAME TRAP, SMALLER
+    // (Codex T8 r3 #1). It REJECTED the true "`report.md` cannot be treated as
+    // verbatim" — `cannot` was outside its negation vocabulary — and MISSED the
+    // false "`report.md` is not escaped but IS verbatim", because an unrelated
+    // "not" stopped the window before it reached the reversal. A vocabulary of
+    // negators cannot be completed, so this half does not try to hold one.
+    //
+    // Three narrow branches, each the shape a reverting editor actually
+    // produces. (a) THE FIDELITY TABLE ROW, where subject and fidelity are
+    // separated by a cell boundary, so exactly one `|` may be crossed and the
+    // affirmative must OPEN the next cell — today that cell opens
+    // "Markdown-**escaped**". (b) THE SAME REVERSAL IN PROSE, with the copula
+    // ADJACENT to its predicate, which is what separates "is verbatim" (and
+    // "is not escaped but IS verbatim") from "is NOT verbatim" and "CANNOT be
+    // treated as verbatim" without naming a single negator. (c) THE
+    // INSTRUCTION reversed into a directive, caught in affirmative sentence
+    // position, so "never compare…" and "you cannot compare…" both pass.
+    forbidden: new RegExp([
+      '`report\\.md`[^|.]{0,40}\\|[ *_]*(?:verbatim|uncapped)',
+      '`?report\\.md`?[^.|]{0,40} (?:is|are|remains?|stays?) (?:\\*\\*|__)*(?:the )?(?:verbatim|uncapped|comparison surface|comparable copy|copy to compare)',
+      `${SUBJECT_LEADS}compare (?:the copies|them) against \`?report\\.md\`?`,
+    ].join('|'), 'i'),
   },
   // (6) THE EMPTY-PATH REMEDIATION.
   {
@@ -8933,25 +9072,54 @@ const README_CLAIMS = [
     what: 'the sort/join/hash/case of the sudo fingerprint',
     section: SECTION_VERIFY,
     required: /[*_]*sorted[*_]* with JavaScript's default comparison \(UTF-16 code-unit order\)[^.]*joined with a single NUL byte[^.]*hashed as [*_]*UTF-8[*_]*, printed as [*_]*lowercase hex/i,
-    forbidden: /joined with (?:a )?(?:colon|comma|newline|space)|printed as (?:upper|UPPER)case hex/i,
+    // Bare predicates rejected their own denials (T8 r3): "the candidates are
+    // NOT joined with a colon", "the digest is NEVER printed as uppercase
+    // hex". The recipe states each step in bold, so an ASSERTED step carries
+    // either an adjacent copula or the emphasis this README puts on it; a
+    // denial in prose carries neither.
+    forbidden: /(?:(?:is|are) |\*\*|__)joined with (?:a )?(?:colon|comma|newline|space)|(?:is|are) (?:printed|rendered) as (?:\*\*|__)*(?:upper|UPPER)case hex|(?:printed|rendered) as (?:\*\*|__)+(?:upper|UPPER)case hex/i,
   },
   {
     what: 'that dedup happens on the DERIVED candidate',
     section: SECTION_VERIFY,
     required: /Deduplicate by exact spelling, on the derived candidate/i,
-    forbidden: /deduplicat\w+ (?:the |on the )?raw `?PATH`? entr/i,
+    // The recipe's steps are bold imperatives leading a numbered item, so the
+    // reversal leads one too. Unanchored, this rejected "it does NOT
+    // deduplicate the raw PATH entries" and "NOTHING deduplicates raw PATH
+    // entries before the candidate is derived" (T8 r3).
+    forbidden: new RegExp([
+      `${SUBJECT_LEADS}deduplicate (?:the |on the )?raw \`?PATH\`? entr`,
+      '(?:the action|it) deduplicates (?:the |on the )?raw `?PATH`? entr',
+    ].join('|'), 'i'),
   },
   {
     what: 'that the count is matched spellings, not distinct binaries or inodes',
     section: SECTION_VERIFY,
     required: /matched candidate [*_]*spellings[*_]*, not distinct binaries or inodes/i,
-    forbidden: /resolving to the same file count(?:s|ed)? twice/i,
+    // REPLACED, NOT RESCUED (Codex T8 r3 #2). The old half forbade
+    // "resolving to the same file counts twice" — which is what this README
+    // ASSERTS ("two **distinct spellings** count separately even when they
+    // resolve to the same file"). It was aimed at the misleading gloss T6 r16
+    // corrected, "two PATH ENTRIES resolving to the same file count twice",
+    // but was never bound to "entries", so it rejected the correct sentence
+    // instead. The required half above already pins the positive rule exactly,
+    // so this half only has to catch the REVERSAL: identity-based dedup, or
+    // distinct spellings collapsing to one.
+    forbidden: new RegExp([
+      `(?:(?:is|are|was|were) (?:dedup\\w+|collapsed|merged|normalis\\w+|normaliz\\w+)|${SUBJECT_LEADS}deduplicate)[^.]{0,20}\\bby (?:\`?realpath\`?|inode)`,
+      '(?:spellings?|candidates?)[^.]{0,60}resolv\\w+ to the same (?:file|binary|inode)[^.]{0,40}count(?:s|ed)? (?:only )?once',
+      'count is distinct (?:binaries|inodes)',
+    ].join('|'), 'i'),
   },
   {
     what: 'that the payload digests are recomputable from the downloaded artifact',
     section: SECTION_VERIFY,
     required: /lowercase hex SHA-256 of that payload's [*_]*UTF-8 bytes[*_]*, computed\s*from memory [*_]*before[*_]* the file was written/i,
-    forbidden: /hashed (?:back )?(?:off|from) disk after staging/i,
+    // Subject-bound with an adjacent copula (T8 r3): the bare phrase rejected
+    // "the payloads are NOT hashed off disk after staging", and a subjectless
+    // widening would still have rejected "NOTHING is hashed from disk after
+    // staging".
+    forbidden: /(?:payloads?|digests?|files?|it|they) (?:is|are|was|were) hashed (?:back )?(?:off|from) disk after staging/i,
   },
   // (8) THE DEMO WORDING BOUNDARY (the reviewer's ruling, and the same
   // over-claim nine rounds of Task 7 were about). The forbidden half uses the
@@ -9014,7 +9182,15 @@ const README_CLAIMS = [
     // subject after the colon. The subject-first branch stays scoped to
     // `never`, because "the state file is not uploaded *by name*" is TRUE and
     // is the sentence a careful editor writes.
-    forbidden: /the state file cannot reach the artifact|`?action-state\.json`? can never be uploaded|\bnot uploaded by this action[^.]{0,30}(?:state file|action-state|collector(?:['’]s)? (?:own )?(?:session )?log)|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
+    //
+    // AND THAT LEFT THE PRE-COLON FORM UNGUARDED (Codex T8 r3 #1). Binding the
+    // post-colon order alone meant "`action-state.json` is not uploaded by this
+    // action" — subject FIRST, the ordinary way anyone writes it — matched no
+    // alternative at all, and that is the exact categorical overclaim: the
+    // uploader follows symlinks, so only "not uploaded BY NAME" is true. The
+    // completion is what carries the polarity here, so the new branch is bound
+    // to `by this action` and lets `by name` through.
+    forbidden: /the state file cannot reach the artifact|`?action-state\.json`? can never be uploaded|\bnot uploaded by this action[^.]{0,30}(?:state file|action-state|collector(?:['’]s)? (?:own )?(?:session )?log)|(?:state file|`?action-state\.json`?|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) not uploaded by (?:this|the) action|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
   },
   // The same claim as it reaches a reader of the EXIT TAXONOMY, where the
   // over-claim actually shipped. The signal name is absent from what the
@@ -9023,7 +9199,12 @@ const README_CLAIMS = [
     what: 'that the signal name is absent from rendered evidence rather than unable to leave the runner',
     section: SECTION_EXITS,
     required: /the signal name is absent from normal rendered evidence[^.]{0,120}not categorically unable to leave the\s*runner/i,
-    forbidden: /nothing that leaves the runner (?:tells|reveals|names|shows|can reveal)|signal name[^.]{0,90}(?:cannot|can never|could never) leave the runner/i,
+    // The 90-character window swallowed the qualifier this claim turns on
+    // (T8 r3): "…but that is not the same as saying it cannot leave the
+    // runner" is the distinction, and the window reached the predicate anyway.
+    // Bound tight, as with the state file — a negative proposition has no
+    // affirmative inflection to key on, so proximity is the only honest test.
+    forbidden: /nothing that leaves the runner (?:tells|reveals|names|shows|can reveal)|signal name(?: itself)? (?:cannot|can never|could never) leave the runner/i,
   },
   // THE TEARDOWN CONTRACT (Codex T8 r1 #2). The hosted/self-hosted split this
   // section used to draw was a category error: RUNNER_TRACKING_ID is exported
@@ -9040,7 +9221,7 @@ const README_CLAIMS = [
     what: 'that the collector idle timeout never terminates the process',
     section: SECTION_SELF_HOSTED,
     required: /the collector's idle timeout never terminates the process/i,
-    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
+    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
   },
   // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 corrected
   // WHERE the reaping lives and left the contract contradicting itself: this
@@ -9067,7 +9248,11 @@ const README_CLAIMS = [
     what: 'that runner death defeats both backstops',
     section: SECTION_SELF_HOSTED,
     required: /two separate backstops, and runner death defeats\s+both/i,
-    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}(?:which is )?(?:exactly )?the case the `?always\(\)`? step[^.]{0,10}covers|(?:covered|handled) by the `?always\(\)`? step/i,
+    // Made affirmative, as on the `action.yml` surface (T8 r3): the window let
+    // the DENIALS through to the predicate, so "runner death is NOT the case
+    // the `always()` step covers" and "a dead runner is NOT handled by the
+    // `always()` step" — both of them this claim, stated — were rejected.
+    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}\bis (?:exactly |precisely )?the case the `?always\(\)`? step[^.]{0,10}covers|(?:is|are) (?:covered|handled) by the `?always\(\)`? step/i,
   },
 ];
 
@@ -9102,6 +9287,707 @@ test('the action README states each hard requirement in the required form, and n
       assert.doesNotMatch(text, claim.forbidden, `${name} must not reverse ${claim.what}`);
     }
   }
+});
+
+// EVERY CLAIM, CHECKED IN BOTH DIRECTIONS — the structural half of the T8 r3
+// ruling, and the reason this table is tracked rather than derived.
+//
+// A forbidden half has two ways to fail and only one of them is visible from
+// inside the suite. It can MISS the regression it exists to catch, which the
+// suite cannot notice because nothing is asserted about text nobody wrote; and
+// it can REJECT A TRUE STATEMENT, which the suite cannot notice either, because
+// the sentence it would fight has not been written yet. Round 1 shipped a pin
+// that REQUIRED a false statement, round 2 replaced it with pins that FORBADE
+// true ones, and round 2 audited all of them from a scratchpad harness that then
+// evaporated — so round 3 opened by re-deriving the same list from scratch. This
+// table is that harness, kept.
+//
+// `accepts` are sentences TRUE of this system, or true of a subject the guard has
+// no business policing; none of them may match. `rejects` are the specific
+// affirmative regressions the guard exists to catch — the sentence an editor
+// would write on reverting the claim; every one of them must match. That second
+// list is deliberately NOT a set of clever paraphrases: a forbidden half catches
+// KNOWN AFFIRMATIVE REGRESSIONS, it does not adjudicate arbitrary English, and
+// widening one until it "decides" a proposition is what produced both failure
+// modes above.
+//
+// Keyed `${table}:${what}`, and the test below fails on a claim with no controls
+// or a control with no claim — so a claim added later cannot skip the check, and
+// a renamed claim cannot silently orphan the probes that proved it.
+const POLARITY_CONTROLS = new Map([
+  ['scope:the same-job limitation', {
+    accepts: [
+      'The guarantee does not survive an earlier instrumented command in the same job.',
+      'It cannot survive an earlier instrumented command in the same job.',
+      'No guarantee here survives an earlier instrumented command.',
+    ],
+    rejects: [
+      'It does survive an earlier instrumented command in the same job.',
+    ],
+  }],
+  ['scope:the separate-job requirement', {
+    accepts: [
+      'Same-job reuse is not safe, so a second invocation belongs in a separate job.',
+      'It cannot be reused safely in the same job.',
+    ],
+    rejects: [
+      'Same-job reuse is safe.',
+    ],
+  }],
+  ['scope:the refusal to guarantee same-job reuse', {
+    accepts: [
+      'Same-job reuse is not something this runner channel can be made to guarantee.',
+    ],
+    rejects: [
+      'Same-job reuse is something this runner channel can be made to guarantee.',
+    ],
+  }],
+  ['scope:the invocation the guarantee is scoped to', {
+    accepts: [
+      'It does not hold for every invocation.',
+      'One invocation at a time per output directory: that rule holds for every invocation.',
+      'The guarantee never applies to any invocation after the first.',
+    ],
+    rejects: [
+      'It holds for every invocation of this action in a job.',
+    ],
+  }],
+  ['platform:the ptrace prerequisite', {
+    accepts: [
+      'The prerequisite is not established on any host that ships sudo.',
+      'It does not hold regardless of the host’s ptrace configuration.',
+      'Strict is refused on any host whose sudo reading is not clear.',
+    ],
+    rejects: [
+      'It holds regardless of the host’s ptrace configuration.',
+    ],
+  }],
+  ['platform:that only mode 3 establishes it', {
+    accepts: [
+      'Modes 1 and 2 are not sufficient.',
+      'A reading of ptrace_scope >= 1 is not enough.',
+    ],
+    rejects: [
+      'Modes 1 and 2 are a boundary.',
+    ],
+  }],
+  ['platform:why modes 1 and 2 are not a boundary here', {
+    accepts: [
+      'CAP_SYS_PTRACE is not theoretical where passwordless sudo exists.',
+      'CAP_SYS_PTRACE is never unreachable on a runner that hands out root.',
+    ],
+    rejects: [
+      'CAP_SYS_PTRACE is theoretical.',
+    ],
+  }],
+  ['platform:that passwordless sudo is what makes the bypass reachable', {
+    accepts: [
+      'Nothing here asserts which Yama mode hosted images ship.',
+      'This action never reads which mode a hosted runner uses.',
+    ],
+    rejects: [
+      'Hosted runners ship mode 1 with passwordless sudo.',
+    ],
+  }],
+  ['platform:that the action refuses rather than merely labels', {
+    accepts: [
+      'Strict does not proceed anyway and label the evidence.',
+      'It refuses instead of proceeding anyway.',
+    ],
+    rejects: [
+      'Under strict the action proceeds anyway and labels the evidence.',
+      'Under strict the action proceeds anyway and labels the evidence instead of refusing.',
+    ],
+  }],
+  ['platform:why labeling alone cannot be the control', {
+    accepts: [
+      'The caveat is not sufficient, because the command can strip it.',
+      'Labeling alone is never enough here.',
+    ],
+    rejects: [
+      'The caveat is sufficient.',
+    ],
+  }],
+  ['platform:what a strict admission buys', {
+    accepts: [
+      'The run digest is not the trust anchor; it is convenience only.',
+      'No single artifact is the unit of trust.',
+    ],
+    rejects: [
+      'The run digest is the trust anchor.',
+    ],
+  }],
+  ['platform:that the trust unit has three parts', {
+    accepts: [
+      'The artifact plus the matching digest is not the trust unit; the admission record is the third part.',
+    ],
+    rejects: [
+      'The artifact plus the matching digest is the trust unit.',
+    ],
+  }],
+  ['platform:that sudo is detected by existence, not behaviour', {
+    accepts: [
+      'Running sudo does not establish the absence of a rule for another command.',
+      'A reading of no passwordless sudo cannot be reached by probing one command.',
+      'Probing `sudo` never proves the absence of a rule for another command.',
+      'The action never concludes no passwordless sudo from a probe.',
+    ],
+    rejects: [
+      'Probing sudo establishes that no rule exists.',
+    ],
+  }],
+  ['platform:what best-effort does NOT buy', {
+    accepts: [
+      'Best-effort evidence is not authenticated.',
+      'Best-effort evidence is never tamper-resistant.',
+    ],
+    rejects: [
+      'Best-effort evidence is authenticated.',
+    ],
+  }],
+  ['platform:that the digest authenticates only on the strict path', {
+    accepts: [
+      'That log line is not the authoritative copy under best-effort.',
+    ],
+    rejects: [
+      'The authoritative copy is that log line.',
+    ],
+  }],
+  ['platform:what an unestablished host costs', {
+    accepts: [
+      'Ptrace is not irrelevant here.',
+      'Attachment is never out of scope entirely.',
+    ],
+    rejects: [
+      'Ptrace is irrelevant.',
+    ],
+  }],
+  ['platform:the labeling behaviour, not a claim to have created the boundary', {
+    accepts: [
+      'The action does not create the boundary; it labels the platform it finds.',
+      'The action can never establish that boundary itself.',
+    ],
+    rejects: [
+      'The action creates the boundary.',
+    ],
+  }],
+  ['platform:the scope of the in-process claim', {
+    accepts: [
+      'It does not give you a view of the world the command cannot influence.',
+      'Nothing here is a view of the world the command it runs cannot influence.',
+    ],
+    rejects: [
+      'This step holds a view of the world the command it runs cannot influence.',
+    ],
+  }],
+  ['platform:that Yama mode 3 is necessary and not sufficient', {
+    accepts: [
+      'Mode 3 alone is not enough.',
+      'ptrace_scope 3 is never all that is required.',
+    ],
+    rejects: [
+      'Mode 3 alone is enough.',
+    ],
+  }],
+  ['platform:the non-ptrace route root opens', {
+    accepts: [
+      'Ptrace is not the only route root opens.',
+      'Ptrace is never the only mechanism.',
+    ],
+    rejects: [
+      'Ptrace is the only route.',
+    ],
+  }],
+  ['platform:that the check names its own limits', {
+    accepts: [
+      'Nothing here proves that no escalation route exists.',
+      'The check does not establish that there is no privilege path.',
+      'It cannot prove that no route exists.',
+    ],
+    rejects: [
+      'The check proves that no escalation route exists.',
+    ],
+  }],
+  ['platform:that every PATH candidate is inspected', {
+    accepts: [
+      'It does not check only the conventional locations.',
+      'PATH is never ignored by the inspection.',
+    ],
+    rejects: [
+      'It checks only the conventional locations.',
+    ],
+  }],
+  ['platform:that the correspondence is verified by a human, not by the action', {
+    accepts: [
+      'The action does not verify that the copies match.',
+      'The action can never confirm that the three pieces match.',
+      'Correspondence is not verified automatically.',
+    ],
+    rejects: [
+      'The action verifies that the copies match.',
+    ],
+  }],
+  ['platform:that the nonce lets a reader detect a mismatch rather than preventing one', {
+    accepts: [
+      'The nonce does not prevent a mismatched pairing.',
+      'It cannot make a mismatch impossible.',
+      'Two records can accidentally be paired across invocations.',
+    ],
+    rejects: [
+      'The nonce prevents a cross-invocation pairing.',
+    ],
+  }],
+  ['platform:that hosted execution stays best-effort', {
+    accepts: [
+      'sysctl -w kernel.yama.ptrace_scope=3 does not make hosted execution strict-admissible.',
+      'No sysctl makes hosted execution strict.',
+      'Strict is not still reachable on a hosted runner after hardening.',
+    ],
+    rejects: [
+      'Hardening the runner with sysctl -w kernel.yama.ptrace_scope=3 makes hosted execution strict-admissible.',
+      'Strict is still reachable on a hosted runner.',
+    ],
+  }],
+  ['platform:that runner job cleanup kills the tracked collector on hosted AND self-hosted runners', {
+    accepts: [
+      'Self-hosted runners do reap the tracked process tree.',
+      'Reaping is not a hosted-image behaviour.',
+    ],
+    rejects: [
+      'Self-hosted runners do not reap the process tree.',
+    ],
+  }],
+  ['platform:that the idle timeout is not a teardown backstop', {
+    accepts: [
+      'The idle timeout is not a teardown backstop.',
+      'The idle timeout never exits the process.',
+    ],
+    rejects: [
+      'The idle timeout acts as a teardown backstop.',
+      'The idle timeout eventually exits the collector’s process.',
+    ],
+  }],
+  ['platform:that the always() step is scoped to a runner that survives to run it', {
+    accepts: [
+      'The always() step covers a preceding step failing, not the runner dying.',
+      'The always() step does not run if the runner process dies.',
+    ],
+    rejects: [
+      'The always() step runs even if the runner process dies.',
+    ],
+  }],
+  ['platform:that runner death defeats both backstops', {
+    accepts: [
+      'Runner death is not the case the always() step covers.',
+      'A dead runner is not handled by the always() step.',
+    ],
+    rejects: [
+      'The runner process died, which is the case the always() step covers.',
+    ],
+  }],
+  ['platform:that the state file is excluded by path NAME, not by byte-level prevention', {
+    accepts: [
+      'The state file is not uploaded by name, but its bytes can still reach the archive through a symlink.',
+      'No enumerated path names the state file, which is not the same as saying it cannot reach the artifact.',
+    ],
+    rejects: [
+      'The state file must never be uploaded.',
+    ],
+  }],
+  ['platform:that report-path is absolute only when output-dir is', {
+    accepts: [
+      'report-path is not the absolute path of report.md when output-dir is relative.',
+    ],
+    rejects: [
+      'report-path is the absolute path of report.md.',
+    ],
+  }],
+  ['platform:that output-dir is the staging root rather than the artifact', {
+    accepts: [
+      'output-dir never becomes the artifact; it is the staging root.',
+    ],
+    rejects: [
+      'output-dir becomes the artifact.',
+    ],
+  }],
+  ['readme:that the guarantee is scoped to the first (or only) invocation', {
+    accepts: [
+      'The guarantee does not hold for every invocation.',
+      'One invocation at a time per output directory: that rule holds for every invocation.',
+      'It never applies to any invocation after the first.',
+    ],
+    rejects: [
+      'The guarantee holds for every invocation.',
+    ],
+  }],
+  ['readme:that an earlier instrumented command in the same job breaks it', {
+    accepts: [
+      'The guarantees do not survive an earlier instrumented command in the same job.',
+      'Nothing here survives an earlier instrumented command untouched, so use a separate job.',
+    ],
+    rejects: [
+      'The guarantees survive an earlier instrumented command.',
+    ],
+  }],
+  ['readme:the separate-job requirement', {
+    accepts: [
+      'Same-job reuse is not safe.',
+      'You cannot reuse it safely in the same job.',
+    ],
+    rejects: [
+      'Same-job reuse is supported.',
+    ],
+  }],
+  ['readme:the refusal to guarantee same-job reuse', {
+    accepts: [
+      'Same-job reuse is not something this runner channel can be made to guarantee.',
+    ],
+    rejects: [
+      'Same-job reuse is something this runner channel can be made to guarantee.',
+    ],
+  }],
+  ['readme:that all five outputs are availability-only and attacker-suppressible', {
+    accepts: [
+      'The outputs are not authoritative.',
+      'None of the outputs are trustworthy on their own.',
+      'The outputs can be suppressed by an attacker.',
+    ],
+    rejects: [
+      'The five outputs are authoritative.',
+    ],
+  }],
+  ['readme:that the verdict is the run step exit code, not an output', {
+    accepts: [
+      'The digest is not the trust anchor.',
+      'The evidence-digest output is never the authoritative copy.',
+    ],
+    rejects: [
+      'The digest is the trust anchor.',
+    ],
+  }],
+  ['readme:that report-path is absolute only when output-dir is', {
+    accepts: [
+      'It is not the absolute path of `report.md` when `output-dir` is relative.',
+    ],
+    rejects: [
+      '`report-path` is the absolute path of `report.md`.',
+    ],
+  }],
+  ['readme:that output-dir is the staging root rather than the artifact', {
+    accepts: [
+      'It never becomes the artifact; it is the staging root.',
+    ],
+    rejects: [
+      '`output-dir` becomes the artifact.',
+    ],
+  }],
+  ['readme:that strict refuses on the default hosted configuration', {
+    accepts: [
+      'Strict is not available on the default hosted runner.',
+      'Strict never works on a hosted runner that ships sudo.',
+    ],
+    rejects: [
+      'Strict is available on the default hosted runner.',
+    ],
+  }],
+  ['readme:that the refusal precedes the wrapped command', {
+    accepts: [
+      'Labelling alone is not enough.',
+      'The label is never sufficient on its own.',
+    ],
+    rejects: [
+      'Labelling alone is enough.',
+    ],
+  }],
+  ['readme:that mode 3 is necessary and not sufficient', {
+    accepts: [
+      'Mode 3 alone is not sufficient.',
+      '`ptrace_scope` 3 is never all that is needed.',
+    ],
+    rejects: [
+      'Mode 3 alone is sufficient.',
+    ],
+  }],
+  ['readme:that the sysctl route does not buy strict on a hosted runner', {
+    accepts: [
+      'Hardening the runner with `sysctl -w kernel.yama.ptrace_scope=3` does not make hosted execution strict-admissible.',
+      'No sysctl makes hosted execution strict.',
+      'You cannot harden the runner first and reach strict that way.',
+    ],
+    rejects: [
+      'Hardening the runner with `sysctl -w kernel.yama.ptrace_scope=3` makes hosted execution strict-admissible.',
+      'Harden the runner first, and hosted execution becomes strict-admissible.',
+    ],
+  }],
+  ['readme:what best-effort costs', {
+    accepts: [
+      'Best-effort evidence is not authenticated.',
+      'None of it is tamper-resistant.',
+    ],
+    rejects: [
+      'Best-effort evidence remains trustworthy.',
+    ],
+  }],
+  ['readme:that strict is reachable only where there is no route to root', {
+    accepts: [
+      'Strict is not reachable on ordinary hosts.',
+      'Strict is never reachable on any runner with a route to root.',
+    ],
+    rejects: [
+      'Strict is reachable on most hosts.',
+    ],
+  }],
+  ['readme:that the admission check names routes rather than their absence', {
+    accepts: [
+      'It does not prove that no escalation route exists.',
+      'Nothing here establishes that there is no privilege path.',
+      'The reading cannot guarantee that no route exists.',
+    ],
+    rejects: [
+      'The reading proves that no escalation route exists.',
+    ],
+  }],
+  ['readme:that the action verifies no correspondence between the three pieces', {
+    accepts: [
+      'The action does not verify that the copies match.',
+      'It can never confirm that the three pieces belong together.',
+    ],
+    rejects: [
+      'The action verifies that the copies match.',
+    ],
+  }],
+  ['readme:the diagnostic prefix and its step provenance', {
+    accepts: [
+      'The prefix does not tell you whether the run was strict or best-effort.',
+      'Nothing in the prefix distinguishes strict from best-effort.',
+    ],
+    rejects: [
+      'The prefix tells you whether the run was strict or best-effort.',
+    ],
+  }],
+  ['readme:that the regime is distinguished inside the record, not by the prefix', {
+    accepts: [
+      'There is no separate prefix for best-effort.',
+      'A dedicated prefix for best-effort does not exist.',
+    ],
+    rejects: [
+      'A separate prefix marks best-effort.',
+    ],
+  }],
+  ['readme:that duplicate or conflicting lines make the set unusable', {
+    accepts: [
+      'The action does not de-duplicate the conflicting lines for you.',
+      'Nothing in support.js reconciles duplicate records.',
+    ],
+    rejects: [
+      'The action de-duplicates the conflicting lines.',
+    ],
+  }],
+  ['readme:a rendered admission record', {
+    accepts: [
+      'The record is not byte-identical across surfaces.',
+      'The copies are never identical on all three surfaces.',
+    ],
+    rejects: [
+      'The record is byte-identical across all three surfaces.',
+    ],
+  }],
+  ['readme:that report.md is escaped and capped while report.json is the comparable copy', {
+    accepts: [
+      '`report.md` cannot be treated as verbatim.',
+      '`report.md` is not verbatim.',
+      '`report.md` is escaped and capped, never verbatim.',
+      'Never compare the copies against `report.md`.',
+      'You cannot compare the copies against `report.md`.',
+    ],
+    rejects: [
+      '`report.md` is verbatim, uncapped.',
+      '| `report.md` (and the Step Summary) | **Verbatim, uncapped.** This is the copy to compare against. |',
+      '`report.md` is not escaped but is verbatim.',
+      'Compare the copies against `report.md`.',
+    ],
+  }],
+  ['readme:the unset-rather-than-empty PATH remediation', {
+    accepts: [
+      '`PATH=""` is not safe, and it does not count as absent.',
+      'Setting `PATH` to an empty string is never equivalent to unsetting it.',
+    ],
+    rejects: [
+      '`PATH=""` is fine.',
+    ],
+  }],
+  ['readme:that only an ABSENT PATH means conventional locations only', {
+    accepts: [
+      'An empty `PATH` does not mean "conventional locations only".',
+    ],
+    rejects: [
+      'An empty `PATH` means "conventional locations only".',
+    ],
+  }],
+  ['readme:the sort/join/hash/case of the sudo fingerprint', {
+    accepts: [
+      'The candidates are not joined with a colon.',
+      'The digest is never printed as uppercase hex.',
+    ],
+    rejects: [
+      'The candidates are joined with a colon.',
+    ],
+  }],
+  ['readme:that dedup happens on the DERIVED candidate', {
+    accepts: [
+      'It does not deduplicate the raw `PATH` entries.',
+      'Nothing deduplicates raw `PATH` entries before the candidate is derived.',
+    ],
+    rejects: [
+      'It deduplicates the raw `PATH` entries.',
+    ],
+  }],
+  ['readme:that the count is matched spellings, not distinct binaries or inodes', {
+    accepts: [
+      'Two distinct candidate spellings resolving to the same file count twice.',
+      '`/a/sudo` and `/b/sudo` are 2, regardless of filesystem identity.',
+      'There is no `realpath`, and no inode comparison.',
+      'Candidates are not deduplicated by inode.',
+    ],
+    rejects: [
+      'Two distinct candidate spellings resolving to the same file count once.',
+      'Candidates are deduplicated by `realpath`.',
+      'The count is distinct binaries, not matched spellings.',
+    ],
+  }],
+  ['readme:that the payload digests are recomputable from the downloaded artifact', {
+    accepts: [
+      'The payloads are not hashed off disk after staging.',
+      'Nothing is hashed from disk after staging.',
+    ],
+    rejects: [
+      'The payloads are hashed off disk after staging.',
+    ],
+  }],
+  ['readme:that the demo proves the exact fixture', {
+    accepts: [
+      'It does not prove that arbitrary secrets cannot leak.',
+      'The demo demonstrates that secrets can ever leak into a report is not a claim anyone makes.',
+      'Nothing in the demo proves that no secret can be redacted in general.',
+    ],
+    rejects: [
+      'The demo proves that arbitrary secrets cannot leak.',
+    ],
+  }],
+  ['readme:that the demo does NOT generalise to arbitrary secrets', {
+    accepts: [
+      'The demo does not prove redaction in general.',
+      'The demo never proves redaction for any secret.',
+    ],
+    rejects: [
+      'The demo therefore proves redaction in general.',
+    ],
+  }],
+  ['readme:why the collector inherits the job environment', {
+    accepts: [
+      'A stripped environment is not safer here.',
+      'A clean environment would never be preferable.',
+    ],
+    rejects: [
+      'A stripped environment is safer.',
+    ],
+  }],
+  ['readme:that the state file is excluded by PATH, not by byte-level prevention', {
+    accepts: [
+      '`action-state.json` is not uploaded by name.',
+      'The state file is not uploaded by name, but its bytes can still reach the archive.',
+      'A checkout’s `package-lock.json` is not uploaded by this action.',
+      'The state file can reach the artifact through a symlink.',
+    ],
+    rejects: [
+      '`action-state.json` is not uploaded by this action.',
+      'The state file is not uploaded by this action.',
+      'Not uploaded by this action: the collector’s own session log.',
+      'The state file cannot reach the artifact.',
+      'The state file is never uploaded.',
+    ],
+  }],
+  ['readme:that the signal name is absent from rendered evidence rather than unable to leave the runner', {
+    accepts: [
+      'The signal name is absent from normal rendered evidence, but it is not categorically unable to leave the runner.',
+      'The signal name is absent from normal rendered evidence, but that is not the same as saying it cannot leave the runner.',
+      'The signal name can leave the runner through a symlinked payload.',
+    ],
+    rejects: [
+      'The signal name cannot leave the runner.',
+    ],
+  }],
+  ['readme:that runner job cleanup also kills the tracked collector on hosted AND self-hosted runners', {
+    accepts: [
+      'A self-hosted runner does reap the tracked collector.',
+      'Reaping is not a hosted-image behaviour.',
+    ],
+    rejects: [
+      'A self-hosted runner does not reap.',
+    ],
+  }],
+  ['readme:that the collector idle timeout never terminates the process', {
+    accepts: [
+      'The idle timeout is not a teardown backstop.',
+      'The idle timeout never terminates the process.',
+    ],
+    rejects: [
+      'The idle timeout eventually exits the collector process.',
+      'The idle timeout eventually exits the collector’s process.',
+    ],
+  }],
+  ['readme:that the always() teardown step is scoped to a runner that survives to run it', {
+    accepts: [
+      'The `always()` step covers a preceding step failing, not the runner dying.',
+      'The `always()` step does not run when the runner process dies.',
+    ],
+    rejects: [
+      'The `always()` step runs even if the runner process dies.',
+    ],
+  }],
+  ['readme:that runner death defeats both backstops', {
+    accepts: [
+      'Runner death is not the case the `always()` step covers.',
+      'A dead runner is not handled by the `always()` step.',
+    ],
+    rejects: [
+      'The runner process died, which is exactly the case the `always()` step covers.',
+    ],
+  }],
+]);
+
+test('every polarity guard accepts the true statements it must not reject, and catches the regression it exists for', () => {
+  const tables = [['scope', SCOPE_CLAIMS], ['platform', PLATFORM_CLAIMS], ['readme', README_CLAIMS]];
+  const covered = new Set();
+  for (const [table, claims] of tables) {
+    const names = new Set();
+    for (const claim of claims) {
+      // A duplicate `what` inside one table would silently share one set of
+      // controls between two different guards.
+      assert.equal(names.has(claim.what), false, `${table}: two claims are both called '${claim.what}'`);
+      names.add(claim.what);
+      const key = `${table}:${claim.what}`;
+      const control = POLARITY_CONTROLS.get(key);
+      assert.ok(control, `no true-statement controls for ${key} — every claim is checked in both directions`);
+      covered.add(key);
+      for (const sentence of control.accepts) {
+        assert.doesNotMatch(sentence, claim.forbidden,
+          `${key}: the forbidden half rejects a TRUE statement — ${sentence}`);
+      }
+      for (const sentence of control.rejects) {
+        assert.match(sentence, claim.forbidden,
+          `${key}: the forbidden half misses the regression it exists for — ${sentence}`);
+      }
+    }
+  }
+  for (const key of POLARITY_CONTROLS.keys()) {
+    assert.ok(covered.has(key), `controls for ${key}, but no claim by that name — renamed or removed?`);
+  }
+  // A floor on the probe set, so a future tidy-up cannot pass this test by
+  // deleting the sentences instead of satisfying them.
+  const probes = [...POLARITY_CONTROLS.values()]
+    .reduce((n, c) => n + c.accepts.length + c.rejects.length, 0);
+  assert.ok(probes >= 220, `expected the control set to stay at 220+ probes, found ${probes}`);
 });
 
 // The residual disclosures, as a presence sweep rather than a polarity pair:
