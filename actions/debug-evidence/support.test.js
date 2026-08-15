@@ -5279,7 +5279,10 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     {
       what: 'the invocation the guarantee is scoped to',
       required: /it holds for the first \(or only\) invocation of this action in a job/i,
-      forbidden: /it holds for (?:every|any|each|all) invocations?/i,
+      // Same widening as the README pin of this claim (T8 r1 audit): the
+      // paraphrase "the guarantee applies to any invocation" reversed it
+      // without using the word "holds".
+      forbidden: /it holds for (?:every|any|each|all) invocations?|(?:guarantees?|it) appl(?:ies|y) to (?:every|any|each|all) invocations?/i,
     },
   ];
   for (const claim of claims) {
@@ -5443,6 +5446,39 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
       where: ['action.yml comments', 'action.yml input/output descriptions'],
       required: /hosted execution (?:therefore )?(?:stays|remains) best-effort/i,
       forbidden: /strict is still reachable|harden the runner first|sysctl -w kernel\.yama\.ptrace_scope=3[^.]*(?:strict|reachable)/i,
+    },
+    // THE TEARDOWN CONTRACT (Codex T8 r1 #2), pinned here because the two
+    // sentences it replaces were both false and both shipped: this file said
+    // hosted runners reap the process tree while self-hosted ones do not
+    // (a category error — RUNNER_TRACKING_ID is set by the RUNNER, and `start`
+    // hands its complete environment to the detached shim without clearing
+    // it, so the collector is tracked on both), and it credited the
+    // collector's idle timeout as a teardown backstop (it retires in-memory
+    // session credentials and never exits the process). The forbidden halves
+    // are those two exact shapes.
+    {
+      what: 'that runner job cleanup kills the tracked collector on hosted AND self-hosted runners',
+      required: /on hosted and self-hosted runners alike/i,
+      forbidden: /hosted runners reap the process tree[^.]{0,60}self-hosted runners rely on this step|self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
+    },
+    {
+      what: 'that the idle timeout is not a teardown backstop',
+      required: /the collector's idle timeout never terminates the process/i,
+      forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
+    },
+    // The same two descriptions as the README pins, on the surface GitHub
+    // actually renders to a consumer who never opens this file.
+    {
+      what: 'that report-path is absolute only when output-dir is',
+      where: ['action.yml input/output descriptions'],
+      required: /absolute exactly when output-dir is/i,
+      forbidden: /absolute path of report\.md/i,
+    },
+    {
+      what: 'that output-dir is the staging root rather than the artifact',
+      where: ['action.yml input/output descriptions'],
+      required: /it is the STAGING\s+ROOT, not the artifact/i,
+      forbidden: /becomes the artifact/i,
     },
   ];
   // SURFACES, asserted separately (Codex T6 r8 #4). The round-7 version flowed
@@ -8628,6 +8664,7 @@ const readmeSections = (text) => {
   return new Map([...sections].map(([name, lines]) => [name, lines.join(' ').replace(/\s+/g, ' ').trim()]));
 };
 
+const SECTION_INPUTS = 'Inputs';
 const SECTION_OUTPUTS = 'Outputs';
 const SECTION_ARTIFACT = 'The evidence artifact';
 const SECTION_REDACTION = 'Redaction invariant';
@@ -8636,6 +8673,7 @@ const SECTION_LOGS = 'Reading the step logs';
 const SECTION_VERIFY = 'Verifying a run by hand';
 const SECTION_EXITS = 'Exit semantics';
 const SECTION_DEMO = 'Demo';
+const SECTION_SELF_HOSTED = 'Self-hosted runners';
 const SECTION_RESIDUALS = 'Scope, limitations, and residual risks';
 
 // The eight hard requirements, each as a required form plus the inverse that
@@ -8648,7 +8686,10 @@ const README_CLAIMS = [
     what: 'that the guarantee is scoped to the first (or only) invocation',
     section: SECTION_RESIDUALS,
     required: /scoped to the first \(or only\) invocation in a job/i,
-    forbidden: /(?:holds|hold|applies) (?:for|to) (?:every|any|each|all) invocations?/i,
+    // `appl(?:y|ies)` since T8 r1: the round-1 audit paraphrased this as "the
+    // guarantees apply to any invocation" and the pin, which knew only
+    // "applies", let it through.
+    forbidden: /(?:holds|hold|appl(?:ies|y)) (?:for|to) (?:every|any|each|all) invocations?/i,
   },
   {
     what: 'that an earlier instrumented command in the same job breaks it',
@@ -8680,6 +8721,27 @@ const README_CLAIMS = [
     section: SECTION_OUTPUTS,
     required: /the verdict is the run step's exit code/i,
     forbidden: /digest[^.]{0,30}is the (?:trust anchor|authoritative copy)/i,
+  },
+  // TWO DESCRIPTIONS THAT PROMISED MORE THAN THE CODE DELIVERS (Codex T8 r1
+  // #4). `resolveEvidenceDir` and the `report-path` assignment both use
+  // `path.join`, never `path.resolve`, so a relative custom `output-dir` — a
+  // `../debug-evidence` passes validation, it only has to resolve outside the
+  // workspace — yields a RELATIVE `report-path`. The honest description was
+  // taken over making the implementation absolute, which is a behaviour change
+  // and would need tests of its own. The `output-dir` half is the same error
+  // pointing the other way: it is the staging ROOT, and only the nonce child's
+  // three enumerated paths are submitted.
+  {
+    what: 'that report-path is absolute only when output-dir is',
+    section: SECTION_OUTPUTS,
+    required: /absolute exactly when `output-dir` is/i,
+    forbidden: /absolute path of `?report\.md`?/i,
+  },
+  {
+    what: 'that output-dir is the staging root rather than the artifact',
+    section: SECTION_INPUTS,
+    required: /it is the [*_]*staging root[*_]*, not the artifact/i,
+    forbidden: /becomes the artifact/i,
   },
   // (3) EVIDENCE-TRUST: THE REFUSAL, ITS COST, ITS REACH, AND THE SYSCTL ROUTE.
   {
@@ -8760,7 +8822,16 @@ const README_CLAIMS = [
     what: 'that report.md is escaped and capped while report.json is the comparable copy',
     section: SECTION_LOGS,
     required: /The copies are not\s*byte-identical across surfaces/i,
-    forbidden: /compare (?:the copies|them) against `?report\.md`?|`report\.md`[^|]{0,60}verbatim/i,
+    // THE SECOND BLIND GUARD THIS ROUND'S AUDIT FOUND. The window was
+    // `[^|]{0,60}`, chosen so a match could not run across a table cell — but
+    // the fidelity TABLE is exactly where this reversal would land, and `|`
+    // is what separates `report.md` from its fidelity there. The pin was
+    // therefore structurally incapable of firing at the one place the claim
+    // lives: `| `report.md` | Verbatim, uncapped. |` passed it. `[^.]{0,60}`
+    // keeps the match inside one sentence (which was the real intent) and
+    // still does not match this README's own row, whose next 60 characters
+    // after `report.md` are "(and the Step Summary) | Markdown-**escaped**…".
+    forbidden: /compare (?:the copies|them) against `?report\.md`?|`report\.md`[^.]{0,60}verbatim/i,
   },
   // (6) THE EMPTY-PATH REMEDIATION.
   {
@@ -8808,7 +8879,9 @@ const README_CLAIMS = [
     what: 'that the demo proves the exact fixture',
     section: SECTION_DEMO,
     required: /the demo proves the exact\s*`DEMO_FAKE_SECRET` -> `\[REDACTED\]` fixture/i,
-    forbidden: /(?:proves|demonstrates|establishes) that (?:arbitrary |any |no )?secrets? (?:cannot|can never|will never) leak/i,
+    // `can ever` added T8 r1: "demonstrates that no secret can ever leak" is
+    // the same over-claim and the alternation did not carry it.
+    forbidden: /(?:proves|demonstrates|establishes) that (?:arbitrary |any |no )?secrets? (?:cannot|can never|can ever|will never|could ever) leak/i,
   },
   {
     what: 'that the demo does NOT generalise to arbitrary secrets',
@@ -8821,13 +8894,56 @@ const README_CLAIMS = [
     what: 'why the collector inherits the job environment',
     section: SECTION_REDACTION,
     required: /A collector that inherits less is a collector that redacts less/i,
-    forbidden: /start(?:ing)? the collector with a (?:clean|stripped|minimal) environment (?:is|would be) (?:safer|better|recommended)/i,
+    // Widened T8 r1: the subject was pinned to "starting the collector with",
+    // so the shorter drift ("a stripped environment would be better") walked
+    // straight past it.
+    forbidden: /(?:start(?:ing)? the collector with )?a (?:clean|stripped|minimal|reduced) environment (?:is|would be) (?:safer|better|recommended|preferable)/i,
   },
   {
     what: 'that the state file is excluded by PATH, not by byte-level prevention',
     section: SECTION_ARTIFACT,
     required: /no path the upload step enumerates names it/i,
-    forbidden: /the state file cannot reach the artifact|`action-state\.json` can never be uploaded/i,
+    // THIS FORBIDDEN HALF WAS THE DEFECT (Codex T8 r1 #1). It listed two
+    // spellings nobody had written and missed the two this README actually
+    // shipped — "is never uploaded" in the exits section and "Not uploaded by
+    // this action" in this one — while the exits test below POSITIVELY
+    // REQUIRED the first of them. A pin that mandates an over-claim is worse
+    // than no pin: it fights whoever tries to correct the sentence.
+    //
+    // The true claim is about PATHS. The uploader follows symlinks and expands
+    // directory descendants (residual 3), so a swap inside the staging window
+    // puts either file's BYTES into the archive under an enumerated payload
+    // name. Any wording that promises the bytes cannot leave is forbidden,
+    // whichever of the two files it is about.
+    // The apostrophe class is both spellings on purpose: a curly one is an
+    // ordinary editor artefact and would otherwise walk the pin.
+    forbidden: /the state file cannot reach the artifact|`action-state\.json` can never be uploaded|not uploaded by this action|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
+  },
+  // The same claim as it reaches a reader of the EXIT TAXONOMY, where the
+  // over-claim actually shipped. The signal name is absent from what the
+  // action RENDERS; it is not categorically unable to leave the runner.
+  {
+    what: 'that the signal name is absent from rendered evidence rather than unable to leave the runner',
+    section: SECTION_EXITS,
+    required: /the signal name is absent from normal rendered evidence[^.]{0,120}not categorically unable to leave the\s*runner/i,
+    forbidden: /nothing that leaves the runner (?:tells|reveals|names|shows|can reveal)|signal name[^.]{0,90}(?:cannot|can never|could never) leave the runner/i,
+  },
+  // THE TEARDOWN CONTRACT (Codex T8 r1 #2). The hosted/self-hosted split this
+  // section used to draw was a category error: RUNNER_TRACKING_ID is exported
+  // by the RUNNER, `start` passes its complete environment into the detached
+  // shim and never clears it, so the collector is tracked on both — and the
+  // idle timeout has never terminated anything.
+  {
+    what: 'that runner job cleanup also kills the tracked collector on hosted AND self-hosted runners',
+    section: SECTION_SELF_HOSTED,
+    required: /normal runner job cleanup also attempts to kill the tracked\s*collector, on hosted and\s*self-hosted runners alike/i,
+    forbidden: /hosted runners? (?:additionally )?reaps?[^.]{0,60}self-hosted runner does not|(?:a |the )?self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
+  },
+  {
+    what: 'that the collector idle timeout never terminates the process',
+    section: SECTION_SELF_HOSTED,
+    required: /the collector's idle timeout never terminates the process/i,
+    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector'?s? )?process/i,
   },
 ];
 
@@ -8837,8 +8953,9 @@ test('the action README states each hard requirement in the required form, and n
   // every per-section assertion below into a lookup of undefined, and the
   // failure would read as a missing claim rather than a missing section.
   for (const name of [
-    SECTION_OUTPUTS, SECTION_ARTIFACT, SECTION_REDACTION, SECTION_TRUST,
-    SECTION_LOGS, SECTION_VERIFY, SECTION_EXITS, SECTION_DEMO, SECTION_RESIDUALS,
+    SECTION_INPUTS, SECTION_OUTPUTS, SECTION_ARTIFACT, SECTION_REDACTION, SECTION_TRUST,
+    SECTION_LOGS, SECTION_VERIFY, SECTION_EXITS, SECTION_DEMO, SECTION_SELF_HOSTED,
+    SECTION_RESIDUALS,
   ]) {
     const body = sections.get(name);
     assert.ok(typeof body === 'string' && body.length > 200, `README section '${name}' is missing or empty`);
@@ -8889,9 +9006,16 @@ test('the action README documents the three exit classes, the signal convention,
   assert.match(exits, /a [*_]*returned[*_]* refusal is `3`, a [*_]*thrown[*_]* error is `1`/i);
   assert.match(exits, /Input validation[^.]*exits [*_]*1[*_]*/i);
   assert.match(exits, /killed by a signal is recorded as exit [*_]*128[*_]*/i);
-  // The signal NAME never leaves the runner, so a reader must not go looking
-  // for it in the artifact.
-  assert.match(exits, /signal name is recorded in the state file only[*_]*, which is never uploaded/i);
+  // THE SIGNAL NAME IS SCOPED BY PATH, NOT BY BYTES (Codex T8 r1 #1, and this
+  // line was the requirement that made the over-claim mandatory). The state
+  // file is not enumerated by the upload step and nothing renders it — so a
+  // reader has no ordinary place to look for the signal name — but the
+  // uploader follows symlinks, so it is NOT categorically unable to leave the
+  // runner. Both halves are required here; the polarity pin above forbids the
+  // strong form on every surface.
+  assert.match(exits, /signal name is recorded in the state file only[*_]*\s*[—-]+\s*a\s*path the upload step does not enumerate/i);
+  assert.match(exits, /the signal name is absent from normal rendered evidence/i);
+  assert.doesNotMatch(exits, /which is never uploaded/i);
   assert.match(exits, /could not be spawned at all is recorded as [*_]*127[*_]*/i);
   assert.match(exits, /One invocation at a time per output directory/i);
   // Staging is invocation-scoped since T6 r1 #3, so the honest form of the old

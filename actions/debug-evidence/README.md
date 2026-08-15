@@ -82,7 +82,7 @@ Every default below is the literal default in [`action.yml`](action.yml).
 | `working-directory` | no | `.` | Directory the wrapped command runs in. |
 | `session-name` | no | `ci-debug` | Session label (`[A-Za-z0-9_-]+`); the session id derives from it. |
 | `fail-on-command-failure` | no | `"true"` | `'true'`: the action fails when the wrapped command exits non-zero. `'false'`: the failure is reported in the summary/outputs only. Evidence capture, artifact upload, and teardown happen regardless. |
-| `output-dir` | no | `""` -> `${{ runner.temp }}/debug-evidence` | Evidence staging dir (**must be outside the workspace**); becomes the artifact. |
+| `output-dir` | no | `""` -> `${{ runner.temp }}/debug-evidence` | Evidence staging dir (**must be outside the workspace**). It is the **staging root**, not the artifact: only the three paths under this invocation's nonce child are submitted to the upload step. |
 | `artifact-name` | no | `debug-evidence` | Uploaded evidence artifact name. |
 | `node-version` | no | `24` | Node.js version for the collector and renderer. |
 | `port` | no | `8787` | Collector port (loopback only). Self-hosted runners sharing a host must pick distinct ports. |
@@ -115,7 +115,7 @@ is booted and before your command exists. A rejected input is an **exit 1** with
 | `command-exit-code` | Exit code of the wrapped command; empty until the run step has run. |
 | `session-id` | Collector session id; empty until the run step has run. |
 | `event-count` | Events captured in the session; empty until the run step has captured one. |
-| `report-path` | Absolute path of `report.md` in the staged evidence; empty until the run step has captured one. |
+| `report-path` | Path of `report.md` in the staged evidence: `output-dir` joined with this invocation's staging child, so it is absolute exactly when `output-dir` is — which the default is. Nothing resolves it, so a relative custom `output-dir` produces a relative value. Empty until the run step has captured one. |
 | `evidence-digest` | The SHA-256 digest line for the staged payloads, byte-identical to the line the run step printed to its own step log. Empty until the run step has captured a session. |
 
 `event-count`, `report-path` and `evidence-digest` are written only when the report
@@ -207,10 +207,12 @@ claim: it is about the paths, not about the bytes. See
 uploader's unconditional symlink following, which is the reason the sentence is written
 that way.
 
-Not uploaded by this action: the collector's own session log under
-`<workspace>/.debug/debug-<session-id>.log`. The collector writes it there, through the
-same redaction path, and it is left in the checkout — if a later step of yours diffs or
-archives the workspace, it will see it.
+The collector's own session log under `<workspace>/.debug/debug-<session-id>.log` is not
+enumerated either, and the same qualification applies to it: no path the upload step
+enumerates names that file, which is a weaker statement than "its bytes cannot reach the
+archive". The collector writes it there, through the same redaction path, and it is left
+in the checkout — if a later step of yours diffs or archives the workspace, it will see
+it.
 
 ## Redaction invariant
 
@@ -286,9 +288,11 @@ grants the same power and none of them is visible from here.
 ### Why `strict` refuses on the default hosted configuration
 
 GitHub-hosted runner images ship `sudo`, so the sudo reading is not clear and `start`
-returns 3. (Those images also default to Yama mode 1, which is bypassable with
-`CAP_SYS_PTRACE` — but the sudo finding alone is enough to deny, and it is the one the
-demo pins.) This is not a claim taken on trust: this repository's own
+returns 3. That one finding is enough to deny on its own, and it is the one this repository
+pins. Nothing here asserts a current `ptrace_scope` value for those images: `ubuntu-latest`
+is a moving external image, and copying an assertion out of `action.yml` would not be
+verification of it. The sudo finding, by contrast, is not a claim taken on trust — this
+repository's own
 [`debug-evidence-demo.yml`](../../.github/workflows/debug-evidence-demo.yml) runs a
 `strict-refusal` job on a real hosted runner on every pull request, which asserts the
 exit 3, the single admission record, and a `sudo binary: present: …` finding inside that
@@ -332,6 +336,23 @@ reading:
 The fixed literal above is all the action reports: `PATH` is attacker-influenced text and
 this value travels into the step log, the admission record and the artifact, so the
 offending component is never interpolated.
+
+**Precedence, because more than one of these can be true at once.** A host can satisfy
+several of the conditions below simultaneously, and the reading names only the winner.
+The order is **`present` > unreadable > empty-or-relative > `absent`** (`support.js:299`):
+
+1. if **any** candidate exists, the reading is `present: <count> at sha256=…` — so a host
+   carrying `/usr/bin/sudo` *and* `PATH=""` reports `present: 1 at sha256=…`, not this
+   `unknown`;
+2. otherwise, if any candidate could not be `lstat`-ed for a reason other than "no such
+   file", the reading is the bare `unknown`;
+3. otherwise, if any `PATH` component was empty or relative, the reading is
+   `unknown: empty-or-relative PATH entry`;
+4. otherwise `absent`, the only one that clears.
+
+An empty or relative component therefore *contributes* to the reading rather than
+deciding it. Every one of the first three denies strict admission, so the precedence
+changes what the record says about a host, never whether that host qualifies.
 
 **Remediation: unset `PATH` rather than emptying it.** An absent variable means
 "conventional locations only" and can still clear; an explicitly empty string is
@@ -438,9 +459,16 @@ Everything below is manual by design; the action performs none of it.
 1. **Download the artifact** for the run, and open the `start` and `run` step logs.
 2. **Take the invocation nonce** from the `start` log's admission-record headline
    (`invocation=…`). Every later check uses that one value.
-3. **Select exactly one admission record and exactly one digest line** for that nonce, by
-   the rules under [Log-line grammar](#log-line-grammar). Reject the set on any duplicate
-   or disagreement.
+3. **Select exactly one admission record, and exactly one qualification-plus-digest
+   block**, for that nonce, by the rules under [Log-line grammar](#log-line-grammar). The
+   block is what binds the record to the digest: `run` writes its
+   `evidence-qualification ` lines and its single `evidence-sha256` line back to back,
+   from one process at one moment, and **the `evidence-sha256` line carries no nonce of
+   its own** — the qualification lines beside it are the only thing that says which
+   invocation the digest belongs to. Nothing enforces that adjacency (a detached child of
+   your command can still write to the same stream), which is precisely why you select
+   one block rather than searching for a digest. Reject the set on any duplicate or
+   disagreement.
 4. **Check the regime**: `admission=STRICT (authenticated)` means the three-part trust
    unit applies. `DIAGNOSTIC ONLY` means it does not, and steps 5–6 below tell you what
    the run *said*, not what is provably true.
@@ -452,10 +480,12 @@ Everything below is manual by design; the action performs none of it.
 
    Each value is the lowercase hex SHA-256 of that payload's **UTF-8 bytes**, computed
    from memory *before* the file was written — so `sha256sum session.log` over the
-   downloaded artifact reproduces it exactly, and any divergence means the bytes changed
-   after the run step staged them. A run that staged only `session.log` (renderer
-   failure) prints only that one pair; a run that staged nothing prints no digest line at
-   all.
+   downloaded artifact reproduces it exactly **when the archive's entry under that name is
+   the file the run step staged**, and any divergence means the bytes carried under that
+   name are not the bytes staged (a symlink or a directory substituted at one of the three
+   enumerated paths is such a divergence, and detecting it is the point). A run that staged
+   only `session.log` (renderer failure) prints only that one pair; a run that staged
+   nothing prints no digest line at all.
 6. **Compare the record copies**: strip the `debug-evidence-action: start: ` and
    `evidence-qualification ` prefixes from the two log copies and compare them to
    `report.json`'s `caveats[]` array. All three must agree line for line, and all three
@@ -473,7 +503,10 @@ reproduce it from your own host:
    `/usr/bin/sudo`, `/bin/sudo`, `/usr/local/bin/sudo`. Then split the **inherited**
    `PATH` on `:`; for each entry that starts with `/`, strip **all** trailing slashes and
    append `/sudo`. (An entry that does not start with `/`, including an empty one, is not
-   a candidate — it makes the whole reading `unknown: empty-or-relative PATH entry`.)
+   a candidate. It does not by itself decide the reading: see
+   [the precedence](#when-the-sudo-reading-says-unknown-empty-or-relative-path-entry) —
+   `unknown: empty-or-relative PATH entry` is reported only when nothing was found and
+   nothing was unreadable.)
 2. **Deduplicate by exact spelling, on the derived candidate** — after trailing-slash
    normalisation and after the conventional paths are merged in. So `/usr/bin:/usr/bin`
    yields one candidate, `/usr/bin:/usr/bin/` yields one candidate, and a `PATH` entry
@@ -522,10 +555,14 @@ Two more rules:
 process the action spawned is itself terminated by a signal, its reported status is `null`
 and 128 is the sentinel the action stores in its place. (A signal that kills something
 *inside* your script is different — bash then exits normally with `128+n`, and that code
-is mirrored like any other.) The **signal name is recorded in the state file only**, which
-is never uploaded and never rendered — and no diagnostic prints it either, so nothing that
-leaves the runner tells you which signal it was. A command that could not be spawned at
-all is recorded as **127**.
+is mirrored like any other.) The **signal name is recorded in the state file only** — a
+path the upload step does not enumerate, and one nothing renders — and no diagnostic
+prints it either, so **the signal name is absent from normal rendered evidence**, which is
+a claim about paths and not one about bytes: it is not categorically unable to leave the
+runner, because the symlink substitution described under
+[residual risks](#scope-limitations-and-residual-risks) can put the state file's bytes into
+the archive under an enumerated payload name. A command that could not be spawned at all
+is recorded as **127**.
 
 **One invocation at a time per output directory.** `action-state.json` sits at the root
 of the output directory and carries exactly one invocation's identity. Sequential reuse
@@ -567,15 +604,21 @@ afterwards (commenting, uploading elsewhere) may still be.
 
 ## Self-hosted runners
 
-- **Teardown is the `Stop collector` step.** The collector is detached and outlives the
-  `start` step, so nothing else in the job stops it. Hosted runners additionally reap the
-  job's process tree at job end; a self-hosted runner does not, so that `always()` step
-  is what you are relying on.
-- **The collector does not self-terminate when idle.** Be precise about this: the
-  collector's 15-minute idle timeout retires *in-memory session credentials* (a later
-  `POST /log` then gets `unknown_session`) — it does **not** exit the process and it is
-  not a teardown backstop. If the `Stop collector` step never runs (a cancelled job, a
-  runner killed mid-step), the process keeps listening on its port until something else
+- **`Stop collector` is this action's own teardown.** The collector is detached and
+  outlives the `start` step, so no other step of this action stops it.
+- **Normal runner job cleanup also attempts to kill the tracked collector, on hosted and
+  self-hosted runners alike.** That is *runner* behaviour, not a property of the hosted
+  images, and this action does nothing to opt out of it: the runner exports
+  `RUNNER_TRACKING_ID` into every step's environment, `start` hands its step's **complete**
+  environment to the detached shim and never clears that variable, so the collector stays
+  a tracked process and the runner's job finalization terminates tracked orphans. Treat it
+  as a backstop and not as a guarantee — it is unavailable if process tracking was
+  disabled or altered on that runner, or if the runner process itself died, which is
+  exactly the case the `always()` step above covers.
+- **The collector's idle timeout never terminates the process.** Be precise about this:
+  the 15-minute idle timeout retires *in-memory session credentials* (a later `POST /log`
+  then gets `unknown_session`) and does nothing else. If neither `Stop collector` nor the
+  runner's own cleanup runs, the process keeps listening on its port until something else
   stops it.
 - **Pick distinct `port` values** for invocations that can overlap on one host. Teardown
   signals the collector and returns without waiting for it to exit, so even a strictly

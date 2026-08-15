@@ -25,7 +25,10 @@ inputs:
     required: false
     default: "true"
   output-dir:
-    description: "Evidence staging dir (MUST be outside the workspace); becomes the artifact"
+    description: >-
+      Evidence staging dir (MUST be outside the workspace). It is the STAGING
+      ROOT, not the artifact: only the three paths under this invocation's
+      nonce child are submitted to the upload step.
     required: false
     default: ""
   artifact-name:
@@ -130,7 +133,12 @@ outputs:
     description: "Events captured in the session; empty until the run step has captured one"
     value: ${{ steps.run.outputs.event-count }}
   report-path:
-    description: "Absolute path of report.md in the staged evidence; empty until the run step has captured one"
+    description: >-
+      Path of report.md in the staged evidence: output-dir joined with this
+      invocation's staging child, so it is absolute exactly when output-dir is
+      — which the default is. Nothing resolves it, so a relative custom
+      output-dir produces a relative value. Empty until the run step has
+      captured one.
     value: ${{ steps.run.outputs.report-path }}
   evidence-digest:
     description: >-
@@ -382,10 +390,29 @@ runs:
         if-no-files-found: ignore
 
     - name: Stop collector
-      # The collector is detached and outlives the start step, so nothing else
-      # in the job will stop it. Hosted runners reap the process tree at job
-      # end; self-hosted runners rely on this step (and on the collector's own
-      # idle timeout as a backstop).
+      # THIS ACTION'S OWN TEARDOWN. The collector is detached and outlives the
+      # start step, so no other step of this action stops it.
+      #
+      # NORMAL RUNNER JOB CLEANUP ALSO ATTEMPTS TO KILL THE TRACKED COLLECTOR,
+      # ON HOSTED AND SELF-HOSTED RUNNERS ALIKE (Codex T8 r1 #2, correcting
+      # what this comment said before). That is RUNNER behaviour and not a
+      # property of the hosted images: the runner exports RUNNER_TRACKING_ID
+      # into every step's environment, `start` hands its step's COMPLETE
+      # environment to the detached shim (support.js: `{ ...env }`) and never
+      # clears that variable, so the collector stays a tracked process and job
+      # finalization terminates tracked orphans. The previous hosted/
+      # self-hosted split was simply wrong about where the behaviour lives.
+      #
+      # It is a backstop, not a guarantee: it is unavailable if process
+      # tracking was disabled or altered on that runner, or if the runner
+      # process itself died — which is the case this always() step covers.
+      #
+      # AND THE COLLECTOR'S IDLE TIMEOUT NEVER TERMINATES THE PROCESS. The
+      # 15-minute timeout retires IN-MEMORY SESSION CREDENTIALS
+      # (retireInactiveSessions in scripts/debug_server.js, reached only from
+      # request handlers) and does nothing else; the process keeps listening.
+      # This file previously advertised it as a teardown backstop, which it
+      # has never been.
       if: ${{ always() && steps.start.outcome != 'skipped' }}
       shell: bash
       env:
