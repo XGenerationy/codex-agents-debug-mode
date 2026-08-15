@@ -4051,6 +4051,29 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 round-1 outcome (`d495db2`) — the audit found SIX, and one guard was blind by construction
+
+**THE 27-CLAIM AUDIT WAS THE ROUND'S REAL PRODUCT.** A harness loaded the live claim arrays and checked each three ways: does the required half still match its section; does the forbidden half already match a shipped surface; and — **the one that matters — does the forbidden half catch the paraphrase a careless editor would actually write** (65 synthesized inverses). **Six findings across 29 claims; two were guards that had become defects.**
+
+1. **The assigned one.** The required half was already correct; the FORBIDDEN half listed two spellings nobody had ever written and missed the two the README actually shipped — `is never uploaded` and `Not uploaded by this action`. All three shipped paraphrases walked straight through it.
+2. **THE PREDICTED SECOND ONE, and it was blind BY CONSTRUCTION.** The `report.md is escaped and capped` claim's forbidden half was `` `report\.md`[^|]{0,60}verbatim ``. The `[^|]` window was chosen so a match could not run across a table cell — **but the fidelity table is exactly where that reversal lands, and `|` is precisely what separates the filename from its fidelity there. The pin was structurally incapable of firing at the one place the claim lives.** Proven by control: with the old window, appending `| \`report.md\` | Verbatim, uncapped. |` leaves the test GREEN; under `[^.]{0,60}` it goes RED, and still does not match the README's own row.
+3. `applies` was forbidden but not `apply`, so "the guarantees apply to any invocation" passed. Same gap in `action.yml`'s scope claim.
+4. A forbidden half anchored on its subject let the shorter drift through ("a stripped environment would be better").
+5. The alternation carried `cannot|can never|will never` but not `can ever`, so "demonstrates that no secret can ever leak" passed.
+6. A CORRECT required half with **over-claiming prose attached**: "`sha256sum session.log` over the downloaded artifact reproduces it exactly" — same shape as finding 1, since under a symlink or directory substitution the archive entry is not the staged file. Scoped in prose; the regex untouched.
+
+**23 CLAIMS CHECKED AND CLEARED against shipped source**, each named in the report — including all eight evidence-trust claims (the "before the collector is booted and before your command exists" ordering is real: `probeAdmission` and the `return 3` both precede `spawnShim`), both PATH-remediation claims, and three of four digest-recipe claims. `action.yml`'s own 24 claims audited the same way: one gap, rest clear.
+
+**32 mutations, 31 red, 0 no-ops** — plus one deliberate GREEN control (the old blind window). A first-pass GREEN was disclosed as the harness mis-aiming at the wrong test and re-aimed, rather than reported as a pass.
+
+**THE FIVE ITEMS:** both upload statements scoped by path, so the signal name is *absent from normal rendered evidence* rather than categorically unable to leave the runner; the teardown contract corrected on BOTH surfaces, verified against `support.js:1170` (`{ ...env, DEBUG_PORT }` — the complete environment, `RUNNER_TRACKING_ID` never cleared) and `debug_server.js:1130-1138` with all four callers being request handlers; sudo precedence documented as **`present` > unreadable > empty/relative > `absent`**, ordering verified in source rather than taken from the brief; **"Absolute" removed** rather than the behaviour changed, because `path.join` at both sites makes it a behaviour change needing its own tests in a documentation round; the Yama parenthetical **removed**, with the README now stating explicitly that nothing here asserts a current `ptrace_scope` and why, so the next editor does not re-add it. Gate 2 step 3 now selects a **"qualification-plus-digest block"** and explains why — the digest line carries no nonce of its own, the qualification lines beside it are the whole binding, and nothing enforces the adjacency.
+
+**Only ONE structural test changed** (the sole polarity test over the two `action.yml` surfaces), with four new platform claims; every other structural test verified still passing, including the reader handling the two `description:` values converted to `>-` block scalars.
+
+> **FLAGGED, DELIBERATELY NOT FIXED, AND OWED TO TASK 9 — the same trap one surface over.** `action.yml:215` still carries *"standard GitHub-hosted runners ship mode 1 with passwordless sudo"*, and **`support.test.js:5315` REQUIRES it** — the identical unpinnable moving-external-image assertion Codex just ruled out of the README, mandated by a required pin. Coordinator-verified at both lines. **Because it is a REQUIRED half it will fight anyone who corrects it**, exactly like finding 1. The implementer left it alone on sound grounds: item 5 was scoped to the README, the operative conclusion (hosted stays best-effort) is independently established by the live sudo pin, and **removing a required pin uninstructed is how previously-verified work gets undone.** Task 9 must rule.
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
