@@ -3918,6 +3918,17 @@ Both cases fixed. `yamlLines` now holds `{ headerIndent, contentIndent }`: the f
 3. PyYAML 6.0.3 is installed locally, so the offline oracle is re-runnable with no setup — but a default-resolver re-run disagrees at the top-level `on` key of every document, and that is the loader, not the reader.
 4. **COORDINATOR CORRECTION to the handover:** the report says `parseWorkflowSyntaxText` has exactly THREE call sites and that a fourth is a signal to re-check the boundary. **There are FOUR** (`support.test.js:5818`, `:7343`, `:7374`, `:7609`) — the fourth is the round's own boundary test, which is legitimate and is precisely the test that guards the split. Counting from **five** onward is the signal.
 
+#### ✅ TASK 7 CLOSED — Approved at `054fdb5` (HEAD `c1e326d`) after NINE fix rounds. No Critical, Important or Minor issues.
+
+Codex's closing confirmations: the parser/schema split is real and correctly composed; **the boundary test does NOT freeze the `on:` gap — "your injected event tightening remaining green is the decisive proof"**; moving BOTH `checkAccepted` and `checkRefused` to the syntax half is correct, because *"letting schema refusal satisfy `checkRefused` would conceal the exact parser fail-open the property is meant to detect"*; no workflow consumer was accidentally moved to the syntax-only API, and **the coordinator's four-call-site correction is accepted — "five onward is the correct maintenance alarm"**; the corrected oracle wording is honest; and the apostrophe/node-start limitation remains honestly disclosed and outside the fix.
+
+> **TWO BINDING RULINGS FOR TASK 8, from the reviewer with all nine rounds in context:**
+>
+> 1. **DO NOT PUBLISH the workflow-reader, property-generator, PyYAML, anchor, flow-collection or apostrophe limitations. They are TEST-HARNESS INTERNALS** and have no place in consumer documentation.
+> 2. **THE DEMO WORDING BOUNDARY — an eighth hard requirement.** Describe the demo as proving the **exact `DEMO_FAKE_SECRET → [REDACTED]` fixture**. **Do NOT inflate it into "the demo proves arbitrary secrets cannot leak."** That is a wording boundary rather than a new public limitation, and it is exactly the over-claim this task spent nine rounds learning to avoid.
+>
+> Otherwise the consumer-facing lessons are already covered by the seven hard requirements: strict versus best-effort trust, hosted-runner refusal, separate-job isolation, availability-only outputs, empty-`PATH` remediation, admission-record interpretation, and the exact digest reconstruction recipe.
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
