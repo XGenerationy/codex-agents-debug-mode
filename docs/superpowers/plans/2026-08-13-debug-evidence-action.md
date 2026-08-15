@@ -3837,6 +3837,19 @@ The claim now reads: *the reader validates selected workflow, job and step struc
 
 **NAMED, NOT FIXED, with the reasoning that has finally been learned:** quote state in `stripYamlComment` restarts at column 0 of every line, so an apostrophe in unquoted text opens a quote that never closes — `run: don't # a real comment` keeps the comment. Fixing it requires knowing where a NODE begins, **"the same reach-one-construct-further trade that has cost this reader a false rejection every time it was taken."** Neither file contains such a line, every value they produce is now pinned exactly, the failure direction is a value too LONG (visible to an exact pin), and the worst case — multi-line quoted scalars — is refused outright by the indentation rule in both quote styles. Not pinned as accepted, per standing doctrine. **One fail-closed coverage gap:** `parseActionYml` still recognises only `path: |`, so a `>` scalar under `runs:` would throw `unparsed nested line` — fail-closed, not silent.
 
+#### Task 7 fix round 7 (Codex review of `f434ead`: 1 Minor, two sub-cases)
+
+**Block-scalar state can survive past YAML's actual boundary.** I asked whether the two-places end-of-body coupling could already disagree; **Codex's answer is sharper than the question — they do NOT disagree, they agree on the WRONG BOUNDARY.** Both compare against the header's LOGICAL indentation rather than the inferred CONTENT indentation. Two cases, both reproduced (the shipped tokenizer marks the offending lines `inScalar: true` while a YAML loader rejects both documents):
+
+1. **A dedented body line is absorbed.** Once the first body line establishes content indentation 10, a later line at indentation 9 is invalid YAML — but both tokenizer and parser accept it, because they test against the header's indentation 8. YAML defines a less-indented line as terminating the block construct.
+2. **A dedented comment leaks scalar state.** Such a line correctly computes `inScalar === false`, but comment stripping reaches its `continue` **without clearing `scalarIndent`** — so a subsequent indented line RESUMES a scalar that YAML already ended. YAML explicitly treats less-indented comments as trailing comments outside scalar content.
+
+FIX: track the INFERRED CONTENT indentation (established by the first body line, not the header); clear scalar state on EVERY non-empty outside line even when comment stripping deletes that line; pin both cases.
+
+**RULED CLEAN — the round-6 change was a net repair, confirmed:** no newly corrupted value in either workflow or `action.yml`, and the real-file changes RESTORE previously lost scalar content. The wider `BLOCK_SCALAR_HEADER` does not admit unsupported workflow headers, because the parser refuses them before a document is produced. The `[*missing]` and per-line quote-state exclusions are now honestly scoped. Commit scope and diff checks clean.
+
+**TRAJECTORY NOTE, recorded honestly.** After round 5 this plan said that if the reader kept producing findings the next step was a decision about whether it earns its keep, not another round of tightening. Rounds 6 and 7 are a DIFFERENT CLASS from rounds 2-5: they are real parser defects causing or risking silent content corruption, not generality chased against a schema we do not implement — exactly as Codex's ledger correction predicted. `actionlint` would NOT fix them (its own ruling: it does not address parser defects, and the structural assertions still need a parser), so the adopt-actionlint exit does not apply here. The reader is now being genuinely debugged rather than inflated. **The standing rule still holds: no new SCHEMA rule without a live defect. Parser correctness is a separate ledger and is worth paying.**
+
 ---
 
 ### Task 8: Documentation — action README, repo README, SKILL.md
