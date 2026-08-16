@@ -11203,6 +11203,34 @@ test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both gua
   // a genuinely failed composite step is not buildable under this repo's gate
   // design (a failed step cannot coexist with a green demo workflow, and
   // `continue-on-error` is forbidden). It ships as a stated limitation.
+  // WHICH GUARD READS WHICH INPUT — and no drive in this file can answer that
+  // (Codex T9 r3). In the skipped-start state the two facts are CORRELATED:
+  // `start` is `skipped` AND `evidence-dir` is empty, so both predicates return
+  // false whichever body sits on whichever guard. SWAPPING THE TWO BRANCH
+  // BODIES INSIDE `evaluateStepGuard` PASSED ALL 140 TESTS IN THIS FILE,
+  // including the drive below — measured, not supposed.
+  //
+  // These are the two states where the predicates ANSWER DIFFERENTLY. NEITHER
+  // IS REACHABLE THROUGH THE REAL WIRING — `start` publishes `evidence-dir` as
+  // its first act, so a skipped start never has one and a start that ran always
+  // does — and that unreachability is precisely why no drive can separate the
+  // bodies and why these are direct calls on the evaluator rather than a
+  // seventh drive. The expressions come from the shipped file, so these probe
+  // the same two dispatch keys the driver switches on.
+  const startGuard = actionStepsByName()['Render evidence report'].if;
+  const uploadGuard = actionStepsByName()['Upload evidence artifact'].if;
+  assert.notEqual(startGuard, uploadGuard, 'two distinct guard shapes, taken from action.yml');
+  // (i) start SKIPPED, evidence-dir POPULATED.
+  assert.equal(evaluateStepGuard(startGuard, { start: 'skipped' }, { 'evidence-dir': '/staged' }), false,
+    'the start guard reads the start OUTCOME, and a skipped start closes it');
+  assert.equal(evaluateStepGuard(uploadGuard, { start: 'skipped' }, { 'evidence-dir': '/staged' }), true,
+    'while the upload guard reads the published PATH, not the outcome sitting beside it');
+  // (ii) the mirror image: start RAN AND FAILED, evidence-dir EMPTY.
+  assert.equal(evaluateStepGuard(startGuard, { start: 'failure' }, {}), true,
+    'a start that ran and failed is not a skipped one, so its guard stays open');
+  assert.equal(evaluateStepGuard(uploadGuard, { start: 'failure' }, {}), false,
+    'while nothing published leaves the uploader with nothing to be pointed at');
+
   const drive = await driveCompositeAction({
     inputs: { run: compositeProbe(0) },
     failStep: 'Set up Node.js',
@@ -11219,13 +11247,18 @@ test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both gua
     ]);
     assert.equal(drive.result, 'failure');
     // `Start collector` carries no `if:`, so it goes only while nothing has
-    // failed; the four steps after it are guarded, and they go the same way for
-    // TWO different reasons. Asserting the outcome map as well as the vector is
-    // what keeps those reasons distinct: three of them read a `start` whose
-    // outcome is `skipped`, and the uploader reads an `evidence-dir` output
-    // that was never published. BOTH guard shapes evaluate false here, which is
-    // what makes this the false branch rather than one shape covering for the
-    // other.
+    // failed; the four steps after it are guarded, and both guard shapes
+    // evaluate false here — which is what makes this the false branch.
+    //
+    // WHAT THE OUTCOME MAP DOES AND DOES NOT SHOW (corrected, Codex T9 r3). It
+    // shows the INPUTS both predicates read are present and carry the values
+    // this case is about: a `start` whose outcome is `skipped`, and an
+    // `evidence-dir` that was never published. It does NOT show which guard
+    // CONSUMED which input — in this state those two facts are correlated, so
+    // both predicates answer false whichever body sits on whichever guard, and
+    // an earlier version of this comment claimed the map "keeps those reasons
+    // distinct" when it does nothing of the kind. The distinctness is proved by
+    // the two orthogonal probes at the head of this test, and by nothing here.
     assert.deepEqual(drive.outcomes, {
       'Set up Node.js': 'failure',
       start: 'skipped',
