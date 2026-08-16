@@ -4173,6 +4173,24 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 round-4 outcome (`5e12d1a`) — the audit went mechanical, and the coordinator found a fifth instance
+
+**THE CLAUSE-CROSSING DEFECT WAS DEFINED OPERATIONALLY RATHER THAN BY EYE**, which is why this round found what four rounds of reading had not: take each `rejects` probe, find the span the guard matches, **insert a denial (`never`, `does not`, `cannot`, `, which is not the same as saying that`) at every word boundary INSIDE that span, and see whether the guard still fires.** A guard that still fires skipped over the denial.
+
+**The reviewer found 2. The mechanical audit found 14 more.** 17 guards contained a `{0,N}` window; **16 demonstrated a real clause crossing from their own regression probes.** Two were retired; the other twelve converted, and for ten a natural true sentence the old guard rejected could be constructed — "The idle timeout **never acts as** a teardown backstop", "The `always()` step **never runs** when the runner process dies", "`PATH=\"\"` **never counts as** absent", "The digest is one part; **nothing** is the trust anchor". Each conversion is proved by a paired RED reversal and GREEN true statement appended to the real surfaces.
+
+**THE COVERAGE CONTRACT NOW ENFORCES ITSELF:** both arrays must be non-empty for every live guard (`rejects: []` and `accepts: []` **both passed before** — M9/M10 now RED); a retired claim must carry no live `forbidden`, no orphaned controls, and a replacement name that EXISTS; and the totals are **exact** (`claims 68`, `retired 4`, `probes 229`) rather than a floor that let eleven probes be deleted. The retirement registry is bound in **both** directions — a retirement pointing at nothing fails, and a disclosure nothing points at fails. The `report.md` positive half now interpolates the cap from `EXCERPT_CHAR_CAP`, **so the documentation and the renderer cannot drift**. Only the README needed new prose; `action.yml` and `support.js` already carried both halves and are unmodified. **42 mutations, 42 as expected**, snapshot restore throughout with `cmp` confirming byte-identity.
+
+> **COORDINATOR FINDING — THE FIFTH INSTANCE, DEMONSTRATED NOT ARGUED, AND IT IS IN THE REPLACEMENT PROTECTION ITSELF.** The report claims **"Zero. All 64 live guards now contain no `{0,N}` gap at all."** That is true **only of the FORBIDDEN halves.** Ten `{0,N}` windows remain in the file, and while most are ordinary assertions or history comments, **three are the `POSITIVE_DISCLOSURES` patterns — the named replacement protection for the four retired guards** (`support.test.js:10115`, `:10123`, `:10131`) — and two are REQUIRED halves (`:5413`, `:9299`).
+>
+> Probed directly rather than inferred: the state-file disclosure pattern `/symlinks unconditionally[\s\S]{0,200}(?:puts the state bytes|put these bytes) into the archive/i` **matches BOTH** the honest disclosure AND its reversal — *"follows symlinks unconditionally, **but nothing here ever** puts the state bytes into the archive."* **So a README that retracted the disclosure would still satisfy the check that exists to keep it published.** The retirement escaped a mechanism that could not decide negatives by adopting a replacement carrying the same defect.
+>
+> The required-half case is a weaker failure (it would accept a degraded statement rather than reject a true one), but the disclosure case is the retirement's whole load-bearing half.
+
+**THE DOCUMENTED BOUNDARY, offered instead of a fifth conversion pass and worth accepting on its own terms:** **61 of the 64 live guards also match their own regression QUOTED INSIDE A DENIAL** — "it is not true that *X*", "the claim that *X* was retracted". **A substring match cannot distinguish an asserted sentence from a mentioned one**, and anchoring further only trades that for missing real comma-continued reversals. The three exceptions are anchored to a sentence or cell start by accident of what they had to pin, not by design. The recommendation: **these guards catch inline reversals of the exact sentences this repository ships — the whole class the last four rounds actually produced — and they do not adjudicate English.** The consequence for authors is one sentence, and it is in the file: **a surface that wants to discuss a retracted claim must PARAPHRASE it rather than quote it.**
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
