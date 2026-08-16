@@ -12,6 +12,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { spawnSync } = require('node:child_process');
 const { escapeMarkdownText } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 // THE RENDERER'S OWN CAP, imported rather than copied. A literal 500 here
 // silently disagrees with debug_report.js the moment the cap moves, and if it
@@ -1974,6 +1975,12 @@ const nodeE = (source) => {
   return `'${executable}' -e ${JSON.stringify(source)}`;
 };
 
+const spawnNodeE = (source) => (_command, { cwd, env }) => spawnSync(
+  process.execPath,
+  ['-e', source],
+  { cwd, env, stdio: 'inherit', windowsHide: true },
+);
+
 const startReal = async (overrides = {}) => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
@@ -3039,7 +3046,7 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
     //
     // Each non-zero exit names a specific defence that failed, so this can
     // never pass because the attack quietly did not run.
-    const steal = nodeE([
+    const stealJs = [
       'const fs = require(\'node:fs\');',
       // 92: production hands the run step DEBUG_ACTION_OUTPUT_DIR; the wrapped
       // command must not see it.
@@ -3055,9 +3062,10 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
       // 96: ...nor mint a fresh session to escalate through.
       'fetch(base + \'/session\', { method: \'POST\', headers: auth, body: JSON.stringify({ name: \'ci-debug\' }) }),',
       ']).then(([h, s]) => process.exit(h.status !== 401 ? 95 : (s.status !== 401 ? 96 : 0)));',
-    ].join(''));
+    ].join('');
     const runCode = await runSubcommand({
-      inputs: { ...context.inputs, runCommand: steal },
+      inputs: { ...context.inputs, runCommand: nodeE(stealJs) },
+      spawnCommand: spawnNodeE(stealJs),
       outputDir: context.outputDir,
       env: {
         ...context.runEnv,
@@ -3951,12 +3959,13 @@ test('a relay that filters the real collector\'s answer is refused: the signatur
   // can catch this is the signature not covering the target that was asked.
   const context = await startReal();
   try {
-    const probe = nodeE([
+    const probeJs = [
       'const post = (msg) => fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg }) });',
       'Promise.all([\'first finding\', \'second finding\', \'the finding that matters\'].map(post)).then((rs) => process.exit(rs.every((r) => r.status === 202) ? 0 : 99));',
-    ].join(''));
+    ].join('');
     const runCode = await runSubcommand({
-      inputs: { ...context.inputs, runCommand: probe },
+      inputs: { ...context.inputs, runCommand: nodeE(probeJs) },
+      spawnCommand: spawnNodeE(probeJs),
       outputDir: context.outputDir,
       env: context.runEnv,
     });
