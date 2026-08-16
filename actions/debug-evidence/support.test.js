@@ -1965,6 +1965,15 @@ const hostCommandEnv = () => {
   return env;
 };
 
+const nodeE = (source) => {
+  // Git Bash `bash -c 'node -e ...'` looks up `node` on PATH. Hosted Node 24
+  // lives only under setup-node's directory; a PATH lookup still returned
+  // exit 127 for some probes (Validate 31975886347). Quote this process's
+  // own executable with forward slashes so the child cannot fail to find it.
+  const executable = process.execPath.replace(/\\/g, '/').replace(/'/g, `'\\''`);
+  return `'${executable}' -e ${JSON.stringify(source)}`;
+};
+
 const startReal = async (overrides = {}) => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
@@ -2029,14 +2038,14 @@ test('run injects exactly the documented env from the session start minted, reco
     const githubOutput = path.join(outputDir, 'github_output');
     writeFileSync(githubOutput, '');
     // The wrapped command posts one event using ONLY the injected env, then exits 7.
-    const probe = 'node -e "' + [
+    const probe = nodeE([
       'const assert = require(\'node:assert\');',
       'assert.ok(process.env.DEBUG_LOG_URL.startsWith(\'http://127.0.0.1:\'));',
       'assert.ok(process.env.DEBUG_SESSION_ID);',
       'assert.ok(process.env.DEBUG_SESSION_TOKEN);',
       'assert.equal(process.env.DEBUG_HYPOTHESIS_ID, undefined);',
       'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'probe event\' }) }).then((r) => process.exit(r.status === 202 ? 7 : 99));',
-    ].join('') + '"';
+    ].join(''));
     const code = await runSubcommand({
       inputs: { ...inputs, runCommand: probe },
       outputDir,
@@ -2070,7 +2079,7 @@ test('start posts one OPEN hypothesis line and run injects DEBUG_HYPOTHESIS_ID â
     assert.equal(parsed.status, 'OPEN');
     assert.equal(parsed.hypothesisId, 'H-demo');
     assert.equal(parsed.title, 'seeded demo');
-    const probe = 'node -e "process.exit(process.env.DEBUG_HYPOTHESIS_ID === \'H-demo\' ? 0 : 90)"';
+    const probe = nodeE("process.exit(process.env.DEBUG_HYPOTHESIS_ID === 'H-demo' ? 0 : 90)");
     const code = await runSubcommand({ inputs: { ...inputs, runCommand: probe }, outputDir, env: runEnv });
     assert.equal(code, 0);
     assert.equal(readState(outputDir).commandExitCode, 0);
@@ -2456,7 +2465,7 @@ test('a lock older than the stale threshold is reaped so a crashed invocation ca
 test('a job-level DEBUG_HYPOTHESIS_ID is never inherited when this action opened no hypothesis', async () => {
   const { outputDir, inputs, runEnv } = await startReal();
   try {
-    const probe = 'node -e "process.exit(process.env.DEBUG_HYPOTHESIS_ID === undefined ? 0 : 91)"';
+    const probe = nodeE('process.exit(process.env.DEBUG_HYPOTHESIS_ID === undefined ? 0 : 91)');
     const code = await runSubcommand({
       inputs: { ...inputs, runCommand: probe },
       outputDir,
@@ -2589,9 +2598,9 @@ const fullLifecycle = async ({ env: envOverride = {}, ...overrides } = {}) => {
   const stepSummary = path.join(context.outputDir, 'step_summary');
   writeFileSync(githubOutput, '');
   writeFileSync(stepSummary, '');
-  const probe = 'node -e "' + [
+  const probe = nodeE([
     'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'demo event\', hypothesisId: process.env.DEBUG_HYPOTHESIS_ID }) }).then((r) => process.exit(r.status === 202 ? 1 : 99));',
-  ].join('') + '"';
+  ].join(''));
   const runCode = await runSubcommand({
     inputs: { ...context.inputs, runCommand: probe },
     outputDir: context.outputDir,
@@ -2688,7 +2697,7 @@ test('run captures the session from the collector, renders md+json, emits output
 const forgedLifecycle = async ({ ...overrides } = {}) => {
   const { env: _ignored, ...rest } = overrides;
   const context = await startReal({ hypothesisId: 'H-demo', hypothesisTitle: 'seeded demo' });
-  const forge = 'node -e "' + [
+  const forge = nodeE([
     'const fs = require(\'node:fs\');',
     'const p = require(\'node:path\');',
     'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'honest event\' }) }).then((r) => {',
@@ -2697,7 +2706,7 @@ const forgedLifecycle = async ({ ...overrides } = {}) => {
     'fs.appendFileSync(p.join(process.env.FORGE_DEBUG_DIR, \'debug-\' + process.env.DEBUG_SESSION_ID + \'.log\'), JSON.stringify({ ts: \'2026-08-13T00:00:00.000Z\', type: \'hypothesis\', hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'forged by the wrapped command\' }) + \'\\n\');',
     'process.exit(r.status === 202 ? 0 : 99);',
     '});',
-  ].join('') + '"';
+  ].join(''));
   const runCode = await runSubcommand({
     inputs: { ...context.inputs, runCommand: forge },
     outputDir: context.outputDir,
@@ -2860,7 +2869,7 @@ test('a wrapped command that kills the collector, forges the log and poisons the
       '',
     ].join('\n'));
     // 90 names the one way this could pass without the attack running.
-    const attack = 'node -e "' + [
+    const attack = nodeE([
       'const fs = require(\'node:fs\');',
       'const cp = require(\'node:child_process\');',
       'const p = require(\'node:path\');',
@@ -2881,7 +2890,7 @@ test('a wrapped command that kills the collector, forges the log and poisons the
       'const child = cp.spawn(process.execPath, [process.env.POISONER], { detached: true, stdio: \'ignore\' });',
       'child.unref();',
       'process.exit(0);',
-    ].join('') + '"';
+    ].join(''));
     const runCode = await runSubcommand({
       inputs: { ...context.inputs, runCommand: attack },
       outputDir: context.outputDir,
@@ -3030,7 +3039,7 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
     //
     // Each non-zero exit names a specific defence that failed, so this can
     // never pass because the attack quietly did not run.
-    const steal = 'node -e "' + [
+    const steal = nodeE([
       'const fs = require(\'node:fs\');',
       // 92: production hands the run step DEBUG_ACTION_OUTPUT_DIR; the wrapped
       // command must not see it.
@@ -3046,7 +3055,7 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
       // 96: ...nor mint a fresh session to escalate through.
       'fetch(base + \'/session\', { method: \'POST\', headers: auth, body: JSON.stringify({ name: \'ci-debug\' }) }),',
       ']).then(([h, s]) => process.exit(h.status !== 401 ? 95 : (s.status !== 401 ? 96 : 0)));',
-    ].join('') + '"';
+    ].join(''));
     const runCode = await runSubcommand({
       inputs: { ...context.inputs, runCommand: steal },
       outputDir: context.outputDir,
@@ -3942,10 +3951,10 @@ test('a relay that filters the real collector\'s answer is refused: the signatur
   // can catch this is the signature not covering the target that was asked.
   const context = await startReal();
   try {
-    const probe = 'node -e "' + [
+    const probe = nodeE([
       'const post = (msg) => fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg }) });',
       'Promise.all([\'first finding\', \'second finding\', \'the finding that matters\'].map(post)).then((rs) => process.exit(rs.every((r) => r.status === 202) ? 0 : 99));',
-    ].join('') + '"';
+    ].join(''));
     const runCode = await runSubcommand({
       inputs: { ...context.inputs, runCommand: probe },
       outputDir: context.outputDir,
@@ -10855,11 +10864,11 @@ const runnerCommandFiles = () => {
 // the code the case needs. The dump file's EXISTENCE is also how the
 // strict-refusal case proves the command never ran at all, an absence with a
 // positive control on the other side of the very same test.
-const compositeProbe = (exitCode) => `node -e "${[
+const compositeProbe = (exitCode) => nodeE([
   'require(\'node:fs\').writeFileSync(process.env.COMPOSITE_ENV_DUMP, JSON.stringify(process.env));',
   'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'composite event\' }) })',
   `.then((r) => process.exit(r.status === 202 ? ${exitCode} : 99));`,
-].join('')}"`;
+].join(''));
 
 // THE ONLY TWO `uses:` STEPS THIS MODEL ADMITS, keyed by the step name that
 // identifies them everywhere else in this file and bound to the action each one
