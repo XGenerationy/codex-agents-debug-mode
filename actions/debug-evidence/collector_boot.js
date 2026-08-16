@@ -90,9 +90,11 @@ const main = () => {
       // runner's own step-output plumbing.
       verify_key: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
     })}\n`);
-    // Windows DACL on project_salt is required, but PowerShell ACL must not
-    // delay the handshake line above. Apply it after the parent can proceed.
-    void server.protectDeferredWindowsPrivateFiles();
+    // Do not spawn powershell.exe from this process. Hosted windows-latest
+    // starts the boot shim as DETACHED_PROCESS (so it outlives `start`);
+    // EncodedCommand then hangs until the 15s ACL timeout, blocking the
+    // event loop so POST /session returns HTTP 500. `start` applies the
+    // current-user-only DACL from the parent, which has a console.
   });
 };
 

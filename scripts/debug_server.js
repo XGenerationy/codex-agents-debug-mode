@@ -1023,7 +1023,7 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
- * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, queue Windows DACL hardening for `project_salt` until `protectDeferredWindowsPrivateFiles()` runs (collector boot handshake). Default false keeps the CLI fail-closed sync path.
+ * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, queue Windows DACL hardening for `project_salt` and skip PowerShell inside this process (including POST /session). The debug-evidence `start` parent applies `protectWindowsPrivateFile` after handshake/mint: a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1353,16 +1353,12 @@ const createDebugServer = ({
             // process timed out on hosted windows-latest (POST /session → 500
             // after 15s; Validate Node 20, 2026-08-16).
             await handle.close();
-            if (process.platform === 'win32') {
+            if (process.platform === 'win32' && !deferWindowsPrivateFileProtection) {
               try {
-                // Use the synchronous helper, not protectWindowsPrivateFileAsync.
-                // On hosted windows-latest, promisified execFile of this
-                // EncodedCommand hangs until the 15s timeout (POST /session →
-                // HTTP 500) while execFileSync with the same script returns
-                // promptly — proven by closeout's passing Windows ACL tests.
-                // The exclusive write handle is already closed above, so this
-                // no longer contends with our own O_WRONLY lock. Blocking the
-                // request handler for a successful ACL is the working path.
+                // CLI / in-process servers apply the DACL here. The action's
+                // detached boot shim sets deferWindowsPrivateFileProtection so
+                // this handler never spawns powershell.exe — that child hangs
+                // until timeout on hosted windows-latest (Validate 31973907121).
                 protectWindowsPrivateFile(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);

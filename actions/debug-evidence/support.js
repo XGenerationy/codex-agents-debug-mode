@@ -24,6 +24,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { canonicalResponderRecord, probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
 const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
@@ -1008,8 +1009,25 @@ const rejectForeignNonce = (state, env, subcommand) => {
 const defaultSpawnShim = (args, { env }) => spawn(process.execPath, [BOOT_SHIM, ...args], {
   env,
   detached: true,
+  windowsHide: true,
   stdio: ['ignore', 'pipe', 'pipe'],
 });
+
+// Hosted Windows: the detached collector must not spawn powershell.exe
+// (Session 0 + DETACHED_PROCESS hangs EncodedCommand for the full 15s ACL
+// budget, and POST /session then returns HTTP 500). `start` is a normal
+// Actions step process with a console; apply the same current-user-only
+// DACL from here after handshake/mint and before this process returns.
+const protectWindowsPrivateFileIfPresent = (privateFile) => {
+  if (process.platform !== 'win32') return;
+  try {
+    lstatSync(privateFile);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  protectWindowsPrivateFile(privateFile);
+};
 
 // Read the shim's single startup line (private pipe). Resolves the parsed
 // JSON object; rejects on timeout, spawn failure, child exit, or unparsable
@@ -1248,6 +1266,20 @@ const startSubcommand = async ({
   });
   if (mint.status !== 201 || !mint.json?.session_id || !mint.json?.session_token) {
     throw abort(`session mint failed (HTTP ${mint.status ?? 'no response'})`);
+  }
+  // Apply current-user-only Windows DACLs from this parent process, never
+  // from the detached collector. powershell.exe EncodedCommand hangs until
+  // timeout inside a DETACHED_PROCESS child on hosted windows-latest, which
+  // blocked POST /session (HTTP 500, Validate 31973907121). Salt is fail-open
+  // if absent (unpersisted); a minted session log is fail-closed.
+  try {
+    protectWindowsPrivateFileIfPresent(path.join(projectRoot, '.debug', 'project_salt'));
+    const relativeLog = mint.json.log_file;
+    if (typeof relativeLog === 'string' && relativeLog.length > 0) {
+      protectWindowsPrivateFile(path.join(projectRoot, relativeLog));
+    }
+  } catch (error) {
+    throw abort(`Windows private-file ACL failed: ${error?.message ?? error}`);
   }
   const sessionId = mint.json.session_id;
   const sessionToken = mint.json.session_token;

@@ -318,15 +318,19 @@ test('start boots a real collector, mints the session, and records state that ca
   }
 });
 
-test('collector boot defers Windows salt ACL until after the handshake line', () => {
-  const source = readFileSync(path.join(__dirname, 'collector_boot.js'), 'utf8');
-  assert.match(source, /deferWindowsPrivateFileProtection:\s*true/);
-  const listenAt = source.indexOf('server.listen');
-  const handshakeAt = source.indexOf('process.stdout.write');
-  const protectAt = source.indexOf('protectDeferredWindowsPrivateFiles');
+test('collector boot never runs PowerShell ACL; start applies it in the parent', () => {
+  const boot = readFileSync(path.join(__dirname, 'collector_boot.js'), 'utf8');
+  const support = readFileSync(path.join(__dirname, 'support.js'), 'utf8');
+  assert.match(boot, /deferWindowsPrivateFileProtection:\s*true/);
+  assert.equal(boot.includes('protectDeferredWindowsPrivateFiles'), false,
+    'the detached boot shim must not spawn powershell.exe (hosted Windows hangs EncodedCommand)');
+  const listenAt = boot.indexOf('server.listen');
+  const handshakeAt = boot.indexOf('process.stdout.write');
   assert.ok(listenAt !== -1, 'boot still calls listen()');
   assert.ok(handshakeAt > listenAt, 'the startup line is written from the listen callback');
-  assert.ok(protectAt > handshakeAt, 'Windows ACL runs after the handshake line, not before listen()');
+  assert.match(support, /protectWindowsPrivateFileIfPresent/);
+  assert.match(support, /protectWindowsPrivateFile\(path\.join\(projectRoot, relativeLog\)\)/);
+  assert.match(support, /windowsHide:\s*true/);
 });
 
 test('httpRequestJson defaults cover the Windows session-log ACL budget', () => {
@@ -2492,7 +2496,18 @@ test('a holder whose lock was reaped and replaced releases without evicting the 
     // A reaper judged this holder stale, deleted its lock, and a successor
     // took the path. This holder is now a ghost: its fd is still open, but
     // the lock on disk is someone else's.
-    unlinkSync(lockPath);
+    //
+    // Windows refuses to unlink a name whose handle is still open in this
+    // process (withStateLock's own finally closes first for that reason).
+    // Overwrite in place when unlink is denied so the ownership-verified
+    // release still sees successor bytes and must leave them alone.
+    try {
+      unlinkSync(lockPath);
+    } catch (error) {
+      if (process.platform !== 'win32' || (error?.code !== 'EPERM' && error?.code !== 'EACCES')) {
+        throw error;
+      }
+    }
     writeFileSync(lockPath, successor);
   });
   assert.match(stamped, new RegExp(`^${process.pid}\\n[0-9a-f-]{36}\\n$`),
