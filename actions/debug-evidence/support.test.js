@@ -3048,20 +3048,22 @@ test('there is no launch token left to steal: the wrapped command cannot forge a
     // never pass because the attack quietly did not run.
     const stealJs = [
       'const fs = require(\'node:fs\');',
-      // 92: production hands the run step DEBUG_ACTION_OUTPUT_DIR; the wrapped
-      // command must not see it.
+      'const http = require(\'node:http\');',
       'if (process.env.DEBUG_ACTION_OUTPUT_DIR !== undefined) process.exit(92);',
-      // 94: the state file is readable — and worthless. No launch token.
       'const state = JSON.parse(fs.readFileSync(process.env.GUESSED_STATE_PATH, \'utf8\'));',
       'if (state.launchToken !== undefined) process.exit(94);',
-      'const base = process.env.DEBUG_LOG_URL.replace(\'/log\', \'\');',
-      'const auth = { \'content-type\': \'application/json\', Authorization: \'Bearer \' + process.env.DEBUG_SESSION_TOKEN };',
+      'const base = new URL(process.env.DEBUG_LOG_URL);',
+      'const post = (urlPath, headers, body) => new Promise((resolve, reject) => {',
+      '  const payload = JSON.stringify(body);',
+      '  const req = http.request({ hostname: \'127.0.0.1\', port: base.port, path: urlPath, method: \'POST\', headers: { \'content-type\': \'application/json\', \'content-length\': Buffer.byteLength(payload), ...headers } }, (res) => { res.resume(); resolve(res.statusCode); });',
+      '  req.on(\'error\', reject);',
+      '  req.end(payload);',
+      '});',
+      'const auth = { Authorization: \'Bearer \' + process.env.DEBUG_SESSION_TOKEN };',
       'Promise.all([',
-      // 95: the only credential it holds must not be able to post a verdict...
-      'fetch(base + \'/hypothesis\', { method: \'POST\', headers: auth, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'forged\' }) }),',
-      // 96: ...nor mint a fresh session to escalate through.
-      'fetch(base + \'/session\', { method: \'POST\', headers: auth, body: JSON.stringify({ name: \'ci-debug\' }) }),',
-      ']).then(([h, s]) => process.exit(h.status !== 401 ? 95 : (s.status !== 401 ? 96 : 0)));',
+      '  post(\'/hypothesis\', auth, { sessionId: process.env.DEBUG_SESSION_ID, hypothesisId: \'H-demo\', status: \'CONFIRMED\', note: \'forged\' }),',
+      '  post(\'/session\', auth, { name: \'ci-debug\' }),',
+      ']).then(([h, s]) => process.exit(h !== 401 ? 95 : (s !== 401 ? 96 : 0))).catch(() => process.exit(1));',
     ].join('');
     const runCode = await runSubcommand({
       inputs: { ...context.inputs, runCommand: nodeE(stealJs) },
@@ -3960,8 +3962,15 @@ test('a relay that filters the real collector\'s answer is refused: the signatur
   const context = await startReal();
   try {
     const probeJs = [
-      'const post = (msg) => fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg }) });',
-      'Promise.all([\'first finding\', \'second finding\', \'the finding that matters\'].map(post)).then((rs) => process.exit(rs.every((r) => r.status === 202) ? 0 : 99));',
+      'const http = require(\'node:http\');',
+      'const url = new URL(process.env.DEBUG_LOG_URL);',
+      'const post = (msg) => new Promise((resolve, reject) => {',
+      '  const payload = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg });',
+      '  const req = http.request({ hostname: url.hostname, port: url.port, path: url.pathname, method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN, \'content-length\': Buffer.byteLength(payload) } }, (res) => { res.resume(); resolve(res.statusCode); });',
+      '  req.on(\'error\', reject);',
+      '  req.end(payload);',
+      '});',
+      'Promise.all([\'first finding\', \'second finding\', \'the finding that matters\'].map(post)).then((rs) => process.exit(rs.every((code) => code === 202) ? 0 : 99)).catch(() => process.exit(1));',
     ].join('');
     const runCode = await runSubcommand({
       inputs: { ...context.inputs, runCommand: nodeE(probeJs) },
