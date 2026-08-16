@@ -4278,11 +4278,17 @@ One file, `support.test.js` (+227 / −41). Contracts unmoved: **68 claims / 4 r
 >
 > **Structural gaps that remain open**
 >
-> 4. **A required half proves a fact is *somewhere* on the surface, not where a reader will look.** Still true. My per-surface patterns narrow this (action.yml comments vs. rendered descriptions are separate surfaces; README claims are section-scoped) but *within* a surface, position is unchecked: move the canonical sentence from a `description:` into a comment and the pin stays green. Closing it needs a per-claim location model. Not done — bounded value for real churn.
-> 5. **Single-pattern required halves (68 of 72) have no name and no declared fact.** Deletion-evidence covers named lists and per-surface maps only. **Weakening** a single pattern — shortening it, dropping a clause — passes everything. Closing it means naming all 68 and declaring `facts` everywhere, or a golden file of pattern sources (which just moves the trust to whoever updates the golden file). Not done: high churn, low marginal return.
+> 4. **A required half proves a fact is *somewhere* on the surface, not where a reader will look.** Still true. My per-surface patterns narrow this (action.yml comments vs. rendered descriptions are separate surfaces; README claims are section-scoped) but *within* a surface, position is unchecked: ~~move the canonical sentence from a `description:` into a comment and the pin stays green~~. Closing it needs a per-claim location model. Not done — bounded value for real churn.
+>
+>     **CORRECTED (Codex, closing review) — the struck example is IMPOSSIBLE and would have misled the next maintainer.** Moving text from an input/output `description:` into a comment crosses **two separately enforced surfaces** and therefore FAILS rather than staying green. The limitation is real but only *within* one surface. Accurate examples: moving a sentence **between two comments**, or **between two different input/output descriptions**. Verified by construction — the per-surface trust-unit patterns were each confirmed to match only their own surface.
+> 5. **Single-pattern required halves (~~68~~ **69** of 72) have no name and no declared fact.** Deletion-evidence covers named lists and per-surface maps only. **Weakening** a single pattern — shortening it, dropping a clause — passes everything. Closing it means naming all ~~68~~ **69** and declaring `facts` everywhere, or a golden file of pattern sources (which just moves the trust to whoever updates the golden file). Not done: high churn, low marginal return.
+>
+>     **CORRECTED (Codex, closing review), and I verified the arithmetic myself with the loader rather than accepting either number:** of the 72 required patterns, **66 are ordinary single patterns, 3 are the named report list, and 3 are the unnamed per-surface trust patterns — so 69 are unnamed, not 68.** The implementer counted the per-surface trio as covered because the per-surface *map* is structurally checked; the map's keys are, but its patterns carry no names.
 > 6. **`facts` is per-claim, so a per-surface `required` whose surfaces state *different* facts cannot be expressed** — the structural check would demand identical name sets. Latent: the one per-surface user has a single unnamed pattern per surface. Close by making `facts` per-surface when a second user appears.
 > 7. **The exact counters (68 / 4 / 230 / 18) are deletion-evident, not tamper-evident** — round 5's ruling, unchanged. Substituting one probe for a weaker one, or duplicating a probe, preserves the totals. I extended naming to the required side and pattern-uniqueness to both, but **the probe lists themselves are still bare arrays that are counted, not named.**
 > 8. **Retirement is checked for existence, not adequacy.** A retired claim must name a disclosure that exists and be pointed at in return — but nothing checks the disclosure actually covers the retired claim's proposition. A retirement pointing at an unrelated disclosure passes.
+>
+> 8b. **ADDED BY CODEX AT THE CLOSING REVIEW — NAMES DO NOT ESTABLISH SEMANTIC ADEQUACY, AND THIS GENERALIZES BOTH 7 AND 8.** `support.test.js:10546-10552` prevents the *same* regex appearing under two different names. **It does not prevent a named fact from being replaced by a DIFFERENT, unique, WEAKER regex that happens to match.** Uniqueness is a syntactic property; covering the named proposition is a semantic one, and nothing here checks the second. **This is the correction that matters most in the list, because it punctures the round's own headline:** naming was adopted over counting on the principle that "naming beats counting," and it does — for deletion and duplication. It buys nothing against substitution-by-weakening. **The scope is wider than limitation 5 admitted: it affects the 3 named requirements and all 18 `POSITIVE_DISCLOSURES` checks too, not merely the 69 unnamed ordinary patterns.** So every part of this mechanism — named and unnamed alike — is deletion-evident and duplication-evident, and none of it is weakening-evident.
 > 9. **`POSITIVE_DISCLOSURES` builds its own surfaces.** It shares the extractors today, which is why round 5 wrote it that way, but **nothing asserts** the registry reads the same text the claim executors do. A divergence would be invisible.
 >
 > **Traps — read these before touching anything**
@@ -4307,6 +4313,18 @@ One file, `support.test.js` (+227 / −41). Contracts unmoved: **68 claims / 4 r
 
 **COORDINATOR'S DISPOSITION.** Limitations 1–3 are Codex's own rulings and need no action. **4–9 ship open.** 10–14 are maintainer traps and belong in the file, not just here — 11 and 13 already are. **Item 15 is the one I agree is worth money**, and it goes to Task 9 as a candidate rather than a seventh round. On the retirement read: the implementer's judgment that **this mechanism never once corrected shipped prose** is the honest measure of it, and it is recorded here so the decision to keep or shrink it is made on evidence rather than sunk cost.
 
+#### ✅ TASK 8 CLOSED — Approved at `5fe954c` after SIX fix rounds. No Critical or Important issues; three Minor, all against the PLAN and HANDOVER rather than the code.
+
+> **Codex, verbatim: "No seventh code round is warranted. Record those corrections and ship."**
+
+**THE CODE IS CONFIRMED CORRECT** on all four items: the three trust-unit patterns at `support.test.js:5497-5499` are surface-specific and complete; the required-side structural contract catches deletion, missing surfaces, duplicate names and identical-pattern substitution; the three swept ordinary assertions work in both directions; and **no claim silently under-matches today** — all claim executors ran in the 131-pass suite, and the three-normalization split is accurately documented as a future editing trap rather than a live defect.
+
+**The three Minor corrections are recorded inline above** at limitations 4, 5 and the new 8b. All three were against text I wrote or relayed, not against the implementation. **8b is the one that matters**: naming beats counting for deletion and duplication and buys **nothing** against substitution-by-weakening, and that gap covers the named requirements and all 18 disclosure checks too — not just the unnamed ones. The round's own headline was narrower than it sounded.
+
+**RETIREMENT — RULED, AND NARROWER THAN THE IMPLEMENTER PROPOSED.** The blunt assessment is accepted: *"the mechanism is overbuilt relative to its demonstrated value."* But **do NOT remove all three counters.** `68` and `4` are largely redundant with bidirectional name coverage; **`230` still uniquely detects deletion of a non-final unnamed probe**, exactly as limitation 7 admits. **Make no retirement change in this PR. Reassess after the next real documentation edit** — the first edit is the experiment that tells you whether the mechanism earns itself.
+
+**ITEM 15 — RULED AGAINST COMMITTING IT NOW, AND THE REASONING CORRECTS MY OWN ENTHUSIASM.** I argued the 45-line loader was the one item worth money because I built it and it worked first try. Codex's answer: **run it as final-review EVIDENCE and record its output, but do not commit it during Task 9.** *"A permanent syntactic audit that the limitations correctly admit would have missed all four round-6 defects is not worth expanding the PR at its final gate."* That is limitation 12 turned against my own recommendation, and it is right — cheap to build is not the same as worth maintaining. **If the documentation mechanism survives its next real edit, that future cycle is the right time to extract and commit the harness.**
+
 ---
 
 ### Task 9: Full battery, scope proof, and handoff
@@ -4314,6 +4332,22 @@ One file, `support.test.js` (+227 / −41). Contracts unmoved: **68 claims / 4 r
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
 > non-ESRCH kill-failure → 3 pin (two lines with the existing `kill` seam: inject a
 > kill that throws `EPERM` → assert return 3 and the diagnostic stderr line).
+
+#### THE FIVE WHOLE-IMPLEMENTATION CHECKS (Codex, at the close of Task 8, answering "what should Task 9 verify that no per-task round could?")
+
+These are additive to Steps 1–4 below, and they exist because **fifteen review rounds each validated one task in isolation.** Every one targets a seam BETWEEN tasks — the place where independently correct modules disagree — which is precisely what a per-task round structurally cannot see.
+
+1. **Composite failure precedence.** Exercise command failure, strict refusal, renderer/report failure, and the queued teardown `EPERM` failure **through the complete action**. Assert the final job result, the staged artifact state, and — the load-bearing one — **that later `always()` steps cannot mask the run verdict.** This subsumes the remaining failure-matrix cases carried since Task 6 (gate 3's `true` mirror, collector loss, authentication failure, renderer failure, signal termination).
+
+2. **End-to-end identity and byte lineage.** Trace ONE invocation nonce and admission record from the `start` output, through the qualification-plus-digest block, into `report.json`, the staged hashes, and **a genuinely downloaded artifact.** This is gate 5 (cross-module byte contract) made concrete, and Codex names it as *"where independently correct modules can disagree."*
+
+3. **Secret/capability boundary.** Confirm the launch token never reaches disk, outputs, logs, reports or the artifact; verify the session credential appears **only** where documented. **Include hostile symlink substitution as a DISCLOSED RESIDUAL, not a promised prevention** — the distinction Task 8 spent six rounds getting into the prose must hold in the test's framing too.
+
+4. **Cross-module constants, derived independently.** Compare state keys, evidence filenames, exit taxonomy, report schema and cap, stripped control-plane variables, digest recipe, and workflow upload paths. **Do NOT derive the expected set using production helpers** — a check that imports the thing it is checking proves only self-consistency. This is the same defect class as the vacuous guards, one level up.
+
+5. **Merge-time operational proof.** Clear the full-diff scanner finding by hand; perform the accepted one-time forwarder bootstrap rerun; **then** verify exact-head checks, unresolved threads, approval state, hosted demo result, and the downloaded artifact before PR closeout. (This formalizes the two MERGE-TIME ACTIONS owed since the 2026-08-14 single-PR decision at `:3681`.)
+
+> **RULED — item 15's harness is NOT committed during Task 9.** Run the 45-line loader as **final-review evidence** and record its output in the handoff. Codex: *"A permanent syntactic audit that the limitations correctly admit would have missed all four round-6 defects is not worth expanding the PR at its final gate."* **If the documentation mechanism survives its next real edit, that future cycle is when to extract and commit it.**
 
 - [ ] **Step 1: Full test battery** (one invocation, foreground, no pipes)
 
