@@ -4248,6 +4248,65 @@ FIX: surface-specific COMPLETE assertions for the trust-unit relationship; bind 
 
 **CONFIRMED SOUND:** the other disclosure phrases are direct, the removed `strict` lookahead is correctly pinned, and **the 64 forbidden guards remain sound within the accepted regression-signature boundary.**
 
+#### Task 8 final-round outcome (`5fe954c`) — all four closed, and the repo's own scanner earned its keep
+
+One file, `support.test.js` (+227 / −41). Contracts unmoved: **68 claims / 4 retired / 230 probes / 18 disclosure checks.** Claim patterns 157 → **154** (required 75 → 72) — the digest recipe collapsed 3→1 and the signal name 2→1, because the shipped prose states each in ONE sentence, so one contiguous pin is both stricter and smaller than three joinable halves.
+
+**(1) CLOSED.** The disclosure now pins `which is a claim about paths and not one about bytes: …` with subject and copula welded on. Mutation `which is` → `which is not` on the real README: pre-fix **GREEN** (the guard certified its own contradiction); fixed **RED ×2**.
+
+**(2) CLOSED, three ways.** (a) The trust unit is now **one complete sentence per surface**, keyed by surface name, in each surface's own wording — verified each pattern matches only its own surface. The proving mutation guts the canonical `action.yml` sentence while **leaving the `:257` recap intact**, which is round 5's M10 lesson run in reverse: pre-fix GREEN (halves matched across two comment blocks), fixed RED. (b) The digest recipe runs unbroken from its subject; a `never` at **any of the four steps** now breaks the match. (c) `required` takes one of three shapes — a single pattern, a **named list bound to a declared `facts` set**, or a **per-surface map whose keys deep-equal `where`** — and both sides reject two halves that are the same pattern under different names. Deleting an element, deleting `facts`, substituting a pattern under its own name, and dropping a surface are each RED; the same deletions were GREEN pre-fix.
+
+**(3) CLOSED.** `(source, flags)` uniqueness per surface, keyed on `String(pattern)`. Codex's exact attack — the symlink pattern copied under the path-name label — was GREEN pre-fix and is now RED.
+
+**(4) SWEPT: 157 ordinary regex assertions** (136 `assert.match`/`doesNotMatch` + 21 `assert(…test(…))`). **11 held a word; 3 needed changing**, all over authored consumer-facing prose: `:753` (40 chars of room for "but never" in the admission record a human reads), `:8843` (**rejected the true** read-only sentence), `:10462` (accepted "Input validation **never** exits 1"). Each now carries **its own inline both-directions probes** — the thing these assertions never had, and the reason the windows survived five rounds. The other 8 are over machine-generated output, where an editor cannot insert a denial.
+
+> **P5a is the round's methodological find.** The first replacement used single spaces and came back **GREEN**, because the closeout-gate commentary **preserves continuation-line indentation** — a wrapped phrase arrives with a run of spaces. Fixed with `\s+`. **The mutation caught it; inspection had not.**
+
+**One self-inflicted defect, caught by the repo:** the first substitution-uniqueness key used a literal `\u0000` separator, putting a NUL byte in the file. `tools/scan_touched_suppressions.js` rejected it (`[scan-error] Touched file contains NUL bytes`).
+
+**COORDINATOR-VERIFIED INDEPENDENTLY**, not taken from the report: validate PASS (payloadFiles 43, safetyScanFiles 87, dependencies 0); `support.test.js` 132/131/0/1; scanner exit 1, only the known forwarder-list finding; `git diff --check` exit 0; counters read directly from the file at `:10485`/`:10610-10612`. **Two mutations re-run from scratch by the coordinator** — negating the README disclosure (**RED ×2**) and deleting one element of a named required list (**RED**) — with byte-identical restore confirmed by `git diff --quiet` after each. The disclosure prose sits at `README.md:561-562` **line-wrapped**, so it matches only because `readmeSections` collapses whitespace; that is limitation 11 below, observed in the wild.
+
+#### Task 8 KNOWN LIMITATIONS — recorded VERBATIM from the implementer, and shipped
+
+> *Everything I know to be still fallible here after this round. This is what a future maintainer inherits.*
+>
+> **Boundaries that were ruled and will not move**
+>
+> 1. **Quoted denial.** A surface that quotes a forbidden sentence in order to deny it trips the forbidden half. Closing it needs negation-scope parsing. Ruled out in round 5; ships as documented.
+> 2. **The 64 forbidden halves are regression *signatures*, not propositional judgments.** They catch the specific affirmative sentences an editor would plausibly write. An unenumerated paraphrase walks straight through. Closing it means either unbounded enumeration or semantics. Same ruling.
+> 3. **Nothing checks a probe is realistic.** The 230 `accepts`/`rejects` sentences are the implementer's guess at what a reverting editor would write. A wrong guess means a guard proved against fiction. Not automatable.
+>
+> **Structural gaps that remain open**
+>
+> 4. **A required half proves a fact is *somewhere* on the surface, not where a reader will look.** Still true. My per-surface patterns narrow this (action.yml comments vs. rendered descriptions are separate surfaces; README claims are section-scoped) but *within* a surface, position is unchecked: move the canonical sentence from a `description:` into a comment and the pin stays green. Closing it needs a per-claim location model. Not done — bounded value for real churn.
+> 5. **Single-pattern required halves (68 of 72) have no name and no declared fact.** Deletion-evidence covers named lists and per-surface maps only. **Weakening** a single pattern — shortening it, dropping a clause — passes everything. Closing it means naming all 68 and declaring `facts` everywhere, or a golden file of pattern sources (which just moves the trust to whoever updates the golden file). Not done: high churn, low marginal return.
+> 6. **`facts` is per-claim, so a per-surface `required` whose surfaces state *different* facts cannot be expressed** — the structural check would demand identical name sets. Latent: the one per-surface user has a single unnamed pattern per surface. Close by making `facts` per-surface when a second user appears.
+> 7. **The exact counters (68 / 4 / 230 / 18) are deletion-evident, not tamper-evident** — round 5's ruling, unchanged. Substituting one probe for a weaker one, or duplicating a probe, preserves the totals. I extended naming to the required side and pattern-uniqueness to both, but **the probe lists themselves are still bare arrays that are counted, not named.**
+> 8. **Retirement is checked for existence, not adequacy.** A retired claim must name a disclosure that exists and be pointed at in return — but nothing checks the disclosure actually covers the retired claim's proposition. A retirement pointing at an unrelated disclosure passes.
+> 9. **`POSITIVE_DISCLOSURES` builds its own surfaces.** It shares the extractors today, which is why round 5 wrote it that way, but **nothing asserts** the registry reads the same text the claim executors do. A divergence would be invisible.
+>
+> **Traps — read these before touching anything**
+>
+> 10. **THE BRITTLENESS IS THE POINT, AND IT IS ALSO THE TRAP.** The trust-unit and recipe pins now fail on any prose rewording. The fix a hurried maintainer reaches for is a small `\s*` or `[^.]{0,N}` bridge. **All six rounds of this defect entered exactly that way.** RE-LIFT the phrase from the file; never bridge it. Nothing enforces this — it is the single most likely route back to the defect class.
+> 11. **THREE DIFFERENT WHITESPACE NORMALIZATIONS, AND THEY BIT ME THIS ROUND.** `readmeSections` collapses all whitespace; `platformSurfaces()` double-trims each comment line; the closeout-gate `commentary` **keeps continuation-line indentation**. A pattern written with single spaces silently under-matches on the third. Use `\s+` there (whitespace cannot hold a word). Closing it means one shared normalizer, which would touch neighbouring assertions that already compensate — not done, so it stays a trap.
+> 12. **THE WINDOW AUDIT IS SYNTACTIC AND WOULD NOT HAVE CAUGHT ANY OF THIS ROUND'S FOUR FINDINGS.** Round 5 reported "157 patterns, zero windows" while all four round-6 defects were already present. Subject-omission, cross-sentence assembly and deletability are invisible to a source scan. **Never again report "zero windows" as "the guards are sound."**
+> 13. **`[*_]*`, `\s+`, `['’]`, `[—-]+` are safe; `[^,]*`, `\S+`, `.{0,N}` are not.** The rule is "no construct that can hold a WORD", not "no quantifier". `\w+` after a stem (`dedup\w+`) is safe — it cannot match whitespace.
+> 14. **My classification of the 8 surviving word-holding ordinary assertions is a judgment with no encoding in the repo.** If one of those output formats ever becomes prose a human authors, nothing re-checks it.
+>
+> **The highest-value thing that was NOT built**
+>
+> 15. **The audit and mutation harness lives nowhere.** Six rounds have each re-derived the `module.exports` + `Module._load` loader by hand, and this round's sweep and window audit are equally disposable. **Committing them as a test (~60 lines total, or refactor the tables into a module the audit can import) would have caught findings 2b and 4 mechanically and would make "zero windows" reproducible instead of asserted.** I did not build it because the round's scope was the four findings and the stopping condition forbids opening new work. If one item from this list is ever actioned, make it this one.
+>
+> **Retirement candidates — my honest read**
+>
+> - **Keep:** the 64 forbidden halves + 230 probes. Cheap, proven in both directions, and the only part with a real regression story.
+> - **Keep:** the per-surface required patterns. They carry their weight — the trust-unit finding was real and only per-surface completeness closes it.
+> - **Retire the three exact counters (68 / 4 / 230).** They are deletion-evidence only, they have been wrong-footed twice as pure bookkeeping, and naming now covers both the registry and the required side. Every round spends effort keeping them accurate for a property that review already provides.
+> - **Borderline — the named-list form I just added has exactly ONE user**, and the per-surface form has one. I added ~45 lines of structural validation to protect two claims. It is correct and it generalizes, but a future maintainer who finds it more ceremony than it earns would be within their rights to collapse Form B back into contiguous per-surface patterns. **The per-surface map is the part that pays; the named list barely does.**
+> - **And the blunt one:** this mechanism has cost **six review rounds and has never corrected a single line of shipped prose.** Every round confirmed the documentation was already right. Its entire value is prospective — catching drift that has not happened. For a document set edited a couple of times a year, that is plausibly a worse trade than a checklist in the PR template. I would not have built it at this size. Now that it exists and is sound within its stated boundary, keeping the cheap half is defensible; growing it further is not.
+
+**COORDINATOR'S DISPOSITION.** Limitations 1–3 are Codex's own rulings and need no action. **4–9 ship open.** 10–14 are maintainer traps and belong in the file, not just here — 11 and 13 already are. **Item 15 is the one I agree is worth money**, and it goes to Task 9 as a candidate rather than a seventh round. On the retirement read: the implementer's judgment that **this mechanism never once corrected shipped prose** is the honest measure of it, and it is recorded here so the decision to keep or shrink it is made on evidence rather than sunk cost.
+
 ---
 
 ### Task 9: Full battery, scope proof, and handoff
