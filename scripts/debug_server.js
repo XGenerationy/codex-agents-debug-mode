@@ -1345,14 +1345,11 @@ const createDebugServer = ({
           try {
             const info = await handle.stat();
             if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
-            // /log events are redacted only for KNOWN secrets (see
-            // createRedactionContext); treat log contents as sensitive. The
-            // 0600 mode above is a no-op against Windows' inherited DACL, so
-            // another local
-            // user with inherited access to a shared checkout could read this
-            // log; establish a protected, current-user-only ACL before any
-            // event can be appended (mirrors collector_token's own Windows
-            // hardening).
+            // Release the exclusive write handle before Windows DACL work.
+            // File.SetAccessControl on a path still opened O_WRONLY by this
+            // process timed out on hosted windows-latest (POST /session → 500
+            // after 15s; Validate Node 20, 2026-08-16).
+            await handle.close();
             if (process.platform === 'win32') {
               try {
                 // Async (execFile) variant, not the synchronous
@@ -1432,7 +1429,7 @@ const createDebugServer = ({
             }
             throw error;
           }
-          await handle.close();
+          // Handle was closed after the creation-time stat, before Windows ACL.
           // Push-then-rebuild at the END of the successful setup path: the
           // token joins the append-only registry only once .debug validation,
           // directory creation, and the session log all succeeded, so only
