@@ -4349,27 +4349,74 @@ These are additive to Steps 1–4 below, and they exist because **fifteen review
 
 > **RULED — item 15's harness is NOT committed during Task 9.** Run the 45-line loader as **final-review evidence** and record its output in the handoff. Codex: *"A permanent syntactic audit that the limitations correctly admit would have missed all four round-6 defects is not worth expanding the PR at its final gate."* **If the documentation mechanism survives its next real edit, that future cycle is when to extract and commit it.**
 
-- [ ] **Step 1: Full test battery** (one invocation, foreground, no pipes)
+#### AMENDMENTS RECORDED DURING TASK 9, BEFORE THE CODE THEY LICENSE
+
+**A1 — Step 3's BASE REF was wrong, and the error is invisible from its output.** The step says `git diff codex/publish-debug-skill...HEAD --stat`. The LOCAL branch of that name sits three commits behind its remote, so the three-dot merge base resolves to a point BEFORE the closeout cycle and the stat pulls in all of `actions/closeout/**`, `scripts/pr_closeout*`, `tools/workflow_checks.js` and the 2026-08-07 plan — 52 files instead of 20. A reviewer reading that output would conclude this PR touches `scripts/pr_closeout*`, which the same step forbids. **The base for this cycle's single PR is `origin/codex/publish-debug-skill` (`af89573`), which is exactly `git merge-base origin/main HEAD`.** Use that, or the merge-base form, and never the bare local branch name.
+
+**A2 — Step 3's allowed-path list omits two paths this very plan mandates.** `scripts/debug_server.js` and `scripts/debug_server.test.js` are changed by this cycle **by design**: the collector-side work at `:1770`, `:1808` and `:1870` (per-session appended-byte digest, the logs-serve responder proof) and the instruction at `:1778` to append to `scripts/debug_server.test.js` in place. The list at Step 3 was written before those tasks and never updated. **Both paths are IN SCOPE.** The corrected list is the twelve entries already there plus `scripts/debug_server.js` and `scripts/debug_server.test.js`. Nothing else changes: `scripts/pr_closeout*` and `actions/closeout/**` remain out of scope and are untouched.
+
+**A3 — checks 2 and 5 are split at the local/hosted boundary, and the hosted halves are NOT built.** Check 2's "a genuinely downloaded artifact" and the whole of check 5 need a hosted CI run and a real pull request. Neither is simulated, and no test pretends to either — a local stand-in would be precisely the confident claim this cycle has repeatedly found worth less than the honest limitation. **Locally the lineage stops at the staged bytes and the ENUMERATED upload paths**; the rest is the merge-time checklist below, for a human to execute at PR time.
+
+**A4 — the residual demonstration uses a DIRECTORY symlink, not a file one.** Check 3 names "hostile symlink substitution". The implementer's host denies `SeCreateSymbolicLinkPrivilege`, so a file-symlink variant could only ever have shipped GREEN-UNTESTED — a check nobody has seen fail, which this cycle's rule 4 forbids. The shipped demonstration plants a junction at an enumerated name and reads the state file through it, which exercises the **second** sentence of the same disclosed residual (`implicitDescendants` expanding a substituted directory) and runs on the implementer's host, where it was proved red by deleting the disclosure it pairs with. The file-symlink variant is deliberately NOT shipped rather than shipped unproven.
+
+- [x] **Step 1: Full test battery** (one invocation, foreground, no pipes)
 
 Run: `npm test`
 Expected: 0 fail, 0 cancelled. The suite grows by the debug_report + debug-evidence-action tests (~25–35 new tests). Pre-existing timing-sensitive suites (`debug_server` collector-claim, `pr_closeout_process` symlink) can flake under machine load — a failure there needs an isolation rerun of THAT file before it is called real.
 
-- [ ] **Step 2: Validator + suppression scan**
+- [x] **Step 2: Validator + suppression scan**
 
 Run: `npm run validate`
 Expected: `{"status":"PASS","payloadFiles":43,...}`.
 
 Run: `npm run scan:suppressions`
-Expected: clean (or the designed additive-only gate-scan advisory when run through the gate).
+Expected: the designed additive-only gate-scan advisory, and nothing else. It exits **1** on the ONE accepted finding recorded at Task 7 — the forwarder-list line `- workflows: ["Validate", "Closeout preview"]` removed from `closeout-gate.yml`, which the fail-closed gate diff cannot distinguish from a weakening. Any SECOND finding, or any marker / config-silencing / test-weakening finding, is a real regression.
 
-- [ ] **Step 3: Scope proof**
+- [x] **Step 3: Scope proof** *(base ref and path list corrected by amendments A1 and A2 above)*
 
-Run: `git diff codex/publish-debug-skill...HEAD --stat`
-Expected: ONLY these paths — `docs/superpowers/{specs,plans}/2026-08-13-*`, `scripts/debug_evidence.js`, `scripts/debug_diff.js`, `scripts/debug_report.js`, `scripts/debug_report.test.js`, `scripts/debug_evidence.test.js`, `tools/validate_repository.js`, `actions/debug-evidence/**`, `.github/workflows/debug-evidence-demo.yml`, `.github/workflows/closeout-gate.yml`, `README.md`, `SKILL.md`. ZERO deletions outside the two modified script files' internal edits; NOTHING under `scripts/pr_closeout*` or `actions/closeout/`.
+Run: `git diff "$(git merge-base origin/main HEAD)...HEAD" --stat` — equivalently `git diff origin/codex/publish-debug-skill...HEAD --stat`. **Not** the bare local `codex/publish-debug-skill`, which is stale; see A1.
+Expected: ONLY these paths — `docs/superpowers/{specs,plans}/2026-08-13-*`, `scripts/debug_evidence.js`, `scripts/debug_diff.js`, `scripts/debug_report.js`, `scripts/debug_report.test.js`, `scripts/debug_evidence.test.js`, `scripts/debug_server.js`, `scripts/debug_server.test.js`, `tools/validate_repository.js`, `actions/debug-evidence/**`, `.github/workflows/debug-evidence-demo.yml`, `.github/workflows/closeout-gate.yml`, `README.md`, `SKILL.md`. ZERO deletions outside the modified script files' internal edits; NOTHING under `scripts/pr_closeout*` or `actions/closeout/`.
 
-- [ ] **Step 4: Commit any stragglers, then report**
+- [x] **Step 4: Commit any stragglers, then report**
 
 Report to the controller: battery numbers (tests/pass/fail/skips), validator JSON, scope stat, and any deviations from this plan (each needs a recorded amendment before it ships).
+
+#### CHECK 5 — THE MERGE-TIME CHECKLIST (a human executes this at PR time; nothing local can stand in for it)
+
+This is check 5 in full, plus the last hop of check 2. Every item needs the hosted runner or the real pull request, so **none of it is simulated and no test in this repo claims any of it.** Work top to bottom; each item says what a PASS looks like, because "it looked fine" is what this cycle spent fifteen rounds removing.
+
+1. **Clear the full-diff scanner finding by hand.** `node tools/scan_touched_suppressions.js` exits 1 on one accepted finding: the deleted `- workflows: ["Validate", "Closeout preview"]` line in `.github/workflows/closeout-gate.yml`. PASS = the run prints `suppression-scan: no marker/config-silencing/test-weakening findings`, then exactly ONE `gate-scan` FAIL line, and that line is byte-identical to the one recorded here apart from `head=`. **A second finding of any kind is a real regression and blocks the merge.**
+2. **Perform the accepted one-time forwarder bootstrap rerun.** The gate's forwarder list now names the demo workflow, and a forwarder cannot retry a workflow it did not know about on the run that introduced it. PASS = the gate is re-run once on the merge head AFTER the forwarder change is present, and the second run forwards the demo retry.
+3. **Exact-head checks.** PASS = every required check is green **on the exact head SHA of the PR**, not on an ancestor. Re-read the SHA from the PR page after the last push; a green check attached to an earlier commit is not evidence about what merges.
+4. **Unresolved review threads.** PASS = zero unresolved threads. A resolved-by-force or hidden thread is not resolved.
+5. **Approval state.** PASS = an approving review that is not dismissed, and no CHANGES_REQUESTED outstanding.
+6. **Hosted demo result.** PASS = `.github/workflows/debug-evidence-demo.yml` completed on the hosted runner and the `strict-refusal` probe reached the ADMISSION REFUSAL (exit 3 from `start`, the wrapped command never executed) rather than an input error. This is the one place the strict default is exercised on the platform it was written for: hosted runners ship a passwordless-sudo rule, so `strict` MUST refuse there. **A demo job that went green under `strict` means the admission check is broken, not that the runner is clean.**
+7. **THE DOWNLOADED ARTIFACT — the last hop of check 2, and the only one that closes it.** Download the `debug-evidence` artifact from the demo run and check, in this order:
+   a. it holds exactly `session.log`, `report.md`, `report.json` — no fourth entry, and no `action-state.json` under any name;
+   b. `sha256` of each of the three equals the matching `name=` field of the `evidence-sha256` line in the **run step's log**;
+   c. the `ADMISSION RECORD` line inside `report.json`'s `caveats` is byte-identical to the one the **start step's log** streamed, and both carry the SAME `invocation=` value;
+   d. the artifact contains neither the session token nor the launch token — grep it for both, taking the session token from nowhere (it is not published; if you cannot obtain it, record that this sub-check was not performed rather than marking it passed).
+   **The local checks stop one hop short of (a)–(d) on purpose. Do not mark check 2 complete until these are done.**
+8. **Only then, PR closeout.**
+
+#### WHAT TASK 9 SHIPPED, AND THE MUTATION THAT PROVED EACH PIECE
+
+Six tests, all in `actions/debug-evidence/support.test.js`, plus the composite harness they share. **Every one was proved in BOTH directions**: green on the tree, and red under a mutation applied to ONE site of a counted anchor and restored byte-for-byte from a snapshot (never `git checkout --`). The ledger is the deliverable, not a footnote — a check nobody has seen fail is not evidence.
+
+| check | proved red by |
+| --- | --- |
+| teardown non-ESRCH → 3 (the queued Task 5 case) | `support.js` teardown: `return 3` → `return 0` after the diagnostic |
+| check 1, composite failure precedence | (a) `report`'s unreadable-staged-report `return 3` → `return 0` — the pure masking case; (b) `finish`'s command-exit mirror → `return 0`; (c) `action.yml`: the `always()` guard deleted from **Apply verdict** |
+| check 2, identity and byte lineage | (a) `admissionCaveats`: `invocation=${nonce}` → a constant; (b) `payloadDigestLine`: hash input `bytes` → `name + bytes` |
+| check 3, secret boundary | `start` persists `launchToken` into `action-state.json` |
+| check 3 (residual), disclosure | the README residual's `follows symlinks, unconditionally` sentence reworded away |
+| check 4, cross-module constants | (a) `EXCERPT_CHAR_CAP` 500 → 400 in `debug_report.js`; (b) `GITHUB_STATE` removed from `RUNNER_COMMAND_FILE_VARS`; (c) an extra key added to `run`'s state commit |
+
+**The composite harness is the part with a future.** `driveCompositeAction` walks the REAL step list out of `action.yml`, evaluates only the two guard shapes the file actually uses (anything else THROWS — a fall-through to `true` would turn a new guard into "always runs"), resolves each step's `env:` expressions and dispatches through `main()`'s own branch table. So the model executes the shipped wiring rather than describing it, which is what mutation (c) on check 1 demonstrates: deleting a guard from `action.yml` changes what runs.
+
+**Check 1 carries its own presence control** — a GREEN drive asserted first, because four cases all asserting `result: 'failure'` would be satisfied by a model hard-wired to fail. Check 3's absence sweeps carry the same: the file walk asserts it found the state file and the staged evidence before asserting the launch token is in neither, and the stripped-variable loop asserts the run step's own process held all five before asserting the child holds none. **Check 1's refusal case proves the wrapped command never ran using a dump file the probe writes as its first act — absent under `strict`, PRESENT in the `best-effort` drive beside it.** That pairing is the control; without it the absence would be the vacuous-guard defect for the seventh time.
+
+**Final-review evidence (item 15's loader, run and NOT committed, per the ruling at `:4326`):** `72` required = `66` ordinary + `3` named + `3` unnamed per-surface; `69` unnamed; `68` claims / `4` retired / `64` forbidden. The suite's own assertions carry `18` disclosure checks and `230` probes. The loader was deleted after the run.
 
 ---
 
