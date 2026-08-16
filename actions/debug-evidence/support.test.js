@@ -11284,11 +11284,21 @@ test('Task 9 check 3: the launch token reaches nothing, and the session credenti
       assert.equal(readFileSync(entry, 'utf8').includes(state.sessionToken), false,
         `${path.basename(entry)} is uploaded, so it must not carry the credential`);
     }
+    // PRESENCE CONTROL for the three sweeps below: an empty output map, an
+    // empty env or an empty summary would each certify themselves clean. Each
+    // is shown to carry its own real content first.
+    assert.ok(drive.startOutputs['invocation-nonce'] && drive.startOutputs['evidence-dir'],
+      'start published its outputs, so sweeping them means something');
+    assert.ok(drive.runOutputs['session-id'] && drive.runOutputs['evidence-digest'],
+      'and so did run');
+    assert.ok(drive.runStepEnv && drive.runStepEnv.DEBUG_ACTION_COLLECTOR_VERIFY_KEY,
+      'the later step\'s environment was captured and is the real one');
     assert.equal(JSON.stringify(drive.startOutputs).includes(state.sessionToken), false,
       'no credential enters a step output');
     assert.equal(JSON.stringify(drive.runOutputs).includes(state.sessionToken), false);
-    assert.equal(readFileSync(path.join(drive.runnerDir, 'github_step_summary'), 'utf8')
-      .includes(state.sessionToken), false, 'nor the job summary');
+    const summary = readFileSync(path.join(drive.runnerDir, 'github_step_summary'), 'utf8');
+    assert.ok(summary.includes('## Debug evidence report'), 'the report step really did publish a summary');
+    assert.equal(summary.includes(state.sessionToken), false, 'and it carries no credential');
     // And it IS handed to the wrapped command — the documented injection, which
     // is what makes every absence above meaningful rather than an artefact of a
     // credential that was never minted in the first place.
