@@ -715,3 +715,77 @@ test('collectContentRemovals does not pair a removal in one file with an additio
     `expected the version removal in package.json to be flagged; got ${JSON.stringify(removals)}`,
   );
 });
+
+const WORKFLOW_RUN_BEFORE = [
+  'on:',
+  '  workflow_run:',
+  '    workflows: ["Validate", "Closeout preview"]',
+  '    types: [completed]',
+  '',
+].join('\n');
+const WORKFLOW_RUN_AFTER = [
+  'on:',
+  '  workflow_run:',
+  '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+  '    types: [completed]',
+  '',
+].join('\n');
+const ACTION_INPUT_BEFORE = [
+  'jobs:',
+  '  x:',
+  '    steps:',
+  '      - uses: example/action@v1',
+  '        with:',
+  '          workflows: ["Validate", "Closeout preview"]',
+  '',
+].join('\n');
+const ACTION_INPUT_AFTER = [
+  'jobs:',
+  '  x:',
+  '    steps:',
+  '      - uses: example/action@v1',
+  '        with:',
+  '          workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+  '',
+].join('\n');
+
+test('collectContentRemovals exempts an order-preserving on.workflow_run.workflows expansion when the parent is proven', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, WORKFLOW_RUN_AFTER);
+  const readFile = () => WORKFLOW_RUN_AFTER;
+  assert.deepEqual(collectContentRemovals(diff, { readFile }), []);
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion without a parent-proving readFile (fail closed)', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, WORKFLOW_RUN_AFTER);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected the unproven workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion under with: (action input, Codex T7 r5)', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', ACTION_INPUT_BEFORE, ACTION_INPUT_AFTER);
+  const readFile = () => ACTION_INPUT_AFTER;
+  const removals = collectContentRemovals(diff, { readFile });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected an action-input workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a workflows: list that reorders or drops a name', async () => {
+  const reordered = [
+    'on:',
+    '  workflow_run:',
+    '    workflows: ["Closeout preview", "Validate", "Debug evidence demo"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, reordered);
+  const removals = collectContentRemovals(diff, { readFile: () => reordered });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a reordered workflows list to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});

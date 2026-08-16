@@ -23,6 +23,7 @@
  */
 
 const { execFileSync } = require('node:child_process');
+const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
@@ -707,12 +708,95 @@ const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
 };
 
 /**
+ * Parse a `workflows: ["A", "B"]` unified-diff line into its indent and name
+ * list. Only the JSON-array spelling is accepted: YAML flow that is not JSON
+ * (single quotes, trailing commas) fails closed rather than being guessed.
+ * @param {string} line unified-diff line starting with `-` or `+`
+ * @returns {{indent: string, names: string[]}|null}
+ */
+const parseWorkflowNameListLine = (line) => {
+  const match = /^[+-](\s*)workflows:\s*(\[[\s\S]*\])\s*$/.exec(line);
+  if (!match) return null;
+  try {
+    const names = JSON.parse(match[2]);
+    if (!Array.isArray(names) || names.length === 0) return null;
+    if (!names.every((name) => typeof name === 'string' && name !== '')) return null;
+    return { indent: match[1], names };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Nearest YAML mapping key whose indent is strictly less than `targetLine`.
+ * Used to prove a `workflows:` list sits under `on.workflow_run` rather than
+ * under an action `with:` input, where adding names can weaken policy.
+ * @param {string} fileText
+ * @param {string} targetLine file line, no +/- prefix
+ * @returns {string|null}
+ */
+const nearestYamlParentKey = (fileText, targetLine) => {
+  const lines = fileText.split(/\r?\n/);
+  const idx = lines.indexOf(targetLine);
+  if (idx < 0) return null;
+  const indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.trim() || /^\s*#/.test(line)) continue;
+    const match = /^(\s*)([A-Za-z0-9_-]+)\s*:/.exec(line);
+    if (!match) continue;
+    if (match[1].length < indent) return match[2];
+  }
+  return null;
+};
+
+/**
+ * True when a removed/added pair is an order-preserving expansion of
+ * `on.workflow_run.workflows` — adding a sibling trigger name without
+ * dropping or reordering the names already there. A line-only `workflows:`
+ * helper cannot prove that parent (the same key under `with:` is an action
+ * input, where adding entries can weaken policy), so this also requires
+ * `readFile(currentFile)` and checks the nearest less-indented key is
+ * `workflow_run`. Missing file, unreadable file, or any other parent fails
+ * closed.
+ * @param {string} removedLine
+ * @param {string} addedLine
+ * @param {string} currentFile
+ * @param {(relPath: string) => string|null|undefined} [readFile]
+ * @returns {boolean}
+ */
+const isSafeWorkflowRunListExpansion = (removedLine, addedLine, currentFile, readFile) => {
+  if (!currentFile.startsWith('.github/workflows/')) return false;
+  if (typeof readFile !== 'function') return false;
+  const removed = parseWorkflowNameListLine(removedLine);
+  const added = parseWorkflowNameListLine(addedLine);
+  if (!removed || !added) return false;
+  if (removed.indent !== added.indent) return false;
+  if (added.names.length <= removed.names.length) return false;
+  for (let i = 0; i < removed.names.length; i += 1) {
+    if (added.names[i] !== removed.names[i]) return false;
+  }
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  let fileText;
+  try {
+    fileText = readFile(currentFile);
+  } catch {
+    return false;
+  }
+  if (typeof fileText !== 'string') return false;
+  return nearestYamlParentKey(fileText, addedLine.slice(1)) === 'workflow_run';
+};
+
+/**
  * Collect substantive removed gate lines from a `--unified=0` diff, pairing
  * each removed (`-`) line with the added (`+`) line at the same position within
  * its hunk. A pure DELETION (no positional replacement) is always collected;
  * a recognized safe replacement (a same-field descriptive value edit, a
- * package.json dependency/script edit, a workflow step rename, or an action
- * pin bump -- see the isSafe* helpers above) is skipped as a benign
+ * package.json dependency/script edit, a workflow step rename, an action
+ * pin bump, or an order-preserving on.workflow_run.workflows expansion --
+ * see the isSafe* helpers above) is skipped as a benign
  * modification. With `--unified=0` each contiguous change is its own hunk
  * whose removed lines all precede its added lines, so index pairing aligns
  * old<->new; hunk/file boundaries flush the pairing buffers so a removed line
@@ -728,9 +812,10 @@ const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
  * UxMW8) -- the same ambiguity pr_closeout_repo.js's prose-gate diff walk
  * already guards against for its own header parsing.
  * @param {string} diff unified diff text (produced with unified=0)
+ * @param {{readFile?: (relPath: string) => string|null|undefined}} [options]
  * @returns {string[]} truncated removed lines that are not safe replacements
  */
-const collectContentRemovals = (diff) => {
+const collectContentRemovals = (diff, { readFile } = {}) => {
   const findings = [];
   let removed = [];
   let added = [];
@@ -750,6 +835,7 @@ const collectContentRemovals = (diff) => {
         || isSafePackageJsonFieldReplacement(line, replacement, currentFile)
         || isSafeWorkflowStepNameReplacement(line, replacement, currentFile)
         || isSafeActionPinReplacement(line, replacement, currentFile)
+        || isSafeWorkflowRunListExpansion(line, replacement, currentFile, readFile)
       )) continue;
       findings.push(line.slice(0, 200));
     }
@@ -803,7 +889,15 @@ const detectGateContentRemovals = (baseSha, gateFiles) => {
   } catch (error) {
     throw new Error(`Failed to read gate diff for content-removal scan: ${error.message}`);
   }
-  return collectContentRemovals(diff);
+  return collectContentRemovals(diff, {
+    readFile: (relPath) => {
+      try {
+        return readFileSync(path.join(root, relPath), 'utf8');
+      } catch {
+        return null;
+      }
+    },
+  });
 };
 
 /**
@@ -942,5 +1036,6 @@ module.exports = {
   isSafePackageJsonFieldReplacement,
   isSafeWorkflowStepNameReplacement,
   isSafeActionPinReplacement,
+  isSafeWorkflowRunListExpansion,
   isMechanicalLockfile,
 };
