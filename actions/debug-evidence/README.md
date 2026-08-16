@@ -202,10 +202,11 @@ sit in that directory is uploaded *by name*.
 `action-state.json` — this invocation's state, including the **session** token (never
 the launch token) — lives at the **root** of the output directory, outside the staging
 child, so no path the upload step enumerates names it. Note the exact shape of that
-claim: it is about the paths, not about the bytes. See
-[Scope, limitations, and residual risks](#scope-limitations-and-residual-risks) for the
-uploader's unconditional symlink following, which is the reason the sentence is written
-that way.
+claim: it is about the paths, not about the bytes. The uploader follows symlinks
+unconditionally, so a substitution inside the staging window can still carry the state
+file's bytes into the archive under an enumerated payload name — see
+[Scope, limitations, and residual risks](#scope-limitations-and-residual-risks), which is
+the reason the sentence is written that way.
 
 The collector's own session log under `<workspace>/.debug/debug-<session-id>.log` is not
 enumerated either, and the same qualification applies to it: no path the upload step

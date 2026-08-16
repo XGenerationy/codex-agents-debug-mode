@@ -5259,24 +5259,33 @@ test('every action output is produced by the run step, and the set is exactly th
 // negation and rejected that same true sentence. A fact stated on two surfaces
 // gets one guard, so the two cannot drift apart again.
 //
-// The construction is INFLECTIONAL, not a negation vocabulary: the reversal an
-// editor writes is "…MAKES hosted execution strict-admissible", and the true
-// sentence is "…does NOT MAKE hosted execution strict-admissible". Requiring
-// the affirmative inflection (`makes`, `does make`, `turns`) separates them
-// without the regex having to know what "not" means. The window tolerates a
-// period followed by a word character, because `kernel.yama.ptrace_scope` is an
-// identifier and not the end of a sentence — the round-1 finding-#2 shape,
-// which had by then recurred three times.
+// AND INFLECTION ALONE WAS THE FOURTH VERSION OF THE SAME DEFECT (Codex T8 r4
+// #1). The 90-character window consumed the negator and then found the
+// affirmative inflection on the far side of it, so this guard REJECTED the true
+// "Hardening the runner NEVER MAKES hosted execution strict-admissible".
+//
+// THE RULING THAT ENDS THE PATTERN: "any window that can cross a clause
+// recreates the semantic problem — keep the guards exact and direct." So there
+// is no window here at all. Each branch is one of the two sentences this
+// repository actually ships, with its negation removed: subject, verb and
+// object adjacent, nothing skippable between them. A negator inserted anywhere
+// inside that span breaks the literal, which is the whole mechanism — no
+// vocabulary of negators, no proximity budget, no judgement about English.
+// The cost is accepted deliberately: a reversal reworded from scratch walks
+// past this guard, and the REQUIRED half is what catches that, because the
+// shipped sentence has to go for the reworded one to take its place.
 const SYSCTL_BUYS_STRICT = new RegExp([
-  // The README's own sentence, reverted.
-  '(?:hardening the runner|the sysctl|sysctl -w kernel\\.yama\\.ptrace_scope=3)'
-    + '(?:[^.]|\\.(?=\\w)){0,90}'
-    + '(?:\\bmakes|\\bdoes make|\\bturns) (?:it|hosted execution|the runner|a hosted runner|hosted runners)'
-    + ' (?:into )?(?:an? )?(?:strict|authenticated)',
-  // Round 7's withdrawn conclusion, in the two forms it was actually written.
+  // The README's own sentence (`README.md`, "Hardening the runner with
+  // `sysctl -w kernel.yama.ptrace_scope=3` does not make hosted execution
+  // strict-admissible"), reverted.
+  'hardening the runner with `?sysctl -w kernel\\.yama\\.ptrace_scope=3`? (?:makes|does make) hosted execution strict',
+  // `action.yml`'s own sentence ("`sysctl -w kernel.yama.ptrace_scope=3` does
+  // NOT turn a hosted runner into an authenticated one"), reverted.
+  '`?sysctl -w kernel\\.yama\\.ptrace_scope=3`? (?:turns|does turn) a hosted runner into an authenticated one',
+  // Round 7's withdrawn conclusion, in the three forms it was actually written.
   'strict is still reachable on (?:a |the )?hosted',
   '(?:must|should|can|may|opt[- ]?in or) harden the runner first',
-  'harden the runner first(?:[^.]|\\.(?=\\w)){0,60}(?:becomes?|is|are) strict',
+  'harden the runner first,? (?:and|then) (?:it|the runner|hosted execution) (?:becomes?|is|are) strict',
 ].join('|'), 'i');
 
 // POLARITY, not vocabulary (Codex T6 r4 #1). The checks above pass on
@@ -5505,7 +5514,16 @@ const PLATFORM_CLAIMS = [
     what: 'that the nonce lets a reader detect a mismatch rather than preventing one',
     where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
     required: /lets a reader detect (?:a|any) mismatch/i,
-    forbidden: /cannot accidentally be paired|cannot be paired with|prevents (?:a |any )?(?:cross-invocation|mismatched) pairing|makes (?:a |any )?mismatch impossible/i,
+    // RETIRED (Codex T8 r4, the retirement ruling). The forbidden proposition
+    // is ITSELF NEGATIVE — "the nonce CANNOT be paired across invocations" —
+    // so there is no affirmative inflection to key on, and the true sentence
+    // is that same proposition BEING DENIED. Distinguishing an asserted
+    // negative from a quoted-and-denied one is not a regex problem, and every
+    // device that bought proximity instead failed in one direction or the
+    // other. Replaced by a POSITIVE DISCLOSURE requirement, named here so that
+    // deleting or renaming the replacement fails the coverage test rather than
+    // silently retiring the protection along with the guard.
+    retired: 'invocation nonce: detects a mismatch, enforces no pairing',
   },
   // Hosted execution stays best-effort, and the round-7 sysctl route is
   // withdrawn: the same passwordless sudo that sets mode 3 opens the BPF
@@ -5533,12 +5551,21 @@ const PLATFORM_CLAIMS = [
   {
     what: 'that runner job cleanup kills the tracked collector on hosted AND self-hosted runners',
     required: /on hosted and self-hosted runners alike/i,
-    forbidden: /hosted runners reap the process tree[^.]{0,60}self-hosted runners rely on this step|self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
+    // The 60-character bridge between the two halves of the false split is
+    // gone (Codex T8 r4 #1): the coordinator is spelled out, so the two
+    // clauses have to be joined the way the retracted sentence joined them
+    // rather than merely co-occurring within a budget.
+    forbidden: /hosted runners? (?:additionally )?reaps? the process tree, (?:while |whereas |and )?(?:a |the )?self-hosted runners? (?:rely on this step|relies on this step|do not|does not)|self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
   },
   {
     what: 'that the idle timeout is not a teardown backstop',
     required: /the collector's idle timeout never terminates the process/i,
-    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
+    // Windowless (Codex T8 r4 #1). The 40-character gap swallowed the negator
+    // and then found the copula on the far side, so this REJECTED the true
+    // "the idle timeout NEVER ACTS AS a teardown backstop" and "…DOES NOT ACT
+    // AS a teardown backstop". The subject now sits adjacent to the verb it is
+    // reversed by, which is the only thing that separates the two.
+    forbidden: /idle timeout (?:is|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
   },
   // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 fixed
   // WHERE the reaping lives and left the contract self-contradictory: the
@@ -5556,8 +5583,10 @@ const PLATFORM_CLAIMS = [
     // true "the always() step covers a preceding step failing, not the
     // runner dying"; the two-directional probe caught it before it shipped.
     // The retracted sentence itself is caught by the claim below, where it
-    // belongs.
-    forbidden: /always\(\) (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
+    // belongs. Windowless since T8 r4 #1: the three gaps let a negator sit
+    // between the subject and its verb, so "the always() step NEVER RUNS when
+    // the runner process dies" — this claim, stated — was rejected.
+    forbidden: /always\(\) (?:step|guard) (?:still )?(?:runs|executes) (?:even |still )?(?:if|when|whether or not|regardless of whether|no matter whether) the runner (?:process )?(?:dies|died|is gone|has died)/i,
   },
   {
     what: 'that runner death defeats both backstops',
@@ -5566,7 +5595,10 @@ const PLATFORM_CLAIMS = [
     // to the predicate: "runner death is NOT the case the always() step
     // covers" and "a dead runner is NOT handled by the always() step" are the
     // sentences this claim asserts, and the pin rejected both of them.
-    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}\bis (?:exactly |precisely )?(?:this|the) case (?:this|the) always\(\) step covers|runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}which (?:this|the) always\(\) step covers|(?:is|are) (?:covered|handled) by (?:this|the) always\(\) step/i,
+    // Windowless since T8 r4 #1: the 45-character gaps were the same escape
+    // in the other direction, so the relative clause the retracted sentence
+    // actually used is written out instead of budgeted for.
+    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death),? which is (?:exactly |precisely )?(?:this|the) case (?:this|the) always\(\) step covers|runner (?:process )?(?:itself )?(?:died|dies|dying|death) is (?:exactly |precisely )?(?:this|the) case (?:this|the) always\(\) step covers|(?:is|are) (?:covered|handled) by (?:this|the) always\(\) step/i,
   },
   // THE UPLOAD CLAIM IS ABOUT PATH NAMES, NEVER BYTES — pinned on these
   // surfaces because it has now needed correcting FOUR times across two
@@ -5580,15 +5612,21 @@ const PLATFORM_CLAIMS = [
     what: 'that the state file is excluded by path NAME, not by byte-level prevention',
     where: ['action.yml comments', 'support.js comments'],
     required: /no enumerated path names it/i,
-    // The 160-character window swallowed the DENIAL of the over-claim (T8 r3):
+    // RETIRED (Codex T8 r4, the retirement ruling), same shape as the nonce
+    // above and the two README claims below. Binding the subject tight bought
+    // proximity, which held only because nobody had yet written the denial in
+    // the tight form; the 160-character window before it had already rejected
     // "no enumerated path names the state file, which is not the same as
-    // saying it cannot reach the artifact" is the distinction this claim
-    // exists to draw, and the pin rejected it. This is the one shape adjacent
-    // copula cannot help with — the forbidden proposition is itself negative —
-    // so the subject is bound TIGHT to its predicate instead: an asserted
-    // "the state file cannot reach the artifact" fires, a sentence that
-    // mentions the phrase in order to deny it does not.
-    forbidden: /(?:state file|`?action-state\.json`?)(?: itself)? (?:cannot|can never) reach the (?:artifact|archive)|(?:state file|action-state\.json)[^.]{0,160}(?:no path (?:here |in this list )?can reach it|must never be uploaded|can never be uploaded)/i,
+    // saying it cannot reach the artifact" — the exact distinction this claim
+    // exists to draw.
+    //
+    // AND THE ARGUMENT THAT BEHAVIOURAL TESTS SUFFICE WAS WRONG: "behavioural
+    // tests establish what the code does; they cannot stop consumer prose from
+    // contradicting it." The symlink test proves the uploader follows links; it
+    // does nothing to stop this file promising the opposite. So the replacement
+    // is not the behavioural test — it is a named positive disclosure that both
+    // halves must still be published on both surfaces.
+    retired: 'state file: no enumerated path names it, and symlink substitution can carry its bytes (action.yml and support.js)',
   },
   // The same two descriptions as the README pins, on the surface GitHub
   // actually renders to a consumer who never opens this file.
@@ -5611,6 +5649,25 @@ const PLATFORM_CLAIMS = [
     forbidden: /(?:output-dir|it|this directory|the directory|the staging (?:root|directory)) becomes the artifact/i,
   },
 ];
+
+// THE THREE NON-README SURFACES, extracted once. They have three different
+// audiences — the comments are read by whoever edits the wiring, the
+// descriptions are the copy GitHub renders to a consumer who never opens the
+// file, and support.js is where the behaviour actually lives — and both the
+// polarity pins and the retired claims' replacement disclosures have to read
+// the same three, or a fact could vanish from one while another kept the
+// assertion green (the round-7 shape, Codex T6 r8 #4).
+const platformSurfaces = () => {
+  const flow = (text, prefix) => text.split(/\r?\n/)
+    .filter((line) => line.trim().startsWith(prefix))
+    .map((line) => line.trim().slice(prefix.length).trim())
+    .join(' ');
+  return {
+    'action.yml comments': flow(ACTION_YML(), '#'),
+    'action.yml input/output descriptions': actionDescriptionText(),
+    'support.js comments': flow(readFileSync(path.join(__dirname, 'support.js'), 'utf8'), '//'),
+  };
+};
 
 test('action.yml states the scope of its integrity guarantee rather than overclaiming', () => {
   // Flowed into one string: these notes wrap across lines, so a phrase can sit
@@ -5648,15 +5705,9 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   // are read by whoever edits the wiring, the descriptions are the copy GitHub
   // renders to a consumer who never opens the file, and support.js is where
   // the behaviour actually lives.
-  const flow = (text, prefix) => text.split(/\r?\n/)
-    .filter((line) => line.trim().startsWith(prefix))
-    .map((line) => line.trim().slice(prefix.length).trim())
-    .join(' ');
-  const surfaces = {
-    'action.yml comments': flow(ACTION_YML(), '#'),
-    'action.yml input/output descriptions': actionDescriptionText(),
-    'support.js comments': flow(readFileSync(path.join(__dirname, 'support.js'), 'utf8'), '//'),
-  };
+  // Built by the shared extractor, so the retired claims' replacement
+  // disclosures below read exactly the same three surfaces this test does.
+  const surfaces = platformSurfaces();
   for (const [name, text] of Object.entries(surfaces)) {
     assert.ok(text.length > 400, `${name}: the surface extractor found nothing to check`);
   }
@@ -5668,7 +5719,10 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     }
     // Its reversal is forbidden EVERYWHERE. A claim that is only required of
     // one surface can still be contradicted on another, and a contradiction
-    // anywhere in the shipped text is the failure this pins.
+    // anywhere in the shipped text is the failure this pins. A RETIRED claim
+    // has no reversal to forbid — its replacement is the named positive
+    // disclosure the coverage test binds it to.
+    if (!claim.forbidden) continue;
     for (const [name, text] of Object.entries(surfaces)) {
       assert.doesNotMatch(text, claim.forbidden, `${name} must not reverse ${claim.what}`);
     }
@@ -8904,7 +8958,9 @@ const README_CLAIMS = [
     what: 'that the verdict is the run step exit code, not an output',
     section: SECTION_OUTPUTS,
     required: /the verdict is the run step's exit code/i,
-    forbidden: /digest[^.]{0,30}is the (?:trust anchor|authoritative copy)/i,
+    // Windowless (Codex T8 r4 #1): a 30-character gap between the subject and
+    // the copula is enough to reach the predicate over a negation.
+    forbidden: /digest(?: line| output)? is the (?:trust anchor|authoritative copy)/i,
   },
   // TWO DESCRIPTIONS THAT PROMISED MORE THAN THE CODE DELIVERS (Codex T8 r1
   // #4). `resolveEvidenceDir` and the `report-path` assignment both use
@@ -8990,7 +9046,17 @@ const README_CLAIMS = [
     what: 'the diagnostic prefix and its step provenance',
     section: SECTION_LOGS,
     required: /debug-evidence-action: <step>: <text>[^|]*\| stderr \|/,
-    forbidden: new RegExp(`${SUBJECT_LEADS}(?:the )?prefix (?:tells|says|shows|distinguishes)[^.]{0,60}(?:strict|best-effort)`, 'i'),
+    // Windowless (Codex T8 r4 #1). The 60-character gap after the verb was the
+    // familiar escape in its worst form here, because the object of the verb is
+    // where the negation lives: "the prefix TELLS YOU NOTHING ABOUT strict or
+    // best-effort" and "the prefix SAYS NOTHING ABOUT whether the run was
+    // strict" are both this claim, and both were rejected. What follows the
+    // verb is now spelled out.
+    forbidden: new RegExp([
+      `${SUBJECT_LEADS}(?:the )?prefix (?:tells you|says|shows|indicates|signals|marks) (?:whether|if) (?:the run|the record|it|this) (?:was|is) (?:strict|best-effort)`,
+      `${SUBJECT_LEADS}(?:the )?prefix (?:distinguishes|separates) (?:strict|best-effort)`,
+      `${SUBJECT_LEADS}(?:the )?prefix (?:tells you|says|shows|indicates|signals|marks) (?:the |which )?regime`,
+    ].join('|'), 'i'),
   },
   {
     what: 'that the regime is distinguished inside the record, not by the prefix',
@@ -9020,7 +9086,18 @@ const README_CLAIMS = [
   {
     what: 'that report.md is escaped and capped while report.json is the comparable copy',
     section: SECTION_LOGS,
-    required: /The copies are not\s*byte-identical across surfaces/i,
+    // THE POSITIVE HALF WAS TOO WEAK TO CARRY THE CLAIM'S NAME (Codex T8 r4
+    // #3). "The copies are not byte-identical across surfaces" proves only
+    // that they differ — delete the two fidelity rows and the claim stays
+    // green while the README no longer says which copy is comparable. Both
+    // facts are pinned directly now: `report.json` is the verbatim, uncapped
+    // copy to compare against, and `report.md` is escaped and capped. The cap
+    // comes from the renderer rather than a literal, so the two cannot drift.
+    required: new RegExp([
+      'The copies are not byte-identical across surfaces',
+      '\\|\\s*`report\\.json`[^|]*\\|\\s*\\*\\*Verbatim, uncapped\\.\\*\\*\\s*This is the copy to compare against\\.',
+      `\\|\\s*\`report\\.md\`[^|]*\\|\\s*Markdown-\\*\\*escaped\\*\\* and capped at ${EXCERPT_CHAR_CAP} characters per caveat`,
+    ].join('[\\s\\S]{0,400}'), 'i'),
     // THE SECOND BLIND GUARD THIS ROUND'S AUDIT FOUND. The window was
     // `[^|]{0,60}`, chosen so a match could not run across a table cell — but
     // the fidelity TABLE is exactly where this reversal would land, and `|`
@@ -9038,19 +9115,29 @@ const README_CLAIMS = [
     // "not" stopped the window before it reached the reversal. A vocabulary of
     // negators cannot be completed, so this half does not try to hold one.
     //
-    // Three narrow branches, each the shape a reverting editor actually
-    // produces. (a) THE FIDELITY TABLE ROW, where subject and fidelity are
-    // separated by a cell boundary, so exactly one `|` may be crossed and the
-    // affirmative must OPEN the next cell — today that cell opens
-    // "Markdown-**escaped**". (b) THE SAME REVERSAL IN PROSE, with the copula
-    // ADJACENT to its predicate, which is what separates "is verbatim" (and
-    // "is not escaped but IS verbatim") from "is NOT verbatim" and "CANNOT be
-    // treated as verbatim" without naming a single negator. (c) THE
-    // INSTRUCTION reversed into a directive, caught in affirmative sentence
-    // position, so "never compare…" and "you cannot compare…" both pass.
+    // AND THE THREE "NARROW" BRANCHES THAT REPLACED IT WERE THE SAME TRAP AGAIN
+    // (Codex T8 r4 #1): the prose branch's 40-character window consumed the
+    // denial and reached the predicate anyway, so it REJECTED the true
+    // "`report.md` NEVER CLAIMS that it is verbatim". Under the round-4 ruling
+    // — "any window that can cross a clause recreates the semantic problem" —
+    // no branch here has a window at all.
+    //
+    // Four direct forms, each the shape a reverting editor actually produces.
+    // (a) THE FIDELITY TABLE ROW, spelled out: the row this README ships, with
+    // its fidelity cell reversed. (b) THE SAME REVERSAL IN PROSE, copula
+    // ADJACENT to the subject, which is what separates "`report.md` is
+    // verbatim" from "is NOT verbatim", "CANNOT be treated as verbatim" and
+    // "NEVER CLAIMS THAT IT is verbatim" without naming a single negator.
+    // (c) THE CONTRASTIVE REVERSAL, "…is not escaped but is verbatim", written
+    // out rather than approximated with a gap: the negated conjunct is a fixed
+    // vocabulary, so no free text sits between the subject and the affirmative,
+    // and no second subject can slip in. (d) THE INSTRUCTION reversed into a
+    // directive, caught in affirmative sentence position, so "never compare…"
+    // and "you cannot compare…" both pass.
     forbidden: new RegExp([
-      '`report\\.md`[^|.]{0,40}\\|[ *_]*(?:verbatim|uncapped)',
-      '`?report\\.md`?[^.|]{0,40} (?:is|are|remains?|stays?) (?:\\*\\*|__)*(?:the )?(?:verbatim|uncapped|comparison surface|comparable copy|copy to compare)',
+      '\\|[ *_]*`report\\.md`(?: \\(and the Step Summary\\))?[ *_]*\\|[ *_]*(?:verbatim|uncapped)',
+      '`?report\\.md`?(?: \\(and the Step Summary\\))? (?:is|are|remains?|stays?) (?:\\*\\*|__)*(?:the )?(?:verbatim|uncapped|comparison surface|comparable copy|copy to compare)',
+      '`?report\\.md`? is (?:not|never) (?:escaped|capped)(?: (?:and|or) (?:not |never )?(?:escaped|capped))* but is (?:still )?(?:\\*\\*|__)*(?:verbatim|uncapped)',
       `${SUBJECT_LEADS}compare (?:the copies|them) against \`?report\\.md\`?`,
     ].join('|'), 'i'),
   },
@@ -9059,7 +9146,10 @@ const README_CLAIMS = [
     what: 'the unset-rather-than-empty PATH remediation',
     section: SECTION_TRUST,
     required: /unset `PATH` rather than emptying it/i,
-    forbidden: /`?PATH=""`?[^.]{0,60}(?:is fine|is safe|clears|counts as absent)|(?:set|setting) `?PATH`? to (?:an )?empty (?:string )?(?:is|to) (?:fine|safe|equivalent)/i,
+    // Windowless (Codex T8 r4 #1): with a 60-character gap this rejected the
+    // true "`PATH=\"\"` NEVER COUNTS AS ABSENT" and "…NEVER CLEARS it". The
+    // second branch never had a gap and is unchanged.
+    forbidden: /`?PATH=""`? (?:is fine|is safe|clears|counts as absent)|(?:set|setting) `?PATH`? to (?:an )?empty (?:string )?(?:is|to) (?:fine|safe|equivalent)/i,
   },
   {
     what: 'that only an ABSENT PATH means conventional locations only',
@@ -9104,10 +9194,12 @@ const README_CLAIMS = [
     // but was never bound to "entries", so it rejected the correct sentence
     // instead. The required half above already pins the positive rule exactly,
     // so this half only has to catch the REVERSAL: identity-based dedup, or
-    // distinct spellings collapsing to one.
+    // distinct spellings collapsing to one. Windowless since T8 r4 #1 — the
+    // 40-character gap before `count once` reached the predicate across "are
+    // not merged, so they never", which is this claim rather than its reversal.
     forbidden: new RegExp([
-      `(?:(?:is|are|was|were) (?:dedup\\w+|collapsed|merged|normalis\\w+|normaliz\\w+)|${SUBJECT_LEADS}deduplicate)[^.]{0,20}\\bby (?:\`?realpath\`?|inode)`,
-      '(?:spellings?|candidates?)[^.]{0,60}resolv\\w+ to the same (?:file|binary|inode)[^.]{0,40}count(?:s|ed)? (?:only )?once',
+      `(?:(?:is|are|was|were) (?:dedup\\w+|collapsed|merged|normalis\\w+|normaliz\\w+)|${SUBJECT_LEADS}deduplicate) by (?:\`?realpath\`?|inode)`,
+      '(?:spellings?|candidates?) resolv\\w+ to the same (?:file|binary|inode) count(?:s|ed)? (?:only )?once',
       'count is distinct (?:binaries|inodes)',
     ].join('|'), 'i'),
   },
@@ -9187,10 +9279,16 @@ const README_CLAIMS = [
     // post-colon order alone meant "`action-state.json` is not uploaded by this
     // action" — subject FIRST, the ordinary way anyone writes it — matched no
     // alternative at all, and that is the exact categorical overclaim: the
-    // uploader follows symlinks, so only "not uploaded BY NAME" is true. The
-    // completion is what carries the polarity here, so the new branch is bound
-    // to `by this action` and lets `by name` through.
-    forbidden: /the state file cannot reach the artifact|`?action-state\.json`? can never be uploaded|\bnot uploaded by this action[^.]{0,30}(?:state file|action-state|collector(?:['’]s)? (?:own )?(?:session )?log)|(?:state file|`?action-state\.json`?|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) not uploaded by (?:this|the) action|(?:state file|action-state\.json|collector(?:['’]s)? (?:own )?(?:session )?log)[^.]{0,70}(?:is|are) never uploaded/i,
+    // uploader follows symlinks, so only "not uploaded BY NAME" is true.
+    //
+    // RETIRED (Codex T8 r4, the retirement ruling). Three rounds of repair
+    // produced three versions of one defect on this single claim, for the
+    // structural reason named above: the forbidden proposition is itself
+    // negative, so the regression and this README's own qualification are the
+    // same words in opposite moods. The replacement is a named positive
+    // disclosure — the path-name half AND the bytes half, both still published
+    // — because a behavioural test cannot stop this README contradicting it.
+    retired: 'state file: no enumerated path names it, and symlink substitution can carry its bytes (README)',
   },
   // The same claim as it reaches a reader of the EXIT TAXONOMY, where the
   // over-claim actually shipped. The signal name is absent from what the
@@ -9202,9 +9300,15 @@ const README_CLAIMS = [
     // The 90-character window swallowed the qualifier this claim turns on
     // (T8 r3): "…but that is not the same as saying it cannot leave the
     // runner" is the distinction, and the window reached the predicate anyway.
-    // Bound tight, as with the state file — a negative proposition has no
-    // affirmative inflection to key on, so proximity is the only honest test.
-    forbidden: /nothing that leaves the runner (?:tells|reveals|names|shows|can reveal)|signal name(?: itself)? (?:cannot|can never|could never) leave the runner/i,
+    //
+    // RETIRED (Codex T8 r4, the retirement ruling). Binding it tight bought
+    // proximity rather than polarity: "the signal name cannot leave the runner"
+    // is the regression, and the same clause quoted in order to deny it is this
+    // section's own sentence. Replaced by a named positive disclosure carrying
+    // BOTH halves — absent from normal rendered evidence, AND able to leave
+    // through substituted state bytes — since the residual sweep checks generic
+    // symlink following, not this consequence being protected.
+    retired: 'signal name: absent from rendered evidence, and able to leave through substituted state bytes',
   },
   // THE TEARDOWN CONTRACT (Codex T8 r1 #2). The hosted/self-hosted split this
   // section used to draw was a category error: RUNNER_TRACKING_ID is exported
@@ -9215,13 +9319,17 @@ const README_CLAIMS = [
     what: 'that runner job cleanup also kills the tracked collector on hosted AND self-hosted runners',
     section: SECTION_SELF_HOSTED,
     required: /normal runner job cleanup also attempts to kill the tracked\s*collector, on hosted and\s*self-hosted runners alike/i,
-    forbidden: /hosted runners? (?:additionally )?reaps?[^.]{0,60}self-hosted runner does not|(?:a |the )?self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
+    // As on the `action.yml` surface (T8 r4 #1): the bridge between the two
+    // halves of the false split is written out rather than budgeted for.
+    forbidden: /hosted runners? (?:additionally )?reaps? the process tree, (?:while |whereas |and )?(?:a |the )?self-hosted runners? (?:rely on this step|relies on this step|do not|does not)|(?:a |the )?self-hosted runners? (?:do|does) not reap|reaping is (?:a )?hosted(?:-image)? behaviour/i,
   },
   {
     what: 'that the collector idle timeout never terminates the process',
     section: SECTION_SELF_HOSTED,
     required: /the collector's idle timeout never terminates the process/i,
-    forbidden: /idle timeout[^.]{0,40}(?:is|as|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
+    // As on the `action.yml` surface (T8 r4 #1): windowless, so "the idle
+    // timeout NEVER ACTS AS a teardown backstop" reads as the assertion it is.
+    forbidden: /idle timeout (?:is|acts as|serves as) (?:a |the )?(?:teardown )?backstop|idle timeout (?:eventually )?(?:exits|terminates|kills|stops) the (?:collector(?:['’]s)? )?process/i,
   },
   // AND THE TWO BACKSTOPS ARE INDEPENDENT (Codex T8 r2 #1). Round 1 corrected
   // WHERE the reaping lives and left the contract contradicting itself: this
@@ -9241,8 +9349,9 @@ const README_CLAIMS = [
     // the two topics' co-occurrence instead rejected the true sentence "the
     // `always()` step covers a preceding step failing, not the runner dying",
     // which the two-directional probe caught before it shipped. The retracted
-    // sentence is caught by the claim below, where it belongs.
-    forbidden: /`?always\(\)`? (?:step|guard)[^.]{0,40}(?:runs|executes)[^.]{0,25}(?:even if|regardless of|no matter|whether or not|if|when)[^.]{0,12}the runner (?:process )?(?:dies|died|is gone|has died)/i,
+    // sentence is caught by the claim below, where it belongs. Windowless
+    // since T8 r4 #1, as on the `action.yml` surface.
+    forbidden: /`?always\(\)`? (?:step|guard) (?:still )?(?:runs|executes) (?:even |still )?(?:if|when|whether or not|regardless of whether|no matter whether) the runner (?:process )?(?:dies|died|is gone|has died)/i,
   },
   {
     what: 'that runner death defeats both backstops',
@@ -9252,7 +9361,8 @@ const README_CLAIMS = [
     // the DENIALS through to the predicate, so "runner death is NOT the case
     // the `always()` step covers" and "a dead runner is NOT handled by the
     // `always()` step" — both of them this claim, stated — were rejected.
-    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death)[^.]{0,45}\bis (?:exactly |precisely )?the case the `?always\(\)`? step[^.]{0,10}covers|(?:is|are) (?:covered|handled) by the `?always\(\)`? step/i,
+    // Windowless since T8 r4 #1, as on the `action.yml` surface.
+    forbidden: /runner (?:process )?(?:itself )?(?:died|dies|dying|death),? which is (?:exactly |precisely )?the case the `?always\(\)`? step covers|runner (?:process )?(?:itself )?(?:died|dies|dying|death) is (?:exactly |precisely )?the case the `?always\(\)`? step covers|(?:is|are) (?:covered|handled) by the `?always\(\)`? step/i,
   },
 ];
 
@@ -9283,6 +9393,10 @@ test('the action README states each hard requirement in the required form, and n
   for (const claim of README_CLAIMS) {
     assert.match(sections.get(claim.section), claim.required,
       `the '${claim.section}' section must state ${claim.what}`);
+    // A RETIRED claim keeps its required half and drops the reversal sweep —
+    // its protection is the named positive disclosure the coverage test binds
+    // it to, not a regex trying to decide a negative proposition.
+    if (!claim.forbidden) continue;
     for (const [name, text] of Object.entries(surfaces)) {
       assert.doesNotMatch(text, claim.forbidden, `${name} must not reverse ${claim.what}`);
     }
@@ -9314,6 +9428,25 @@ test('the action README states each hard requirement in the required form, and n
 // Keyed `${table}:${what}`, and the test below fails on a claim with no controls
 // or a control with no claim — so a claim added later cannot skip the check, and
 // a renamed claim cannot silently orphan the probes that proved it.
+//
+// THE BOUNDARY OF THE MECHANISM, STATED RATHER THAN DISCOVERED IN A SIXTH ROUND.
+// Round 4's ruling — "any window that can cross a clause recreates the semantic
+// problem; keep the guards exact and direct" — has been applied to all 64 live
+// guards: NONE of them now contains a `{0,N}` gap, so no negator can sit between
+// a guard's anchor and its predicate. What that buys is exactly one thing: a
+// denial written INLINE, the way an editor actually writes one ("never makes",
+// "does not act as", "tells you nothing about"), can no longer be mistaken for
+// the assertion it denies.
+//
+// What it does NOT buy, and cannot: 61 of the 64 also match their own regression
+// QUOTED INSIDE A DENIAL — "it is not true that <regression>", "the claim that
+// <regression> was retracted". A substring match cannot tell an asserted
+// sentence from a mentioned one, and widening or anchoring further only trades
+// that for missing real reversals. The three exceptions are the guards already
+// anchored to a sentence or cell start, and they are exceptions by accident of
+// what they had to pin, not by design. So: these guards catch INLINE reversals
+// of the exact sentences this repository ships. They do not adjudicate English,
+// and a surface that wants to discuss a retracted claim has to paraphrase it.
 const POLARITY_CONTROLS = new Map([
   ['scope:the same-job limitation', {
     accepts: [
@@ -9527,21 +9660,17 @@ const POLARITY_CONTROLS = new Map([
       'The action verifies that the copies match.',
     ],
   }],
-  ['platform:that the nonce lets a reader detect a mismatch rather than preventing one', {
-    accepts: [
-      'The nonce does not prevent a mismatched pairing.',
-      'It cannot make a mismatch impossible.',
-      'Two records can accidentally be paired across invocations.',
-    ],
-    rejects: [
-      'The nonce prevents a cross-invocation pairing.',
-    ],
-  }],
   ['platform:that hosted execution stays best-effort', {
     accepts: [
       'sysctl -w kernel.yama.ptrace_scope=3 does not make hosted execution strict-admissible.',
       'No sysctl makes hosted execution strict.',
       'Strict is not still reachable on a hosted runner after hardening.',
+      // THE COUNTEREXAMPLE THAT RETIRED AFFIRMATIVE INFLECTION (Codex T8 r4
+      // #1): the 90-character window consumed `never` and then found `makes`
+      // on the far side of it. Tracked here so the fix is proved rather than
+      // argued.
+      'Hardening the runner never makes hosted execution strict-admissible.',
+      'Hardening the runner with sysctl -w kernel.yama.ptrace_scope=3 never makes hosted execution strict-admissible.',
     ],
     rejects: [
       'Hardening the runner with sysctl -w kernel.yama.ptrace_scope=3 makes hosted execution strict-admissible.',
@@ -9552,6 +9681,7 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'Self-hosted runners do reap the tracked process tree.',
       'Reaping is not a hosted-image behaviour.',
+      'Hosted runners reap the process tree, and it is not the case that self-hosted runners rely on this step.',
     ],
     rejects: [
       'Self-hosted runners do not reap the process tree.',
@@ -9561,6 +9691,9 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The idle timeout is not a teardown backstop.',
       'The idle timeout never exits the process.',
+      // The 40-character window reached `acts as` over both of these (T8 r4).
+      'The idle timeout never acts as a teardown backstop.',
+      'The idle timeout does not act as a teardown backstop.',
     ],
     rejects: [
       'The idle timeout acts as a teardown backstop.',
@@ -9571,6 +9704,7 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The always() step covers a preceding step failing, not the runner dying.',
       'The always() step does not run if the runner process dies.',
+      'The always() step never runs when the runner process dies.',
     ],
     rejects: [
       'The always() step runs even if the runner process dies.',
@@ -9583,15 +9717,6 @@ const POLARITY_CONTROLS = new Map([
     ],
     rejects: [
       'The runner process died, which is the case the always() step covers.',
-    ],
-  }],
-  ['platform:that the state file is excluded by path NAME, not by byte-level prevention', {
-    accepts: [
-      'The state file is not uploaded by name, but its bytes can still reach the archive through a symlink.',
-      'No enumerated path names the state file, which is not the same as saying it cannot reach the artifact.',
-    ],
-    rejects: [
-      'The state file must never be uploaded.',
     ],
   }],
   ['platform:that report-path is absolute only when output-dir is', {
@@ -9660,6 +9785,7 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The digest is not the trust anchor.',
       'The evidence-digest output is never the authoritative copy.',
+      'The digest is one part; nothing is the trust anchor.',
     ],
     rejects: [
       'The digest is the trust anchor.',
@@ -9760,6 +9886,10 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The prefix does not tell you whether the run was strict or best-effort.',
       'Nothing in the prefix distinguishes strict from best-effort.',
+      // The object of the verb is where the negation lives here, so the
+      // 60-character window after it was the worst case of the T8 r4 shape.
+      'The prefix tells you nothing about strict or best-effort.',
+      'The prefix says nothing about whether the run was strict.',
     ],
     rejects: [
       'The prefix tells you whether the run was strict or best-effort.',
@@ -9799,6 +9929,11 @@ const POLARITY_CONTROLS = new Map([
       '`report.md` is escaped and capped, never verbatim.',
       'Never compare the copies against `report.md`.',
       'You cannot compare the copies against `report.md`.',
+      // THE COUNTEREXAMPLE THAT RETIRED THE TEMPERED WINDOW HERE TOO (Codex
+      // T8 r4 #1): the 40-character gap consumed the denial and then reached
+      // `is verbatim`.
+      '`report.md` never claims that it is verbatim.',
+      '`report.md` never claims to be the copy to compare against.',
     ],
     rejects: [
       '`report.md` is verbatim, uncapped.',
@@ -9811,6 +9946,8 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       '`PATH=""` is not safe, and it does not count as absent.',
       'Setting `PATH` to an empty string is never equivalent to unsetting it.',
+      '`PATH=""` never counts as absent.',
+      '`PATH=""` never clears the variable.',
     ],
     rejects: [
       '`PATH=""` is fine.',
@@ -9848,6 +9985,7 @@ const POLARITY_CONTROLS = new Map([
       '`/a/sudo` and `/b/sudo` are 2, regardless of filesystem identity.',
       'There is no `realpath`, and no inode comparison.',
       'Candidates are not deduplicated by inode.',
+      'Two distinct candidate spellings resolving to the same file are not merged, so they never count once.',
     ],
     rejects: [
       'Two distinct candidate spellings resolving to the same file count once.',
@@ -9892,35 +10030,11 @@ const POLARITY_CONTROLS = new Map([
       'A stripped environment is safer.',
     ],
   }],
-  ['readme:that the state file is excluded by PATH, not by byte-level prevention', {
-    accepts: [
-      '`action-state.json` is not uploaded by name.',
-      'The state file is not uploaded by name, but its bytes can still reach the archive.',
-      'A checkout’s `package-lock.json` is not uploaded by this action.',
-      'The state file can reach the artifact through a symlink.',
-    ],
-    rejects: [
-      '`action-state.json` is not uploaded by this action.',
-      'The state file is not uploaded by this action.',
-      'Not uploaded by this action: the collector’s own session log.',
-      'The state file cannot reach the artifact.',
-      'The state file is never uploaded.',
-    ],
-  }],
-  ['readme:that the signal name is absent from rendered evidence rather than unable to leave the runner', {
-    accepts: [
-      'The signal name is absent from normal rendered evidence, but it is not categorically unable to leave the runner.',
-      'The signal name is absent from normal rendered evidence, but that is not the same as saying it cannot leave the runner.',
-      'The signal name can leave the runner through a symlinked payload.',
-    ],
-    rejects: [
-      'The signal name cannot leave the runner.',
-    ],
-  }],
   ['readme:that runner job cleanup also kills the tracked collector on hosted AND self-hosted runners', {
     accepts: [
       'A self-hosted runner does reap the tracked collector.',
       'Reaping is not a hosted-image behaviour.',
+      'Hosted runners reap, and it is not the case that a self-hosted runner does not.',
     ],
     rejects: [
       'A self-hosted runner does not reap.',
@@ -9930,6 +10044,8 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The idle timeout is not a teardown backstop.',
       'The idle timeout never terminates the process.',
+      'The idle timeout never acts as a teardown backstop.',
+      'The idle timeout does not act as a teardown backstop.',
     ],
     rejects: [
       'The idle timeout eventually exits the collector process.',
@@ -9940,6 +10056,7 @@ const POLARITY_CONTROLS = new Map([
     accepts: [
       'The `always()` step covers a preceding step failing, not the runner dying.',
       'The `always()` step does not run when the runner process dies.',
+      'The `always()` step never runs when the runner process dies.',
     ],
     rejects: [
       'The `always()` step runs even if the runner process dies.',
@@ -9956,20 +10073,132 @@ const POLARITY_CONTROLS = new Map([
   }],
 ]);
 
+// WHAT REPLACES A RETIRED GUARD (Codex T8 r4, the retirement ruling).
+//
+// Four claims had a forbidden proposition that is ITSELF NEGATIVE — "the state
+// file cannot reach the artifact", "the signal name cannot leave the runner",
+// "the nonce cannot be paired across invocations". There is no affirmative
+// inflection to key on, because the regression IS a negative sentence, and the
+// true statement is that same sentence being denied. Their forbidden halves are
+// gone.
+//
+// THE ARGUMENT FOR RETIRING THEM WAS ACCEPTED; THE ARGUMENT OFFERED WITH IT WAS
+// NOT, AND THE CORRECTION IS THE POINT: "behavioural tests establish what the
+// code does; they cannot stop consumer prose from contradicting it." The
+// symlink test proves the uploader follows links. Nothing in it stops the README
+// asserting the opposite — and the residual sweep below checks generic symlink
+// following and human comparison, NOT each consequence being protected. So each
+// retirement is paid for with an explicit POSITIVE DISCLOSURE: both halves of
+// the honest claim, required by name on every surface that carries it.
+//
+// These are presence checks, so they can only fail by the fact disappearing —
+// there is no polarity to get wrong and no window to cross. Each retired claim
+// names its replacement, and the coverage test binds the two together in both
+// directions, so deleting the disclosure, renaming it, or retiring a guard
+// against a replacement that does not exist all fail there. A retirement that
+// can be silently deleted is not a retirement.
+const POSITIVE_DISCLOSURES = new Map([
+  ['state file: no enumerated path names it, and symlink substitution can carry its bytes (action.yml and support.js)', {
+    surfaces: () => platformSurfaces(),
+    where: ['action.yml comments', 'support.js comments'],
+    must: [
+      ['the path-name half', /no enumerated path names it/i],
+      // Worded differently on the two surfaces — action.yml names the swap
+      // ("replacing session.log with a link to ../action-state.json"),
+      // support.js names the window — so one alternation covers both rather
+      // than two half-checked surfaces.
+      // The bridge is `[\s\S]`, not `[^.]`: both sentences name `session.log`
+      // and `../action-state.json`, whose dots are identifiers rather than
+      // sentence ends — the round-1 finding-#2 shape, which cost this file
+      // three rounds elsewhere. A presence check cannot reject a true
+      // statement, so a permissive bridge here is free.
+      ['the bytes half', /symlinks unconditionally[\s\S]{0,200}(?:puts the state bytes|put these bytes) into the archive/i],
+    ],
+  }],
+  ['state file: no enumerated path names it, and symlink substitution can carry its bytes (README)', {
+    surfaces: () => ({ 'the evidence artifact section': readmeSections(ACTION_README()).get(SECTION_ARTIFACT) }),
+    where: ['the evidence artifact section'],
+    must: [
+      ['the path-name half', /no path the upload step enumerates names it/i],
+      ['the bytes half', /the uploader follows symlinks\s*unconditionally[\s\S]{0,200}carry the state\s*file's bytes into the archive under an enumerated payload name/i],
+    ],
+  }],
+  ['signal name: absent from rendered evidence, and able to leave through substituted state bytes', {
+    surfaces: () => ({ 'the exit semantics section': readmeSections(ACTION_README()).get(SECTION_EXITS) }),
+    where: ['the exit semantics section'],
+    must: [
+      ['the absent-from-rendered-evidence half', /the signal name is absent from normal rendered evidence/i],
+      ['the can-still-leave half', /not categorically unable to leave the\s*runner, because the symlink substitution[\s\S]{0,200}can put the state file's bytes into\s*the archive/i],
+    ],
+  }],
+  ['invocation nonce: detects a mismatch, enforces no pairing', {
+    surfaces: () => platformSurfaces(),
+    where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
+    must: [
+      ['the detection half', /lets a reader detect (?:a|any) mismatch/i],
+      ['the enforces-nothing half', /nonce (?:enforces (?:nothing|no pairing)|does not enforce the pairing)/i],
+    ],
+  }],
+]);
+
+test('every retired guard is paid for by its named positive disclosure, on every surface that carries it', () => {
+  for (const [name, disclosure] of POSITIVE_DISCLOSURES) {
+    const surfaces = disclosure.surfaces();
+    for (const where of disclosure.where) {
+      const text = surfaces[where];
+      assert.ok(typeof text === 'string' && text.length > 200,
+        `${name}: the surface '${where}' is missing or empty`);
+      for (const [half, pattern] of disclosure.must) {
+        assert.match(text, pattern, `${where} must still disclose ${half} of '${name}'`);
+      }
+    }
+  }
+});
+
 test('every polarity guard accepts the true statements it must not reject, and catches the regression it exists for', () => {
   const tables = [['scope', SCOPE_CLAIMS], ['platform', PLATFORM_CLAIMS], ['readme', README_CLAIMS]];
   const covered = new Set();
-  for (const [table, claims] of tables) {
+  const replaced = new Set();
+  let claims = 0;
+  let retired = 0;
+  let probes = 0;
+  for (const [table, table_claims] of tables) {
     const names = new Set();
-    for (const claim of claims) {
+    for (const claim of table_claims) {
       // A duplicate `what` inside one table would silently share one set of
       // controls between two different guards.
       assert.equal(names.has(claim.what), false, `${table}: two claims are both called '${claim.what}'`);
       names.add(claim.what);
+      claims += 1;
       const key = `${table}:${claim.what}`;
+      if (claim.retired) {
+        // HALF-RETIRING IS THE FAILURE MODE TO BLOCK: a claim marked retired
+        // while it still carries a live regex would skip the both-directions
+        // check below and keep sweeping the surfaces anyway.
+        assert.equal(claim.forbidden, undefined,
+          `${key}: retired, so it must not still carry a forbidden half`);
+        assert.equal(POLARITY_CONTROLS.has(key), false,
+          `${key}: retired, so it has no forbidden half for polarity controls to probe`);
+        assert.ok(POSITIVE_DISCLOSURES.has(claim.retired),
+          `${key}: retired against '${claim.retired}', which is not a named positive disclosure — removing or renaming the replacement must fail here`);
+        replaced.add(claim.retired);
+        retired += 1;
+        continue;
+      }
+      assert.ok(claim.forbidden instanceof RegExp,
+        `${key}: no forbidden half and not marked retired — a claim is pinned in both directions or retired against a named replacement`);
       const control = POLARITY_CONTROLS.get(key);
       assert.ok(control, `no true-statement controls for ${key} — every claim is checked in both directions`);
+      // THE VACUOUS-ASSERTION DEFECT, IN THE TEST BUILT TO PREVENT IT (Codex
+      // T8 r4 #2). `accepts: []` and `rejects: []` both PASSED, so a claim
+      // could satisfy "checked in both directions" without being checked in
+      // either — which is exactly the shape this whole table exists to stop.
+      assert.ok(control.accepts.length > 0,
+        `${key}: no accepts probe — a guard with no true statement to clear is not checked for false positives`);
+      assert.ok(control.rejects.length > 0,
+        `${key}: no rejects probe — a guard with no regression to catch is not checked for false negatives`);
       covered.add(key);
+      probes += control.accepts.length + control.rejects.length;
       for (const sentence of control.accepts) {
         assert.doesNotMatch(sentence, claim.forbidden,
           `${key}: the forbidden half rejects a TRUE statement — ${sentence}`);
@@ -9983,11 +10212,20 @@ test('every polarity guard accepts the true statements it must not reject, and c
   for (const key of POLARITY_CONTROLS.keys()) {
     assert.ok(covered.has(key), `controls for ${key}, but no claim by that name — renamed or removed?`);
   }
-  // A floor on the probe set, so a future tidy-up cannot pass this test by
-  // deleting the sentences instead of satisfying them.
-  const probes = [...POLARITY_CONTROLS.values()]
-    .reduce((n, c) => n + c.accepts.length + c.rejects.length, 0);
-  assert.ok(probes >= 220, `expected the control set to stay at 220+ probes, found ${probes}`);
+  // Both directions on the retirements too: a disclosure nothing points at is
+  // either an orphan left by a deleted retirement or a rename half-applied.
+  for (const name of POSITIVE_DISCLOSURES.keys()) {
+    assert.ok(replaced.has(name), `positive disclosure '${name}' replaces no retired guard — orphaned or renamed?`);
+  }
+  // EXACT COUNTS, NOT A FLOOR (Codex T8 r4 #2). `>= 220` left eleven of the
+  // then-231 probes deletable while this test stayed green, which is the same
+  // vacuous-coverage defect one level up: the contract has to be violated by
+  // deleting a sentence, not absorbed by the slack in it. Raising any of these
+  // three numbers is a deliberate edit; lowering one is the tidy-up this
+  // guards against.
+  assert.equal(claims, 68, `expected 68 claims across the three tables, found ${claims}`);
+  assert.equal(retired, 4, `expected exactly 4 retired guards, found ${retired}`);
+  assert.equal(probes, 229, `expected exactly 229 probes across the 64 live guards, found ${probes}`);
 });
 
 // The residual disclosures, as a presence sweep rather than a polarity pair:
