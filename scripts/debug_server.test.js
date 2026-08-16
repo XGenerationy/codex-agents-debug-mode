@@ -197,6 +197,7 @@ const stopCli = (child) => {
       spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
         stdio: 'ignore',
         windowsHide: true,
+        timeout: 15_000,
       });
     } else {
       child.kill('SIGKILL');
@@ -246,7 +247,10 @@ const GIT_BASH = process.platform === 'win32'
   ? (process.env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe')
   : (process.env.OMO_CODEX_SHELL_PATH || 'bash');
 
-const bashProbe = spawnSync(GIT_BASH, ['-c', 'true']);
+const bashProbe = spawnSync(GIT_BASH, ['-c', 'true'], {
+  timeout: 15_000,
+  windowsHide: true,
+});
 const bashAvailable = !bashProbe.error && bashProbe.status === 0;
 
 // Probe file-symlink privilege once, eagerly, so the dependent test below
@@ -273,13 +277,17 @@ try {
 const toBashPath = (nativePath) => {
   if (process.platform !== 'win32') return nativePath;
   const args = ['-u', nativePath];
-  let converted = spawnSync('cygpath', args, { encoding: 'utf8' });
+  let converted = spawnSync('cygpath', args, { encoding: 'utf8', timeout: 15_000, windowsHide: true });
   if (converted.error?.code === 'ENOENT') {
     // Git for Windows only puts `cmd`/`bin` (bash.exe) on PATH by default;
     // cygpath lives in `usr\bin` alongside the rest of the MSYS toolchain and
     // is typically not on PATH. Fall back to the well-known install root
     // pr_closeout_process.js already trusts for bash.exe.
-    converted = spawnSync('C:\\Program Files\\Git\\usr\\bin\\cygpath.exe', args, { encoding: 'utf8' });
+    converted = spawnSync('C:\\Program Files\\Git\\usr\\bin\\cygpath.exe', args, {
+      encoding: 'utf8',
+      timeout: 15_000,
+      windowsHide: true,
+    });
   }
   if (converted.error || converted.status !== 0) {
     throw converted.error || new Error(`cygpath failed: ${converted.stderr}`);
@@ -3082,11 +3090,19 @@ test('install.ps1 is saved as UTF-8 with a BOM', async () => {
   );
 });
 
-const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], { encoding: 'utf8' });
+const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], {
+  encoding: 'utf8',
+  timeout: 15_000,
+  windowsHide: true,
+});
 const pwshAvailable = !pwshProbe.error && pwshProbe.status === 0;
 
 const runInstallPs1 = (scriptPath, args) =>
-  spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args], { encoding: 'utf8' });
+  spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
+  });
 
 test(
   'install.ps1 rejects a reparse-point payload entry before staging',

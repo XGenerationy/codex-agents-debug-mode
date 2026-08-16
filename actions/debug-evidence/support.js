@@ -1369,11 +1369,16 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
 // rather than buffering it into this process's heap.
 const RESPONSE_BYTE_CAP = 1024 * 1024;
 // Inactivity timeout: no bytes moved for this long.
-const REQUEST_IDLE_TIMEOUT_MS = 5_000;
+// Must exceed protectWindowsPrivateFileAsync's 15s PowerShell budget: POST
+// /session awaits that ACL on Windows before returning 201, and a 5s idle
+// timeout made start fail with `collector request timed out` on hosted
+// windows-latest (Validate logs, 2026-08-16).
+const REQUEST_IDLE_TIMEOUT_MS = 20_000;
 // Wall-clock ceiling for the WHOLE exchange. The idle timeout alone is not a
 // bound: a peer that dribbles one byte every second resets it forever and the
-// subcommand hangs for the life of the job (Codex T4 #2).
-const REQUEST_DEADLINE_MS = 10_000;
+// subcommand hangs for the life of the job (Codex T4 #2). Keep this above the
+// Windows ACL budget so a legitimate mint is not killed by the wall clock.
+const REQUEST_DEADLINE_MS = 25_000;
 
 // Minimal JSON-over-loopback helper (node:http; fetch is avoided so tests can
 // inject `request` and so no keep-alive agent outlives the subcommand).

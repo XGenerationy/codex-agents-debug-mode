@@ -329,6 +329,12 @@ test('collector boot defers Windows salt ACL until after the handshake line', ()
   assert.ok(protectAt > handshakeAt, 'Windows ACL runs after the handshake line, not before listen()');
 });
 
+test('httpRequestJson defaults cover the Windows session-log ACL budget', () => {
+  const source = readFileSync(path.join(__dirname, 'support.js'), 'utf8');
+  assert.match(source, /REQUEST_IDLE_TIMEOUT_MS = 20_000/);
+  assert.match(source, /REQUEST_DEADLINE_MS = 25_000/);
+});
+
 // Ordering is the property, not merely presence. `start` validates its inputs
 // and resolves output-dir containment before it can do anything useful, and an
 // identity emitted after those checks would leave the later steps of a FAILED
@@ -2287,9 +2293,9 @@ test('httpRequestJson always settles: a lying Content-Length, a trickling peer, 
     await liar.close();
   }
 
-  // 2. One byte every 25ms resets the 5s inactivity timeout forever, so only a
+  // 2. One byte every 25ms resets the inactivity timeout forever, so only a
   // wall-clock deadline can stop it. Shortened through the seam; the shipped
-  // default is 10s.
+  // default covers the Windows session-log ACL budget.
   let trickle;
   const trickler = await rawHttpPeer((socket) => {
     socket.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n');
