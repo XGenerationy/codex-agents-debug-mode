@@ -4191,6 +4191,23 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 fix round 5 (Codex review of `5e12d1a`: 2 Important, 1 Minor) — the boundary is ACCEPTED, so this closes the mechanism
+
+**(1) IMPORTANT — the retirement replacement still fails open, CONFIRMED and worse than the coordinator found.** All three `POSITIVE_DISCLOSURES` patterns allow intervening text to negate the promised disclosure; **the coordinator's state-file counterexample "matches exactly as reported"**, and the signal pattern likewise accepts *"the symlink substitution proves that **no route can** put the state file's bytes into the archive."* **Worse: `support.test.js:10145-10155` accepts `must: []`, `where: []`, or deletion of either half — so the named replacement can EXIST WHILE CHECKING NOTHING.** That is the vacuous-assertion defect for the sixth time in this cycle, now inside the registry built to replace the retired guards.
+**RULED — option (b), the coordinator's lean: direct, INDEPENDENT, surface-specific assertions**, plus structural checks for non-empty and exact `where`/`must` sets with unique half names. Two separate assertions cannot be satisfied across a clause because neither spans one.
+
+**(2) IMPORTANT — a live forbidden guard still carries a semantic window, and it is one round 3 CELEBRATED.** `support.test.js:5402` exempts any sentence containing `strict` after the predicate — the `(?![^.]*strict)` lookahead round 3 described as "saving" that claim. **It is a fail-open:** *"The run digest is the trust anchor even without strict admission"* is NOT rejected, although the digest alone is never the trust anchor. Outside the twelve conversions, which are otherwise sound. FIX: remove the lookahead and add that sentence as a rejecting probe.
+
+**(3) Minor — the required-half audit is incomplete, and required halves are NOT polarity-free.** The windows at `:5413` and `:9299` matter because **required halves are still executed** at `:5718` and `:9394`, including for retired claims — and both accept contradictory prose: `:5413` accepts *"The admission record is **not** part of the trust unit; only the digest and artifact matter."* There is also an unbounded equivalent at `:9164` accepting *"sorted … but **never** joined with a single NUL byte and **never** hashed as UTF-8, printed as lowercase hex."* FIX: split into direct affirmative requirements. **"Do not treat presence checks as polarity-free."**
+
+> **THE BOUNDARY IS ACCEPTED — which caps this mechanism and ends the pattern.** *"A regex cannot reliably distinguish assertion from quotation or retraction. Documenting that historical claims must be paraphrased is preferable to another semantic-regex cycle."* The twelve converted guards are **"acceptable regression signatures — they no longer pretend to understand arbitrary English."**
+>
+> **AND THE FRAMING THAT PUTS FIVE ROUNDS IN PROPORTION: "The consumer prose is presently correct; these findings concern protections that can silently certify future contradictory prose."** The shipped documentation is right today. Everything since round 1 has been about whether the guards would notice if it stopped being right.
+
+**ALSO RULED, not blocking:** the exact `68 / 4 / 229` contract is **deletion-evident, not tamper-evident** — probe substitution or duplication preserves the totals, and the disclosure registry sits outside them. Its comment accurately describes deletion protection, so the limitation stands as documented rather than as a defect.
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
