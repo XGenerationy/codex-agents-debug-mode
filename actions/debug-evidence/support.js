@@ -1075,7 +1075,11 @@ const startSubcommand = async ({
   spawnShim = defaultSpawnShim, probeReady = probeReadyCollector, kill = process.kill,
   request = httpRequestJson, probeToken = probeLaunchToken,
   writeStdout = defaultStdoutWrite,
-  nonce = randomUUID(), readyTimeoutMs = Number(env.DEBUG_ACTION_READY_TIMEOUT_MS || 15_000),
+  nonce = randomUUID(), readyTimeoutMs = Number(
+    env.DEBUG_ACTION_READY_TIMEOUT_MS
+    || process.env.DEBUG_ACTION_READY_TIMEOUT_MS
+    || 15_000,
+  ),
   // A SEAM, not a default value: evaluating `evaluateAdmission()` as a default
   // parameter would run it before this function's body, and therefore before
   // the identity outputs below — contradicting the "first act" invariant those
