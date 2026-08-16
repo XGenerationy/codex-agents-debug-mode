@@ -318,6 +318,17 @@ test('start boots a real collector, mints the session, and records state that ca
   }
 });
 
+test('collector boot defers Windows salt ACL until after the handshake line', () => {
+  const source = readFileSync(path.join(__dirname, 'collector_boot.js'), 'utf8');
+  assert.match(source, /deferWindowsPrivateFileProtection:\s*true/);
+  const listenAt = source.indexOf('server.listen');
+  const handshakeAt = source.indexOf('process.stdout.write');
+  const protectAt = source.indexOf('protectDeferredWindowsPrivateFiles');
+  assert.ok(listenAt !== -1, 'boot still calls listen()');
+  assert.ok(handshakeAt > listenAt, 'the startup line is written from the listen callback');
+  assert.ok(protectAt > handshakeAt, 'Windows ACL runs after the handshake line, not before listen()');
+});
+
 // Ordering is the property, not merely presence. `start` validates its inputs
 // and resolves output-dir containment before it can do anything useful, and an
 // identity emitted after those checks would leave the later steps of a FAILED

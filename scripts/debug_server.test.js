@@ -366,6 +366,29 @@ test('project_hash is keyed by a persisted per-project salt, not a bare hash of 
   }
 });
 
+test('deferred Windows salt protection still persists project_salt and agrees on project_hash', async () => {
+  // collector_boot defers PowerShell DACL until after listen()/handshake.
+  // Construction must still write the 32-byte salt and two servers on the
+  // same root must still agree, because already_running depends on it.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-defer-'));
+  try {
+    const first = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      deferWindowsPrivateFileProtection: true,
+    });
+    assert.equal(typeof first.protectDeferredWindowsPrivateFiles, 'function');
+    const saltInfo = await stat(path.join(projectRoot, '.debug', 'project_salt'));
+    assert.equal(saltInfo.size, 32);
+    await first.protectDeferredWindowsPrivateFiles();
+    await first.protectDeferredWindowsPrivateFiles();
+    const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    assert.equal(second.collectorProjectHash, first.collectorProjectHash);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
   // First-writer-wins: the second construction takes the O_CREAT|O_EXCL EEXIST
   // branch and reads the winner rather than renaming a fresh random salt over

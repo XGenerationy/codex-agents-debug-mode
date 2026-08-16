@@ -83,12 +83,23 @@ const computeRetainedLogBytes = (logDir) => {
 // under .debug/ (0600, current-user-only) closes that: two invocations of the
 // SAME project's collector still agree, because both read the same on-disk
 // salt, but an outside guesser would also need to guess the unpublished salt.
+const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection) => {
+  if (process.platform !== 'win32') return;
+  if (Array.isArray(pendingWindowsProtection)) {
+    pendingWindowsProtection.push(privateFile);
+    return;
+  }
+  protectWindowsPrivateFile(privateFile);
+};
+
 // Runs synchronously during createDebugServer's construction, like
 // computeRetainedLogBytes below; every failure (unreadable/corrupt/racing
 // create) falls open to a private, unpersisted salt rather than crashing
 // startup -- worst case is two invocations disagreeing on project_hash, which
 // only affects the already_running convenience check, never authentication.
-const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
+// When `pendingWindowsProtection` is an array, Windows ACL work is queued
+// instead of run inline so listen()/handshake is not blocked by PowerShell.
+const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, pendingWindowsProtection = null) => {
   const saltFile = path.join(debugDir, 'project_salt');
   const readExisting = () => {
     // Refuse a symlinked salt file, mirroring collector_token's own guard: an
@@ -212,8 +223,14 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
       // with the unauthenticated /health project_hash to test candidate
       // canonical paths and defeat the path-privacy the keyed hash was
       // introduced to provide (Codex U1D5A). POSIX is a no-op.
+      //
+      // Hosted Windows PowerShell can take >5s per ACL call. The action boot
+      // shim must emit its startup line from listen(), so the collector_boot
+      // path defers this call until after handshake (pendingWindowsProtection).
+      // Fail-open is unchanged: ACL failure unlinks the salt and the outer
+      // catch returns an unpersisted salt.
       try {
-        protectWindowsPrivateFile(saltFile);
+        applyWindowsPrivateFileProtection(saltFile, pendingWindowsProtection);
       } catch (error) {
         try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
         throw error;
@@ -258,7 +275,7 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
         try { closeSync(tfd); } catch { /* best effort cleanup */ }
       }
       try {
-        protectWindowsPrivateFile(tempFile);
+        applyWindowsPrivateFileProtection(tempFile, pendingWindowsProtection);
       } catch (error2) {
         try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
         throw error2;
@@ -998,6 +1015,7 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
+ * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, queue Windows DACL hardening for `project_salt` until `protectDeferredWindowsPrivateFiles()` runs (collector boot handshake). Default false keeps the CLI fail-closed sync path.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1009,6 +1027,7 @@ const createDebugServer = ({
   redactionEnv = { ...process.env },
   redactionNames = [],
   redactionMaxTokens = 512,
+  deferWindowsPrivateFileProtection = false,
   // Optional RESPONSE-SIGNING key: an Ed25519 PRIVATE KeyObject. Unlike
   // `token`, it authorizes nothing — holding it lets you sign answers as this
   // process, never ask this process for anything. It exists because a caller
@@ -1057,7 +1076,8 @@ const createDebugServer = ({
   // never leak the raw path, but the EADDRINUSE probe in main() still needs
   // a way for two invocations to agree they mean the SAME project without
   // either being able to recover the other's path from what /health reports.
-  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot)).update(canonicalProjectRoot).digest('hex');
+  const pendingWindowsProtection = deferWindowsPrivateFileProtection ? [] : null;
+  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot, pendingWindowsProtection)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   // Fail-closed secret redaction for every persisted event. Built here so a
@@ -1833,6 +1853,19 @@ const createDebugServer = ({
     markCollectorReady: {
       value: () => {
         collectorReady = true;
+      },
+    },
+    protectDeferredWindowsPrivateFiles: {
+      value: async () => {
+        if (!Array.isArray(pendingWindowsProtection) || pendingWindowsProtection.length === 0) return;
+        const files = pendingWindowsProtection.splice(0, pendingWindowsProtection.length);
+        for (const file of files) {
+          try {
+            await protectWindowsPrivateFileAsync(file);
+          } catch {
+            try { unlinkSync(file); } catch { /* best effort cleanup */ }
+          }
+        }
       },
     },
   });

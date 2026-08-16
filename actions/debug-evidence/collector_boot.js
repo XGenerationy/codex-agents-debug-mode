@@ -57,6 +57,7 @@ const main = () => {
     projectRoot,
     limits,
     responderPrivateKey: privateKey,
+    deferWindowsPrivateFileProtection: true,
     // Comma OR whitespace separated, per the documented input contract: a
     // comma-only split turned `DEBUG_REDACT_NAMES="A B,C"` into the names
     // ['A B', 'C'], so A's and B's values were never redacted at all
@@ -89,6 +90,9 @@ const main = () => {
       // runner's own step-output plumbing.
       verify_key: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
     })}\n`);
+    // Windows DACL on project_salt is required, but PowerShell ACL must not
+    // delay the handshake line above. Apply it after the parent can proceed.
+    void server.protectDeferredWindowsPrivateFiles();
   });
 };
 
