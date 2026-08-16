@@ -14,7 +14,6 @@ const {
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
-  protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 } = require('./pr_closeout_fs');
 const { buildSecretReplacements } = require('./pr_closeout_stream');
@@ -92,8 +91,12 @@ const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection
   // Never execFileSync here: hosted Windows PowerShell can take 5–15s per
   // invocation, and createDebugServer runs on the test/CLI construction path.
   // Fail-open matches the outer catch (unlink; unpersisted salt).
-  void protectWindowsPrivateFileAsync(privateFile).catch(() => {
-    try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+  void Promise.resolve().then(() => {
+    try {
+      protectWindowsPrivateFile(privateFile);
+    } catch {
+      try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+    }
   });
 };
 
@@ -1352,13 +1355,15 @@ const createDebugServer = ({
             await handle.close();
             if (process.platform === 'win32') {
               try {
-                // Async (execFile) variant, not the synchronous
-                // protectWindowsPrivateFile: this runs inside the /session
-                // HTTP request handler, and execFileSync would block the Node
-                // event loop for up to the full 15s ACL timeout on every
-                // session creation (UiTMS). The startup token path keeps the
-                // sync variant where blocking is harmless.
-                await protectWindowsPrivateFileAsync(resolvedLogFile);
+                // Use the synchronous helper, not protectWindowsPrivateFileAsync.
+                // On hosted windows-latest, promisified execFile of this
+                // EncodedCommand hangs until the 15s timeout (POST /session →
+                // HTTP 500) while execFileSync with the same script returns
+                // promptly — proven by closeout's passing Windows ACL tests.
+                // The exclusive write handle is already closed above, so this
+                // no longer contends with our own O_WRONLY lock. Blocking the
+                // request handler for a successful ACL is the working path.
+                protectWindowsPrivateFile(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
@@ -1863,7 +1868,7 @@ const createDebugServer = ({
         const files = pendingWindowsProtection.splice(0, pendingWindowsProtection.length);
         for (const file of files) {
           try {
-            await protectWindowsPrivateFileAsync(file);
+            protectWindowsPrivateFile(file);
           } catch {
             try { unlinkSync(file); } catch { /* best effort cleanup */ }
           }
