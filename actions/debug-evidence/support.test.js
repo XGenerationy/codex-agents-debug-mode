@@ -1943,6 +1943,28 @@ test('redactKnownSecrets replaces every occurrence of each known token and ignor
     'x [REDACTED] y [REDACTED]');
 });
 
+const hostCommandEnv = () => {
+  // Job env always has PATH. Tests that drive a real `node -e` wrapped command
+  // through bash must too: spawnSync replaces the child environment, so a
+  // PATH-less runEnv makes Git Bash report `node: command not found` (exit 127)
+  // on hosted Node 24, whose binary lives only on setup-node's PATH.
+  const env = {};
+  for (const key of ['PATH', 'Path', 'PATHEXT', 'SYSTEMROOT', 'SystemRoot', 'WINDIR', 'ComSpec', 'HOME', 'USERPROFILE', 'TMP', 'TEMP', 'TMPDIR', 'LANG']) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  const nodeDir = path.dirname(process.execPath);
+  const pathKey = Object.prototype.hasOwnProperty.call(env, 'PATH') || process.platform !== 'win32' ? 'PATH' : 'Path';
+  const current = env.PATH || env.Path || '';
+  const parts = current.split(path.delimiter).filter(Boolean);
+  if (!parts.includes(nodeDir)) parts.unshift(nodeDir);
+  env[pathKey] = parts.join(path.delimiter);
+  if (process.platform === 'win32') {
+    env.PATH = env[pathKey];
+    env.Path = env[pathKey];
+  }
+  return env;
+};
+
 const startReal = async (overrides = {}) => {
   const outputDir = makeTempDir();
   const projectRoot = makeTempDir();
@@ -1994,6 +2016,7 @@ const startReal = async (overrides = {}) => {
     invocationNonce,
     advertisedEvidenceDir,
     runEnv: {
+      ...hostCommandEnv(),
       DEBUG_ACTION_COLLECTOR_VERIFY_KEY: collectorVerifyKey,
       DEBUG_ACTION_INVOCATION_NONCE: invocationNonce,
     },
@@ -2494,20 +2517,9 @@ test('a holder whose lock was reaped and replaced releases without evicting the 
   await withStateLock(outputDir, () => {
     stamped = readFileSync(lockPath, 'utf8');
     // A reaper judged this holder stale, deleted its lock, and a successor
-    // took the path. This holder is now a ghost: its fd is still open, but
-    // the lock on disk is someone else's.
-    //
-    // Windows refuses to unlink a name whose handle is still open in this
-    // process (withStateLock's own finally closes first for that reason).
-    // Overwrite in place when unlink is denied so the ownership-verified
-    // release still sees successor bytes and must leave them alone.
-    try {
-      unlinkSync(lockPath);
-    } catch (error) {
-      if (process.platform !== 'win32' || (error?.code !== 'EPERM' && error?.code !== 'EACCES')) {
-        throw error;
-      }
-    }
+    // took the path. This holder is now a ghost: it still believes it owns
+    // the critical section, but the lock on disk is someone else's.
+    unlinkSync(lockPath);
     writeFileSync(lockPath, successor);
   });
   assert.match(stamped, new RegExp(`^${process.pid}\\n[0-9a-f-]{36}\\n$`),

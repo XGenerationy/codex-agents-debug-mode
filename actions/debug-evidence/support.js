@@ -858,8 +858,8 @@ const observeLock = (lockPath) => {
   }
 };
 
-// Create the lock and stamp it with WHO holds it. Returns the open fd, or
-// null when someone else already holds the path.
+// Create the lock and stamp it with WHO holds it. Returns true when this
+// caller now owns the path, or false when someone else already holds it.
 //
 // The ownership stamp is what makes an unlink decidable: without it every
 // deleter is blind, and "remove the lock file" cannot distinguish the lock it
@@ -869,7 +869,7 @@ const tryAcquireLock = (lockPath, ownership) => {
   try {
     fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   } catch (error) {
-    if (error?.code === 'EEXIST') return null;
+    if (error?.code === 'EEXIST') return false;
     throw error;
   }
   // Full-write discipline, same as writeState (T3 r2): a lock whose ownership
@@ -888,7 +888,14 @@ const tryAcquireLock = (lockPath, ownership) => {
     try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ }
     throw error;
   }
-  return fd;
+  // Release the descriptor before returning: the lock is the path + ownership
+  // bytes, not an open handle. Windows refuses to unlink a name this process
+  // still has open (Validate Node 20, 2026-08-16), so a live holder that kept
+  // `fd` would make the ownership-verified release and the reaper-successor
+  // test both EPERM. Unix already allowed unlink of a held lock; closing here
+  // matches that model on every platform.
+  closeSync(fd);
+  return true;
 };
 
 // A real critical section for the state file, honored by every writer.
@@ -911,12 +918,12 @@ const withStateLock = async (outputDir, fn, { onStaleObserved = null } = {}) => 
   // several times, and a recycled pid must never be able to impersonate an
   // earlier holder.
   const ownership = `${process.pid}\n${randomUUID()}\n`;
-  let fd = null;
+  let held = false;
   let reaped = false;
   let attempts = 0;
-  while (fd === null) {
-    fd = tryAcquireLock(lockPath, ownership);
-    if (fd !== null) break;
+  while (!held) {
+    held = tryAcquireLock(lockPath, ownership);
+    if (held) break;
     // Someone holds it. Reap it ONCE, and only when it is old enough that no
     // live invocation could still own it — a runner that was cancelled or
     // OOM-killed mid-write leaves this file behind forever, and without a
@@ -954,9 +961,6 @@ const withStateLock = async (outputDir, fn, { onStaleObserved = null } = {}) => 
   try {
     return await fn();
   } finally {
-    // Close before touching the path: Windows refuses to remove a file that
-    // is still open.
-    try { closeSync(fd); } catch { /* best-effort release */ }
     try {
       // Ownership-verified release. A holder that ran long enough to be
       // judged stale no longer owns this path — a reaper deleted its lock and
