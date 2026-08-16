@@ -5288,6 +5288,22 @@ const SYSCTL_BUYS_STRICT = new RegExp([
   'harden the runner first,? (?:and|then) (?:it|the runner|hosted execution) (?:becomes?|is|are) strict',
 ].join('|'), 'i');
 
+// DO NOT TREAT PRESENCE CHECKS AS POLARITY-FREE (Codex T8 r5 #3). A required
+// half asserts that a fact IS STATED, and that is a claim about polarity like
+// any other: if a window inside it lets a denial sit between two pinned words,
+// the check certifies the opposite of the thing it is named for. Three did.
+// `/admission record[^.]{0,80}digest[^.]{0,80}artifact/` was satisfied by "the
+// admission record is NOT part of the trust unit; only the digest and artifact
+// matter", and the unbounded recipe pin by "sorted … but NEVER joined with a
+// single NUL byte and NEVER hashed as UTF-8".
+//
+// So a claim may list SEVERAL required halves, and every one of them must be
+// present independently. Each is a contiguous phrase carrying its own subject —
+// the same rule the forbidden halves converted to in round 4 and the disclosure
+// registry in round 5 — rather than two pinned words with a bridge between them.
+// Splitting is the fix, not narrowing: a narrower bridge is still a bridge.
+const requiredHalves = (claim) => (Array.isArray(claim.required) ? claim.required : [claim.required]);
+
 // POLARITY, not vocabulary (Codex T6 r4 #1). The checks above pass on
 // keywords, so flipping "does NOT survive" to "DOES survive" left every one
 // of them green while the comment asserted the opposite of the truth — a pin
@@ -5399,7 +5415,15 @@ const PLATFORM_CLAIMS = [
   {
     what: 'what a strict admission buys',
     required: /after a\s+successful strict admission, run'?s account is authenticated/i,
-    forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)(?![^.]*strict)/i,
+    // THE LAST SEMANTIC WINDOW IN A LIVE GUARD, AND ROUND 3 CALLED IT A SAVE
+    // (Codex T8 r5 #2). The `(?![^.]*strict)` lookahead excused any sentence
+    // that went on to mention `strict` — which is a rule about a WORD, not
+    // about the proposition, so "the run digest is the trust anchor EVEN
+    // WITHOUT STRICT ADMISSION" walked straight through it. The digest alone is
+    // never the trust anchor, on either regime. The exemption is gone and the
+    // guard is the direct regression form: nothing about the shipped prose
+    // needed it, since no surface asserts this sentence in any mood.
+    forbidden: /the (?:trusted )?run digest is the (?:unit of trust|trust anchor)/i,
   },
   // THE TRUST UNIT HAS THREE PARTS (Codex T6 r9 #3). An artifact plus a
   // digest is forgeable end to end by a command that can rewrite the process
@@ -5410,7 +5434,20 @@ const PLATFORM_CLAIMS = [
   {
     what: 'that the trust unit has three parts',
     where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-    required: /admission record[^.]{0,80}digest[^.]{0,80}artifact/i,
+    // THREE PARTS, PINNED AS THREE REQUIREMENTS (Codex T8 r5 #3). One pattern
+    // with two `[^.]{0,80}` bridges was satisfied by "the admission record is
+    // NOT part of the trust unit; only the digest and artifact matter" — the
+    // denial fitted inside the first bridge. Each part is now its own
+    // contiguous phrase, and the first carries the copula that makes it an
+    // assertion. All three surfaces word the middle differently (`run's
+    // digest`, `the matching digest from run's step log`, `the matching digest
+    // from this step's log`), which is why the bridge existed and why the
+    // alternation replaces it.
+    required: [
+      /the trust unit is the (?:pre-command )?admission record/i,
+      /plus (?:run['’]s|the matching) digest/i,
+      /plus the artifact/i,
+    ],
     forbidden: /the artifact plus the matching digest from its step log is the trust unit|the artifact plus the matching digest is the (?:trust unit|unit of trust)/i,
   },
   // SUDO IS DETECTED BY EXISTENCE, NEVER BY BEHAVIOUR (the r9 Critical).
@@ -5688,7 +5725,9 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   // And the claim it qualifies is stated as scoped, not absolute.
   assert.match(commentary, /out of (?:the reach of|reach of)?\s*THIS invocation'?s? (?:wrapped )?command|unreachable by THIS invocation/i);
   for (const claim of SCOPE_CLAIMS) {
-    assert.match(commentary, claim.required, `the scope note must state ${claim.what}`);
+    for (const required of requiredHalves(claim)) {
+      assert.match(commentary, required, `the scope note must state ${claim.what}`);
+    }
     assert.doesNotMatch(commentary, claim.forbidden, `the scope note must not reverse ${claim.what}`);
   }
   // The README reference is an OBLIGATION on Task 8, not a claim that a
@@ -5715,7 +5754,11 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
     // A claim states which surfaces MUST carry it — and must carry it in each
     // of them independently.
     for (const where of claim.where ?? ['action.yml comments']) {
-      assert.match(surfaces[where], claim.required, `${where} must state ${claim.what}`);
+      // Each required half independently, so a fact cannot go missing behind
+      // another one being present.
+      for (const required of requiredHalves(claim)) {
+        assert.match(surfaces[where], required, `${where} must state ${claim.what}`);
+      }
     }
     // Its reversal is forbidden EVERYWHERE. A claim that is only required of
     // one surface can still be contradicted on another, and a contradiction
@@ -9045,7 +9088,11 @@ const README_CLAIMS = [
   {
     what: 'the diagnostic prefix and its step provenance',
     section: SECTION_LOGS,
-    required: /debug-evidence-action: <step>: <text>[^|]*\| stderr \|/,
+    // The `[^|]*` gap held nothing but the closing backtick (Codex T8 r5 #3
+    // sweep): it could not cross a cell boundary, but it could still hold a
+    // qualification inside the cell. Written out, so the grammar and the stream
+    // it goes to are one contiguous pin.
+    required: /`debug-evidence-action: <step>: <text>` \| stderr \|/,
     // Windowless (Codex T8 r4 #1). The 60-character gap after the verb was the
     // familiar escape in its worst form here, because the object of the verb is
     // where the negation lives: "the prefix TELLS YOU NOTHING ABOUT strict or
@@ -9093,11 +9140,17 @@ const README_CLAIMS = [
     // facts are pinned directly now: `report.json` is the verbatim, uncapped
     // copy to compare against, and `report.md` is escaped and capped. The cap
     // comes from the renderer rather than a literal, so the two cannot drift.
-    required: new RegExp([
-      'The copies are not byte-identical across surfaces',
-      '\\|\\s*`report\\.json`[^|]*\\|\\s*\\*\\*Verbatim, uncapped\\.\\*\\*\\s*This is the copy to compare against\\.',
-      `\\|\\s*\`report\\.md\`[^|]*\\|\\s*Markdown-\\*\\*escaped\\*\\* and capped at ${EXCERPT_CHAR_CAP} characters per caveat`,
-    ].join('[\\s\\S]{0,400}'), 'i'),
+    //
+    // THREE FACTS, THREE REQUIREMENTS (Codex T8 r5 #3 sweep). Round 4 pinned
+    // all three but joined them with `[\s\S]{0,400}`, which is 400 characters
+    // of room for "…none of which is still true:" between the sentence and the
+    // rows — and `[^|]*` inside each row label was a second, smaller gap.
+    // Each fact stands alone now, row label and cell contiguous.
+    required: [
+      /The copies are not byte-identical across surfaces/i,
+      /\| `report\.json` -> `caveats\[\]` \| \*\*Verbatim, uncapped\.\*\* This is the copy to compare against\./i,
+      new RegExp(`\\| \`report\\.md\` \\(and the Step Summary\\) \\| Markdown-\\*\\*escaped\\*\\* and capped at ${EXCERPT_CHAR_CAP} characters per caveat`, 'i'),
+    ],
     // THE SECOND BLIND GUARD THIS ROUND'S AUDIT FOUND. The window was
     // `[^|]{0,60}`, chosen so a match could not run across a table cell — but
     // the fidelity TABLE is exactly where this reversal would land, and `|`
@@ -9161,7 +9214,21 @@ const README_CLAIMS = [
   {
     what: 'the sort/join/hash/case of the sudo fingerprint',
     section: SECTION_VERIFY,
-    required: /[*_]*sorted[*_]* with JavaScript's default comparison \(UTF-16 code-unit order\)[^.]*joined with a single NUL byte[^.]*hashed as [*_]*UTF-8[*_]*, printed as [*_]*lowercase hex/i,
+    // THE UNBOUNDED ONE (Codex T8 r5 #3). Two `[^.]*` gaps chained the four
+    // recipe steps into one pattern, and the recipe is written without a full
+    // stop until the end — so "sorted … but NEVER joined with a single NUL byte
+    // and NEVER hashed as UTF-8, printed as lowercase hex" satisfied a
+    // requirement whose entire purpose is that those steps ARE the recipe.
+    // Each step is now its own contiguous phrase, and each is bound to what
+    // precedes it — `and **joined`, `the joined string hashed as` — so a
+    // negator cannot be inserted before the predicate without breaking the
+    // match. `[*_]*` absorbs this README's emphasis and nothing else; it cannot
+    // hold a word.
+    required: [
+      /[*_]*sorted[*_]* with JavaScript's default comparison \(UTF-16 code-unit order\)/i,
+      /and [*_]*joined with a single NUL byte/i,
+      /the joined string hashed as [*_]*UTF-8[*_]*, printed as [*_]*lowercase hex/i,
+    ],
     // Bare predicates rejected their own denials (T8 r3): "the candidates are
     // NOT joined with a colon", "the digest is NEVER printed as uppercase
     // hex". The recipe states each step in bold, so an ASSERTED step carries
@@ -9296,7 +9363,17 @@ const README_CLAIMS = [
   {
     what: 'that the signal name is absent from rendered evidence rather than unable to leave the runner',
     section: SECTION_EXITS,
-    required: /the signal name is absent from normal rendered evidence[^.]{0,120}not categorically unable to leave the\s*runner/i,
+    // A RETIRED CLAIM STILL EXECUTES ITS REQUIRED HALF, so this window was
+    // live (Codex T8 r5 #3). The 120-character bridge between the two halves
+    // was room for the qualification to be reversed — the second half is the
+    // one that stops the section over-claiming, and a bridge that can hold a
+    // denial is a bridge that can certify the over-claim. Two contiguous
+    // phrases instead, matching the halves of the named replacement disclosure
+    // below so one prose edit cannot satisfy one and not the other.
+    required: [
+      /so [*_]*the signal name is absent from normal rendered evidence/i,
+      /a claim about paths and not one about bytes: it is not categorically unable to leave the runner/i,
+    ],
     // The 90-character window swallowed the qualifier this claim turns on
     // (T8 r3): "…but that is not the same as saying it cannot leave the
     // runner" is the distinction, and the window reached the predicate anyway.
@@ -9391,8 +9468,10 @@ test('the action README states each hard requirement in the required form, and n
     assert.ok(text.length > 1000, `${name}: the surface reader found nothing to check`);
   }
   for (const claim of README_CLAIMS) {
-    assert.match(sections.get(claim.section), claim.required,
-      `the '${claim.section}' section must state ${claim.what}`);
+    for (const required of requiredHalves(claim)) {
+      assert.match(sections.get(claim.section), required,
+        `the '${claim.section}' section must state ${claim.what}`);
+    }
     // A RETIRED claim keeps its required half and drops the reversal sweep —
     // its protection is the named positive disclosure the coverage test binds
     // it to, not a regex trying to decide a negative proposition.
@@ -9431,12 +9510,22 @@ test('the action README states each hard requirement in the required form, and n
 //
 // THE BOUNDARY OF THE MECHANISM, STATED RATHER THAN DISCOVERED IN A SIXTH ROUND.
 // Round 4's ruling — "any window that can cross a clause recreates the semantic
-// problem; keep the guards exact and direct" — has been applied to all 64 live
-// guards: NONE of them now contains a `{0,N}` gap, so no negator can sit between
-// a guard's anchor and its predicate. What that buys is exactly one thing: a
-// denial written INLINE, the way an editor actually writes one ("never makes",
-// "does not act as", "tells you nothing about"), can no longer be mistaken for
-// the assertion it denies.
+// problem; keep the guards exact and direct" — applies to all 64 live guards:
+// none contains a `{0,N}` gap, so no negator can sit between a guard's anchor
+// and its predicate. What that buys is exactly one thing: a denial written
+// INLINE, the way an editor actually writes one ("never makes", "does not act
+// as", "tells you nothing about"), can no longer be mistaken for the assertion
+// it denies.
+//
+// ROUND 4 CLAIMED THAT AS "ZERO WINDOWS ANYWHERE" AND IT WAS TRUE ONLY OF THE
+// FORBIDDEN HALVES — the mechanical audit had swept one half of each pair and
+// the report generalised. Three windows survived in the disclosure registry,
+// three more in required halves, and one live forbidden guard kept a
+// `(?![^.]*strict)` LOOKAHEAD that exempted any sentence mentioning the word.
+// All of them are gone as of round 5, and the audit that finds them is one
+// grep for a quantifier in a claim, a control or a disclosure — not a reading.
+// The lesson is the one that took five rounds: sweep BOTH halves of a
+// mechanism, and say which half you swept.
 //
 // What it does NOT buy, and cannot: 61 of the 64 also match their own regression
 // QUOTED INSIDE A DENIAL — "it is not true that <regression>", "the claim that
@@ -9548,6 +9637,11 @@ const POLARITY_CONTROLS = new Map([
     ],
     rejects: [
       'The run digest is the trust anchor.',
+      // The sentence the removed `(?![^.]*strict)` lookahead let through
+      // (Codex T8 r5 #2). It is here so the fix is proved by this test rather
+      // than by the reasoning that motivated it: restore the lookahead and this
+      // probe goes RED.
+      'The run digest is the trust anchor even without strict admission.',
     ],
   }],
   ['platform:that the trust unit has three parts', {
@@ -10088,71 +10182,172 @@ const POLARITY_CONTROLS = new Map([
 // symlink test proves the uploader follows links. Nothing in it stops the README
 // asserting the opposite — and the residual sweep below checks generic symlink
 // following and human comparison, NOT each consequence being protected. So each
-// retirement is paid for with an explicit POSITIVE DISCLOSURE: both halves of
+// retirement is paid for with an explicit POSITIVE DISCLOSURE: every half of
 // the honest claim, required by name on every surface that carries it.
 //
-// These are presence checks, so they can only fail by the fact disappearing —
-// there is no polarity to get wrong and no window to cross. Each retired claim
-// names its replacement, and the coverage test binds the two together in both
-// directions, so deleting the disclosure, renaming it, or retiring a guard
-// against a replacement that does not exist all fail there. A retirement that
-// can be silently deleted is not a retirement.
+// PRESENCE CHECKS ARE NOT POLARITY-FREE, AND THE FIRST VERSION OF THIS REGISTRY
+// PROVED IT (Codex T8 r5 #1). Round 4 wrote each disclosure as ONE pattern
+// joining its two halves across a `[\s\S]{0,200}` bridge, on the reasoning that
+// a presence check cannot reject a true statement so a permissive bridge is
+// free. It is not free in the other direction: the bridge is where a denial
+// sits. `/symlinks unconditionally[\s\S]{0,200}puts the state bytes into the
+// archive/` matched the honest sentence AND "…follows symlinks unconditionally,
+// BUT NOTHING HERE EVER puts the state bytes into the archive" — so a README
+// that RETRACTED the disclosure still satisfied the check that exists to keep it
+// published. The retirement had escaped a mechanism that could not decide
+// negatives by adopting a replacement carrying the same defect.
+//
+// THE FIX IS TO REMOVE THE JOIN, NOT TO TIGHTEN IT. Every fact below is asserted
+// SEPARATELY, and every pattern is a CONTIGUOUS phrase of the shipped prose
+// carrying its own subject — no gap of any width, so there is nowhere for a
+// negator to sit. Two independent single-fact assertions cannot be satisfied
+// across one clause, because neither of them spans one.
+//
+// Contiguity is what makes them subject-bound, and that is the property to
+// preserve when the prose changes: "puts the state bytes into the archive" is
+// satisfied by "nothing ever puts the state bytes into the archive", while
+// "replacing session.log with a link to ../action-state.json puts the state
+// bytes into the archive" is not. Bind the predicate to the subject that
+// performs it, with nothing between them. What remains unreachable is the
+// documented boundary at the head of POLARITY_CONTROLS: the same phrase QUOTED
+// inside a denial. A surface discussing a retracted claim must paraphrase it.
+//
+// The prose differs per surface — action.yml names the swap, support.js names
+// the staging window, the README says it a third way — so the patterns are
+// SURFACE-SPECIFIC rather than one alternation covering all of them, which is
+// also what stops a fact being half-checked on the surface that words it
+// differently.
+//
+// Each retired claim names its replacement, and the coverage test binds the two
+// together in both directions, so deleting the disclosure, renaming it, or
+// retiring a guard against a replacement that does not exist all fail there. A
+// retirement that can be silently deleted is not a retirement.
 const POSITIVE_DISCLOSURES = new Map([
   ['state file: no enumerated path names it, and symlink substitution can carry its bytes (action.yml and support.js)', {
     surfaces: () => platformSurfaces(),
     where: ['action.yml comments', 'support.js comments'],
-    must: [
-      ['the path-name half', /no enumerated path names it/i],
-      // Worded differently on the two surfaces — action.yml names the swap
-      // ("replacing session.log with a link to ../action-state.json"),
-      // support.js names the window — so one alternation covers both rather
-      // than two half-checked surfaces.
-      // The bridge is `[\s\S]`, not `[^.]`: both sentences name `session.log`
-      // and `../action-state.json`, whose dots are identifiers rather than
-      // sentence ends — the round-1 finding-#2 shape, which cost this file
-      // three rounds elsewhere. A presence check cannot reject a true
-      // statement, so a permissive bridge here is free.
-      ['the bytes half', /symlinks unconditionally[\s\S]{0,200}(?:puts the state bytes|put these bytes) into the archive/i],
-    ],
+    // The facts, named once. Every surface below must check exactly these, so
+    // dropping one — or duplicating another in its place — fails structurally
+    // rather than quietly reducing what the disclosure covers.
+    facts: ['the path-name half', 'the symlink-following half', 'the bytes-into-archive half'],
+    must: {
+      'action.yml comments': [
+        ['the path-name half', /outside the staging child, so no enumerated path names it/i],
+        ['the symlink-following half', /Residual 2 below is this same step following symlinks unconditionally/i],
+        ['the bytes-into-archive half', /replacing session\.log with a link to \.\.\/action-state\.json puts the state bytes into the archive/i],
+      ],
+      'support.js comments': [
+        ['the path-name half', /carries this run['’]s session token and no enumerated path names it/i],
+        ['the symlink-following half', /the pinned uploader follows symlinks unconditionally/i],
+        ['the bytes-into-archive half', /a swap inside the staging window can still put these bytes into the archive/i],
+      ],
+    },
   }],
   ['state file: no enumerated path names it, and symlink substitution can carry its bytes (README)', {
     surfaces: () => ({ 'the evidence artifact section': readmeSections(ACTION_README()).get(SECTION_ARTIFACT) }),
     where: ['the evidence artifact section'],
-    must: [
-      ['the path-name half', /no path the upload step enumerates names it/i],
-      ['the bytes half', /the uploader follows symlinks\s*unconditionally[\s\S]{0,200}carry the state\s*file's bytes into the archive under an enumerated payload name/i],
-    ],
+    facts: ['the path-name half', 'the symlink-following half', 'the bytes-into-archive half'],
+    must: {
+      'the evidence artifact section': [
+        ['the path-name half', /outside the staging child, so no path the upload step enumerates names it/i],
+        ['the symlink-following half', /The uploader follows symlinks unconditionally/i],
+        ['the bytes-into-archive half', /a substitution inside the staging window can still carry the state file['’]s bytes into the archive under an enumerated payload name/i],
+      ],
+    },
   }],
   ['signal name: absent from rendered evidence, and able to leave through substituted state bytes', {
     surfaces: () => ({ 'the exit semantics section': readmeSections(ACTION_README()).get(SECTION_EXITS) }),
     where: ['the exit semantics section'],
-    must: [
-      ['the absent-from-rendered-evidence half', /the signal name is absent from normal rendered evidence/i],
-      ['the can-still-leave half', /not categorically unable to leave the\s*runner, because the symlink substitution[\s\S]{0,200}can put the state file's bytes into\s*the archive/i],
-    ],
+    facts: ['the absent-from-rendered-evidence half', 'the paths-not-bytes half', 'the bytes-into-archive half'],
+    must: {
+      'the exit semantics section': [
+        ['the absent-from-rendered-evidence half', /no diagnostic prints it either, so [*_]*the signal name is absent from normal rendered evidence/i],
+        ['the paths-not-bytes half', /a claim about paths and not one about bytes: it is not categorically unable to leave the runner/i],
+        // The subject is the whole phrase "the symlink substitution described
+        // under [residual risks](…)", link and all, because that is what sits
+        // adjacent to the predicate in the shipped sentence. Spelling the
+        // anchor out keeps the pattern contiguous; the alternative was a
+        // `[^)]*` gap, which is the defect this round removes.
+        ['the bytes-into-archive half', /the symlink substitution described under \[residual risks\]\(#scope-limitations-and-residual-risks\) can put the state file['’]s bytes into the archive/i],
+      ],
+    },
   }],
   ['invocation nonce: detects a mismatch, enforces no pairing', {
     surfaces: () => platformSurfaces(),
     where: ['action.yml comments', 'action.yml input/output descriptions', 'support.js comments'],
-    must: [
-      ['the detection half', /lets a reader detect (?:a|any) mismatch/i],
-      ['the enforces-nothing half', /nonce (?:enforces (?:nothing|no pairing)|does not enforce the pairing)/i],
-    ],
+    facts: ['the enforces-nothing half', 'the detection half'],
+    must: {
+      // `no pairing` in the comment, `nothing` in the two rendered copies —
+      // pinned as each surface writes it rather than as one alternation, so a
+      // surface cannot lose its half and be covered by another's wording.
+      'action.yml comments': [
+        ['the enforces-nothing half', /The nonce ENFORCES no pairing/i],
+        ['the detection half', /it lets a reader detect a mismatch that would otherwise be invisible/i],
+      ],
+      'action.yml input/output descriptions': [
+        ['the enforces-nothing half', /The nonce enforces nothing/i],
+        ['the detection half', /it lets a reader detect a mismatch that would otherwise be invisible/i],
+      ],
+      'support.js comments': [
+        ['the enforces-nothing half', /The nonce ENFORCES nothing/i],
+        ['the detection half', /it lets a reader detect a mismatch that would otherwise be invisible/i],
+      ],
+    },
   }],
 ]);
 
+// THE REGISTRY'S OWN COVERAGE, ENFORCED RATHER THAN DESCRIBED (Codex T8 r5 #1).
+// The first version accepted `must: []`, `where: []`, or the deletion of either
+// key: the loops simply ran zero times, so a NAMED REPLACEMENT COULD EXIST WHILE
+// CHECKING NOTHING while the coverage test above still confirmed it existed.
+// That is the vacuous-assertion defect for the sixth time in this cycle, and it
+// had reached the registry built to replace the retired guards. Structure is
+// checked before content, and the exact total below is asserted after.
 test('every retired guard is paid for by its named positive disclosure, on every surface that carries it', () => {
+  let checks = 0;
   for (const [name, disclosure] of POSITIVE_DISCLOSURES) {
+    assert.ok(Array.isArray(disclosure.where) && disclosure.where.length > 0,
+      `${name}: no surfaces — a disclosure that checks nowhere is not a replacement`);
+    assert.equal(new Set(disclosure.where).size, disclosure.where.length,
+      `${name}: a surface is named twice in 'where'`);
+    assert.ok(Array.isArray(disclosure.facts) && disclosure.facts.length > 0,
+      `${name}: no facts — a disclosure that requires nothing is not a replacement`);
+    assert.equal(new Set(disclosure.facts).size, disclosure.facts.length,
+      `${name}: a fact is named twice in 'facts'`);
+    // EXACT, both ways: a surface in `where` with no patterns, or patterns for a
+    // surface `where` no longer lists, is a half-applied edit either way.
+    assert.deepEqual(Object.keys(disclosure.must ?? {}).sort(), [...disclosure.where].sort(),
+      `${name}: 'must' and 'where' name different surfaces`);
     const surfaces = disclosure.surfaces();
     for (const where of disclosure.where) {
       const text = surfaces[where];
       assert.ok(typeof text === 'string' && text.length > 200,
         `${name}: the surface '${where}' is missing or empty`);
-      for (const [half, pattern] of disclosure.must) {
+      const halves = disclosure.must[where];
+      assert.ok(Array.isArray(halves) && halves.length > 0,
+        `${name}: '${where}' checks nothing`);
+      // UNIQUE NAMES, AND EXACTLY THE DECLARED SET. Without the uniqueness
+      // check a duplicate could stand in for a deleted half and keep the
+      // count; without the set equality a half could be dropped from one
+      // surface while the others carried it.
+      const named = halves.map(([half]) => half);
+      assert.equal(new Set(named).size, named.length,
+        `${name}: '${where}' names one of its halves twice`);
+      assert.deepEqual([...named].sort(), [...disclosure.facts].sort(),
+        `${name}: '${where}' does not check exactly the declared facts`);
+      for (const [half, pattern] of halves) {
+        assert.ok(pattern instanceof RegExp, `${name}: ${half} on '${where}' is not a pattern`);
         assert.match(text, pattern, `${where} must still disclose ${half} of '${name}'`);
+        checks += 1;
       }
     }
   }
+  // Exact, like the 68/4/230 contract below and for the same reason: the per
+  // disclosure checks above make a fact undeletable WITHIN a disclosure, and
+  // this one makes a whole surface — or a whole disclosure — undeletable across
+  // the registry. (2 surfaces x 3 facts) + 3 + 3 + (3 surfaces x 2 facts) = 18,
+  // over the seven (disclosure, surface) pairs.
+  assert.equal(checks, 18, `expected exactly 18 disclosure assertions across the registry, found ${checks}`);
 });
 
 test('every polarity guard accepts the true statements it must not reject, and catches the regression it exists for', () => {
@@ -10171,6 +10366,14 @@ test('every polarity guard accepts the true statements it must not reject, and c
       names.add(claim.what);
       claims += 1;
       const key = `${table}:${claim.what}`;
+      // THE SAME VACUITY CHECK ON THE REQUIRED SIDE, which round 5 gave them
+      // the ability to fail: now that `required` may be a list, `required: []`
+      // would assert nothing while the claim still looked pinned — and a
+      // retired claim's required half is all it has. Checked for every claim,
+      // retired or live, before the branch below.
+      const halves = requiredHalves(claim);
+      assert.ok(halves.length > 0 && halves.every((half) => half instanceof RegExp),
+        `${key}: 'required' must be a pattern, or a non-empty list of them`);
       if (claim.retired) {
         // HALF-RETIRING IS THE FAILURE MODE TO BLOCK: a claim marked retired
         // while it still carries a live regex would skip the both-directions
@@ -10223,9 +10426,13 @@ test('every polarity guard accepts the true statements it must not reject, and c
   // deleting a sentence, not absorbed by the slack in it. Raising any of these
   // three numbers is a deliberate edit; lowering one is the tidy-up this
   // guards against.
+  //
+  // 229 -> 230 in round 5: the one sentence the removed `(?![^.]*strict)`
+  // lookahead let through, added as a rejecting probe so that fix is proved
+  // here rather than argued in a report.
   assert.equal(claims, 68, `expected 68 claims across the three tables, found ${claims}`);
   assert.equal(retired, 4, `expected exactly 4 retired guards, found ${retired}`);
-  assert.equal(probes, 229, `expected exactly 229 probes across the 64 live guards, found ${probes}`);
+  assert.equal(probes, 230, `expected exactly 230 probes across the 64 live guards, found ${probes}`);
 });
 
 // The residual disclosures, as a presence sweep rather than a polarity pair:
