@@ -495,6 +495,22 @@ const safeTokenEqual = (actual, expected) => {
   );
 };
 
+// SHA-256 over a Buffer in bounded chunks that yield to the event loop so a
+// 16 MiB session log cannot stall GET /sessions/:id/logs for the whole hash.
+const HASH_YIELD_BYTES = 64 * 1024;
+const hashBufferSha256 = async (buffer, { yieldEvery = HASH_YIELD_BYTES } = {}) => {
+  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const hash = createHash('sha256');
+  const stride = Number.isInteger(yieldEvery) && yieldEvery >= 1 ? yieldEvery : HASH_YIELD_BYTES;
+  for (let offset = 0; offset < bytes.length; offset += stride) {
+    hash.update(bytes.subarray(offset, Math.min(offset + stride, bytes.length)));
+    if (offset + stride < bytes.length) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return hash.digest('hex');
+};
+
 // What a responder signature actually covers. Exported because the VERIFIER
 // must build the identical string from what it INTENDED to ask — one shared
 // definition means the two sides cannot drift apart.
@@ -542,14 +558,16 @@ const bearerToken = (request) => {
 // authenticated endpoint cannot add its own check and forget the
 // timing-safe comparison or the 401 response shape.
 //
-// There is no multi-tenant/client_id model here: this collector is a
-// single-operator, loopback-only server bound to one projectRoot per
-// process (see isAllowedHost). The per-session token — 256 bits of random
-// entropy, generated in /session and required by every subsequent /log call
-// for that session — is the actual scoping boundary between concurrent
-// sessions, and this function is what enforces it uniformly.
-const authorizeRequest = (response, suppliedToken, expectedToken) => {
-  if (safeTokenEqual(suppliedToken, expectedToken)) return true;
+// Tenant binding: every session is minted under this collector's projectHash
+// (HMAC of canonical projectRoot). GET /sessions/:id/logs must present that
+// client_id in the query; the per-session token remains the credential that
+// distinguishes concurrent sessions. Both comparisons are timing-safe.
+const authorizeRequest = (response, suppliedToken, expectedToken, tenant) => {
+  const tokenOk = safeTokenEqual(suppliedToken, expectedToken);
+  const tenantOk = tenant === undefined
+    ? true
+    : safeTokenEqual(tenant.supplied, tenant.expected);
+  if (tokenOk && tenantOk) return true;
   sendJson(response, 401, { error: 'unauthorized' });
   return false;
 };
@@ -1275,6 +1293,7 @@ const createDebugServer = ({
           lastActivityAt: Date.now(),
           logFile,
           sessionToken,
+          clientId: projectHash,
           provisional: true,
         });
         try {
@@ -1467,6 +1486,7 @@ const createDebugServer = ({
         sendJson(response, 201, {
           session_id: sessionId,
           session_token: sessionToken,
+          client_id: projectHash,
           log_file: `.debug/${fileName}`,
         });
         return;
@@ -1659,16 +1679,19 @@ const createDebugServer = ({
         const presented = bearerToken(request);
         retireInactiveSessions();
         const session = sessions.get(sessionLogsMatch[1]);
-        // One choke point still decides: select which credential this request
-        // is claiming, then let authorizeRequest do the timing-safe compare
-        // and own the 401 shape. safeTokenEqual is total and constant-time on
-        // both arms, and a request presenting neither token falls through to
-        // the launch-token comparison — so an unknown session is a 401, not a
-        // 404, for anyone who cannot already read every session.
+        // Tenant first, then credential. client_id is this collector's
+        // projectHash, bound onto the session at mint. Missing or mismatched
+        // client_id is 401 — the same shape as a bad token — so an unknown
+        // session without the tenant binding cannot be distinguished from an
+        // unauthorized read of a live one.
+        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
         const expected = session && safeTokenEqual(presented, session.sessionToken)
           ? session.sessionToken
           : token;
-        if (!authorizeRequest(response, presented, expected)) return;
+        if (!authorizeRequest(response, presented, expected, {
+          supplied: query.get('client_id'),
+          expected: session?.clientId || projectHash,
+        })) return;
         if (!session) {
           sendJson(response, 404, { error: 'unknown_session' });
           return;
@@ -1687,8 +1710,7 @@ const createDebugServer = ({
         }
         // Fail-closed query parsing: unknown parameter names are rejected so
         // a typo cannot silently disable a filter and widen what is returned.
-        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
-        const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        const allowedParams = new Set(['client_id', 'hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
         const seenParams = new Set();
         for (const name of query.keys()) {
           // Unknown names AND duplicates are rejected: a typo or a stray
@@ -1761,7 +1783,7 @@ const createDebugServer = ({
             // running digest of the bytes this server appended is the only
             // check that sees it. `copy()` snapshots the incremental hash so
             // the session's own digest stays open for the next append.
-            if (createHash('sha256').update(buffer).digest('hex')
+            if (await hashBufferSha256(buffer)
               !== session.logFileIdentity.contentDigest.copy().digest('hex')) {
               throw new RequestError('session_log_tampered', 409);
             }
@@ -1830,7 +1852,7 @@ const createDebugServer = ({
             method: request.method,
             target: request.url,
             challenge,
-            bodyDigest: createHash('sha256').update(body, 'utf8').digest('hex'),
+            bodyDigest: await hashBufferSha256(Buffer.from(body, 'utf8')),
           }), 'utf8'), responderPrivateKey).toString('base64');
         }
         response.writeHead(200, responseHeaders);
@@ -2861,5 +2883,6 @@ module.exports = {
   redactEventForAppend,
   redactEventValue,
   resolvePowerShellExecutable,
+  hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 };

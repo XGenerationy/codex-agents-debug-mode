@@ -1,7 +1,7 @@
 'use strict';
 
 // All logic for actions/debug-evidence lives here; action.yml is wiring only.
-// Subcommands: start | run | report | teardown | finish, driven by
+// Subcommands: start | run | report | bind-artifact | teardown | finish, driven by
 // DEBUG_ACTION_* env vars. State travels via action-state.json at the
 // OUTPUT-DIR ROOT — deliberately outside the evidence child, because it
 // carries this run's session token and NO ENUMERATED PATH NAMES IT. That is
@@ -13,7 +13,8 @@
 
 const {
   appendFileSync, closeSync, constants, fstatSync, lstatSync, mkdirSync,
-  openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
+  openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync,
+  writeFileSync, writeSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const {
@@ -1287,6 +1288,10 @@ const startSubcommand = async ({
   }
   const sessionId = mint.json.session_id;
   const sessionToken = mint.json.session_token;
+  const clientId = mint.json.client_id;
+  if (typeof clientId !== 'string' || !/^[a-f0-9]{64}$/.test(clientId)) {
+    throw abort('session mint returned no usable client_id');
+  }
   // Masked before the token is used for anything else, and before it is
   // written anywhere.
   maskValue(env, sessionToken, writeStdout);
@@ -1313,10 +1318,10 @@ const startSubcommand = async ({
     }
   }
   // Persist BEFORE releasing the pipes, and kill the child if persisting
-  // fails (Codex T3 #2). teardown stops the collector by reading its pid out
-  // of this file, so a live collector whose state never landed is a collector
-  // nothing can stop: it would hold the port and keep writing session logs
-  // for the rest of the runner's life.
+  // fails (Codex T3 #2). teardown stops the collector from the pid published
+  // as a pre-command start output, not from this file: the wrapped command
+  // can rewrite action-state.json. The pid is still recorded here as a
+  // diagnostic, never as the kill target.
   //
   // Note what is NOT in here: the launch token. The session token that is
   // recorded can append events and read this session's own log back, and
@@ -1330,6 +1335,7 @@ const startSubcommand = async ({
       sessionName: inputs.sessionName,
       sessionId,
       sessionToken,
+      clientId,
       hypothesisId: inputs.hypothesisId,
       hypothesisTitle: inputs.hypothesisTitle,
       failOnCommandFailure: inputs.failOnCommandFailure,
@@ -1365,7 +1371,10 @@ const startSubcommand = async ({
   // invocation's command exists, and why an EARLIER invocation's command in
   // the same job is outside the guarantee (Codex T6 r3 #1).
   if (env.GITHUB_OUTPUT) {
-    writeOutputs(env.GITHUB_OUTPUT, { 'collector-verify-key': startLine.verify_key });
+    writeOutputs(env.GITHUB_OUTPUT, {
+      'collector-verify-key': startLine.verify_key,
+      'collector-pid': String(startLine.pid),
+    });
   }
   // RELEASE the pipes, never destroy them (Codex T3 #1): destroying this end
   // leaves the collector writing into a closed pipe for the rest of the job,
@@ -1386,15 +1395,20 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
   const state = readState(outputDir);
   if (!state) return 0; // start never wrote state — nothing to tear down
   if (rejectForeignNonce(state, env, 'teardown')) return 3;
-  if (!Number.isInteger(state.pid) || state.pid < 1) {
+  // PID comes from start's pre-command step output, not from action-state.json.
+  // The wrapped command can rewrite the state file; it cannot change the
+  // value the runner already parsed out of start's GITHUB_OUTPUT.
+  const rawPid = env.DEBUG_ACTION_COLLECTOR_PID;
+  const pid = Number.parseInt(rawPid, 10);
+  if (!Number.isInteger(pid) || pid < 1 || String(pid) !== String(rawPid).trim()) {
     process.stderr.write('debug-evidence-action: teardown: recorded state carries no usable pid.\n');
     return 3;
   }
   try {
-    kill(state.pid);
+    kill(pid);
   } catch (error) {
     if (error?.code === 'ESRCH') return 0; // already gone — success, not a leak
-    process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${state.pid}: ${error?.code ?? error}\n`);
+    process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${pid}: ${error?.code ?? error}\n`);
     return 3;
   }
   return 0;
@@ -1507,8 +1521,8 @@ const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', 
 // the report carry the real session id, which the CLI could only derive from
 // a filename — the staged copy is called session.log, so the CLI rendered
 // every report as "(file)".
-const defaultRenderReport = (sessionText, sessionId, { caveats = [] } = {}) => {
-  const report = buildReport(parseSessionText(sessionText), { sessionId, caveats });
+const defaultRenderReport = (sessionText, sessionId, { caveats = [], capturedAt = null } = {}) => {
+  const report = buildReport(parseSessionText(sessionText), { sessionId, caveats, capturedAt });
   return { markdown: renderMarkdown(report), json: renderJson(report) };
 };
 
@@ -1517,7 +1531,19 @@ const defaultRenderReport = (sessionText, sessionId, { caveats = [] } = {}) => {
 // in-memory payload leaves the process, and injecting it is how a test can
 // prove the digests describe the payload rather than whatever ended up on
 // disk.
-const defaultStageFile = (filePath, bytes) => writeFileSync(filePath, bytes);
+const defaultStageFile = (filePath, bytes) => {
+  try { unlinkSync(filePath); } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+    | (constants.O_NOFOLLOW || 0);
+  const fd = openSync(filePath, flags, 0o444);
+  try {
+    writeSync(fd, bytes);
+  } finally {
+    closeSync(fd);
+  }
+};
 
 // Rebuild the collector's public verification key from the SPKI DER base64
 // that travelled as a step output. Anything unparsable is treated as no key
@@ -1544,7 +1570,7 @@ const responderVerifyKey = (encoded) => {
 //
 // The key is public, so this is verification, not a shared secret: nothing
 // here could sign anything even if the whole environment leaked.
-const verifyResponderProof = ({ verifyKey, sessionId, challenge, text, proof }) => {
+const verifyResponderProof = ({ verifyKey, sessionId, clientId, challenge, text, proof }) => {
   if (verifyKey === null || typeof proof !== 'string' || proof === '') return false;
   const signature = Buffer.from(proof, 'base64');
   // Ed25519 signatures are exactly 64 bytes; anything else is not one, and
@@ -1552,7 +1578,7 @@ const verifyResponderProof = ({ verifyKey, sessionId, challenge, text, proof }) 
   if (signature.length !== 64) return false;
   const record = Buffer.from(canonicalResponderRecord({
     method: 'GET',
-    target: `/sessions/${sessionId}/logs`,
+    target: `/sessions/${sessionId}/logs?client_id=${clientId}`,
     challenge,
     bodyDigest: createHash('sha256').update(text, 'utf8').digest('hex'),
   }), 'utf8');
@@ -1592,6 +1618,22 @@ const EVIDENCE_FILES = ['session.log', 'report.md', 'report.json'];
 // because all three callers must fail the same way — run clearing on entry,
 // report clearing what it will not publish, and report refusing an invocation
 // it cannot identify.
+const dropSubstitutedStagedFiles = (evidenceDir) => {
+  for (const name of EVIDENCE_FILES) {
+    const staged = path.join(evidenceDir, name);
+    let info;
+    try {
+      info = lstatSync(staged);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (info.isSymbolicLink() || !info.isFile()) {
+      rmSync(staged, { recursive: true, force: true });
+    }
+  }
+};
+
 const clearStagedEvidence = (evidenceDir, names = EVIDENCE_FILES) => {
   mkdirSync(evidenceDir, { recursive: true });
   for (const name of names) {
@@ -1697,14 +1739,18 @@ const UNREACHABLE_READ = /^live_read_(connect_failed|timeout|unauthorized)/;
 // divergence is exactly what the comparison is meant to catch.
 //
 // Only payloads that exist appear; a run that staged nothing claims nothing.
-const payloadDigestLine = (payloads) => {
+const payloadDigestLine = (payloads, { capturedAt } = {}) => {
   const parts = [];
   for (const name of EVIDENCE_FILES) {
     const bytes = payloads[name];
     if (bytes === undefined) continue;
     parts.push(`${name}=${createHash('sha256').update(bytes, 'utf8').digest('hex')}`);
   }
-  return parts.length === 0 ? null : `evidence-sha256 ${parts.join(' ')}`;
+  if (parts.length === 0) return null;
+  if (typeof capturedAt === 'string' && capturedAt !== '') {
+    parts.unshift(`capturedAt=${capturedAt}`);
+  }
+  return `evidence-sha256 ${parts.join(' ')}`;
 };
 
 // One diagnostic is one line. The values interpolated into run's capture
@@ -1862,6 +1908,10 @@ const runSubcommand = async ({
     process.stderr.write('debug-evidence-action: run: recorded state carries no session; the start step never completed its mint.\n');
     return 3;
   }
+  if (typeof state.clientId !== 'string' || !/^[a-f0-9]{64}$/.test(state.clientId)) {
+    process.stderr.write('debug-evidence-action: run: recorded state carries no usable client_id; capture cannot bind the session to this tenant.\n');
+    return 3;
+  }
   // Read from THIS process's environment, before the wrapped command exists.
   // From the environment only, never from state: the key is public, so its
   // secrecy does not matter, but its INTEGRITY is everything — a same-user
@@ -1947,15 +1997,16 @@ const runSubcommand = async ({
         // token and still leave capture possible.
         token: state.sessionToken,
         sessionId: state.sessionId,
+        clientId: state.clientId,
         timeoutMs: LIVE_READ_TIMEOUT_MS,
         deadlineMs: LIVE_READ_DEADLINE_MS,
         challenge,
       });
       if (!verifyResponderProof({
-        verifyKey, sessionId: state.sessionId, challenge, text: answer.text, proof: answer.proof,
+        verifyKey, sessionId: state.sessionId, clientId: state.clientId, challenge, text: answer.text, proof: answer.proof,
       })) {
         readFailure = 'responder_proof_invalid';
-        process.stderr.write(oneLine(`debug-evidence-action: run: whatever served session ${state.sessionId} on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
+        process.stderr.write(oneLine(`debug-evidence-action: run: whatever served this session on port ${state.port} could not prove it is this run's collector; refusing to treat its answer as evidence.`) + '\n');
       } else {
         entries = answer.entries;
         // The bytes the proof covers, and the only copy anything downstream
@@ -1990,7 +2041,7 @@ const runSubcommand = async ({
     // the step itself fails below, so unverifiable bytes can be inspected but
     // can never ride a green build. Read into memory like every other payload
     // — a copyFileSync would put the render back on a pathname.
-    process.stderr.write(oneLine(`debug-evidence-action: run: no collector on port ${state.port} would serve session ${state.sessionId} (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence and failing this step.`) + '\n');
+    process.stderr.write(oneLine(`debug-evidence-action: run: no collector on port ${state.port} would serve this session (${readFailure}); staging the on-disk log as UNAUTHENTICATED partial evidence and failing this step.`) + '\n');
     try {
       payloads['session.log'] = readFileSync(path.join(state.projectRoot, '.debug', `debug-${state.sessionId}.log`), 'utf8');
     } catch (error) {
@@ -2002,9 +2053,10 @@ const runSubcommand = async ({
     // session, a torn line, an unprovable responder. Falling back to the file
     // on disk would stage precisely the bytes nothing will vouch for, so this
     // is an evidence-integrity failure and nothing else.
-    process.stderr.write(oneLine(`debug-evidence-action: run: the collector refused to serve session ${state.sessionId} (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
+    process.stderr.write(oneLine(`debug-evidence-action: run: the collector refused to serve this session (${readFailure}); the on-disk log is not a substitute for it.`) + '\n');
   }
   const evidenceCopied = payloads['session.log'] !== undefined;
+  const capturedAt = new Date().toISOString();
   let reportRendered = false;
   let eventCount = '';
   if (evidenceCopied) {
@@ -2018,6 +2070,7 @@ const runSubcommand = async ({
       // record labels as `unknown`, never as met.
       rendered = renderReport(payloads['session.log'], state.sessionId, {
         caveats: admissionCaveats(state.admission, state.evidenceTrust, state.nonce),
+        capturedAt,
       });
     } catch (error) {
       process.stderr.write(oneLine(`debug-evidence-action: run: renderer failed (${error?.message ?? error}).`) + '\n');
@@ -2038,7 +2091,7 @@ const runSubcommand = async ({
   // describes what this invocation decided to stage, so anything that reaches
   // the files afterwards is a mismatch rather than a blessing. Computing it
   // from the files instead would hand a swap the step log's endorsement.
-  const digestLine = payloadDigestLine(payloads);
+  const digestLine = payloadDigestLine(payloads, { capturedAt });
   const stagedNames = EVIDENCE_FILES.filter((name) => payloads[name] !== undefined);
   for (const name of stagedNames) stageFile(path.join(evidenceDir, name), payloads[name]);
   // Printed as soon as the bytes exist and BEFORE the ownership commit: this
@@ -2169,6 +2222,7 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
   // before the wrapped command existed (Codex T6 r2 #1).
   if (requireInvocationNonce(env, 'report')) return 3;
   const evidenceDir = resolveEvidenceDir(outputDir, env.DEBUG_ACTION_INVOCATION_NONCE);
+  dropSubstitutedStagedFiles(evidenceDir);
   const state = readState(outputDir);
   // Is this invocation's own run what wrote these slots? Absent state and a
   // foreign nonce both mean no, and in both cases whatever is sitting in the
@@ -2224,6 +2278,19 @@ const reportSubcommand = ({ outputDir, env = process.env }) => {
 // be defeated, and defeating them buys nothing. What remains genuinely this
 // step's is the command-failure mirror, which is not security-critical: a
 // hostile wrapped command chooses its own exit code regardless.
+const bindArtifactSubcommand = ({ env = process.env, writeStdout = (text) => process.stdout.write(text) }) => {
+  if (requireInvocationNonce(env, 'bind-artifact')) return 3;
+  const id = String(env.DEBUG_ACTION_ARTIFACT_ID || '');
+  const digest = String(env.DEBUG_ACTION_ARTIFACT_DIGEST || '').replace(/^sha256:/i, '');
+  if (id === '' && digest === '') return 0;
+  if (!/^[0-9]+$/.test(id) || !/^[a-f0-9]{64}$/i.test(digest)) {
+    process.stderr.write('debug-evidence-action: bind-artifact: upload reported an unusable artifact identity.\n');
+    return 3;
+  }
+  writeStdout(`evidence-artifact id=${id} digest=sha256:${digest.toLowerCase()}\n`);
+  return 0;
+};
+
 const finishSubcommand = ({ outputDir, env = process.env }) => {
   if (requireInvocationNonce(env, 'finish')) return 3;
   const state = readState(outputDir);
@@ -2312,12 +2379,14 @@ const main = async () => {
       process.exitCode = await runSubcommand({ inputs, outputDir, env });
     } else if (subcommand === 'report') {
       process.exitCode = reportSubcommand({ outputDir, env });
+    } else if (subcommand === 'bind-artifact') {
+      process.exitCode = bindArtifactSubcommand({ env });
     } else if (subcommand === 'teardown') {
       process.exitCode = teardownSubcommand({ outputDir, env });
     } else if (subcommand === 'finish') {
       process.exitCode = finishSubcommand({ outputDir, env });
     } else {
-      throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use start, run, report, teardown, or finish.`);
+      throw new Error(`Unknown subcommand: ${subcommand ?? '(none)'}. Use start, run, report, bind-artifact, teardown, or finish.`);
     }
   } catch (error) {
     const secrets = collectStateSecrets(readState(outputDir));
@@ -2338,6 +2407,7 @@ module.exports = {
   defaultSpawnCommand,
   defaultSpawnShim,
   finishSubcommand,
+  bindArtifactSubcommand,
   httpRequestJson,
   detectSudoBinary,
   evaluateAdmission,

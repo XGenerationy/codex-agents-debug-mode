@@ -386,9 +386,12 @@ runs:
       #    retention-days, compression-level, overwrite, include-hidden-files)
       #    and hardcodes `followSymbolicLinks: true` with
       #    `implicitDescendants: true` in its glob options — verified against
-      #    the pinned SHA. A swap inside the staging window can therefore
-      #    substitute a link to an unrelated readable file. Same answer: the
-      #    digest describes what run staged, not what the artifact carries.
+      #    the pinned SHA. `report` unlinks any staged symlink or non-file
+      #    before this step so a post-hash substitution cannot ride the
+      #    upload. Capture timestamp lives on the digest line and in
+      #    report.json; bind-artifact records the uploader's artifact-id and
+      #    artifact-digest.
+      id: upload
       if: ${{ always() && steps.start.outputs.evidence-dir != '' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
@@ -398,6 +401,22 @@ runs:
           ${{ steps.start.outputs.evidence-dir }}/report.md
           ${{ steps.start.outputs.evidence-dir }}/report.json
         if-no-files-found: ignore
+
+    - name: Bind artifact identity
+      # The uploader's artifact-id and artifact-digest are the immutable
+      # reference the in-memory payload hashes cannot be: they name what
+      # GitHub stored, after the upload, not a path the wrapped command can
+      # still rewrite. Empty when nothing was uploaded (if-no-files-found:
+      # ignore). Identity travels from start's pre-command output so a
+      # rewritten state file cannot bind a stranger's artifact.
+      if: ${{ always() && steps.upload.outcome == 'success' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+        DEBUG_ACTION_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        DEBUG_ACTION_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+      run: node "${{ github.action_path }}/support.js" bind-artifact
 
     - name: Stop collector
       # THIS ACTION'S OWN TEARDOWN. The collector is detached and outlives the
@@ -437,6 +456,7 @@ runs:
       env:
         DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
         DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+        DEBUG_ACTION_COLLECTOR_PID: ${{ steps.start.outputs.collector-pid }}
       run: node "${{ github.action_path }}/support.js" teardown
 
     - name: Apply verdict

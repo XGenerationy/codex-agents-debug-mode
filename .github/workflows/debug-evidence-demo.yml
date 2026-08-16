@@ -128,7 +128,12 @@ jobs:
           REPORT_PATH: ${{ steps.demo.outputs.report-path }}
         run: |
           set -euo pipefail
-          echo "command-exit-code=$EXIT_CODE event-count=$EVENT_COUNT session-id=$SESSION_ID"
+          if [ -n "$SESSION_ID" ]; then
+            SESSION_PRESENT=yes
+          else
+            SESSION_PRESENT=no
+          fi
+          echo "command-exit-code=$EXIT_CODE event-count=$EVENT_COUNT session-present=$SESSION_PRESENT"
           echo "$DIGEST"
           test "$EXIT_CODE" = "1"
           test "$EVENT_COUNT" = "4"
@@ -364,8 +369,28 @@ jobs:
           SECOND_REPORT: ${{ steps.second.outputs.report-path }}
         run: |
           set -euo pipefail
-          echo "first:  session=$FIRST_SESSION exit=$FIRST_EXIT report=$FIRST_REPORT"
-          echo "second: session=$SECOND_SESSION exit=$SECOND_EXIT report=$SECOND_REPORT"
+          if [ -n "$FIRST_SESSION" ]; then
+            FIRST_SESSION_PRESENT=yes
+          else
+            FIRST_SESSION_PRESENT=no
+          fi
+          if [ -n "$FIRST_REPORT" ]; then
+            FIRST_REPORT_PRESENT=yes
+          else
+            FIRST_REPORT_PRESENT=no
+          fi
+          if [ -n "$SECOND_SESSION" ]; then
+            SECOND_SESSION_PRESENT=yes
+          else
+            SECOND_SESSION_PRESENT=no
+          fi
+          if [ -n "$SECOND_REPORT" ]; then
+            SECOND_REPORT_PRESENT=yes
+          else
+            SECOND_REPORT_PRESENT=no
+          fi
+          echo "first:  session-present=$FIRST_SESSION_PRESENT exit=$FIRST_EXIT report-present=$FIRST_REPORT_PRESENT"
+          echo "second: session-present=$SECOND_SESSION_PRESENT exit=$SECOND_EXIT report-present=$SECOND_REPORT_PRESENT"
           test -n "$FIRST_SESSION"
           test -n "$SECOND_SESSION"
           test "$FIRST_SESSION" != "$SECOND_SESSION"

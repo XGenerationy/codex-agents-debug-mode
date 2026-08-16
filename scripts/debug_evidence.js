@@ -244,8 +244,10 @@ const resolveSessionRef = (projectRoot, ref) => {
 const LIVE_READ_MAX_BYTES = 64 * 1024 * 1024;
 const LIVE_READ_DEADLINE_MS = 60000;
 
+const CLIENT_ID_PATTERN = /^[a-f0-9]{64}$/;
+
 const readSessionLive = ({
-  port, token, sessionId, filters = {}, timeoutMs = 5000,
+  port, token, sessionId, clientId, filters = {}, timeoutMs = 5000,
   deadlineMs = LIVE_READ_DEADLINE_MS, maxBytes = LIVE_READ_MAX_BYTES, challenge,
 }) => new Promise((resolve, reject) => {
   // Reject a non-integer or sub-1 bound before it can disable the check it
@@ -275,6 +277,10 @@ const readSessionLive = ({
     reject(new Error(`invalid_session_ref:${sessionId}`));
     return;
   }
+  if (typeof clientId !== 'string' || !CLIENT_ID_PATTERN.test(clientId)) {
+    reject(new Error('invalid_client_id'));
+    return;
+  }
   // hypothesisId/runId must be validated and trimmed through the SAME
   // normalizeJoinKeyFilter helper filterEntries uses, before being
   // serialized into the query string. Without this, a non-string value
@@ -301,6 +307,7 @@ const readSessionLive = ({
     return;
   }
   const query = new URLSearchParams();
+  query.set('client_id', clientId);
   for (const [key, value] of Object.entries(filters)) {
     if (key === 'hypothesisId' || key === 'runId') continue;
     if (value !== undefined) query.set(key, String(value));
@@ -420,7 +427,7 @@ const readSessionLive = ({
 // on session size and now by readSessionLive's timeoutMs on any single
 // poll. Task 3/4 choose their poll interval knowing this cost rather than
 // polling aggressively.
-const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
+const createSessionTail = ({ port, token, sessionId, clientId, timeoutMs }) => {
   let seen = 0;
   // Single-flight guard: the viewer polls on a timer, and a slow collector
   // can let a second poll start before the first settles. poll() reads the
@@ -434,7 +441,7 @@ const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
       if (inFlight) return inFlight;
       inFlight = (async () => {
         try {
-          const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
+          const entries = await readSessionLive({ port, token, sessionId, clientId, timeoutMs });
           const fresh = entries.slice(seen);
           seen = entries.length;
           return fresh;

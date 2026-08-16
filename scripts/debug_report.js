@@ -61,7 +61,7 @@ const parseArgs = (args) => {
   return { positional, format };
 };
 
-const buildReport = (entries, { sessionId = null, caveats = [] } = {}) => {
+const buildReport = (entries, { sessionId = null, caveats = [], capturedAt = null } = {}) => {
   const folded = foldHypotheses(entries);
   let events = 0;
   let hypothesisLines = 0;
@@ -118,6 +118,7 @@ const buildReport = (entries, { sessionId = null, caveats = [] } = {}) => {
     session: {
       id: sessionId, entries: entries.length, events, hypothesisLines, otherTypedLines,
     },
+    capturedAt: typeof capturedAt === 'string' && capturedAt !== '' ? capturedAt : null,
     // Labels that have to travel WITH the evidence rather than living only in
     // whatever log produced it: a reader holding the artifact and not the job
     // must still see them. Callers pass the wording; this only guarantees the

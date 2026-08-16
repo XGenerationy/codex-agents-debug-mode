@@ -16,6 +16,16 @@ const {
   readSessionLive,
   resolveSessionRef,
 } = require('./debug_evidence');
+const { probeServer } = require('./debug_server');
+
+const liveCollector = async (projectRoot) => {
+  const collector = await discoverCollector(projectRoot);
+  const identity = await probeServer(collector.port);
+  if (!identity || typeof identity.project_hash !== 'string') {
+    throw new Error('collector_not_running');
+  }
+  return { ...collector, clientId: identity.project_hash };
+};
 
 const USAGE = 'Usage: debug_viewer.js [projectRoot] --session <id|path> '
   + '[--hypothesis <id>] [--type all|event|hypothesis] [--since <ISO>] '
@@ -99,7 +109,7 @@ const runAgentMode = async (parsed) => {
     // filters (GET-parity guaranteed by the core's test), emit the raw
     // stored lines byte-verbatim. Errors (collector_not_running,
     // live_read_*) propagate to main's catch: one line, exit 1.
-    const collector = await discoverCollector(parsed.projectRoot);
+    const collector = await liveCollector(parsed.projectRoot);
     const entries = await readSessionLive({ ...collector, sessionId: parsed.session, filters: parsed.filters });
     for (const entry of entries) process.stdout.write(`${entry.raw}\n`);
     return 0;
@@ -260,7 +270,7 @@ const main = async () => {
   let liveUnavailableReason;
   if (!parsed.forceFile) {
     try {
-      const collector = await discoverCollector(parsed.projectRoot);
+      const collector = await liveCollector(parsed.projectRoot);
       tail = createSessionTail({ ...collector, sessionId });
       entries = await tail.poll();
       live = true;

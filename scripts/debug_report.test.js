@@ -41,6 +41,12 @@ test('buildReport counts events vs hypothesis lines and groups tagged events per
   assert.equal(h1.status, 'OPEN');
   assert.equal(h1.title, 'null id');
   assert.equal(h1.events, 2);
+  assert.equal(report.capturedAt, null);
+});
+
+test('buildReport records a capture timestamp when the caller supplies one', () => {
+  const report = buildReport(SESSION, { sessionId: 'demo-abc', capturedAt: '2026-08-16T22:00:00.000Z' });
+  assert.equal(report.capturedAt, '2026-08-16T22:00:00.000Z');
 });
 
 test('buildReport renders recorded statuses only — it never invents a verdict', () => {

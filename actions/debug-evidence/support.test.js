@@ -5,7 +5,7 @@ const { createHash, createPublicKey, generateKeyPairSync, sign } = require('node
 const { EventEmitter } = require('node:events');
 const {
   appendFileSync, closeSync, constants, existsSync, openSync, readFileSync, readdirSync,
-  unlinkSync, utimesSync, writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync,
+  unlinkSync, utimesSync, writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, chmodSync,
 } = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -29,6 +29,7 @@ const {
   defaultSpawnCommand,
   defaultSpawnShim,
   finishSubcommand,
+  bindArtifactSubcommand,
   httpRequestJson,
   maskValue,
   actionInputsFromEnv,
@@ -52,8 +53,22 @@ const {
   validateActionInputs,
   withStateLock,
   writeOutputs,
-  writeState,
+  writeState: writeStateRaw,
 } = require('./support');
+
+const CLIENT_ID = 'a'.repeat(64);
+const writeState = (outputDir, state, options) => {
+  if (
+    state
+    && typeof state === 'object'
+    && typeof state.sessionId === 'string'
+    && state.sessionId !== ''
+    && !Object.hasOwn(state, 'clientId')
+  ) {
+    return writeStateRaw(outputDir, { clientId: CLIENT_ID, ...state }, options);
+  }
+  return writeStateRaw(outputDir, state, options);
+};
 
 const makeTempDir = () => mkdtempSync(path.join(os.tmpdir(), 'debug-evidence-action-'));
 
@@ -64,10 +79,14 @@ const makeTempDir = () => mkdtempSync(path.join(os.tmpdir(), 'debug-evidence-act
 // `runEnv` stands in for the verification-key one — because all four fail
 // closed without it. Read from the state file rather than passed in, so the
 // tests that let `start` mint its own random nonce work unchanged.
-const invocationEnv = (outputDir, extra = {}) => ({
-  DEBUG_ACTION_INVOCATION_NONCE: readState(outputDir)?.nonce,
-  ...extra,
-});
+const invocationEnv = (outputDir, extra = {}) => {
+  const state = readState(outputDir);
+  return {
+    DEBUG_ACTION_INVOCATION_NONCE: state?.nonce,
+    ...(state?.pid ? { DEBUG_ACTION_COLLECTOR_PID: String(state.pid) } : {}),
+    ...extra,
+  };
+};
 
 // The staged evidence child is INVOCATION-SCOPED (Codex T6 r1 #3), so naming
 // it takes the same identity the production steps are handed. Resolved from
@@ -118,7 +137,7 @@ const fakeChild = () => {
 // start owns the mint now, so every fake-shim test has to get past the port
 // challenge and POST /session before it reaches the behaviour it is actually
 // about. These are the two seams that do it.
-const MINTED = { status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43) } };
+const MINTED = { status: 201, json: { session_id: 'ci-debug-abc', session_token: 'z'.repeat(43), client_id: 'a'.repeat(64) } };
 const mintSeams = { probeToken: async () => true, request: async () => MINTED };
 
 // What readSessionLive rejects with when nothing is listening on the port.
@@ -150,7 +169,7 @@ const IMPOSTOR_KEYS = generateKeyPairSync('ed25519');
 // Sign exactly what the collector signs: the canonical record, imported from
 // the collector itself so a drift between the two definitions is impossible to
 // write by accident. `target` defaults to the unfiltered form capture asks for.
-const proofFor = (privateKey, challenge, text, target = '/sessions/ci-debug-abc/logs') => sign(
+const proofFor = (privateKey, challenge, text, target = `/sessions/ci-debug-abc/logs?client_id=${CLIENT_ID}`) => sign(
   null,
   Buffer.from(canonicalResponderRecord({
     method: 'GET',
@@ -313,6 +332,8 @@ test('start boots a real collector, mints the session, and records state that ca
     const emitted = readFileSync(githubOutput, 'utf8');
     assert.match(emitted, /^invocation-nonce=[A-Za-z0-9_-]{8,64}$/m, 'the nonce travels as a step output');
     assert.equal(emitted.includes(`invocation-nonce=${state.nonce}`), true, 'and it is the nonce the state records');
+    assert.match(emitted, /^collector-pid=\d+$/m, 'the collector pid travels as a step output for teardown');
+    assert.equal(emitted.includes(`collector-pid=${state.pid}`), true, 'and it is the pid the start handshake recorded');
     assert.ok(!emitted.includes(state.sessionToken), 'no credential enters a step output');
   } finally {
     teardownSubcommand({ outputDir, env: invocationEnv(outputDir) });
@@ -426,6 +447,77 @@ test('a teardown kill that fails for anything but ESRCH is a 3 that names the pi
   assert.match(written, /teardown: failed to stop collector pid 4242: EPERM/);
 });
 
+test('teardown signals the start-output pid, never a rewritten state.pid', () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 1111 });
+  const killed = [];
+  assert.equal(teardownSubcommand({
+    outputDir,
+    env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', DEBUG_ACTION_COLLECTOR_PID: '4242' },
+    kill: (pid) => killed.push(pid),
+  }), 0);
+  assert.deepEqual(killed, [4242], 'the kill target is the pre-command pid, not the mutated state field');
+});
+
+test('teardown refuses when the start-output pid is absent even if state records one', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 4242 });
+  const killed = [];
+  const { written } = await captureStderr(() => {
+    assert.equal(teardownSubcommand({
+      outputDir,
+      env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' },
+      kill: (pid) => killed.push(pid),
+    }), 3);
+  });
+  assert.deepEqual(killed, [], 'a pid taken from mutable state is never signalled');
+  assert.match(written, /recorded state carries no usable pid/);
+});
+
+test('bind-artifact records an immutable artifact id and digest, and no-ops when upload produced none', async () => {
+  const printed = [];
+  assert.equal(bindArtifactSubcommand({
+    env: {
+      DEBUG_ACTION_INVOCATION_NONCE: 'n1',
+      DEBUG_ACTION_ARTIFACT_ID: '42',
+      DEBUG_ACTION_ARTIFACT_DIGEST: 'sha256:' + 'ab'.repeat(32),
+    },
+    writeStdout: (text) => printed.push(text),
+  }), 0);
+  assert.deepEqual(printed, [`evidence-artifact id=42 digest=sha256:${'ab'.repeat(32)}\n`]);
+  assert.equal(bindArtifactSubcommand({
+    env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1' },
+    writeStdout: () => { throw new Error('empty upload must not print a binding'); },
+  }), 0);
+  const { written } = await captureStderr(() => {
+    assert.equal(bindArtifactSubcommand({
+      env: {
+        DEBUG_ACTION_INVOCATION_NONCE: 'n1',
+        DEBUG_ACTION_ARTIFACT_ID: 'not-a-number',
+        DEBUG_ACTION_ARTIFACT_DIGEST: 'ab'.repeat(32),
+      },
+    }), 3);
+  });
+  assert.match(written, /unusable artifact identity/);
+});
+
+test('report unlinks a post-hash symlink substitution so upload cannot follow it', () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, {
+    nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    reportRendered: true, evidenceCopied: true,
+  });
+  const evidenceDir = resolveEvidenceDir(outputDir, 'n1');
+  mkdirSync(evidenceDir, { recursive: true });
+  const secret = path.join(outputDir, 'action-state.json');
+  symlinkSync(secret, path.join(evidenceDir, 'session.log'));
+  writeFileSync(path.join(evidenceDir, 'report.md'), '## report\n');
+  writeFileSync(path.join(evidenceDir, 'report.json'), '{"schema":1,"session":{"events":0}}\n');
+  assert.equal(reportSubcommand({ outputDir, env: invocationEnv(outputDir) }), 0);
+  assert.equal(existsSync(path.join(evidenceDir, 'session.log')), false,
+    'a symlink left in a staged slot is dropped before the uploader can follow it');
+});
+
 // A fresh job whose `start` fails early hands teardown NO nonce. Pointed at a
 // REUSED custom output-dir, the lenient check let it read that directory's
 // stale state and kill(state.pid) — a pid belonging to another invocation, or
@@ -492,12 +584,27 @@ const sudoPresent = (...paths) => `present: ${paths.length} at sha256=${
 const assertOneDigest = (printed, expected = null) => {
   const digests = printed.filter((text) => text.startsWith('evidence-sha256'));
   assert.equal(digests.length, 1, 'exactly one digest line');
-  if (expected !== null) assert.deepEqual(digests, [`${expected}\n`], 'over the expected bytes');
+  if (expected !== null) {
+    if (expected instanceof RegExp) assert.match(digests[0], expected);
+    else assert.deepEqual(digests, [`${expected}\n`], 'over the expected bytes');
+  }
   for (const text of printed) {
     assert.ok(text.startsWith('evidence-sha256') || text.startsWith('evidence-qualification'),
       `run wrote something that is neither a digest nor a qualification: ${text}`);
   }
   return digests[0];
+};
+
+const stagedDigestBody = (evidenceDir) => ['session.log', 'report.md', 'report.json']
+  .filter((name) => existsSync(path.join(evidenceDir, name)))
+  .map((name) => `${name}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex')}`)
+  .join(' ');
+
+const assertStagedDigest = (printed, evidenceDir, label = 'over the bytes actually staged') => {
+  const line = assertOneDigest(printed).trim();
+  assert.match(line, /^evidence-sha256 capturedAt=\S+ /, label);
+  assert.equal(line.replace(/^evidence-sha256 capturedAt=\S+ /, ''), stagedDigestBody(evidenceDir), label);
+  return line;
 };
 
 const assertQualifiedDigest = (printed, digestIndex) => {
@@ -2245,7 +2352,7 @@ test('start masks each token the moment it exists and in the order it is used, b
     request: async ({ path: requestPath }) => {
       ledger.push(`request ${requestPath}`);
       return requestPath === '/session'
-        ? { status: 201, json: { session_id: 'ci-debug-abc', session_token: sessionToken } }
+        ? { status: 201, json: { session_id: 'ci-debug-abc', session_token: sessionToken, client_id: 'a'.repeat(64) } }
         : { status: 202, json: { status: 'recorded' } };
     },
     writeStdout: (text) => ledger.push(text),
@@ -2305,7 +2412,7 @@ test('run re-registers the session token with the runner before handing it to a 
   assert.equal(ledger[1], 'spawn');
   const digestEntry = ledger.findIndex((entry) => entry.startsWith('evidence-sha256'));
   assert.ok(digestEntry > 1, 'the digest comes after the spawn, not before it');
-  assert.match(ledger[digestEntry], /^evidence-sha256 session\.log=[0-9a-f]{64} /);
+  assert.match(ledger[digestEntry], /^evidence-sha256 capturedAt=\S+ session\.log=[0-9a-f]{64} /);
   // The only thing between them is the admission record run mirrors beside the
   // digest, and nothing follows it.
   for (const entry of ledger.slice(2, digestEntry)) {
@@ -2418,7 +2525,7 @@ test('a fresh lock held by another invocation makes the commit fail bounded, nev
   const outputDir = makeTempDir();
   const recorded = {
     nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
-    sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+    sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43), clientId: CLIENT_ID,
   };
   writeState(outputDir, recorded);
   const githubOutput = path.join(outputDir, 'github_output');
@@ -2654,6 +2761,7 @@ test('run captures the session from the collector, renders md+json, emits output
     const reportJson = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
     assert.equal(reportJson.schema, 1);
     assert.equal(reportJson.hypotheses[0].status, 'OPEN');
+    assert.match(reportJson.capturedAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.ok(readFileSync(context.stepSummary, 'utf8').includes('## Debug evidence report'));
     const outputs = readFileSync(context.githubOutput, 'utf8');
     assert.match(outputs, /event-count=\d+/);
@@ -2673,10 +2781,7 @@ test('run captures the session from the collector, renders md+json, emits output
     // the same composite action, so a detached child CAN rewrite these files
     // in between. The step log cannot be revised once streamed, so a digest
     // printed here is the record an artifact is checked against (Codex T5 r3).
-    const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
-      .map((file) => `${file}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, file))).digest('hex')}`)
-      .join(' ')}`;
-    assertOneDigest(printed, expected, 'over the bytes actually staged');
+    const expected = assertStagedDigest(printed, evidenceDir, 'over the bytes actually staged');
     assert.ok(outputs.includes(`evidence-digest=${expected}\n`),
       'and the same content on the machine surface, so either can be compared against the artifact');
     assert.equal(state.collectorAlive, true, 'the collector answered an authenticated challenge');
@@ -2972,7 +3077,7 @@ test('a collector that merely died still stages the labeled partial log, still f
   assert.ok(readFileSync(path.join(evidenceDirOf(outputDir), 'session.log'), 'utf8')
     .includes('the last thing the collector wrote down'),
     'and it is still there after the publish step, for the upload step to take');
-  assert.match(written, /no collector on port 1 would serve session ci-debug-abc/);
+  assert.match(written, /no collector on port 1 would serve this session/);
   assert.match(written, /UNAUTHENTICATED partial evidence and failing this step/,
     'the step log says both what was staged and what it cost');
   assert.equal(finishSubcommand({ outputDir, env: invocationEnv(outputDir) }), 3, 'finish agrees; the job was already red');
@@ -3836,10 +3941,7 @@ test('render and digest never re-read the staged path: the payload is one immuta
   assert.equal(reportJson.hypotheses[0].status, 'OPEN');
   assert.ok(!readFileSync(path.join(evidenceDir, 'report.md'), 'utf8').includes('FORGED mid-flight'));
   // Every digest describes the bytes this invocation decided to stage.
-  const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
-    .map((file) => `${file}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, file))).digest('hex')}`)
-    .join(' ')}`;
-  assertOneDigest(printed, expected);
+  const expected = assertStagedDigest(printed, evidenceDir);
   assert.ok(readFileSync(githubOutput, 'utf8').includes(`evidence-digest=${expected}\n`));
 });
 
@@ -3862,7 +3964,9 @@ test('a swap after staging is DETECTABLE: the logged digests still describe what
     // is streamed and immutable, and the digests in it describe the capture,
     // not whatever is on disk at upload time.
     for (const name of ['session.log', 'report.md', 'report.json']) {
-      writeFileSync(path.join(evidenceDir, name), 'swapped after the fact\n');
+      const staged = path.join(evidenceDir, name);
+      chmodSync(staged, 0o644);
+      writeFileSync(staged, 'swapped after the fact\n');
       const actual = createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex');
       assert.equal(logged.includes(`${name}=${actual}`), false,
         `${name}: the swapped bytes must not match the digest that was logged`);
@@ -3927,7 +4031,9 @@ const relayCollector = async (realPort, extraQuery) => {
       port: realPort,
       // The whole attack in one line: the caller asked for the session, we ask
       // for a slice of it, and the collector signs what it was asked for.
-      path: `${request.url}${extraQuery}`,
+      path: request.url.includes('?')
+        ? `${request.url}&${extraQuery.replace(/^\?/, '')}`
+        : `${request.url}${extraQuery}`,
       method: 'GET',
       // Everything the caller sent, including its Bearer token and its fresh
       // challenge — with Host rewritten, which any relay must do and which the
@@ -3990,7 +4096,10 @@ test('a relay that filters the real collector\'s answer is refused: the signatur
       const code = await captureViaRun({ outputDir: context.outputDir, env: context.runEnv, inputs: context.inputs });
       assert.equal(code, 3, 'a validly signed answer to a DIFFERENT question is not evidence');
       assert.equal(relay.targets.length, 1, 'the relay was asked exactly once');
-      assert.equal(relay.targets[0].includes('?'), false, 'capture asked for the whole session, unfiltered');
+      assert.match(relay.targets[0], /\?client_id=[a-f0-9]{64}$/,
+        'capture asked for the whole session, tenant-scoped and otherwise unfiltered');
+      assert.equal(relay.targets[0].includes('type='), false);
+      assert.equal(relay.targets[0].includes('limit='), false);
       const after = readState(context.outputDir);
       assert.equal(after.collectorAlive, false);
       assert.equal(after.evidenceCopied, false);
@@ -5104,6 +5213,7 @@ test('action.yml declares exactly the steps this action runs, in the order the a
     'Run wrapped command',
     'Render evidence report',
     'Upload evidence artifact',
+    'Bind artifact identity',
     'Stop collector',
     'Apply verdict',
   ]);
@@ -5116,10 +5226,11 @@ test('action.yml is wiring-only: each subcommand exactly once, with its exact sh
     'node "${{ github.action_path }}/support.js" start',
     'node "${{ github.action_path }}/support.js" run',
     'node "${{ github.action_path }}/support.js" report',
+    'node "${{ github.action_path }}/support.js" bind-artifact',
     'node "${{ github.action_path }}/support.js" teardown',
     'node "${{ github.action_path }}/support.js" finish',
   ]);
-  assert.deepEqual(wiring.map((step) => step.shell), ['bash', 'bash', 'bash', 'bash', 'bash']);
+  assert.deepEqual(wiring.map((step) => step.shell), ['bash', 'bash', 'bash', 'bash', 'bash', 'bash']);
   // Everything that is not a support.js call is one of the two pinned
   // third-party actions — there is no third kind of step.
   assert.deepEqual(steps.filter((step) => step.run === undefined).map((step) => step.uses), [
@@ -5175,12 +5286,23 @@ test('every step env is exactly what its subcommand reads — no more, no less',
   // The post-command steps get where to look and who they are. Nothing else:
   // their environments are the ones a hostile wrapped command can influence,
   // so there must be nothing in them worth influencing.
-  for (const name of ['Render evidence report', 'Stop collector', 'Apply verdict']) {
+  for (const name of ['Render evidence report', 'Apply verdict']) {
     assert.deepEqual(byName[name].env, {
       DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
       DEBUG_ACTION_INVOCATION_NONCE: NONCE_EXPR,
     }, `${name} carries its output dir and its identity, and nothing else`);
   }
+  assert.deepEqual(byName['Stop collector'].env, {
+    DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
+    DEBUG_ACTION_INVOCATION_NONCE: NONCE_EXPR,
+    DEBUG_ACTION_COLLECTOR_PID: '${{ steps.start.outputs.collector-pid }}',
+  }, 'teardown signals the pre-command start-output pid, never a field from mutable state');
+  assert.deepEqual(byName['Bind artifact identity'].env, {
+    DEBUG_ACTION_OUTPUT_DIR: OUTPUT_DIR_EXPR,
+    DEBUG_ACTION_INVOCATION_NONCE: NONCE_EXPR,
+    DEBUG_ACTION_ARTIFACT_ID: '${{ steps.upload.outputs.artifact-id }}',
+    DEBUG_ACTION_ARTIFACT_DIGEST: '${{ steps.upload.outputs.artifact-digest }}',
+  }, 'bind-artifact records the uploader identity from the upload step outputs');
   assert.deepEqual(byName['Set up Node.js'].env, {});
   assert.deepEqual(byName['Upload evidence artifact'].env, {});
 });
@@ -5212,6 +5334,7 @@ test('invocation identity travels as start\'s step output, to every step that re
   assert.deepEqual(carriers.map((step) => step.name), [
     'Run wrapped command',
     'Render evidence report',
+    'Bind artifact identity',
     'Stop collector',
     'Apply verdict',
   ], 'every step that reads recorded state is told which invocation it belongs to');
@@ -5235,6 +5358,7 @@ test('the guards are exact: post-command steps on always(), upload on what run a
     // where they have neither identity nor state of their own.
     assert.equal(byName[name].if, START_GUARD, `${name} carries the exact guard`);
   }
+  assert.equal(byName['Bind artifact identity'].if, "${{ always() && steps.upload.outcome == 'success' }}");
   // The upload step asks the only process that can honestly answer. Not gated
   // on `report` succeeding: a Step Summary failure must never suppress
   // evidence run proved (Codex T6 r1 #3).
@@ -5915,12 +6039,12 @@ test('action.yml states the scope of its integrity guarantee rather than overcla
   }
 });
 
-test('the output-dir default expression is byte-identical at every site, and there are exactly five', () => {
+test('the output-dir default expression is byte-identical at every site, and there are exactly six', () => {
   const text = ACTION_YML();
   // Exact, not a floor: under a `>=` bound two sites could diverge — one
   // pointing somewhere else entirely — while the count still passed.
-  assert.equal(text.split(OUTPUT_DIR_EXPR).length - 1, 5,
-    'start/run/report/teardown/finish env, and nowhere else');
+  assert.equal(text.split(OUTPUT_DIR_EXPR).length - 1, 6,
+    'start/run/report/bind-artifact/teardown/finish env, and nowhere else');
   assert.equal(text.includes("format('{0}/debug-evidence',runner.temp"), false, 'no whitespace variant');
 });
 
@@ -8182,9 +8306,12 @@ test('demo repro drives the full lifecycle: seeded exit 1, redacted secret, dete
     // reader compares it against are checked as one chain rather than by
     // shape. The action hashes in memory before writing; equality here says
     // the two agree for this session.
-    const digestLine = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
-      .map((name) => `${name}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex')}`)
-      .join(' ')}`;
+    const digestLines = stdout.filter((text) => text.startsWith('evidence-sha256'));
+    assert.equal(digestLines.length, 1, 'exactly one digest line');
+    const digestLine = digestLines[0].trim();
+    assert.match(digestLine, /^evidence-sha256 capturedAt=\S+ /);
+    assert.equal(digestLine.replace(/^evidence-sha256 capturedAt=\S+ /, ''), stagedDigestBody(evidenceDir),
+      'the printed digest describes the bytes this run staged');
     assert.ok(printed.includes(`${digestLine}\n`), 'the printed digest describes the bytes this run staged');
     const outputs = readFileSync(githubOutput, 'utf8');
     assert.match(outputs, /command-exit-code=1/);
@@ -10804,6 +10931,9 @@ const evaluateStepGuard = (expression, outcomes, startOutputs) => {
   if (expression === "${{ always() && steps.start.outputs.evidence-dir != '' }}") {
     return (startOutputs['evidence-dir'] ?? '') !== '';
   }
+  if (expression === "${{ always() && steps.upload.outcome == 'success' }}") {
+    return outcomes.upload === 'success';
+  }
   throw new Error(`unmodelled step guard: ${expression}`);
 };
 
@@ -10820,6 +10950,9 @@ const resolveActionExpression = (value, { inputs, runnerTemp, startOutputs }) =>
     '${{ steps.start.outputs.collector-verify-key }}': startOutputs['collector-verify-key'] ?? '',
     '${{ steps.start.outputs.invocation-nonce }}': startOutputs['invocation-nonce'] ?? '',
     '${{ steps.start.outputs.evidence-dir }}': startOutputs['evidence-dir'] ?? '',
+    '${{ steps.start.outputs.collector-pid }}': startOutputs['collector-pid'] ?? '',
+    '${{ steps.upload.outputs.artifact-id }}': '',
+    '${{ steps.upload.outputs.artifact-digest }}': '',
   };
   if (Object.hasOwn(table, value)) return table[value];
   const input = /^\$\{\{ inputs\.([a-z-]+) \}\}$/.exec(value);
@@ -10835,7 +10968,7 @@ const resolveActionExpression = (value, { inputs, runnerTemp, startOutputs }) =>
 // The only shape a wiring-only step may have. Anything else — a second command,
 // a shell pipeline, a different script — is refused rather than executed as
 // whatever it happens to resemble.
-const STEP_SUBCOMMAND = /^node "\$\{\{ github\.action_path \}\}\/support\.js" (start|run|report|teardown|finish)$/;
+const STEP_SUBCOMMAND = /^node "\$\{\{ github\.action_path \}\}\/support\.js" (start|run|report|bind-artifact|teardown|finish)$/;
 
 // `main()`'s dispatch, driven by the env `action.yml` declares for each step.
 // Deliberately NOT a table of hand-written argument objects: part of what is
@@ -10853,6 +10986,7 @@ const invokeSubcommand = async (subcommand, env, seams) => {
     if (subcommand === 'start') return await startSubcommand({ inputs, outputDir, env, projectRoot, ...seams });
     if (subcommand === 'run') return await runSubcommand({ inputs, outputDir, env, ...seams });
     if (subcommand === 'report') return reportSubcommand({ outputDir, env, ...seams });
+    if (subcommand === 'bind-artifact') return bindArtifactSubcommand({ env, ...seams });
     if (subcommand === 'teardown') return teardownSubcommand({ outputDir, env, ...seams });
     if (subcommand === 'finish') return finishSubcommand({ outputDir, env, ...seams });
     throw new Error(`Unknown subcommand: ${subcommand}`);
@@ -11059,7 +11193,16 @@ const driveCompositeAction = async ({
     // state to act on, which is the refusal case.
     stop: () => {
       const state = readState(outputDir);
-      if (state?.pid) teardownSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: state.nonce } });
+      const pid = startOutputs['collector-pid'] || (state?.pid != null ? String(state.pid) : '');
+      if (state) {
+        teardownSubcommand({
+          outputDir,
+          env: {
+            DEBUG_ACTION_INVOCATION_NONCE: state.nonce,
+            ...(pid ? { DEBUG_ACTION_COLLECTOR_PID: pid } : {}),
+          },
+        });
+      }
     },
   };
 };
@@ -11085,6 +11228,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'success', 0],
       ['Render evidence report', 'success', 0],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'success', 0],
       ['Apply verdict', 'success', 0],
     ]);
@@ -11108,6 +11252,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'success', 0],
       ['Render evidence report', 'success', 0],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'success', 0],
       ['Apply verdict', 'failure', 7],
     ]);
@@ -11135,6 +11280,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'skipped', null],
       ['Render evidence report', 'success', 0],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'success', 0],
       ['Apply verdict', 'failure', 3],
     ]);
@@ -11147,7 +11293,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
     assert.match(refusal.stderr.start, /refusing to run the wrapped command/);
     // THREE later steps returned 0 here. None of them cleared the verdict.
     assert.deepEqual(refusal.steps.filter(([, outcome]) => outcome === 'success').map(([name]) => name),
-      ['Set up Node.js', 'Render evidence report', 'Upload evidence artifact', 'Stop collector']);
+      ['Set up Node.js', 'Render evidence report', 'Upload evidence artifact', 'Bind artifact identity', 'Stop collector']);
   } finally {
     refusal.stop();
   }
@@ -11180,6 +11326,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'failure', 3],
       ['Render evidence report', 'success', 0],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'success', 0],
       ['Apply verdict', 'failure', 3],
     ]);
@@ -11218,6 +11365,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'success', 0],
       ['Render evidence report', 'failure', 3],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'success', 0],
       ['Apply verdict', 'success', 0],
     ]);
@@ -11247,6 +11395,7 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
       ['Run wrapped command', 'success', 0],
       ['Render evidence report', 'success', 0],
       ['Upload evidence artifact', 'success', null],
+      ['Bind artifact identity', 'success', 0],
       ['Stop collector', 'failure', 3],
       ['Apply verdict', 'success', 0],
     ]);
@@ -11290,17 +11439,23 @@ test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both gua
   // the same two dispatch keys the driver switches on.
   const startGuard = actionStepsByName()['Render evidence report'].if;
   const uploadGuard = actionStepsByName()['Upload evidence artifact'].if;
+  const bindGuard = actionStepsByName()['Bind artifact identity'].if;
   assert.notEqual(startGuard, uploadGuard, 'two distinct guard shapes, taken from action.yml');
+  assert.notEqual(bindGuard, uploadGuard, 'bind-artifact is gated on the upload OUTCOME, not the path');
   // (i) start SKIPPED, evidence-dir POPULATED.
   assert.equal(evaluateStepGuard(startGuard, { start: 'skipped' }, { 'evidence-dir': '/staged' }), false,
     'the start guard reads the start OUTCOME, and a skipped start closes it');
   assert.equal(evaluateStepGuard(uploadGuard, { start: 'skipped' }, { 'evidence-dir': '/staged' }), true,
     'while the upload guard reads the published PATH, not the outcome sitting beside it');
+  assert.equal(evaluateStepGuard(bindGuard, { upload: 'skipped' }, {}), false,
+    'and bind-artifact stays closed unless the uploader actually succeeded');
   // (ii) the mirror image: start RAN AND FAILED, evidence-dir EMPTY.
   assert.equal(evaluateStepGuard(startGuard, { start: 'failure' }, {}), true,
     'a start that ran and failed is not a skipped one, so its guard stays open');
   assert.equal(evaluateStepGuard(uploadGuard, { start: 'failure' }, {}), false,
     'while nothing published leaves the uploader with nothing to be pointed at');
+  assert.equal(evaluateStepGuard(bindGuard, { upload: 'success' }, {}), true,
+    'a successful upload opens the bind step even if start itself failed');
 
   const drive = await driveCompositeAction({
     inputs: { run: compositeProbe(0) },
@@ -11313,6 +11468,7 @@ test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both gua
       ['Run wrapped command', 'skipped', null],
       ['Render evidence report', 'skipped', null],
       ['Upload evidence artifact', 'skipped', null],
+      ['Bind artifact identity', 'skipped', null],
       ['Stop collector', 'skipped', null],
       ['Apply verdict', 'skipped', null],
     ]);
@@ -11335,7 +11491,8 @@ test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both gua
       start: 'skipped',
       run: 'skipped',
       report: 'skipped',
-      'Upload evidence artifact': 'skipped',
+      upload: 'skipped',
+      'Bind artifact identity': 'skipped',
       'Stop collector': 'skipped',
       'Apply verdict': 'skipped',
     });
@@ -11450,7 +11607,9 @@ test('Task 9 check 2: one invocation nonce and one admission record, traced from
     const digest = drive.stdout.run.filter((text) => text.startsWith('evidence-sha256 '));
     assert.equal(digest.length, 1);
     const hashes = Object.fromEntries(digest[0].trim().slice('evidence-sha256 '.length).split(' ')
-      .map((part) => [part.slice(0, part.indexOf('=')), part.slice(part.indexOf('=') + 1)]));
+      .map((part) => [part.slice(0, part.indexOf('=')), part.slice(part.indexOf('=') + 1)])
+      .filter(([name]) => name !== 'capturedAt'));
+    assert.ok(/capturedAt=\S+/.test(digest[0]), 'the digest names when the payloads were captured');
     assert.deepEqual(Object.keys(hashes), ['session.log', 'report.md', 'report.json']);
     for (const [name, hex] of Object.entries(hashes)) {
       assert.equal(hex, createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex'),
@@ -11644,7 +11803,7 @@ test('Task 9 check 4: the cross-module constants, against literals rather than t
     // nobody audited, and a missing one is how a consumer silently reads
     // `undefined` and treats it as a value.
     assert.deepEqual(Object.keys(state).sort(), [
-      'admission', 'collectorAlive', 'commandError', 'commandExitCode', 'commandSignal',
+      'admission', 'clientId', 'collectorAlive', 'commandError', 'commandExitCode', 'commandSignal',
       'evidenceAuthentic', 'evidenceCopied', 'evidenceTrust', 'failOnCommandFailure',
       'hypothesisId', 'hypothesisTitle', 'nonce', 'pid', 'port', 'projectRoot',
       'reportRendered', 'sessionId', 'sessionName', 'sessionToken',
@@ -11746,12 +11905,14 @@ test('Task 9 check 4: the cross-module constants, against literals rather than t
       ['DEBUG_HYPOTHESIS_ID', 'DEBUG_LOG_URL', 'DEBUG_SESSION_ID', 'DEBUG_SESSION_TOKEN'],
       'exactly the injected session contract, and nothing of the action\'s own wiring');
 
-    // (6) THE DIGEST RECIPE, rebuilt from the literal: the prefix, the fixed
-    // order, `name=`, a SHA-256 of the staged bytes, single-space joined.
-    const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
-      .map((name) => `${name}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex')}`)
-      .join(' ')}`;
-    assert.deepEqual(drive.stdout.run.filter((text) => text.startsWith('evidence-sha256')), [`${expected}\n`]);
+    // (6) THE DIGEST RECIPE, rebuilt from the literal: the prefix, capturedAt,
+    // the fixed file order, `name=`, a SHA-256 of the staged bytes, single-space joined.
+    const digestLines = drive.stdout.run.filter((text) => text.startsWith('evidence-sha256'));
+    assert.equal(digestLines.length, 1);
+    const expected = digestLines[0].trim();
+    assert.match(expected, /^evidence-sha256 capturedAt=\S+ /);
+    assert.equal(expected.replace(/^evidence-sha256 capturedAt=\S+ /, ''), stagedDigestBody(evidenceDir));
+    assert.deepEqual(digestLines, [`${expected}\n`]);
     assert.equal(drive.runOutputs['evidence-digest'], expected,
       'and the machine surface carries the identical line');
 
