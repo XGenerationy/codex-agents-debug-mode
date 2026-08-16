@@ -4478,6 +4478,14 @@ Four direct calls on `evaluateStepGuard` at the head of the MODEL ONLY test, usi
 
 **The one Minor is the round-3 rewording itself:** "a red job is the probe reporting that the refusal did not happen" is false — a red job can be a checkout/setup failure, `start` exiting 1 on an input or runtime error, or the shell assertion erroring. **A red job means the refusal was NOT CONFIRMED, not that it did not occur.** Corrected in place to Codex's clause: a green job confirms the refusal; a red job is NOT PASS and requires inspecting whether strict returned a non-3 status or the probe failed before confirming it. The parenthetical now carries both retracted versions — the round-3 sentence condemned the expected outcome, the round-4 one over-read a red job the other way. Symmetrical over-claims, two rounds apart, in one sentence about one job.
 
+#### ✅ TASK 9 CLOSED — "Approved — this closes Task 9 and cycle 4's implementation." (Codex, at `d10cfd0`, after four fix rounds.)
+
+Confirmed at close: the corrected checklist sentence is accurate; the reviewed code unchanged since `6d4597e`; merge base `af89573`; scope 20 files; `diff --check` clean. **Every Important finding across the four rounds was against coordinator prose about the verification — the checklist, the retraction, the retraction's attribution, the red-job clause. No code issue from any round remains open.**
+
+**THE PR-DESCRIPTION RULING, delivered with the approval:** the merge-time checklist is COPIED INTO the PR description — *"Do not make reviewers chase a line inside a 5,900-line plan. The plan can be linked as provenance, but the PR must carry the executable gate itself."* Codex supplied the full description verbatim (summary, trust model, six disclosed residuals and limits, verification numbers, the accepted scanner finding with its exact line, the eight-item checklist with the bootstrap reasoning inline, and a ninth closing item: run the deterministic PR-closeout runner and require PASS before merging). It is carried to the PR unedited. The closing instruction, recorded because it is a design judgment about disclosure itself: **"That is enough disclosure. Do not put the seventeen-round review history into the PR; it obscures the actual contract."**
+
+#### ✅ CYCLE 4 IMPLEMENTATION COMPLETE — all nine tasks closed. Remaining: push, stacked PR onto `codex/publish-debug-skill` with Codex's description, then the human merge-time checklist.
+
 ---
 
 ## Plan self-review record (writing-plans checklist)
