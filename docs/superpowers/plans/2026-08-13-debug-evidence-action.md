@@ -4464,6 +4464,14 @@ One file, `support.test.js` (+161/−11). The checklist corrections were already
 
 **RULED, both judgment calls upheld verbatim:** "Keep the reap test. The failure is otherwise assertion-invisible." / "Bind the driver to action identity, not the SHA. The exact SHA already has an independent structural pin." Also confirmed: the reap catch preserves the original exception (`readState` null-safe, `process.kill` caught); checklist item 2 accurate; 7d executable as written. Codex independently re-confirmed merge base `af89573`, scope 20 files, `diff --check` clean. PR-description ruling still deferred until (1) and (2) land.
 
+#### Task 9 round-3 outcome (`6d4597e`) — the swap measured green before the fix, red after, on the identical mutation
+
+One file, `support.test.js` (+40/−7). **The finding was confirmed by measurement before anything moved: with the probes absent, the two branch bodies inside `evaluateStepGuard` were swapped and ALL 140 TESTS PASSED — not one test in the file could tell which predicate sat on which guard.** Post-fix, the byte-identical mutation (anchor re-counted, still exactly one site) dies at probe (i): `the start guard reads the start OUTCOME, and a skipped start closes it — expected: false / actual: true`.
+
+Four direct calls on `evaluateStepGuard` at the head of the MODEL ONLY test, using guard expressions read out of `action.yml` (`Render evidence report`.if and `Upload evidence artifact`.if — the same two dispatch keys the driver switches on) plus an `assert.notEqual` proving they are distinct shapes: (i) skipped start + POPULATED `evidence-dir` → start guard false, upload guard TRUE; (ii) ran-and-failed start + EMPTY `evidence-dir` → start guard TRUE, upload guard false. Both arms independently kill the swap. The comment records WHY these are unit calls rather than a seventh drive: neither state is reachable through the real wiring — `start` publishes `evidence-dir` as its first act — which is exactly why no drive could separate the bodies. The `:11223` comment is corrected IN PLACE, keeping its own history: the outcome map shows the inputs exist; the earlier "keeps those reasons distinct" claim was wrong; the distinctness belongs to the probes and to nothing else.
+
+**Battery (implementer, then coordinator-verified):** `support.test.js` 140/139/0/1; validate PASS 43/87/0; scanner exit 1, the one known finding; `git diff --check` 0; scope 20 files. The implementer's closing observation, kept because it names the cycle's residue: *"the assertion was true, the prose around it over-read what the assertion could support. The probes are cheap; the comment discipline is what actually costs, and it is what caught this."*
+
 ---
 
 ## Plan self-review record (writing-plans checklist)
