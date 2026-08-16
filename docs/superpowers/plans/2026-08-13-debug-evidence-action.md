@@ -4208,6 +4208,28 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 round-5 outcome (`95a4fc2`) — the join was REMOVED rather than tightened, and the audit is now reproducible
+
+**The disclosures no longer join two facts across a gap — each pattern is a contiguous phrase of shipped prose CARRYING ITS OWN SUBJECT.** The reviewer's counterexample fails because subject and predicate are welded: *"replacing session.log with a link to ../action-state.json puts the state bytes into the archive"* is simply not contained in *"…but nothing here ever puts the state bytes into the archive."* Structural enforcement added: non-empty `where`/`facts`, no duplicates, `Object.keys(must)` deep-equal to `where`, per-surface half names unique AND exactly equal to `facts`, every pattern a RegExp, and an exact total of 18. **Tamper-evidence was taken inside the registry because it was cheap there — a duplicate can no longer stand in for a deletion.**
+
+**The `(?![^.]*strict)` lookahead is gone**, replaced by the direct regression form, with the sentence it used to excuse now a tracked rejecting probe (229 → 230). **Required halves may now be lists**, feeding all three executors, with `required: []` blocked by the same vacuity check the forbidden side already had. **The sweep found 5 needing splitting — including `:9096`, which NO review named**, because it hid from round 4's line-based grep by being built with `new RegExp([...].join())`. 68 → 75 required patterns.
+
+**THE INSTRUCTIVE MUTATION:** M10 came back GREEN until the implementer found that **`action.yml` states the three-part trust unit in TWO comment blocks, both flowing into one haystack.** Reversing both → RED; reversing one → GREEN, **which is correct**. That is a property of the surface model, not a bug, and it changes what a required half means.
+
+**WINDOWS: ZERO, AND THIS TIME MEASURED ON REGEXP SOURCE RATHER THAN LINES** — 157 patterns audited (75 required, 64 forbidden, 18 disclosure), none containing `{0,N}`, `[^x]*`, `[\s\S]*`, `.*` or a negative lookaround. Run against the PRE-FIX file the same audit reported exactly 10 — the set the review and coordinator named, plus `:9096`. The 64 forbidden halves re-probed against their own 75 regression sentences: **0 clause crossings, so round 4's conversions hold.** Coordinator-verified independently: every surviving `{0,N}`/`[^x]*` in the file is either a history comment or an ordinary assertion outside the machinery.
+
+> **COORDINATOR RESIDUAL — the defect class survives OUTSIDE the audited machinery.** `support.test.js:10462` asserts `/Input validation[^.]*exits [*_]*1[*_]*/i`, and probing it directly: it matches **both** *"Input validation failure exits 1 rather than 3"* AND *"Input validation **never** exits 1; it exits 3."* This is an ordinary presence assertion in the exits-section test rather than one of the 157 claim patterns — so the round's "zero" is accurate as scoped — but it is precisely the shape Codex's own ruling addressed: **"do not treat presence checks as polarity-free."** Flagged for judgment rather than fixed unilaterally.
+
+**THE HANDOVER — six items, all genuinely undocumented, and two are traps:**
+1. **The audit is a script, not a reading, and it is reproducible** — load the claim tables by appending `module.exports` to a temporary copy IN THE SAME DIRECTORY (`__dirname` must still resolve), and stub `node:test` through `Module._load`. **The stub must be a CALLABLE FUNCTION carrying the named helpers**, because the file does `const test = require('node:test')`. Roughly thirty lines; every round so far re-derived it by hand.
+2. **The signal is only usable with one refinement: a crossing must STRICTLY SPAN the injected denial** (`start < i && end > i + denial.length`). Without it the audit reports ~28 artifacts — the injected word swallowed as the pattern's own leading token, or the pattern re-anchoring after the denial, which is the accepted mention boundary. **"My first pass reported 8 leaks and every one was noise. Anyone who reruns a naive version will chase ghosts and may 'fix' sound guards."**
+3. **A surface is a whole-file concatenation, so deleting a sentence is not deleting a fact.** `action.yml` states the trust unit twice; `support.js` carries commentary that can satisfy a required half after the consumer-facing statement is gone. **A required half proves the fact is SOMEWHERE on the surface, not that it is where a reader will look.** Count occurrences before mutating, or a GREEN means nothing.
+4. **On a prose edit, RE-LIFT the phrase; do not bridge it.** All five rounds of this defect entered the same way — the prose changed slightly and someone inserted a small `\s*`, `[^.]{0,N}` or `[\s\S]{0,N}` to reach across the change. Each was locally reasonable; each recreated the semantic problem.
+5. **Do not apply "no quantifiers" mechanically.** `[*_]*` is load-bearing — it absorbs this README's `**bold**` markers and matches nothing else. **The rule is "no construct that can hold a WORD", not "no quantifier".**
+6. **If the probe contract is ever hardened, copy the REGISTRY, not the counter.** `68 / 4 / 230` counts probes, so substitution and duplication survive it; the disclosure registry is duplication-evident because each half is NAMED, names must be unique, and the name set must equal a separately declared `facts` list. **Naming beats counting.**
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
