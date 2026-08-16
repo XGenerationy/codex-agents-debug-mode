@@ -4230,6 +4230,26 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 fix round 6 (Codex review of `95a4fc2`: 2 Important, 2 Minor) — THE LAST ROUND, with an explicit stopping condition
+
+> **STOPPING CONDITION, set by the coordinator BEFORE this round runs.** Six rounds have now found the same defect class in successively narrower instances, and Codex's own standing note is the proportion: **"The current shipped prose is correct, but its protections still fail open in the cases above."** The consumer documentation has been right since round 1; every round since has hardened guards against FUTURE drift. **This is the last fix round. Anything still open after it is recorded as a known limitation in the plan and shipped — not carried into a seventh round.** The four items below are concrete and bounded; two are structural (deletion-evidence), which is why they are worth one more pass rather than a footnote.
+
+**(1) IMPORTANT — a replacement disclosure still matches a direct contradiction.** `support.test.js:10265` omits the subject/copula `which is`, so this PASSES: *"which is **not** a claim about paths and not one about bytes: it is not categorically unable to leave the runner."* **Codex is explicit that this is NOT the accepted quoted-denial boundary — "it is an ordinary negation immediately before the matched fragment."** FIX: pin `which is a claim…` contiguously.
+
+**(2) IMPORTANT — the new required halves are not all subject-bound, and their coverage is DELETABLE.** Three parts:
+- `support.test.js:5448-5449` can take *"plus the matching digest"* and *"plus the artifact"* **from an unrelated sentence on the concatenated surface** — the whole-file concatenation property, biting exactly where round 5 documented it would.
+- `:9228` accepts *"the candidates are **not** sorted with JavaScript's default comparison…"* **because the pattern starts after `not`.**
+- **Deleting one element from any required list passes the non-empty check at `:10374-10376`** — there is no exact 75-pattern contract and no named-fact binding, so the deletion-evidence won in the registry was never extended to the required side.
+FIX: surface-specific COMPLETE assertions for the trust-unit relationship; bind the digest recipe to its subject; make multi-half requirements deletion-evident.
+
+**(3) Minor — the exact-18 registry is not duplicate-SUBSTITUTION-evident.** `:10333-10340` checks unique half NAMES, not unique pattern SOURCES. **Replacing the path-name pattern with a copy of the symlink-following pattern under the original path-name label preserves the fact set, all 18 checks, and every current match.** Codex: *"Your M5 covered duplicating the tuple, not duplicating its regex under another label."* FIX: check `(source, flags)` uniqueness per surface.
+
+**(4) Minor — RULED: the machinery boundary is ARBITRARY, so sweep ordinary consumer-documentation assertions too.** The coordinator's `:10462` residual is confirmed — it accepts *"Input validation **never** exits 1; it exits 3."* — **and its mirror is added: `:8843` REJECTS the true *"The permissions are read-only and are **not** only for the snapshot."*** Both are word-holding windows over consumer-facing claims, and **"the accepted quoted-denial limitation does not excuse either case."** The coordinator's lean to sweep them was right.
+
+**CONFIRMED SOUND:** the other disclosure phrases are direct, the removed `strict` lookahead is correctly pinned, and **the 64 forbidden guards remain sound within the accepted regression-signature boundary.**
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
