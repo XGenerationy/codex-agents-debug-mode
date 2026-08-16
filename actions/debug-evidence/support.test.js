@@ -384,6 +384,26 @@ test('teardown is idempotent: dead pid is success, missing state is success, non
   assert.equal(teardownSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: 'other' } }), 3, 'nonce mismatch refuses to trust state');
 });
 
+// The OTHER side of that ESRCH branch, and the case it cannot stand in for
+// (queued at the Task 5 spec review, landed in Task 9). ESRCH means the
+// collector is already gone, which is the outcome teardown wanted. Anything
+// else means it is still running and this step could not stop it — a listener
+// holding the port and writing session logs for the rest of the runner's life
+// — so it is a refusal, and the diagnostic names the pid and the errno,
+// because "teardown failed" with neither is not actionable at 3am.
+test('a teardown kill that fails for anything but ESRCH is a 3 that names the pid and the errno', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'n1', pid: 4242 });
+  const { written } = await captureStderr(() => {
+    assert.equal(teardownSubcommand({
+      outputDir,
+      env: invocationEnv(outputDir),
+      kill: () => { const error = new Error('operation not permitted'); error.code = 'EPERM'; throw error; },
+    }), 3, 'a collector this step could not stop is a failure, never a silent success');
+  });
+  assert.match(written, /teardown: failed to stop collector pid 4242: EPERM/);
+});
+
 // A fresh job whose `start` fails early hands teardown NO nonce. Pointed at a
 // REUSED custom output-dir, the lenient check let it read that directory's
 // stale state and kill(state.pid) — a pid belonging to another invocation, or
@@ -10664,4 +10684,821 @@ test('the action README documents the three exit classes, the signal convention,
   // collide there at all — the exposure is any same-user process, not a
   // neighbouring invocation.
   assert.match(exits, /each invocation stages into its own\s*`debug-evidence-files-<nonce>` child, so invocations do not collide there/i);
+});
+
+// ===========================================================================
+// --- Task 9: the whole-implementation checks -------------------------------
+// ===========================================================================
+//
+// Fifteen review rounds each validated ONE task in isolation. Everything below
+// targets a seam BETWEEN tasks — the place where two independently correct
+// modules disagree — which is precisely what a per-task round structurally
+// cannot see. They are additive: nothing here replaces a per-task pin, and
+// where a fact is already pinned inside one module, what is added here is the
+// COMPOSITION of it with the modules on either side.
+//
+// WHAT IS DELIBERATELY NOT HERE, and is owed at merge time instead: the last
+// hop of the lineage below (a genuinely DOWNLOADED artifact) and the whole of
+// the operational proof (exact-head checks, unresolved threads, approval
+// state, the hosted demo result). Both need a hosted CI run and a real pull
+// request. A local test standing in for either would be a confident claim
+// where this cycle has repeatedly found the honest limitation worth more, so
+// these checks stop at the staged bytes and the ENUMERATED upload paths, and
+// the plan carries a merge-time checklist for a human instead.
+
+// GITHUB'S COMPOSITE-STEP SEMANTICS, applied to the REAL step list.
+//
+// Every other test in this file drives ONE subcommand, which is the right unit
+// for "does run refuse a forged log" and the wrong unit for "can a later
+// always() step turn a failed run green" — because the answer to the second is
+// in no subcommand at all. It is in the step list, the guards, and the runner's
+// rule that a composite action fails if ANY of its steps failed. Three rules,
+// modelled, and nothing else:
+//
+//   - a step with no `if:` runs only while no earlier step has failed;
+//   - a step with an `if:` runs when its own guard says so, failed or not;
+//   - a step that fails sets `failed`, and NOTHING ever clears it again.
+//
+// The step list, the guards, the env maps, the upload paths and the subcommand
+// names all come out of `action.yml`, and the dispatch is `main()`'s. A
+// rewiring therefore changes what this executes, rather than being described by
+// a second copy of the wiring that can quietly disagree with the first.
+
+// The two guard shapes `action.yml` actually uses, and NOTHING else. An
+// evaluator that fell through to `true` on an expression it did not recognise
+// would silently turn a new guard into "always runs" — the fail-open shape this
+// cycle keeps finding. Unrecognised guards throw.
+const evaluateStepGuard = (expression, outcomes, startOutputs) => {
+  if (expression === START_GUARD) return outcomes.start !== 'skipped';
+  if (expression === "${{ always() && steps.start.outputs.evidence-dir != '' }}") {
+    return (startOutputs['evidence-dir'] ?? '') !== '';
+  }
+  throw new Error(`unmodelled step guard: ${expression}`);
+};
+
+// Resolve one `action.yml` scalar the way the runner would. EXACT forms only:
+// an expression this does not know throws rather than resolving to '', because
+// an env var that silently went empty is how a subcommand ends up reading a
+// default nobody wrote — and for `DEBUG_ACTION_EVIDENCE_TRUST`, absent and ''
+// are two different documented behaviours.
+const resolveActionExpression = (value, { inputs, runnerTemp, startOutputs }) => {
+  if (!value.includes('${{')) return value;
+  const table = {
+    "${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}":
+      inputs['output-dir'] || path.join(runnerTemp, 'debug-evidence'),
+    '${{ steps.start.outputs.collector-verify-key }}': startOutputs['collector-verify-key'] ?? '',
+    '${{ steps.start.outputs.invocation-nonce }}': startOutputs['invocation-nonce'] ?? '',
+    '${{ steps.start.outputs.evidence-dir }}': startOutputs['evidence-dir'] ?? '',
+  };
+  if (Object.hasOwn(table, value)) return table[value];
+  const input = /^\$\{\{ inputs\.([a-z-]+) \}\}$/.exec(value);
+  if (input) {
+    assert.ok(Object.hasOwn(inputs, input[1]), `action.yml reads an input it does not declare: ${input[1]}`);
+    return inputs[input[1]];
+  }
+  const staged = /^\$\{\{ steps\.start\.outputs\.evidence-dir \}\}\/(.+)$/.exec(value);
+  if (staged) return path.join(startOutputs['evidence-dir'] ?? '', staged[1]);
+  throw new Error(`unmodelled action.yml expression: ${value}`);
+};
+
+// The only shape a wiring-only step may have. Anything else — a second command,
+// a shell pipeline, a different script — is refused rather than executed as
+// whatever it happens to resemble.
+const STEP_SUBCOMMAND = /^node "\$\{\{ github\.action_path \}\}\/support\.js" (start|run|report|teardown|finish)$/;
+
+// `main()`'s dispatch, driven by the env `action.yml` declares for each step.
+// Deliberately NOT a table of hand-written argument objects: part of what is
+// under test is whether the env NAMES in action.yml are the ones support.js
+// reads, and a harness that passed `inputs` straight in would be answering that
+// question itself. The terminal `catch` mirrors main()'s, because the
+// difference it encodes is the exit taxonomy a consumer branches on: a THROWN
+// error is a 1, a RETURNED refusal is a 3.
+const invokeSubcommand = async (subcommand, env, seams) => {
+  const outputDir = env.DEBUG_ACTION_OUTPUT_DIR
+    || path.join(env.RUNNER_TEMP || os.tmpdir(), 'debug-evidence');
+  const inputs = actionInputsFromEnv(env);
+  const projectRoot = env.GITHUB_WORKSPACE || process.cwd();
+  try {
+    if (subcommand === 'start') return await startSubcommand({ inputs, outputDir, env, projectRoot, ...seams });
+    if (subcommand === 'run') return await runSubcommand({ inputs, outputDir, env, ...seams });
+    if (subcommand === 'report') return reportSubcommand({ outputDir, env, ...seams });
+    if (subcommand === 'teardown') return teardownSubcommand({ outputDir, env, ...seams });
+    if (subcommand === 'finish') return finishSubcommand({ outputDir, env, ...seams });
+    throw new Error(`Unknown subcommand: ${subcommand}`);
+  } catch (error) {
+    process.stderr.write(`debug-evidence-action: ${error?.message ?? error}\n`);
+    return 1;
+  }
+};
+
+// The runner's own per-step files. Deliberately NOT under the action's
+// output-dir: check 3 asserts that exactly one file under that tree carries the
+// session credential, and mixing the runner's bookkeeping into it would make
+// that a statement about this harness rather than about the action.
+const runnerCommandFiles = () => {
+  const dir = makeTempDir();
+  const env = {};
+  for (const name of ['GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY']) {
+    env[name] = path.join(dir, name.toLowerCase());
+    writeFileSync(env[name], '');
+  }
+  return { dir, env };
+};
+
+// The wrapped command every composite drive runs. It records the environment it
+// was handed — which is what check 4 reads the stripped control-plane variables
+// out of — logs one event through the injected session contract, and exits with
+// the code the case needs. The dump file's EXISTENCE is also how the
+// strict-refusal case proves the command never ran at all, an absence with a
+// positive control on the other side of the very same test.
+const compositeProbe = (exitCode) => `node -e "${[
+  'require(\'node:fs\').writeFileSync(process.env.COMPOSITE_ENV_DUMP, JSON.stringify(process.env));',
+  'fetch(process.env.DEBUG_LOG_URL, { method: \'POST\', headers: { \'content-type\': \'application/json\', \'x-debug-session-token\': process.env.DEBUG_SESSION_TOKEN }, body: JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID, msg: \'composite event\' }) })',
+  `.then((r) => process.exit(r.status === 202 ? ${exitCode} : 99));`,
+].join('')}"`;
+
+// Drive the whole action: every step action.yml declares, in order, under the
+// three rules above. `seams` is keyed by subcommand; `afterStep` by step name —
+// the injection point for what happens BETWEEN two steps of the same composite
+// action, which is where the staging window lives.
+const driveCompositeAction = async ({
+  inputs: overrides = {}, seams = {}, afterStep = {}, extraEnv = {},
+} = {}) => {
+  const runnerTemp = makeTempDir();
+  const workspace = makeTempDir();
+  const runner = runnerCommandFiles();
+  const envDump = path.join(runner.dir, 'wrapped-env.json');
+  const declared = parseActionYml();
+  // The defaults a caller gets when they set only `run`, taken from the parsed
+  // file rather than restated — so this is the SHIPPED wiring rather than a
+  // second copy of it that can drift.
+  const inputs = Object.fromEntries(Object.entries(declared.inputs)
+    .map(([name, spec]) => [name, spec.default ?? '']));
+  Object.assign(inputs, { port: String(await getFreePort()), ...overrides });
+  const outcomes = {};
+  const startOutputs = {};
+  const runOutputs = {};
+  const stdout = {};
+  const stderr = {};
+  const steps = [];
+  const context = { inputs, runnerTemp, startOutputs };
+  let failed = false;
+  let upload = null;
+  let index = 0;
+  const { written } = await captureStderr(async (read) => {
+    for (const step of declared.steps) {
+      index += 1;
+      const key = step.id ?? step.name;
+      const guarded = step.if === undefined ? !failed : evaluateStepGuard(step.if, outcomes, startOutputs);
+      if (!guarded) {
+        outcomes[key] = 'skipped';
+        steps.push([step.name, 'skipped', null]);
+        continue;
+      }
+      let code = null;
+      if (step.run === undefined) {
+        // The two pinned third-party actions. setup-node is a no-op here; the
+        // uploader is an OBSERVATION POINT — it records the paths action.yml
+        // enumerates, resolved exactly as the runner would, and what is sitting
+        // at each of them at the moment it would have archived them.
+        if (step.name === 'Upload evidence artifact') {
+          const paths = [...step.with.path].map((entry) => resolveActionExpression(entry, context));
+          upload = {
+            name: resolveActionExpression(step.with.name, context),
+            ifNoFilesFound: step.with['if-no-files-found'],
+            paths,
+            present: paths.filter((entry) => existsSync(entry)),
+          };
+        }
+      } else {
+        const match = STEP_SUBCOMMAND.exec(step.run);
+        assert.ok(match, `a wiring-only step ran something this model refuses to interpret: ${step.run}`);
+        const subcommand = match[1];
+        const stepOutput = path.join(runner.dir, `step-output-${index}`);
+        writeFileSync(stepOutput, '');
+        const env = {
+          ...runner.env,
+          GITHUB_OUTPUT: stepOutput,
+          RUNNER_TEMP: runnerTemp,
+          GITHUB_WORKSPACE: workspace,
+          COMPOSITE_ENV_DUMP: envDump,
+          ...extraEnv,
+          ...Object.fromEntries(Object.entries(step.env)
+            .map(([name, value]) => [name, resolveActionExpression(value, context)])),
+        };
+        const printed = [];
+        const before = read().length;
+        code = await invokeSubcommand(subcommand, env, {
+          ...(subcommand === 'start' || subcommand === 'run' ? { writeStdout: (text) => printed.push(text) } : {}),
+          ...(seams[subcommand] ?? {}),
+        });
+        stderr[subcommand] = read().slice(before);
+        stdout[subcommand] = printed;
+        const emitted = parseStepOutputs(readFileSync(stepOutput, 'utf8'));
+        if (subcommand === 'start') Object.assign(startOutputs, emitted);
+        if (subcommand === 'run') Object.assign(runOutputs, emitted);
+        if (subcommand === 'run') context.runStepEnv = env;
+      }
+      const outcome = code === null || code === 0 ? 'success' : 'failure';
+      outcomes[key] = outcome;
+      if (outcome === 'failure') failed = true;
+      steps.push([step.name, outcome, code]);
+      if (afterStep[step.name]) await afterStep[step.name]({ startOutputs, runnerTemp, inputs });
+    }
+  });
+  const outputDir = inputs['output-dir'] || path.join(runnerTemp, 'debug-evidence');
+  return {
+    steps,
+    result: failed ? 'failure' : 'success',
+    outcomes,
+    startOutputs,
+    runOutputs,
+    stdout,
+    stderr,
+    allStderr: written,
+    upload,
+    inputs,
+    outputDir,
+    runnerTemp,
+    runnerDir: runner.dir,
+    envDump,
+    runStepEnv: context.runStepEnv,
+    // Every drive that got as far as recording a pid leaves a live collector
+    // behind, so every caller stops it in a finally. Silent when there is no
+    // state to act on, which is the refusal case.
+    stop: () => {
+      const state = readState(outputDir);
+      if (state?.pid) teardownSubcommand({ outputDir, env: { DEBUG_ACTION_INVOCATION_NONCE: state.nonce } });
+    },
+  };
+};
+
+// A host whose readings do NOT establish the in-process boundary — one sudo
+// binary is enough, and it is the reading a standard hosted runner actually
+// produces. Used wherever a check needs the qualification block to carry real
+// findings rather than an empty one.
+const NOT_ESTABLISHED = () => admissionOf({ sudo: sudoPresent('/usr/bin/sudo') });
+
+test('Task 9 check 1: composite failure precedence — no later always() step can un-fail a run verdict', async () => {
+  // (Z) THE PRESENCE CONTROL, and it comes first because every case below
+  // asserts `result: 'failure'`. Without a drive that reaches 'success', a
+  // model hard-wired to fail would satisfy all of them and say nothing at all.
+  const green = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: { start: { probeAdmission: ADMITTED } },
+  });
+  try {
+    assert.deepEqual(green.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'success', 0],
+      ['Run wrapped command', 'success', 0],
+      ['Render evidence report', 'success', 0],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'success', 0],
+      ['Apply verdict', 'success', 0],
+    ]);
+    assert.equal(green.result, 'success');
+    assert.deepEqual(green.upload.present.map((entry) => path.basename(entry)).sort(),
+      ['report.json', 'report.md', 'session.log'], 'a green run stages all three');
+  } finally {
+    green.stop();
+  }
+
+  // (A) THE WRAPPED COMMAND FAILS. Every step of the machinery succeeds; the
+  // verdict step mirrors the command's own code and the action is red.
+  const commandFailure = await driveCompositeAction({
+    inputs: { run: compositeProbe(7) },
+    seams: { start: { probeAdmission: ADMITTED } },
+  });
+  try {
+    assert.deepEqual(commandFailure.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'success', 0],
+      ['Run wrapped command', 'success', 0],
+      ['Render evidence report', 'success', 0],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'success', 0],
+      ['Apply verdict', 'failure', 7],
+    ]);
+    assert.equal(commandFailure.result, 'failure');
+    assert.deepEqual(commandFailure.upload.present.map((entry) => path.basename(entry)).sort(),
+      ['report.json', 'report.md', 'session.log'],
+      'a failing command is exactly when the evidence matters most, so all three still ship');
+  } finally {
+    commandFailure.stop();
+  }
+
+  // (B) STRICT REFUSAL, and the property that makes it a control rather than a
+  // label: `Run wrapped command` carries no `if:`, so a failed `start` SKIPS it
+  // and the command never executes. Proved by the dump file the probe writes as
+  // its first act — absent here, and PRESENT in the best-effort drive
+  // immediately below, which is the same mechanism reporting the other answer.
+  const refusal = await driveCompositeAction({
+    inputs: { run: compositeProbe(0), 'evidence-trust': 'strict' },
+    seams: { start: { probeAdmission: NOT_ESTABLISHED } },
+  });
+  try {
+    assert.deepEqual(refusal.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'failure', 3],
+      ['Run wrapped command', 'skipped', null],
+      ['Render evidence report', 'success', 0],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'success', 0],
+      ['Apply verdict', 'failure', 3],
+    ]);
+    assert.equal(refusal.result, 'failure');
+    assert.equal(existsSync(refusal.envDump), false, 'the wrapped command never ran at all');
+    // The upload step still runs — its guard is start's PRE-command output —
+    // and finds nothing, which is what `if-no-files-found: ignore` is for.
+    assert.deepEqual(refusal.upload.present, [], 'and nothing was staged for it to publish');
+    assert.equal(refusal.upload.ifNoFilesFound, 'ignore');
+    assert.match(refusal.stderr.start, /refusing to run the wrapped command/);
+    // THREE later steps returned 0 here. None of them cleared the verdict.
+    assert.deepEqual(refusal.steps.filter(([, outcome]) => outcome === 'success').map(([name]) => name),
+      ['Set up Node.js', 'Render evidence report', 'Upload evidence artifact', 'Stop collector']);
+  } finally {
+    refusal.stop();
+  }
+
+  const admitted = await driveCompositeAction({
+    inputs: { run: compositeProbe(0), 'evidence-trust': 'best-effort' },
+    seams: { start: { probeAdmission: NOT_ESTABLISHED } },
+  });
+  try {
+    assert.equal(admitted.result, 'success', 'the same host, opted in, runs the command and goes green');
+    assert.equal(existsSync(admitted.envDump), true,
+      'the control for the absence above: this probe DOES record having run');
+  } finally {
+    admitted.stop();
+  }
+
+  // (C1) THE RENDERER FAILS. run stages the authenticated log and nothing else,
+  // and fails itself; report keeps that log for the artifact and returns 0.
+  const rendererFailure = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: {
+      start: { probeAdmission: ADMITTED },
+      run: { renderReport: () => { throw new Error('renderer exploded'); } },
+    },
+  });
+  try {
+    assert.deepEqual(rendererFailure.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'success', 0],
+      ['Run wrapped command', 'failure', 3],
+      ['Render evidence report', 'success', 0],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'success', 0],
+      ['Apply verdict', 'failure', 3],
+    ]);
+    assert.equal(rendererFailure.result, 'failure');
+    assert.deepEqual(rendererFailure.upload.present.map((entry) => path.basename(entry)),
+      ['session.log'], 'partial evidence a human can read still ships; the rendered surfaces do not');
+    assert.match(rendererFailure.stderr.run, /renderer failed/);
+    assert.match(rendererFailure.stderr.report, /staged a session log but no report/);
+  } finally {
+    rendererFailure.stop();
+  }
+
+  // (C2) THE REPORT STEP ITSELF FAILS, and this is the load-bearing case: the
+  // run step SUCCEEDED, both steps after the failure returned 0, and the LAST
+  // step of the action is one of them. The action is still red. A composite
+  // whose result were "whatever the final step said" would be green here, which
+  // is the whole reason this case exists.
+  const reportFailure = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: { start: { probeAdmission: ADMITTED } },
+    afterStep: {
+      // Between staging and publishing, in the window a detached child of the
+      // wrapped command owns: replace report.md with a directory, the one thing
+      // `report` cannot read past.
+      'Run wrapped command': ({ startOutputs }) => {
+        const staged = path.join(startOutputs['evidence-dir'], 'report.md');
+        unlinkSync(staged);
+        mkdirSync(staged);
+      },
+    },
+  });
+  try {
+    assert.deepEqual(reportFailure.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'success', 0],
+      ['Run wrapped command', 'success', 0],
+      ['Render evidence report', 'failure', 3],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'success', 0],
+      ['Apply verdict', 'success', 0],
+    ]);
+    assert.equal(reportFailure.result, 'failure',
+      'a failed step in the middle is a failed action, whatever the steps after it said');
+    assert.match(reportFailure.stderr.report, /staged report is unreadable/);
+  } finally {
+    reportFailure.stop();
+  }
+
+  // (D) TEARDOWN CANNOT STOP THE COLLECTOR — the queued Task 5 case, composed.
+  // run succeeded, report succeeded, the verdict step succeeded, and the action
+  // is red because one step between them could not do its job.
+  const teardownFailure = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: {
+      start: { probeAdmission: ADMITTED },
+      teardown: {
+        kill: () => { const error = new Error('operation not permitted'); error.code = 'EPERM'; throw error; },
+      },
+    },
+  });
+  try {
+    assert.deepEqual(teardownFailure.steps, [
+      ['Set up Node.js', 'success', null],
+      ['Start collector', 'success', 0],
+      ['Run wrapped command', 'success', 0],
+      ['Render evidence report', 'success', 0],
+      ['Upload evidence artifact', 'success', null],
+      ['Stop collector', 'failure', 3],
+      ['Apply verdict', 'success', 0],
+    ]);
+    assert.equal(teardownFailure.result, 'failure');
+    assert.match(teardownFailure.stderr.teardown, /failed to stop collector pid \d+: EPERM/);
+  } finally {
+    teardownFailure.stop();
+  }
+});
+
+test('Task 9 check 2: one invocation nonce and one admission record, traced from start\'s step output to the enumerated upload paths', async () => {
+  // A host that does not establish the boundary, opted in — so the record
+  // carries real findings and the qualification block is the long one. An
+  // admitted run traces the same way through a shorter text.
+  const drive = await driveCompositeAction({
+    inputs: {
+      run: compositeProbe(0),
+      'evidence-trust': 'best-effort',
+      'hypothesis-id': 'H-lineage',
+      'hypothesis-title': 'the byte lineage',
+    },
+    seams: { start: { probeAdmission: NOT_ESTABLISHED } },
+  });
+  try {
+    assert.equal(drive.result, 'success');
+
+    // HOP 1 — the identity, published by `start` as a step output before any
+    // check that can fail, and before the wrapped command existed.
+    const nonce = drive.startOutputs['invocation-nonce'];
+    assert.match(nonce, /^[A-Za-z0-9_-]{8,64}$/);
+    const evidenceDir = drive.startOutputs['evidence-dir'];
+    assert.equal(path.basename(evidenceDir), `debug-evidence-files-${nonce}`,
+      'the staging directory is named by the invocation, so the path itself carries the identity');
+    assert.equal(path.dirname(evidenceDir), drive.outputDir);
+
+    // HOP 2 — the admission record, streamed by `start` to its own step log.
+    const PREFIX = 'debug-evidence-action: start: ';
+    const startRecord = drive.stderr.start.split('\n')
+      .filter((line) => line.startsWith(PREFIX))
+      .map((line) => line.slice(PREFIX.length))
+      // The opt-in diagnostic is a different sentence from the record itself.
+      .filter((line) => !line.startsWith('BEST-EFFORT EVIDENCE:'));
+    assert.ok(startRecord.length >= 6, 'the record is a block of statements, not one line');
+    assert.ok(startRecord[0].startsWith('ADMISSION RECORD'));
+    assert.ok(startRecord.some((line) => /^Findings: sudo binary: present: 1 at sha256=[0-9a-f]{64}\.$/.test(line)),
+      'and the findings are this host\'s reading, not a template');
+
+    // HOP 3 — run's own copy, printed beside the digest. BYTE-IDENTICAL to
+    // start's, which is the entire reason a reader is asked to compare them:
+    // two blocks assembled separately would differ for innocent reasons and
+    // destroy the comparison.
+    const QUALIFICATION = 'evidence-qualification ';
+    const runRecord = drive.stdout.run
+      .filter((text) => text.startsWith(QUALIFICATION))
+      .map((text) => text.slice(QUALIFICATION.length).replace(/\n$/, ''));
+    assert.deepEqual(runRecord, startRecord, 'one builder, two surfaces, the same bytes');
+
+    // AND THE NONCE IS WHAT BINDS THEM. Every statement naming an invocation
+    // names THIS one, on both copies.
+    const naming = startRecord.filter((line) => line.includes('invocation='));
+    assert.ok(naming.length >= 2, 'more than one statement carries the identity');
+    for (const line of naming) {
+      assert.ok(line.includes(`invocation=${nonce}`), `a record statement names another invocation: ${line}`);
+    }
+
+    // HOP 4 — the artifact's copy. `report.json` is one of the three enumerated
+    // payloads, and a reader holding only the archive has nothing else.
+    const reportJson = JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8'));
+    assert.deepEqual(reportJson.caveats, startRecord,
+      'the machine surface carries the record verbatim and uncapped');
+    assert.ok(readFileSync(path.join(evidenceDir, 'report.md'), 'utf8').includes(`invocation=${nonce}`),
+      'and the human surface carries the identity too');
+
+    // HOP 5 — the digest, over the bytes this process decided to stage.
+    // Recomputed here from node:crypto rather than by calling the action's own
+    // helper: a check that shared the implementation's arithmetic would agree
+    // with a broken one.
+    const digest = drive.stdout.run.filter((text) => text.startsWith('evidence-sha256 '));
+    assert.equal(digest.length, 1);
+    const hashes = Object.fromEntries(digest[0].trim().slice('evidence-sha256 '.length).split(' ')
+      .map((part) => [part.slice(0, part.indexOf('=')), part.slice(part.indexOf('=') + 1)]));
+    assert.deepEqual(Object.keys(hashes), ['session.log', 'report.md', 'report.json']);
+    for (const [name, hex] of Object.entries(hashes)) {
+      assert.equal(hex, createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex'),
+        `${name}: the digest describes the bytes sitting at the staged path`);
+    }
+
+    // HOP 6 — the ENUMERATED UPLOAD PATHS, resolved out of `action.yml` with
+    // the very step output `start` published at hop 1. This is where the local
+    // trace stops: what an actual archive contains is a hosted-run fact, owed
+    // at merge time, and nothing here may stand in for it.
+    assert.deepEqual([...drive.upload.paths].sort(),
+      ['report.json', 'report.md', 'session.log'].map((name) => path.join(evidenceDir, name)).sort());
+    assert.deepEqual([...drive.upload.present].sort(), [...drive.upload.paths].sort(),
+      'every enumerated path exists at the moment the uploader would read it');
+    for (const entry of drive.upload.paths) {
+      assert.ok(entry.includes(`debug-evidence-files-${nonce}`),
+        'every enumerated path is inside the child this invocation named');
+      assert.equal(hashes[path.basename(entry)],
+        createHash('sha256').update(readFileSync(entry)).digest('hex'),
+        'and hashes to the line the step log already carries');
+    }
+  } finally {
+    drive.stop();
+  }
+});
+
+test('Task 9 check 3: the launch token reaches nothing, and the session credential reaches only what the documentation names', async () => {
+  const drive = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: { start: { probeAdmission: ADMITTED } },
+    // The runner's masking channel is the ONE place the launch token is
+    // deliberately written, and registering it is gated on this literal. It is
+    // also the only way a test can hold the value at all: the token exists
+    // solely inside start's process, and start is the only thing that names it.
+    extraEnv: { GITHUB_ACTIONS: 'true' },
+  });
+  try {
+    assert.equal(drive.result, 'success');
+    const state = JSON.parse(readFileSync(path.join(drive.outputDir, 'action-state.json'), 'utf8'));
+    const masked = drive.stdout.start.filter((text) => text.startsWith('::add-mask::'))
+      .map((text) => text.slice('::add-mask::'.length).replace(/\n$/, ''));
+    // Two credentials exist in start's process, in the order it uses them.
+    // Identifying the launch token POSITIVELY — as "the masked value that is
+    // not the session token" — is what stops this being a test of an index: a
+    // start that stopped masking the launch token leaves one line here and
+    // fails, rather than silently re-labelling the session token.
+    assert.equal(masked.length, 2, 'both credentials are registered with the runner');
+    assert.equal(masked[1], state.sessionToken, 'the second is the session token start minted');
+    const launchToken = masked[0];
+    assert.notEqual(launchToken, state.sessionToken);
+    assert.ok(launchToken.length >= 16, 'and the first is the launch token, which nothing else may carry');
+
+    // THE LAUNCH TOKEN, NOWHERE. Every file the action wrote, every runner file
+    // it was handed, every diagnostic it printed, every enumerated payload, and
+    // the environment of the one step that runs after the token was spent.
+    const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (
+      entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]));
+    const onDisk = [...walk(drive.outputDir), ...walk(drive.runnerDir)];
+    // PRESENCE CONTROL FIRST: an empty file list would certify anything at all.
+    assert.ok(onDisk.some((file) => path.basename(file) === 'action-state.json'),
+      'the walk found the action\'s own state file');
+    assert.ok(onDisk.some((file) => path.basename(file) === 'session.log'), 'and the staged evidence');
+    for (const file of onDisk) {
+      assert.equal(readFileSync(file, 'utf8').includes(launchToken), false,
+        `the launch token must not be readable at ${path.basename(file)}`);
+    }
+    const printed = Object.values(drive.stdout).flat()
+      .filter((text) => text !== `::add-mask::${launchToken}\n`);
+    for (const text of [drive.allStderr, ...printed]) {
+      assert.equal(text.includes(launchToken), false,
+        'nothing but the masking registration itself ever prints it');
+    }
+    assert.equal(JSON.stringify(drive.runStepEnv).includes(launchToken), false,
+      'nor does it survive into the environment of any step after the one that minted it');
+
+    // THE SESSION CREDENTIAL, EXACTLY WHERE DOCUMENTED. Under the output-dir
+    // that is the state file and nothing else — asserted as a SET, so a second
+    // carrier is a failure rather than an addition nobody notices.
+    assert.deepEqual(
+      walk(drive.outputDir).filter((file) => readFileSync(file, 'utf8').includes(state.sessionToken))
+        .map((file) => path.relative(drive.outputDir, file)),
+      ['action-state.json'],
+    );
+    for (const entry of drive.upload.paths) {
+      assert.equal(readFileSync(entry, 'utf8').includes(state.sessionToken), false,
+        `${path.basename(entry)} is uploaded, so it must not carry the credential`);
+    }
+    assert.equal(JSON.stringify(drive.startOutputs).includes(state.sessionToken), false,
+      'no credential enters a step output');
+    assert.equal(JSON.stringify(drive.runOutputs).includes(state.sessionToken), false);
+    assert.equal(readFileSync(path.join(drive.runnerDir, 'github_step_summary'), 'utf8')
+      .includes(state.sessionToken), false, 'nor the job summary');
+    // And it IS handed to the wrapped command — the documented injection, which
+    // is what makes every absence above meaningful rather than an artefact of a
+    // credential that was never minted in the first place.
+    assert.equal(JSON.parse(readFileSync(drive.envDump, 'utf8')).DEBUG_SESSION_TOKEN, state.sessionToken);
+  } finally {
+    drive.stop();
+  }
+});
+
+test('Task 9 check 3 (residual): the state file is unnamed by PATH — and the substitution that defeats that is DISCLOSED, never prevented', {
+  skip: !directorySymlinkAvailable && 'directory symlinks unavailable here',
+}, async () => {
+  const drive = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    seams: { start: { probeAdmission: ADMITTED } },
+  });
+  try {
+    const evidenceDir = drive.startOutputs['evidence-dir'];
+    const statePath = path.join(drive.outputDir, 'action-state.json');
+    // THE HALF THAT IS TRUE, and the whole of it: the state file is the staging
+    // child's SIBLING, so no path the upload step enumerates names it.
+    assert.equal(path.relative(evidenceDir, statePath), path.join('..', 'action-state.json'));
+    for (const entry of drive.upload.paths) {
+      assert.equal(entry.includes('action-state.json'), false, 'no enumerated path names the state file');
+      assert.equal(path.dirname(entry), evidenceDir);
+    }
+    // THE HALF THAT IS NOT, DEMONSTRATED. The pinned uploader follows symlinks
+    // unconditionally AND expands directories with implicitDescendants, so a
+    // link planted at one of the enumerated names inside the staging window
+    // reaches whatever it points at — here the output-dir root, whose contents
+    // are the state file, session token and all.
+    //
+    // THIS IS A DISCLOSED RESIDUAL, NOT A DEFECT AND NOT A PROMISE. Nothing in
+    // this action prevents it, the documentation says so in as many words, and
+    // no assertion here may ever be written as though it did. The test shows
+    // the residual is real, then shows the shipped text disclosing it. The
+    // distinction cost Task 8 six rounds and it is preserved here on purpose.
+    // What CAN regress is the disclosure, and the second half below is that.
+    //
+    // A directory link rather than a file one, and the choice is about
+    // evidence rather than taste: file symlinks need a privilege the
+    // implementer's host does not grant, so that variant could only ever have
+    // been shipped GREEN-untested. This one runs, and was proved to go red by
+    // deleting the disclosure it pairs with. The consequence it demonstrates —
+    // a substituted directory contributing its descendants — is the second
+    // sentence of the very residual it checks.
+    const staged = path.join(evidenceDir, 'session.log');
+    unlinkSync(staged);
+    symlinkSync(drive.outputDir, staged, 'junction');
+    const throughTheLink = readFileSync(path.join(staged, 'action-state.json'), 'utf8');
+    assert.equal(throughTheLink, readFileSync(statePath, 'utf8'),
+      'an enumerated name now reaches the state file: the residual is real');
+    assert.ok(throughTheLink.includes(JSON.parse(readFileSync(statePath, 'utf8')).sessionToken),
+      'including the credential the enumerated payloads are otherwise free of');
+    const residuals = readmeSections(ACTION_README()).get(SECTION_RESIDUALS);
+    assert.match(residuals, /The uploader follows symlinks, unconditionally/);
+    assert.match(residuals, /`action-state\.json` among them/);
+    assert.match(residuals, /a \*directory\* substituted at one of those names contributes its descendants/);
+    assert.match(residuals, /scopes its claim to the \*paths\* the upload step enumerates/);
+  } finally {
+    drive.stop();
+  }
+});
+
+// EVERY EXPECTED VALUE BELOW IS A LITERAL. None is read out of the module it
+// checks, and none of the production helpers that define them
+// (`EVIDENCE_FILES`, `RUNNER_COMMAND_FILE_VARS`, `EXCERPT_CHAR_CAP`,
+// `payloadDigestLine`) is consulted — a check that imports the thing it checks
+// proves self-consistency and nothing else, which is this cycle's vacuous-guard
+// defect one level up. The OBSERVED side comes from the shipped files and from
+// a real lifecycle; only the expectation is written here.
+test('Task 9 check 4: the cross-module constants, against literals rather than the modules that define them', async () => {
+  const drive = await driveCompositeAction({
+    inputs: {
+      run: compositeProbe(0),
+      'hypothesis-id': 'H-constants',
+      'hypothesis-title': 'cross-module constants',
+    },
+    seams: { start: { probeAdmission: ADMITTED } },
+  });
+  try {
+    assert.equal(drive.result, 'success');
+    const evidenceDir = drive.startOutputs['evidence-dir'];
+    const state = JSON.parse(readFileSync(path.join(drive.outputDir, 'action-state.json'), 'utf8'));
+
+    // (1) THE STATE KEYS. `start` writes twelve of them and `run`'s
+    // compare-and-set adds seven; the plan's type-consistency list is a third
+    // copy. Exact, because an EXTRA key is how a later step acquires an input
+    // nobody audited, and a missing one is how a consumer silently reads
+    // `undefined` and treats it as a value.
+    assert.deepEqual(Object.keys(state).sort(), [
+      'admission', 'collectorAlive', 'commandError', 'commandExitCode', 'commandSignal',
+      'evidenceAuthentic', 'evidenceCopied', 'evidenceTrust', 'failOnCommandFailure',
+      'hypothesisId', 'hypothesisTitle', 'nonce', 'pid', 'port', 'projectRoot',
+      'reportRendered', 'sessionId', 'sessionName', 'sessionToken',
+    ]);
+    assert.deepEqual(Object.keys(state.admission).sort(),
+      ['blockers', 'capabilities', 'ptrace', 'sudo', 'uid']);
+
+    // (2) THE EVIDENCE FILENAMES, from three places that have to agree: what
+    // the run step actually staged, what `action.yml` enumerates for the
+    // uploader, and the literal.
+    const NAMES = ['report.json', 'report.md', 'session.log'];
+    assert.deepEqual(readdirSync(evidenceDir).sort(), NAMES);
+    assert.deepEqual(parseActionYml().steps
+      .find((step) => step.name === 'Upload evidence artifact')
+      .with.path.map((entry) => path.basename(entry)).sort(), NAMES);
+
+    // (3) THE EXIT TAXONOMY. Each class PRODUCED rather than described.
+    const taxonomy = { success: drive.steps.find(([name]) => name === 'Apply verdict')[2] };
+    await captureStderr(async () => {
+      // A thrown error is a 1: main()'s terminal catch, reached through the
+      // same dispatch every composite drive above uses.
+      taxonomy.thrown = await invokeSubcommand('start', {
+        DEBUG_ACTION_OUTPUT_DIR: makeTempDir(),
+        DEBUG_ACTION_RUN: 'true',
+        DEBUG_ACTION_PORT: 'not-a-port',
+      }, { probeAdmission: ADMITTED, spawnShim: () => { throw new Error('never reached'); } });
+      // A returned refusal is a 3.
+      taxonomy.refusal = teardownSubcommand({ outputDir: makeTempDir(), env: {} });
+      // 127 and 128 are the wrapped command's own sentinels, recorded by run.
+      const sentinel = async (result) => {
+        const outputDir = makeTempDir();
+        writeState(outputDir, {
+          nonce: 'n1', pid: 1, port: 1, sessionName: 'ci-debug',
+          sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
+        });
+        await runSubcommand({
+          inputs: baseInputs(),
+          outputDir,
+          env: RUN_ENV,
+          writeStdout: () => {},
+          readLive: collectorAnswer([{ ts: '2026-08-16T00:00:00.000Z', msg: 'captured' }]),
+          spawnCommand: () => result,
+        });
+        return readState(outputDir).commandExitCode;
+      };
+      taxonomy.spawnFailure = await sentinel({ error: new Error('spawn ENOENT') });
+      taxonomy.signal = await sentinel({ status: null, signal: 'SIGKILL' });
+    });
+    assert.deepEqual(taxonomy, { success: 0, thrown: 1, refusal: 3, spawnFailure: 127, signal: 128 });
+
+    // (4) THE REPORT SCHEMA AND ITS PER-CAVEAT CAP. The producer stamps the
+    // version, the consumer inside `run` refuses anything else, and the human
+    // surface truncates at the cap — three modules, one pair of numbers.
+    assert.equal(JSON.parse(readFileSync(path.join(evidenceDir, 'report.json'), 'utf8')).schema, 1);
+    const rendered = defaultRenderReport('', 'ci-debug-cap', { caveats: ['x'.repeat(600)] });
+    const caveatLine = rendered.markdown.split('\n').find((line) => line.startsWith('> **Caveat:** '));
+    assert.equal(caveatLine.slice('> **Caveat:** '.length).length, 500,
+      'the human surface caps each caveat at 500 characters');
+    assert.equal(JSON.parse(rendered.json).caveats[0].length, 600,
+      'and the machine surface is never capped');
+    await captureStderr(async () => {
+      const schemaDir = makeTempDir();
+      writeState(schemaDir, {
+        nonce: 'n1', pid: 1, port: 1, sessionToken: 'x'.repeat(43),
+        sessionId: 'ci-debug-abc', projectRoot: makeTempDir(),
+      });
+      assert.equal(await runSubcommand({
+        inputs: baseInputs(),
+        outputDir: schemaDir,
+        env: RUN_ENV,
+        writeStdout: () => {},
+        readLive: collectorAnswer([{ ts: '2026-08-16T00:00:00.000Z', msg: 'served' }]),
+        spawnCommand: () => ({ status: 0 }),
+        renderReport: () => ({ markdown: '## Debug evidence report\n', json: JSON.stringify({ schema: 2, session: { events: 1 } }) }),
+      }), 3, 'the consumer requires schema 1, not merely "a report"');
+      assert.equal(existsSync(path.join(evidenceDirOf(schemaDir), 'report.json')), false);
+    });
+
+    // (5) THE STRIPPED CONTROL-PLANE VARIABLES, in order, against the literal —
+    // and against the copy `demo/repro.js` keeps, read out of its TEXT. The
+    // existing pin compares the two production lists to EACH OTHER, which is
+    // exactly the self-consistency this check exists to go around.
+    const STRIPPED = ['GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY'];
+    const reproList = /const STRIPPED_CONTROL_PLANE = \[([^\]]*)\]/.exec(readFileSync(REPRO_PATH, 'utf8'));
+    assert.ok(reproList, 'demo/repro.js still declares the list this compares against');
+    assert.deepEqual([...reproList[1].matchAll(/'([A-Z_]+)'/g)].map((match) => match[1]), STRIPPED);
+    // PRESENCE CONTROL: the run step's own process held all five, so their
+    // absence from the child is a DELETION rather than a variable that was
+    // never set. Without this the loop below passes on an empty environment.
+    for (const name of STRIPPED) {
+      assert.ok(drive.runStepEnv[name], `the run step itself was handed ${name}`);
+    }
+    const wrapped = JSON.parse(readFileSync(drive.envDump, 'utf8'));
+    for (const name of STRIPPED) {
+      assert.equal(Object.hasOwn(wrapped, name), false, `${name} must not reach the wrapped command`);
+    }
+    assert.deepEqual(Object.keys(wrapped).filter((name) => name.startsWith('DEBUG_ACTION_')), []);
+    assert.deepEqual(Object.keys(wrapped).filter((name) => name.startsWith('DEBUG_')).sort(),
+      ['DEBUG_HYPOTHESIS_ID', 'DEBUG_LOG_URL', 'DEBUG_SESSION_ID', 'DEBUG_SESSION_TOKEN'],
+      'exactly the injected session contract, and nothing of the action\'s own wiring');
+
+    // (6) THE DIGEST RECIPE, rebuilt from the literal: the prefix, the fixed
+    // order, `name=`, a SHA-256 of the staged bytes, single-space joined.
+    const expected = `evidence-sha256 ${['session.log', 'report.md', 'report.json']
+      .map((name) => `${name}=${createHash('sha256').update(readFileSync(path.join(evidenceDir, name))).digest('hex')}`)
+      .join(' ')}`;
+    assert.deepEqual(drive.stdout.run.filter((text) => text.startsWith('evidence-sha256')), [`${expected}\n`]);
+    assert.equal(drive.runOutputs['evidence-digest'], expected,
+      'and the machine surface carries the identical line');
+
+    // (7) THE UPLOAD PATH SET, as `action.yml` writes it.
+    assert.deepEqual([...parseActionYml().steps
+      .find((step) => step.name === 'Upload evidence artifact').with.path].sort(), [
+      '${{ steps.start.outputs.evidence-dir }}/report.json',
+      '${{ steps.start.outputs.evidence-dir }}/report.md',
+      '${{ steps.start.outputs.evidence-dir }}/session.log',
+    ]);
+  } finally {
+    drive.stop();
+  }
 });
