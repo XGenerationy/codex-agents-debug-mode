@@ -4153,6 +4153,26 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 fix round 4 (Codex review of `adb7b59`: 2 Important, 1 Minor) — and the rule that ends the pattern
+
+**(1) IMPORTANT — the replacement devices STILL reject true statements. Fourth version of the same trap.** The shared `SYSCTL_BUYS_STRICT` guard (`support.test.js:5270`) matches the TRUE sentence *"Hardening the runner **never makes** hosted execution strict-admissible"* — **its 90-character window consumes `never`, then finds the affirmative `makes`. Inflection alone is therefore insufficient.** Likewise the `report.md` prose branch (`:9053`) rejects *"`report.md` **never claims** that it is verbatim"*, because the window consumes the matrix denial before reaching `is verbatim`. **"The report construction is still a smaller version of the same trap."**
+
+> **THE ROOT CAUSE, NAMED AT LAST — and it retires the whole approach that produced four rounds of this: "ANY WINDOW THAT CAN CROSS A CLAUSE RECREATES THE SEMANTIC PROBLEM. KEEP THE GUARDS EXACT AND DIRECT."** Subject binding, affirmative inflection and affirmative position are useful for NARROW REGRESSION SIGNATURES — they are not a general polarity mechanism, and **the 64 non-retired guards are NOT categorically sound.** Every fix so far has widened or tempered a window; the answer is to stop having windows and match the direct regression form.
+
+**(2) IMPORTANT — the tracked test does not enforce its own stated coverage contract, and it is the vacuous-assertion defect AGAIN.** At `support.test.js:9970`, **a control object with `accepts: []` or `rejects: []` PASSES** — so a claim need not actually be checked in both directions, which is precisely what the test was built to guarantee. And the global floor at `:9990` **permits ELEVEN of the current 231 probes to be deleted while staying green.** FIX: require BOTH arrays non-empty for every non-retired guard, and **pin the exact total — or exact per-claim counts — rather than `>= 220`.**
+
+**(3) Minor — the `report.md` claim's POSITIVE half is too weak.** `support.test.js:9023` proves only that the copies are not byte-identical. It does not require that `report.md` is escaped and capped, nor that `report.json` is the verbatim comparison surface — **so deleting the fidelity rows leaves the claim green.** Pin both positive facts directly.
+
+> **RETIREMENT RULING: ACCEPTED — but the coordinator's supporting argument was WRONG, and the correction matters.** I endorsed the implementer's reasoning that the residual sweep plus existing behavioural tests suffice, since the suite already proves the uploader follows symlinks. Codex's rebuttal: **"Behavioral tests establish what the code does; they cannot stop consumer prose from contradicting it."** The symlink test proves the behaviour; it does nothing to prevent the README asserting the opposite. And the existing residual sweep "checks generic symlink following and human comparison, NOT each consequence being protected."
+>
+> **So each retired guard needs an explicit POSITIVE DISCLOSURE requirement in its place:**
+> - **State file:** no enumerated path names it **AND** symlink substitution can carry its bytes.
+> - **Signal name:** absent from normal rendered evidence **AND** able to leave through substituted state bytes.
+> - **Nonce:** detects a mismatch but **enforces/prevents no pairing.**
+> - **Mark each claim structurally as `retired` with its NAMED REPLACEMENT PROTECTION, so removal or renaming still fails coverage.**
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
