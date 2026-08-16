@@ -30,6 +30,11 @@ const STATUS_CHAR_CAP = 40;
 // the 1 MiB a Step Summary accepts. Blocks beyond this cap are announced, not
 // dropped in silence, and report.json still carries every one of them.
 const HYPOTHESIS_RENDER_CAP = 100;
+// Same document-bound for caveats: each value is already capped at
+// EXCERPT_CHAR_CAP, but rendering every caveat still overflows a 1 MiB Step
+// Summary (~2,033 × 500). Blocks beyond this cap are announced, not dropped
+// in silence, and report.json still carries every one of them.
+const CAVEAT_RENDER_CAP = 100;
 const SESSION_FILE_PATTERN = /^debug-([A-Za-z0-9_-]+)\.log$/;
 
 // Same equals-only convention as debug_diff (space-form values rejected).
@@ -158,8 +163,14 @@ const renderMarkdown = (report) => {
   lines.push('');
   // Above the evidence, never below it: a caveat qualifies everything that
   // follows, so a reader must meet it first.
-  for (const caveat of report.caveats ?? []) {
+  const caveats = report.caveats ?? [];
+  for (const caveat of caveats.slice(0, CAVEAT_RENDER_CAP)) {
     lines.push(`> **Caveat:** ${capped(escapeMarkdownText(caveat), EXCERPT_CHAR_CAP)}`);
+    lines.push('');
+  }
+  const hiddenCaveats = Math.max(0, caveats.length - CAVEAT_RENDER_CAP);
+  if (hiddenCaveats > 0) {
+    lines.push(`_…and ${hiddenCaveats} more ${hiddenCaveats === 1 ? 'caveat' : 'caveats'} (full list in report.json)_`);
     lines.push('');
   }
   for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
@@ -194,8 +205,13 @@ const renderText = (report) => {
   const id = report.session.id === null ? '(file)' : escapeMarkdownText(report.session.id);
   lines.push(`Debug evidence report — session ${id}`);
   lines.push(`entries ${report.session.entries} · events ${report.session.events} · hypothesis lines ${report.session.hypothesisLines} · untagged ${report.untaggedEvents}`);
-  for (const caveat of report.caveats ?? []) {
+  const caveats = report.caveats ?? [];
+  for (const caveat of caveats.slice(0, CAVEAT_RENDER_CAP)) {
     lines.push(`caveat: ${capped(escapeMarkdownText(caveat), EXCERPT_CHAR_CAP)}`);
+  }
+  const hiddenCaveats = Math.max(0, caveats.length - CAVEAT_RENDER_CAP);
+  if (hiddenCaveats > 0) {
+    lines.push(`…and ${hiddenCaveats} more ${hiddenCaveats === 1 ? 'caveat' : 'caveats'} (full list in report.json)`);
   }
   lines.push('');
   for (const h of report.hypotheses.slice(0, HYPOTHESIS_RENDER_CAP)) {
@@ -277,4 +293,12 @@ if (require.main === module) {
 // shrank. The action's sentinel test pins this name alongside the three
 // functions it calls, so removing it fails with a sentence naming the cause
 // rather than with the NaN comparison the measurement would otherwise report.
-module.exports = { EXCERPT_CHAR_CAP, buildReport, parseArgs, renderJson, renderMarkdown, renderText };
+module.exports = {
+  CAVEAT_RENDER_CAP,
+  EXCERPT_CHAR_CAP,
+  buildReport,
+  parseArgs,
+  renderJson,
+  renderMarkdown,
+  renderText,
+};

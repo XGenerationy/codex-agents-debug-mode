@@ -9,7 +9,7 @@ const test = require('node:test');
 
 const REPORT = path.join(__dirname, 'debug_report.js');
 const { parseSessionText } = require('./debug_evidence');
-const { buildReport, renderJson, renderMarkdown, renderText } = require('./debug_report');
+const { CAVEAT_RENDER_CAP, buildReport, renderJson, renderMarkdown, renderText } = require('./debug_report');
 
 const line = (object) => `${JSON.stringify(object)}\n`;
 
@@ -274,6 +274,34 @@ test('CLI failure stays ONE line even when the ref (and the OS error quoting it)
 // labeled unreachable-collector fallback: a reader who has the artifact and not
 // the job must still see it. Absent by default, so an ordinary report is
 // unchanged.
+test('human surfaces render at most CAVEAT_RENDER_CAP caveats and announce the remainder', () => {
+  const label = (i) => `caveat-${String(i).padStart(3, '0')}`;
+  const atCap = buildReport([], { caveats: Array.from({ length: CAVEAT_RENDER_CAP }, (_, i) => label(i)) });
+  assert.equal(atCap.caveats.length, CAVEAT_RENDER_CAP);
+  assert.ok(!renderMarkdown(atCap).includes('more caveat'), 'no announce at exactly the cap');
+  assert.ok(!renderText(atCap).includes('more caveat'));
+  const overCap = buildReport([], {
+    caveats: Array.from({ length: CAVEAT_RENDER_CAP + 1 }, (_, i) => label(i)),
+  });
+  assert.equal(overCap.caveats.length, CAVEAT_RENDER_CAP + 1, 'the report object keeps every caveat');
+  const md = renderMarkdown(overCap);
+  assert.ok(md.includes('_…and 1 more caveat (full list in report.json)_'), 'italic md footer, singular at 1');
+  assert.equal((md.match(/^> \*\*Caveat:\*\* /gm) ?? []).length, CAVEAT_RENDER_CAP, 'exactly the cap rendered');
+  assert.ok(!md.includes(label(CAVEAT_RENDER_CAP)), 'the cap-plus-one caveat never reaches the human surface');
+  const txt = renderText(overCap);
+  assert.ok(txt.includes('…and 1 more caveat (full list in report.json)'), 'plain text footer, singular at 1');
+  assert.ok(!txt.includes(label(CAVEAT_RENDER_CAP)));
+  assert.equal(JSON.parse(renderJson(overCap)).caveats.length, CAVEAT_RENDER_CAP + 1, 'the machine surface keeps every caveat');
+});
+
+test('the caveat overflow announce pluralizes, like the hypothesis announce above it', () => {
+  const many = buildReport([], {
+    caveats: Array.from({ length: CAVEAT_RENDER_CAP + 2 }, (_, i) => `c${i}`),
+  });
+  assert.ok(renderMarkdown(many).includes('_…and 2 more caveats (full list in report.json)_'));
+  assert.ok(renderText(many).includes('…and 2 more caveats (full list in report.json)'));
+});
+
 test('caveats travel with the report: absent by default, verbatim in JSON, capped and prominent in the human surfaces', () => {
   const entries = [{ raw: line({ msg: 'e' }), parsed: { msg: 'e' } }];
   const plain = buildReport(entries, { sessionId: 'ci-debug-abc' });

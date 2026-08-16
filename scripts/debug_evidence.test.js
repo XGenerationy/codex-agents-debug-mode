@@ -501,10 +501,38 @@ test('readSessionLive is bounded by an absolute deadline, not just socket inacti
       () => readSessionLive({ port, token: LAUNCH, sessionId: 'drip-session-1', deadlineMs: 300 }),
       /live_read_deadline_exceeded/,
     );
-    assert.ok(Date.now() - startedAt < 3_000, 'the deadline fired; the idle timeout never could');
+    const elapsed = Date.now() - startedAt;
+    // Upper bound: the 5s idle timeout was not what fired. Lower bound: the
+    // configured 300ms deadline was, and not an instant rejection.
+    assert.ok(elapsed < 3_000, `the idle timeout never could have fired (${elapsed}ms)`);
+    assert.ok(elapsed >= 250, `the configured deadline fired, not something instant (${elapsed}ms)`);
   } finally {
     clearInterval(drip);
     await close(server);
+  }
+});
+
+test('readSessionLive rejects a non-integer or sub-1 maxBytes fail-closed, before any request', async () => {
+  // A non-numeric cap (e.g. NaN from `Number(envVar)`) makes `bytes > maxBytes`
+  // false for every chunk and silently disables the bound. Reject fail-closed,
+  // matching createRedactionContext's maxTokens check. `undefined` is
+  // intentionally excluded: the destructure default substitutes LIVE_READ_MAX_BYTES.
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '64', null, true]) {
+    await assert.rejects(
+      () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', maxBytes: bad }),
+      /invalid_live_read_max_bytes/,
+      `maxBytes=${String(bad)} should be rejected before any request`,
+    );
+  }
+});
+
+test('readSessionLive rejects a non-integer or sub-1 deadlineMs fail-closed, before any request', async () => {
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '300', null, true]) {
+    await assert.rejects(
+      () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', deadlineMs: bad }),
+      /invalid_live_read_deadline/,
+      `deadlineMs=${String(bad)} should be rejected before any request`,
+    );
   }
 });
 

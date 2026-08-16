@@ -248,6 +248,19 @@ const readSessionLive = ({
   port, token, sessionId, filters = {}, timeoutMs = 5000,
   deadlineMs = LIVE_READ_DEADLINE_MS, maxBytes = LIVE_READ_MAX_BYTES, challenge,
 }) => new Promise((resolve, reject) => {
+  // Reject a non-integer or sub-1 bound before it can disable the check it
+  // configures: `bytes > NaN` is false for every chunk, which turns the byte
+  // cap off silently instead of failing closed. `deadlineMs: NaN` / `0` makes
+  // setTimeout fire on the next tick, so every read would reject instantly.
+  // Same fail-closed shape as createRedactionContext's maxTokens check.
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+    reject(new Error('invalid_live_read_max_bytes'));
+    return;
+  }
+  if (!Number.isInteger(deadlineMs) || deadlineMs < 1) {
+    reject(new Error('invalid_live_read_deadline'));
+    return;
+  }
   // Pre-flight, before any request setup: sessionId is interpolated
   // directly into the request path below. Mirrors resolveSessionRef's
   // bare-id guard (SESSION_ID_PATTERN, defined above) — sessionId here is

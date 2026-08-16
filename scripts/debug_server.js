@@ -1028,6 +1028,15 @@ const createDebugServer = ({
   // challenges.
   responderPrivateKey = null,
 } = {}) => {
+  if (responderPrivateKey !== null) {
+    // Fail at boot, not on the first challenged read: an unusable signing key
+    // otherwise surfaces as an opaque 500 from GET /sessions/:id/logs.
+    if (typeof responderPrivateKey !== 'object'
+      || responderPrivateKey.type !== 'private'
+      || responderPrivateKey.asymmetricKeyType !== 'ed25519') {
+      throw new Error('invalid_responder_private_key');
+    }
+  }
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
   // and its target hash to the same project_hash (already_running, not
@@ -1644,6 +1653,14 @@ const createDebugServer = ({
         if (session.provisional) {
           sendJson(response, 425, { error: 'session_initializing' });
           return;
+        }
+        // Session-token reads prove the CI caller still holds the surviving
+        // credential and is still capturing; refresh lastActivityAt so an
+        // idle wrapped command cannot retire the session under a live capture.
+        // Launch-token reads stay observers: operator inspection does not
+        // prove the instrumented app is alive.
+        if (safeTokenEqual(presented, session.sessionToken)) {
+          session.lastActivityAt = Date.now();
         }
         // Fail-closed query parsing: unknown parameter names are rejected so
         // a typo cannot silently disable a filter and widen what is returned.

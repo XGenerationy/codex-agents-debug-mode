@@ -4719,6 +4719,37 @@ test('GET does not refresh session activity (reads are observers)', async () => 
   }
 });
 
+test('GET with the session token refreshes activity so a live capture cannot idle-out under its own reads', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-session-read-'));
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const sessionAuth = { authorization: `Bearer ${session.session_token}` };
+    const createdAt = Date.now();
+    let last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: sessionAuth });
+    if (Date.now() - createdAt < idleMs) assert.equal(last.status, 200);
+    // Keep issuing session-token reads WHILE waiting out the budget: these
+    // are the surviving CI credential, and they must keep the session alive.
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: sessionAuth });
+      assert.equal(last.status, 200, 'a session-token read after the idle threshold must still succeed');
+    }
+    assert.equal(last.status, 200);
+    assert.equal(last.headers['content-type'], 'application/x-ndjson');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const session = (await createSession(baseUrl)).body;
@@ -4807,6 +4838,53 @@ test('the content digest keeps pace with ordinary appends: interleaved writes an
   });
 });
 
+test('a concurrent append and read never serves a torn trailing line', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'seeded' },
+    });
+    const messages = ['concurrent-a', 'concurrent-b', 'concurrent-c'];
+    const expected = ['seeded', ...messages];
+    const logs = messages.map((msg) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+    }));
+    const read = requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    const [readRes, ...logRes] = await Promise.all([read, ...logs]);
+    for (const posted of logRes) assert.equal(posted.status, 202);
+    assert.equal(readRes.status, 200);
+    if (readRes.text.length) assert.equal(readRes.text.endsWith('\n'), true, 'a non-empty body is a complete NDJSON window');
+    const lines = readRes.text.split('\n').filter(Boolean);
+    // Seeded line plus N in-flight appends: the concurrent read may observe
+    // any complete prefix of that window, never a torn trailing line.
+    assert.ok(
+      lines.length >= 1 && lines.length <= expected.length,
+      `read must observe a complete snapshot of 1..${expected.length} lines, got ${lines.length}`,
+    );
+    const parsed = lines.map((line) => JSON.parse(line));
+    for (const entry of parsed) {
+      assert.equal(typeof entry.msg, 'string');
+      assert.equal(expected.includes(entry.msg), true, `observed line must be a complete message, not a prefix: ${entry.msg}`);
+    }
+    const followUp = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(followUp.status, 200);
+    const finalLines = followUp.text.split('\n').filter(Boolean);
+    assert.equal(finalLines.length, expected.length, 'once the appends settle, the session holds every complete line');
+    assert.equal(followUp.text.endsWith('\n'), true);
+    for (const line of finalLines) JSON.parse(line);
+  });
+});
+
 test('GET /sessions/:id/logs accepts a session\'s own token for its own session and nothing else', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const mine = (await createSession(baseUrl)).body;
@@ -4883,8 +4961,46 @@ const withResponderServer = async (responderPrivateKey, run) => {
   }
 };
 
+test('createDebugServer rejects a non-Ed25519 responderPrivateKey at construction', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-bad-responder-'));
+  const { publicKey } = generateKeyPairSync('ed25519');
+  const { privateKey: rsaPrivateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  try {
+    for (const [label, bad] of [
+      ['string', 'not-a-key'],
+      ['plain object', {}],
+      ['ed25519 public key', publicKey],
+      ['rsa private key', rsaPrivateKey],
+    ]) {
+      assert.throws(
+        () => createDebugServer({
+          projectRoot,
+          token: TEST_LAUNCH_TOKEN,
+          redactionEnv: {},
+          responderPrivateKey: bad,
+        }),
+        /invalid_responder_private_key/,
+        `${label} must fail at boot, not on the first challenged read`,
+      );
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('GET /sessions/:id/logs signs a record covering the request target, the nonce and the served bytes', async () => {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+
+  // The record is the cross-process contract. Rebuilding it with the same
+  // helper the server signs with cannot catch a reordered field or a dropped
+  // domain tag, so pin the exact bytes once.
+  assert.equal(
+    canonicalResponderRecord({
+      method: 'GET', target: '/t', challenge: 'c', bodyDigest: 'd',
+    }),
+    'debug-evidence.logs.v1\nGET\n/t\nc\nd',
+  );
+
   await withResponderServer(privateKey, async ({ baseUrl }) => {
     const session = (await createSession(baseUrl)).body;
     await requestJson(baseUrl, {
@@ -4951,12 +5067,21 @@ test('GET /sessions/:id/logs signs a record covering the request target, the non
     // refuses to put one in a header value, and its server would reject the
     // request — so the charset check below is the second line of a defence
     // whose first line is the protocol itself.
-    for (const hostile of ['', 'short', `${nonceOne} with spaces`, `${nonceOne}/slash`, 'a'.repeat(129)]) {
+    for (const hostile of ['', 'short', `${nonceOne} with spaces`, `${nonceOne}/slash`, 'a'.repeat(15), 'a'.repeat(129)]) {
       const rejected = await requestRaw(baseUrl, {
         pathname,
         headers: { ...LAUNCH_AUTH, 'x-debug-challenge': hostile },
       });
+      assert.equal(rejected.status, 200, `served unsigned, not refused, for: ${JSON.stringify(hostile)}`);
       assert.equal(rejected.headers['x-debug-proof'], undefined, `refused to sign for: ${JSON.stringify(hostile)}`);
+    }
+    for (const ok of ['a'.repeat(16), 'a'.repeat(128)]) {
+      const accepted = await requestRaw(baseUrl, {
+        pathname,
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': ok },
+      });
+      assert.equal(accepted.status, 200, `signed bound still served for length ${ok.length}`);
+      assert.equal(typeof accepted.headers['x-debug-proof'], 'string', `signed for length ${ok.length}`);
     }
   });
 });
