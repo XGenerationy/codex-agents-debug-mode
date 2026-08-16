@@ -4440,6 +4440,22 @@ Six tests, all in `actions/debug-evidence/support.test.js`, plus the composite h
 
 **WHAT HELD, verbatim from the review:** A1/A2 are correct (merge base `af89573`, exactly 20 allowed files); "the six local drives are not vacuous for the cases they exercise"; "check 2's local six-hop lineage is complete up to the intentional archive boundary"; check 3's launch-token identification is sound because the earlier exact-order test independently binds the mask to `startLine.launch_token`; and passwordless sudo on hosted Linux VMs is confirmed against GitHub's current documentation. Codex's sandbox again could not start Node (`EPERM lstat`), so the battery numbers remain coordinator-verified. **No PR-description ruling yet — "the merge-time contract itself needs correction first."**
 
+#### Task 9 round-2 outcome (`cada897`) — the driver is fail-closed on all four seams, and mutation A1 demonstrated the finding before fixing it
+
+One file, `support.test.js` (+161/−11). The checklist corrections were already committed at `2160246`; this round is the two Minor code fixes plus the drive finding 1 required.
+
+**(A) `uses:` steps are now allow-listed.** `PINNED_USES_STEPS` maps step name → required action; an unknown `uses:` step THROWS, and a known name whose `uses` no longer starts with its declared action THROWS. **Mutation A1 is the round's proof-of-finding: `actions/setup-node@<sha>` swapped to `rogue-owner/setup-node@<sha>` — pre-fix, ALL THREE check-1 tests PASSED with byte-identical step vectors while a different owner's action stood in silently.** Fixed: 3 fail naming the rogue. A2 (a genuine third `uses:` step inserted) → RED, `unmodelled uses: step`.
+
+**(B) The driver reaps its own collector on a mid-drive throw** — `process.kill` directly in the catch (a second teardown diagnostic on an already-failing path would bury the first); the success path still exits through `teardownSubcommand` so production teardown stays exercised. Proved by a harness test that removes the reap → collector still alive after 2s → RED.
+
+**(C) The skipped-start drive** (`support.test.js:11189`, "MODEL ONLY" in the name). `failStep` forces a **pinned `uses:` step only** — an assertion rejects forcing any subcommand's verdict, because a harness able to invent a `run` outcome would answer the questions check 1 exists to ask. Exact 7-entry vector (setup-node `failure`, six `skipped`), outcome map asserted separately so the TWO guard shapes are distinguished rather than one covering for the other, `startOutputs` empty, `upload` null, no state file, no env dump. The retraction framing is in the test comment verbatim. RED ×2: the guard's skipped-comparison flipped to `true`; the no-`if:` rule flipped to `true`.
+
+**TWO JUDGMENT CALLS, flagged by the implementer, RULED BY THE COORDINATOR, submitted to Codex to overturn:**
+1. **The harness reap test ships in-tree (140 tests, not 139).** Rule 4 cuts both ways — a fix whose only failure mode is an orphaned process, proved once on a discarded scratch run, is an unproven fix. Kept.
+2. **The allow-list binds to the ACTION, not the full SHA.** The exact SHA pin already lives in the `action.yml` structural tests; duplicating it in the driver would make one deliberate version bump fail twice while detecting nothing new. The driver's question is *whose code is this model standing in for*. Kept as action-identity.
+
+**Battery (implementer, then coordinator-verified):** `support.test.js` 140/139/0/1; full `npm test` 1137/1096/0/41; validate PASS 43/87/0; scanner exit 1, the one known finding; `git diff --check` 0; scope 20 files, nothing under `scripts/pr_closeout*` or `actions/closeout/`. One mutation (`R2B-no-reap`) deliberately leaks a collector by construction; the implementer reaped it by hand — the only leaking mutation in either round.
+
 ---
 
 ## Plan self-review record (writing-plans checklist)
