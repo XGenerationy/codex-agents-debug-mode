@@ -287,6 +287,11 @@ const buildProtectWindowsPrivateFileArgs = (privateFile) => {
 // seconds to load PowerShell/.NET ACL types. Keep the operation bounded and
 // fail closed, but allow a realistic startup budget before reporting failure.
 const PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS = 15_000;
+const PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS = Object.freeze({
+  stdio: 'ignore',
+  timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
+  windowsHide: true,
+});
 
 /**
  * Establish and verify a protected, current-user-only Windows DACL (and owner)
@@ -304,7 +309,7 @@ const protectWindowsPrivateFile = (privateFile) => {
   execFileSync(
     resolvePowerShellExecutable(),
     buildProtectWindowsPrivateFileArgs(privateFile),
-    { stdio: 'ignore', timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
+    PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
   );
 };
 
@@ -324,7 +329,7 @@ const protectWindowsPrivateFileAsync = async (privateFile) => {
   await execFileAsync(
     resolvePowerShellExecutable(),
     buildProtectWindowsPrivateFileArgs(privateFile),
-    { timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
+    PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
   );
 };
 

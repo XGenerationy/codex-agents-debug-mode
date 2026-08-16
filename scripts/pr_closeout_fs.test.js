@@ -260,3 +260,20 @@ test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lac
   assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0, true), [flags],
     'a platform with neither extra flag must still get the plain attempt');
 });
+
+test('Windows ACL sync and async entry points share stdio ignore so PowerShell cannot deadlock the pipe', () => {
+  // execFile without stdio:ignore buffers child output; a PowerShell that
+  // writes more than the pipe capacity never exits and hits the 15s timeout.
+  // Session mint on hosted windows-latest failed that way (HTTP 500 after 15s).
+  const source = readFileSync(path.join(__dirname, 'pr_closeout_fs.js'), 'utf8');
+  assert.match(source, /PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS = Object\.freeze\(\{/);
+  assert.match(source, /stdio: 'ignore'/);
+  const syncIdx = source.indexOf('const protectWindowsPrivateFile =');
+  const asyncIdx = source.indexOf('const protectWindowsPrivateFileAsync =');
+  const optionsIdx = source.indexOf('PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS');
+  assert.ok(optionsIdx !== -1 && syncIdx !== -1 && asyncIdx !== -1);
+  assert.ok(
+    source.includes('PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,\n  );'),
+    'both execFile wrappers must pass the shared options object',
+  );
+});
