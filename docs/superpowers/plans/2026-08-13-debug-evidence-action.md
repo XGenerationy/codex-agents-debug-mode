@@ -4129,6 +4129,30 @@ Also corrected: the signal name is printed by *nothing* (a first draft said the 
 
 ---
 
+#### Task 8 round-3 outcome (`adb7b59`) — the audit is now a standing test, and one guard class is recommended for RETIREMENT
+
+**THE BIDIRECTIONAL CHECK IS NOW TRACKED, AND IT COSTS NOTHING.** All **68 claims, 231 probes** (149 `accepts` that must NOT match the forbidden half, 82 `rejects` that must), plus three structural assertions — a claim with no controls fails, **a control with no claim fails so a rename cannot silently orphan its probes**, duplicate `what` strings fail — and a floor of 220 probes so a tidy-up cannot pass by deleting sentences instead of satisfying them. **Runtime 11.6 ms: 0.055% of the file's 21 s.** The two claim tables were hoisted from a test body to module scope to make it possible, verified behaviour-neutral first.
+
+**WHAT IT WOULD HAVE CAUGHT, each verified by mutation rather than asserted:** round 1's `holds for every invocation` overshoot; **round 2's own retracted first draft** of the `always()` pin (which round 2 caught by hand, in a harness that then evaporated); round 3's `report.md` tempered window; round 3's missing `action-state.json` pre-colon branch; **the round-1 finding-#2 shape in its third recurrence** (the sysctl guard's inability to cross `kernel.yama.ptrace_scope`); and round 3's `readme[25]`. **Every finding of the last three rounds is now a standing test.**
+
+**THE COUNT DRIFT, EXPLAINED — AND ROUND 2's AUDIT WAS NOT ACTUALLY TWO-SIDED.** Round 2's "33" was a count of rejected PROBES out of 92, never a guard count. The re-derivation found **44 failing probes — 34 false positives AND 10 FALSE NEGATIVES — concentrated in 27 guards**, growing to **32 changed** of 68 as probes were added. **The set did not shrink; it grew, and round 2 could not have seen most of it: round 2 measured ONE DIRECTION ONLY — whether guards reject true statements — and never asked whether a guard still catches its regression, so all 10 false negatives were structurally invisible to it.** That is why the sysctl blindness had to be found by hand in review. Among the new finds: `collector'?s?` missed a **curly apostrophe**, and a negative lookahead was an outright fail-open.
+
+**THE FIXES were bound per claim — "by subject, affirmative inflection, or affirmative sentence position, chosen per claim, never applied uniformly"** — honouring the ruling against a mechanical sweep. The sysctl pair became **one shared `SYSCTL_BUYS_STRICT`, so two surfaces stating one fact cannot drift apart again**, keyed on inflection (`makes`/`does make`/`turns`) so the regex separates the reversal from "does not make" **without knowing what "not" means**, and tolerating `\.(?=\w)` so `kernel.yama.ptrace_scope` reads as an identifier rather than a sentence end. `readme[25]` was replaced, not rescued. One fail-open removed. **33 mutations, 33 as expected — including 8 that APPEND TRUE STATEMENTS to the real README and `action.yml` and leave everything GREEN.** Snapshot restore throughout, worktree proved byte-identical afterwards.
+
+> **THE SOUNDNESS ANSWER, and it ends the patching rather than extending it: MOSTLY SOUND, WITH ONE CLASS TO RETIRE.**
+>
+> The mechanism works now **because the guards stopped pretending.** Three devices carry polarity and none needs a negation vocabulary — **affirmative inflection** (`makes` vs `does not make`), **subject binding** (`the check proves…` vs `nothing here proves…`), and **affirmative position** (a subject leading a sentence or cell vs being talked about). Each is a property of the ASSERTED sentence rather than a judgement about negation.
+>
+> **THE CLASS THAT CANNOT WORK: claims whose forbidden proposition is ITSELF NEGATIVE** — three, with a fourth of the same shape lurking. The reversal is *"the state file **cannot reach** the artifact"*: there is no affirmative inflection to key on **because the regression is a negative sentence**, and the true statement is that same sentence **being denied** (*"…which is not the same as saying it cannot reach the artifact"*). **"Distinguishing an asserted negative from a quoted-and-denied one is not a regex problem."** Today's guards buy proximity, which holds only because nobody has yet written the denial in the tight form — **"it will fail eventually, in one direction or the other."**
+>
+> **RECOMMENDED: retire those forbidden halves.** Keep the required halves plus the existing residual-disclosure sweep, which is already a presence check rather than a polarity pair and is the right instrument for "this fact must still be published". **The decisive argument: these are the only claims whose truth is a BEHAVIOURAL FACT THE SUITE ALREADY TESTS** — that the uploader follows symlinks is asserted by real tests, not prose. *"A prose guard that cannot decide its own proposition is worth less than the behavioural test that already proves the fact."*
+>
+> Two smaller admissions volunteered: `readme[23]`'s forbidden half **leans on this README's bolding convention** (asserted recipe steps are bold, prose denials are not) — honest but convention-dependent; and several forbidden halves are now **redundant with a precise required half**, belt-and-braces rather than load-bearing.
+
+**Verification caveat disclosed rather than buried:** the first full `npm test` after the last edit reported one failure in `scripts/pr_closeout_workflow.test.js` — a file this commit does not touch, carrying its own comment about inode reuse. Coordinator-checked: it passes 74/74 on three consecutive isolated runs, which is CONSISTENT WITH a flake rather than proof of one; the clean final `npm test` (1128/1087/0/41) is the stronger evidence.
+
+---
+
 ### Task 9: Full battery, scope proof, and handoff
 
 > **Queued test (Task 5 spec-review disposition):** add the missing teardown
