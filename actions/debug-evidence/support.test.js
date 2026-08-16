@@ -10817,13 +10817,43 @@ const compositeProbe = (exitCode) => `node -e "${[
   `.then((r) => process.exit(r.status === 202 ? ${exitCode} : 99));`,
 ].join('')}"`;
 
+// THE ONLY TWO `uses:` STEPS THIS MODEL ADMITS, keyed by the step name that
+// identifies them everywhere else in this file and bound to the action each one
+// must carry.
+//
+// Round 1 treated ANY non-`run` step as a successful no-op, which is exactly
+// the fail-open shape the guard evaluator and the expression resolver both
+// refuse (Codex T9 r1 #4). Its cost is not hypothetical: swapping
+// `actions/setup-node` for a same-named action belonging to somebody else left
+// every drive's step vector byte-identical and silently green, because the
+// model never looked at what the step was.
+//
+// Pinned to the ACTION and not to the SHA. The SHA is a version, it has its own
+// exact pin in the `action.yml` tests above, and duplicating it here would make
+// one deliberate bump fail in two places while detecting nothing the pin does
+// not already detect. What must not change unnoticed is WHOSE code this model
+// is standing in for.
+const PINNED_USES_STEPS = new Map([
+  ['Set up Node.js', 'actions/setup-node'],
+  ['Upload evidence artifact', 'actions/upload-artifact'],
+]);
+
 // Drive the whole action: every step action.yml declares, in order, under the
 // three rules above. `seams` is keyed by subcommand; `afterStep` by step name —
 // the injection point for what happens BETWEEN two steps of the same composite
-// action, which is where the staging window lives.
+// action, which is where the staging window lives. `failStep` forces ONE pinned
+// `uses:` step to fail, which is the only way to reach a skipped `start`.
 const driveCompositeAction = async ({
-  inputs: overrides = {}, seams = {}, afterStep = {}, extraEnv = {},
+  inputs: overrides = {}, seams = {}, afterStep = {}, extraEnv = {}, failStep = null,
 } = {}) => {
+  // RESTRICTED TO THE PINNED STEPS, deliberately. A harness able to invent a
+  // `run`, `report` or `finish` outcome would be a harness that answers the
+  // very questions check 1 exists to ask, so the forcing seam cannot reach
+  // them: those verdicts must keep coming from the subcommands themselves.
+  if (failStep !== null) {
+    assert.ok(PINNED_USES_STEPS.has(failStep),
+      `failStep may only force a pinned uses: step, never a subcommand's verdict — got '${failStep}'`);
+  }
   const runnerTemp = makeTempDir();
   const workspace = makeTempDir();
   const runner = runnerCommandFiles();
@@ -10842,10 +10872,11 @@ const driveCompositeAction = async ({
   const stderr = {};
   const steps = [];
   const context = { inputs, runnerTemp, startOutputs };
+  const outputDir = inputs['output-dir'] || path.join(runnerTemp, 'debug-evidence');
   let failed = false;
   let upload = null;
   let index = 0;
-  const { written } = await captureStderr(async (read) => {
+  const walkSteps = async (read) => {
     for (const step of declared.steps) {
       index += 1;
       const key = step.id ?? step.name;
@@ -10855,13 +10886,24 @@ const driveCompositeAction = async ({
         steps.push([step.name, 'skipped', null]);
         continue;
       }
+      const forced = step.run === undefined && step.name === failStep;
       let code = null;
       if (step.run === undefined) {
-        // The two pinned third-party actions. setup-node is a no-op here; the
-        // uploader is an OBSERVATION POINT — it records the paths action.yml
-        // enumerates, resolved exactly as the runner would, and what is sitting
-        // at each of them at the moment it would have archived them.
-        if (step.name === 'Upload evidence artifact') {
+        // The two pinned third-party actions, and NOTHING else: a `uses:` step
+        // this model has never been told about is refused rather than run as
+        // whatever it happens to resemble.
+        const action = PINNED_USES_STEPS.get(step.name);
+        if (action === undefined) {
+          throw new Error(`unmodelled uses: step '${step.name}' (${step.uses}) — admit it deliberately or leave it out`);
+        }
+        if (!String(step.uses ?? '').startsWith(`${action}@`)) {
+          throw new Error(`step '${step.name}' no longer uses ${action}: ${step.uses}`);
+        }
+        // setup-node is a no-op here; the uploader is an OBSERVATION POINT — it
+        // records the paths action.yml enumerates, resolved exactly as the
+        // runner would, and what is sitting at each of them at the moment it
+        // would have archived them.
+        if (step.name === 'Upload evidence artifact' && !forced) {
           const paths = [...step.with.path].map((entry) => resolveActionExpression(entry, context));
           upload = {
             name: resolveActionExpression(step.with.name, context),
@@ -10899,14 +10941,32 @@ const driveCompositeAction = async ({
         if (subcommand === 'run') Object.assign(runOutputs, emitted);
         if (subcommand === 'run') context.runStepEnv = env;
       }
-      const outcome = code === null || code === 0 ? 'success' : 'failure';
+      const outcome = forced || !(code === null || code === 0) ? 'failure' : 'success';
       outcomes[key] = outcome;
       if (outcome === 'failure') failed = true;
       steps.push([step.name, outcome, code]);
       if (afterStep[step.name]) await afterStep[step.name]({ startOutputs, runnerTemp, inputs });
     }
-  });
-  const outputDir = inputs['output-dir'] || path.join(runnerTemp, 'debug-evidence');
+  };
+  // A DRIVE THAT THROWS MUST NOT LEAVE ITS COLLECTOR RUNNING. `stop()` below is
+  // reachable only on the value this function RETURNS, so a throw anywhere
+  // between the spawn and that return leaked a live listener holding a port for
+  // the rest of the process — 27 of them accumulated in one afternoon of
+  // mutation work, and were reaped by hand (Codex T9 r1 #5). Signalled directly
+  // rather than through `teardownSubcommand`, because this path is already
+  // failing and a second diagnostic on the way out buries the first.
+  const reapCollector = () => {
+    const state = readState(outputDir);
+    if (!state?.pid) return;
+    try { process.kill(state.pid); } catch { /* already gone, which is the outcome wanted */ }
+  };
+  let written;
+  try {
+    ({ written } = await captureStderr(walkSteps));
+  } catch (error) {
+    reapCollector();
+    throw error;
+  }
   return {
     steps,
     result: failed ? 'failure' : 'success',
@@ -11124,6 +11184,96 @@ test('Task 9 check 1: composite failure precedence — no later always() step ca
   } finally {
     teardownFailure.stop();
   }
+});
+
+test('Task 9 check 1 (MODEL ONLY): a failed setup step skips start, and both guard shapes then evaluate false', async () => {
+  // THE FALSE BRANCH of `steps.start.outcome != 'skipped'`. None of the six
+  // drives above reaches it — every one of them has a `start` that RAN, whether
+  // it succeeded or refused — and it is the only part of the semantic model
+  // that is exercisable at all without a hosted runner.
+  //
+  // WHAT THIS PROVES, stated exactly, because round 1 over-claimed here and the
+  // over-claim was retracted (Codex T9 r1 #1): IT PROVES THE MODEL'S
+  // CONSISTENCY, EXPLICITLY NOT GITHUB'S BEHAVIOUR. The semantic model ships
+  // DOCUMENTATION-SUPPORTED — GitHub's expressions and steps-context pages list
+  // `skipped` among the `steps.<id>.outcome` values and specify `always()` —
+  // and UNVERIFIED BY LIVE EXECUTION in this repository. Nothing in this repo
+  // settles it: the hosted `strict-refusal` job calls `support.js start`
+  // DIRECTLY and never invokes the composite action at all, and a live probe of
+  // a genuinely failed composite step is not buildable under this repo's gate
+  // design (a failed step cannot coexist with a green demo workflow, and
+  // `continue-on-error` is forbidden). It ships as a stated limitation.
+  const drive = await driveCompositeAction({
+    inputs: { run: compositeProbe(0) },
+    failStep: 'Set up Node.js',
+  });
+  try {
+    assert.deepEqual(drive.steps, [
+      ['Set up Node.js', 'failure', null],
+      ['Start collector', 'skipped', null],
+      ['Run wrapped command', 'skipped', null],
+      ['Render evidence report', 'skipped', null],
+      ['Upload evidence artifact', 'skipped', null],
+      ['Stop collector', 'skipped', null],
+      ['Apply verdict', 'skipped', null],
+    ]);
+    assert.equal(drive.result, 'failure');
+    // `Start collector` carries no `if:`, so it goes only while nothing has
+    // failed; the four steps after it are guarded, and they go the same way for
+    // TWO different reasons. Asserting the outcome map as well as the vector is
+    // what keeps those reasons distinct: three of them read a `start` whose
+    // outcome is `skipped`, and the uploader reads an `evidence-dir` output
+    // that was never published. BOTH guard shapes evaluate false here, which is
+    // what makes this the false branch rather than one shape covering for the
+    // other.
+    assert.deepEqual(drive.outcomes, {
+      'Set up Node.js': 'failure',
+      start: 'skipped',
+      run: 'skipped',
+      report: 'skipped',
+      'Upload evidence artifact': 'skipped',
+      'Stop collector': 'skipped',
+      'Apply verdict': 'skipped',
+    });
+    assert.deepEqual(drive.startOutputs, {},
+      'start never ran, so the upload guard had an empty evidence-dir to read');
+    assert.equal(drive.upload, null, 'and the uploader never reached its observation point');
+    // NO COLLECTOR WAS EVER SPAWNED. `start` is the only step that spawns one
+    // and it did not run, so there is no state file — which is also why the
+    // `stop()` below is a no-op rather than an error.
+    assert.equal(existsSync(path.join(drive.outputDir, 'action-state.json')), false);
+    assert.equal(existsSync(drive.envDump), false, 'and the wrapped command never ran either');
+  } finally {
+    drive.stop();
+  }
+});
+
+test('Task 9 check 1 (HARNESS): a drive that throws mid-way reaps the collector it started', async () => {
+  // The harness's own hygiene, and it earns a test because the failure mode is
+  // invisible from any assertion: `stop()` lives on the value the driver
+  // RETURNS, so until this fix a throw between the spawn and that return left a
+  // listener holding its port for the rest of the process. It cost 27 orphaned
+  // collectors across one afternoon of mutation work — during which every
+  // failing drive leaked, which is precisely when a harness is least able to
+  // clean up after itself (Codex T9 r1 #5).
+  const outputDir = makeTempDir();
+  await assert.rejects(() => driveCompositeAction({
+    inputs: { run: compositeProbe(0), 'output-dir': outputDir },
+    seams: { start: { probeAdmission: ADMITTED } },
+    // Thrown BETWEEN two steps, which is where every staging-window injection
+    // point in these checks lives — so this is the shape a mid-drive failure
+    // actually takes here.
+    afterStep: { 'Start collector': () => { throw new Error('a check failed mid-drive'); } },
+  }), /a check failed mid-drive/);
+  const state = readState(outputDir);
+  // PRESENCE CONTROL: a drive that never got as far as spawning anything would
+  // satisfy the liveness assertion below by having nothing to leak.
+  assert.ok(state?.pid, 'the collector really was spawned and recorded, so there was something to leak');
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  for (let attempt = 0; attempt < 100 && alive(state.pid); attempt += 1) {
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+  }
+  assert.equal(alive(state.pid), false, 'the driver signalled it on its way out');
 });
 
 test('Task 9 check 2: one invocation nonce and one admission record, traced from start\'s step output to the enumerated upload paths', async () => {
