@@ -89,7 +89,12 @@ const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection
     pendingWindowsProtection.push(privateFile);
     return;
   }
-  protectWindowsPrivateFile(privateFile);
+  // Never execFileSync here: hosted Windows PowerShell can take 5–15s per
+  // invocation, and createDebugServer runs on the test/CLI construction path.
+  // Fail-open matches the outer catch (unlink; unpersisted salt).
+  void protectWindowsPrivateFileAsync(privateFile).catch(() => {
+    try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+  });
 };
 
 // Runs synchronously during createDebugServer's construction, like

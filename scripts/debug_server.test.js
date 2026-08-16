@@ -372,11 +372,14 @@ test('deferred Windows salt protection still persists project_salt and agrees on
   // same root must still agree, because already_running depends on it.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-defer-'));
   try {
+    const startedAt = Date.now();
     const first = createDebugServer({
       projectRoot,
       token: TEST_LAUNCH_TOKEN,
       deferWindowsPrivateFileProtection: true,
     });
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(elapsedMs < 2000, `deferred construction must not wait on PowerShell ACL (${elapsedMs}ms)`);
     assert.equal(typeof first.protectDeferredWindowsPrivateFiles, 'function');
     const saltInfo = await stat(path.join(projectRoot, '.debug', 'project_salt'));
     assert.equal(saltInfo.size, 32);

@@ -65,6 +65,7 @@ jobs:
         run: npm run scan:suppressions
 
       - name: Run tests
+        timeout-minutes: 40
         env:
           # Windows collector boot pays for PowerShell ACL on private files;
           # the default 15s handshake timeout expires before listen() fires.
