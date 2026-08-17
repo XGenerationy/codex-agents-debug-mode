@@ -36,6 +36,9 @@ const {
 
 const { MIN_AUTO_SECRET_LENGTH, buildChildEnvironment } = require('./pr_closeout_stream');
 
+/** Executor repo outside process.cwd(): cloud VMs often keep infra (VNC/desktop-init) with cwd on the workspace, which false-BLOCKs orphan sweeps. */
+const mkIsolatedRepo = () => mkdtemp(path.join(tmpdir(), 'closeout-isolated-repo-'));
+
 const windowsAclIsCurrentUserOnly = (filePath) => {
   const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
   const script = [
@@ -291,6 +294,8 @@ test('live child-process output redacts an environment-independent Bearer token 
   // fixture avoids status-signal words (error/fail/warn) so classification
   // stays PASS.
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-pattern-redact-'));
+  const repo = await mkIsolatedRepo();
+  try {
   // The credentials are assembled at RUNTIME inside the child (split so the
   // contiguous SENTINEL string never appears in the command source): the
   // evidence log echoes the command text in its header, and a literal
@@ -306,7 +311,7 @@ test('live child-process output redacts an environment-independent Bearer token 
     "process.stdout.write('-----END PLACEHOLDER KEY-----\\nend-marker\\n');",
   ].join('');
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -320,12 +325,17 @@ test('live child-process output redacts an environment-independent Bearer token 
   assert.doesNotMatch(log, /SENTINEL/, 'no pattern-shaped credential may reach the evidence log');
   assert.match(log, /\[REDACTED:token\]/, 'the evidence log carries the Bearer redaction marker');
   assert.match(log, /\[REDACTED:pem-block\]/, 'the evidence log carries the PEM redaction marker');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('command executor records timestamps, exit code, output, and a log', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-executor-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -344,6 +354,9 @@ test('command executor records timestamps, exit code, output, and a log', async 
     /clean output/,
   );
   assert.equal(result.logPath, '<output>/logs/qualification.probe.attempt-001.log');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('keeps the full redacted raw log while capping report output', async () => {
@@ -368,8 +381,10 @@ test('keeps the full redacted raw log while capping report output', async () => 
 
 test('classifies warning output that appears after the report capture cap', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-tail-warning-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -382,6 +397,9 @@ test('classifies warning output that appears after the report capture cap', asyn
   assert.doesNotMatch(result.stdout, /UserWarning/);
   assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /UserWarning/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('classifies a no-work summary that appears after the report capture cap', async () => {
@@ -396,9 +414,10 @@ test('classifies a no-work summary that appears after the report capture cap', a
   // produces different wording -- so matching it proves the post-cap summary
   // was caught by the stream, not by the (now blind) capped string.
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-tail-nowork-'));
+  const repo = await mkIsolatedRepo();
   try {
     const execute = createCommandExecutor({
-      repo: process.cwd(),
+      repo,
       outputDir,
       shell: process.execPath,
       shellArgs: (command) => ['-e', command],
@@ -412,6 +431,7 @@ test('classifies a no-work summary that appears after the report capture cap', a
     assert.equal(result.status, 'FAIL', statusDiag(result));
     assert.match(result.evidence, /no-work/i);
   } finally {
+    await rm(repo, { recursive: true, force: true });
     // ~2 MB raw evidence log; every other filesystem test cleans up (UmlJZ).
     await rm(outputDir, { recursive: true, force: true });
   }
@@ -467,8 +487,10 @@ test('probeCommandDefault records a status signal that streams past the capture 
 
 test('hashes full output beyond the report capture cap', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-digest-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -477,6 +499,9 @@ test('hashes full output beyond the report capture cap', async () => {
   const second = await execute({ id: 'second', command: "process.stdout.write('x'.repeat(2100000) + 'B')" }, 'qualification');
   assert.equal(first.stdout, second.stdout);
   assert.notEqual(first.outputDigest.stdout, second.outputDigest.stdout);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('fails a successful command when its artifact proof is missing and passes a refreshed artifact', async () => {
@@ -679,8 +704,10 @@ test('readBoundArtifactJson rejects and never reads past the verified size when 
 
 test('requires explicit health evidence from a postcondition command', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-health-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -698,12 +725,17 @@ test('requires explicit health evidence from a postcondition command', async () 
   }, 'confirmation');
   assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.proofResult.matched, true);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('rejects hunter proof when Docker reports running but unhealthy', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-unhealthy-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -722,12 +754,17 @@ test('rejects hunter proof when Docker reports running but unhealthy', async () 
   assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.equal(result.proofResult.matched, false);
   assert.match(result.evidence, /running.*healthy/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('rejects arbitrary proof regex syntax instead of evaluating it', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-regex-policy-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -743,13 +780,18 @@ test('rejects arbitrary proof regex syntax instead of evaluating it', async () =
   }, 'confirmation');
   assert.equal(result.status, 'FAIL', statusDiag(result));
   assert.match(result.evidence, /literal:|semantic:/i);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('never returns raw secrets embedded in primary or proof commands', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-secret-command-'));
+  const repo = await mkIsolatedRepo();
   const secret = 'secret-12345';
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -769,13 +811,18 @@ test('never returns raw secrets embedded in primary or proof commands', async ()
   assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
   assert.match(result.command, /\[REDACTED\]/);
   assert.match(result.proof.command, /\[REDACTED\]/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('classifies status signals before redaction without retaining the raw secret', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-raw-signal-'));
+  const repo = await mkIsolatedRepo();
   const secret = 'ERROR: super-sensitive-raw-signal';
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -795,14 +842,19 @@ test('classifies status signals before redaction without retaining the raw secre
   assert.doesNotMatch(serialized, /super-sensitive-raw-signal/);
   assert.doesNotMatch(log, /super-sensitive-raw-signal/);
   assert.match(result.stdout, /\[REDACTED\]/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('does not pass ambient credentials to child commands', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-child-env-'));
+  const repo = await mkIsolatedRepo();
   const dockerCredential = '{"auths":{"registry.example":{"auth":"ambient-secret"}}}';
   const allowedCredential = 'explicit-required-secret';
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -820,6 +872,9 @@ test('does not pass ambient credentials to child commands', async () => {
   assert.equal(result.status, 'PASS', statusDiag(result));
   assert.equal(result.stdout, '{"docker":null,"allowed":"[REDACTED]"}');
   assert.doesNotMatch(JSON.stringify(result), /ambient-secret|explicit-required-secret/);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('normalizes repository and user paths before capture and logging', async () => {
@@ -882,8 +937,10 @@ test('does not turn a root-only HOME into a needle that mangles every path separ
 
 test('uses unique logs for repeated baseline setup attempts', async () => {
   const outputDir = await mkdtemp(path.join(tmpdir(), 'closeout-baseline-logs-'));
+  const repo = await mkIsolatedRepo();
+  try {
   const execute = createCommandExecutor({
-    repo: process.cwd(),
+    repo,
     outputDir,
     shell: process.execPath,
     shellArgs: (command) => ['-e', command],
@@ -905,6 +962,9 @@ test('uses unique logs for repeated baseline setup attempts', async () => {
     await readFile(path.join(outputDir, 'logs', 'baseline-setup.baseline-dependency-setup.attempt-002.log'), 'utf8'),
     /second-attempt/,
   );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('redacts a baseline worktree cwd the same way as the head repo', async () => {
@@ -2041,15 +2101,20 @@ test('probeCommandDefault runs commands through a non-login shell (--noprofile -
   assert.deepEqual(defaultShellArgs('true', '/bin/dash'), ['-c', 'set -e; set -o pipefail; true']);
   assert.deepEqual(defaultShellArgs('true', 'C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe'), ['--noprofile', '--norc', '-c', 'set -eo pipefail; true']);
   const shell = resolveCommandShell({ env: process.env });
+  const repo = await mkIsolatedRepo();
+  try {
   const result = await probeCommandDefault({
     command: 'printf %s probe-default-ok',
-    repo: process.cwd(),
+    repo,
     shell,
     env: process.env,
   });
   assert.equal(result.exitCode, 0, `default probe must succeed via non-login shell: ${JSON.stringify(result)}`);
   assert.equal(result.stdout, 'probe-default-ok');
   assert.equal(result.terminationStatus, 'PASS');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test('probeCommandDefault clears timeout timers so a fast probe does not hold the process', async () => {
