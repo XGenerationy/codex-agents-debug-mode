@@ -4842,19 +4842,31 @@ test('GET with the session token but an invalid query does not refresh activity'
       headers: sessionAuth,
     });
     // Assert the pre-expiry 400 only when we provably raced the budget, like
-    // the observer test above: the property assertion below holds regardless.
+    // the observer test above: the property assertions below hold regardless.
     if (Date.now() - createdAt < idleMs) assert.equal(first.status, 400);
     // Keep issuing REJECTED session-token reads WHILE waiting out the budget:
     // an unknown parameter is refused fail-closed before the refresh, so a
     // refused read proves nothing — if it refreshed lastActivityAt, repeated
     // malformed reads could retain an otherwise idle session indefinitely.
+    let rejectedWhileLive = first.status === 400 ? 1 : 0;
     while (Date.now() - createdAt < idleMs + 300) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      await requestRaw(baseUrl, {
+      const read = await requestRaw(baseUrl, {
         pathname: sessionLogsPath(session, 'bogus=1'),
         headers: sessionAuth,
       });
+      if (read.status === 400) rejectedWhileLive += 1;
     }
+    // Guard against a vacuous pass without adding a new flake mode: at least
+    // one read must have been rejected 400 while the session was still live,
+    // or this test never exercised the invalid-query path at all. A runner so
+    // stalled that every read missed the idle budget already fails the
+    // session-token refresh test above (its in-loop 200 assertion), so this
+    // demands nothing that suite does not already demand.
+    assert.ok(
+      rejectedWhileLive >= 1,
+      'at least one invalid read must be rejected 400 while the session is live',
+    );
     const final = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     assert.equal(final.status, 404);
     assert.equal(JSON.parse(final.text).error, 'unknown_session');
