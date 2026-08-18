@@ -1,6 +1,6 @@
 'use strict';
 
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const { execFile } = require('node:child_process');
 const { mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
 const os = require('node:os');
