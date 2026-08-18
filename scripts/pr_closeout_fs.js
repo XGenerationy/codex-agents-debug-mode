@@ -408,6 +408,7 @@ module.exports = {
   openNoFollow,
   openNoFollowFlagAttempts,
   openNoFollowSync,
+  PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,

@@ -16,6 +16,9 @@ const {
   openNoFollow,
   openNoFollowFlagAttempts,
   openNoFollowSync,
+  PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+  protectWindowsPrivateFile,
+  protectWindowsPrivateFileAsync,
 } = require('./pr_closeout_fs');
 
 test('openNoFollow defaults to O_RDONLY when flags are omitted', async () => {
@@ -261,19 +264,23 @@ test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lac
     'a platform with neither extra flag must still get the plain attempt');
 });
 
-test('Windows ACL sync and async entry points share stdio ignore so PowerShell cannot deadlock the pipe', () => {
-  // execFile without stdio:ignore buffers child output; a PowerShell that
-  // writes more than the pipe capacity never exits and hits the 15s timeout.
-  // Session mint on hosted windows-latest failed that way (HTTP 500 after 15s).
-  const source = readFileSync(path.join(__dirname, 'pr_closeout_fs.js'), 'utf8');
-  assert.match(source, /PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS = Object\.freeze\(\{/);
-  assert.match(source, /stdio: 'ignore'/);
-  const syncIdx = source.indexOf('const protectWindowsPrivateFile =');
-  const asyncIdx = source.indexOf('const protectWindowsPrivateFileAsync =');
-  const optionsIdx = source.indexOf('PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS');
-  assert.ok(optionsIdx !== -1 && syncIdx !== -1 && asyncIdx !== -1);
+test('Windows ACL sync and async entry points share one frozen stdio-ignore options object', () => {
+  // stdio:'ignore' is load-bearing for the SYNC path: execFileSync honors it,
+  // so the session-mint PowerShell never leaves a pipe for the parent to
+  // service. execFile (async) builds its spawn options from a whitelist that
+  // drops `stdio` and drains its own pipes regardless, so for that path the
+  // shared object buys symmetry, not deadlock protection. Assert behavior on
+  // the exported object rather than source formatting.
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.stdio, 'ignore');
   assert.ok(
-    source.includes('PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,\n  );'),
-    'both execFile wrappers must pass the shared options object',
+    Object.isFrozen(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS),
+    'shared options must stay frozen',
   );
+  for (const fn of [protectWindowsPrivateFile, protectWindowsPrivateFileAsync]) {
+    assert.match(
+      fn.toString(),
+      /PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS/,
+      `${fn.name} must pass the shared exec options object`,
+    );
+  }
 });
