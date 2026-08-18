@@ -845,3 +845,35 @@ test('collectContentRemovals STILL flags a with: expansion whose text also exist
     `expected the ambiguous duplicate-line expansion to be flagged; got ${JSON.stringify(removals)}`,
   );
 });
+
+test('collectContentRemovals STILL flags a workflows: expansion embedded in a run: | block scalar', async () => {
+  // A raw-text parent scan sees the scalar's own `workflow_run:`-shaped line
+  // as the nearest less-indented key and would exempt the edit. The ancestor
+  // chain proof rejects it: block-scalar content is always indented under its
+  // real jobs/steps ancestry and can never present as top-level
+  // on -> workflow_run (CodeRabbit PR8, block-scalar bypass).
+  const scalarBefore = [
+    'jobs:',
+    '  x:',
+    '    steps:',
+    '      - run: |',
+    '          workflow_run:',
+    '            workflows: ["Validate", "Closeout preview"]',
+    '',
+  ].join('\n');
+  const scalarAfter = [
+    'jobs:',
+    '  x:',
+    '    steps:',
+    '      - run: |',
+    '          workflow_run:',
+    '            workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', scalarBefore, scalarAfter);
+  const removals = collectContentRemovals(diff, { readFile: () => scalarAfter });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a block-scalar-embedded workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});

@@ -735,7 +735,7 @@ const parseWorkflowNameListLine = (line) => {
  * @param {string} targetLine file line, no +/- prefix
  * @returns {string|null}
  */
-const nearestYamlParentKey = (fileText, targetLine) => {
+const yamlAncestorKeyChain = (fileText, targetLine) => {
   const lines = fileText.split(/\r?\n/);
   const idx = lines.indexOf(targetLine);
   if (idx < 0) return null;
@@ -743,17 +743,27 @@ const nearestYamlParentKey = (fileText, targetLine) => {
   // not be the edited occurrence's (e.g. a byte-identical list under a step's
   // with: at the same indent), and guessing would fail OPEN by attributing an
   // action-input expansion to the earlier on.workflow_run occurrence. Refuse
-  // to resolve a parent instead; the caller fails closed and flags the line.
+  // to resolve a chain instead; the caller fails closed and flags the line.
   if (lines.indexOf(targetLine, idx + 1) !== -1) return null;
-  const indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
-  for (let i = idx - 1; i >= 0; i -= 1) {
+  const chain = [];
+  let indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
+  for (let i = idx - 1; i >= 0 && indent > 0; i -= 1) {
     const line = lines[i];
     if (!line.trim() || /^\s*#/.test(line)) continue;
     const match = /^(\s*)([A-Za-z0-9_-]+)\s*:/.exec(line);
     if (!match) continue;
-    if (match[1].length < indent) return match[2];
+    if (match[1].length < indent) {
+      chain.unshift(match[2]);
+      indent = match[1].length;
+    }
   }
-  return null;
+  // A chain is proven only when it reaches a column-0 top-level key. Block
+  // scalar content (e.g. a `workflow_run:`-shaped line inside `run: |`) can
+  // never satisfy that: scalar text is always indented under its own key, so
+  // its walk surfaces the real jobs/steps ancestry — or no column-0 key at
+  // all — and the caller fails closed.
+  if (indent !== 0) return null;
+  return chain;
 };
 
 /**
@@ -762,13 +772,14 @@ const nearestYamlParentKey = (fileText, targetLine) => {
  * dropping or reordering the names already there. A line-only `workflows:`
  * helper cannot prove that parent (the same key under `with:` is an action
  * input, where adding entries can weaken policy), so this also requires
- * `readFile(currentFile)` and checks the nearest less-indented key is
- * `workflow_run`. Missing file, unreadable file, or any other parent fails
- * closed. Note `readFile` returns WORKING-TREE content while `addedLine`
- * comes from the base-to-HEAD diff: when the two diverge (e.g. uncommitted
- * edits to the workflow), the exact-text lookup in nearestYamlParentKey
- * simply misses and the expansion stays flagged — that divergence must
- * remain fail-closed, never guessed around.
+ * `readFile(currentFile)` and checks the full ancestor chain is exactly
+ * top-level `on` → `workflow_run`. Missing file, unreadable file, any other
+ * chain, or a chain that never reaches a column-0 key (block-scalar
+ * embeddings) fails closed. Note `readFile` returns WORKING-TREE content
+ * while `addedLine` comes from the base-to-HEAD diff: when the two diverge
+ * (e.g. uncommitted edits to the workflow), the exact-text lookup in
+ * yamlAncestorKeyChain simply misses and the expansion stays flagged — that
+ * divergence must remain fail-closed, never guessed around.
  * @param {string} removedLine
  * @param {string} addedLine
  * @param {string} currentFile
@@ -796,7 +807,8 @@ const isSafeWorkflowRunListExpansion = (removedLine, addedLine, currentFile, rea
     return false;
   }
   if (typeof fileText !== 'string') return false;
-  return nearestYamlParentKey(fileText, addedLine.slice(1)) === 'workflow_run';
+  const chain = yamlAncestorKeyChain(fileText, addedLine.slice(1));
+  return !!chain && chain.length === 2 && chain[0] === 'on' && chain[1] === 'workflow_run';
 };
 
 /**
