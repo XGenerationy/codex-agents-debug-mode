@@ -750,10 +750,16 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
   for (let i = idx - 1; i >= 0 && indent > 0; i -= 1) {
     const line = lines[i];
     if (!line.trim() || /^\s*#/.test(line)) continue;
-    const match = /^(\s*)([A-Za-z0-9_-]+)\s*:/.exec(line);
+    // Quoted keys are valid YAML and the yamllint-recommended spelling for
+    // `on` (a YAML 1.1 truthy): '"on":' and "'workflow_run':" must resolve
+    // to the same chain entries as their bare forms, so a legitimately
+    // quoted trigger is exempted rather than flagged for its spelling. The
+    // quoted alternatives keep the same conservative charset — anything
+    // stranger stays unmatched and the chain fails closed.
+    const match = /^(\s*)(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))\s*:/.exec(line);
     if (!match) continue;
     if (match[1].length < indent) {
-      chain.unshift(match[2]);
+      chain.unshift(match[2] ?? match[3] ?? match[4]);
       indent = match[1].length;
     }
   }

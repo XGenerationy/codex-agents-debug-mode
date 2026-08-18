@@ -846,6 +846,29 @@ test('collectContentRemovals STILL flags a with: expansion whose text also exist
   );
 });
 
+test('collectContentRemovals exempts a proven expansion whose on/workflow_run keys are quoted', async () => {
+  // yamllint's truthy rule recommends quoting `on` (a YAML 1.1 boolean), so
+  // '"on":' and a quoted trigger key are legitimate spellings of the same
+  // chain. The ancestry matcher must resolve them like the bare forms rather
+  // than flagging a safe expansion for its quoting style (CodeRabbit PR8).
+  const quotedBefore = [
+    '"on":',
+    "  'workflow_run':",
+    '    workflows: ["Validate", "Closeout preview"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const quotedAfter = [
+    '"on":',
+    "  'workflow_run':",
+    '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', quotedBefore, quotedAfter);
+  assert.deepEqual(collectContentRemovals(diff, { readFile: () => quotedAfter }), []);
+});
+
 test('collectContentRemovals STILL flags a workflows: expansion embedded in a run: | block scalar', async () => {
   // A raw-text parent scan sees the scalar's own `workflow_run:`-shaped line
   // as the nearest less-indented key and would exempt the edit. The ancestor
