@@ -759,15 +759,23 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
     const match = /^(\s*)(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))\s*:/.exec(line);
     if (!match) continue;
     if (match[1].length < indent) {
+      // A key whose value begins a block scalar (`on: |`, `"on": >-`, …)
+      // encloses everything below it at deeper indent as literal TEXT — the
+      // target line included — so a chain through it proves nothing. The
+      // enclosing scalar's key always has lower indent than its content and
+      // therefore always enters this walk; refusing here fails the whole
+      // lookup closed (Qodo PR8: '"on": |' embedding trigger-shaped text).
+      if (/:\s*[|>][0-9+-]*\s*(?:#.*)?$/.test(line)) return null;
       chain.unshift(match[2] ?? match[3] ?? match[4]);
       indent = match[1].length;
     }
   }
   // A chain is proven only when it reaches a column-0 top-level key. Block
-  // scalar content (e.g. a `workflow_run:`-shaped line inside `run: |`) can
-  // never satisfy that: scalar text is always indented under its own key, so
-  // its walk surfaces the real jobs/steps ancestry — or no column-0 key at
-  // all — and the caller fails closed.
+  // scalar content nested below any mapping (e.g. a `workflow_run:`-shaped
+  // line inside a step's `run: |`) surfaces the real jobs/steps ancestry —
+  // or no column-0 key at all — and a scalar whose key itself is top-level
+  // is rejected by the block-scalar guard above, so scalar text can never
+  // present as the proven trigger chain.
   if (indent !== 0) return null;
   return chain;
 };

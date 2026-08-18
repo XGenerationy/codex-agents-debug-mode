@@ -869,6 +869,33 @@ test('collectContentRemovals exempts a proven expansion whose on/workflow_run ke
   assert.deepEqual(collectContentRemovals(diff, { readFile: () => quotedAfter }), []);
 });
 
+test('collectContentRemovals STILL flags a workflows: expansion inside a top-level on: | scalar', async () => {
+  // The enclosing scalar's key is itself at column 0 here, so the ancestry
+  // walk reaches column 0 through trigger-shaped SCALAR TEXT — the chain must
+  // refuse any ancestor whose value begins a block scalar, quoted or bare
+  // (Qodo PR8). Both spellings are pinned.
+  for (const onKey of ['on: |', '"on": |']) {
+    const scalarBefore = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview"]',
+      '',
+    ].join('\n');
+    const scalarAfter = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', scalarBefore, scalarAfter);
+    const removals = collectContentRemovals(diff, { readFile: () => scalarAfter });
+    assert.ok(
+      removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+      `expected the ${onKey} scalar-embedded expansion to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
+});
+
 test('collectContentRemovals STILL flags a workflows: expansion embedded in a run: | block scalar', async () => {
   // A raw-text parent scan sees the scalar's own `workflow_run:`-shaped line
   // as the nearest less-indented key and would exempt the edit. The ancestor
