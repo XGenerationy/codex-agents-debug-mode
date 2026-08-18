@@ -32,6 +32,7 @@ const {
   bindArtifactSubcommand,
   httpRequestJson,
   maskValue,
+  protectWindowsPrivateFileIfPresent,
   actionInputsFromEnv,
   admissionBlockers,
   admissionCaveats,
@@ -353,6 +354,39 @@ test('collector boot never runs PowerShell ACL; start applies it in the parent',
   assert.match(support, /protectWindowsPrivateFileIfPresent/);
   assert.match(support, /protectWindowsPrivateFile\(path\.join\(projectRoot, relativeLog\)\)/);
   assert.match(support, /windowsHide:\s*true/);
+});
+
+test('a salt whose Windows ACL cannot be applied is deleted, never left with inherited permissions', () => {
+  // Parity with readOrCreateProjectSalt (scripts/debug_server.js): the
+  // in-process path unlinks project_salt when the owner-only DACL fails and
+  // continues unpersisted. The deferred path hands that hardening to this
+  // parent-side helper, which must not abort and leave the salt on disk with
+  // inherited NTFS read permissions (Qodo PR8, failed-ACL salt exposure).
+  const debugDir = path.join(makeTempDir(), '.debug');
+  mkdirSync(debugDir, { recursive: true });
+  const saltFile = path.join(debugDir, 'project_salt');
+  const bystander = path.join(debugDir, 'collector_note');
+  writeFileSync(saltFile, 'x'.repeat(32));
+  writeFileSync(bystander, 'untouched');
+  const protects = [];
+  assert.throws(
+    () => protectWindowsPrivateFileIfPresent(saltFile, {
+      platform: 'win32',
+      protect: (file) => { protects.push(file); throw new Error('acl_denied'); },
+    }),
+    /acl_denied/,
+    'the original ACL error surfaces unmasked',
+  );
+  assert.deepEqual(protects, [saltFile]);
+  assert.ok(!existsSync(saltFile), 'the unprotectable salt must not persist with inherited permissions');
+  assert.ok(existsSync(bystander), 'exactly the salt is deleted, never a neighbour');
+  writeFileSync(saltFile, 'y'.repeat(32));
+  protectWindowsPrivateFileIfPresent(saltFile, { platform: 'win32', protect: () => {} });
+  assert.ok(existsSync(saltFile), 'a successfully protected salt persists');
+  protectWindowsPrivateFileIfPresent(saltFile, {
+    platform: 'linux', protect: () => { throw new Error('never reached off-Windows'); },
+  });
+  assert.ok(existsSync(saltFile), 'non-Windows stays a no-op');
 });
 
 test('httpRequestJson defaults cover the Windows session-log ACL budget', () => {

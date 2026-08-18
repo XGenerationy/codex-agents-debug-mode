@@ -1023,15 +1023,28 @@ const defaultSpawnShim = (args, { env }) => spawn(process.execPath, [BOOT_SHIM, 
 // budget, and POST /session then returns HTTP 500). `start` is a normal
 // Actions step process with a console; apply the same current-user-only
 // DACL from here after handshake/mint and before this process returns.
-const protectWindowsPrivateFileIfPresent = (privateFile) => {
-  if (process.platform !== 'win32') return;
+// `platform`/`protect` are seams: the failure path below is Windows-only and
+// non-Windows CI has no PowerShell to fail with.
+const protectWindowsPrivateFileIfPresent = (privateFile, {
+  platform = process.platform, protect = protectWindowsPrivateFile,
+} = {}) => {
+  if (platform !== 'win32') return;
   try {
     lstatSync(privateFile);
   } catch (error) {
     if (error?.code === 'ENOENT') return;
     throw error;
   }
-  protectWindowsPrivateFile(privateFile);
+  try {
+    protect(privateFile);
+  } catch (error) {
+    // Mirror the collector's in-process contract (readOrCreateProjectSalt in
+    // scripts/debug_server.js): a salt whose owner-only DACL could not be
+    // applied must never stay persisted with inherited NTFS read permissions.
+    // Unlink exactly this file, then rethrow the ORIGINAL ACL error unmasked.
+    try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+    throw error;
+  }
 };
 
 // Read the shim's single startup line (private pipe). Resolves the parsed
@@ -2412,6 +2425,7 @@ module.exports = {
   detectSudoBinary,
   evaluateAdmission,
   maskValue,
+  protectWindowsPrivateFileIfPresent,
   readEffectiveUid,
   readOwnCapabilities,
   readPtraceScope,
