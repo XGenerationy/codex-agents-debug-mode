@@ -728,12 +728,16 @@ const parseWorkflowNameListLine = (line) => {
 };
 
 /**
- * Nearest YAML mapping key whose indent is strictly less than `targetLine`.
- * Used to prove a `workflows:` list sits under `on.workflow_run` rather than
- * under an action `with:` input, where adding names can weaken policy.
+ * Full chain of YAML mapping keys enclosing `targetLine`, outermost first, as
+ * proven by strictly decreasing indent from the target up to a column-0 key.
+ * Used to prove a `workflows:` list sits under top-level `on.workflow_run`
+ * rather than under an action `with:` input, where adding names can weaken
+ * policy. Returns null — fail closed — when the target line is absent,
+ * duplicated (ambiguous), enclosed by a block-scalar-valued key (its content
+ * is literal text, not mappings), or never reaches a column-0 key.
  * @param {string} fileText
  * @param {string} targetLine file line, no +/- prefix
- * @returns {string|null}
+ * @returns {string[]|null} ancestor keys outermost-first, or null when unproven
  */
 const yamlAncestorKeyChain = (fileText, targetLine) => {
   const lines = fileText.split(/\r?\n/);

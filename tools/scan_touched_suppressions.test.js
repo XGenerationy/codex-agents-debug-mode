@@ -751,8 +751,17 @@ const ACTION_INPUT_AFTER = [
 
 test('collectContentRemovals exempts an order-preserving on.workflow_run.workflows expansion when the parent is proven', async () => {
   const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, WORKFLOW_RUN_AFTER);
-  const readFile = () => WORKFLOW_RUN_AFTER;
+  const readPaths = [];
+  const readFile = (relPath) => {
+    readPaths.push(relPath);
+    return WORKFLOW_RUN_AFTER;
+  };
   assert.deepEqual(collectContentRemovals(diff, { readFile }), []);
+  // The parent proof reads the path taken from the diff's `+++` header, which
+  // detectGateContentRemovals joins with the repository root. A regression
+  // that kept the `b/` prefix would still satisfy a mock that ignores its
+  // argument, so pin the exact repository-relative path (CodeRabbit PR8).
+  assert.deepEqual(readPaths, ['.github/workflows/closeout-gate.yml']);
 });
 
 test('collectContentRemovals STILL flags a workflows: expansion without a parent-proving readFile (fail closed)', async () => {
@@ -867,6 +876,35 @@ test('collectContentRemovals exempts a proven expansion whose on/workflow_run ke
   ].join('\n');
   const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', quotedBefore, quotedAfter);
   assert.deepEqual(collectContentRemovals(diff, { readFile: () => quotedAfter }), []);
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion under mismatched-quote keys', async () => {
+  // The quoted-key alternatives are exact pairs: a mismatched form ('"on:' or
+  // "'workflow_run\":") must stay unmatched so the chain never reaches a
+  // column-0 key and the expansion fails closed. Pins the charset against a
+  // future widening that silently accepted them (CodeRabbit PR8).
+  for (const [onKey, triggerKey] of [['"on:', '  workflow_run:'], ['on:', "  'workflow_run\":"]]) {
+    const before = [
+      onKey,
+      triggerKey,
+      '    workflows: ["Validate", "Closeout preview"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const after = [
+      onKey,
+      triggerKey,
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    const removals = collectContentRemovals(diff, { readFile: () => after });
+    assert.ok(
+      removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+      `expected the mismatched-quote (${onKey} / ${triggerKey.trim()}) expansion to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
 });
 
 test('collectContentRemovals STILL flags a workflows: expansion inside a top-level on: | scalar', async () => {
