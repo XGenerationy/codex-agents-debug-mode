@@ -66,6 +66,15 @@ test('a line with an unknown type is counted apart — never an event, never an 
   assert.equal(report.session.hypothesisLines, 1);
   assert.equal(report.session.otherTypedLines, 1);
   assert.deepEqual(report.excerpts, ['real event'], 'unknown line shapes stay out of the excerpts');
+  assert.ok(
+    renderMarkdown(report).includes('_other typed lines: 1_'),
+    'the Step Summary surface announces them instead of rendering as if the line never existed',
+  );
+  assert.ok(
+    !renderMarkdown(buildReport(SESSION, { sessionId: null })).includes('other typed lines'),
+    'no announce when there are none',
+  );
+  assert.equal(JSON.parse(renderJson(report)).session.otherTypedLines, 1, 'the machine surface is unchanged');
 });
 
 test('event messages are verbatim — objects serialize, a missing msg is named, and no coercion can throw', () => {

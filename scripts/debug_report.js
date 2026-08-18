@@ -191,6 +191,15 @@ const renderMarkdown = (report) => {
     lines.push(`_untagged events: ${report.untaggedEvents}_`);
     lines.push('');
   }
+  // Announced for the same reason buildReport counts them apart instead of
+  // dropping them: markdown is the Step Summary surface, and its header names
+  // only events and hypothesis lines, so a line shape this renderer predates
+  // would otherwise read as if it had never been logged. renderText names
+  // `entries`, which already leaves the remainder derivable.
+  if (report.session.otherTypedLines > 0) {
+    lines.push(`_other typed lines: ${report.session.otherTypedLines}_`);
+    lines.push('');
+  }
   if (report.excerpts.length > 0) {
     lines.push('**Last events**');
     lines.push('');
