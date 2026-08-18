@@ -1868,6 +1868,37 @@ test(
   },
 );
 
+test(
+  'repairs a hard-linked project_salt into a protected current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    // The repair branch replaces the directory entry via a private temp file
+    // plus an atomic rename. Windows hardening is queued (microtask or the
+    // pending list), so it necessarily runs AFTER that synchronous block:
+    // hardening the temp name aimed the ACL at a path the rename had already
+    // consumed, and the live project_salt kept its inherited DACL. Assert the
+    // repaired FINAL file carries the same current-user-only ACL the
+    // fresh-create path gets.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-repair-acl-'));
+    const debugDir = path.join(projectRoot, '.debug');
+    try {
+      const outsideFile = path.join(projectRoot, 'outside-salt-target.txt');
+      await mkdir(debugDir, { recursive: true });
+      await writeFile(outsideFile, 'precious-unrelated-content', 'utf8');
+      await link(outsideFile, path.join(debugDir, 'project_salt'));
+      createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+      // Let the deferred (microtask) hardening land before inspecting the ACL.
+      await new Promise((resolve) => setImmediate(resolve));
+      const acl = windowsAclIsCurrentUserOnly(path.join(debugDir, 'project_salt'));
+      assert.equal(acl.status, 0, `${acl.stdout}\n${acl.stderr}`);
+      assert.equal(acl.stdout.trim(), 'ok');
+      assert.equal(await readFile(outsideFile, 'utf8'), 'precious-unrelated-content');
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 test('releases its own collector_claim when startup fails after the claim is held', { timeout: 20000 }, async () => {
   // releaseOwnedClaim runs on server 'close' / process 'exit'. The externally
   // reachable path to it is a startup failure AFTER the claim is acquired:

@@ -88,9 +88,15 @@ const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection
     pendingWindowsProtection.push(privateFile);
     return;
   }
-  // Never execFileSync here: hosted Windows PowerShell can take 5–15s per
-  // invocation, and createDebugServer runs on the test/CLI construction path.
-  // Fail-open matches the outer catch (unlink; unpersisted salt).
+  // Never execFileSync synchronously here: hosted Windows PowerShell can take
+  // 5–15s per invocation, and createDebugServer runs on the test/CLI
+  // construction path. The microtask still calls execFileSync, one tick later
+  // -- the guarantee is that it never blocks BEFORE the 'listening' callback,
+  // which Node emits from the nextTick queue that drains ahead of promise
+  // microtasks, so a consumer writing its handshake line there is never held
+  // behind the ACL. Fail-open matches the outer catch (unlink; unpersisted
+  // salt), which is why callers must queue the FINAL path, never a temp name
+  // they are about to rename away.
   void Promise.resolve().then(() => {
     try {
       protectWindowsPrivateFile(privateFile);
@@ -283,15 +289,23 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, pendingWindowsPr
         try { closeSync(tfd); } catch { /* best effort cleanup */ }
       }
       try {
-        applyWindowsPrivateFileProtection(tempFile, pendingWindowsProtection);
+        renameSync(tempFile, saltFile);
       } catch (error2) {
         try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
         throw error2;
       }
+      // Harden the FINAL path, after the rename. Windows hardening never runs
+      // inside this synchronous block -- it is queued onto
+      // pendingWindowsProtection or a microtask -- so aiming it at `tempFile`
+      // hardened a name the rename had already consumed: the ACL failed on the
+      // vanished temp name, its handler unlinked that same absent path, and the
+      // live project_salt stayed on disk with inherited NTFS permissions. That
+      // is the exposure the ACL exists to prevent (Codex U1D5A) and breaks the
+      // unlink-or-do-not-persist rule the fresh-create path above keeps.
       try {
-        renameSync(tempFile, saltFile);
+        applyWindowsPrivateFileProtection(saltFile, pendingWindowsProtection);
       } catch (error2) {
-        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
+        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
         throw error2;
       }
     }
