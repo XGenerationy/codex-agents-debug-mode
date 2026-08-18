@@ -1700,14 +1700,6 @@ const createDebugServer = ({
           sendJson(response, 425, { error: 'session_initializing' });
           return;
         }
-        // Session-token reads prove the CI caller still holds the surviving
-        // credential and is still capturing; refresh lastActivityAt so an
-        // idle wrapped command cannot retire the session under a live capture.
-        // Launch-token reads stay observers: operator inspection does not
-        // prove the instrumented app is alive.
-        if (safeTokenEqual(presented, session.sessionToken)) {
-          session.lastActivityAt = Date.now();
-        }
         // Fail-closed query parsing: unknown parameter names are rejected so
         // a typo cannot silently disable a filter and widen what is returned.
         const allowedParams = new Set(['client_id', 'hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
@@ -1741,6 +1733,17 @@ const createDebugServer = ({
         }
         const hypothesisFilter = query.get('hypothesisId')?.trim() ?? undefined;
         const runFilter = query.get('runId')?.trim() ?? undefined;
+        // Session-token reads prove the CI caller still holds the surviving
+        // credential and is still capturing; refresh lastActivityAt so an
+        // idle wrapped command cannot retire the session under a live capture.
+        // Launch-token reads stay observers: operator inspection does not
+        // prove the instrumented app is alive. The refresh sits AFTER the
+        // fail-closed query validation above: a rejected read proves nothing,
+        // and refreshing before the invalid_query throws would let repeated
+        // malformed reads retain an otherwise idle session indefinitely.
+        if (safeTokenEqual(presented, session.sessionToken)) {
+          session.lastActivityAt = Date.now();
+        }
         // Serialize ONLY the identity check + bounded byte read on the
         // per-session append chain: no append can interleave mid-read, so the
         // identity check and the byte window are consistent and a torn

@@ -4823,6 +4823,47 @@ test('GET with the session token refreshes activity so a live capture cannot idl
   }
 });
 
+test('GET with the session token but an invalid query does not refresh activity', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-invalid-read-'));
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const sessionAuth = { authorization: `Bearer ${session.session_token}` };
+    const createdAt = Date.now();
+    const first = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session, 'bogus=1'),
+      headers: sessionAuth,
+    });
+    // Assert the pre-expiry 400 only when we provably raced the budget, like
+    // the observer test above: the property assertion below holds regardless.
+    if (Date.now() - createdAt < idleMs) assert.equal(first.status, 400);
+    // Keep issuing REJECTED session-token reads WHILE waiting out the budget:
+    // an unknown parameter is refused fail-closed before the refresh, so a
+    // refused read proves nothing — if it refreshed lastActivityAt, repeated
+    // malformed reads could retain an otherwise idle session indefinitely.
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await requestRaw(baseUrl, {
+        pathname: sessionLogsPath(session, 'bogus=1'),
+        headers: sessionAuth,
+      });
+    }
+    const final = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+    assert.equal(final.status, 404);
+    assert.equal(JSON.parse(final.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const session = (await createSession(baseUrl)).body;
