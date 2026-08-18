@@ -789,3 +789,59 @@ test('collectContentRemovals STILL flags a workflows: list that reorders or drop
     `expected a reordered workflows list to be flagged; got ${JSON.stringify(removals)}`,
   );
 });
+
+test('collectContentRemovals STILL flags a workflows: list that drops an existing name', async () => {
+  const dropped = [
+    'on:',
+    '  workflow_run:',
+    '    workflows: ["Validate", "Debug evidence demo", "Another gate"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, dropped);
+  const removals = collectContentRemovals(diff, { readFile: () => dropped });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a workflows list dropping "Closeout preview" to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a with: expansion whose text also exists under workflow_run (duplicate-line ambiguity)', async () => {
+  // The action-input list under with: is byte-identical to the trigger's
+  // list, indentation included (trigger nested at 4 spaces per level, step
+  // sequence at the steps: key's own indent). Resolving the parent from the
+  // FIRST occurrence would attribute the with: expansion to on.workflow_run
+  // and exempt it — the ambiguity must fail closed and keep the line flagged.
+  const duplicatedBefore = [
+    'on:',
+    '    workflow_run:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '        types: [completed]',
+    'jobs:',
+    '  gate:',
+    '    steps:',
+    '    - uses: example/action@v1',
+    '      with:',
+    '        workflows: ["Validate", "Closeout preview"]',
+    '',
+  ].join('\n');
+  const duplicatedAfter = [
+    'on:',
+    '    workflow_run:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '        types: [completed]',
+    'jobs:',
+    '  gate:',
+    '    steps:',
+    '    - uses: example/action@v1',
+    '      with:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', duplicatedBefore, duplicatedAfter);
+  const removals = collectContentRemovals(diff, { readFile: () => duplicatedAfter });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected the ambiguous duplicate-line expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});

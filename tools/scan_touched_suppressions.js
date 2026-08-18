@@ -739,6 +739,12 @@ const nearestYamlParentKey = (fileText, targetLine) => {
   const lines = fileText.split(/\r?\n/);
   const idx = lines.indexOf(targetLine);
   if (idx < 0) return null;
+  // A duplicated target line is ambiguous: the first occurrence's parent may
+  // not be the edited occurrence's (e.g. a byte-identical list under a step's
+  // with: at the same indent), and guessing would fail OPEN by attributing an
+  // action-input expansion to the earlier on.workflow_run occurrence. Refuse
+  // to resolve a parent instead; the caller fails closed and flags the line.
+  if (lines.indexOf(targetLine, idx + 1) !== -1) return null;
   const indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
   for (let i = idx - 1; i >= 0; i -= 1) {
     const line = lines[i];
@@ -758,7 +764,11 @@ const nearestYamlParentKey = (fileText, targetLine) => {
  * input, where adding entries can weaken policy), so this also requires
  * `readFile(currentFile)` and checks the nearest less-indented key is
  * `workflow_run`. Missing file, unreadable file, or any other parent fails
- * closed.
+ * closed. Note `readFile` returns WORKING-TREE content while `addedLine`
+ * comes from the base-to-HEAD diff: when the two diverge (e.g. uncommitted
+ * edits to the workflow), the exact-text lookup in nearestYamlParentKey
+ * simply misses and the expansion stays flagged — that divergence must
+ * remain fail-closed, never guessed around.
  * @param {string} removedLine
  * @param {string} addedLine
  * @param {string} currentFile
