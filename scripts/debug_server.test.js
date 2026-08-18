@@ -308,7 +308,17 @@ test('hashBufferSha256 matches crypto SHA-256 over chunked buffers and yields be
   const empty = await hashBufferSha256(Buffer.alloc(0));
   assert.equal(empty, createHash('sha256').update(Buffer.alloc(0)).digest('hex'));
   const payload = Buffer.alloc(200 * 1024, 0x5a);
+  // The yield is what keeps a 16 MiB hash from stalling GET /sessions/:id/logs,
+  // and a digest comparison cannot see it: deleting the setImmediate leaves
+  // every digest identical. An immediate queued BEFORE the hash starts runs
+  // first ONLY if the hash really awaits setImmediate between strides —
+  // without the yield the async body settles on the microtask queue, which
+  // drains before the check phase is ever reached, and this order flips.
+  const order = [];
+  setImmediate(() => order.push('immediate'));
   const digest = await hashBufferSha256(payload, { yieldEvery: 64 * 1024 });
+  order.push('hash');
+  assert.deepEqual(order, ['immediate', 'hash'], 'the hash yielded to the event loop mid-buffer');
   assert.equal(digest, createHash('sha256').update(payload).digest('hex'));
   assert.match(digest, /^[a-f0-9]{64}$/);
 });
