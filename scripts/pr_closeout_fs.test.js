@@ -17,6 +17,7 @@ const {
   openNoFollowFlagAttempts,
   openNoFollowSync,
   PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+  PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
 } = require('./pr_closeout_fs');
@@ -264,23 +265,56 @@ test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lac
     'a platform with neither extra flag must still get the plain attempt');
 });
 
-test('Windows ACL sync and async entry points share one frozen stdio-ignore options object', () => {
+test('Windows ACL sync and async entry points share one frozen stdio-ignore options object', async () => {
   // stdio:'ignore' is load-bearing for the SYNC path: execFileSync honors it,
   // so the session-mint PowerShell never leaves a pipe for the parent to
   // service. execFile (async) builds its spawn options from a whitelist that
   // drops `stdio` and drains its own pipes regardless, so for that path the
-  // shared object buys symmetry, not deadlock protection. Assert behavior on
-  // the exported object rather than source formatting.
+  // shared object buys symmetry, not deadlock protection. Drive both entry
+  // points through their exec seams so the assertions cover the actual
+  // invocation — the object reference, timeout, and windowsHide — not
+  // source text.
   assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.stdio, 'ignore');
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.timeout, PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS);
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.windowsHide, true);
   assert.ok(
     Object.isFrozen(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS),
     'shared options must stay frozen',
   );
-  for (const fn of [protectWindowsPrivateFile, protectWindowsPrivateFileAsync]) {
-    assert.match(
-      fn.toString(),
-      /PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS/,
-      `${fn.name} must pass the shared exec options object`,
+  const calls = [];
+  protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
+    platform: 'win32',
+    execFileSyncFn: (file, args, options) => calls.push({ entry: 'sync', file, args, options }),
+  });
+  await protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+    platform: 'win32',
+    execFileAsyncFn: async (file, args, options) => calls.push({ entry: 'async', file, args, options }),
+  });
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(
+      call.options,
+      PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+      `${call.entry} exec must receive the one shared frozen options object by reference`,
     );
+    assert.match(call.file, /\\powershell\.exe$/iu);
+    assert.ok(call.args.includes('-EncodedCommand'), `${call.entry} must run the fixed encoded program`);
   }
+  // Off Windows both entry points are no-ops that never reach exec.
+  const never = () => { throw new Error('never reached off-Windows'); };
+  protectWindowsPrivateFile('/p/.debug/project_salt', { platform: 'linux', execFileSyncFn: never });
+  await protectWindowsPrivateFileAsync('/p/.debug/session.log', { platform: 'darwin', execFileAsyncFn: never });
+  // Fail closed: the sync variant throws, the async variant rejects.
+  assert.throws(
+    () => protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
+      platform: 'win32', execFileSyncFn: () => { throw new Error('acl_denied'); },
+    }),
+    /acl_denied/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', execFileAsyncFn: async () => { throw new Error('acl_denied'); },
+    }),
+    /acl_denied/,
+  );
 });

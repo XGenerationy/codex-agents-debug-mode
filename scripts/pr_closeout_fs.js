@@ -303,10 +303,15 @@ const PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS = Object.freeze({
  * event loop is acceptable; request handlers must use
  * protectWindowsPrivateFileAsync instead.
  * @param {string} privateFile
+ * @param {{execFileSyncFn?: typeof execFileSync, platform?: string}} [overrides]
+ *   Test-only seam, mirroring resolvePowerShellExecutable's own options;
+ *   production callers pass only `privateFile`.
  */
-const protectWindowsPrivateFile = (privateFile) => {
-  if (process.platform !== 'win32') return;
-  execFileSync(
+const protectWindowsPrivateFile = (privateFile, {
+  execFileSyncFn = execFileSync, platform = process.platform,
+} = {}) => {
+  if (platform !== 'win32') return;
+  execFileSyncFn(
     resolvePowerShellExecutable(),
     buildProtectWindowsPrivateFileArgs(privateFile),
     PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
@@ -322,11 +327,15 @@ const protectWindowsPrivateFile = (privateFile) => {
  * platforms. Rejects (fails closed) on any non-zero exit exactly as the
  * synchronous variant throws.
  * @param {string} privateFile
+ * @param {{execFileAsyncFn?: typeof execFileAsync, platform?: string}} [overrides]
+ *   Test-only seam, mirroring protectWindowsPrivateFile's above.
  * @returns {Promise<void>}
  */
-const protectWindowsPrivateFileAsync = async (privateFile) => {
-  if (process.platform !== 'win32') return;
-  await execFileAsync(
+const protectWindowsPrivateFileAsync = async (privateFile, {
+  execFileAsyncFn = execFileAsync, platform = process.platform,
+} = {}) => {
+  if (platform !== 'win32') return;
+  await execFileAsyncFn(
     resolvePowerShellExecutable(),
     buildProtectWindowsPrivateFileArgs(privateFile),
     PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
@@ -409,6 +418,7 @@ module.exports = {
   openNoFollowFlagAttempts,
   openNoFollowSync,
   PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+  PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
