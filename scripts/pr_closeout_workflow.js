@@ -241,16 +241,16 @@ const outputDirLockHolder = (text) => {
  * @returns {string}
  */
 const readOutputDirLockFileSync = (lockPath) => {
-  const before = lstatSync(lockPath);
-  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+  const before = fileIdentity(lstatSync(lockPath, { bigint: true }));
+  if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
   const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0);
   const descriptor = openSync(lockPath, flags);
   try {
-    const info = fstatSync(descriptor);
+    const info = fileIdentity(fstatSync(descriptor, { bigint: true }));
     if (
-      !info.isFile()
+      !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
       || info.dev !== before.dev
       || info.ino !== before.ino
@@ -285,15 +285,15 @@ const readOutputDirLockFileSync = (lockPath) => {
  * @returns {Promise<string>} raw lock payload.
  */
 const readOutputDirLockFile = async (lockPath) => {
-  const before = await lstat(lockPath);
-  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+  const before = fileIdentity(await lstat(lockPath, { bigint: true }));
+  if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
   const handle = await openNoFollow(lockPath, fsConstants.O_RDONLY);
   try {
-    const info = await handle.stat();
+    const info = fileIdentity(await handle.stat({ bigint: true }));
     if (
-      !info.isFile()
+      !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
       || info.dev !== before.dev
       || info.ino !== before.ino

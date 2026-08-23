@@ -65,6 +65,7 @@ const {
 } = require('./pr_closeout_stream');
 const {
   assertNotSymlink: assertNotSymlinkShared,
+  fileIdentity,
   isTrustedSystemRoot,
   looksLikeWindowsRoot,
   openNoFollow: openNoFollowShared,
@@ -1858,8 +1859,8 @@ const openLogBoundToParent = async (target, expected, flags, mode) => {
     throw error;
   }
   try {
-    const info = await dirHandle.stat();
-    if (!expected || expected.ino === 0 || info.dev !== expected.dev || info.ino !== expected.ino) {
+    const info = fileIdentity(await dirHandle.stat({ bigint: true }));
+    if (!expected || expected.ino === '0' || info.dev !== expected.dev || info.ino !== expected.ino) {
       throw new Error(`Refusing to write evidence log through a logs directory swapped after validation: ${parent}`);
     }
     try {
@@ -1937,7 +1938,7 @@ const openLogNoFollow = async (
       // read this evidence log. Establish a protected, current-user-only ACL
       // before any evidence bytes are written (mirrors the debug collector's
       // own token/session-log/port hardening in debug_server.js).
-      const preProtectInfo = await handle.stat();
+      const preProtectInfo = fileIdentity(await handle.stat({ bigint: true }));
       try {
         protectWindowsPrivateFile(target);
       } catch {
@@ -1955,13 +1956,13 @@ const openLogNoFollow = async (
       // otherwise compare equal vacuously.
       let postProtectInfo;
       try {
-        postProtectInfo = await lstat(target);
+        postProtectInfo = fileIdentity(await lstat(target, { bigint: true }));
       } catch {
         await handle.close().catch(() => undefined);
         throw new Error(`Refusing to write evidence log with an unverifiable identity: ${target}`);
       }
       if (
-        preProtectInfo.ino === 0
+        preProtectInfo.ino === '0'
         || postProtectInfo.dev !== preProtectInfo.dev
         || postProtectInfo.ino !== preProtectInfo.ino
       ) {
@@ -2013,13 +2014,13 @@ const assertLogParentIdentity = async (target, expected) => {
   const parent = path.dirname(target);
   let info;
   try {
-    info = await lstat(parent);
+    info = fileIdentity(await lstat(parent, { bigint: true }));
   } catch {
     throw new Error(`Refusing to write evidence log with an unverifiable parent directory: ${parent}`);
   }
   if (
     !expected
-    || expected.ino === 0
+    || expected.ino === '0'
     || info.dev !== expected.dev
     || info.ino !== expected.ino
   ) {
@@ -2071,7 +2072,7 @@ const writeLogHeaderNoFollow = async (
     // Capture the verified file's dev/ino (openLogNoFollow already proved it a
     // regular, single-link file) so the append reopen can confirm it lands on
     // this same inode, not a replacement swapped in afterwards.
-    const info = await handle.stat();
+    const info = fileIdentity(await handle.stat({ bigint: true }));
     return { dev: info.dev, ino: info.ino };
   } finally {
     await handle.close();
@@ -2125,7 +2126,7 @@ const createLogAppendStreamNoFollow = async (
     // own identity before any command output is streamed to it.
     if (securedDirIdentity) await assertLogParentIdentity(target, securedDirIdentity);
     if (securedFileIdentity) {
-      const info = await handle.stat();
+      const info = fileIdentity(await handle.stat({ bigint: true }));
       // Only compare identity when BOTH the recorded and observed inode are
       // non-zero: some Windows volumes and network mounts report ino: 0 for
       // every file, which would otherwise make this comparison reject every
@@ -2134,8 +2135,8 @@ const createLogAppendStreamNoFollow = async (
       // O_NOFOLLOW plus the parent-directory identity check above instead
       // (CodeRabbit UohnP).
       if (
-        securedFileIdentity.ino !== 0
-        && info.ino !== 0
+        securedFileIdentity.ino !== '0'
+        && info.ino !== '0'
         && (info.dev !== securedFileIdentity.dev || info.ino !== securedFileIdentity.ino)
       ) {
         throw new Error(
@@ -2572,7 +2573,7 @@ const openArtifact = async (artifact) => {
 const hashArtifactDefault = async (artifact) => {
   const handle = await openArtifact(artifact);
   try {
-    const before = await handle.stat();
+    const before = fileIdentity(await handle.stat({ bigint: true }));
     if (Number(before.size) > MAX_ARTIFACT_HASH_BYTES) {
       throw new Error(
         `Artifact exceeds hash size limit (${before.size} > ${MAX_ARTIFACT_HASH_BYTES} bytes): ${artifact}`,
@@ -2594,8 +2595,11 @@ const hashArtifactDefault = async (artifact) => {
       hash.update(buffer.subarray(0, bytesRead));
       position += bytesRead;
     }
-    const after = await handle.stat();
-    const stable = ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']
+    const after = fileIdentity(await handle.stat({ bigint: true }));
+    // Nanoseconds, not the truncated milliseconds these fields used to carry:
+    // a rewrite that lands inside the same millisecond would otherwise read as
+    // stable. dev/ino are exact decimal strings for the same reason.
+    const stable = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']
       .every((field) => before[field] === after[field]);
     return { digest: hash.digest('hex'), before, after, stable };
   } finally {
@@ -2666,7 +2670,7 @@ const snapshotArtifactProof = async ({
     const realRoot = await filesystem.realpath(path.resolve(cwd));
     let info;
     try {
-      info = await filesystem.lstat(artifact);
+      info = fileIdentity(await filesystem.lstat(artifact, { bigint: true }));
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
       const realParent = await resolveExistingParent(artifact, filesystem);
@@ -2675,14 +2679,14 @@ const snapshotArtifactProof = async ({
       }
       return { status: 'PASS', exists: false, path: artifact, realRoot };
     }
-    if (info.isSymbolicLink()) {
+    if (info.isSymbolicLink) {
       return { status: 'FAIL', evidence: `Artifact proof cannot use a symbolic link: ${proof.path}` };
     }
     const realArtifact = await filesystem.realpath(artifact);
     if (!isContainedPath(realRoot, realArtifact)) {
       return { status: 'FAIL', evidence: `Artifact proof real path resolves outside the command worktree: ${proof.path}` };
     }
-    if (!info.isFile()) return { status: 'FAIL', evidence: `Artifact proof is not a file: ${proof.path}` };
+    if (!info.isFile) return { status: 'FAIL', evidence: `Artifact proof is not a file: ${proof.path}` };
     const hashed = await hashArtifact(realArtifact);
     const digest = typeof hashed === 'string' ? hashed : hashed.digest;
     const handleInfo = typeof hashed === 'string' ? info : hashed.after;
@@ -2758,7 +2762,7 @@ const readBoundArtifactJson = async (proofResult, { openArtifactFn = openArtifac
   }
   const handle = await openArtifactFn(proofResult.realPath);
   try {
-    const before = await handle.stat();
+    const before = fileIdentity(await handle.stat({ bigint: true }));
     if (before.dev !== proofResult.dev || before.ino !== proofResult.ino || before.size !== proofResult.size) {
       return { status: 'FAIL', evidence: 'Semantic artifact identity changed after artifact verification.' };
     }
@@ -2786,10 +2790,10 @@ const readBoundArtifactJson = async (proofResult, { openArtifactFn = openArtifac
     if (extraBytesRead > 0) {
       return { status: 'FAIL', evidence: 'Semantic artifact changed while it was being verified.' };
     }
-    const after = await handle.stat();
+    const after = fileIdentity(await handle.stat({ bigint: true }));
     const digest = createHash('sha256').update(content).digest('hex');
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs || digest !== proofResult.digest) {
+      || before.mtimeNs !== after.mtimeNs || digest !== proofResult.digest) {
       return { status: 'FAIL', evidence: 'Semantic artifact changed while it was being verified.' };
     }
     return { status: 'PASS', value: JSON.parse(content.toString('utf8')) };
@@ -3092,7 +3096,11 @@ const createCommandExecutor = ({
     // directory's dev/ino (the same object path.dirname(logPath) resolves to
     // at write time).
     try {
-      const info = await lstat(logsDir);
+      // Normalized record: a default lstat reports ino as a Number, which
+      // rounds a 64-bit NTFS file reference above 2**53 to float64 and lets
+      // two DIFFERENT directories compare equal at every re-verification
+      // below (see fileIdentity in pr_closeout_fs.js).
+      const info = fileIdentity(await lstat(logsDir, { bigint: true }));
       securedLogsDirIdentity = { dev: info.dev, ino: info.ino };
     } catch {
       securedLogsDirIdentity = null;

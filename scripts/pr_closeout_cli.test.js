@@ -148,13 +148,28 @@ test('rejects a --config that exceeds the regular-file size cap', async () => {
   }
 });
 
+// Stand-in for the `{ bigint: true }` Stats readCloseoutConfig's identity
+// capture asks for: BigInt scalars plus the prototype methods the normalizer
+// calls. A hand-built Number fake would make every test below exercise the
+// normalizer's type rejection instead of the guard it is written to prove.
+const bigStat = ({
+  dev = 1n, ino = 1n, size = 0n, mtimeMs = 0n, isFile = true, isSymbolicLink = false,
+} = {}) => ({
+  dev, ino, nlink: 1n, size,
+  ctimeMs: mtimeMs, ctimeNs: mtimeMs * 1000000n,
+  birthtimeMs: mtimeMs, birthtimeNs: mtimeMs * 1000000n,
+  mtimeMs, mtimeNs: mtimeMs * 1000000n,
+  isFile: () => isFile,
+  isSymbolicLink: () => isSymbolicLink,
+});
+
 test('rejects a non-regular --config target through the descriptor guard', async () => {
   // Codex #UDDQK: a FIFO/device behind the config path must be rejected from
   // the opened descriptor, never read. Windows cannot create FIFOs without
   // admin, so the opener is injected — the same seam openNoFollow provides.
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const fakeHandle = {
-    stat: async () => ({ isFile: () => false, size: 12 }),
+    stat: async () => bigStat({ isFile: false, size: 12n }),
     read: async () => { throw new Error('read must not be reached for a non-regular config'); },
     close: async () => {},
   };
@@ -185,7 +200,7 @@ test('rejects a symlinked --config even when NOFOLLOW is unavailable and the ope
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const targetContent = JSON.stringify({ baseRef: 'HEAD' });
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 1, ino: 999 }),
+    stat: async () => bigStat({ dev: 1n, ino: 999n, size: BigInt(targetContent.length) }),
     read: async (buffer, offset) => {
       const chunk = Buffer.from(targetContent, 'utf8');
       chunk.copy(buffer, offset);
@@ -195,7 +210,7 @@ test('rejects a symlinked --config even when NOFOLLOW is unavailable and the ope
   };
   await assert.rejects(
     readCloseoutConfig('closeout-link.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => true, dev: 1, ino: 42 }),
+      lstatFn: async () => bigStat({ dev: 1n, ino: 42n, isSymbolicLink: true }),
       openFile: async () => fakeHandle,
     }),
     /must not be a symlink/,
@@ -209,13 +224,13 @@ test('rejects a --config swapped for a symlink between lstat and open (TOCTOU)',
   // pre-open lstat to close that gap.
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 999 }),
+    stat: async () => bigStat({ dev: 1n, ino: 999n, size: 2n }),
     read: async () => { throw new Error('read must not be reached once identity mismatches'); },
     close: async () => {},
   };
   await assert.rejects(
     readCloseoutConfig('closeout-race.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 42 }),
+      lstatFn: async () => bigStat({ dev: 1n, ino: 42n }),
       openFile: async () => fakeHandle,
     }),
     /must not be a symlink/,
@@ -226,7 +241,7 @@ test('accepts a regular --config whose pre-open lstat identity matches the opene
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const targetContent = JSON.stringify({ baseRef: 'HEAD' });
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 7, ino: 55 }),
+    stat: async () => bigStat({ dev: 7n, ino: 55n, size: BigInt(targetContent.length) }),
     read: async (buffer, offset) => {
       const chunk = Buffer.from(targetContent, 'utf8');
       chunk.copy(buffer, offset);
@@ -235,7 +250,7 @@ test('accepts a regular --config whose pre-open lstat identity matches the opene
     close: async () => {},
   };
   const config = await readCloseoutConfig('closeout-ok.json', {
-    lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+    lstatFn: async () => bigStat({ dev: 7n, ino: 55n }),
     openFile: async () => fakeHandle,
   });
   assert.deepEqual(config, { baseRef: 'HEAD' });
@@ -267,13 +282,13 @@ test('rejects a --config identity check when the filesystem never assigns real i
   // actionable message instead.
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 0 }),
+    stat: async () => bigStat({ dev: 1n, ino: 0n, size: 2n }),
     read: async () => { throw new Error('read must not be reached once ino reporting is untrusted'); },
     close: async () => {},
   };
   await assert.rejects(
     readCloseoutConfig('closeout-zero-ino.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 0 }),
+      lstatFn: async () => bigStat({ dev: 1n, ino: 0n }),
       openFile: async () => fakeHandle,
     }),
     /does not report a usable file identity/,
@@ -286,13 +301,13 @@ test('rejects a --config identity check when only the pre-open lstat reports ino
   // verified identity to compare either way.
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: 2, dev: 1, ino: 9 }),
+    stat: async () => bigStat({ dev: 1n, ino: 9n, size: 2n }),
     read: async () => { throw new Error('read must not be reached once ino reporting is untrusted'); },
     close: async () => {},
   };
   await assert.rejects(
     readCloseoutConfig('closeout-zero-ino-pre.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 1, ino: 0 }),
+      lstatFn: async () => bigStat({ dev: 1n, ino: 0n }),
       openFile: async () => fakeHandle,
     }),
     /does not report a usable file identity/,
@@ -310,7 +325,7 @@ test('rejects a --config truncated after handle.stat() but before the read finis
   const targetContent = JSON.stringify({ baseRef: 'HEAD' });
   const truncatedContent = '{}';
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 7, ino: 55, mtimeMs: 1000 }),
+    stat: async () => bigStat({ dev: 7n, ino: 55n, size: BigInt(targetContent.length), mtimeMs: 1000n }),
     read: async (buffer, offset) => {
       if (offset > 0) return { bytesRead: 0 };
       const chunk = Buffer.from(truncatedContent, 'utf8');
@@ -321,7 +336,7 @@ test('rejects a --config truncated after handle.stat() but before the read finis
   };
   await assert.rejects(
     readCloseoutConfig('closeout-truncated.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+      lstatFn: async () => bigStat({ dev: 7n, ino: 55n }),
       openFile: async () => fakeHandle,
     }),
     /truncated while it was being read/,
@@ -341,15 +356,14 @@ test('rejects a --config rewritten in place between the pre-read and post-read s
     stat: async () => {
       statCalls += 1;
       // First call: the pre-read stat. Second call: the post-read re-stat,
-      // reporting a different mtimeMs as if the file had been rewritten in
+      // reporting a different mtime as if the file had been rewritten in
       // place (same dev/ino/size) during the read.
-      return {
-        isFile: () => true,
-        size: targetContent.length,
-        dev: 7,
-        ino: 55,
-        mtimeMs: statCalls === 1 ? 1000 : 2000,
-      };
+      return bigStat({
+        dev: 7n,
+        ino: 55n,
+        size: BigInt(targetContent.length),
+        mtimeMs: statCalls === 1 ? 1000n : 2000n,
+      });
     },
     read: async (buffer, offset) => {
       const chunk = Buffer.from(targetContent, 'utf8');
@@ -360,7 +374,7 @@ test('rejects a --config rewritten in place between the pre-read and post-read s
   };
   await assert.rejects(
     readCloseoutConfig('closeout-rewritten.json', {
-      lstatFn: async () => ({ isSymbolicLink: () => false, dev: 7, ino: 55 }),
+      lstatFn: async () => bigStat({ dev: 7n, ino: 55n }),
       openFile: async () => fakeHandle,
     }),
     /changed while it was being read/,
@@ -377,7 +391,7 @@ test('rejects a --config opened after an ENOENT lstat pre-check finds nothing to
   const { readCloseoutConfig } = require('./pr_closeout.js');
   const targetContent = JSON.stringify({ baseRef: 'HEAD' });
   const fakeHandle = {
-    stat: async () => ({ isFile: () => true, size: targetContent.length, dev: 1, ino: 1 }),
+    stat: async () => bigStat({ dev: 1n, ino: 1n, size: BigInt(targetContent.length) }),
     read: async (buffer, offset) => {
       const chunk = Buffer.from(targetContent, 'utf8');
       chunk.copy(buffer, offset);

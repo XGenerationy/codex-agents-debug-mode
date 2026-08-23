@@ -6,6 +6,7 @@ const http = require('node:http');
 const net = require('node:net');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
+const { fileIdentity: toIdentity } = require('./pr_closeout_fs');
 const test = require('node:test');
 
 const {
@@ -586,14 +587,21 @@ test('rejects artifact proof paths whose real target escapes through a link', as
     proof: { type: 'artifact', path: 'linked/render.json' },
     cwd,
     filesystem: {
+      // Stands in for the `{ bigint: true }` Stats the identity capture asks
+      // for: BigInt scalars plus the prototype methods the normalizer calls.
       lstat: async () => ({
         isFile: () => true,
         isSymbolicLink: () => false,
-        size: 12,
-        mtimeMs: 1,
-        ctimeMs: 1,
-        dev: 1,
-        ino: 1,
+        size: 12n,
+        nlink: 1n,
+        mtimeMs: 1n,
+        mtimeNs: 1000000n,
+        ctimeMs: 1n,
+        ctimeNs: 1000000n,
+        birthtimeMs: 1n,
+        birthtimeNs: 1000000n,
+        dev: 1n,
+        ino: 1n,
       }),
       realpath: async (target) => (path.resolve(target) === cwd ? cwd : outside),
     },
@@ -1629,11 +1637,11 @@ test('binds an evidence log header write to the validated logs directory identit
   const logPath = path.join(logsDir, 'qualification.probe.attempt-001.log');
   try {
     await writeFile(logPath, 'PRIOR-EVIDENCE', 'utf8');
-    const real = await lstat(logsDir);
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
     // A mismatching identity stands in for a logsDir swapped between
     // validation and this open (same filesystem, different inode).
     await assert.rejects(
-      writeLogHeaderNoFollow(logPath, 'command: x\ncwd: <repo>\n', { dev: real.dev + 1, ino: real.ino }),
+      writeLogHeaderNoFollow(logPath, 'command: x\ncwd: <repo>\n', { dev: String(BigInt(real.dev) + 1n), ino: real.ino }),
       /logs directory swapped after validation/,
     );
     // Rejected before truncate: the prior content is intact.
@@ -1641,6 +1649,64 @@ test('binds an evidence log header write to the validated logs directory identit
     // The matching identity still writes the header (happy path preserved).
     await writeLogHeaderNoFollow(logPath, 'command: ok\ncwd: <repo>\n', { dev: real.dev, ino: real.ino });
     assert.match(await readFile(logPath, 'utf8'), /^command: ok/);
+  } finally {
+    await rm(logsDir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a swapped logs directory on the forced Linux route, on the ino term as well as the dev term', async () => {
+  // WHAT THIS PROVES, AND WHAT IT DOES NOT. It proves the forced-Linux route
+  // rejects a logs directory swapped after validation, on the INO term as well
+  // as the dev term and on an unusable (ino 0) recorded identity — cases the
+  // forced-linux plumbing test above never reaches, since it passes a MATCHING
+  // identity.
+  //
+  // It does NOT prove WHICH guard rejected. openLogBoundToParent carries its
+  // own copy of the directory-identity check and throws assertLogParentIdentity's
+  // message deliberately, so on a host without a working /proc — this Windows
+  // matrix, or a Linux host with no /proc mounted — the fd-bind child open
+  // fails ENOENT, openLogNoFollow falls back to the path-based open, and the
+  // FALLBACK's identity check produces the identical rejection. Measured:
+  // deleting openLogBoundToParent's check outright leaves this test green here.
+  // Isolating that guard is provable only on a Linux host with /proc, and is
+  // recorded as a limitation rather than asserted as if this covered it.
+  const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-fdbind-swap-'));
+  const logPath = path.join(logsDir, 'qualification.fdbind-swap.attempt-001.log');
+  try {
+    await writeFile(logPath, 'PRIOR-EVIDENCE', 'utf8');
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
+    // A mismatching ino, with dev held equal, so the ino term is what rejects.
+    // BigInt arithmetic on the exact reference: `Number(ino) + 1` is exactly
+    // the rounding this record exists to remove and could collide straight
+    // back to the original value above 2**53.
+    await assert.rejects(
+      writeLogHeaderNoFollow(
+        logPath,
+        'command: x\ncwd: <repo>\n',
+        { dev: real.dev, ino: String(BigInt(real.ino) + 1n) },
+        'linux',
+      ),
+      /logs directory swapped after validation/,
+    );
+    // Rejected before truncate: the prior content is intact.
+    assert.equal(await readFile(logPath, 'utf8'), 'PRIOR-EVIDENCE');
+    // A mismatching dev is rejected on the same path.
+    await assert.rejects(
+      writeLogHeaderNoFollow(
+        logPath,
+        'command: x\ncwd: <repo>\n',
+        { dev: String(BigInt(real.dev) + 1n), ino: real.ino },
+        'linux',
+      ),
+      /logs directory swapped after validation/,
+    );
+    // An identity the filesystem could not supply (ino 0) is refused outright
+    // rather than compared vacuously.
+    await assert.rejects(
+      writeLogHeaderNoFollow(logPath, 'command: x\ncwd: <repo>\n', { dev: real.dev, ino: '0' }, 'linux'),
+      /logs directory swapped after validation/,
+    );
+    assert.equal(await readFile(logPath, 'utf8'), 'PRIOR-EVIDENCE');
   } finally {
     await rm(logsDir, { recursive: true, force: true });
   }
@@ -1657,7 +1723,7 @@ test('writes an evidence log header successfully whether or not the forced Linux
   const logsDir = await mkdtemp(path.join(tmpdir(), 'closeout-fdbind-plumbing-'));
   const logPath = path.join(logsDir, 'qualification.fdbind-plumbing.attempt-001.log');
   try {
-    const real = await lstat(logsDir);
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
     const identity = await writeLogHeaderNoFollow(
       logPath,
       'command: ok\ncwd: <repo>\n',
@@ -1665,8 +1731,14 @@ test('writes an evidence log header successfully whether or not the forced Linux
       'linux',
     );
     assert.match(await readFile(logPath, 'utf8'), /^command: ok/);
-    assert.equal(typeof identity.dev, 'number');
-    assert.equal(typeof identity.ino, 'number');
+    // Pinned as STRINGS, and this assertion inverted deliberately when the
+    // identity capture stopped rounding. dev/ino are the full 64-bit values as
+    // decimal strings: a Number ino is an already-rounded float64, so an NTFS
+    // file reference above 2**53 would let two DIFFERENT files compare equal
+    // at every re-verification that consumes this record (see fileIdentity in
+    // pr_closeout_fs.js). A 'number' pin here would now be a pin on the defect.
+    assert.equal(typeof identity.dev, 'string');
+    assert.equal(typeof identity.ino, 'string');
   } finally {
     await rm(logsDir, { recursive: true, force: true });
   }
@@ -1693,7 +1765,7 @@ test('rejects a leaf symlink swapped into the log path between the pre-open chec
   const attackerTarget = path.join(attackerDir, 'clobber-me.txt');
   await writeFile(attackerTarget, 'do not overwrite this\n', 'utf8');
   try {
-    const real = await lstat(logsDir);
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
     const identity = { dev: real.dev, ino: real.ino };
     await writeFile(logPath, 'seed\n', 'utf8');
 
@@ -1794,7 +1866,7 @@ test('binds the evidence log append stream to the validated logs directory and h
     logPath,
   };
   try {
-    const real = await lstat(logsDir);
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
     // Establish the header exactly as createCommandExecutor does, capturing the
     // header file's own identity to thread into the append reopen.
     const fileIdentity = await writeLogHeaderNoFollow(
@@ -1807,12 +1879,25 @@ test('binds the evidence log append stream to the validated logs directory and h
     // the header write and this append open.
     const swappedDir = await spawnCaptured({
       ...baseArgs,
-      securedDirIdentity: { dev: real.dev + 1, ino: real.ino },
+      securedDirIdentity: { dev: String(BigInt(real.dev) + 1n), ino: real.ino },
       securedFileIdentity: fileIdentity,
     });
     assert.equal(swappedDir.exitCode, 0);
     assert.equal(typeof swappedDir.logWriteError, 'string');
     assert.match(swappedDir.logWriteError, /swapped after validation/);
+
+    // The same swap seen on the INO rather than the dev. Without this case
+    // every parent-identity fixture holds ino constant and only varies dev, so
+    // the ino term can be disabled outright and the suite stays green -- the
+    // same blind spot CodeRabbit caught in debug_server's dev/ino fixtures.
+    // dev is held equal here so the ino term is what has to do the rejecting.
+    const swappedDirIno = await spawnCaptured({
+      ...baseArgs,
+      securedDirIdentity: { dev: real.dev, ino: String(BigInt(real.ino) + 1n) },
+      securedFileIdentity: fileIdentity,
+    });
+    assert.equal(swappedDirIno.exitCode, 0);
+    assert.match(swappedDirIno.logWriteError, /swapped after validation/);
 
     // A mismatching FILE identity stands in for the header file replaced in
     // place (same directory) after its header write. Reuse the directory's
@@ -1829,7 +1914,7 @@ test('binds the evidence log append stream to the validated logs directory and h
     // unavailable (see the ino:0 handling it applies), not because a swap
     // was detected (CodeRabbit UohnR). Skip rather than assert a false
     // guarantee in that case.
-    if (real.ino === 0) {
+    if (real.ino === '0') {
       t.diagnostic('platform reports ino: 0 for lstat; swapped-file identity fixture is not distinguishable here, skipping');
     } else {
       const swappedFile = await spawnCaptured({
@@ -1878,16 +1963,16 @@ test('does not treat an unavailable recorded inode as evidence of an append-time
     logPath,
   };
   try {
-    const real = await lstat(logsDir);
+    const real = toIdentity(await lstat(logsDir, { bigint: true }));
     await writeLogHeaderNoFollow(logPath, 'command: bound\ncwd: <repo>\n', { dev: real.dev, ino: real.ino });
-    const fileReal = await lstat(logPath);
+    const fileReal = toIdentity(await lstat(logPath, { bigint: true }));
     const result = await spawnCaptured({
       ...baseArgs,
       securedDirIdentity: { dev: real.dev, ino: real.ino },
       // Recorded file identity with an unavailable inode: must be skipped
       // rather than treated as a guaranteed mismatch against the real
       // (non-zero, on this host) observed inode.
-      securedFileIdentity: { dev: fileReal.dev, ino: 0 },
+      securedFileIdentity: { dev: fileReal.dev, ino: '0' },
     });
     assert.equal(result.exitCode, 0);
     assert.ok(!result.logWriteError, statusDiag(result));

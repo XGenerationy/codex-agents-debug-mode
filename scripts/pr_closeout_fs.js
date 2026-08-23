@@ -432,7 +432,7 @@ const protectWindowsPrivateFileAsync = (privateFile, {
  * object carries birthtimeMs and isSameProtectedFileIdentity's tolerant term
  * compares it across that boundary.
  * @param {import('node:fs').BigIntStats} stats - MUST come from a `{ bigint: true }` stat/lstat/fstat.
- * @returns {{dev:string,ino:string,nlink:number,ctimeMs:number,ctimeNs:string,birthtimeMs:number,birthtimeNs:string,size:number,isFile:boolean,isSymbolicLink:boolean}}
+ * @returns {{dev:string,ino:string,nlink:number,ctimeMs:number,ctimeNs:string,birthtimeMs:number,birthtimeNs:string,mtimeMs:number,mtimeNs:string,size:number,isFile:boolean,isSymbolicLink:boolean}}
  */
 const fileIdentity = (stats) => {
   // A default Stats reaching here would be stringified from an ALREADY-rounded
@@ -451,12 +451,17 @@ const fileIdentity = (stats) => {
     birthtimeMs: Number(stats.birthtimeMs),
     birthtimeNs: String(stats.birthtimeNs),
     // NOT an identity term and deliberately not compared by any predicate
-    // below -- mtime is caller-settable on every platform. It is carried
-    // because a consumer reads it for RECENCY (debug_server.js's
-    // initializing-claim grace), and a record missing the field would make
-    // `Date.now() - info.mtimeMs` NaN and that comparison silently false.
-    // Whole-ms truncation is immaterial to a seconds-scale grace window.
+    // below -- mtime is caller-settable on every platform. Both forms are
+    // carried because the two consumers need different things: a RECENCY read
+    // (debug_server.js's initializing-claim grace) wants a Number, where
+    // whole-ms truncation is immaterial to a seconds-scale window and a record
+    // missing the field would make `Date.now() - info.mtimeMs` NaN and that
+    // comparison silently false; a same-descriptor before/after CHANGE
+    // comparison (pr_closeout.js's config read, pr_closeout_process.js's bound
+    // artifacts) wants the exact value, and truncating it there would widen
+    // the in-place-rewrite window from ~100 ns to 1 ms.
     mtimeMs: Number(stats.mtimeMs),
+    mtimeNs: String(stats.mtimeNs),
     size: Number(stats.size),
     // Recorded as booleans, not carried as the Stats' methods: the whole point
     // of the record is that the BigInt Stats never escapes this expression, so
