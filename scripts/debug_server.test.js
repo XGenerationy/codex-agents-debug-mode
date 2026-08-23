@@ -28,6 +28,7 @@ const {
   redactEventForAppend,
   redactEventValue,
   resolvePowerShellExecutable,
+  resolveSessionIdleTimeoutMs,
   hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
@@ -403,9 +404,13 @@ test('project_hash is keyed by a persisted per-project salt, not a bare hash of 
 });
 
 test('deferred Windows salt protection still persists project_salt and agrees on project_hash', async () => {
-  // collector_boot defers PowerShell DACL until after listen()/handshake.
-  // Construction must still write the 32-byte salt and two servers on the
-  // same root must still agree, because already_running depends on it.
+  // collector_boot skips in-process PowerShell DACL entirely; the action's
+  // `start` parent hardens the salt after listen()/handshake. Construction
+  // must still write the 32-byte salt and two servers on the same root must
+  // still agree, because already_running depends on it. There is no deferred
+  // drain to call: the old queue+drain machinery had no production caller
+  // and implied a protection it never performed (audit V1c), so defer mode
+  // is now a plain skip.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-defer-'));
   try {
     const startedAt = Date.now();
@@ -416,16 +421,39 @@ test('deferred Windows salt protection still persists project_salt and agrees on
     });
     const elapsedMs = Date.now() - startedAt;
     assert.ok(elapsedMs < 2000, `deferred construction must not wait on PowerShell ACL (${elapsedMs}ms)`);
-    assert.equal(typeof first.protectDeferredWindowsPrivateFiles, 'function');
+    assert.equal(
+      first.protectDeferredWindowsPrivateFiles,
+      undefined,
+      'the undrained defer queue must stay deleted — protection parity is owned by the start parent',
+    );
     const saltInfo = await stat(path.join(projectRoot, '.debug', 'project_salt'));
     assert.equal(saltInfo.size, 32);
-    await first.protectDeferredWindowsPrivateFiles();
-    await first.protectDeferredWindowsPrivateFiles();
     const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
     assert.equal(second.collectorProjectHash, first.collectorProjectHash);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('POST /session hardens the session log via the awaited async ACL, never the sync variant', async () => {
+  // Wiring pin, deliberately source-level: the branch is win32-only and its
+  // failure mode is a concurrency stall (execFileSync froze the single-
+  // threaded server for the ACL's full 15s budget, timing out concurrent
+  // live reads — audit V1a), which no fast deterministic test can observe.
+  // The async variant's own semantics — spawn-based, settles on 'exit',
+  // immune to the pipe-inheritance hang that forced the old sync workaround
+  // (31c1f48) — are behaviorally covered in pr_closeout_fs.test.js; this pin
+  // guards the handler's side of the contract: the request path awaits the
+  // async entry point and never calls the blocking one.
+  const source = await readFile(path.join(__dirname, 'debug_server.js'), 'utf8');
+  assert.ok(
+    source.includes('await protectWindowsPrivateFileAsync(resolvedLogFile)'),
+    'the mint handler must await the spawn-based async ACL',
+  );
+  assert.ok(
+    !source.includes('protectWindowsPrivateFile(resolvedLogFile)'),
+    'the mint handler must not call the event-loop-blocking sync ACL',
+  );
 });
 
 test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
@@ -4194,6 +4222,30 @@ test('parseRedactNames splits, trims, and drops empty entries', () => {
   ]);
   assert.deepEqual(parseRedactNames(undefined), []);
   assert.deepEqual(parseRedactNames(''), []);
+  // Whitespace separates too, matching the documented contract and the boot
+  // shim, which now imports THIS parser. Under the old comma-only split,
+  // "A B,C" parsed to ['A B', 'C'] and — replacement matching being
+  // whole-name — A's and B's values were silently never redacted on the CLI
+  // path (Codex T3 #5, audit V8a).
+  assert.deepEqual(parseRedactNames('A B,C'), ['A', 'B', 'C']);
+  assert.deepEqual(parseRedactNames('ONE\tTWO\nTHREE, FOUR'), ['ONE', 'TWO', 'THREE', 'FOUR']);
+});
+
+test('resolveSessionIdleTimeoutMs honors finite budgets and the explicit Infinity opt-out', () => {
+  // Infinity disables idle retirement: the debug-evidence collector is
+  // job-scoped (teardown owns its lifecycle), and a wrapped command quiet for
+  // longer than any finite budget must not lose its session before `run`'s
+  // only capture read (audit V6a). Everything non-usable falls back to the
+  // 15-minute default rather than accidentally retiring instantly.
+  assert.equal(resolveSessionIdleTimeoutMs(1500), 1500);
+  assert.equal(resolveSessionIdleTimeoutMs(1), 1);
+  assert.equal(resolveSessionIdleTimeoutMs(Infinity), Infinity);
+  const defaultMs = 15 * 60 * 1_000;
+  assert.equal(resolveSessionIdleTimeoutMs(undefined), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(0), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(-5), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(Number.NaN), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs('900000'), defaultMs);
 });
 
 const postHypothesis = (baseUrl, body, headers = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` }) =>

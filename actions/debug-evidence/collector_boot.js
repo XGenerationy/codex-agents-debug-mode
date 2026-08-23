@@ -9,7 +9,7 @@
 
 const { generateKeyPairSync } = require('node:crypto');
 const path = require('node:path');
-const { createDebugServer } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
+const { createDebugServer, parseRedactNames } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
 
 const fail = (reason) => {
   process.stderr.write(`${JSON.stringify({ status: 'error', reason })}\n`);
@@ -32,6 +32,15 @@ const main = () => {
   if (maxEvents === null || maxBytes === null) return fail('invalid_limits');
   if (maxEvents !== undefined) limits.maxEventsPerSession = maxEvents;
   if (maxBytes !== undefined) limits.maxTotalBytes = maxBytes;
+  // This collector is JOB-SCOPED: the action's teardown step owns its
+  // lifecycle, so idle retirement adds nothing here — and it actively broke
+  // captures: with the default 15-minute budget, a wrapped command whose
+  // final quiet stretch exceeded it had its session retired before `run`'s
+  // only capture read (the first and only authenticated read happens AFTER
+  // the command exits), turning a successful job into exit 3 with a
+  // misleading counterfeit-collector diagnostic (audit V6a). Infinity is the
+  // documented explicit opt-out (resolveSessionIdleTimeoutMs).
+  limits.sessionIdleTimeoutMs = Infinity;
   // redactionEnv defaults to { ...process.env } inside createDebugServer, and
   // this shim inherits the full job env from `start` — that inheritance is the
   // redaction guarantee for job secrets (spec Security invariant 3).
@@ -58,12 +67,12 @@ const main = () => {
     limits,
     responderPrivateKey: privateKey,
     deferWindowsPrivateFileProtection: true,
-    // Comma OR whitespace separated, per the documented input contract: a
-    // comma-only split turned `DEBUG_REDACT_NAMES="A B,C"` into the names
-    // ['A B', 'C'], so A's and B's values were never redacted at all
-    // (Codex T3 #5).
-    redactionNames: String(process.env.DEBUG_REDACT_NAMES ?? '')
-      .split(/[\s,]+/).map((name) => name.trim()).filter(Boolean),
+    // Comma OR whitespace separated, per the documented input contract
+    // (Codex T3 #5). Parsed by the SHARED exported parser, never an inline
+    // copy: the inline fix here once left the CLI's parseRedactNames with the
+    // old comma-only split, so the same env var silently under-redacted on
+    // the CLI path (audit V8a). One parser, one contract.
+    redactionNames: parseRedactNames(process.env.DEBUG_REDACT_NAMES),
   });
   // EPIPE survival (Codex T3 #1). This collector outlives the `start` step:
   // once the startup line below is read, the parent releases its end of these

@@ -14,6 +14,7 @@ const {
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
+  protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
 } = require('./pr_closeout_fs');
 const { buildSecretReplacements } = require('./pr_closeout_stream');
@@ -82,21 +83,26 @@ const computeRetainedLogBytes = (logDir) => {
 // under .debug/ (0600, current-user-only) closes that: two invocations of the
 // SAME project's collector still agree, because both read the same on-disk
 // salt, but an outside guesser would also need to guess the unpublished salt.
-const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection) => {
+const applyWindowsPrivateFileProtection = (privateFile, skipInProcessAcl = false) => {
   if (process.platform !== 'win32') return;
-  if (Array.isArray(pendingWindowsProtection)) {
-    pendingWindowsProtection.push(privateFile);
-    return;
-  }
+  // `skipInProcessAcl` is deferWindowsPrivateFileProtection: the action's
+  // detached boot shim must never spawn powershell.exe (hosted Windows hangs
+  // it), so the debug-evidence `start` PARENT applies this file's DACL after
+  // the handshake instead. This used to queue the path onto an array a drain
+  // method was meant to consume, but nothing in production ever drained it —
+  // the parent hardens the paths it knows about directly — so the queue was
+  // machinery that implied protection it never performed (audit V1c).
+  if (skipInProcessAcl) return;
   // Never execFileSync synchronously here: hosted Windows PowerShell can take
   // 5–15s per invocation, and createDebugServer runs on the test/CLI
   // construction path. The microtask still calls execFileSync, one tick later
   // -- the guarantee is that it never blocks BEFORE the 'listening' callback,
   // which Node emits from the nextTick queue that drains ahead of promise
   // microtasks, so a consumer writing its handshake line there is never held
-  // behind the ACL. Fail-open matches the outer catch (unlink; unpersisted
-  // salt), which is why callers must queue the FINAL path, never a temp name
-  // they are about to rename away.
+  // behind the ACL. Fail-open: an ACL failure unlinks the file inside the
+  // microtask (unlink-or-do-not-persist), which is why callers must pass the
+  // FINAL path, never a temp name they are about to rename away. This
+  // function never throws synchronously — callers need no try/catch.
   void Promise.resolve().then(() => {
     try {
       protectWindowsPrivateFile(privateFile);
@@ -111,9 +117,11 @@ const applyWindowsPrivateFileProtection = (privateFile, pendingWindowsProtection
 // create) falls open to a private, unpersisted salt rather than crashing
 // startup -- worst case is two invocations disagreeing on project_hash, which
 // only affects the already_running convenience check, never authentication.
-// When `pendingWindowsProtection` is an array, Windows ACL work is queued
-// instead of run inline so listen()/handshake is not blocked by PowerShell.
-const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, pendingWindowsProtection = null) => {
+// When `skipInProcessAcl` is true (the action's detached boot shim), Windows
+// ACL work is skipped here entirely: the debug-evidence `start` parent
+// applies the DACL after handshake, so listen() is never blocked by
+// PowerShell and this process never spawns it.
+const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, skipInProcessAcl = false) => {
   const saltFile = path.join(debugDir, 'project_salt');
   const readExisting = () => {
     // Refuse a symlinked salt file, mirroring collector_token's own guard: an
@@ -240,15 +248,12 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, pendingWindowsPr
       //
       // Hosted Windows PowerShell can take >5s per ACL call. The action boot
       // shim must emit its startup line from listen(), so the collector_boot
-      // path defers this call until after handshake (pendingWindowsProtection).
-      // Fail-open is unchanged: ACL failure unlinks the salt and the outer
-      // catch returns an unpersisted salt.
-      try {
-        applyWindowsPrivateFileProtection(saltFile, pendingWindowsProtection);
-      } catch (error) {
-        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
-        throw error;
-      }
+      // path skips this call and the debug-evidence `start` parent hardens
+      // the salt after handshake. Fail-open lives inside the helper: an ACL
+      // failure unlinks the salt in its microtask, and the helper never
+      // throws synchronously (the try/catch that used to wrap this call was
+      // unreachable — audit V1b).
+      applyWindowsPrivateFileProtection(saltFile, skipInProcessAcl);
     } catch (error) {
       if (error?.code !== 'EEXIST' || wroteWinner) throw error;
       // saltFile already exists (a concurrent winner or a prior run): adopt it
@@ -295,19 +300,15 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, pendingWindowsPr
         throw error2;
       }
       // Harden the FINAL path, after the rename. Windows hardening never runs
-      // inside this synchronous block -- it is queued onto
-      // pendingWindowsProtection or a microtask -- so aiming it at `tempFile`
-      // hardened a name the rename had already consumed: the ACL failed on the
-      // vanished temp name, its handler unlinked that same absent path, and the
-      // live project_salt stayed on disk with inherited NTFS permissions. That
-      // is the exposure the ACL exists to prevent (Codex U1D5A) and breaks the
-      // unlink-or-do-not-persist rule the fresh-create path above keeps.
-      try {
-        applyWindowsPrivateFileProtection(saltFile, pendingWindowsProtection);
-      } catch (error2) {
-        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
-        throw error2;
-      }
+      // inside this synchronous block -- it runs in the helper's microtask
+      // (or in the `start` parent under skipInProcessAcl) -- so aiming it at
+      // `tempFile` hardened a name the rename had already consumed: the ACL
+      // failed on the vanished temp name, its handler unlinked that same
+      // absent path, and the live project_salt stayed on disk with inherited
+      // NTFS permissions. That is the exposure the ACL exists to prevent
+      // (Codex U1D5A) and breaks the unlink-or-do-not-persist rule the
+      // fresh-create path above keeps. The helper never throws synchronously.
+      applyWindowsPrivateFileProtection(saltFile, skipInProcessAcl);
     }
     // Read back the on-disk winner so every publisher returns the same bytes
     // (Codex U16Cd); with no concurrency this is exactly the salt just written.
@@ -338,6 +339,21 @@ const DEFAULT_LIMITS = Object.freeze({
   maxEventsPerSession: 2_000,
   maxTotalBytes: 16 * 1024 * 1024,
 });
+
+// Resolve the effective session idle timeout. Finite values >= 1ms are
+// honored; Infinity is an EXPLICIT opt-out that disables idle retirement
+// entirely — the debug-evidence action's job-scoped collector needs it,
+// because teardown owns that collector's lifecycle and a wrapped command
+// quiet for longer than any finite budget must not lose its session before
+// `run`'s only capture read (audit V6a). Anything else (0, negatives, NaN,
+// non-numbers) falls back to the default. With Infinity,
+// `lastActivityAt <= Date.now() - Infinity` is false for every session, so
+// retireInactiveSessions retires nothing.
+const resolveSessionIdleTimeoutMs = (value) => (
+  value === Infinity || (Number.isFinite(value) && value >= 1)
+    ? value
+    : DEFAULT_LIMITS.sessionIdleTimeoutMs
+);
 
 /**
  * A structured, expected request failure: `code` is the machine-readable
@@ -1051,11 +1067,11 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
- * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
+ * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes). sessionIdleTimeoutMs accepts Infinity to disable idle retirement for job-scoped collectors whose lifecycle a teardown step owns (see resolveSessionIdleTimeoutMs).
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
- * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, queue Windows DACL hardening for `project_salt` and skip PowerShell inside this process (including POST /session). The debug-evidence `start` parent applies `protectWindowsPrivateFile` after handshake/mint: a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path.
+ * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, skip ALL Windows DACL hardening inside this process (project_salt and POST /session's log file): the debug-evidence `start` parent applies `protectWindowsPrivateFile` itself after handshake/mint, because a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path (mint awaits the spawn-based async ACL).
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1116,8 +1132,7 @@ const createDebugServer = ({
   // never leak the raw path, but the EADDRINUSE probe in main() still needs
   // a way for two invocations to agree they mean the SAME project without
   // either being able to recover the other's path from what /health reports.
-  const pendingWindowsProtection = deferWindowsPrivateFileProtection ? [] : null;
-  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot, pendingWindowsProtection)).update(canonicalProjectRoot).digest('hex');
+  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot, deferWindowsPrivateFileProtection)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   // Fail-closed secret redaction for every persisted event. Built here so a
@@ -1182,10 +1197,7 @@ const createDebugServer = ({
         `${count},"max":${cap}}\n`);
     }
   };
-  const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
-    && effectiveLimits.sessionIdleTimeoutMs >= 1
-    ? effectiveLimits.sessionIdleTimeoutMs
-    : DEFAULT_LIMITS.sessionIdleTimeoutMs;
+  const sessionIdleTimeoutMs = resolveSessionIdleTimeoutMs(effectiveLimits.sessionIdleTimeoutMs);
   const originSet = new Set(allowedOrigins);
   let totalBytes = computeRetainedLogBytes(logDir);
   // Token-file persistence finishes after listen(); until then the collector
@@ -1392,7 +1404,16 @@ const createDebugServer = ({
                 // detached boot shim sets deferWindowsPrivateFileProtection so
                 // this handler never spawns powershell.exe — that child hangs
                 // until timeout on hosted windows-latest (Validate 31973907121).
-                protectWindowsPrivateFile(resolvedLogFile);
+                //
+                // AWAITED, never execFileSync: this runs inside the request
+                // handler of a single-threaded server, and the sync variant
+                // froze the whole event loop for the ACL's duration (up to
+                // its 15s budget) — concurrent /log appends and live reads
+                // (5s client timeout) stalled behind one mint. The async
+                // variant is spawn-based and immune to the pipe-inheritance
+                // hang that forced the earlier sync workaround (31c1f48);
+                // see protectWindowsPrivateFileAsync's contract.
+                await protectWindowsPrivateFileAsync(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
@@ -1897,19 +1918,6 @@ const createDebugServer = ({
         collectorReady = true;
       },
     },
-    protectDeferredWindowsPrivateFiles: {
-      value: async () => {
-        if (!Array.isArray(pendingWindowsProtection) || pendingWindowsProtection.length === 0) return;
-        const files = pendingWindowsProtection.splice(0, pendingWindowsProtection.length);
-        for (const file of files) {
-          try {
-            protectWindowsPrivateFile(file);
-          } catch {
-            try { unlinkSync(file); } catch { /* best effort cleanup */ }
-          }
-        }
-      },
-    },
   });
   return server;
 };
@@ -2331,11 +2339,17 @@ const parseAllowedOrigins = (value) =>
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-// DEBUG_REDACT_NAMES: comma-separated env-var names that must always be
-// redacted from persisted events regardless of value length (the CLI-facing
-// mirror of the closeout config's `names` opt-in).
+// DEBUG_REDACT_NAMES: comma- OR whitespace-separated env-var names that must
+// always be redacted from persisted events regardless of value length (the
+// CLI-facing mirror of the closeout config's `names` opt-in). The split must
+// stay comma-or-whitespace: a comma-only split turned `"A B,C"` into the
+// names ['A B', 'C'], and since replacement matching is whole-name, A's and
+// B's values were silently never redacted (Codex T3 #5 — originally fixed
+// only in the action's boot shim while this CLI parser kept the comma-only
+// split; audit V8a). collector_boot.js imports THIS function so the two
+// consumers of the env var cannot diverge again.
 const parseRedactNames = (value) => String(value ?? '')
-  .split(',')
+  .split(/[\s,]+/)
   .map((name) => name.trim())
   .filter(Boolean);
 
@@ -2900,6 +2914,7 @@ module.exports = {
   redactEventForAppend,
   redactEventValue,
   resolvePowerShellExecutable,
+  resolveSessionIdleTimeoutMs,
   hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 };
