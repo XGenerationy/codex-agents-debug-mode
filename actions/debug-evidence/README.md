@@ -633,11 +633,17 @@ afterwards (commenting, uploading elsewhere) may still be.
   executes, and finalizing the job is work that same dead process would have had to do. The
   `always()` step does not cover that case. Nothing in this action does, and together with
   the next bullet, that is the path which can leave a listener behind.
-- **The collector's idle timeout never terminates the process.** Be precise about this:
-  the 15-minute idle timeout retires *in-memory session credentials* (a later `POST /log`
-  then gets `unknown_session`) and does nothing else. If neither `Stop collector` nor the
-  runner's own cleanup runs, the process keeps listening on its port until something else
-  stops it.
+- **The collector's idle timeout never terminates the process.** Be precise about this,
+  in both directions: on the action path idle retirement is **disabled entirely** — the
+  boot shim sets `sessionIdleTimeoutMs = Infinity`, because the finite default retired a
+  quiet wrapped command's session before `run`'s only capture read — so *in-memory session
+  credentials are never idle-retired here*: they stay valid for the collector's whole
+  lifetime, bounded by `Stop collector`, runner job finalization, and process death — not
+  by time. (The 15-minute retirement, after which a later `POST /log` gets
+  `unknown_session`, applies only to a collector started with default limits, e.g. the
+  CLI.) If neither `Stop collector` nor the runner's own cleanup runs, the process keeps
+  listening on its port — holding its still-valid session credentials — until something
+  else stops it.
 - **Pick distinct `port` values** for invocations that can overlap on one host. Teardown
   signals the collector and returns without waiting for it to exit, so even a strictly
   sequential second invocation on the same port is racing a listener that may still hold

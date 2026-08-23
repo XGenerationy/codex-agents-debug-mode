@@ -44,7 +44,7 @@ inputs:
     required: false
     default: "8787"
   redact-names:
-    description: "Comma-separated extra env-var names to always redact (extends DEBUG_REDACT_NAMES)"
+    description: "Comma- or whitespace-separated extra env-var names to always redact (extends DEBUG_REDACT_NAMES)"
     required: false
     default: ""
   max-events:
@@ -445,12 +445,16 @@ runs:
       # With the collector detached and the timeout below never exiting it,
       # that is the case which can leave a listener behind.
       #
-      # AND THE COLLECTOR'S IDLE TIMEOUT NEVER TERMINATES THE PROCESS. The
-      # 15-minute timeout retires IN-MEMORY SESSION CREDENTIALS
-      # (retireInactiveSessions in scripts/debug_server.js, reached only from
-      # request handlers) and does nothing else; the process keeps listening.
-      # This file previously advertised it as a teardown backstop, which it
-      # has never been.
+      # AND THE COLLECTOR'S IDLE TIMEOUT NEVER TERMINATES THE PROCESS —
+      # on this action's path it does not even retire credentials: the boot
+      # shim disables idle retirement outright (sessionIdleTimeoutMs =
+      # Infinity, so a quiet wrapped command cannot lose its session before
+      # run's capture read), which means in-memory session credentials stay
+      # valid for the collector's whole lifetime, bounded by this step, job
+      # finalization, and process death — never by time. (The 15-minute
+      # retirement in retireInactiveSessions applies only to default-limits
+      # collectors, e.g. the CLI.) This file previously advertised the
+      # timeout as a teardown backstop, which it has never been.
       if: ${{ always() && steps.start.outcome != 'skipped' }}
       shell: bash
       env:
