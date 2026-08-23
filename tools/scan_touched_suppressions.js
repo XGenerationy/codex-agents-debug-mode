@@ -36,7 +36,7 @@ const {
   readGateChanges,
   scanTouchedSuppressions,
 } = require('../scripts/pr_closeout_repo');
-const { BLOCK_SCALAR_HEADER, stripTrailingYamlComment } = require('./workflow_checks');
+const { BLOCK_SCALAR_HEADER, stripTrailingYamlComment, walkQuoteState } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
@@ -735,7 +735,9 @@ const parseWorkflowNameListLine = (line) => {
  * rather than under an action `with:` input, where adding names can weaken
  * policy. Returns null — fail closed — when the target line is absent,
  * duplicated (ambiguous), enclosed by a block-scalar-valued key (its content
- * is literal text, not mappings), or never reaches a column-0 key.
+ * is literal text, not mappings), begins inside — or is walked through lines
+ * that begin inside — an open multi-line quoted scalar (also literal text),
+ * or never reaches a column-0 key.
  * @param {string} fileText
  * @param {string} targetLine file line, no +/- prefix
  * @returns {string[]|null} ancestor keys outermost-first, or null when unproven
@@ -750,10 +752,43 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
   // action-input expansion to the earlier on.workflow_run occurrence. Refuse
   // to resolve a chain instead; the caller fails closed and flags the line.
   if (lines.indexOf(targetLine, idx + 1) !== -1) return null;
+  // Cross-line quote tracking, the quoted-scalar analogue of the V7a
+  // block-scalar refusal below (2026-08-23 review verifier): a single- or
+  // double-quoted scalar left open on one line makes every following line
+  // its string CONTENT until the closing quote, so a line that BEGINS inside
+  // one is inert text no matter how key-shaped it looks. Without this pass
+  // the walk proved chains out of that text — `workflow_run: 'completed`
+  // followed by an indented `workflows: [...]` line is VALID YAML whose list
+  // line is scalar content, yet it walked as a real key and the exemption
+  // failed OPEN. Seed each line with the previous line's carryover exactly
+  // like findUnpinnedUses' per-line loop, sharing walkQuoteState rather than
+  // hand-rolling a second walker that could drift (the incident record on
+  // the walker itself shows drifted copies reintroducing fixed bugs).
+  // `stopAtComment` (true) keeps a quote character inside a real trailing
+  // comment from corrupting the carried state, per the same loop's contract.
+  const lineStartStates = new Array(idx + 1);
+  let quoteCarryover = { inDouble: false, inSingle: false };
+  for (let i = 0; i <= idx; i += 1) {
+    lineStartStates[i] = quoteCarryover;
+    quoteCarryover = walkQuoteState(lines[i], lines[i].length, quoteCarryover, true);
+  }
+  const beginsInsideQuotedScalar = (i) => lineStartStates[i].inDouble || lineStartStates[i].inSingle;
+  // A target that begins inside an open quoted scalar IS that scalar's
+  // content — its `workflows:` text can never be the real trigger list, and
+  // its enclosing key (which the walk below would find as a legitimate-
+  // looking ancestor) proves the wrong thing. Refuse outright.
+  if (beginsInsideQuotedScalar(idx)) return null;
   const chain = [];
   let indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
   for (let i = idx - 1; i >= 0 && indent > 0; i -= 1) {
     const line = lines[i];
+    // Refuse any chain walked THROUGH quoted-scalar content, before the
+    // blank/comment skip: a content line whose text merely looks blank or
+    // comment-shaped is still string interior, and in well-formed YAML no
+    // quoted content can sit between the target and its real ancestors
+    // without the target being content too — reaching one here means the
+    // file is lying about its structure somewhere, so prove nothing.
+    if (beginsInsideQuotedScalar(i)) return null;
     if (!line.trim() || /^\s*#/.test(line)) continue;
     // Quoted keys are valid YAML and the yamllint-recommended spelling for
     // `on` (a YAML 1.1 truthy): '"on":' and "'workflow_run':" must resolve
@@ -782,8 +817,9 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
       // trailing comment (`on: # was: |`), refusing a chain that is actually
       // provable (review V3a — fail-closed noise, but noise that invites
       // loosening the shared regex). Clean fresh-line quote state is the
-      // strip's default and the only option here: this walk has no
-      // cross-line quote tracking (a known, separately-tracked limitation).
+      // strip's default and exactly right here: the cross-line pass above
+      // already refused every line that begins inside an open quoted scalar,
+      // so any line reaching this check is proven to start outside one.
       if (BLOCK_SCALAR_HEADER.test(stripTrailingYamlComment(line))) return null;
       chain.unshift(match[2] ?? match[3] ?? match[4]);
       indent = match[1].length;
@@ -807,8 +843,9 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
  * input, where adding entries can weaken policy), so this also requires
  * `readFile(currentFile)` and checks the full ancestor chain is exactly
  * top-level `on` → `workflow_run`. Missing file, unreadable file, any other
- * chain, or a chain that never reaches a column-0 key (block-scalar
- * embeddings) fails closed. Note `readFile` returns WORKING-TREE content
+ * chain, a chain that never reaches a column-0 key (block-scalar
+ * embeddings), or one that starts in or crosses multi-line quoted-scalar
+ * content fails closed. Note `readFile` returns WORKING-TREE content
  * while `addedLine` comes from the base-to-HEAD diff: when the two diverge
  * (e.g. uncommitted edits to the workflow), the exact-text lookup in
  * yamlAncestorKeyChain simply misses and the expansion stays flagged — that

@@ -1004,3 +1004,88 @@ test('collectContentRemovals STILL flags a workflows: expansion embedded in a ru
     `expected a block-scalar-embedded workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
   );
 });
+
+test('collectContentRemovals STILL flags a workflows: expansion inside a multi-line QUOTED scalar', async () => {
+  // The quoted-scalar analogue of the V7a block-scalar embedding (2026-08-23
+  // review verifier): a single- or double-quoted scalar left open on one line
+  // makes every following line its string CONTENT until the closing quote,
+  // but the ancestry walk had no cross-line quote tracking, so content lines
+  // shaped like `on:` / `workflow_run:` were walked as real YAML keys and
+  // proved a chain out of inert quoted text — fail-OPEN. Three embeddings
+  // are pinned: the first is VALID YAML (`workflow_run: 'completed` opens
+  // the scalar, so its value swallows the `workflows:` line — the whole
+  // value resolves to one plain string, not a workflows list); the other two
+  // embed the trigger-shaped chain wholesale in a `name:` scalar, where no
+  // line of the "proof" is real YAML structure at all.
+  const embeddings = [
+    {
+      label: 'workflow_run: opens the quote over its own fake workflows list',
+      lines: (list) => [
+        'on:',
+        "  workflow_run: 'completed",
+        `    workflows: ${list}`,
+        "    tail'",
+        '',
+      ],
+    },
+    {
+      label: 'whole trigger chain embedded in a name: quoted scalar',
+      lines: (list) => [
+        "name: 'x",
+        'on:',
+        '  workflow_run:',
+        `    workflows: ${list}`,
+        "  z'",
+        '',
+      ],
+    },
+    {
+      label: 'double-quoted variant of the wholesale embedding',
+      lines: (list) => [
+        'name: "x',
+        'on:',
+        '  workflow_run:',
+        `    workflows: ${list}`,
+        '  z"',
+        '',
+      ],
+    },
+  ];
+  for (const { label, lines } of embeddings) {
+    const before = lines('["Validate", "Closeout preview"]').join('\n');
+    const after = lines('["Validate", "Closeout preview", "Debug evidence demo"]').join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    const removals = collectContentRemovals(diff, { readFile: () => after });
+    assert.ok(
+      removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+      `expected the quoted-scalar embedding (${label}) to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
+});
+
+test('collectContentRemovals exempts a proven expansion below a CLOSED multi-line quoted scalar', async () => {
+  // The fail-closed-noise guard for the quoted-scalar refusal above: a
+  // multi-line quoted scalar that opens AND closes before `on:` (a wrapped
+  // `name:`, the one plausible spelling in real workflows) leaves every line
+  // the walk actually visits starting outside any quote, so the chain must
+  // still prove and the expansion must stay exempt. Refusing here would be
+  // the over-broad "any quote anywhere in the file" reading, which this
+  // pins against.
+  const quoted = (list) => [
+    "name: 'My",
+    "  workflow'",
+    'on:',
+    '  workflow_run:',
+    `    workflows: ${list}`,
+    '    types: [completed]',
+    '',
+  ];
+  const before = quoted('["Validate", "Closeout preview"]').join('\n');
+  const after = quoted('["Validate", "Closeout preview", "Debug evidence demo"]').join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+  assert.deepEqual(
+    collectContentRemovals(diff, { readFile: () => after }),
+    [],
+    'a closed quoted scalar above on: must not refuse a genuinely provable chain',
+  );
+});

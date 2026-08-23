@@ -832,9 +832,14 @@ const hasTopLevelPermissions = (content) => {
 // `\S.*:` prefix must only ever run on comment-stripped text, or a trailing
 // comment containing a `: |`-shaped fragment false-matches as a header
 // (review V3a). One header pattern, one contract — including the strip.
+// walkQuoteState is exported for the same prover's cross-line quote
+// tracking (the quoted-scalar analogue of V7a): a second hand-rolled quote
+// walker over there could only drift from this one the way the in-file
+// copies already did once (CodeRabbit #6YSoOn) — one walker, one contract.
 module.exports = {
   BLOCK_SCALAR_HEADER,
   findUnpinnedUses,
   hasTopLevelPermissions,
   stripTrailingYamlComment,
+  walkQuoteState,
 };
