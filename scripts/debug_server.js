@@ -11,6 +11,7 @@ const {
   assertNotSymlink: assertNotSymlinkShared,
   isSameFileIdentity,
   isSameLockIdentity,
+  isSameProtectedFileIdentity,
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
@@ -1427,13 +1428,22 @@ const createDebugServer = ({
               // handle.stat() above and that call returning, the ACL could
               // land on a different filesystem object than this handle. Fail
               // closed rather than trust an unverified file as protected.
+              //
+              // Same predicate as the deferred parent's re-verification
+              // (actions/debug-evidence/support.js applyStartWindowsAcls) so
+              // one contract cannot be hardened on one half and left weaker
+              // on the other. In THIS win32-only branch the ino term is what
+              // rejects the recreate; the birth-time term the shared
+              // predicate adds is a POSIX inode-reuse layer inherited from
+              // it, not a Windows defense (NTFS file tunneling lets a
+              // same-name recreate keep the original's creation time).
               let postProtectInfo;
               try {
                 postProtectInfo = await lstat(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_escapes_root', 409);
               }
-              if (!isSameFileIdentity(info, postProtectInfo)) {
+              if (!isSameProtectedFileIdentity(info, postProtectInfo)) {
                 throw new RequestError('session_log_escapes_root', 409);
               }
             }
@@ -1536,9 +1546,17 @@ const createDebugServer = ({
           // during that PowerShell call got the DACL landed on a substitute
           // undetected — the exact unverified-protect the in-process path
           // above fails closed on (review V2a).
+          // birthtimeMs travels beside dev/ino because the parent compares
+          // with the same predicate the in-process path above uses, and that
+          // predicate SKIPS its birth term when either side reports none —
+          // so omitting the field here does not merely lose a check, it
+          // silently makes the parent's comparison the weaker dev/ino one
+          // while reading as if it were the stronger. It costs no extra stat:
+          // the value comes from the SAME O_EXCL creation handle as dev/ino.
           log_file_identity: {
             dev: sessions.get(sessionId).logFileIdentity.dev,
             ino: sessions.get(sessionId).logFileIdentity.ino,
+            birthtimeMs: sessions.get(sessionId).logFileIdentity.birthtimeMs,
           },
         });
         return;

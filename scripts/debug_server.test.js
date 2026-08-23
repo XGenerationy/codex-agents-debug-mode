@@ -748,9 +748,26 @@ test('requires the launch token and returns only an opaque relative log path', a
     // undetected (review V2a).
     const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file));
     assert.deepEqual(
-      authorized.body.log_file_identity,
+      { dev: authorized.body.log_file_identity.dev, ino: authorized.body.log_file_identity.ino },
       { dev: mintedLog.dev, ino: mintedLog.ino },
       'the response identity must be the created file, not a placeholder',
+    );
+    // birthtimeMs is pinned BY TYPE, not by value: the server reads it from
+    // the O_EXCL creation handle while this stat() re-reads the path after the
+    // response returned, and on mounts that record no birth time Node falls
+    // the field back to ctimeMs or 0 — a value comparison would flake there
+    // (the repo already hit one CI-only filesystem surprise, Codex UkAeu)
+    // while proving nothing the dev/ino pair above does not already prove.
+    // Presence is what matters: the parent's shared predicate SKIPS its birth
+    // term when either side is falsy, so a dropped field would silently
+    // downgrade the deferred re-verification while every other assertion here
+    // stayed green.
+    assert.equal(typeof authorized.body.log_file_identity.birthtimeMs, 'number');
+    // Exact shape, so a renamed or extra field is still caught the way the
+    // previous whole-object deepEqual caught it.
+    assert.deepEqual(
+      Object.keys(authorized.body.log_file_identity).sort(),
+      ['birthtimeMs', 'dev', 'ino'],
     );
     assert.equal(JSON.stringify(authorized.body).includes(projectRoot), false);
   } finally {
