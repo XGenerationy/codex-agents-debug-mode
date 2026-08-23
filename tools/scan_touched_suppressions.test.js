@@ -911,8 +911,14 @@ test('collectContentRemovals STILL flags a workflows: expansion inside a top-lev
   // The enclosing scalar's key is itself at column 0 here, so the ancestry
   // walk reaches column 0 through trigger-shaped SCALAR TEXT — the chain must
   // refuse any ancestor whose value begins a block scalar, quoted or bare
-  // (Qodo PR8). Both spellings are pinned.
-  for (const onKey of ['on: |', '"on": |']) {
+  // (Qodo PR8). Anchored/tagged/chomping headers are pinned alongside the
+  // plain spellings: the old inline guard required `|`/`>` directly after the
+  // colon, so `"on": &a |` and `"on": !!str |` were not recognized as scalar
+  // headers and their body lines were walked as real YAML keys — the
+  // exemption failed OPEN on exactly this embedding (audit V7a); the guard
+  // now shares workflow_checks.js's BLOCK_SCALAR_HEADER, which tolerates the
+  // anchor/tag prefix forms.
+  for (const onKey of ['on: |', '"on": |', 'on: &a |', '"on": &a |', '"on": !!str |', '"on": &a |- # cmt', '"on": >-']) {
     const scalarBefore = [
       onKey,
       '  workflow_run:',

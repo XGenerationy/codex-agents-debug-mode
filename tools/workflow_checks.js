@@ -822,4 +822,10 @@ const hasTopLevelPermissions = (content) => {
   return false;
 };
 
-module.exports = { findUnpinnedUses, hasTopLevelPermissions };
+// BLOCK_SCALAR_HEADER is exported for tools/scan_touched_suppressions.js's
+// ancestry prover: its weaker inline copy did not recognize anchored/tagged
+// headers (`"on": &a |`), so a block scalar's BODY lines were walked as real
+// YAML keys and could prove an on->workflow_run chain out of inert literal
+// text — the exemption failed OPEN on the exact embedding shape its guard
+// existed to refuse (audit V7a). One header pattern, one contract.
+module.exports = { BLOCK_SCALAR_HEADER, findUnpinnedUses, hasTopLevelPermissions };

@@ -36,6 +36,7 @@ const {
   readGateChanges,
   scanTouchedSuppressions,
 } = require('../scripts/pr_closeout_repo');
+const { BLOCK_SCALAR_HEADER } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
@@ -769,7 +770,13 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
       // enclosing scalar's key always has lower indent than its content and
       // therefore always enters this walk; refusing here fails the whole
       // lookup closed (Qodo PR8: '"on": |' embedding trigger-shaped text).
-      if (/:\s*[|>][0-9+-]*\s*(?:#.*)?$/.test(line)) return null;
+      // The SHARED header pattern, never a weaker inline copy: the inline
+      // regex `/:\s*[|>].../` required the indicator directly after the
+      // colon, so an anchored or tagged header (`"on": &a |`, `"on": !!str
+      // |`) was not recognized as a scalar and its BODY lines were walked as
+      // real YAML keys — proving a chain out of inert literal text, i.e.
+      // failing OPEN on the exact embedding the guard refuses (audit V7a).
+      if (BLOCK_SCALAR_HEADER.test(line)) return null;
       chain.unshift(match[2] ?? match[3] ?? match[4]);
       indent = match[1].length;
     }
