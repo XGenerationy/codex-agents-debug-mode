@@ -4,6 +4,7 @@ const {
   closeSync, constants, readFileSync, readSync, writeSync,
 } = require('node:fs');
 const { mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { EventEmitter } = require('node:events');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -266,14 +267,16 @@ test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lac
 });
 
 test('Windows ACL sync and async entry points share one frozen stdio-ignore options object', async () => {
-  // stdio:'ignore' is load-bearing for the SYNC path: execFileSync honors it,
+  // stdio:'ignore' is load-bearing for BOTH paths now. execFileSync honors it,
   // so the session-mint PowerShell never leaves a pipe for the parent to
-  // service. execFile (async) builds its spawn options from a whitelist that
-  // drops `stdio` and drains its own pipes regardless, so for that path the
-  // shared object buys symmetry, not deadlock protection. Drive both entry
-  // points through their exec seams so the assertions cover the actual
-  // invocation — the object reference, timeout, and windowsHide — not
-  // source text.
+  // service. The async variant is built on spawn — which also honors it —
+  // precisely because promisified execFile silently DROPPED `stdio` (it
+  // always buffers through pipes and settles only when they close), and a
+  // PowerShell descendant holding those inherited pipes open past exit hung
+  // the call until the 15s timeout on hosted windows-latest (the hang that
+  // forced the sync workaround in 31c1f48). Drive both entry points through
+  // their exec seams so the assertions cover the actual invocation — the
+  // object reference, timeout, and windowsHide — not source text.
   assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.stdio, 'ignore');
   assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.timeout, PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS);
   assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.windowsHide, true);
@@ -282,13 +285,26 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
     'shared options must stay frozen',
   );
   const calls = [];
+  // A ChildProcess stand-in: an EventEmitter that reports the given exit. The
+  // helper must settle on 'exit'/'error' alone — it has no pipes to wait for.
+  const fakeChild = ({ code = 0, signal = null, error = null } = {}) => {
+    const child = new EventEmitter();
+    queueMicrotask(() => {
+      if (error) child.emit('error', error);
+      else child.emit('exit', code, signal);
+    });
+    return child;
+  };
   protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
     platform: 'win32',
     execFileSyncFn: (file, args, options) => calls.push({ entry: 'sync', file, args, options }),
   });
   await protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
     platform: 'win32',
-    execFileAsyncFn: async (file, args, options) => calls.push({ entry: 'async', file, args, options }),
+    spawnFn: (file, args, options) => {
+      calls.push({ entry: 'async', file, args, options });
+      return fakeChild();
+    },
   });
   assert.equal(calls.length, 2);
   for (const call of calls) {
@@ -303,8 +319,10 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
   // Off Windows both entry points are no-ops that never reach exec.
   const never = () => { throw new Error('never reached off-Windows'); };
   protectWindowsPrivateFile('/p/.debug/project_salt', { platform: 'linux', execFileSyncFn: never });
-  await protectWindowsPrivateFileAsync('/p/.debug/session.log', { platform: 'darwin', execFileAsyncFn: never });
-  // Fail closed: the sync variant throws, the async variant rejects.
+  await protectWindowsPrivateFileAsync('/p/.debug/session.log', { platform: 'darwin', spawnFn: never });
+  // Fail closed: the sync variant throws; the async variant rejects on a
+  // spawn 'error' event, a synchronous spawn throw, a non-zero exit, and
+  // signal death (which is also how the shared timeout's kill surfaces).
   assert.throws(
     () => protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
       platform: 'win32', execFileSyncFn: () => { throw new Error('acl_denied'); },
@@ -313,8 +331,26 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
   );
   await assert.rejects(
     protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
-      platform: 'win32', execFileAsyncFn: async () => { throw new Error('acl_denied'); },
+      platform: 'win32', spawnFn: () => fakeChild({ error: new Error('acl_denied') }),
     }),
     /acl_denied/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => { throw new Error('spawn_refused'); },
+    }),
+    /spawn_refused/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => fakeChild({ code: 5 }),
+    }),
+    /windows_private_file_acl_failed: 5/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => fakeChild({ code: null, signal: 'SIGTERM' }),
+    }),
+    /windows_private_file_acl_failed: SIGTERM/,
   );
 });

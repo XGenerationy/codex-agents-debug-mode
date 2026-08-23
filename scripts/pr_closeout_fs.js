@@ -1,10 +1,7 @@
-const { execFile, execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const { constants, existsSync, openSync } = require('node:fs');
 const { lstat, open } = require('node:fs/promises');
 const path = require('node:path');
-const { promisify } = require('node:util');
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
@@ -321,26 +318,49 @@ const protectWindowsPrivateFile = (privateFile, {
 /**
  * Asynchronous sibling of protectWindowsPrivateFile: runs the identical fixed
  * PowerShell program (same DACL + owner hardening and verification, same 15s
- * timeout) via a promisified child_process.execFile instead of execFileSync,
- * so a request-serving path (the /session handler) does not block the Node
- * event loop for up to the full timeout on every call. No-op on non-Windows
- * platforms. Rejects (fails closed) on any non-zero exit exactly as the
- * synchronous variant throws.
+ * timeout via the shared exec options) without blocking the Node event loop,
+ * so a request-serving path (the /session handler) stays responsive for the
+ * duration of the ACL work. No-op on non-Windows platforms. Rejects (fails
+ * closed) on spawn failure, a non-zero exit, or signal death (including the
+ * timeout kill) exactly where the synchronous variant throws.
+ *
+ * Built on spawn + the shared `stdio: 'ignore'`, NOT on a promisified
+ * execFile: execFile does not honor `stdio` — it always buffers stdout and
+ * stderr through pipes and settles only when those pipes close, and on hosted
+ * windows-latest a PowerShell descendant held the inherited pipe handles open
+ * past exit, so the promisified call hung until the 15s timeout on every
+ * mint (POST /session → HTTP 500; the sync switch in 31c1f48 worked around
+ * exactly this). spawn with stdio ignored creates no pipes to hold, and the
+ * 'exit' event fires on process exit regardless of descendants.
  * @param {string} privateFile
- * @param {{execFileAsyncFn?: typeof execFileAsync, platform?: string}} [overrides]
+ * @param {{spawnFn?: typeof spawn, platform?: string}} [overrides]
  *   Test-only seam, mirroring protectWindowsPrivateFile's above.
  * @returns {Promise<void>}
  */
-const protectWindowsPrivateFileAsync = async (privateFile, {
-  execFileAsyncFn = execFileAsync, platform = process.platform,
-} = {}) => {
-  if (platform !== 'win32') return;
-  await execFileAsyncFn(
-    resolvePowerShellExecutable(),
-    buildProtectWindowsPrivateFileArgs(privateFile),
-    PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
-  );
-};
+const protectWindowsPrivateFileAsync = (privateFile, {
+  spawnFn = spawn, platform = process.platform,
+} = {}) => new Promise((resolve, reject) => {
+  if (platform !== 'win32') {
+    resolve();
+    return;
+  }
+  let child;
+  try {
+    child = spawnFn(
+      resolvePowerShellExecutable(),
+      buildProtectWindowsPrivateFileArgs(privateFile),
+      PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+    );
+  } catch (error) {
+    reject(error);
+    return;
+  }
+  child.once('error', reject);
+  child.once('exit', (code, signal) => {
+    if (code === 0) resolve();
+    else reject(new Error(`windows_private_file_acl_failed: ${signal ?? code}`));
+  });
+});
 
 // Some Windows filesystems (and older Node releases on certain mounts) report
 // dev/ino as 0 for every file. A same-path swap between two stat calls would
