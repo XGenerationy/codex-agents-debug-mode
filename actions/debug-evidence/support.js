@@ -14,7 +14,7 @@
 const {
   appendFileSync, closeSync, constants, fstatSync, lstatSync, mkdirSync,
   openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync,
-  writeFileSync, writeSync,
+  writeFileSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const {
@@ -1047,6 +1047,34 @@ const protectWindowsPrivateFileIfPresent = (privateFile, {
   }
 };
 
+// The two files `start` hardens carry DIFFERENT failure contracts, and this
+// helper is where the split lives so a shared catch cannot creep back in
+// (audit V2a): the SALT is fail-open — on failure the helper above has
+// already unlinked it, which is exactly the absent-salt state the collector
+// tolerates (readOrCreateProjectSalt: worst case a wrong already_running
+// hint, "never authentication") — so a transient PowerShell failure warns
+// and continues rather than aborting a whole job over a convenience file.
+// The minted SESSION LOG is fail-closed: a protect failure here throws to
+// the caller, whose abort kills the collector — unprotected captured
+// evidence is the exposure the hardening exists to prevent. The seams exist
+// for tests; production passes only projectRoot/relativeLog.
+const applyStartWindowsAcls = ({
+  projectRoot,
+  relativeLog,
+  protectIfPresent = protectWindowsPrivateFileIfPresent,
+  protect = protectWindowsPrivateFile,
+  warn = (text) => process.stderr.write(text),
+}) => {
+  try {
+    protectIfPresent(path.join(projectRoot, '.debug', 'project_salt'));
+  } catch (error) {
+    warn(`debug-evidence-action: start: project_salt ACL failed; the salt was unlinked and this invocation continues without one (already_running hints may disagree): ${error?.message ?? error}\n`);
+  }
+  if (typeof relativeLog === 'string' && relativeLog.length > 0) {
+    protect(path.join(projectRoot, relativeLog));
+  }
+};
+
 // Read the shim's single startup line (private pipe). Resolves the parsed
 // JSON object; rejects on timeout, spawn failure, child exit, or unparsable
 // output.
@@ -1275,12 +1303,18 @@ const startSubcommand = async ({
   if (!(await probeToken(port, startLine.launch_token))) {
     throw abort(`collector identity could not be verified on port ${port}; refusing to send the launch token`);
   }
+  // The .catch matters as much as the status check: a REJECTED request
+  // (connection error, idle timeout, deadline) used to propagate straight to
+  // main's catch without killing the collector — one of the kill-less
+  // failure paths that orphaned it for the rest of the job (audit V4a).
   const mint = await request({
     port,
     method: 'POST',
     path: '/session',
     headers: { Authorization: `Bearer ${startLine.launch_token}` },
     body: { name: inputs.sessionName },
+  }).catch((error) => {
+    throw abort(`session mint failed: ${error?.message ?? error}`);
   });
   if (mint.status !== 201 || !mint.json?.session_id || !mint.json?.session_token) {
     throw abort(`session mint failed (HTTP ${mint.status ?? 'no response'})`);
@@ -1288,16 +1322,13 @@ const startSubcommand = async ({
   // Apply current-user-only Windows DACLs from this parent process, never
   // from the detached collector. powershell.exe EncodedCommand hangs until
   // timeout inside a DETACHED_PROCESS child on hosted windows-latest, which
-  // blocked POST /session (HTTP 500, Validate 31973907121). Salt is fail-open
-  // if absent (unpersisted); a minted session log is fail-closed.
+  // blocked POST /session (HTTP 500, Validate 31973907121). Only the session
+  // log can abort here — applyStartWindowsAcls swallows-and-warns the salt's
+  // failure by contract (audit V2a).
   try {
-    protectWindowsPrivateFileIfPresent(path.join(projectRoot, '.debug', 'project_salt'));
-    const relativeLog = mint.json.log_file;
-    if (typeof relativeLog === 'string' && relativeLog.length > 0) {
-      protectWindowsPrivateFile(path.join(projectRoot, relativeLog));
-    }
+    applyStartWindowsAcls({ projectRoot, relativeLog: mint.json.log_file });
   } catch (error) {
-    throw abort(`Windows private-file ACL failed: ${error?.message ?? error}`);
+    throw abort(`Windows session-log ACL failed: ${error?.message ?? error}`);
   }
   const sessionId = mint.json.session_id;
   const sessionToken = mint.json.session_token;
@@ -1325,6 +1356,10 @@ const startSubcommand = async ({
         status: 'OPEN',
         ...(inputs.hypothesisTitle ? { title: inputs.hypothesisTitle } : {}),
       },
+    }).catch((error) => {
+      // Same rule as the mint above: a rejected exchange must still take the
+      // collector down (audit V4a).
+      throw abort(`hypothesis post failed: ${error?.message ?? error}`);
     });
     if (hypothesis.status !== 202) {
       throw abort(`hypothesis post failed (HTTP ${hypothesis.status ?? 'no response'})`);
@@ -1384,10 +1419,19 @@ const startSubcommand = async ({
   // invocation's command exists, and why an EARLIER invocation's command in
   // the same job is outside the guarantee (Codex T6 r3 #1).
   if (env.GITHUB_OUTPUT) {
-    writeOutputs(env.GITHUB_OUTPUT, {
-      'collector-verify-key': startLine.verify_key,
-      'collector-pid': String(startLine.pid),
-    });
+    try {
+      writeOutputs(env.GITHUB_OUTPUT, {
+        'collector-verify-key': startLine.verify_key,
+        'collector-pid': String(startLine.pid),
+      });
+    } catch (error) {
+      // The one post-spawn failure path that had no kill guard (audit V4a):
+      // an ENOSPC/EACCES on the GITHUB_OUTPUT append here left a live
+      // collector whose pid teardown could never learn — the collector-pid
+      // output below IS teardown's only kill authority, so dying without
+      // publishing it must also mean dying without the collector.
+      throw abort(`step-output publish failed: ${error?.message ?? error}`);
+    }
   }
   // RELEASE the pipes, never destroy them (Codex T3 #1): destroying this end
   // leaves the collector writing into a closed pipe for the rest of the job,
@@ -1405,25 +1449,45 @@ const startSubcommand = async ({
 
 const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill }) => {
   if (requireInvocationNonce(env, 'teardown')) return 3;
-  const state = readState(outputDir);
-  if (!state) return 0; // start never wrote state — nothing to tear down
-  if (rejectForeignNonce(state, env, 'teardown')) return 3;
-  // PID comes from start's pre-command step output, not from action-state.json.
-  // The wrapped command can rewrite the state file; it cannot change the
-  // value the runner already parsed out of start's GITHUB_OUTPUT.
+  // Kill authority comes ONLY from runner-memory channels: the pid from
+  // start's pre-command step output (DEBUG_ACTION_COLLECTOR_PID) plus the
+  // invocation nonce already validated above. The state file is same-user
+  // writable by the wrapped command, so it is DIAGNOSTIC ONLY and must never
+  // be able to VETO the kill: gating on it let a deleted action-state.json
+  // return 0 ("nothing to tear down") and a rewritten nonce return 3, both
+  // without stopping a collector whose trustworthy pid this function was
+  // holding at that very moment (audit V4b). The pid is only ever published
+  // AFTER writeState succeeded, so "env pid present, state missing" cannot
+  // arise legitimately within one invocation — its appearance IS the
+  // tamper evidence.
   const rawPid = env.DEBUG_ACTION_COLLECTOR_PID;
   const pid = Number.parseInt(rawPid, 10);
-  if (!Number.isInteger(pid) || pid < 1 || String(pid) !== String(rawPid).trim()) {
-    process.stderr.write('debug-evidence-action: teardown: recorded state carries no usable pid.\n');
+  const hasPid = Number.isInteger(pid) && pid >= 1 && String(pid) === String(rawPid).trim();
+  const state = readState(outputDir);
+  if (!hasPid) {
+    // The ordinary path here is a start that failed before spawning (or
+    // before publishing): no pid, no state, nothing to stop. State present
+    // without a pid still authorizes nothing — say so accurately: the pid
+    // travels in the step output, never in recorded state (audit V4c).
+    if (!state) return 0;
+    process.stderr.write('debug-evidence-action: teardown: no usable collector pid arrived in DEBUG_ACTION_COLLECTOR_PID (start\'s collector-pid step output); action-state.json is diagnostic only and cannot authorize a kill.\n');
     return 3;
   }
+  // Kill FIRST, judge state after: the stop must happen regardless of what
+  // the (attacker-writable) state file claims.
   try {
     kill(pid);
   } catch (error) {
-    if (error?.code === 'ESRCH') return 0; // already gone — success, not a leak
-    process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${pid}: ${error?.code ?? error}\n`);
+    if (error?.code !== 'ESRCH') { // already gone — success, not a leak
+      process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${pid}: ${error?.code ?? error}\n`);
+      return 3;
+    }
+  }
+  if (!state) {
+    process.stderr.write('debug-evidence-action: teardown: action-state.json is missing although start published a collector pid; the collector was stopped from the step output. A same-user process removed or replaced the state file.\n');
     return 3;
   }
+  if (rejectForeignNonce(state, env, 'teardown')) return 3;
   return 0;
 };
 
@@ -1432,16 +1496,19 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
 // rather than buffering it into this process's heap.
 const RESPONSE_BYTE_CAP = 1024 * 1024;
 // Inactivity timeout: no bytes moved for this long.
-// Must exceed protectWindowsPrivateFileAsync's 15s PowerShell budget: POST
-// /session awaits that ACL on Windows before returning 201, and a 5s idle
-// timeout made start fail with `collector request timed out` on hosted
-// windows-latest (Validate logs, 2026-08-16).
-const REQUEST_IDLE_TIMEOUT_MS = 20_000;
+// These were once raised to 20s/25s "to exceed protectWindowsPrivateFileAsync's
+// 15s PowerShell budget" — a rationale the defer redesign then removed: the
+// action's collector boots with deferWindowsPrivateFileProtection, so ITS
+// POST /session performs no ACL work at all (start applies DACLs parent-side,
+// after the mint response has returned), and nothing on the action's request
+// path waits on PowerShell. The original budgets are restored so a genuinely
+// hung or dead collector fails the step in seconds, not half a minute
+// (audit V2c).
+const REQUEST_IDLE_TIMEOUT_MS = 5_000;
 // Wall-clock ceiling for the WHOLE exchange. The idle timeout alone is not a
 // bound: a peer that dribbles one byte every second resets it forever and the
-// subcommand hangs for the life of the job (Codex T4 #2). Keep this above the
-// Windows ACL budget so a legitimate mint is not killed by the wall clock.
-const REQUEST_DEADLINE_MS = 25_000;
+// subcommand hangs for the life of the job (Codex T4 #2).
+const REQUEST_DEADLINE_MS = 10_000;
 
 // Minimal JSON-over-loopback helper (node:http; fetch is avoided so tests can
 // inject `request` and so no keep-alive agent outlives the subcommand).
@@ -1512,7 +1579,18 @@ const httpRequestJson = ({
 });
 
 // stdio: 'inherit' — the wrapped command's output belongs in the step log.
-const defaultSpawnCommand = (command, { cwd, env }) => spawnSync('bash', ['-c', command], { cwd, env, stdio: 'inherit' });
+//
+// The flags match what `shell: bash` gives an ordinary workflow step
+// (--noprofile --norc -e -o pipefail). Bare `bash -c` reported only the LAST
+// command's status, so a multi-line `run` input like "npm test\necho done"
+// (or "failing | tee log") recorded command-exit-code=0 and finish passed
+// with fail-on-command-failure: "true" — the wrapped failure was masked
+// green where the identical script in a bare step fails (audit V5a).
+const defaultSpawnCommand = (command, { cwd, env }) => spawnSync(
+  'bash',
+  ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command],
+  { cwd, env, stdio: 'inherit' },
+);
 
 
 // Render both surfaces from bytes ALREADY IN MEMORY.
@@ -1544,17 +1622,38 @@ const defaultRenderReport = (sessionText, sessionId, { caveats = [], capturedAt 
 // in-memory payload leaves the process, and injecting it is how a test can
 // prove the digests describe the payload rather than whatever ended up on
 // disk.
-const defaultStageFile = (filePath, bytes) => {
+const defaultStageFile = (filePath, bytes, { writeAll = writeFileSync } = {}) => {
   try { unlinkSync(filePath); } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
   const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
     | (constants.O_NOFOLLOW || 0);
   const fd = openSync(filePath, flags, 0o444);
+  let staged = false;
   try {
-    writeSync(fd, bytes);
+    // writeFileSync (fd form) loops until the whole payload lands, and the
+    // staged size is verified before this returns — the same discipline
+    // writeState earned the hard way: a bare writeSync returns a COUNT a
+    // caller must honour, and a legal short write (ENOSPC mid-write, an
+    // rlimit) would otherwise stage truncated evidence silently while the
+    // already-printed digest line describes the full in-memory payload, so
+    // the artifact later reads as tampered — or truncated evidence ships
+    // under a green digest (audit V3b).
+    writeAll(fd, bytes);
+    const stagedBytes = fstatSync(fd).size;
+    const expectedBytes = Buffer.byteLength(bytes);
+    if (stagedBytes !== expectedBytes) {
+      throw new Error(`refusing truncated staged evidence (${stagedBytes} of ${expectedBytes} bytes): ${filePath}`);
+    }
+    staged = true;
   } finally {
+    // Close before any cleanup (Windows refuses to unlink an open file), and
+    // never leave a truncated slot behind: unlink-or-do-not-persist, exactly
+    // as writeState treats its staging temp.
     closeSync(fd);
+    if (!staged) {
+      try { unlinkSync(filePath); } catch { /* best-effort cleanup */ }
+    }
   }
 };
 
@@ -2416,9 +2515,11 @@ module.exports = {
   admissionCaveats,
   admissionEstablished,
   admissionField,
+  applyStartWindowsAcls,
   defaultRenderReport,
   defaultSpawnCommand,
   defaultSpawnShim,
+  defaultStageFile,
   finishSubcommand,
   bindArtifactSubcommand,
   httpRequestJson,

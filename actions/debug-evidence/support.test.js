@@ -25,9 +25,11 @@ const {
 } = require('../../scripts/debug_server');
 
 const {
+  applyStartWindowsAcls,
   defaultRenderReport,
   defaultSpawnCommand,
   defaultSpawnShim,
+  defaultStageFile,
   finishSubcommand,
   bindArtifactSubcommand,
   httpRequestJson,
@@ -352,8 +354,24 @@ test('collector boot never runs PowerShell ACL; start applies it in the parent',
   assert.ok(listenAt !== -1, 'boot still calls listen()');
   assert.ok(handshakeAt > listenAt, 'the startup line is written from the listen callback');
   assert.match(support, /protectWindowsPrivateFileIfPresent/);
-  assert.match(support, /protectWindowsPrivateFile\(path\.join\(projectRoot, relativeLog\)\)/);
+  // start routes both DACLs through applyStartWindowsAcls, whose default
+  // seams are the real protect helpers; the session log's protect call lives
+  // inside it (fail-closed), the salt's beside it (fail-open, audit V2a).
+  assert.match(support, /applyStartWindowsAcls\(\{ projectRoot, relativeLog: mint\.json\.log_file \}\)/);
+  assert.match(support, /protect\(path\.join\(projectRoot, relativeLog\)\)/);
   assert.match(support, /windowsHide:\s*true/);
+  // Job-scoped lifecycle: teardown owns this collector, so the shim must
+  // disable idle retirement — with the finite default, a wrapped command
+  // quiet for its final 15+ minutes had its session retired before `run`'s
+  // only capture read, failing a successful job with a counterfeit-collector
+  // diagnostic (audit V6a).
+  assert.match(boot, /sessionIdleTimeoutMs\s*=\s*Infinity/);
+  // One redaction contract: the shim parses DEBUG_REDACT_NAMES through the
+  // exported shared parser, never an inline copy — the inline fix once left
+  // the CLI under-redacting the same env var (audit V8a).
+  assert.match(boot, /parseRedactNames\(process\.env\.DEBUG_REDACT_NAMES\)/);
+  assert.equal(boot.includes('.split('), false,
+    'no inline DEBUG_REDACT_NAMES split may reappear in the shim');
 });
 
 test('a salt whose Windows ACL cannot be applied is deleted, never left with inherited permissions', () => {
@@ -389,10 +407,17 @@ test('a salt whose Windows ACL cannot be applied is deleted, never left with inh
   assert.ok(existsSync(saltFile), 'non-Windows stays a no-op');
 });
 
-test('httpRequestJson defaults cover the Windows session-log ACL budget', () => {
+test('httpRequestJson defaults stay at the tight pre-ACL budgets', () => {
+  // The 20s/25s raise existed only to outlast a PowerShell wait the defer
+  // redesign removed from the action's request path entirely (the shim's
+  // collector does no ACL work in POST /session; start hardens parent-side
+  // after the mint returns). With no wait left to cover, wide budgets only
+  // slowed real failures down 4-5x (audit V2c). If a future change puts a
+  // genuine wait back on this path, raise these WITH that change and say
+  // which wait each number covers.
   const source = readFileSync(path.join(__dirname, 'support.js'), 'utf8');
-  assert.match(source, /REQUEST_IDLE_TIMEOUT_MS = 20_000/);
-  assert.match(source, /REQUEST_DEADLINE_MS = 25_000/);
+  assert.match(source, /REQUEST_IDLE_TIMEOUT_MS = 5_000/);
+  assert.match(source, /REQUEST_DEADLINE_MS = 10_000/);
 });
 
 // Ordering is the property, not merely presence. `start` validates its inputs
@@ -505,7 +530,131 @@ test('teardown refuses when the start-output pid is absent even if state records
     }), 3);
   });
   assert.deepEqual(killed, [], 'a pid taken from mutable state is never signalled');
-  assert.match(written, /recorded state carries no usable pid/);
+  // The diagnostic names the channel that was actually inspected — the
+  // collector-pid step output — never "recorded state", whose pid field is
+  // present and valid in exactly this scenario (audit V4c).
+  assert.match(written, /no usable collector pid arrived in DEBUG_ACTION_COLLECTOR_PID/);
+});
+
+test('a deleted state file cannot veto teardown: the step-output pid is killed anyway', async () => {
+  // The wrapped command owns the output-dir's filesystem. Gating the kill on
+  // readState let `rm action-state.json` turn teardown into a green no-op
+  // while the collector lived on (audit V4b). The pid is only ever published
+  // AFTER writeState succeeded, so env-pid-present-without-state cannot
+  // arise legitimately — it IS the tamper evidence, and the kill must
+  // proceed from the runner-memory channel alone.
+  const outputDir = makeTempDir();
+  const killed = [];
+  const { written } = await captureStderr(() => {
+    assert.equal(teardownSubcommand({
+      outputDir,
+      env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', DEBUG_ACTION_COLLECTOR_PID: '4242' },
+      kill: (pid) => killed.push(pid),
+    }), 3, 'tamper evidence is surfaced as a failure, never a silent success');
+  });
+  assert.deepEqual(killed, [4242], 'the collector is stopped regardless of what the state file claims');
+  assert.match(written, /action-state\.json is missing although start published a collector pid/);
+});
+
+test('a foreign-nonce state file cannot veto teardown either: kill first, judge state after', async () => {
+  const outputDir = makeTempDir();
+  writeState(outputDir, { nonce: 'stranger', pid: 1111 });
+  const killed = [];
+  await captureStderr(() => {
+    assert.equal(teardownSubcommand({
+      outputDir,
+      env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', DEBUG_ACTION_COLLECTOR_PID: '4242' },
+      kill: (pid) => killed.push(pid),
+    }), 3, 'the foreign state is still reported as a refusal');
+  });
+  assert.deepEqual(killed, [4242],
+    'a rewritten nonce reports, but the step-output pid is signalled regardless (audit V4b)');
+});
+
+test('the wrapped command runs under errexit and pipefail, matching a bare workflow step', () => {
+  // Bare `bash -c` reports only the LAST command's status: "false\ntrue"
+  // exited 0, so a failing multi-line `run` input recorded
+  // command-exit-code=0 and finish passed with fail-on-command-failure:
+  // "true" — masked green where the identical script in a `shell: bash`
+  // step (--noprofile --norc -eo pipefail) fails (audit V5a). Real bash on
+  // purpose: every CI platform of this repo ships one, and the flags are
+  // the contract under test.
+  const cwd = makeTempDir();
+  const env = { ...process.env };
+  // `;` rather than a literal newline: to bash the two forms are the same
+  // list, but on a dev box where PATH's `bash` is the WSL launcher
+  // (System32\bash.exe) an embedded newline is mangled in transit and both
+  // shapes exit 0, hollowing the discrimination. The `;` form survives the
+  // launcher and still flips 0 -> 1 the moment -e is dropped (probed).
+  const multi = defaultSpawnCommand('false; true', { cwd, env });
+  assert.notEqual(multi.status, 0, 'errexit: the first failing line is the verdict, not the last line');
+  const piped = defaultSpawnCommand('false | cat', { cwd, env });
+  assert.notEqual(piped.status, 0, 'pipefail: a failing producer is not laundered by a succeeding consumer');
+  const ok = defaultSpawnCommand('true', { cwd, env });
+  assert.equal(ok.status, 0, 'a genuinely successful command still reports 0');
+});
+
+test('defaultStageFile refuses a short write and leaves no truncated slot behind', () => {
+  const dir = makeTempDir();
+  const target = path.join(dir, 'session.log');
+  const payload = Buffer.from('twelve bytes');
+  // A legal partial write (ENOSPC mid-write, an rlimit) returns a short
+  // COUNT instead of throwing. Without the fstat verification the truncated
+  // file staged silently while the digest line — hashed from memory before
+  // staging — described the full payload, so the artifact later read as
+  // tampered, or truncated evidence shipped under a green digest (audit
+  // V3b). writeState caught this exact class once already (Codex T3 r2).
+  assert.throws(
+    () => defaultStageFile(target, payload, {
+      writeAll: (fd, bytes) => writeSync(fd, Buffer.from(bytes).subarray(0, 3)),
+    }),
+    /refusing truncated staged evidence \(3 of 12 bytes\)/,
+  );
+  assert.equal(existsSync(target), false, 'unlink-or-do-not-persist: no truncated slot may remain staged');
+  defaultStageFile(target, payload);
+  assert.equal(readFileSync(target, 'utf8'), 'twelve bytes', 'the real writer stages the full payload');
+});
+
+test('applyStartWindowsAcls: salt failure warns and continues, session-log failure throws', () => {
+  // Two files, two contracts (audit V2a). The salt is fail-open: its protect
+  // helper has already unlinked it on failure, which is the absent-salt
+  // state the collector tolerates (worst case a wrong already_running hint,
+  // never authentication) — aborting a whole job over it turned a transient
+  // PowerShell hiccup into a hard failure. The minted session log stays
+  // fail-closed: its failure must reach the caller's abort.
+  const projectRoot = makeTempDir();
+  const warned = [];
+  const protects = [];
+  applyStartWindowsAcls({
+    projectRoot,
+    relativeLog: '.debug/session-x.log',
+    protectIfPresent: () => { throw new Error('salt_acl_denied'); },
+    protect: (file) => protects.push(file),
+    warn: (text) => warned.push(text),
+  });
+  assert.equal(warned.length, 1, 'the salt failure is reported');
+  assert.match(warned[0], /project_salt ACL failed; the salt was unlinked and this invocation continues/);
+  assert.match(warned[0], /salt_acl_denied/);
+  assert.deepEqual(protects, [path.join(projectRoot, '.debug/session-x.log')],
+    'the session log is still protected after a salt failure');
+  assert.throws(
+    () => applyStartWindowsAcls({
+      projectRoot,
+      relativeLog: '.debug/session-x.log',
+      protectIfPresent: () => {},
+      protect: () => { throw new Error('log_acl_denied'); },
+      warn: () => { throw new Error('the log failure must throw, never warn'); },
+    }),
+    /log_acl_denied/,
+  );
+  // No minted log (an empty relativeLog) protects nothing and throws nothing.
+  applyStartWindowsAcls({
+    projectRoot,
+    relativeLog: undefined,
+    protectIfPresent: () => {},
+    protect: () => { throw new Error('nothing to protect'); },
+    warn: () => {},
+  });
 });
 
 test('bind-artifact records an immutable artifact id and digest, and no-ops when upload produced none', async () => {
@@ -535,7 +684,13 @@ test('bind-artifact records an immutable artifact id and digest, and no-ops when
   assert.match(written, /unusable artifact identity/);
 });
 
-test('report unlinks a post-hash symlink substitution so upload cannot follow it', () => {
+test('report unlinks a post-hash symlink substitution so upload cannot follow it', {
+  // The planted link targets a FILE, so a junction cannot stand in for it and
+  // this test needs the real privilege; without the guard it hard-failed with
+  // EPERM on unprivileged Windows dev machines while hosted runners (which
+  // hold SeCreateSymbolicLinkPrivilege) stayed green (audit V10f).
+  skip: !fileSymlinkAvailable && 'file symlinks unavailable here (need SeCreateSymbolicLinkPrivilege on Windows)',
+}, () => {
   const outputDir = makeTempDir();
   writeState(outputDir, {
     nonce: 'n1', pid: 1, port: 1, sessionId: 'ci-debug-abc', sessionToken: 'x'.repeat(43),
@@ -1898,6 +2053,67 @@ test('a spawn failure rejects instead of escaping as an uncaught error event', a
   });
   setImmediate(() => child.emit('error', Object.assign(new Error('spawn node ENOENT'), { code: 'ENOENT' })));
   await assert.rejects(starting, /failed to spawn: spawn node ENOENT/);
+});
+
+test('a REJECTED session mint still kills the collector, never orphans it', async () => {
+  // The status-check path went through abort() and killed; a rejected
+  // request promise (connection error, idle timeout, deadline) propagated
+  // straight past every kill to main's catch, leaving a live collector whose
+  // pid nothing had published — one of the kill-less failure paths of audit
+  // V4a. The rejection must take the same abort road as a bad status.
+  const outputDir = makeTempDir();
+  const child = fakeChild();
+  const killed = [];
+  const starting = startSubcommand({
+    probeAdmission: ADMITTED,
+    inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
+    spawnShim: () => child,
+    probeReady: async () => ({ project_hash: 'hash', ready: true }),
+    probeToken: async () => true,
+    request: async () => { throw new Error('boom'); },
+    kill: (pid) => { killed.push(pid); },
+    readyTimeoutMs: 5_000,
+  });
+  setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
+  })}\n`));
+  await assert.rejects(starting, /session mint failed: boom/);
+  assert.deepEqual(killed, [4242], 'the rejected exchange must still take the collector down');
+});
+
+test('a failed step-output publish after the spawn kills the collector, never orphans it', async () => {
+  // The writeOutputs call publishing collector-verify-key/collector-pid was
+  // the one post-spawn failure path with no kill guard (audit V4a) — and the
+  // cruellest one: the value it failed to publish is teardown's ONLY kill
+  // authority, so dying here without killing left a collector nothing could
+  // stop for the rest of the job. GITHUB_OUTPUT starts as a real file (the
+  // step-entry nonce write must succeed) and becomes a directory inside the
+  // probeReady seam, so the post-spawn append is the first one to fail.
+  const outputDir = makeTempDir();
+  const child = fakeChild();
+  const killed = [];
+  const githubOutput = path.join(makeTempDir(), 'gh-output');
+  writeFileSync(githubOutput, '');
+  const starting = startSubcommand({
+    probeAdmission: ADMITTED,
+    inputs: baseInputs(), outputDir, projectRoot: makeTempDir(),
+    env: { GITHUB_OUTPUT: githubOutput },
+    spawnShim: () => child,
+    probeReady: async () => {
+      unlinkSync(githubOutput);
+      mkdirSync(githubOutput);
+      return { project_hash: 'hash', ready: true };
+    },
+    ...mintSeams,
+    kill: (pid) => { killed.push(pid); },
+    readyTimeoutMs: 5_000,
+  });
+  setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
+    status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
+  })}\n`));
+  await assert.rejects(starting, /step-output publish failed/);
+  assert.deepEqual(killed, [4242],
+    'dying without publishing the pid must also mean dying without the collector');
 });
 
 test('start kills the collector when its state cannot be recorded, leaving no unrecorded child', async () => {

@@ -23,7 +23,7 @@ One invocation is seven composite steps, in this order:
 |---|---|
 | `Set up Node.js` | `actions/setup-node`, pinned by SHA, at the `node-version` input. |
 | `Start collector` | Publishes this invocation's identity, decides admission (see [Evidence trust](#evidence-trust-strict-and-best-effort)), boots a loopback collector, mints a session, and optionally posts the one `OPEN` hypothesis line. |
-| `Run wrapped command` | Runs your command under `bash -c`, then — in the same process — reads the session back from the collector over an authenticated, signature-checked request, renders the report, hashes the payloads, and stages them. |
+| `Run wrapped command` | Runs your command under `bash --noprofile --norc -e -o pipefail -c` (the same errexit/pipefail semantics a `shell: bash` workflow step gets, so a failing line in a multi-line command — or a failing producer in a pipe — is the recorded verdict, never the last command's status), then, in the same process, reads the session back from the collector over an authenticated, signature-checked request, renders the report, hashes the payloads, and stages them. |
 | `Render evidence report` | Appends the staged `report.md` to `$GITHUB_STEP_SUMMARY` when this invocation's run captured one; otherwise it clears the staging slots it will not publish. Publish-only: it verifies nothing and decides nothing. |
 | `Upload evidence artifact` | `actions/upload-artifact`, pinned by SHA, over three enumerated file paths. |
 | `Stop collector` | Signals the detached collector process. |
@@ -78,7 +78,7 @@ Every default below is the literal default in [`action.yml`](action.yml).
 
 | input | required | default | what it is |
 |---|---|---|---|
-| `run` | yes | — | Command to execute under instrumentation (`bash -c`). |
+| `run` | yes | — | Command to execute under instrumentation (`bash -e -o pipefail -c`, matching workflow-step semantics). |
 | `working-directory` | no | `.` | Directory the wrapped command runs in. |
 | `session-name` | no | `ci-debug` | Session label (`[A-Za-z0-9_-]+`); the session id derives from it. |
 | `fail-on-command-failure` | no | `"true"` | `'true'`: the action fails when the wrapped command exits non-zero. `'false'`: the failure is reported in the summary/outputs only. Evidence capture, artifact upload, and teardown happen regardless. |

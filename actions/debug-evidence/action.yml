@@ -7,7 +7,7 @@ description: >-
 
 inputs:
   run:
-    description: "Command to execute under instrumentation (bash -c)"
+    description: "Command to execute under instrumentation (bash -e -o pipefail -c, matching workflow-step semantics)"
     required: true
   working-directory:
     description: "Directory the wrapped command runs in"
