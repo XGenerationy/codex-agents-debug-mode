@@ -36,7 +36,7 @@ const {
   readGateChanges,
   scanTouchedSuppressions,
 } = require('../scripts/pr_closeout_repo');
-const { BLOCK_SCALAR_HEADER } = require('./workflow_checks');
+const { BLOCK_SCALAR_HEADER, stripTrailingYamlComment } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
@@ -776,7 +776,15 @@ const yamlAncestorKeyChain = (fileText, targetLine) => {
       // |`) was not recognized as a scalar and its BODY lines were walked as
       // real YAML keys — proving a chain out of inert literal text, i.e.
       // failing OPEN on the exact embedding the guard refuses (audit V7a).
-      if (BLOCK_SCALAR_HEADER.test(line)) return null;
+      // Tested against the COMMENT-STRIPPED line, per the pattern's own
+      // contract at its home: the greedy `\S.*:` prefix otherwise swallows
+      // past a real `#` and matches a `: |`-shaped fragment INSIDE the
+      // trailing comment (`on: # was: |`), refusing a chain that is actually
+      // provable (review V3a — fail-closed noise, but noise that invites
+      // loosening the shared regex). Clean fresh-line quote state is the
+      // strip's default and the only option here: this walk has no
+      // cross-line quote tracking (a known, separately-tracked limitation).
+      if (BLOCK_SCALAR_HEADER.test(stripTrailingYamlComment(line))) return null;
       chain.unshift(match[2] ?? match[3] ?? match[4]);
       indent = match[1].length;
     }

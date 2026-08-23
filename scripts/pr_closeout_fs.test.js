@@ -353,4 +353,23 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
     }),
     /windows_private_file_acl_failed: SIGTERM/,
   );
+  // BACKSTOP DEADLINE (review V2c hardening): spawn's shared timeout issues
+  // TerminateProcess, but 'exit' fires only once the kernel finishes tearing
+  // every thread down — a thread wedged in a non-alertable kernel wait can
+  // defer that indefinitely, and a promise settling only on 'error'/'exit'
+  // would hold its awaiting mint open forever. The reject is the load-bearing
+  // half; the extra kill is best-effort.
+  const wedged = new EventEmitter();
+  let kills = 0;
+  wedged.kill = () => { kills += 1; };
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
+    }),
+    /windows_private_file_acl_failed: deadline/,
+  );
+  assert.equal(kills, 1, 'the deadline still attempts to kill the wedged child');
+  // A late 'exit' after settlement lands on an already-settled promise: a
+  // no-op, never a second settlement or an unhandled rejection.
+  wedged.emit('exit', 0, null);
 });

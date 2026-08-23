@@ -339,6 +339,7 @@ const protectWindowsPrivateFile = (privateFile, {
  */
 const protectWindowsPrivateFileAsync = (privateFile, {
   spawnFn = spawn, platform = process.platform,
+  deadlineMs = PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS + 5_000,
 } = {}) => new Promise((resolve, reject) => {
   if (platform !== 'win32') {
     resolve();
@@ -355,8 +356,28 @@ const protectWindowsPrivateFileAsync = (privateFile, {
     reject(error);
     return;
   }
-  child.once('error', reject);
+  // BACKSTOP DEADLINE, past the shared timeout's own kill: spawn's timeout
+  // initiates TerminateProcess, but 'exit' fires only after the kernel
+  // finishes tearing every thread down — a thread wedged in a non-alertable
+  // kernel wait (hung filter driver, AV) can defer that indefinitely, and a
+  // promise that settles only on 'error'/'exit' would then never settle,
+  // holding its awaiting request open forever. The REJECT is the
+  // load-bearing half (it bounds settlement whatever the child's fate); the
+  // extra kill is best-effort. unref'd so a settled call never holds the
+  // process open; a late 'exit' after this fires is a no-op on the settled
+  // promise (review V2c hardening — the replaced sync variant wedged the
+  // whole event loop in this same scenario).
+  const deadline = setTimeout(() => {
+    try { child.kill(); } catch { /* best effort */ }
+    reject(new Error('windows_private_file_acl_failed: deadline'));
+  }, deadlineMs);
+  deadline.unref?.();
+  child.once('error', (error) => {
+    clearTimeout(deadline);
+    reject(error);
+  });
   child.once('exit', (code, signal) => {
+    clearTimeout(deadline);
     if (code === 0) resolve();
     else reject(new Error(`windows_private_file_acl_failed: ${signal ?? code}`));
   });

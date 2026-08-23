@@ -357,15 +357,16 @@ test('collector boot never runs PowerShell ACL; start applies it in the parent',
   // start routes both DACLs through applyStartWindowsAcls, whose default
   // seams are the real protect helpers; the session log's protect call lives
   // inside it (fail-closed), the salt's beside it (fail-open, audit V2a).
-  assert.match(support, /applyStartWindowsAcls\(\{ projectRoot, relativeLog: mint\.json\.log_file \}\)/);
-  assert.match(support, /protect\(path\.join\(projectRoot, relativeLog\)\)/);
+  assert.match(support, /applyStartWindowsAcls\(\{ projectRoot, relativeLog: mintedLog, expectedIdentity: mintedLogIdentity \?\? null \}\)/);
+  assert.match(support, /const logFile = path\.join\(projectRoot, relativeLog\);/);
+  assert.match(support, /protect\(logFile\)/);
   assert.match(support, /windowsHide:\s*true/);
   // Job-scoped lifecycle: teardown owns this collector, so the shim must
   // disable idle retirement — with the finite default, a wrapped command
   // quiet for its final 15+ minutes had its session retired before `run`'s
   // only capture read, failing a successful job with a counterfeit-collector
   // diagnostic (audit V6a).
-  assert.match(boot, /sessionIdleTimeoutMs\s*=\s*Infinity/);
+  assert.match(boot, /sessionIdleTimeoutMs\s*[:=]\s*Infinity/);
   // One redaction contract: the shim parses DEBUG_REDACT_NAMES through the
   // exported shared parser, never an inline copy — the inline fix once left
   // the CLI under-redacting the same env var (audit V8a).
@@ -405,6 +406,51 @@ test('a salt whose Windows ACL cannot be applied is deleted, never left with inh
     platform: 'linux', protect: () => { throw new Error('never reached off-Windows'); },
   });
   assert.ok(existsSync(saltFile), 'non-Windows stays a no-op');
+});
+
+test('a salt that cannot even be inspected is removed where possible, and the lstat error surfaces unmasked', () => {
+  // The non-ENOENT lstat class (EPERM/EIO/ENOTDIR — AV hold, planted
+  // deny-ACL) means the salt may exist but could not be inspected, let alone
+  // hardened. This branch used to rethrow WITHOUT the unlink, so the
+  // caller's fail-open warning overclaimed a cleanup that never ran (review
+  // V1b): unlink-or-do-not-persist applies to this class too.
+  const unlinked = [];
+  const eperm = Object.assign(new Error('EPERM: operation not permitted, lstat'), { code: 'EPERM' });
+  assert.throws(
+    () => protectWindowsPrivateFileIfPresent('/fake/.debug/project_salt', {
+      platform: 'win32',
+      statFile: () => { throw eperm; },
+      unlink: (file) => unlinked.push(file),
+      protect: () => { throw new Error('protect must never run after a failed lstat'); },
+    }),
+    /EPERM/,
+    'the original lstat error surfaces unmasked',
+  );
+  assert.deepEqual(unlinked, ['/fake/.debug/project_salt'],
+    'the uninspectable salt gets the same best-effort removal as an unprotectable one');
+  // The ENOTDIR shape (a file squatting where .debug should be): the same
+  // condition breaks lstat and unlink alike — the ORIGINAL error still wins.
+  // Seam-injected, because a real `<file>/project_salt` probe is
+  // platform-dependent (Windows reports it as ENOENT, the clean no-op).
+  const enotdir = Object.assign(new Error('ENOTDIR: not a directory, lstat'), { code: 'ENOTDIR' });
+  assert.throws(
+    () => protectWindowsPrivateFileIfPresent('/blocked/.debug/project_salt', {
+      platform: 'win32',
+      statFile: () => { throw enotdir; },
+      unlink: () => { throw Object.assign(new Error('ENOTDIR: not a directory, unlink'), { code: 'ENOTDIR' }); },
+      protect: () => { throw new Error('protect must never run after a failed lstat'); },
+    }),
+    (error) => error === enotdir,
+    'the original lstat error propagates even when the best-effort unlink also fails',
+  );
+  // ENOENT stays a clean no-op: nothing to harden, nothing to remove.
+  const absent = [];
+  protectWindowsPrivateFileIfPresent(path.join(makeTempDir(), 'never-created', 'project_salt'), {
+    platform: 'win32',
+    unlink: (file) => absent.push(file),
+    protect: () => { throw new Error('protect must never run for an absent salt'); },
+  });
+  assert.deepEqual(absent, [], 'an absent salt triggers no unlink attempt');
 });
 
 test('httpRequestJson defaults stay at the tight pre-ACL budgets', () => {
@@ -623,10 +669,49 @@ test('defaultStageFile refuses a short write and leaves no truncated slot behind
   assert.equal(readFileSync(target, 'utf8'), 'twelve bytes', 'the real writer stages the full payload');
 });
 
+test('a close failure fails the stage and the state write alike, and neither leaves its file behind', () => {
+  // A close failure is a flush failure — the bytes may be gone. The previous
+  // shape closed in the finally, where a close throw skipped the !staged
+  // unlink (leaving a truncated 0o444 file for the always() upload) and
+  // masked the original write/verify error (review V2b). Both writers share
+  // the discipline; both are pinned here.
+  const dir = makeTempDir();
+  const target = path.join(dir, 'session.log');
+  let closes = 0;
+  assert.throws(
+    () => defaultStageFile(target, Buffer.from('twelve bytes'), {
+      closeAll: (fd) => {
+        closes += 1;
+        if (closes === 1) throw Object.assign(new Error('EIO: flush failed'), { code: 'EIO' });
+        closeSync(fd);
+      },
+    }),
+    /EIO: flush failed/,
+    'the close error itself is the verdict, never masked by cleanup',
+  );
+  assert.equal(closes, 2, 'the finally still closes the fd so the unlink can succeed on Windows');
+  assert.equal(existsSync(target), false,
+    'unlink-or-do-not-persist: an unflushed stage must not await the always() upload');
+  const outputDir = makeTempDir();
+  let stateCloses = 0;
+  assert.throws(
+    () => writeState(outputDir, { nonce: 'n1', pid: 4242 }, {
+      closeAll: (fd) => {
+        stateCloses += 1;
+        if (stateCloses === 1) throw Object.assign(new Error('EIO: flush failed'), { code: 'EIO' });
+        closeSync(fd);
+      },
+    }),
+    /EIO: flush failed/,
+  );
+  assert.deepEqual(readdirSync(outputDir), [],
+    'no staging temp and no state file survive a failed flush');
+});
+
 test('applyStartWindowsAcls: salt failure warns and continues, session-log failure throws', () => {
   // Two files, two contracts (audit V2a). The salt is fail-open: its protect
-  // helper has already unlinked it on failure, which is the absent-salt
-  // state the collector tolerates (worst case a wrong already_running hint,
+  // helper removes it on failure where possible, and the absent-salt state
+  // is one the collector tolerates (worst case a wrong already_running hint,
   // never authentication) — aborting a whole job over it turned a transient
   // PowerShell hiccup into a hard failure. The minted session log stays
   // fail-closed: its failure must reach the caller's abort.
@@ -641,7 +726,7 @@ test('applyStartWindowsAcls: salt failure warns and continues, session-log failu
     warn: (text) => warned.push(text),
   });
   assert.equal(warned.length, 1, 'the salt failure is reported');
-  assert.match(warned[0], /project_salt ACL failed; the salt was unlinked and this invocation continues/);
+  assert.match(warned[0], /project_salt ACL failed; the salt was removed where possible and this invocation continues without one/);
   assert.match(warned[0], /salt_acl_denied/);
   assert.deepEqual(protects, [path.join(projectRoot, '.debug/session-x.log')],
     'the session log is still protected after a salt failure');
@@ -662,6 +747,76 @@ test('applyStartWindowsAcls: salt failure warns and continues, session-log failu
     protectIfPresent: () => {},
     protect: () => { throw new Error('nothing to protect'); },
     warn: () => {},
+  });
+});
+
+test('applyStartWindowsAcls re-verifies the session log identity after the protect call', () => {
+  // The protect helper re-resolves the path BY NAME in a separate PowerShell
+  // process, so a file swapped between the mint (which stat'ed the creation
+  // handle) and that call returning would receive nothing while a substitute
+  // got the DACL. The mint response carries the creation identity precisely
+  // so this parent can compare — parity with the in-process mint path's
+  // "fail closed rather than trust an unverified file as protected"
+  // (review V2a).
+  const projectRoot = makeTempDir();
+  const minted = { dev: 7, ino: 9 };
+  const base = {
+    projectRoot,
+    relativeLog: '.debug/session-x.log',
+    expectedIdentity: minted,
+    protectIfPresent: () => {},
+    warn: () => { throw new Error('the log contract never warns'); },
+  };
+  // Same file after hardening: dev/ino match, still singly linked.
+  applyStartWindowsAcls({
+    ...base,
+    protect: () => {},
+    statFile: () => ({ dev: 7, ino: 9, nlink: 1 }),
+  });
+  // A swapped file (new inode) must not be trusted as protected.
+  assert.throws(
+    () => applyStartWindowsAcls({
+      ...base,
+      protect: () => {},
+      statFile: () => ({ dev: 7, ino: 10, nlink: 1 }),
+    }),
+    /session log identity changed during ACL hardening; refusing to trust the protected file/,
+  );
+  // A hardlink grown during the window is the classic redirect shape.
+  assert.throws(
+    () => applyStartWindowsAcls({
+      ...base,
+      protect: () => {},
+      statFile: () => ({ dev: 7, ino: 9, nlink: 2 }),
+    }),
+    /session log identity changed during ACL hardening/,
+  );
+  // A log that vanished mid-hardening fails closed with its own message.
+  assert.throws(
+    () => applyStartWindowsAcls({
+      ...base,
+      protect: () => {},
+      statFile: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); },
+    }),
+    /session log vanished during ACL hardening: gone/,
+  );
+  // The check runs strictly AFTER protect: a protect throw wins outright and
+  // the stat seam is never consulted.
+  assert.throws(
+    () => applyStartWindowsAcls({
+      ...base,
+      protect: () => { throw new Error('log_acl_denied'); },
+      statFile: () => { throw new Error('stat must not run when protect already failed'); },
+    }),
+    /log_acl_denied/,
+  );
+  // No expectedIdentity (the CLI path mints in-process and verifies there):
+  // protect alone settles it, the stat seam stays untouched.
+  applyStartWindowsAcls({
+    ...base,
+    expectedIdentity: null,
+    protect: () => {},
+    statFile: () => { throw new Error('no identity was promised, nothing to re-verify'); },
   });
 });
 
@@ -2519,6 +2674,42 @@ test('a session-mint failure kills the collector in start, so nothing is left ho
   assert.equal(requests, 1);
   assert.deepEqual(killed, [4242], 'the mint runs before any state is written, so the collector is unstoppable unless start kills it');
   assert.equal(readState(outputDir), null, 'and no state claims a session that was never minted');
+});
+
+test('a mint that names a log file but omits its identity is refused before any ACL work', async () => {
+  // The post-ACL re-verification compares against the creation identity the
+  // mint ships (review V2a). A mint that omits or malforms it would silently
+  // skip that check — the parent would harden a by-name path with nothing to
+  // prove it is still the minted file — so the omission fails closed here,
+  // ahead of applyStartWindowsAcls, and the collector is killed like any
+  // other mint failure.
+  const mintShapes = [
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log' },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: 9 } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7 } },
+  ];
+  for (const json of mintShapes) {
+    const outputDir = makeTempDir();
+    const child = fakeChild();
+    const killed = [];
+    const starting = startSubcommand({
+      probeAdmission: ADMITTED,
+      inputs: baseInputs(), outputDir, projectRoot: makeTempDir(), env: {},
+      spawnShim: () => child,
+      probeReady: async () => ({ project_hash: 'hash', ready: true }),
+      probeToken: async () => true,
+      request: async () => ({ status: 201, json }),
+      kill: (pid) => { killed.push(pid); },
+      readyTimeoutMs: 5_000,
+    });
+    setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
+      status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
+    })}\n`));
+    await assert.rejects(starting, /session mint returned no usable log-file identity/,
+      `shape must fail closed: ${JSON.stringify(json.log_file_identity)}`);
+    assert.deepEqual(killed, [4242], 'an unusable mint kills the collector like any other mint failure');
+    assert.equal(readState(outputDir), null, 'no state claims the refused session');
+  }
 });
 
 test('start challenges the port occupant before the launch token is ever put on the wire', async () => {
@@ -8994,12 +9185,20 @@ const bashPath = (value) => value.replace(/\\/g, '/');
 const SHELL_TOOLS = 'command -v grep >/dev/null && command -v sed >/dev/null && command -v cut >/dev/null && command -v node >/dev/null';
 const SHELL_AVAILABLE = (() => {
   try {
-    return spawnShell('bash', ['-c', SHELL_TOOLS], { encoding: 'utf8' }).status === 0;
+    if (spawnShell('bash', ['-c', SHELL_TOOLS], { encoding: 'utf8' }).status !== 0) return false;
+    // Newline TRANSPORT, not just tool presence (review ALT1): on a dev box
+    // whose PATH `bash` is the WSL launcher (System32\bash.exe), an embedded
+    // newline in the -c script is mangled in transit (proven on such a box:
+    // both halves of a two-line script ran as one), so every bash-dependent
+    // assertion below would execute a different script than the one written
+    // here — with no diagnostic. Such a box must skip loudly instead.
+    const transit = spawnShell('bash', ['-c', 'echo a\necho b'], { encoding: 'utf8' });
+    return transit.status === 0 && transit.stdout.replace(/\r/g, '') === 'a\nb\n';
   } catch {
     return false;
   }
 })();
-const NO_SHELL = 'no bash with grep/sed/cut/node here; the shipped scripts cannot be executed';
+const NO_SHELL = 'no bash that carries grep/sed/cut/node AND multi-line scripts intact (WSL launcher?); the shipped scripts cannot be executed faithfully';
 
 const STRICT_NONCE = 'abcdef01-2345-6789-abcd-ef0123456789';
 // What a GitHub-hosted runner actually reports: sudo present, and a ptrace mode

@@ -26,12 +26,6 @@ const main = () => {
   const projectRoot = process.argv[2] || process.cwd();
   const port = Number(process.env.DEBUG_PORT || 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return fail('invalid_port');
-  const limits = {};
-  const maxEvents = parsePositiveInt(process.env.DEBUG_ACTION_MAX_EVENTS);
-  const maxBytes = parsePositiveInt(process.env.DEBUG_ACTION_MAX_BYTES);
-  if (maxEvents === null || maxBytes === null) return fail('invalid_limits');
-  if (maxEvents !== undefined) limits.maxEventsPerSession = maxEvents;
-  if (maxBytes !== undefined) limits.maxTotalBytes = maxBytes;
   // This collector is JOB-SCOPED: the action's teardown step owns its
   // lifecycle, so idle retirement adds nothing here — and it actively broke
   // captures: with the default 15-minute budget, a wrapped command whose
@@ -39,8 +33,14 @@ const main = () => {
   // only capture read (the first and only authenticated read happens AFTER
   // the command exits), turning a successful job into exit 3 with a
   // misleading counterfeit-collector diagnostic (audit V6a). Infinity is the
-  // documented explicit opt-out (resolveSessionIdleTimeoutMs).
-  limits.sessionIdleTimeoutMs = Infinity;
+  // documented explicit opt-out (resolveSessionIdleTimeoutMs). Unconditional
+  // — declared in the literal so no reader mistakes it for an env override.
+  const limits = { sessionIdleTimeoutMs: Infinity };
+  const maxEvents = parsePositiveInt(process.env.DEBUG_ACTION_MAX_EVENTS);
+  const maxBytes = parsePositiveInt(process.env.DEBUG_ACTION_MAX_BYTES);
+  if (maxEvents === null || maxBytes === null) return fail('invalid_limits');
+  if (maxEvents !== undefined) limits.maxEventsPerSession = maxEvents;
+  if (maxBytes !== undefined) limits.maxTotalBytes = maxBytes;
   // redactionEnv defaults to { ...process.env } inside createDebugServer, and
   // this shim inherits the full job env from `start` — that inheritance is the
   // redaction guarantee for job secrets (spec Security invariant 3).

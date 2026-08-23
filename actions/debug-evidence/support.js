@@ -25,7 +25,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { canonicalResponderRecord, probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
-const { protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
+const { isSameFileIdentity, protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
 const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
@@ -756,7 +756,7 @@ const validateActionInputs = ({
 // verified against the payload before the commit, so the invariant holds for
 // ANY writer, not merely the one this code happens to call today: a committed
 // action-state.json always parses to the full state.
-const writeState = (outputDir, state, { writeAll = writeFileSync } = {}) => {
+const writeState = (outputDir, state, { writeAll = writeFileSync, closeAll = closeSync } = {}) => {
   mkdirSync(outputDir, { recursive: true });
   const target = path.join(outputDir, STATE_FILE);
   let existing = null;
@@ -779,12 +779,17 @@ const writeState = (outputDir, state, { writeAll = writeFileSync } = {}) => {
     if (stagedBytes !== expectedBytes) {
       throw new Error(`refusing to commit a partially written action state (${stagedBytes} of ${expectedBytes} bytes): ${tempPath}`);
     }
+    // Close INSIDE the try (same discipline as defaultStageFile, review
+    // V2b): a close failure is a flush failure and must both fail the write
+    // and reach the temp-file unlink below — the old finally-side close
+    // skipped the unlink and masked the original error when it threw.
+    closeAll(fd);
     staged = true;
   } finally {
-    // Close before any cleanup: Windows refuses to unlink a file that is
-    // still open, which would strand a half-written staging file.
-    closeSync(fd);
     if (!staged) {
+      // Close before unlink: Windows refuses to unlink a file that is still
+      // open. Guarded so the ORIGINAL error propagates.
+      try { closeAll(fd); } catch { /* already closed */ }
       try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
     }
   }
@@ -1027,12 +1032,22 @@ const defaultSpawnShim = (args, { env }) => spawn(process.execPath, [BOOT_SHIM, 
 // non-Windows CI has no PowerShell to fail with.
 const protectWindowsPrivateFileIfPresent = (privateFile, {
   platform = process.platform, protect = protectWindowsPrivateFile,
+  statFile = lstatSync, unlink = unlinkSync,
 } = {}) => {
   if (platform !== 'win32') return;
   try {
-    lstatSync(privateFile);
+    statFile(privateFile);
   } catch (error) {
     if (error?.code === 'ENOENT') return;
+    // A non-ENOENT lstat failure (EPERM/EIO/ENOTDIR — AV hold, planted
+    // deny-ACL) means the file may exist but could not even be inspected,
+    // let alone hardened. The unlink-or-do-not-persist rule applies to this
+    // class too (review V1b: this branch used to rethrow WITHOUT the unlink,
+    // so the caller's fail-open warning overclaimed a cleanup that never
+    // ran). Best-effort only — the same condition that broke the lstat
+    // usually breaks the unlink — which is why the caller's message must
+    // never assert the removal succeeded.
+    try { unlink(privateFile); } catch { /* best effort cleanup */ }
     throw error;
   }
   try {
@@ -1042,15 +1057,15 @@ const protectWindowsPrivateFileIfPresent = (privateFile, {
     // scripts/debug_server.js): a salt whose owner-only DACL could not be
     // applied must never stay persisted with inherited NTFS read permissions.
     // Unlink exactly this file, then rethrow the ORIGINAL ACL error unmasked.
-    try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+    try { unlink(privateFile); } catch { /* best effort cleanup */ }
     throw error;
   }
 };
 
 // The two files `start` hardens carry DIFFERENT failure contracts, and this
 // helper is where the split lives so a shared catch cannot creep back in
-// (audit V2a): the SALT is fail-open — on failure the helper above has
-// already unlinked it, which is exactly the absent-salt state the collector
+// (audit V2a): the SALT is fail-open — on failure the helper above removes
+// it where possible, and the absent-salt state is one the collector
 // tolerates (readOrCreateProjectSalt: worst case a wrong already_running
 // hint, "never authentication") — so a transient PowerShell failure warns
 // and continues rather than aborting a whole job over a convenience file.
@@ -1061,17 +1076,45 @@ const protectWindowsPrivateFileIfPresent = (privateFile, {
 const applyStartWindowsAcls = ({
   projectRoot,
   relativeLog,
+  expectedIdentity = null,
   protectIfPresent = protectWindowsPrivateFileIfPresent,
   protect = protectWindowsPrivateFile,
+  statFile = lstatSync,
   warn = (text) => process.stderr.write(text),
 }) => {
   try {
     protectIfPresent(path.join(projectRoot, '.debug', 'project_salt'));
   } catch (error) {
-    warn(`debug-evidence-action: start: project_salt ACL failed; the salt was unlinked and this invocation continues without one (already_running hints may disagree): ${error?.message ?? error}\n`);
+    // "removed where possible", never "was unlinked": two of the helper's
+    // failure shapes (a non-ENOENT lstat error; a protect failure whose
+    // best-effort unlink also fails) can leave the salt on disk, and the
+    // warning must not misreport the on-disk state (review V1b). The next
+    // successful start re-hardens or removes a survivor.
+    warn(`debug-evidence-action: start: project_salt ACL failed; the salt was removed where possible and this invocation continues without one (if removal also failed, the salt remains with inherited permissions until the next successful start; already_running hints may disagree): ${error?.message ?? error}\n`);
   }
   if (typeof relativeLog === 'string' && relativeLog.length > 0) {
-    protect(path.join(projectRoot, relativeLog));
+    const logFile = path.join(projectRoot, relativeLog);
+    protect(logFile);
+    // Post-ACL identity re-verification, PARITY WITH THE IN-PROCESS PATH
+    // (scripts/debug_server.js's mint: "Fail closed rather than trust an
+    // unverified file as protected"): the protect helper re-resolves the
+    // path BY NAME in a separate PowerShell process, so a file swapped
+    // between the mint (which stat'ed the creation handle) and that call
+    // returning would receive nothing while a substitute got the DACL.
+    // The mint response carries the creation identity precisely so this
+    // parent can compare (review V2a); a mismatch throws, and the caller's
+    // abort kills the collector — the session-log contract is fail-closed.
+    if (expectedIdentity) {
+      let postInfo;
+      try {
+        postInfo = statFile(logFile);
+      } catch (error) {
+        throw new Error(`session log vanished during ACL hardening: ${error?.message ?? error}`);
+      }
+      if (!isSameFileIdentity(expectedIdentity, postInfo)) {
+        throw new Error('session log identity changed during ACL hardening; refusing to trust the protected file');
+      }
+    }
   }
 };
 
@@ -1325,8 +1368,19 @@ const startSubcommand = async ({
   // blocked POST /session (HTTP 500, Validate 31973907121). Only the session
   // log can abort here — applyStartWindowsAcls swallows-and-warns the salt's
   // failure by contract (audit V2a).
+  //
+  // A minted log MUST arrive with its creation identity: it is what the
+  // post-ACL re-verification compares against (parity with the in-process
+  // mint path — review V2a), and a mint that omits it would silently skip
+  // that check, so the omission fails closed here instead.
+  const mintedLog = mint.json.log_file;
+  const mintedLogIdentity = mint.json.log_file_identity;
+  if (typeof mintedLog === 'string' && mintedLog.length > 0
+    && (typeof mintedLogIdentity?.dev !== 'number' || typeof mintedLogIdentity?.ino !== 'number')) {
+    throw abort('session mint returned no usable log-file identity');
+  }
   try {
-    applyStartWindowsAcls({ projectRoot, relativeLog: mint.json.log_file });
+    applyStartWindowsAcls({ projectRoot, relativeLog: mintedLog, expectedIdentity: mintedLogIdentity ?? null });
   } catch (error) {
     throw abort(`Windows session-log ACL failed: ${error?.message ?? error}`);
   }
@@ -1480,11 +1534,14 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
     return 3;
   }
   if (!state) {
-    // The pid is only ever published AFTER writeState succeeded, so this
-    // combination cannot arise legitimately within one invocation — it IS
-    // tamper evidence. Refuse the bare-pid signal (reuse risk above) and
-    // fail the step so the tampering surfaces.
-    process.stderr.write('debug-evidence-action: teardown: action-state.json is missing although start published a collector pid; refusing to signal a bare pid (a reused pid would hit an unrelated process). A surviving collector is reaped by runner job finalization.\n');
+    // The pid is only ever published AFTER writeState succeeded, so within
+    // one invocation this combination arises only when something removed the
+    // state file after start — tampering by the wrapped command, or (rarely)
+    // external cleanup of a custom output-dir between start and teardown.
+    // Either way the file no longer corroborates the pid: refuse the
+    // bare-pid signal (reuse risk above) and fail the step so the removal
+    // surfaces.
+    process.stderr.write('debug-evidence-action: teardown: action-state.json is missing although start published a collector pid; refusing to signal a bare pid (a reused pid would hit an unrelated process). Either the wrapped command tampered with the state file or external cleanup removed the output directory; a surviving collector is reaped by runner job finalization.\n');
     return 3;
   }
   if (rejectForeignNonce(state, env, 'teardown')) return 3;
@@ -1629,7 +1686,7 @@ const defaultRenderReport = (sessionText, sessionId, { caveats = [], capturedAt 
 // in-memory payload leaves the process, and injecting it is how a test can
 // prove the digests describe the payload rather than whatever ended up on
 // disk.
-const defaultStageFile = (filePath, bytes, { writeAll = writeFileSync } = {}) => {
+const defaultStageFile = (filePath, bytes, { writeAll = writeFileSync, closeAll = closeSync } = {}) => {
   try { unlinkSync(filePath); } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
@@ -1652,13 +1709,22 @@ const defaultStageFile = (filePath, bytes, { writeAll = writeFileSync } = {}) =>
     if (stagedBytes !== expectedBytes) {
       throw new Error(`refusing truncated staged evidence (${stagedBytes} of ${expectedBytes} bytes): ${filePath}`);
     }
+    // Close INSIDE the try, as the last step before the flag: a close
+    // failure is a flush failure — the bytes may be gone — so it must fail
+    // the stage AND reach the unlink below. The previous shape closed in
+    // the finally, where a close throw skipped the !staged unlink (leaving
+    // a truncated 0o444 file for the always() upload) and masked the
+    // original write/verify error (review V2b).
+    closeAll(fd);
     staged = true;
   } finally {
-    // Close before any cleanup (Windows refuses to unlink an open file), and
-    // never leave a truncated slot behind: unlink-or-do-not-persist, exactly
-    // as writeState treats its staging temp.
-    closeSync(fd);
     if (!staged) {
+      // Close before unlink (Windows refuses to unlink an open file); EBADF
+      // from a close that already ran in the try is swallowed — nothing can
+      // reopen the fd in this synchronous window. Each cleanup is guarded so
+      // the ORIGINAL error is what propagates: unlink-or-do-not-persist,
+      // exactly as writeState treats its staging temp.
+      try { closeAll(fd); } catch { /* already closed */ }
       try { unlinkSync(filePath); } catch { /* best-effort cleanup */ }
     }
   }

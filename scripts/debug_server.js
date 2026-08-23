@@ -1209,6 +1209,11 @@ const createDebugServer = ({
   // inactivity. A subsequent /log therefore gets unknown_session instead of
   // reviving an old bearer capability.
   const retireInactiveSessions = () => {
+    // Infinity is the documented retirement opt-out (job-scoped collectors,
+    // resolveSessionIdleTimeoutMs): the compare below could never retire
+    // anything, so say so here instead of running a can-never-trigger loop
+    // on every request (review E1 — intent documentation more than cost).
+    if (sessionIdleTimeoutMs === Infinity) return;
     const expiration = Date.now() - sessionIdleTimeoutMs;
     for (const [sessionId, session] of sessions) {
       if (!session.provisional && session.lastActivityAt <= expiration) {
@@ -1523,6 +1528,18 @@ const createDebugServer = ({
           session_token: sessionToken,
           client_id: projectHash,
           log_file: `.debug/${fileName}`,
+          // The log file's creation identity (from the O_EXCL handle's stat,
+          // the same reading logFileIdentity keeps server-side). On the
+          // deferred path the debug-evidence `start` parent applies the
+          // Windows DACL by NAME after this response returns; without these
+          // fields it had nothing to re-verify against, so a file swapped
+          // during that PowerShell call got the DACL landed on a substitute
+          // undetected — the exact unverified-protect the in-process path
+          // above fails closed on (review V2a).
+          log_file_identity: {
+            dev: sessions.get(sessionId).logFileIdentity.dev,
+            ino: sessions.get(sessionId).logFileIdentity.ino,
+          },
         });
         return;
       }

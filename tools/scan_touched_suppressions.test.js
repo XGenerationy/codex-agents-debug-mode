@@ -940,6 +940,39 @@ test('collectContentRemovals STILL flags a workflows: expansion inside a top-lev
   }
 });
 
+test('collectContentRemovals exempts a proven expansion whose on: line carries a scalar-shaped trailing comment', async () => {
+  // The chain prover tests BLOCK_SCALAR_HEADER against the COMMENT-STRIPPED
+  // ancestor line, per the pattern's contract at its home: the greedy
+  // `\S.*:` prefix otherwise swallows past the real `#` and matches a
+  // `: |`-shaped fragment INSIDE the comment, misreading a plain `on:` key
+  // as a scalar header and refusing a chain that is actually provable
+  // (review V3a — fail-closed noise, but noise that invites loosening the
+  // shared regex). The real-header-with-comment direction (`"on": &a |- #
+  // cmt` still refused) is pinned in the scalar-embedding test above.
+  for (const onKey of ['on: # was: |', '"on": # was: >-']) {
+    const before = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const after = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    assert.deepEqual(
+      collectContentRemovals(diff, { readFile: () => after }),
+      [],
+      `a trailing comment on ${JSON.stringify(onKey)} is not a block-scalar header and must not refuse the chain`,
+    );
+  }
+});
+
 test('collectContentRemovals STILL flags a workflows: expansion embedded in a run: | block scalar', async () => {
   // A raw-text parent scan sees the scalar's own `workflow_run:`-shaped line
   // as the nearest less-indented key and would exempt the edit. The ancestor

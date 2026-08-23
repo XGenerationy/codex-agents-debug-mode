@@ -741,6 +741,17 @@ test('requires the launch token and returns only an opaque relative log path', a
     assert.match(authorized.body.session_token, /^[A-Za-z0-9_-]{43}$/);
     assert.match(authorized.body.log_file, /^\.debug\/debug-[a-z0-9-]+\.log$/);
     assert.equal(path.isAbsolute(authorized.body.log_file), false);
+    // The mint carries the log's creation identity (dev/ino from the O_EXCL
+    // handle's stat) so the deferred debug-evidence `start` parent can
+    // re-verify the file it hardens BY NAME is still the file this server
+    // created — without it a swap during the PowerShell ACL call went
+    // undetected (review V2a).
+    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file));
+    assert.deepEqual(
+      authorized.body.log_file_identity,
+      { dev: mintedLog.dev, ino: mintedLog.ino },
+      'the response identity must be the created file, not a placeholder',
+    );
     assert.equal(JSON.stringify(authorized.body).includes(projectRoot), false);
   } finally {
     await close(server);

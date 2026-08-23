@@ -827,5 +827,14 @@ const hasTopLevelPermissions = (content) => {
 // headers (`"on": &a |`), so a block scalar's BODY lines were walked as real
 // YAML keys and could prove an on->workflow_run chain out of inert literal
 // text — the exemption failed OPEN on the exact embedding shape its guard
-// existed to refuse (audit V7a). One header pattern, one contract.
-module.exports = { BLOCK_SCALAR_HEADER, findUnpinnedUses, hasTopLevelPermissions };
+// existed to refuse (audit V7a). stripTrailingYamlComment travels WITH it:
+// the pattern's own contract (see its usage above) is that the greedy
+// `\S.*:` prefix must only ever run on comment-stripped text, or a trailing
+// comment containing a `: |`-shaped fragment false-matches as a header
+// (review V3a). One header pattern, one contract — including the strip.
+module.exports = {
+  BLOCK_SCALAR_HEADER,
+  findUnpinnedUses,
+  hasTopLevelPermissions,
+  stripTrailingYamlComment,
+};
