@@ -4,7 +4,7 @@ const assert = require('node:assert');
 const { createHash, createPublicKey, generateKeyPairSync, sign } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const {
-  appendFileSync, closeSync, constants, existsSync, openSync, readFileSync, readdirSync,
+  appendFileSync, closeSync, constants, existsSync, lstatSync, openSync, readFileSync, readdirSync,
   unlinkSync, utimesSync, writeFileSync, writeSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, chmodSync,
 } = require('node:fs');
 const http = require('node:http');
@@ -358,6 +358,12 @@ test('collector boot never runs PowerShell ACL; start applies it in the parent',
   // seams are the real protect helpers; the session log's protect call lives
   // inside it (fail-closed), the salt's beside it (fail-open, audit V2a).
   assert.match(support, /applyStartWindowsAcls\(\{ projectRoot, relativeLog: mintedLog, expectedIdentity: mintedLogIdentity \?\? null \}\)/);
+  // The post-ACL comparison must call the PROTECTED predicate, not the lax
+  // one: with the lax predicate the birth term the mint now ships is never
+  // consulted, and the weaker check reads exactly like the stronger one.
+  assert.match(support, /isSameProtectedFileIdentity\(expectedIdentity, postInfo\)/);
+  assert.equal(support.includes('isSameFileIdentity('), false,
+    'the lax predicate must not reappear on the post-ACL path');
   assert.match(support, /const logFile = path\.join\(projectRoot, relativeLog\);/);
   assert.match(support, /protect\(logFile\)/);
   assert.match(support, /windowsHide:\s*true/);
@@ -759,7 +765,7 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
   // "fail closed rather than trust an unverified file as protected"
   // (review V2a).
   const projectRoot = makeTempDir();
-  const minted = { dev: 7, ino: 9 };
+  const minted = { dev: 7, ino: 9, birthtimeMs: 1000 };
   const base = {
     projectRoot,
     relativeLog: '.debug/session-x.log',
@@ -771,14 +777,14 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
   applyStartWindowsAcls({
     ...base,
     protect: () => {},
-    statFile: () => ({ dev: 7, ino: 9, nlink: 1 }),
+    statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 1000 }),
   });
   // A swapped file (new inode) must not be trusted as protected.
   assert.throws(
     () => applyStartWindowsAcls({
       ...base,
       protect: () => {},
-      statFile: () => ({ dev: 7, ino: 10, nlink: 1 }),
+      statFile: () => ({ dev: 7, ino: 10, nlink: 1, birthtimeMs: 1000 }),
     }),
     /session log identity changed during ACL hardening; refusing to trust the protected file/,
   );
@@ -787,10 +793,31 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
     () => applyStartWindowsAcls({
       ...base,
       protect: () => {},
-      statFile: () => ({ dev: 7, ino: 9, nlink: 2 }),
+      statFile: () => ({ dev: 7, ino: 9, nlink: 2, birthtimeMs: 1000 }),
     }),
     /session log identity changed during ACL hardening/,
   );
+  // A recreate that landed on the SAME inode is invisible to dev/ino/nlink —
+  // the POSIX shape (tmpfs hands a freed ino to the next file created in the
+  // directory). The creation time is what separates the two files, and this
+  // assertion is the only thing standing between the deferred path and the
+  // lax predicate it used to call.
+  assert.throws(
+    () => applyStartWindowsAcls({
+      ...base,
+      protect: () => {},
+      statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 5000 }),
+    }),
+    /session log identity changed during ACL hardening; refusing to trust the protected file/,
+  );
+  // An identity with no usable birth time (0 — a mount that records none)
+  // still hardens: the term is skipped, never failed.
+  applyStartWindowsAcls({
+    ...base,
+    expectedIdentity: { dev: 7, ino: 9, birthtimeMs: 0 },
+    protect: () => {},
+    statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 1000 }),
+  });
   // A log that vanished mid-hardening fails closed with its own message.
   assert.throws(
     () => applyStartWindowsAcls({
@@ -2687,6 +2714,15 @@ test('a mint that names a log file but omits its identity is refused before any 
     { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log' },
     { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: 9 } },
     { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7 } },
+    // birthtimeMs is held to the same standard as dev/ino: absent, wrong
+    // type, and the JSON `null` a non-finite number serializes to all fail
+    // closed. Without these rows a dropped field would silently downgrade the
+    // post-ACL comparison to dev/ino — the shared predicate skips its birth
+    // term when either side is falsy, so the weaker check reads exactly like
+    // the stronger one.
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9 } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9, birthtimeMs: '1000' } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9, birthtimeMs: null } },
   ];
   for (const json of mintShapes) {
     const outputDir = makeTempDir();
@@ -2709,6 +2745,52 @@ test('a mint that names a log file but omits its identity is refused before any 
       `shape must fail closed: ${JSON.stringify(json.log_file_identity)}`);
     assert.deepEqual(killed, [4242], 'an unusable mint kills the collector like any other mint failure');
     assert.equal(readState(outputDir), null, 'no state claims the refused session');
+  }
+});
+
+test('a complete mint identity hardens the log and starts, including on a birth-time-less filesystem', async () => {
+  // The negative table above only proves REJECTION, and the shared MINTED
+  // fixture ships no log_file at all, so the identity guard is short-circuited
+  // on every other start test. Without this case an over-strict clause
+  // (rejecting a legitimate 0) or a bare `===` in the shared predicate would
+  // ship with the whole suite green. 0 is what Node reports for birthtimeMs on
+  // mounts that record none (many tmpfs/overlayfs/NFS): it must START.
+  for (const wireBirth of ['real', 0]) {
+    const outputDir = makeTempDir();
+    const projectRoot = makeTempDir();
+    mkdirSync(path.join(projectRoot, '.debug'), { recursive: true });
+    const relativeLog = '.debug/debug-ci-debug-abc.log';
+    writeFileSync(path.join(projectRoot, relativeLog), '');
+    const real = lstatSync(path.join(projectRoot, relativeLog));
+    const child = fakeChild();
+    const killed = [];
+    const starting = startSubcommand({
+      probeAdmission: ADMITTED,
+      inputs: baseInputs(), outputDir, projectRoot, env: {},
+      spawnShim: () => child,
+      probeReady: async () => ({ project_hash: 'hash', ready: true }),
+      probeToken: async () => true,
+      request: async () => ({
+        status: 201,
+        json: {
+          ...MINTED.json,
+          log_file: relativeLog,
+          log_file_identity: {
+            dev: real.dev,
+            ino: real.ino,
+            birthtimeMs: wireBirth === 'real' ? real.birthtimeMs : 0,
+          },
+        },
+      }),
+      kill: (pid) => { killed.push(pid); },
+      readyTimeoutMs: 5_000,
+    });
+    setImmediate(() => child.stdout.emit('data', `${JSON.stringify({
+      status: 'started', port: 8787, pid: 4242, project_hash: 'hash', launch_token: 'x'.repeat(43), verify_key: VERIFY_KEY_B64,
+    })}\n`));
+    assert.equal(await starting, 0, `a well-formed identity must start (birthtimeMs: ${wireBirth})`);
+    assert.deepEqual(killed, [], 'a well-formed identity is not a mint failure');
+    assert.equal(readState(outputDir).pid, 4242);
   }
 });
 

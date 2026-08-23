@@ -25,7 +25,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { canonicalResponderRecord, probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
-const { isSameFileIdentity, protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
+const { isSameProtectedFileIdentity, protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
 const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
@@ -1104,6 +1104,21 @@ const applyStartWindowsAcls = ({
     // The mint response carries the creation identity precisely so this
     // parent can compare (review V2a); a mismatch throws, and the caller's
     // abort kills the collector — the session-log contract is fail-closed.
+    //
+    // WHAT THE COMPARISON PROVES, STATED HONESTLY: on Windows the ino term is
+    // what rejects the recreate (a reused MFT record comes back with an
+    // incremented sequence number, moving the reference by 2**48) — though it
+    // is a float64 compare, so it rejects that SHAPE rather than proving
+    // sameness in general; see isSameFileIdentity's own note. The birthtimeMs
+    // term the shared predicate adds is the POSIX inode-reuse layer (tmpfs
+    // hands a freed ino straight to the next file; the successor's creation
+    // time is its own) and proves nothing on NTFS, where file tunneling gives
+    // a same-name recreate the original's creation time for the default 15s
+    // tunnel window and the owner can set it outright. This comparison runs on
+    // EVERY platform — only protect() above is win32-gated — which is where
+    // the birth term earns its place. The term is skipped when either side
+    // reports no birth time (0 on mounts that record none), so it can never
+    // turn a healthy start red.
     if (expectedIdentity) {
       let postInfo;
       try {
@@ -1111,7 +1126,7 @@ const applyStartWindowsAcls = ({
       } catch (error) {
         throw new Error(`session log vanished during ACL hardening: ${error?.message ?? error}`);
       }
-      if (!isSameFileIdentity(expectedIdentity, postInfo)) {
+      if (!isSameProtectedFileIdentity(expectedIdentity, postInfo)) {
         throw new Error('session log identity changed during ACL hardening; refusing to trust the protected file');
       }
     }
@@ -1373,10 +1388,22 @@ const startSubcommand = async ({
   // post-ACL re-verification compares against (parity with the in-process
   // mint path — review V2a), and a mint that omits it would silently skip
   // that check, so the omission fails closed here instead.
+  //
+  // birthtimeMs is REQUIRED to be present and finite, and 0 is legitimate:
+  // Number.isFinite(0) is true, so a mount that records no birth time still
+  // starts, while an absent field, a string, and the JSON `null` that a
+  // non-finite number serializes to all fail closed here rather than silently
+  // degrading the re-verification to dev/ino — the shared predicate SKIPS its
+  // birth term when either side is falsy, so a missing field would read as a
+  // stronger check than it is. Version skew cannot produce the absent shape:
+  // collector_boot.js requires the sibling scripts/debug_server.js from THIS
+  // checkout, and start always spawns its own shim (a pre-existing listener
+  // fails the handshake with port_in_use; it is never adopted).
   const mintedLog = mint.json.log_file;
   const mintedLogIdentity = mint.json.log_file_identity;
   if (typeof mintedLog === 'string' && mintedLog.length > 0
-    && (typeof mintedLogIdentity?.dev !== 'number' || typeof mintedLogIdentity?.ino !== 'number')) {
+    && (typeof mintedLogIdentity?.dev !== 'number' || typeof mintedLogIdentity?.ino !== 'number'
+      || !Number.isFinite(mintedLogIdentity?.birthtimeMs))) {
     throw abort('session mint returned no usable log-file identity');
   }
   try {
