@@ -362,12 +362,24 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
   const wedged = new EventEmitter();
   let kills = 0;
   wedged.kill = () => { kills += 1; };
-  await assert.rejects(
-    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
-      platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
-    }),
-    /windows_private_file_acl_failed: deadline/,
-  );
+  // The deadline timer is unref'd BY DESIGN (production callers hold a live
+  // server handle, and a settled call must never hold the process open), so
+  // in this bare test process it must not be the loop's ONLY handle: with
+  // nothing else referenced, Node 20/22 drain the event loop before the
+  // 20ms deadline fires and the runner cancels the still-pending test
+  // (cancelledByParent — Validate run 32642837205). Hold one referenced
+  // timer across the await so the loop survives to the deadline.
+  const keepAlive = setTimeout(() => {}, 60_000);
+  try {
+    await assert.rejects(
+      protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+        platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
+      }),
+      /windows_private_file_acl_failed: deadline/,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
   assert.equal(kills, 1, 'the deadline still attempts to kill the wedged child');
   // A late 'exit' after settlement lands on an already-settled promise: a
   // no-op, never a second settlement or an unhandled rejection.
