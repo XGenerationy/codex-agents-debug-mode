@@ -86,12 +86,23 @@ Every default below is the literal default in [`action.yml`](action.yml).
 | `artifact-name` | no | `debug-evidence` | Uploaded evidence artifact name. |
 | `node-version` | no | `24` | Node.js version for the collector and renderer. |
 | `port` | no | `8787` | Collector port (loopback only). Self-hosted runners sharing a host must pick distinct ports. |
-| `redact-names` | no | `""` | Comma-separated extra env-var names to always redact (extends `DEBUG_REDACT_NAMES`). |
+| `redact-names` | no | `""` | Comma- or whitespace-separated extra env-var names to always redact (extends `DEBUG_REDACT_NAMES`). |
 | `max-events` | no | `""` | Per-session event limit override (collector default 2000). |
 | `max-bytes` | no | `""` | Total evidence byte limit override (collector default 16MB). |
 | `hypothesis-id` | no | `""` | Optional: when set, the action posts one status `OPEN` hypothesis line (a launch-token capability the wrapped command does not hold) and injects `DEBUG_HYPOTHESIS_ID` into the wrapped command's environment. The action never posts any other status — verdicts stay with you. |
 | `hypothesis-title` | no | `""` | Optional title for the hypothesis line; ignored without `hypothesis-id`. |
 | `evidence-trust` | no | `strict` | `strict` refuses to run your command unless this host positively establishes the in-process boundary the evidence depends on; `best-effort` runs anyway and labels the result. See [Evidence trust](#evidence-trust-strict-and-best-effort). |
+
+> **Release note — `run` shell semantics.** The wrapped command executes under
+> `bash --noprofile --norc -e -o pipefail -c`, the same semantics an ordinary
+> `shell: bash` workflow step gets. This is a deliberate behavior change from
+> the earlier bare `bash -c`, and it is **breaking** for inputs that relied on
+> last-command status: `failing-step; cleanup` now stops at (and reports) the
+> failing step, and a failing producer in a pipeline is no longer laundered by
+> a succeeding consumer. Scripts that want the old tolerance must say so
+> explicitly (`failing-step || true`), exactly as they would in a workflow
+> step. Any future relaxation of these flags is itself a semantics change and
+> gets the same treatment here.
 
 Input validation is fail-closed and happens in `Start collector`, before the collector
 is booted and before your command exists. A rejected input is an **exit 1** with an

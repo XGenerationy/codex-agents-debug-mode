@@ -1449,17 +1449,23 @@ const startSubcommand = async ({
 
 const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill }) => {
   if (requireInvocationNonce(env, 'teardown')) return 3;
-  // Kill authority comes ONLY from runner-memory channels: the pid from
-  // start's pre-command step output (DEBUG_ACTION_COLLECTOR_PID) plus the
-  // invocation nonce already validated above. The state file is same-user
-  // writable by the wrapped command, so it is DIAGNOSTIC ONLY and must never
-  // be able to VETO the kill: gating on it let a deleted action-state.json
-  // return 0 ("nothing to tear down") and a rewritten nonce return 3, both
-  // without stopping a collector whose trustworthy pid this function was
-  // holding at that very moment (audit V4b). The pid is only ever published
-  // AFTER writeState succeeded, so "env pid present, state missing" cannot
-  // arise legitimately within one invocation — its appearance IS the
-  // tamper evidence.
+  // The pid comes ONLY from start's pre-command step output
+  // (DEBUG_ACTION_COLLECTOR_PID), never from action-state.json: the wrapped
+  // command can rewrite the state file, it cannot change what the runner
+  // already parsed into memory. But the state file still GATES the kill,
+  // deliberately: a PID is a locator, not a process identity. A wrapped
+  // command that killed the collector itself, waited for the OS to reuse
+  // the pid, and then deleted or nonce-rewrote the state file would turn an
+  // ungated kill into a signal aimed at an unrelated same-user process
+  // (Codex, audit-fix-round review — the kill-before-judge shape shipped
+  // briefly and was reverted for exactly this). The cost of the gate is
+  // that the same actor can VETO the stop instead (audit V4b); that is the
+  // lesser harm, because the runner's job finalization reaps a surviving
+  // tracked collector (action.yml documents the backstop) while a mis-aimed
+  // kill has none. Both tamper shapes still exit 3 with the evidence named.
+  // Binding a true process identity — creation time captured at spawn and
+  // carried in a runner-memory channel — is the future fix that would allow
+  // killing safely without the state gate.
   const rawPid = env.DEBUG_ACTION_COLLECTOR_PID;
   const pid = Number.parseInt(rawPid, 10);
   const hasPid = Number.isInteger(pid) && pid >= 1 && String(pid) === String(rawPid).trim();
@@ -1473,21 +1479,22 @@ const teardownSubcommand = ({ outputDir, env = process.env, kill = process.kill 
     process.stderr.write('debug-evidence-action: teardown: no usable collector pid arrived in DEBUG_ACTION_COLLECTOR_PID (start\'s collector-pid step output); action-state.json is diagnostic only and cannot authorize a kill.\n');
     return 3;
   }
-  // Kill FIRST, judge state after: the stop must happen regardless of what
-  // the (attacker-writable) state file claims.
-  try {
-    kill(pid);
-  } catch (error) {
-    if (error?.code !== 'ESRCH') { // already gone — success, not a leak
-      process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${pid}: ${error?.code ?? error}\n`);
-      return 3;
-    }
-  }
   if (!state) {
-    process.stderr.write('debug-evidence-action: teardown: action-state.json is missing although start published a collector pid; the collector was stopped from the step output. A same-user process removed or replaced the state file.\n');
+    // The pid is only ever published AFTER writeState succeeded, so this
+    // combination cannot arise legitimately within one invocation — it IS
+    // tamper evidence. Refuse the bare-pid signal (reuse risk above) and
+    // fail the step so the tampering surfaces.
+    process.stderr.write('debug-evidence-action: teardown: action-state.json is missing although start published a collector pid; refusing to signal a bare pid (a reused pid would hit an unrelated process). A surviving collector is reaped by runner job finalization.\n');
     return 3;
   }
   if (rejectForeignNonce(state, env, 'teardown')) return 3;
+  try {
+    kill(pid);
+  } catch (error) {
+    if (error?.code === 'ESRCH') return 0; // already gone — success, not a leak
+    process.stderr.write(`debug-evidence-action: teardown: failed to stop collector pid ${pid}: ${error?.code ?? error}\n`);
+    return 3;
+  }
   return 0;
 };
 

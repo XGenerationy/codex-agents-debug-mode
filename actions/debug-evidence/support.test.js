@@ -536,13 +536,17 @@ test('teardown refuses when the start-output pid is absent even if state records
   assert.match(written, /no usable collector pid arrived in DEBUG_ACTION_COLLECTOR_PID/);
 });
 
-test('a deleted state file cannot veto teardown: the step-output pid is killed anyway', async () => {
-  // The wrapped command owns the output-dir's filesystem. Gating the kill on
-  // readState let `rm action-state.json` turn teardown into a green no-op
-  // while the collector lived on (audit V4b). The pid is only ever published
-  // AFTER writeState succeeded, so env-pid-present-without-state cannot
-  // arise legitimately — it IS the tamper evidence, and the kill must
-  // proceed from the runner-memory channel alone.
+test('a deleted state file is tamper evidence, never a bare-pid kill (pid reuse)', async () => {
+  // The pid is only ever published AFTER writeState succeeded, so
+  // env-pid-present-without-state cannot arise legitimately — it IS tamper
+  // evidence and must exit 3, never the old silent 0 (audit V4b). But the
+  // signal is REFUSED: a pid is a locator, not an identity, and a wrapped
+  // command that killed the collector itself, waited for pid reuse, and
+  // deleted the state file would aim an ungated kill at an unrelated
+  // same-user process (Codex, audit-fix-round review; the kill-before-judge
+  // shape shipped briefly and was reverted for exactly this). The veto is
+  // the lesser harm — runner job finalization reaps a surviving collector,
+  // a mis-aimed kill has no backstop.
   const outputDir = makeTempDir();
   const killed = [];
   const { written } = await captureStderr(() => {
@@ -552,11 +556,16 @@ test('a deleted state file cannot veto teardown: the step-output pid is killed a
       kill: (pid) => killed.push(pid),
     }), 3, 'tamper evidence is surfaced as a failure, never a silent success');
   });
-  assert.deepEqual(killed, [4242], 'the collector is stopped regardless of what the state file claims');
+  assert.deepEqual(killed, [], 'no bare-pid signal: a reused pid would hit an unrelated process');
   assert.match(written, /action-state\.json is missing although start published a collector pid/);
+  assert.match(written, /refusing to signal a bare pid/);
 });
 
-test('a foreign-nonce state file cannot veto teardown either: kill first, judge state after', async () => {
+test('a foreign-nonce state file also refuses the kill and reports, exactly as before', async () => {
+  // Same identity reasoning as the deleted-state case: a nonce-rewritten
+  // state file no longer corroborates that the published pid still names
+  // this invocation's collector, so the signal is refused and the tampering
+  // exits 3 (rejectForeignNonce reports the mismatch).
   const outputDir = makeTempDir();
   writeState(outputDir, { nonce: 'stranger', pid: 1111 });
   const killed = [];
@@ -565,10 +574,9 @@ test('a foreign-nonce state file cannot veto teardown either: kill first, judge 
       outputDir,
       env: { DEBUG_ACTION_INVOCATION_NONCE: 'n1', DEBUG_ACTION_COLLECTOR_PID: '4242' },
       kill: (pid) => killed.push(pid),
-    }), 3, 'the foreign state is still reported as a refusal');
+    }), 3, 'the foreign state is reported as a refusal');
   });
-  assert.deepEqual(killed, [4242],
-    'a rewritten nonce reports, but the step-output pid is signalled regardless (audit V4b)');
+  assert.deepEqual(killed, [], 'no signal on a nonce that no longer corroborates the pid');
 });
 
 test('the wrapped command runs under errexit and pipefail, matching a bare workflow step', () => {
