@@ -1050,6 +1050,62 @@ test('collectContentRemovals STILL flags a workflows: expansion inside a multi-l
         '',
       ],
     },
+    // A tag (`!!str`) or anchor (`&v`) before the opening quote is still a
+    // quoted scalar — YAML forbids a plain scalar from BEGINNING with either
+    // indicator at a node-start position, so the token always introduces the
+    // node that follows (PyYAML verified: each variant resolves
+    // workflow_run to one plain string). walkQuoteState previously treated
+    // `!`/`&` as ordinary content and cleared quote-open context, so the
+    // opener went unrecognized, the content lines walked as real keys, and
+    // the exemption failed OPEN on exactly these spellings (Codex rescue
+    // 2026-08-23 — the tag/anchor analogue of the V7a anchored/tagged
+    // block-scalar headers).
+    {
+      label: 'tagged quote opener (workflow_run: !!str \'completed)',
+      lines: (list) => [
+        'on:',
+        "  workflow_run: !!str 'completed",
+        `    workflows: ${list}`,
+        "    tail'",
+        '',
+      ],
+    },
+    {
+      label: 'anchored quote opener (workflow_run: &value \'completed)',
+      lines: (list) => [
+        'on:',
+        "  workflow_run: &value 'completed",
+        `    workflows: ${list}`,
+        "    tail'",
+        '',
+      ],
+    },
+    {
+      label: 'anchor-plus-tag quote opener',
+      lines: (list) => [
+        'on:',
+        "  workflow_run: &v !!str 'completed",
+        `    workflows: ${list}`,
+        "    tail'",
+        '',
+      ],
+    },
+    // The comment-strip interaction: the `#` here is CONTENT of the tagged
+    // open scalar, not a comment, so the strip must leave the line intact
+    // (and the carryover must mark every following line as quoted content).
+    // With the broken walker the strip discarded ` # fake: |` — the very
+    // text whose accidental BLOCK_SCALAR_HEADER match previously refused
+    // this chain — so c7612f1 alone turned this embedding fail-OPEN.
+    {
+      label: 'tagged opener whose scalar content contains a comment-shaped fragment',
+      lines: (list) => [
+        "on: !!str 'completed # fake: |",
+        '  workflow_run:',
+        `    workflows: ${list}`,
+        "  tail'",
+        '',
+      ],
+    },
   ];
   for (const { label, lines } of embeddings) {
     const before = lines('["Validate", "Closeout preview"]').join('\n');
@@ -1070,22 +1126,27 @@ test('collectContentRemovals exempts a proven expansion below a CLOSED multi-lin
   // the walk actually visits starting outside any quote, so the chain must
   // still prove and the expansion must stay exempt. Refusing here would be
   // the over-broad "any quote anywhere in the file" reading, which this
-  // pins against.
-  const quoted = (list) => [
-    "name: 'My",
-    "  workflow'",
-    'on:',
-    '  workflow_run:',
-    `    workflows: ${list}`,
-    '    types: [completed]',
-    '',
-  ];
-  const before = quoted('["Validate", "Closeout preview"]').join('\n');
-  const after = quoted('["Validate", "Closeout preview", "Debug evidence demo"]').join('\n');
-  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
-  assert.deepEqual(
-    collectContentRemovals(diff, { readFile: () => after }),
-    [],
-    'a closed quoted scalar above on: must not refuse a genuinely provable chain',
-  );
+  // pins against. The anchored spelling pins the same direction for the
+  // tag/anchor-aware walker: recognizing `&n 'My` as a real opener must
+  // also mean finding its CLOSE on the next line, not carrying a phantom
+  // open scalar over the genuine chain below.
+  for (const nameOpener of ["name: 'My", "name: &n 'My"]) {
+    const quoted = (list) => [
+      nameOpener,
+      "  workflow'",
+      'on:',
+      '  workflow_run:',
+      `    workflows: ${list}`,
+      '    types: [completed]',
+      '',
+    ];
+    const before = quoted('["Validate", "Closeout preview"]').join('\n');
+    const after = quoted('["Validate", "Closeout preview", "Debug evidence demo"]').join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    assert.deepEqual(
+      collectContentRemovals(diff, { readFile: () => after }),
+      [],
+      `a closed quoted scalar (${nameOpener}) above on: must not refuse a genuinely provable chain`,
+    );
+  }
 });
