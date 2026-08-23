@@ -539,6 +539,20 @@ test(
   },
 );
 
+// Perturb a stat's dev/ino to model a post-swap disk state, preserving the
+// shape the identity capture consumes. Two details matter and both bit here:
+// the capture asks for a `{ bigint: true }` stat, so the perturbation has to be
+// BigInt arithmetic rather than Number arithmetic; and a bare object spread
+// drops the Stats prototype, where isFile/isSymbolicLink live, which the
+// normalizer calls. Returning a prototype-preserving clone keeps the fake a
+// stand-in for a real stat rather than a differently-shaped object that would
+// fail the check for the wrong reason.
+const withSwappedIdentity = (info) => Object.assign(
+  Object.create(Object.getPrototypeOf(info)),
+  info,
+  { dev: info.dev + 1n, ino: info.ino + 4096n },
+);
+
 test('writeEvidenceReport refuses to rename a staged report.json whose identity changed before commit', async () => {
   // Staging names are pid+ms and writeNoFollow closes its descriptor well
   // before the rename below, so a concurrent writer with access to
@@ -551,10 +565,10 @@ test('writeEvidenceReport refuses to rename a staged report.json whose identity 
   // racing a real concurrent process (Codex UnYbv).
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-swap-json-'));
   try {
-    const lstatFn = async (target) => {
-      const info = await lstat(target);
+    const lstatFn = async (target, options) => {
+      const info = await lstat(target, options);
       if (path.basename(target).startsWith('.report.json.')) {
-        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+        return withSwappedIdentity(info);
       }
       return info;
     };
@@ -587,10 +601,10 @@ test('writeEvidenceReport refuses to rename a staged report.md whose identity ch
   // report file may ever be written (Codex UnYbv).
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-swap-md-'));
   try {
-    const lstatFn = async (target) => {
-      const info = await lstat(target);
+    const lstatFn = async (target, options) => {
+      const info = await lstat(target, options);
       if (path.basename(target).startsWith('.report.md.')) {
-        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+        return withSwappedIdentity(info);
       }
       return info;
     };
@@ -628,10 +642,10 @@ test('writeEvidenceReport removes a committed report.md whose identity changed d
   // trusted and committed as the final report.
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-postswap-md-'));
   try {
-    const lstatFn = async (target) => {
-      const info = await lstat(target);
+    const lstatFn = async (target, options) => {
+      const info = await lstat(target, options);
       if (path.basename(target) === 'report.md') {
-        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+        return withSwappedIdentity(info);
       }
       return info;
     };
@@ -665,10 +679,10 @@ test('writeEvidenceReport removes a committed report.json whose identity changed
   // be rolled back too so the pair is never left inconsistent (Qodo UplSr).
   const outputDir = await mkdtemp(path.join(tmpdir(), 'pr-closeout-report-postswap-json-'));
   try {
-    const lstatFn = async (target) => {
-      const info = await lstat(target);
+    const lstatFn = async (target, options) => {
+      const info = await lstat(target, options);
       if (path.basename(target) === 'report.json') {
-        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+        return withSwappedIdentity(info);
       }
       return info;
     };
@@ -709,10 +723,10 @@ test('writeEvidenceReport leaves a pre-existing valid report pair untouched when
     const priorJson = await readFile(path.join(outputDir, 'report.json'), 'utf8');
     const priorMarkdown = await readFile(path.join(outputDir, 'report.md'), 'utf8');
 
-    const lstatFn = async (target) => {
-      const info = await lstat(target);
+    const lstatFn = async (target, options) => {
+      const info = await lstat(target, options);
       if (path.basename(target).startsWith('.report.md.')) {
-        return { ...info, dev: info.dev + 1, ino: info.ino + 4096 };
+        return withSwappedIdentity(info);
       }
       return info;
     };

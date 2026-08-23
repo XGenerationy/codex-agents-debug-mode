@@ -32,6 +32,7 @@ const {
   hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
+const { fileIdentity } = require('./pr_closeout_fs');
 
 const { buildSecretReplacements } = require('./pr_closeout_stream');
 
@@ -746,12 +747,18 @@ test('requires the launch token and returns only an opaque relative log path', a
     // re-verify the file it hardens BY NAME is still the file this server
     // created — without it a swap during the PowerShell ACL call went
     // undetected (review V2a).
-    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file));
+    // Compared against a { bigint: true } stat, not a default one: the wire
+    // carries dev/ino as decimal STRINGS precisely because a JSON number is a
+    // float64 and would re-round a 64-bit NTFS file reference in transit. A
+    // default stat here would reintroduce that rounding inside the assertion
+    // and the test would pass while proving the opposite of its name.
+    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file), { bigint: true });
     assert.deepEqual(
       { dev: authorized.body.log_file_identity.dev, ino: authorized.body.log_file_identity.ino },
-      { dev: mintedLog.dev, ino: mintedLog.ino },
+      { dev: String(mintedLog.dev), ino: String(mintedLog.ino) },
       'the response identity must be the created file, not a placeholder',
     );
+    assert.equal(typeof authorized.body.log_file_identity.ino, 'string', 'the wire ino must be a string, never a JSON number');
     // birthtimeMs is pinned BY TYPE, not by value: the server reads it from
     // the O_EXCL creation handle while this stat() re-reads the path after the
     // response returned, and on mounts that record no birth time Node falls
@@ -1388,21 +1395,21 @@ test('isSameFileIdentity rejects a zero/zero identity even though dev and ino bo
   // re-verification in main() relies on this predicate to fail closed instead
   // of trusting an absent identity.
   assert.equal(
-    isSameFileIdentity({ dev: 0, ino: 0, nlink: 1 }, { dev: 0, ino: 0, nlink: 1 }),
+    isSameFileIdentity({ dev: '0', ino: '0', nlink: 1 }, { dev: '0', ino: '0', nlink: 1 }),
     false,
   );
 });
 
 test('isSameFileIdentity accepts a genuine matching non-zero identity', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '42', nlink: 1 }),
     true,
   );
 });
 
 test('isSameFileIdentity rejects a real dev/ino mismatch', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 43, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '43', nlink: 1 }),
     false,
   );
 });
@@ -1413,14 +1420,14 @@ test('isSameFileIdentity rejects a dev mismatch even when ino matches', () => {
   // two different devices (numerically possible when comparing files from
   // different volumes/mounts) must still be rejected as a different file.
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 2, ino: 42, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '2', ino: '42', nlink: 1 }),
     false,
   );
 });
 
 test('isSameFileIdentity rejects when nlink indicates a hard link was added', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 2 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '42', nlink: 2 }),
     false,
   );
 });
@@ -1532,7 +1539,7 @@ test('reclaimStaleCollectorClaim restores a same-identity successor claim instea
   const successorContent = `41000\nlive-instance\n${process.pid}\n`;
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1560,7 +1567,7 @@ test('reclaimStaleCollectorClaim deletes a genuinely stale claim whose content i
   const staleContent = '40000\nstale-instance\n999999\n';
   try {
     await writeFile(claimFile, staleContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1587,7 +1594,9 @@ test('reclaimStaleCollectorClaim backs off without touching a claim whose identi
     // disk; isSameLockIdentity rejects it (dev/ino mismatch) with no reliance
     // on platform-specific inode values.
     const status = await reclaimStaleCollectorClaim(claimFile, {
-      claimInfo: { dev: 1, ino: 424242, nlink: 1, ctimeMs: 1000 },
+      claimInfo: {
+        dev: '1', ino: '424242', nlink: 1, ctimeNs: '1000000000', birthtimeNs: '1000000000',
+      },
       claimText: '40000\nstale-instance\n999999\n',
       readClaimText: reclaimReadClaimText,
     });
@@ -1616,7 +1625,7 @@ test('reclaimStaleCollectorClaim restores a misidentified successor when link() 
   const successorContent = `41000\nlive-instance\n${process.pid}\n`;
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1657,7 +1666,7 @@ test('reclaimStaleCollectorClaim does not clobber a fresh claim that wins the ra
   const thirdContenderContent = '42000\nthird-instance\n555555\n';
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1703,7 +1712,7 @@ test('unlinkOwnedClaimIfUnchanged leaves a successor claim that replaced the rea
     // A distinct real file stands in for the now-gone inode the release read,
     // so its dev/ino differ from the successor now sitting at claimFile.
     await writeFile(readInode, '40000\nown-instance\n999999\n', 'utf8');
-    const openedIdentity = await lstat(readInode);
+    const openedIdentity = fileIdentity(await lstat(readInode, { bigint: true }));
     await writeFile(claimFile, successorContent, 'utf8');
     const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
     assert.equal(unlinked, false, 'a successor that replaced the read inode must not be unlinked');
@@ -1726,7 +1735,7 @@ test('unlinkOwnedClaimIfUnchanged unlinks a claim that still identifies the read
   const claimFile = path.join(dir, 'collector_claim');
   try {
     await writeFile(claimFile, `40000\nown-instance\n${process.pid}\n`, 'utf8');
-    const openedIdentity = await lstat(claimFile);
+    const openedIdentity = fileIdentity(await lstat(claimFile, { bigint: true }));
     const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
     assert.equal(unlinked, true, 'an unchanged owned claim must be unlinked');
     assert.equal(existsSync(claimFile), false, 'the owned claim must be removed');

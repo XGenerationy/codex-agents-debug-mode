@@ -765,7 +765,21 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
   // "fail closed rather than trust an unverified file as protected"
   // (review V2a).
   const projectRoot = makeTempDir();
-  const minted = { dev: 7, ino: 9, birthtimeMs: 1000 };
+  // The wire shape: dev/ino are decimal STRINGS. A JSON number is a float64 by
+  // specification, so a 64-bit NTFS file reference above 2**53 would be
+  // re-rounded in transit and this parent would re-verify against a value that
+  // no longer names one file.
+  const minted = { dev: '7', ino: '9', birthtimeMs: 1000 };
+  // The statFile seam stands in for a `{ bigint: true }` lstat, which is what
+  // the post-ACL capture now asks for: BigInt dev/ino plus the prototype
+  // methods the normalizer calls.
+  const statted = ({ ino = 9n, nlink = 1n, birthtimeMs = 1000n, dev = 7n }) => () => ({
+    dev, ino, nlink, size: 0n, mtimeMs: birthtimeMs,
+    ctimeMs: birthtimeMs, ctimeNs: birthtimeMs * 1000000n,
+    birthtimeMs, birthtimeNs: birthtimeMs * 1000000n,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  });
   const base = {
     projectRoot,
     relativeLog: '.debug/session-x.log',
@@ -777,14 +791,14 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
   applyStartWindowsAcls({
     ...base,
     protect: () => {},
-    statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 1000 }),
+    statFile: statted({}),
   });
   // A swapped file (new inode) must not be trusted as protected.
   assert.throws(
     () => applyStartWindowsAcls({
       ...base,
       protect: () => {},
-      statFile: () => ({ dev: 7, ino: 10, nlink: 1, birthtimeMs: 1000 }),
+      statFile: statted({ ino: 10n }),
     }),
     /session log identity changed during ACL hardening; refusing to trust the protected file/,
   );
@@ -793,7 +807,7 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
     () => applyStartWindowsAcls({
       ...base,
       protect: () => {},
-      statFile: () => ({ dev: 7, ino: 9, nlink: 2, birthtimeMs: 1000 }),
+      statFile: statted({ nlink: 2n }),
     }),
     /session log identity changed during ACL hardening/,
   );
@@ -806,7 +820,7 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
     () => applyStartWindowsAcls({
       ...base,
       protect: () => {},
-      statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 5000 }),
+      statFile: statted({ birthtimeMs: 5000n }),
     }),
     /session log identity changed during ACL hardening; refusing to trust the protected file/,
   );
@@ -814,9 +828,9 @@ test('applyStartWindowsAcls re-verifies the session log identity after the prote
   // still hardens: the term is skipped, never failed.
   applyStartWindowsAcls({
     ...base,
-    expectedIdentity: { dev: 7, ino: 9, birthtimeMs: 0 },
+    expectedIdentity: { dev: '7', ino: '9', birthtimeMs: 0 },
     protect: () => {},
-    statFile: () => ({ dev: 7, ino: 9, nlink: 1, birthtimeMs: 1000 }),
+    statFile: statted({}),
   });
   // A log that vanished mid-hardening fails closed with its own message.
   assert.throws(
@@ -2712,17 +2726,26 @@ test('a mint that names a log file but omits its identity is refused before any 
   // other mint failure.
   const mintShapes = [
     { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log' },
-    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: 9 } },
-    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7 } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7' } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: '' } },
+    // dev/ino must be STRINGS, and a NUMERIC identity is now the shape that
+    // fails closed -- the inverse of what this table asserted before. A JSON
+    // number is a float64, so a 64-bit NTFS file reference above 2**53 arrives
+    // re-rounded and no longer names one file; and the shared predicate
+    // refuses a non-string ino outright, so accepting a numeric mint here
+    // would abort every deferred start later with a far less obvious message.
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9, birthtimeMs: 1000 } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: 9, birthtimeMs: 1000 } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: '9', birthtimeMs: 1000 } },
     // birthtimeMs is held to the same standard as dev/ino: absent, wrong
     // type, and the JSON `null` a non-finite number serializes to all fail
     // closed. Without these rows a dropped field would silently downgrade the
     // post-ACL comparison to dev/ino — the shared predicate skips its birth
     // term when either side is falsy, so the weaker check reads exactly like
     // the stronger one.
-    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9 } },
-    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9, birthtimeMs: '1000' } },
-    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: 7, ino: 9, birthtimeMs: null } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: '9' } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: '9', birthtimeMs: '1000' } },
+    { ...MINTED.json, log_file: '.debug/debug-ci-debug-abc.log', log_file_identity: { dev: '7', ino: '9', birthtimeMs: null } },
   ];
   for (const json of mintShapes) {
     const outputDir = makeTempDir();
@@ -2761,7 +2784,7 @@ test('a complete mint identity hardens the log and starts, including on a birth-
     mkdirSync(path.join(projectRoot, '.debug'), { recursive: true });
     const relativeLog = '.debug/debug-ci-debug-abc.log';
     writeFileSync(path.join(projectRoot, relativeLog), '');
-    const real = lstatSync(path.join(projectRoot, relativeLog));
+    const real = lstatSync(path.join(projectRoot, relativeLog), { bigint: true });
     const child = fakeChild();
     const killed = [];
     const starting = startSubcommand({
@@ -2776,9 +2799,9 @@ test('a complete mint identity hardens the log and starts, including on a birth-
           ...MINTED.json,
           log_file: relativeLog,
           log_file_identity: {
-            dev: real.dev,
-            ino: real.ino,
-            birthtimeMs: wireBirth === 'real' ? real.birthtimeMs : 0,
+            dev: String(real.dev),
+            ino: String(real.ino),
+            birthtimeMs: wireBirth === 'real' ? Number(real.birthtimeMs) : 0,
           },
         },
       }),

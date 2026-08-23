@@ -14,7 +14,7 @@ const {
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
-const { isSameLockIdentity, openNoFollow } = require('./pr_closeout_fs');
+const { fileIdentity, isSameLockIdentity, openNoFollow } = require('./pr_closeout_fs');
 const {
   classifyGateIntegrity,
   digestValidationConfig,
@@ -206,7 +206,7 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
 /**
- * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, dirIdentity: {dev: number, ino: number}, release: () => Promise<void> }} OutputDirLock
+ * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, dirIdentity: {dev: string, ino: string}, release: () => Promise<void> }} OutputDirLock
  */
 
 // Upper bound for a .closeout.lock payload (`pid\nnonce\niso\n` — well under
@@ -336,13 +336,21 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // finding: "Bind the evidence lock to the output directory inode").
       let dirIdentity;
       try {
-        dirIdentity = await statPath(outputDir);
+        // Normalized to exact decimal strings, like every other identity
+        // binding in this repo: a default stat reports ino as a Number, and an
+        // NTFS file reference above 2**53 is rounded to float64, so two
+        // DIFFERENT directories can compare equal here (see fileIdentity in
+        // pr_closeout_fs.js for the measurements). A swap-detection check that
+        // can be defeated by rounding is not swap detection.
+        dirIdentity = fileIdentity(await statPath(outputDir, { bigint: true }));
         // Some filesystems (notably Windows FAT/network mounts) report
         // dev/ino as 0 for every path, which would make the swap-detection
         // comparisons below and in assertOutputDirLockIdentity pass
         // vacuously for a same-path replacement. Fail closed rather than
-        // record an identity that provides no actual guarantee.
-        if (dirIdentity.ino === 0) {
+        // record an identity that provides no actual guarantee. The literal is
+        // the STRING '0' -- a `=== 0` here would never match a normalized ino
+        // and would silently retire this rejection.
+        if (dirIdentity.ino === '0') {
           throw new Error(
             `Filesystem does not report a usable directory identity for ${outputDir}; refusing to rely on dev/ino swap detection.`,
           );
@@ -418,7 +426,10 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // quarantining the original (Codex Uert4).
       let staleIdentity = null;
       try {
-        staleIdentity = await lstat(lockPath);
+        // Normalized record: isSameLockIdentity compares the exact 64-bit
+        // reference and the nanosecond timestamps, neither of which survives a
+        // default stat (see fileIdentity in pr_closeout_fs.js).
+        staleIdentity = fileIdentity(await lstat(lockPath, { bigint: true }));
       } catch {
         staleIdentity = null;
       }
@@ -504,7 +515,7 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         } else if (staleIdentity) {
           let currentIdentity;
           try {
-            currentIdentity = await lstat(lockPath);
+            currentIdentity = fileIdentity(await lstat(lockPath, { bigint: true }));
           } catch (identityError) {
             if (identityError?.code === 'ENOENT') continue;
             throw identityError;
@@ -628,19 +639,19 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
  * (the pre-acquisition call, or a non-exclusive run that never took a lock).
  * @param {OutputDirLock|null|undefined} lock
  * @param {string} outputDir
- * @param {{statPath?: (path: string) => Promise<import('node:fs').Stats>}} [deps]
+ * @param {{statPath?: (path: string, options?: object) => Promise<import('node:fs').BigIntStats>}} [deps]
  * @returns {Promise<void>}
  */
 const assertOutputDirLockIdentity = async (lock, outputDir, { statPath = stat } = {}) => {
   if (!lock) return;
-  const info = await statPath(outputDir);
+  const info = fileIdentity(await statPath(outputDir, { bigint: true }));
   // A zero ino (no usable filesystem identity) must never compare equal to
   // itself here: acquireOutputDirLock already refuses to record such an
   // identity, but failing closed independently means this check stays safe
   // even if a lock object ever reached this function some other way.
   if (
-    lock.dirIdentity.ino === 0
-    || info.ino === 0
+    lock.dirIdentity.ino === '0'
+    || info.ino === '0'
     || info.dev !== lock.dirIdentity.dev
     || info.ino !== lock.dirIdentity.ino
   ) {

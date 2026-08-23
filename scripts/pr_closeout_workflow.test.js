@@ -16,6 +16,19 @@ const {
   runCloseoutWorkflow,
 } = require('./pr_closeout_workflow');
 
+// A stand-in for the `{ bigint: true }` Stats a real stat returns on a mount
+// that reports no usable identity (Windows FAT / some network mounts report
+// dev/ino as 0 for every path). The identity capture normalizes a BigInt
+// Stats, so an injected fake has to answer in that shape -- returning plain
+// Numbers here would make the test exercise the normalizer's type rejection
+// instead of the zero-identity rejection it is written to prove.
+const zeroIdentityStats = () => ({
+  dev: 0n, ino: 0n, nlink: 1n, size: 0n,
+  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n,
+  isFile: () => false,
+  isSymbolicLink: () => false,
+});
+
 const configuredCommands = Object.fromEntries(
   MANDATORY_CHECKS.filter(({ fixed }) => !fixed).map(({ id }) => [id, `run ${id}`]),
 );
@@ -696,9 +709,15 @@ test('isSameLockIdentity does not treat a reused inode as the same file', () => 
   // file" and let a guard-failure reclaim quarantine it. ctimeMs must also
   // match: a freshly created file (even on a reused inode) always gets a new
   // change time the original snapshot cannot share.
-  const stale = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
-  const reusedInodeSuccessor = { ino: 42, dev: 1, nlink: 1, ctimeMs: 2000 };
-  const untouchedSameFile = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
+  //
+  // Written in the normalized identity-record shape the predicate now
+  // consumes: dev/ino are exact decimal strings and the change time is
+  // compared in nanoseconds, so this fixture cannot pass by the predicate
+  // merely refusing an unrecognized shape.
+  const base = { dev: '1', nlink: 1, birthtimeNs: '500000000' };
+  const stale = { ...base, ino: '42', ctimeNs: '1000000000' };
+  const reusedInodeSuccessor = { ...base, ino: '42', ctimeNs: '2000000000' };
+  const untouchedSameFile = { ...base, ino: '42', ctimeNs: '1000000000' };
   assert.equal(isSameLockIdentity(stale, reusedInodeSuccessor), false);
   assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 });
@@ -966,7 +985,7 @@ test('acquireOutputDirLock refuses to record a directory identity the filesystem
   const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-zero-identity-'));
   try {
     await assert.rejects(
-      acquireOutputDirLock(tmp, { statPath: async () => ({ dev: 0, ino: 0 }) }),
+      acquireOutputDirLock(tmp, { statPath: async () => zeroIdentityStats() }),
       /usable directory identity/i,
     );
     // The lock file created before the identity check must not be left
@@ -1011,10 +1030,10 @@ test('assertOutputDirLockIdentity rejects a zero/zero identity even though dev a
   // reports ino 0 means dev/ino both read 0/0 on both sides. A mismatched
   // ino (e.g. 42 vs 0) is already caught by the plain inequality check and
   // is not the case this guard exists for.
-  const fakeLock = { dirIdentity: { dev: 0, ino: 0 } };
+  const fakeLock = { dirIdentity: { dev: '0', ino: '0' } };
   await assert.rejects(
     assertOutputDirLockIdentity(fakeLock, 'C:/evidence', {
-      statPath: async () => ({ dev: 0, ino: 0 }),
+      statPath: async () => zeroIdentityStats(),
     }),
     /changed identity/i,
   );

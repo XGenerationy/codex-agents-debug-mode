@@ -1,7 +1,7 @@
 const { constants } = require('node:fs');
 const { chmod, lstat, mkdir, rename, unlink } = require('node:fs/promises');
 const path = require('node:path');
-const { assertNotSymlink: assertNotSymlinkShared, isSameFileIdentity, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
+const { assertNotSymlink: assertNotSymlinkShared, fileIdentity, isSameFileIdentity, openNoFollow, protectWindowsPrivateFile } = require('./pr_closeout_fs');
 
 /**
  * Escape untrusted report text for Markdown: collapse newlines and replace
@@ -385,8 +385,12 @@ const writeNoFollow = async (target, contents) => {
         throw error;
       }
     }
-    const info = await handle.stat();
-    if (!info.isFile() || info.nlink !== 1) {
+    // Normalized identity record, not a default Stats: the dev/ino this
+    // snapshot carries are re-compared after the ACL call below and again by
+    // assertStagedIdentity/assertCommittedIdentity, and a default stat rounds
+    // ino to float64 (see fileIdentity in pr_closeout_fs.js).
+    const info = fileIdentity(await handle.stat({ bigint: true }));
+    if (!info.isFile || info.nlink !== 1) {
       throw new Error(
         `Refusing to write evidence report through a non-private file (nlink=${info.nlink}): ${target}`,
       );
@@ -414,23 +418,22 @@ const writeNoFollow = async (target, contents) => {
       // replacement while the writeFile below still targets the original,
       // potentially still broadly-readable, inode through this open handle.
       // Re-check the post-protection path identity against the descriptor
-      // before writing any evidence. nlink was already verified to be exactly
-      // 1 above (before chmod or this call ran), so a hard link cannot reach
-      // here and only dev/ino are compared; a zero ino is rejected outright
-      // because some Windows filesystems report dev/ino as 0 for every file
-      // and would otherwise compare equal vacuously. Mirrors the evidence-log
-      // hardening in pr_closeout_process.js.
+      // before writing any evidence. This defers to the shared predicate
+      // rather than re-listing dev/ino/zero-ino inline: the inline copy it
+      // replaces was a second implementation of the same contract that had to
+      // be hardened in lockstep by hand, and it was not -- it kept comparing a
+      // float64 ino after the shared one stopped. nlink was already verified
+      // to be exactly 1 above (before chmod or this call ran), so the
+      // predicate's own nlink term is redundant here rather than a new
+      // requirement. Mirrors the evidence-log hardening in
+      // pr_closeout_process.js.
       let postProtectInfo;
       try {
-        postProtectInfo = await lstat(target);
+        postProtectInfo = fileIdentity(await lstat(target, { bigint: true }));
       } catch {
         throw new Error(`Refusing to write evidence report with an unverifiable identity: ${target}`);
       }
-      if (
-        info.ino === 0
-        || postProtectInfo.dev !== info.dev
-        || postProtectInfo.ino !== info.ino
-      ) {
+      if (!isSameFileIdentity(info, postProtectInfo)) {
         throw new Error(
           `Refusing to write evidence report through a path swapped during ACL protection: ${target}`,
         );
@@ -458,14 +461,14 @@ const writeNoFollow = async (target, contents) => {
  * post-ACL-protection recheck above uses for the equivalent window during
  * protectWindowsPrivateFile.
  * @param {string} target
- * @param {import('node:fs').Stats} info - identity captured when writeNoFollow wrote `target`.
+ * @param {ReturnType<typeof fileIdentity>} info - identity captured when writeNoFollow wrote `target`.
  * @param {typeof lstat} [lstatFn]
  * @returns {Promise<void>}
  */
 const assertStagedIdentity = async (target, info, lstatFn = lstat) => {
   let current;
   try {
-    current = await lstatFn(target);
+    current = fileIdentity(await lstatFn(target, { bigint: true }));
   } catch {
     throw new Error(`Refusing to write evidence report with an unverifiable staged identity: ${target}`);
   }
@@ -493,14 +496,14 @@ const assertStagedIdentity = async (target, info, lstatFn = lstat) => {
  * remove `target` rather than return it as trustworthy evidence (Qodo
  * UplSr).
  * @param {string} target - the final destination path (report.json/report.md), already renamed into place.
- * @param {import('node:fs').Stats} info - identity captured when writeNoFollow wrote the staged temp file.
+ * @param {ReturnType<typeof fileIdentity>} info - identity captured when writeNoFollow wrote the staged temp file.
  * @param {typeof lstat} [lstatFn]
  * @returns {Promise<void>}
  */
 const assertCommittedIdentity = async (target, info, lstatFn = lstat) => {
   let current;
   try {
-    current = await lstatFn(target);
+    current = fileIdentity(await lstatFn(target, { bigint: true }));
   } catch {
     throw new Error(`Refusing to trust evidence report with an unverifiable post-rename identity: ${target}`);
   }

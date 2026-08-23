@@ -9,6 +9,7 @@ const http = require('node:http');
 const path = require('node:path');
 const {
   assertNotSymlink: assertNotSymlinkShared,
+  fileIdentity,
   isSameFileIdentity,
   isSameLockIdentity,
   isSameProtectedFileIdentity,
@@ -761,7 +762,7 @@ const verifyLogIdentity = async (session, info) => {
   // nlink > 1 means the session log was hard-linked to another path after
   // /session; the token/artifact writers already fail closed on that shape.
   if (
-    !info.isFile() || !identity
+    !info.isFile || !identity
     || info.nlink > 1
     || info.dev !== identity.dev || info.ino !== identity.ino
     || !sameBirth
@@ -801,7 +802,7 @@ const appendSessionEvent = (session, serializedEvent) => {
       throw error;
     }
     try {
-      await verifyLogIdentity(session, await handle.stat());
+      await verifyLogIdentity(session, fileIdentity(await handle.stat({ bigint: true })));
       await handle.writeFile(serializedEvent, 'utf8');
       // Byte count and digest advance together, and only after the write
       // succeeded: a partial or failed append must leave both describing the
@@ -1397,8 +1398,16 @@ const createDebugServer = ({
             0o600,
           );
           try {
-            const info = await handle.stat();
-            if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
+            // Normalized identity record, not a default Stats: dev/ino here
+            // become the session's pinned log identity -- re-verified after the
+            // DACL below, on every /log append, and by the deferred parent
+            // across the wire -- and a default stat rounds ino to float64 (see
+            // fileIdentity in pr_closeout_fs.js). Keeping the raw BigInt Stats
+            // instead would silently break verifyLogIdentity's
+            // `info.size !== identity.bytesWritten` and make JSON.stringify of
+            // the mint response throw.
+            const info = fileIdentity(await handle.stat({ bigint: true }));
+            if (!info.isFile) throw new RequestError('session_log_not_regular', 409);
             // Release the exclusive write handle before Windows DACL work.
             // File.SetAccessControl on a path still opened O_WRONLY by this
             // process timed out on hosted windows-latest (POST /session → 500
@@ -1439,7 +1448,7 @@ const createDebugServer = ({
               // same-name recreate keep the original's creation time).
               let postProtectInfo;
               try {
-                postProtectInfo = await lstat(resolvedLogFile);
+                postProtectInfo = fileIdentity(await lstat(resolvedLogFile, { bigint: true }));
               } catch {
                 throw new RequestError('session_log_escapes_root', 409);
               }
@@ -1836,7 +1845,7 @@ const createDebugServer = ({
             throw error;
           }
           try {
-            await verifyLogIdentity(session, await handle.stat());
+            await verifyLogIdentity(session, fileIdentity(await handle.stat({ bigint: true })));
             // Read exactly the bytes this server wrote: bytesWritten bounds
             // the window, so appended-after or truncated content can never
             // slip in (size was already checked equal inside verifyLogIdentity).
@@ -2240,7 +2249,7 @@ const reclaimStaleCollectorClaim = async (claimFile, {
     if (!claimInfo) return 'backed-off';
     let currentClaimInfo;
     try {
-      currentClaimInfo = await lstatFn(claimFile);
+      currentClaimInfo = fileIdentity(await lstatFn(claimFile, { bigint: true }));
     } catch (error) {
       if (error?.code === 'ENOENT') return 'backed-off';
       throw error;
@@ -2359,7 +2368,7 @@ const unlinkOwnedClaimIfUnchanged = (claimFile, openedIdentity, {
   if (!openedIdentity) return false;
   let currentInfo;
   try {
-    currentInfo = lstatSyncFn(claimFile);
+    currentInfo = fileIdentity(lstatSyncFn(claimFile, { bigint: true }));
   } catch {
     return false;
   }
@@ -2614,7 +2623,7 @@ const main = () => {
           // whatever now occupies the path.
           let claimInfo = null;
           try {
-            claimInfo = await lstat(claimFile);
+            claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
           } catch {
             claimInfo = null;
           }
@@ -2634,8 +2643,8 @@ const main = () => {
           // and links/special files are never trusted for the grace.
           const completeClaim = isCompleteClaimText(claimText);
           if (!completeClaim && claimInfo) {
-            const freshPrivateRegularClaim = claimInfo.isFile()
-              && !claimInfo.isSymbolicLink()
+            const freshPrivateRegularClaim = claimInfo.isFile
+              && !claimInfo.isSymbolicLink
               && claimInfo.nlink === 1
               && claimInfo.size <= MAX_CLAIM_FILE_BYTES
               && Date.now() - claimInfo.mtimeMs < COLLECTOR_CLAIM_INITIALIZING_GRACE_MS;
@@ -2731,9 +2740,9 @@ const main = () => {
               // between lstat and open, so size/link checks and the buffer
               // sizing must come from the descriptor actually being read
               // (CodeRabbit discussion_r3652923124).
-              const opened = fstatSync(fd);
+              const opened = fileIdentity(fstatSync(fd, { bigint: true }));
               if (
-                !opened.isFile()
+                !opened.isFile
                 || opened.nlink > 1
                 || opened.size < 1
                 || opened.size > MAX_CLAIM_FILE_BYTES
@@ -2797,8 +2806,8 @@ const main = () => {
         handle = await openNoFollow(tokenFile, constants.O_WRONLY, 0o600);
       }
       try {
-        const info = await handle.stat();
-        if (!info.isFile() || info.nlink > 1) throw new Error('collector_token_not_private');
+        const info = fileIdentity(await handle.stat({ bigint: true }));
+        if (!info.isFile || info.nlink > 1) throw new Error('collector_token_not_private');
         // Re-verify the just-opened path still resolves inside projectRoot.
         // This is the post-open half of the TOCTOU narrowing described
         // above: if the parent was swapped for a symlink between the
@@ -2830,7 +2839,7 @@ const main = () => {
           // inode as the open handle before writing.
           let postProtectInfo;
           try {
-            postProtectInfo = await lstat(tokenFile);
+            postProtectInfo = fileIdentity(await lstat(tokenFile, { bigint: true }));
           } catch {
             throw new Error('collector_token_parent_replaced');
           }
@@ -2859,8 +2868,8 @@ const main = () => {
         0o600,
       );
       try {
-        const portWriteInfo = await portHandle.stat();
-        if (!portWriteInfo.isFile() || portWriteInfo.nlink > 1) {
+        const portWriteInfo = fileIdentity(await portHandle.stat({ bigint: true }));
+        if (!portWriteInfo.isFile || portWriteInfo.nlink > 1) {
           throw new Error('collector_port_not_private');
         }
         let realPortFile;
@@ -2886,7 +2895,7 @@ const main = () => {
         // isSameFileIdentity binding).
         let portPathIdentity;
         try {
-          portPathIdentity = await lstat(portFile);
+          portPathIdentity = fileIdentity(await lstat(portFile, { bigint: true }));
         } catch {
           throw new Error('collector_port_parent_replaced');
         }
