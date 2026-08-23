@@ -13,7 +13,9 @@ const { symlink } = require('node:fs/promises');
 
 const {
   assertNotSymlink,
+  isSameFileIdentity,
   isSameLockIdentity,
+  isSameProtectedFileIdentity,
   openNoFollow,
   openNoFollowFlagAttempts,
   openNoFollowSync,
@@ -202,8 +204,12 @@ test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs
   const collidingSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 5000 };
   assert.equal(isSameLockIdentity(stale, collidingSuccessor), false);
 
-  // Genuine same file: every dimension including the immutable birthtime
-  // matches, so a real stale record stays reclaimable (no false rejection).
+  // Genuine same file: every dimension including the birth time matches, so a
+  // real stale record stays reclaimable (no false rejection). "Unchanged for
+  // this record", not "immutable" — on NTFS a same-name recreate inherits the
+  // original's creation time through file tunneling, and the owner can set it
+  // outright, which is why the predicate's doc refuses to call the term
+  // independent on win32.
   const untouchedSameFile = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
   assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 
@@ -211,6 +217,47 @@ test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs
   // ctimeMs alone -- the new birthtime term does not weaken the existing guard.
   const freshCtimeSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 6000, birthtimeMs: 6000 };
   assert.equal(isSameLockIdentity(stale, freshCtimeSuccessor), false);
+});
+
+test('isSameProtectedFileIdentity rejects an inode reuse the lax predicate accepts', () => {
+  // POSIX inode reuse (tmpfs hands a freed ino to the next file created in the
+  // directory): dev/ino/nlink cannot see it, the creation time can. This is
+  // the whole reason the post-ACL callers use this predicate instead of the
+  // lax one — and the difference is asserted rather than assumed, so a future
+  // edit that collapses the two is caught here.
+  const preInfo = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  const reusedIno = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 5000 };
+  assert.equal(isSameFileIdentity(preInfo, reusedIno), true, 'the lax predicate is blind to this swap');
+  assert.equal(isSameProtectedFileIdentity(preInfo, reusedIno), false);
+  assert.equal(isSameProtectedFileIdentity(preInfo, { ...preInfo }), true, 'a genuine same file is not rejected');
+});
+
+test('isSameProtectedFileIdentity skips the birth term when either side reports none', () => {
+  // The deferred caller's preInfo is a JSON wire object, and mounts that do
+  // not record a birth time report 0. Neither may turn a healthy check red: a
+  // bare `===` would abort every deferred start on the first shape, and on the
+  // second it would silently become a ctimeMs comparison (Node falls
+  // birthtimeMs back to ctimeMs where statx is unavailable) — precisely what
+  // isSameFileIdentity's contract forbids for ACL-protect callers, whose
+  // intervening operation legitimately moves ctimeMs.
+  const real = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  assert.equal(isSameProtectedFileIdentity({ dev: 1, ino: 42 }, real), true);
+  assert.equal(isSameProtectedFileIdentity({ ...real, birthtimeMs: 0 }, real), true);
+  assert.equal(isSameProtectedFileIdentity(real, { ...real, birthtimeMs: 0 }), true);
+});
+
+test('isSameProtectedFileIdentity still rejects every shape isSameFileIdentity rejects', () => {
+  // Composition, not re-implementation: the four lax terms are inherited from
+  // one predicate rather than re-listed here, so a hardening that lands in
+  // isSameFileIdentity cannot leave the protected variant behind (the
+  // one-contract-one-implementation rule this repo already paid for twice —
+  // the V8a redaction parser and the V7a scalar-header regex).
+  const pre = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  const born = (over) => ({ dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000, ...over });
+  assert.equal(isSameProtectedFileIdentity({ ...pre, dev: 0, ino: 0 }, born({ dev: 0, ino: 0 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ ino: 43 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ dev: 2 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ nlink: 2 })), false);
 });
 
 test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () => {
