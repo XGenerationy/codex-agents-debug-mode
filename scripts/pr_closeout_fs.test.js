@@ -367,18 +367,30 @@ test('Windows ACL sync and async entry points share one frozen stdio-ignore opti
   // in this bare test process it must not be the loop's ONLY handle: with
   // nothing else referenced, Node 20/22 drain the event loop before the
   // 20ms deadline fires and the runner cancels the still-pending test
-  // (cancelledByParent — Validate run 32642837205). Hold one referenced
-  // timer across the await so the loop survives to the deadline.
-  const keepAlive = setTimeout(() => {}, 60_000);
+  // (cancelledByParent — Validate run 32642837205). A REFERENCED WATCHDOG
+  // rather than a bare keep-alive (Codex): it holds the loop open to the
+  // deadline AND, should the backstop ever stop settling the promise, loses
+  // the race with a non-matching error so the test fails fast and directly
+  // instead of parking until the runner cancels it again.
+  let watchdog;
+  const watchdogFired = new Promise((unusedResolve, rejectWatch) => {
+    watchdog = setTimeout(
+      () => rejectWatch(new Error('deadline backstop never settled the wedged promise within 500ms')),
+      500,
+    );
+  });
   try {
     await assert.rejects(
-      protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
-        platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
-      }),
+      Promise.race([
+        protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+          platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
+        }),
+        watchdogFired,
+      ]),
       /windows_private_file_acl_failed: deadline/,
     );
   } finally {
-    clearTimeout(keepAlive);
+    clearTimeout(watchdog);
   }
   assert.equal(kills, 1, 'the deadline still attempts to kill the wedged child');
   // A late 'exit' after settlement lands on an already-settled promise: a
