@@ -26,7 +26,7 @@ const {
 // instead of the zero-identity rejection it is written to prove.
 const zeroIdentityStats = () => ({
   dev: 0n, ino: 0n, nlink: 1n, size: 0n,
-  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n,
+  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n, mtimeNs: 0n,
   isFile: () => false,
   isSymbolicLink: () => false,
 });
@@ -731,6 +731,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       openFn: () => 3,
       closeFn: () => {},
       fstatFn: () => lockStat({ ino: 0n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
     /Evidence lock changed while opening/,
   );
@@ -742,6 +743,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       openFn: () => 3,
       closeFn: () => {},
       fstatFn: () => lockStat({ ino: 7n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
     /Evidence lock changed while opening/,
   );
@@ -751,6 +753,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       openFn: () => 3,
       closeFn: () => {},
       fstatFn: () => lockStat({ ino: 0n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
     /Evidence lock changed while opening/,
   );
@@ -767,6 +770,7 @@ test('readOutputDirLockFileSync rejects a lock swapped between the pre-open lsta
       openFn: () => 3,
       closeFn: () => {},
       fstatFn: () => lockStat({ ino: 8n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
     /Evidence lock changed while opening/,
   );
@@ -777,6 +781,7 @@ test('readOutputDirLockFileSync rejects a lock swapped between the pre-open lsta
       openFn: () => 3,
       closeFn: () => {},
       fstatFn: () => lockStat({ dev: 2n, ino: 7n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
     /Evidence lock changed while opening/,
   );
