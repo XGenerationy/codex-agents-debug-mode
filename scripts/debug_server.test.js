@@ -463,6 +463,29 @@ const waitUntil = async (predicate, message, timeoutMs = 5000) => {
   }
 };
 
+// win32-only: assert `filePath` carries the owner-only DACL
+// protectWindowsPrivateFile establishes (single ACE, current identity,
+// FullControl), read back through icacls — a read, no Set-Acl. The expected
+// identity comes from `whoami` (the process TOKEN's domain\user, which is
+// what the ACL helper resolves via WindowsIdentity::GetCurrent), NOT from
+// %USERNAME% — the two diverge on hosts whose token identity differs from
+// the login env (Codex rescue r3 observed exactly that in its sandbox).
+const assertOwnerOnlyDacl = (filePath, label) => {
+  const whoami = spawnSync('whoami', [], { encoding: 'utf8', windowsHide: true });
+  assert.equal(whoami.status, 0, `whoami must resolve the process token identity: ${whoami.stderr}`);
+  const identity = whoami.stdout.trim().toLowerCase();
+  assert.ok(identity, 'whoami must print a domain\\user identity');
+  const icacls = spawnSync('icacls', [filePath], { encoding: 'utf8', windowsHide: true });
+  assert.equal(icacls.status, 0, `icacls must read the DACL of ${label}'s log: ${icacls.stderr}`);
+  // Grant lines are the ones carrying an ACE (`principal:(...)`).
+  const grants = icacls.stdout.split(/\r?\n/).filter((line) => line.includes(':('));
+  assert.equal(grants.length, 1, `${label} must leave an owner-only DACL; got ${JSON.stringify(icacls.stdout)}`);
+  assert.ok(
+    grants[0].toLowerCase().includes(`${identity}:`) && grants[0].includes('(F)'),
+    `the single ACE must grant the token identity (${identity}) FullControl; got ${JSON.stringify(grants[0])}`,
+  );
+};
+
 test('POST /session stays pending until the awaited ACL adapter resolves, and no usable session exists before then', async () => {
   // Criterion: the mint response must not publish a session credential until
   // asynchronous ACL protection has succeeded. The credential's ONLY channel
@@ -603,20 +626,7 @@ test('createDebugServer without a test ACL adapter keeps the production default,
       const minted = await createSession(baseUrl);
       assert.equal(minted.status, 201, 'the default (real) ACL path must still mint');
       if (process.platform === 'win32') {
-        const logPath = path.join(projectRoot, minted.body.log_file);
-        const icacls = spawnSync('icacls', [logPath], { encoding: 'utf8', windowsHide: true });
-        assert.equal(icacls.status, 0, `icacls must read the minted log's DACL: ${icacls.stderr}`);
-        // Grant lines are the ones carrying an ACE (`principal:(...)`).
-        // Exactly one, for the current user, with FullControl — matching by
-        // username rather than localized well-known principal names.
-        const grants = icacls.stdout.split(/\r?\n/).filter((line) => line.includes(':('));
-        assert.equal(grants.length, 1, `the default mint must leave an owner-only DACL; got ${JSON.stringify(icacls.stdout)}`);
-        const user = String(process.env.USERNAME || '');
-        assert.ok(user, 'USERNAME must be set on Windows for the DACL owner assertion');
-        assert.ok(
-          grants[0].toLowerCase().includes(`\\${user.toLowerCase()}:`) && grants[0].includes('(F)'),
-          `the single ACE must grant the current user FullControl; got ${JSON.stringify(grants[0])}`,
-        );
+        assertOwnerOnlyDacl(path.join(projectRoot, minted.body.log_file), 'the default mint');
       }
     } finally {
       await close(server);
@@ -635,13 +645,17 @@ test('the sessionLogAclForTests seam is refused outside the node:test runner (no
   // The test-only claim is an ENFORCED gate, not a naming convention (Codex
   // rescue r2): the node:test runner marks its child processes with
   // NODE_TEST_CONTEXT, and construction with an adapter fails closed without
-  // it, so a production importer cannot hand createDebugServer a no-op
-  // adapter and mint unprotected 201s. Proven from a plain `node -e` child
+  // it, so a production importer cannot enable the seam by merely passing
+  // the option. (The env var is forgeable, so the gate is the OUTER layer:
+  // the additive-seam test below is what guarantees a forged env still
+  // cannot strip the real Windows ACL.) Proven from a plain `node -e` child
   // with NODE_TEST_CONTEXT scrubbed — the same child then constructs
-  // WITHOUT the adapter to pin that the gate rejects only the seam, never
-  // production boot. deferWindowsPrivateFileProtection keeps the child's
-  // construction off PowerShell; the gate fires before any route exists, so
-  // defer changes nothing it guards.
+  // WITHOUT the adapter, pinning ONLY that the gate never rejects
+  // adapter-less production boot; the default path's end-to-end protection
+  // is pinned by the icacls read-back in the default-path test, not here.
+  // deferWindowsPrivateFileProtection keeps the child's construction off
+  // PowerShell; the gate fires before any route exists, so defer changes
+  // nothing it guards.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-gate-'));
   try {
     const script = `
@@ -677,16 +691,52 @@ test('the sessionLogAclForTests seam is refused outside the node:test runner (no
   }
 });
 
-test('the injected adapter cannot bypass the post-protect identity re-verification', async () => {
-  // The seam substitutes only the protection CALL; the identity re-check
-  // after it is the route contract and must still fail the mint closed when
-  // the file the adapter "protected" is no longer the file the handler
-  // created. Removing the log while the adapter is pending makes the
-  // post-protect lstat fail on every platform, so an awaited adapter
-  // deterministically yields 409 session_log_escapes_root — and doubles as
-  // an await backstop: a handler that did not await the adapter would have
-  // re-verified the still-present file long before the removal and minted
-  // a 201 instead.
+test('a no-op adapter cannot strip the real Windows ACL: the seam is additive, never a replacement', { skip: process.platform !== 'win32' }, async () => {
+  // The structural answer to "any injectable seam is a forgeable switch"
+  // (Codex rescue r3): on the one platform that HAS production ACL
+  // protection, an injected adapter runs IN ADDITION to
+  // protectWindowsPrivateFileAsync, never instead of it. So even a caller
+  // that forges the runner env and injects `async () => {}` still mints
+  // logs carrying the real owner-only DACL — there is no combination of
+  // option and environment that skips Set-Acl on Windows. Read back through
+  // icacls after a no-op-adapter mint; under the old replace-the-call seam
+  // the log kept its inherited multi-ACE DACL and this fails.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-additive-'));
+  try {
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: async (logFilePath) => {
+        protectedPath = logFilePath;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const minted = await createSession(baseUrl);
+      assert.equal(minted.status, 201);
+      assert.ok(protectedPath, 'the adapter must still be invoked');
+      assertOwnerOnlyDacl(path.join(projectRoot, minted.body.log_file), 'a no-op-adapter mint');
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the injected adapter cannot bypass the post-protect verification: a removed log never mints', async () => {
+  // The seam leaves the whole post-adapter tail of the branch in force.
+  // Removing the log while the awaited adapter is pending must fail the
+  // mint closed on every platform — on win32 the never-skippable real ACL
+  // runs next and fails on the missing file (session_log_acl_failed);
+  // elsewhere the post-protect identity lstat fails
+  // (session_log_escapes_root). Green-direction ordering is deterministic
+  // (an awaiting handler cannot settle before release, pinned by the event
+  // order below); as a RED probe for a dropped await it is a detection
+  // window like the pending test's, not a proof — a non-awaiting handler
+  // re-verifies the still-present file and mints 201, caught unless its own
+  // pipeline stalled past the removal (Codex rescue r3).
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-swap-'));
   try {
     let releaseAcl;
@@ -702,13 +752,26 @@ test('the injected adapter cannot bypass the post-protect identity re-verificati
     });
     const baseUrl = await listen(server);
     try {
-      const mint = createSession(baseUrl);
+      const events = [];
+      const mint = createSession(baseUrl).then((result) => {
+        events.push('mint-settled');
+        return result;
+      });
       await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
       rmSync(protectedPath);
+      events.push('acl-released');
       releaseAcl();
       const minted = await mint;
-      assert.equal(minted.status, 409);
-      assert.equal(minted.body.error, 'session_log_escapes_root');
+      assert.deepEqual(
+        events,
+        ['acl-released', 'mint-settled'],
+        'the mint may settle only after the ACL adapter is released',
+      );
+      const expected = process.platform === 'win32'
+        ? { status: 500, error: 'session_log_acl_failed' }
+        : { status: 409, error: 'session_log_escapes_root' };
+      assert.equal(minted.status, expected.status);
+      assert.equal(minted.body.error, expected.error);
       // The failed mint leaves no session behind.
       const orphanWrite = await requestJson(baseUrl, {
         method: 'POST',

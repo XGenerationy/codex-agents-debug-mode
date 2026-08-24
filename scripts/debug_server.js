@@ -1074,7 +1074,7 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
  * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, skip ALL Windows DACL hardening inside this process (project_salt and POST /session's log file): the debug-evidence `start` parent applies `protectWindowsPrivateFile` itself after handshake/mint, because a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path (mint awaits the spawn-based async ACL).
- * @param {(logFilePath: string) => Promise<void>} [options.sessionLogAclForTests] - TEST-ONLY async adapter awaited in place of the real session-log ACL in POST /session (runs the protection branch on every platform); no production caller passes it. See the destructuring comment below for the full contract.
+ * @param {(logFilePath: string) => Promise<void>} [options.sessionLogAclForTests] - TEST-ONLY async adapter awaited BEFORE the real session-log ACL in POST /session; additive (the win32 Set-Acl still runs regardless), makes the protection branch run on every platform, and is refused outside the node:test runner. No production caller passes it. See the destructuring comment below for the full contract.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1106,20 +1106,25 @@ const createDebugServer = ({
   // challenges.
   responderPrivateKey = null,
   // TEST-ONLY seam for the session-log ACL step in POST /session: an async
-  // adapter awaited IN PLACE of protectWindowsPrivateFileAsync, so route
-  // tests can drive the mint path's fail-closed contract (adapter pending →
-  // response pending; rejected → session_log_acl_failed; resolved → 201)
-  // without spawning PowerShell (~325ms per Set-Acl). When supplied, the
-  // protection branch runs on EVERY platform so non-Windows CI exercises the
-  // same route contract. This is not a production ACL switch, and not merely
-  // by convention: construction REFUSES the option outside the node:test
-  // runner (see the NODE_TEST_CONTEXT gate below), no production caller
-  // (main(), the action's boot shim) passes it and nothing wires it to a
-  // flag or env var, an adapter still runs inside the same awaited
-  // fail-closed branch (its rejection rejects the mint), and the
-  // post-protect identity re-verification below cannot be bypassed by it.
-  // The default null keeps the real implementation and the win32-only gate
-  // exactly as before.
+  // adapter awaited BEFORE the real protection, so route tests can drive the
+  // mint path's fail-closed contract (adapter pending → response pending;
+  // rejected → session_log_acl_failed; resolved → the branch proceeds).
+  // When supplied, the protection branch runs on EVERY platform so
+  // non-Windows CI exercises the same route contract — without spawning
+  // PowerShell there (~325ms per Set-Acl).
+  //
+  // This cannot be a production ACL switch, structurally: the seam is
+  // ADDITIVE — on win32 the real protectWindowsPrivateFileAsync still runs
+  // unconditionally after the adapter, so even a caller that forges the
+  // test-runner environment and injects a no-op still mints logs carrying
+  // the real owner-only DACL, and on other platforms there is no production
+  // ACL to weaken (the branch is win32-only without an adapter). On top of
+  // that structural guarantee, construction refuses the option outside the
+  // node:test runner (NODE_TEST_CONTEXT gate below), no production caller
+  // (main(), the action's boot shim) passes it, nothing wires it to a flag
+  // or env var, and the adapter cannot bypass the awaited fail-closed
+  // mapping or the post-protect identity re-verification. The default null
+  // keeps the branch byte-for-byte at its production behavior.
   sessionLogAclForTests = null,
 } = {}) => {
   if (responderPrivateKey !== null) {
@@ -1138,16 +1143,15 @@ const createDebugServer = ({
       // first mint.
       throw new Error('invalid_session_log_acl_for_tests');
     }
-    // "Test-only" is an ENFORCED gate, not a naming convention (Codex rescue
-    // r2): the node:test runner marks its child processes with
-    // NODE_TEST_CONTEXT, and outside one this option refuses to construct
-    // rather than silently ignoring the adapter — so no production importer
-    // can hand this factory a no-op adapter and mint session logs that
-    // skipped ACL protection. Deliberately forging the runner's environment
-    // to get past this is no longer "passing an option", which is the line
-    // the gate exists to draw; the adapter still cannot bypass the awaited
-    // fail-closed mapping or the post-protect identity re-verification
-    // below even then.
+    // Enforced misuse gate (Codex rescue r2): the node:test runner marks its
+    // child processes with NODE_TEST_CONTEXT, and outside one this option
+    // refuses to construct rather than silently ignoring the adapter. The
+    // env var is forgeable (Codex rescue r3), which is why this is only the
+    // OUTER layer: the security guarantee does not rest here but on the
+    // seam being additive — the real win32 ACL below runs regardless of the
+    // adapter, so forging this environment buys a caller nothing but the
+    // extra awaited call. The gate's job is to make accidental production
+    // use a loud boot failure instead of a quietly accepted option.
     if (!process.env.NODE_TEST_CONTEXT) {
       throw new Error('session_log_acl_for_tests_outside_test_runner');
     }
@@ -1468,11 +1472,23 @@ const createDebugServer = ({
                 // hang that forced the earlier sync workaround (31c1f48);
                 // see protectWindowsPrivateFileAsync's contract.
                 //
-                // sessionLogAclForTests substitutes only the protection CALL
-                // (see its option comment): the await, the fail-closed
-                // mapping, and the identity re-verification below are the
-                // route contract under test and stay in force either way.
-                await (sessionLogAclForTests ?? protectWindowsPrivateFileAsync)(resolvedLogFile);
+                // sessionLogAclForTests is ADDITIVE, never a replacement (see
+                // its option comment): it is awaited first so route tests can
+                // hold or fail the mint deterministically, and then — on the
+                // one platform that has production ACL protection — the real
+                // call still runs unconditionally. No combination of option
+                // and environment skips Set-Acl on Windows; on other
+                // platforms the adapter exercises this branch's contract
+                // (await, fail-closed mapping, the re-verification below)
+                // that production there never runs at all. The await, the
+                // error mapping, and the identity re-verification stay in
+                // force either way.
+                if (sessionLogAclForTests !== null) {
+                  await sessionLogAclForTests(resolvedLogFile);
+                }
+                if (process.platform === 'win32') {
+                  await protectWindowsPrivateFileAsync(resolvedLogFile);
+                }
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
