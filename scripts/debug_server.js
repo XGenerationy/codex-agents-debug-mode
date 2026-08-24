@@ -1111,9 +1111,11 @@ const createDebugServer = ({
   // response pending; rejected → session_log_acl_failed; resolved → 201)
   // without spawning PowerShell (~325ms per Set-Acl). When supplied, the
   // protection branch runs on EVERY platform so non-Windows CI exercises the
-  // same route contract. This is not a production ACL switch: no production
-  // caller (main(), the action's boot shim) passes it and nothing wires it
-  // to a flag or env var, an adapter still runs inside the same awaited
+  // same route contract. This is not a production ACL switch, and not merely
+  // by convention: construction REFUSES the option outside the node:test
+  // runner (see the NODE_TEST_CONTEXT gate below), no production caller
+  // (main(), the action's boot shim) passes it and nothing wires it to a
+  // flag or env var, an adapter still runs inside the same awaited
   // fail-closed branch (its rejection rejects the mint), and the
   // post-protect identity re-verification below cannot be bypassed by it.
   // The default null keeps the real implementation and the win32-only gate
@@ -1129,11 +1131,26 @@ const createDebugServer = ({
       throw new Error('invalid_responder_private_key');
     }
   }
-  if (sessionLogAclForTests !== null && typeof sessionLogAclForTests !== 'function') {
-    // Same fail-at-boot posture as invalid_responder_private_key: a
-    // non-callable adapter would otherwise surface as an opaque 500 on the
-    // first mint.
-    throw new Error('invalid_session_log_acl_for_tests');
+  if (sessionLogAclForTests !== null) {
+    if (typeof sessionLogAclForTests !== 'function') {
+      // Same fail-at-boot posture as invalid_responder_private_key: a
+      // non-callable adapter would otherwise surface as an opaque 500 on the
+      // first mint.
+      throw new Error('invalid_session_log_acl_for_tests');
+    }
+    // "Test-only" is an ENFORCED gate, not a naming convention (Codex rescue
+    // r2): the node:test runner marks its child processes with
+    // NODE_TEST_CONTEXT, and outside one this option refuses to construct
+    // rather than silently ignoring the adapter — so no production importer
+    // can hand this factory a no-op adapter and mint session logs that
+    // skipped ACL protection. Deliberately forging the runner's environment
+    // to get past this is no longer "passing an option", which is the line
+    // the gate exists to draw; the adapter still cannot bypass the awaited
+    // fail-closed mapping or the post-protect identity re-verification
+    // below even then.
+    if (!process.env.NODE_TEST_CONTEXT) {
+      throw new Error('session_log_acl_for_tests_outside_test_runner');
+    }
   }
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling

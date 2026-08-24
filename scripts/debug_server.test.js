@@ -484,18 +484,24 @@ test('POST /session stays pending until the awaited ACL adapter resolves, and no
     });
     const baseUrl = await listen(server);
     try {
-      let mintSettled = false;
+      const events = [];
       const mint = createSession(baseUrl).then((result) => {
-        mintSettled = true;
+        events.push('mint-settled');
         return result;
       });
       await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
       const sessionId = sessionIdFromLogPath(protectedPath);
-      // Give a non-awaiting handler ample time to respond wrongly; a handler
-      // that genuinely awaits the adapter cannot settle here, so the green
-      // path is deterministic, not timing-dependent.
+      // The green direction is deterministic: an awaiting handler cannot
+      // settle before releaseAcl, so the order assertion at the end can
+      // never flake. The RED direction is a detection window, not a proof —
+      // a handler that dropped the await settles on its own schedule, and
+      // this pause plus the /log round trip below give it ample room to
+      // settle early and be caught (here and by the final order check); a
+      // pathological stall could outlast the window, which the swap test
+      // below backstops by making a non-awaited re-verification observable
+      // as the wrong status code.
       await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.equal(mintSettled, false, 'the mint response must stay pending while the ACL adapter is unsettled');
+      assert.deepEqual(events, [], 'the mint response must stay pending while the ACL adapter is unsettled');
       // The provisional slot must refuse session-log access before ACL
       // success. 425 fires before any token check, so no credential is
       // needed to prove the refusal.
@@ -506,9 +512,15 @@ test('POST /session stays pending until the awaited ACL adapter resolves, and no
       });
       assert.equal(pendingWrite.status, 425);
       assert.equal(pendingWrite.body.error, 'session_initializing');
-      assert.equal(mintSettled, false, 'probing /log must not have flushed the pending mint');
+      assert.deepEqual(events, [], 'probing /log must not have flushed the pending mint');
+      events.push('acl-released');
       releaseAcl();
       const minted = await mint;
+      assert.deepEqual(
+        events,
+        ['acl-released', 'mint-settled'],
+        'the mint may settle only after the ACL adapter is released',
+      );
       assert.equal(minted.status, 201);
       assert.equal(minted.body.session_id, sessionId);
       // Only after ACL success does the same session accept writes.
@@ -571,10 +583,16 @@ test('POST /session fails closed when the ACL adapter rejects: 500 session_log_a
 
 test('createDebugServer without a test ACL adapter keeps the production default, and a non-callable adapter fails at boot', async () => {
   // The production default is the real spawn-based ACL: with no adapter
-  // supplied the mint must still succeed — on the windows-latest CI leg this
-  // runs protectWindowsPrivateFileAsync for real (as every adapter-less mint
-  // in this file already does); elsewhere the win32-only gate skips it, as
-  // in production. The boot-time type check mirrors
+  // supplied the mint must still succeed, and on Windows the minted log must
+  // actually CARRY the owner-only DACL protectWindowsPrivateFileAsync
+  // establishes (owner FullControl, inheritance broken, every other rule
+  // removed) — asserted through icacls, a read, so this pin costs no
+  // Set-Acl beyond the one the default mint itself performs (which every
+  // adapter-less mint in this file already pays on the windows-latest leg).
+  // A 201 alone would also pass with the protection branch deleted; the
+  // DACL read is what pins the default wiring to the real implementation.
+  // On non-Windows the win32-only gate skips protection, as in production,
+  // and the 201 is the whole observable. The boot-time type check mirrors
   // invalid_responder_private_key: a non-callable adapter would otherwise
   // surface as an opaque 500 on the first mint.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-default-'));
@@ -584,6 +602,22 @@ test('createDebugServer without a test ACL adapter keeps the production default,
     try {
       const minted = await createSession(baseUrl);
       assert.equal(minted.status, 201, 'the default (real) ACL path must still mint');
+      if (process.platform === 'win32') {
+        const logPath = path.join(projectRoot, minted.body.log_file);
+        const icacls = spawnSync('icacls', [logPath], { encoding: 'utf8', windowsHide: true });
+        assert.equal(icacls.status, 0, `icacls must read the minted log's DACL: ${icacls.stderr}`);
+        // Grant lines are the ones carrying an ACE (`principal:(...)`).
+        // Exactly one, for the current user, with FullControl — matching by
+        // username rather than localized well-known principal names.
+        const grants = icacls.stdout.split(/\r?\n/).filter((line) => line.includes(':('));
+        assert.equal(grants.length, 1, `the default mint must leave an owner-only DACL; got ${JSON.stringify(icacls.stdout)}`);
+        const user = String(process.env.USERNAME || '');
+        assert.ok(user, 'USERNAME must be set on Windows for the DACL owner assertion');
+        assert.ok(
+          grants[0].toLowerCase().includes(`\\${user.toLowerCase()}:`) && grants[0].includes('(F)'),
+          `the single ACE must grant the current user FullControl; got ${JSON.stringify(grants[0])}`,
+        );
+      }
     } finally {
       await close(server);
     }
@@ -592,6 +626,100 @@ test('createDebugServer without a test ACL adapter keeps the production default,
       /invalid_session_log_acl_for_tests/,
       'a non-callable test adapter must be rejected at construction',
     );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the sessionLogAclForTests seam is refused outside the node:test runner (no production ACL switch)', async () => {
+  // The test-only claim is an ENFORCED gate, not a naming convention (Codex
+  // rescue r2): the node:test runner marks its child processes with
+  // NODE_TEST_CONTEXT, and construction with an adapter fails closed without
+  // it, so a production importer cannot hand createDebugServer a no-op
+  // adapter and mint unprotected 201s. Proven from a plain `node -e` child
+  // with NODE_TEST_CONTEXT scrubbed — the same child then constructs
+  // WITHOUT the adapter to pin that the gate rejects only the seam, never
+  // production boot. deferWindowsPrivateFileProtection keeps the child's
+  // construction off PowerShell; the gate fires before any route exists, so
+  // defer changes nothing it guards.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-gate-'));
+  try {
+    const script = `
+      const { createDebugServer } = require(${JSON.stringify(path.join(__dirname, 'debug_server.js'))});
+      const options = {
+        projectRoot: ${JSON.stringify(projectRoot)},
+        token: ${JSON.stringify(TEST_LAUNCH_TOKEN)},
+        deferWindowsPrivateFileProtection: true,
+      };
+      try {
+        createDebugServer({ ...options, sessionLogAclForTests: async () => {} });
+        console.log('adapter:constructed');
+      } catch (error) {
+        console.log('adapter:threw:' + error.message);
+      }
+      createDebugServer(options);
+      console.log('plain:constructed');
+    `;
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env, windowsHide: true });
+    assert.equal(child.status, 0, `the gate probe child must exit cleanly: ${child.stderr}`);
+    assert.ok(
+      child.stdout.includes('adapter:threw:session_log_acl_for_tests_outside_test_runner'),
+      `constructing with the adapter outside the test runner must fail closed; got ${JSON.stringify(child.stdout)}`,
+    );
+    assert.ok(
+      child.stdout.includes('plain:constructed'),
+      `the gate must not reject adapter-less production construction; got ${JSON.stringify(child.stdout)}`,
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the injected adapter cannot bypass the post-protect identity re-verification', async () => {
+  // The seam substitutes only the protection CALL; the identity re-check
+  // after it is the route contract and must still fail the mint closed when
+  // the file the adapter "protected" is no longer the file the handler
+  // created. Removing the log while the adapter is pending makes the
+  // post-protect lstat fail on every platform, so an awaited adapter
+  // deterministically yields 409 session_log_escapes_root — and doubles as
+  // an await backstop: a handler that did not await the adapter would have
+  // re-verified the still-present file long before the removal and minted
+  // a 201 instead.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-swap-'));
+  try {
+    let releaseAcl;
+    const aclGate = new Promise((resolve) => { releaseAcl = resolve; });
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: (logFilePath) => {
+        protectedPath = logFilePath;
+        return aclGate;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const mint = createSession(baseUrl);
+      await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
+      rmSync(protectedPath);
+      releaseAcl();
+      const minted = await mint;
+      assert.equal(minted.status, 409);
+      assert.equal(minted.body.error, 'session_log_escapes_root');
+      // The failed mint leaves no session behind.
+      const orphanWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: sessionIdFromLogPath(protectedPath), msg: 'probe after swapped log' },
+      });
+      assert.equal(orphanWrite.status, 404);
+      assert.equal(orphanWrite.body.error, 'unknown_session');
+    } finally {
+      await close(server);
+    }
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
