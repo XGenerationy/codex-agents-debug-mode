@@ -476,18 +476,28 @@ const waitUntil = async (predicate, message, timeoutMs = 5000) => {
 // is exactly the principal the ACL helper grants, so equality on it is the
 // full token-identity assertion.
 const assertOwnerOnlyDacl = (filePath, label) => {
-  const psPath = `'${filePath.replace(/'/g, "''")}'`;
+  // .NET BCL calls, not the Get-Acl cmdlet, and the path as UTF-16 base64 —
+  // the invocation shape of buildProtectWindowsPrivateFileArgs and the
+  // windowsAclIsCurrentUserOnly sibling. On hosted windows runners the pwsh
+  // PSModulePath leaks into spawned Windows PowerShell 5.1 sessions and the
+  // Get-Acl CMDLET dies on Microsoft.PowerShell.Security module autoload
+  // ("module could not be loaded", exit 1) while the BCL path runs clean —
+  // observed on the Validate matrix, which first executed for this branch
+  // once the PR became mergeable.
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
   const script = [
     '$ErrorActionPreference = "Stop"',
-    `$acl = Get-Acl -LiteralPath ${psPath}`,
-    '$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))',
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
     '[Console]::WriteLine("count=" + $rules.Count)',
     'foreach ($r in $rules) { [Console]::WriteLine("rule=" + $r.IdentityReference.Value + "|" + $r.FileSystemRights + "|" + $r.AccessControlType) }',
-    '[Console]::WriteLine("me=" + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+    '[Console]::WriteLine("me=" + $sid.Value)',
   ].join('; ');
   const probe = spawnSync(
     resolvePowerShellExecutable(),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     // Same 15s bound as every other PowerShell probe here: a hung
     // powershell.exe blocks the test worker — spawnSync cannot be
     // interrupted by the surrounding test timeout.
