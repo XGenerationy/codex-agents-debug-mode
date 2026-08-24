@@ -440,11 +440,13 @@ test('deferred Windows salt protection still persists project_salt and agrees on
 // replacing the former source-text wiring pin, which asserted the handler's
 // SOURCE contained `await protectWindowsPrivateFileAsync(...)` but verified
 // nothing about the route contract). The seam is `sessionLogAclForTests`: an
-// async adapter createDebugServer awaits IN PLACE of the real spawn-based
-// ACL, so these tests observe the mint route's fail-closed behavior without
-// spawning PowerShell (~325ms per Set-Acl). When an adapter is supplied the
-// protection branch runs on every platform, so the non-Windows CI legs
-// exercise the same route contract the win32 branch enforces in production.
+// async adapter createDebugServer awaits BEFORE the real spawn-based ACL —
+// additive, never a replacement (on win32 the real Set-Acl still runs after
+// a resolving adapter) — so these tests observe the mint route's fail-closed
+// behavior, and the non-Windows legs do it without spawning PowerShell
+// (~325ms per Set-Acl). When an adapter is supplied the protection branch
+// runs on every platform, so the non-Windows CI legs exercise the same
+// route contract the win32 branch enforces in production.
 // The real implementation's own semantics stay covered in
 // pr_closeout_fs.test.js, and every adapter-less mint in this file (on the
 // windows-latest leg) exercises the production default end to end.
@@ -465,25 +467,40 @@ const waitUntil = async (predicate, message, timeoutMs = 5000) => {
 
 // win32-only: assert `filePath` carries the owner-only DACL
 // protectWindowsPrivateFile establishes (single ACE, current identity,
-// FullControl), read back through icacls — a read, no Set-Acl. The expected
-// identity comes from `whoami` (the process TOKEN's domain\user, which is
-// what the ACL helper resolves via WindowsIdentity::GetCurrent), NOT from
-// %USERNAME% — the two diverge on hosts whose token identity differs from
-// the login env (Codex rescue r3 observed exactly that in its sandbox).
+// FullControl, Allow), read back through one PowerShell Get-Acl — a read, no
+// Set-Acl. Compared by SID, not by account name: names localize and a name
+// match can be forged by a same-named account in another domain, while
+// whoami's domain qualification itself varies by host (Codex rescue r3/r4
+// observed both a token identity diverging from %USERNAME% and a
+// domain-stripped whoami). The SID from WindowsIdentity::GetCurrent().User
+// is exactly the principal the ACL helper grants, so equality on it is the
+// full token-identity assertion.
 const assertOwnerOnlyDacl = (filePath, label) => {
-  const whoami = spawnSync('whoami', [], { encoding: 'utf8', windowsHide: true });
-  assert.equal(whoami.status, 0, `whoami must resolve the process token identity: ${whoami.stderr}`);
-  const identity = whoami.stdout.trim().toLowerCase();
-  assert.ok(identity, 'whoami must print a domain\\user identity');
-  const icacls = spawnSync('icacls', [filePath], { encoding: 'utf8', windowsHide: true });
-  assert.equal(icacls.status, 0, `icacls must read the DACL of ${label}'s log: ${icacls.stderr}`);
-  // Grant lines are the ones carrying an ACE (`principal:(...)`).
-  const grants = icacls.stdout.split(/\r?\n/).filter((line) => line.includes(':('));
-  assert.equal(grants.length, 1, `${label} must leave an owner-only DACL; got ${JSON.stringify(icacls.stdout)}`);
-  assert.ok(
-    grants[0].toLowerCase().includes(`${identity}:`) && grants[0].includes('(F)'),
-    `the single ACE must grant the token identity (${identity}) FullControl; got ${JSON.stringify(grants[0])}`,
+  const psPath = `'${filePath.replace(/'/g, "''")}'`;
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    `$acl = Get-Acl -LiteralPath ${psPath}`,
+    '$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))',
+    '[Console]::WriteLine("count=" + $rules.Count)',
+    'foreach ($r in $rules) { [Console]::WriteLine("rule=" + $r.IdentityReference.Value + "|" + $r.FileSystemRights + "|" + $r.AccessControlType) }',
+    '[Console]::WriteLine("me=" + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+  ].join('; ');
+  const probe = spawnSync(
+    resolvePowerShellExecutable(),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    { encoding: 'utf8', windowsHide: true },
   );
+  assert.equal(probe.status, 0, `the DACL probe for ${label}'s log must succeed: ${probe.stderr}`);
+  const lines = probe.stdout.split(/\r?\n/).filter(Boolean);
+  const tokenSid = lines.find((line) => line.startsWith('me='))?.slice(3);
+  assert.ok(tokenSid && tokenSid.startsWith('S-1-'), `the probe must report the token SID; got ${JSON.stringify(probe.stdout)}`);
+  assert.ok(lines.includes('count=1'), `${label} must leave an owner-only DACL (exactly one ACE); got ${JSON.stringify(probe.stdout)}`);
+  const rules = lines.filter((line) => line.startsWith('rule=')).map((line) => line.slice(5).split('|'));
+  assert.equal(rules.length, 1, `expected exactly one reported ACE; got ${JSON.stringify(probe.stdout)}`);
+  const [sid, rights, type] = rules[0];
+  assert.equal(sid, tokenSid, `the single ACE must be granted to the process token SID, no other principal`);
+  assert.ok(rights.includes('FullControl'), `the ACE must grant FullControl; got ${JSON.stringify(rights)}`);
+  assert.equal(type, 'Allow');
 };
 
 test('POST /session stays pending until the awaited ACL adapter resolves, and no usable session exists before then', async () => {
