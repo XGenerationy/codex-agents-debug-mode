@@ -1074,6 +1074,7 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
  * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, skip ALL Windows DACL hardening inside this process (project_salt and POST /session's log file): the debug-evidence `start` parent applies `protectWindowsPrivateFile` itself after handshake/mint, because a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path (mint awaits the spawn-based async ACL).
+ * @param {(logFilePath: string) => Promise<void>} [options.sessionLogAclForTests] - TEST-ONLY async adapter awaited in place of the real session-log ACL in POST /session (runs the protection branch on every platform); no production caller passes it. See the destructuring comment below for the full contract.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1104,6 +1105,20 @@ const createDebugServer = ({
   // Omitted by every existing caller (CLI, viewer), which simply never
   // challenges.
   responderPrivateKey = null,
+  // TEST-ONLY seam for the session-log ACL step in POST /session: an async
+  // adapter awaited IN PLACE of protectWindowsPrivateFileAsync, so route
+  // tests can drive the mint path's fail-closed contract (adapter pending →
+  // response pending; rejected → session_log_acl_failed; resolved → 201)
+  // without spawning PowerShell (~325ms per Set-Acl). When supplied, the
+  // protection branch runs on EVERY platform so non-Windows CI exercises the
+  // same route contract. This is not a production ACL switch: no production
+  // caller (main(), the action's boot shim) passes it and nothing wires it
+  // to a flag or env var, an adapter still runs inside the same awaited
+  // fail-closed branch (its rejection rejects the mint), and the
+  // post-protect identity re-verification below cannot be bypassed by it.
+  // The default null keeps the real implementation and the win32-only gate
+  // exactly as before.
+  sessionLogAclForTests = null,
 } = {}) => {
   if (responderPrivateKey !== null) {
     // Fail at boot, not on the first challenged read: an unusable signing key
@@ -1113,6 +1128,12 @@ const createDebugServer = ({
       || responderPrivateKey.asymmetricKeyType !== 'ed25519') {
       throw new Error('invalid_responder_private_key');
     }
+  }
+  if (sessionLogAclForTests !== null && typeof sessionLogAclForTests !== 'function') {
+    // Same fail-at-boot posture as invalid_responder_private_key: a
+    // non-callable adapter would otherwise surface as an opaque 500 on the
+    // first mint.
+    throw new Error('invalid_session_log_acl_for_tests');
   }
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
@@ -1413,7 +1434,8 @@ const createDebugServer = ({
             // process timed out on hosted windows-latest (POST /session → 500
             // after 15s; Validate Node 20, 2026-08-16).
             await handle.close();
-            if (process.platform === 'win32' && !deferWindowsPrivateFileProtection) {
+            if (!deferWindowsPrivateFileProtection
+              && (sessionLogAclForTests !== null || process.platform === 'win32')) {
               try {
                 // CLI / in-process servers apply the DACL here. The action's
                 // detached boot shim sets deferWindowsPrivateFileProtection so
@@ -1428,7 +1450,12 @@ const createDebugServer = ({
                 // variant is spawn-based and immune to the pipe-inheritance
                 // hang that forced the earlier sync workaround (31c1f48);
                 // see protectWindowsPrivateFileAsync's contract.
-                await protectWindowsPrivateFileAsync(resolvedLogFile);
+                //
+                // sessionLogAclForTests substitutes only the protection CALL
+                // (see its option comment): the await, the fail-closed
+                // mapping, and the identity re-verification below are the
+                // route contract under test and stay in force either way.
+                await (sessionLogAclForTests ?? protectWindowsPrivateFileAsync)(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
@@ -1441,8 +1468,9 @@ const createDebugServer = ({
               // Same predicate as the deferred parent's re-verification
               // (actions/debug-evidence/support.js applyStartWindowsAcls) so
               // one contract cannot be hardened on one half and left weaker
-              // on the other. In THIS win32-only branch the ino term is what
-              // rejects the recreate; the birth-time term the shared
+              // on the other. In this branch (win32-only in production; any
+              // platform under an injected test adapter) the ino term is
+              // what rejects the recreate; the birth-time term the shared
               // predicate adds is a POSIX inode-reuse layer inherited from
               // it, not a Windows defense (NTFS file tunneling lets a
               // same-name recreate keep the original's creation time).

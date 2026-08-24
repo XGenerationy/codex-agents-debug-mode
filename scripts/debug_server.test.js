@@ -436,25 +436,165 @@ test('deferred Windows salt protection still persists project_salt and agrees on
   }
 });
 
-test('POST /session hardens the session log via the awaited async ACL, never the sync variant', async () => {
-  // Wiring pin, deliberately source-level: the branch is win32-only and its
-  // failure mode is a concurrency stall (execFileSync froze the single-
-  // threaded server for the ACL's full 15s budget, timing out concurrent
-  // live reads — audit V1a), which no fast deterministic test can observe.
-  // The async variant's own semantics — spawn-based, settles on 'exit',
-  // immune to the pipe-inheritance hang that forced the old sync workaround
-  // (31c1f48) — are behaviorally covered in pr_closeout_fs.test.js; this pin
-  // guards the handler's side of the contract: the request path awaits the
-  // async entry point and never calls the blocking one.
-  const source = await readFile(path.join(__dirname, 'debug_server.js'), 'utf8');
-  assert.ok(
-    source.includes('await protectWindowsPrivateFileAsync(resolvedLogFile)'),
-    'the mint handler must await the spawn-based async ACL',
-  );
-  assert.ok(
-    !source.includes('protectWindowsPrivateFile(resolvedLogFile)'),
-    'the mint handler must not call the event-loop-blocking sync ACL',
-  );
+// Route-level coverage for the awaited session-log ACL step (issue #9,
+// replacing the former source-text wiring pin, which asserted the handler's
+// SOURCE contained `await protectWindowsPrivateFileAsync(...)` but verified
+// nothing about the route contract). The seam is `sessionLogAclForTests`: an
+// async adapter createDebugServer awaits IN PLACE of the real spawn-based
+// ACL, so these tests observe the mint route's fail-closed behavior without
+// spawning PowerShell (~325ms per Set-Acl). When an adapter is supplied the
+// protection branch runs on every platform, so the non-Windows CI legs
+// exercise the same route contract the win32 branch enforces in production.
+// The real implementation's own semantics stay covered in
+// pr_closeout_fs.test.js, and every adapter-less mint in this file (on the
+// windows-latest leg) exercises the production default end to end.
+
+// The adapter receives the resolved log-file path (`debug-<sessionId>.log`),
+// which is the only way a test can learn the session id BEFORE the mint
+// response reveals it — exactly what probing the pending state needs.
+const sessionIdFromLogPath = (logFilePath) =>
+  path.basename(logFilePath).replace(/^debug-/, '').replace(/\.log$/, '');
+
+const waitUntil = async (predicate, message, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+test('POST /session stays pending until the awaited ACL adapter resolves, and no usable session exists before then', async () => {
+  // Criterion: the mint response must not publish a session credential until
+  // asynchronous ACL protection has succeeded. The credential's ONLY channel
+  // is the 201 body, so "response still pending" is itself the credential
+  // half of the guarantee; the /log probe below covers the access half — the
+  // reserved slot must refuse session-log writes while the ACL is pending.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-pending-'));
+  try {
+    let releaseAcl;
+    const aclGate = new Promise((resolve) => { releaseAcl = resolve; });
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: (logFilePath) => {
+        protectedPath = logFilePath;
+        return aclGate;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      let mintSettled = false;
+      const mint = createSession(baseUrl).then((result) => {
+        mintSettled = true;
+        return result;
+      });
+      await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
+      const sessionId = sessionIdFromLogPath(protectedPath);
+      // Give a non-awaiting handler ample time to respond wrongly; a handler
+      // that genuinely awaits the adapter cannot settle here, so the green
+      // path is deterministic, not timing-dependent.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(mintSettled, false, 'the mint response must stay pending while the ACL adapter is unsettled');
+      // The provisional slot must refuse session-log access before ACL
+      // success. 425 fires before any token check, so no credential is
+      // needed to prove the refusal.
+      const pendingWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId, msg: 'probe during pending ACL' },
+      });
+      assert.equal(pendingWrite.status, 425);
+      assert.equal(pendingWrite.body.error, 'session_initializing');
+      assert.equal(mintSettled, false, 'probing /log must not have flushed the pending mint');
+      releaseAcl();
+      const minted = await mint;
+      assert.equal(minted.status, 201);
+      assert.equal(minted.body.session_id, sessionId);
+      // Only after ACL success does the same session accept writes.
+      const write = await recordEvent(baseUrl, minted.body);
+      assert.equal(write.status, 202);
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /session fails closed when the ACL adapter rejects: 500 session_log_acl_failed, slot and log file reclaimed', async () => {
+  // maxSessions: 1 makes the reclamation observable at the route level — a
+  // leaked slot from the failed mint would make the follow-up mint 429
+  // instead of 201.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-reject-'));
+  try {
+    let aclMode = 'reject';
+    let rejectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      limits: { maxSessions: 1 },
+      sessionLogAclForTests: async (logFilePath) => {
+        if (aclMode === 'reject') {
+          rejectedPath = logFilePath;
+          throw new Error('injected ACL failure');
+        }
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const failed = await createSession(baseUrl);
+      assert.equal(failed.status, 500);
+      assert.equal(failed.body.error, 'session_log_acl_failed');
+      assert.ok(rejectedPath, 'the rejecting adapter must have been invoked');
+      // No usable session survives the failure: the slot is gone (404, not
+      // 425) and the created log file was removed, so nothing on disk or in
+      // the session table outlives the failed protection.
+      const orphanWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: sessionIdFromLogPath(rejectedPath), msg: 'probe after rejected ACL' },
+      });
+      assert.equal(orphanWrite.status, 404);
+      assert.equal(orphanWrite.body.error, 'unknown_session');
+      assert.equal(existsSync(rejectedPath), false, 'the unprotected log file must not remain on disk');
+      aclMode = 'resolve';
+      const recovered = await createSession(baseUrl);
+      assert.equal(recovered.status, 201, `the failed mint must not leak its maxSessions slot; got ${JSON.stringify(recovered.body)}`);
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('createDebugServer without a test ACL adapter keeps the production default, and a non-callable adapter fails at boot', async () => {
+  // The production default is the real spawn-based ACL: with no adapter
+  // supplied the mint must still succeed — on the windows-latest CI leg this
+  // runs protectWindowsPrivateFileAsync for real (as every adapter-less mint
+  // in this file already does); elsewhere the win32-only gate skips it, as
+  // in production. The boot-time type check mirrors
+  // invalid_responder_private_key: a non-callable adapter would otherwise
+  // surface as an opaque 500 on the first mint.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-default-'));
+  try {
+    const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const baseUrl = await listen(server);
+    try {
+      const minted = await createSession(baseUrl);
+      assert.equal(minted.status, 201, 'the default (real) ACL path must still mint');
+    } finally {
+      await close(server);
+    }
+    assert.throws(
+      () => createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN, sessionLogAclForTests: 'not-a-function' }),
+      /invalid_session_log_acl_for_tests/,
+      'a non-callable test adapter must be rejected at construction',
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
