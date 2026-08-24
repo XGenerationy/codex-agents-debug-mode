@@ -1941,11 +1941,17 @@ const openLogNoFollow = async (
       let preProtectInfo;
       try {
         preProtectInfo = fileIdentity(await handle.stat({ bigint: true }));
-      } catch {
+      } catch (error) {
         // Same close-then-refuse as the post-protection lstat below: the
         // callers receive only the error, so the descriptor must not leak.
+        // The original failure rides along as `cause` — EBADF/EIO/EPERM and
+        // fileIdentity's TypeError each demand a different response, and a
+        // bare message would erase which one fired (Qodo PR #10 review).
         await handle.close().catch(() => undefined);
-        throw new Error(`Refusing to write evidence log with an unverifiable identity: ${target}`);
+        throw new Error(
+          `Refusing to write evidence log with an unverifiable identity: ${target}`,
+          { cause: error },
+        );
       }
       try {
         protectWindowsPrivateFile(target);

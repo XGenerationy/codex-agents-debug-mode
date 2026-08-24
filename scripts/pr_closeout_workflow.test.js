@@ -733,7 +733,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       fstatFn: () => lockStat({ ino: 0n }),
       readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
   // Zero on only ONE side is refused too: a pre-open snapshot with no usable
   // identity cannot be compared against anything, whichever side reports it.
@@ -745,7 +745,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       fstatFn: () => lockStat({ ino: 7n }),
       readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
   assert.throws(
     () => readOutputDirLockFileSync('lock', {
@@ -755,7 +755,7 @@ test('readOutputDirLockFileSync refuses a lock whose identity the filesystem can
       fstatFn: () => lockStat({ ino: 0n }),
       readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
 });
 
@@ -801,7 +801,7 @@ test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too
       lstatFn: async () => lockStat({ ino: 0n }),
       openFn: async () => handleFor(lockStat({ ino: 0n })),
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
   // Each side's zero term is exercised on its OWN, matching the sync
   // counterpart. The both-zero case above cannot isolate either: with both
@@ -821,14 +821,14 @@ test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too
       lstatFn: async () => lockStat({ ino: 0n }),
       openFn: async () => handleFor(lockStat({ ino: 7n })),
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
   await assert.rejects(
     readOutputDirLockFile('lock', {
       lstatFn: async () => lockStat({ ino: 7n }),
       openFn: async () => handleFor(lockStat({ ino: 0n })),
     }),
-    /Evidence lock changed while opening/,
+    /unusable filesystem identity/,
   );
   await assert.rejects(
     readOutputDirLockFile('lock', {

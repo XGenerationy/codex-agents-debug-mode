@@ -265,14 +265,22 @@ const outputDirLockHolder = (text) => {
 // pre-open snapshot is unusable; the descriptor's is), matching the same
 // pairing in pr_closeout.js's config reader -- but no future reader should
 // mistake either one for independently load-bearing.
-const lockIdentityBindFailed = (before, info) => (
-  !info.isFile
-  || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
-  || info.ino === '0'
-  || before.ino === '0'
-  || info.dev !== before.dev
-  || info.ino !== before.ino
-);
+// Returns the bind failure's reason so the readers can reject with a
+// message that names the actual condition: a zero-identity mount is an
+// environment fact an operator can act on (avoid/relocate the output
+// directory), while the remaining terms mean the lock changed under us —
+// conflating the two sent operators hunting TOCTOU swaps that never
+// happened (Qodo PR #10 review).
+const lockIdentityBindFailure = (before, info) => {
+  if (before.ino === '0' || info.ino === '0') return 'unusable-identity';
+  if (
+    !info.isFile
+    || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+    || info.dev !== before.dev
+    || info.ino !== before.ino
+  ) return 'changed';
+  return null;
+};
 
 /**
  * Synchronous counterpart to readOutputDirLockFile for the process `exit`
@@ -300,8 +308,12 @@ const readOutputDirLockFileSync = (lockPath, {
   const descriptor = openFn(lockPath, flags);
   try {
     const info = fileIdentity(fstatFn(descriptor, { bigint: true }));
-    // lockIdentityBindFailed carries the full zero-identity rationale.
-    if (lockIdentityBindFailed(before, info)) {
+    // lockIdentityBindFailure carries the full zero-identity rationale.
+    const bindFailure = lockIdentityBindFailure(before, info);
+    if (bindFailure === 'unusable-identity') {
+      throw new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+    }
+    if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
     }
     const buffer = Buffer.alloc(info.size);
@@ -343,7 +355,11 @@ const readOutputDirLockFile = async (lockPath, {
   try {
     const info = fileIdentity(await handle.stat({ bigint: true }));
     // Same shared bind and rationale as the sync reader above.
-    if (lockIdentityBindFailed(before, info)) {
+    const bindFailure = lockIdentityBindFailure(before, info);
+    if (bindFailure === 'unusable-identity') {
+      throw new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+    }
+    if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
     }
     const buffer = Buffer.alloc(info.size);
