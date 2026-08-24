@@ -112,8 +112,10 @@ const payloadFiles = payloadEntries.flatMap(walk).sort();
 // 37 -> 41: pr_closeout_retry.js + gate_retry_cli.js (workflow_run retry /
 // base-branch-drift gate re-verification, chatgpt-codex-connector PR7
 // #6YaxWe / #6YbMwY) plus their two test modules.
-if (payloadFiles.length !== 41) {
-  failures.push(`Expected 41 skill payload files, found ${payloadFiles.length}`);
+// 41 -> 43: debug_report.js (single-session CI/Step Summary renderer,
+// cycle 4 debug-evidence action) + debug_report.test.js.
+if (payloadFiles.length !== 43) {
+  failures.push(`Expected 43 skill payload files, found ${payloadFiles.length}`);
 }
 
 try {

@@ -330,3 +330,47 @@ test('agent mode --live without a running collector fails with one clean line, e
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('a live listener that fails the identity probe is reported, not silenced as collector_not_running', async () => {
+  // probeServer returns null for every failure, so folding them all into
+  // collector_not_running suppressed the TUI fallback warning (that code is
+  // the one case it stays silent for) and told the operator nothing was
+  // running while a process was demonstrably bound to the recorded port.
+  const { root } = await seedRoot();
+  const squatter = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ service: 'some-other-service' }));
+  });
+  await new Promise((resolve) => squatter.listen(0, '127.0.0.1', resolve));
+  try {
+    await writeFile(path.join(root, '.debug', 'collector_port'), String(squatter.address().port), 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'launch-token', 'utf8');
+    const result = await runViewer([root, '--session', 's1', '--live']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, 'collector_identity_unverified\n');
+  } finally {
+    await new Promise((resolve) => squatter.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('stale routing files with nothing listening stay the silent offline case', async () => {
+  // The collector never unlinks collector_port/collector_token, not even on a
+  // clean exit (only collector_claim is released), so stale files plus a
+  // refused connection are the ORDINARY offline state: it must keep the quiet
+  // collector_not_running fallback rather than warning on every such session.
+  const { root } = await seedRoot();
+  const probe = http.createServer(() => {});
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const deadPort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  try {
+    await writeFile(path.join(root, '.debug', 'collector_port'), String(deadPort), 'utf8');
+    await writeFile(path.join(root, '.debug', 'collector_token'), 'launch-token', 'utf8');
+    const result = await runViewer([root, '--session', 's1', '--live']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, 'collector_not_running\n');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -65,6 +65,19 @@ jobs:
         run: npm run scan:suppressions
 
       - name: Run tests
+        timeout-minutes: 40
+        env:
+          # HEADROOM ONLY, and the original cause is gone: the boot shim now
+          # defers ALL PowerShell DACL work to the `start` parent, so nothing
+          # blocks before listen() (the old rationale — "collector boot pays
+          # for PowerShell ACL" — described the pre-defer design; audit V2d).
+          # The widened Windows wait is kept purely for hosted-runner
+          # process-start variance, at a stated cost: a regression that
+          # reintroduces pre-listen blocking work passes Windows CI for up to
+          # 60s per handshake instead of failing at 15s like Ubuntu. The
+          # assertion is still "the shim reported startup"; only the wait is
+          # longer.
+          DEBUG_ACTION_READY_TIMEOUT_MS: ${{ runner.os == 'Windows' && '60000' || '15000' }}
         run: npm test
 
       - name: Smoke Bash installer

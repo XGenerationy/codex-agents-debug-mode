@@ -6,7 +6,7 @@
 // three renderers; the no-flag default is TTY-aware: table for humans,
 // JSON (schema: 1) for pipes, because agents must never scrape tables.
 const {
-  escapeEvidenceText,
+  escapeMarkdownText,
   foldHypotheses,
   readSessionFile,
   resolveSessionRef,
@@ -122,34 +122,12 @@ const renderJson = (diff) => `${JSON.stringify(diff, null, 2)}\n`;
 // evidence that gets pasted into PRs/chat, so raw interpolation would let
 // log content forge headings, verdicts, or break out of a backtick code
 // span (report structure must reflect the engine, never log content).
-// escapeEvidenceText (the shared core helper, also used by the viewer TUI)
-// turns embedded newlines/quotes/control chars into their escaped literal
-// form (a real newline becomes the two printable characters "\" + "n",
-// never an actual line break) — this is the single source of truth for
-// that layer. Two markdown/table-specific additions on top: backticks are
-// escaped separately since JSON escaping does not touch them and this text
-// can land inside a backtick code span, and the box-drawing pipe `│`
-// becomes `¦` so a crafted id cannot mimic table cell borders — the docs
-// promise report structure NEVER reflects log content, without
-// qualification. JSON output needs none of this — JSON.stringify(diff, ...)
-// already escapes everything correctly there.
-// Markdown-inline-structural punctuation is backslash-escaped so untrusted
-// log content renders as literal text in the Markdown report (the report is
-// what gets pasted into PRs): emphasis/strong (* _), code spans (`), links
-// and images ([ ] ( ) !), and raw-HTML delimiters (< > & — XSS if a consumer
-// renders md with HTML enabled). These are exactly the characters that can
-// forge inline Markdown structure; other ASCII punctuation (= : / , " ' etc.)
-// has no inline structural meaning and is left untouched to keep the report
-// readable. The box-drawing pipe is the one exception: it must become a
+// The transform itself is owned by debug_evidence.js (escapeMarkdownText).
+// Unlike Markdown punctuation, the box-drawing pipe must become a
 // DIFFERENT character (¦), not just a backslashed one, because the TABLE
 // renderer's cell borders are real │ that the terminal prints regardless of
 // a preceding backslash. JSON output needs none of this.
-const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&]/g;
-function escapeText(value) {
-  return escapeEvidenceText(value)
-    .replaceAll('│', '¦')
-    .replace(MARKDOWN_PUNCTUATION, '\\$&');
-}
+const escapeText = escapeMarkdownText;
 
 // Stored status is untrusted log content, and older logs can carry a
 // non-string value (foldHypotheses copies parsed.status verbatim). Escape

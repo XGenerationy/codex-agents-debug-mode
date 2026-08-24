@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, generateKeyPairSync, verify } = require('node:crypto');
 const { constants, existsSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } = require('node:fs/promises');
 const http = require('node:http');
@@ -13,6 +13,7 @@ const {
   COLLECTOR_VERSION,
   REDACTION_MAX_DEPTH,
   RequestError,
+  canonicalResponderRecord,
   createDebugServer,
   createRedactionContext,
   isInsideRoot,
@@ -27,6 +28,8 @@ const {
   redactEventForAppend,
   redactEventValue,
   resolvePowerShellExecutable,
+  resolveSessionIdleTimeoutMs,
+  hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
 
@@ -105,6 +108,14 @@ const createSession = (baseUrl, name = 'Fix Null User ID', headers = {}) =>
     },
     body: { name },
   });
+
+const sessionLogsPath = (session, extraQuery = '') => {
+  const params = new URLSearchParams(
+    extraQuery.startsWith('?') ? extraQuery.slice(1) : extraQuery,
+  );
+  params.set('client_id', session.client_id);
+  return `/sessions/${session.session_id}/logs?${params.toString()}`;
+};
 
 const recordEvent = (baseUrl, session, msg = 'Function entry') =>
   requestJson(baseUrl, {
@@ -196,6 +207,7 @@ const stopCli = (child) => {
       spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
         stdio: 'ignore',
         windowsHide: true,
+        timeout: 15_000,
       });
     } else {
       child.kill('SIGKILL');
@@ -245,7 +257,10 @@ const GIT_BASH = process.platform === 'win32'
   ? (process.env.OMO_CODEX_GIT_BASH_PATH || 'C:\\Program Files\\Git\\bin\\bash.exe')
   : (process.env.OMO_CODEX_SHELL_PATH || 'bash');
 
-const bashProbe = spawnSync(GIT_BASH, ['-c', 'true']);
+const bashProbe = spawnSync(GIT_BASH, ['-c', 'true'], {
+  timeout: 15_000,
+  windowsHide: true,
+});
 const bashAvailable = !bashProbe.error && bashProbe.status === 0;
 
 // Probe file-symlink privilege once, eagerly, so the dependent test below
@@ -272,19 +287,42 @@ try {
 const toBashPath = (nativePath) => {
   if (process.platform !== 'win32') return nativePath;
   const args = ['-u', nativePath];
-  let converted = spawnSync('cygpath', args, { encoding: 'utf8' });
+  let converted = spawnSync('cygpath', args, { encoding: 'utf8', timeout: 15_000, windowsHide: true });
   if (converted.error?.code === 'ENOENT') {
     // Git for Windows only puts `cmd`/`bin` (bash.exe) on PATH by default;
     // cygpath lives in `usr\bin` alongside the rest of the MSYS toolchain and
     // is typically not on PATH. Fall back to the well-known install root
     // pr_closeout_process.js already trusts for bash.exe.
-    converted = spawnSync('C:\\Program Files\\Git\\usr\\bin\\cygpath.exe', args, { encoding: 'utf8' });
+    converted = spawnSync('C:\\Program Files\\Git\\usr\\bin\\cygpath.exe', args, {
+      encoding: 'utf8',
+      timeout: 15_000,
+      windowsHide: true,
+    });
   }
   if (converted.error || converted.status !== 0) {
     throw converted.error || new Error(`cygpath failed: ${converted.stderr}`);
   }
   return converted.stdout.trim();
 };
+
+test('hashBufferSha256 matches crypto SHA-256 over chunked buffers and yields between strides', async () => {
+  const empty = await hashBufferSha256(Buffer.alloc(0));
+  assert.equal(empty, createHash('sha256').update(Buffer.alloc(0)).digest('hex'));
+  const payload = Buffer.alloc(200 * 1024, 0x5a);
+  // The yield is what keeps a 16 MiB hash from stalling GET /sessions/:id/logs,
+  // and a digest comparison cannot see it: deleting the setImmediate leaves
+  // every digest identical. An immediate queued BEFORE the hash starts runs
+  // first ONLY if the hash really awaits setImmediate between strides —
+  // without the yield the async body settles on the microtask queue, which
+  // drains before the check phase is ever reached, and this order flips.
+  const order = [];
+  setImmediate(() => order.push('immediate'));
+  const digest = await hashBufferSha256(payload, { yieldEvery: 64 * 1024 });
+  order.push('hash');
+  assert.deepEqual(order, ['immediate', 'hash'], 'the hash yielded to the event loop mid-buffer');
+  assert.equal(digest, createHash('sha256').update(payload).digest('hex'));
+  assert.match(digest, /^[a-f0-9]{64}$/);
+});
 
 test('prints CLI help without starting the server', () => {
   const scriptPath = path.join(__dirname, 'debug_server.js');
@@ -363,6 +401,59 @@ test('project_hash is keyed by a persisted per-project salt, not a bare hash of 
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test('deferred Windows salt protection still persists project_salt and agrees on project_hash', async () => {
+  // collector_boot skips in-process PowerShell DACL entirely; the action's
+  // `start` parent hardens the salt after listen()/handshake. Construction
+  // must still write the 32-byte salt and two servers on the same root must
+  // still agree, because already_running depends on it. There is no deferred
+  // drain to call: the old queue+drain machinery had no production caller
+  // and implied a protection it never performed (audit V1c), so defer mode
+  // is now a plain skip.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-defer-'));
+  try {
+    const startedAt = Date.now();
+    const first = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      deferWindowsPrivateFileProtection: true,
+    });
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(elapsedMs < 2000, `deferred construction must not wait on PowerShell ACL (${elapsedMs}ms)`);
+    assert.equal(
+      first.protectDeferredWindowsPrivateFiles,
+      undefined,
+      'the undrained defer queue must stay deleted — protection parity is owned by the start parent',
+    );
+    const saltInfo = await stat(path.join(projectRoot, '.debug', 'project_salt'));
+    assert.equal(saltInfo.size, 32);
+    const second = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    assert.equal(second.collectorProjectHash, first.collectorProjectHash);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /session hardens the session log via the awaited async ACL, never the sync variant', async () => {
+  // Wiring pin, deliberately source-level: the branch is win32-only and its
+  // failure mode is a concurrency stall (execFileSync froze the single-
+  // threaded server for the ACL's full 15s budget, timing out concurrent
+  // live reads — audit V1a), which no fast deterministic test can observe.
+  // The async variant's own semantics — spawn-based, settles on 'exit',
+  // immune to the pipe-inheritance hang that forced the old sync workaround
+  // (31c1f48) — are behaviorally covered in pr_closeout_fs.test.js; this pin
+  // guards the handler's side of the contract: the request path awaits the
+  // async entry point and never calls the blocking one.
+  const source = await readFile(path.join(__dirname, 'debug_server.js'), 'utf8');
+  assert.ok(
+    source.includes('await protectWindowsPrivateFileAsync(resolvedLogFile)'),
+    'the mint handler must await the spawn-based async ACL',
+  );
+  assert.ok(
+    !source.includes('protectWindowsPrivateFile(resolvedLogFile)'),
+    'the mint handler must not call the event-loop-blocking sync ACL',
+  );
 });
 
 test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
@@ -650,6 +741,34 @@ test('requires the launch token and returns only an opaque relative log path', a
     assert.match(authorized.body.session_token, /^[A-Za-z0-9_-]{43}$/);
     assert.match(authorized.body.log_file, /^\.debug\/debug-[a-z0-9-]+\.log$/);
     assert.equal(path.isAbsolute(authorized.body.log_file), false);
+    // The mint carries the log's creation identity (dev/ino from the O_EXCL
+    // handle's stat) so the deferred debug-evidence `start` parent can
+    // re-verify the file it hardens BY NAME is still the file this server
+    // created — without it a swap during the PowerShell ACL call went
+    // undetected (review V2a).
+    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file));
+    assert.deepEqual(
+      { dev: authorized.body.log_file_identity.dev, ino: authorized.body.log_file_identity.ino },
+      { dev: mintedLog.dev, ino: mintedLog.ino },
+      'the response identity must be the created file, not a placeholder',
+    );
+    // birthtimeMs is pinned BY TYPE, not by value: the server reads it from
+    // the O_EXCL creation handle while this stat() re-reads the path after the
+    // response returned, and on mounts that record no birth time Node falls
+    // the field back to ctimeMs or 0 — a value comparison would flake there
+    // (the repo already hit one CI-only filesystem surprise, Codex UkAeu)
+    // while proving nothing the dev/ino pair above does not already prove.
+    // Presence is what matters: the parent's shared predicate SKIPS its birth
+    // term when either side is falsy, so a dropped field would silently
+    // downgrade the deferred re-verification while every other assertion here
+    // stayed green.
+    assert.equal(typeof authorized.body.log_file_identity.birthtimeMs, 'number');
+    // Exact shape, so a renamed or extra field is still caught the way the
+    // previous whole-object deepEqual caught it.
+    assert.deepEqual(
+      Object.keys(authorized.body.log_file_identity).sort(),
+      ['birthtimeMs', 'dev', 'ino'],
+    );
     assert.equal(JSON.stringify(authorized.body).includes(projectRoot), false);
   } finally {
     await close(server);
@@ -949,12 +1068,10 @@ test('requires the per-session token before accepting a log event', async () => 
 });
 
 test('rejects a genuinely valid session token when presented against a different session', async () => {
-  // The collector has no multi-tenant/client_id concept; the per-session
-  // token is the only scoping boundary between concurrent sessions (see
-  // authorizeRequest in debug_server.js). A credential that is valid for
-  // session A must never authorize a write against session B, even though
-  // the token itself is real (not guessed/forged) and passes safeTokenEqual
-  // for its own session.
+  // The per-session token is the credential boundary between concurrent
+  // sessions; client_id (the collector projectHash) is the tenant binding
+  // GET /sessions/:id/logs also requires. A credential that is valid for
+  // session A must never authorize a write against session B.
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-'));
   const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
   const baseUrl = await listen(server);
@@ -1802,6 +1919,37 @@ test(
       assert.equal(acl.stdout.trim(), 'ok');
     } finally {
       await close(server);
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'repairs a hard-linked project_salt into a protected current-user-only Windows ACL',
+  { skip: process.platform !== 'win32' && 'Windows ACL semantics only', timeout: 20000 },
+  async () => {
+    // The repair branch replaces the directory entry via a private temp file
+    // plus an atomic rename. Windows hardening is queued (microtask or the
+    // pending list), so it necessarily runs AFTER that synchronous block:
+    // hardening the temp name aimed the ACL at a path the rename had already
+    // consumed, and the live project_salt kept its inherited DACL. Assert the
+    // repaired FINAL file carries the same current-user-only ACL the
+    // fresh-create path gets.
+    const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-salt-repair-acl-'));
+    const debugDir = path.join(projectRoot, '.debug');
+    try {
+      const outsideFile = path.join(projectRoot, 'outside-salt-target.txt');
+      await mkdir(debugDir, { recursive: true });
+      await writeFile(outsideFile, 'precious-unrelated-content', 'utf8');
+      await link(outsideFile, path.join(debugDir, 'project_salt'));
+      createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+      // Let the deferred (microtask) hardening land before inspecting the ACL.
+      await new Promise((resolve) => setImmediate(resolve));
+      const acl = windowsAclIsCurrentUserOnly(path.join(debugDir, 'project_salt'));
+      assert.equal(acl.status, 0, `${acl.stdout}\n${acl.stderr}`);
+      assert.equal(acl.stdout.trim(), 'ok');
+      assert.equal(await readFile(outsideFile, 'utf8'), 'precious-unrelated-content');
+    } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
   },
@@ -3055,11 +3203,19 @@ test('install.ps1 is saved as UTF-8 with a BOM', async () => {
   );
 });
 
-const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], { encoding: 'utf8' });
+const pwshProbe = spawnSync('pwsh', ['-NoProfile', '-Command', '$true'], {
+  encoding: 'utf8',
+  timeout: 15_000,
+  windowsHide: true,
+});
 const pwshAvailable = !pwshProbe.error && pwshProbe.status === 0;
 
 const runInstallPs1 = (scriptPath, args) =>
-  spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args], { encoding: 'utf8' });
+  spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
+  });
 
 test(
   'install.ps1 rejects a reparse-point payload entry before staging',
@@ -4094,6 +4250,30 @@ test('parseRedactNames splits, trims, and drops empty entries', () => {
   ]);
   assert.deepEqual(parseRedactNames(undefined), []);
   assert.deepEqual(parseRedactNames(''), []);
+  // Whitespace separates too, matching the documented contract and the boot
+  // shim, which now imports THIS parser. Under the old comma-only split,
+  // "A B,C" parsed to ['A B', 'C'] and — replacement matching being
+  // whole-name — A's and B's values were silently never redacted on the CLI
+  // path (Codex T3 #5, audit V8a).
+  assert.deepEqual(parseRedactNames('A B,C'), ['A', 'B', 'C']);
+  assert.deepEqual(parseRedactNames('ONE\tTWO\nTHREE, FOUR'), ['ONE', 'TWO', 'THREE', 'FOUR']);
+});
+
+test('resolveSessionIdleTimeoutMs honors finite budgets and the explicit Infinity opt-out', () => {
+  // Infinity disables idle retirement: the debug-evidence collector is
+  // job-scoped (teardown owns its lifecycle), and a wrapped command quiet for
+  // longer than any finite budget must not lose its session before `run`'s
+  // only capture read (audit V6a). Everything non-usable falls back to the
+  // 15-minute default rather than accidentally retiring instantly.
+  assert.equal(resolveSessionIdleTimeoutMs(1500), 1500);
+  assert.equal(resolveSessionIdleTimeoutMs(1), 1);
+  assert.equal(resolveSessionIdleTimeoutMs(Infinity), Infinity);
+  const defaultMs = 15 * 60 * 1_000;
+  assert.equal(resolveSessionIdleTimeoutMs(undefined), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(0), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(-5), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs(Number.NaN), defaultMs);
+  assert.equal(resolveSessionIdleTimeoutMs('900000'), defaultMs);
 });
 
 const postHypothesis = (baseUrl, body, headers = { Authorization: `Bearer ${TEST_LAUNCH_TOKEN}` }) =>
@@ -4384,7 +4564,7 @@ test('an invalid join-key request does not refresh session activity', async () =
     // well before the bug's extended deadline (t0+gap+idleMs).
     const remain = (t0 + idleMs + 300) - Date.now();
     if (remain > 0) await new Promise((resolve) => setTimeout(resolve, remain));
-    const after = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const after = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     // Correct (no refresh on invalid): session retired → 404.
     // Buggy (refreshed on invalid): session still live → 200.
     assert.equal(after.status, 404);
@@ -4508,18 +4688,37 @@ const seedReadableSession = async (baseUrl) => {
   return session;
 };
 
-test('GET /sessions/:id/logs requires the launch token and serves verbatim NDJSON', async () => {
+test('GET /sessions/:id/logs requires a credential for THIS session and serves verbatim NDJSON', async () => {
   await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
     const session = await seedReadableSession(baseUrl);
-    const noAuth = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs` });
-    assert.equal(noAuth.status, 401);
-    const sessionAuth = await requestRaw(baseUrl, {
+    const noTenant = await requestRaw(baseUrl, {
       pathname: `/sessions/${session.session_id}/logs`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(noTenant.status, 401, 'GET logs without client_id is unauthorized even with a valid token');
+    const wrongTenant = await requestRaw(baseUrl, {
+      pathname: `/sessions/${session.session_id}/logs?client_id=${'0'.repeat(64)}`,
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(wrongTenant.status, 401, 'GET logs with a foreign client_id is unauthorized');
+    assert.equal(typeof session.client_id, 'string');
+    assert.match(session.client_id, /^[a-f0-9]{64}$/);
+    const noAuth = await requestRaw(baseUrl, { pathname: sessionLogsPath(session) });
+    assert.equal(noAuth.status, 401);
+    const strangerAuth = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session),
+      headers: { Authorization: 'Bearer not-a-token-this-server-ever-issued' },
+    });
+    assert.equal(strangerAuth.status, 401);
+    // The session's own token reads its own log — same-session read scope,
+    // added so a CI caller can drop the launch token and still capture.
+    const ownAuth = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session),
       headers: { Authorization: `Bearer ${session.session_token}` },
     });
-    assert.equal(sessionAuth.status, 401);
+    assert.equal(ownAuth.status, 200);
     const ok = await requestRaw(baseUrl, {
-      pathname: `/sessions/${session.session_id}/logs`,
+      pathname: sessionLogsPath(session),
       headers: LAUNCH_AUTH,
     });
     assert.equal(ok.status, 200);
@@ -4536,7 +4735,7 @@ test('GET /sessions/:id/logs filters combine and limit is tail-biased', async ()
     const session = await seedReadableSession(baseUrl);
     const fetchLogs = async (query) => {
       const res = await requestRaw(baseUrl, {
-        pathname: `/sessions/${session.session_id}/logs${query}`,
+        pathname: sessionLogsPath(session, query),
         headers: LAUNCH_AUTH,
       });
       assert.equal(res.status, 200, query);
@@ -4563,7 +4762,7 @@ test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail
     const session = await seedReadableSession(baseUrl);
     for (const query of ['?type=bogus', '?sinceTs=notadate', '?untilTs=', '?limit=0', '?limit=abc', '?limit=-1', '?surprise=1', '?type=all&type=all', '?limit=1&limit=2']) {
       const res = await requestRaw(baseUrl, {
-        pathname: `/sessions/${session.session_id}/logs${query}`,
+        pathname: sessionLogsPath(session, query),
         headers: LAUNCH_AUTH,
       });
       assert.equal(res.status, 400, query);
@@ -4578,15 +4777,18 @@ test('GET /sessions/:id/logs rejects malformed and unknown query parameters fail
 // default-idle server; retirement gets its own short-idle server.
 test('GET /sessions/:id/logs rejects unknown sessions and swapped log files fail-closed', async () => {
   await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
-    const unknown = await requestRaw(baseUrl, { pathname: '/sessions/debug-nope-000000000000/logs', headers: LAUNCH_AUTH });
+    const session = (await createSession(baseUrl)).body;
+    const unknown = await requestRaw(baseUrl, {
+      pathname: `/sessions/debug-nope-000000000000/logs?client_id=${session.client_id}`,
+      headers: LAUNCH_AUTH,
+    });
     assert.equal(unknown.status, 404);
     assert.equal(JSON.parse(unknown.text).error, 'unknown_session');
-    const session = (await createSession(baseUrl)).body;
     // Swap the log file out from under the recorded identity.
     const logPath = path.join(projectRoot, session.log_file);
     await rm(logPath);
     await writeFile(logPath, '{"msg":"forged"}\n');
-    const swapped = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const swapped = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     assert.equal(swapped.status, 409);
     assert.equal(JSON.parse(swapped.text).error, 'session_log_replaced');
   });
@@ -4604,7 +4806,7 @@ test('GET /sessions/:id/logs is live-only: retired sessions return 404', async (
   try {
     const session = (await createSession(baseUrl)).body;
     await new Promise((resolve) => setTimeout(resolve, 25));
-    const retired = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const retired = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     assert.equal(retired.status, 404);
     assert.equal(JSON.parse(retired.text).error, 'unknown_session');
   } finally {
@@ -4621,7 +4823,7 @@ test('GET /sessions/:id/logs output never contains a raw known secret', async ()
       pathname: '/log',
       body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'leak supersecretvalue123' },
     });
-    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const res = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     assert.equal(res.status, 200);
     assert.equal(res.text.includes('supersecretvalue123'), false);
     assert.equal(res.text.includes('[REDACTED]'), true);
@@ -4655,7 +4857,7 @@ test('concurrent appends never produce torn GET output', async () => {
     for (let i = 6; i <= 30; i += 1) {
       writes.push(log(i));
       if (i % 3 === 0) {
-        reads.push(requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH }));
+        reads.push(requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH }));
       }
     }
     await Promise.all(writes);
@@ -4691,7 +4893,7 @@ test('GET does not refresh session activity (reads are observers)', async () => 
   try {
     const session = (await createSession(baseUrl)).body;
     const createdAt = Date.now();
-    const first = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const first = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     // Assert the pre-expiry 200 only when we provably raced the budget: on a
     // pathologically slow environment the property assertion below still holds.
     if (Date.now() - createdAt < idleMs) assert.equal(first.status, 200);
@@ -4701,7 +4903,7 @@ test('GET does not refresh session activity (reads are observers)', async () => 
     let last = first;
     while (Date.now() - createdAt < idleMs + 300) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      last = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+      last = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     }
     assert.equal(last.status, 404);
     assert.equal(JSON.parse(last.text).error, 'unknown_session');
@@ -4711,10 +4913,94 @@ test('GET does not refresh session activity (reads are observers)', async () => 
   }
 });
 
+test('GET with the session token refreshes activity so a live capture cannot idle-out under its own reads', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-session-read-'));
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const sessionAuth = { authorization: `Bearer ${session.session_token}` };
+    const createdAt = Date.now();
+    let last = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: sessionAuth });
+    if (Date.now() - createdAt < idleMs) assert.equal(last.status, 200);
+    // Keep issuing session-token reads WHILE waiting out the budget: these
+    // are the surviving CI credential, and they must keep the session alive.
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      last = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: sessionAuth });
+      assert.equal(last.status, 200, 'a session-token read after the idle threshold must still succeed');
+    }
+    assert.equal(last.status, 200);
+    assert.equal(last.headers['content-type'], 'application/x-ndjson');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET with the session token but an invalid query does not refresh activity', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-invalid-read-'));
+  const idleMs = 1500;
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    limits: { sessionIdleTimeoutMs: idleMs },
+  });
+  const baseUrl = await listen(server);
+  try {
+    const session = (await createSession(baseUrl)).body;
+    const sessionAuth = { authorization: `Bearer ${session.session_token}` };
+    const createdAt = Date.now();
+    const first = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session, 'bogus=1'),
+      headers: sessionAuth,
+    });
+    // Assert the pre-expiry 400 only when we provably raced the budget, like
+    // the observer test above: the property assertions below hold regardless.
+    if (Date.now() - createdAt < idleMs) assert.equal(first.status, 400);
+    // Keep issuing REJECTED session-token reads WHILE waiting out the budget:
+    // an unknown parameter is refused fail-closed before the refresh, so a
+    // refused read proves nothing — if it refreshed lastActivityAt, repeated
+    // malformed reads could retain an otherwise idle session indefinitely.
+    let rejectedWhileLive = first.status === 400 ? 1 : 0;
+    while (Date.now() - createdAt < idleMs + 300) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const read = await requestRaw(baseUrl, {
+        pathname: sessionLogsPath(session, 'bogus=1'),
+        headers: sessionAuth,
+      });
+      if (read.status === 400) rejectedWhileLive += 1;
+    }
+    // Guard against a vacuous pass without adding a new flake mode: at least
+    // one read must have been rejected 400 while the session was still live,
+    // or this test never exercised the invalid-query path at all. A runner so
+    // stalled that every read missed the idle budget already fails the
+    // session-token refresh test above (its in-loop 200 assertion), so this
+    // demands nothing that suite does not already demand.
+    assert.ok(
+      rejectedWhileLive >= 1,
+      'at least one invalid read must be rejected 400 while the session is live',
+    );
+    const final = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+    assert.equal(final.status, 404);
+    assert.equal(JSON.parse(final.text).error, 'unknown_session');
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('GET on a fresh session returns 200 with an empty NDJSON body', async () => {
   await withRedactionServer({}, [], async ({ baseUrl }) => {
     const session = (await createSession(baseUrl)).body;
-    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs`, headers: LAUNCH_AUTH });
+    const res = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
     assert.equal(res.status, 200);
     assert.equal(res.headers['content-type'], 'application/x-ndjson');
     assert.equal(res.text, '');
@@ -4732,8 +5018,365 @@ test('runId is stored trimmed on both routes and joins GET filters', async () =>
     await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN', runId: '  r1  ' });
     const lines = await readSessionLines(projectRoot, session);
     assert.deepEqual(lines.map((line) => line.runId), ['r1', 'r1']);
-    const res = await requestRaw(baseUrl, { pathname: `/sessions/${session.session_id}/logs?runId=r1`, headers: LAUNCH_AUTH });
+    const res = await requestRaw(baseUrl, { pathname: sessionLogsPath(session, '?runId=r1'), headers: LAUNCH_AUTH });
     assert.equal(res.status, 200);
     assert.equal(res.text.split('\n').filter(Boolean).length, 2);
+  });
+});
+
+test('GET /sessions/:id/logs refuses a same-length in-place rewrite that metadata alone cannot see', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'honest event' },
+    });
+    const logPath = path.join(projectRoot, session.log_file);
+    const before = await stat(logPath);
+    const original = await readFile(logPath, 'utf8');
+    const healthy = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+    assert.equal(healthy.status, 200);
+    assert.equal(healthy.text.includes('honest event'), true);
+    // Rewrite in place, byte for byte the same length. writeFile truncates and
+    // refills the SAME inode, so dev, ino, birthtime and the final size are all
+    // unchanged — every field verifyLogIdentity compares still matches while
+    // the log now says something the collector never recorded.
+    const forged = original.replace('honest event', 'FORGED event');
+    assert.equal(Buffer.byteLength(forged, 'utf8'), Buffer.byteLength(original, 'utf8'),
+      'the whole point of this attack is that the byte count does not move');
+    await writeFile(logPath, forged);
+    const after = await stat(logPath);
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.equal(after.birthtimeMs, before.birthtimeMs);
+    // Only the content digest can tell. It answers in the existing
+    // replaced-class 409, which readSessionLive already surfaces to callers as
+    // live_read_log_replaced.
+    const tampered = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+    assert.equal(tampered.status, 409);
+    assert.equal(JSON.parse(tampered.text).error, 'session_log_tampered');
+    assert.equal(tampered.text.includes('FORGED event'), false, 'the forgery is refused, never served');
+  });
+});
+
+test('the content digest keeps pace with ordinary appends: interleaved writes and reads stay served', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    for (const msg of ['first', 'second', 'third']) {
+      await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+      });
+      // Read after every append: a digest that fell out of step with
+      // bytesWritten by even one event would reject the server's OWN file here.
+      const res = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+      assert.equal(res.status, 200);
+      assert.equal(res.text.includes(msg), true);
+    }
+    await postHypothesis(baseUrl, { sessionId: session.session_id, hypothesisId: 'H1', status: 'OPEN' });
+    const res = await requestRaw(baseUrl, { pathname: sessionLogsPath(session), headers: LAUNCH_AUTH });
+    assert.equal(res.status, 200);
+    assert.equal(res.text.split('\n').filter(Boolean).length, 4, 'hypothesis appends are digested too');
+    // The served bytes are still exactly the file the collector wrote.
+    assert.equal(res.text, await readFile(path.join(projectRoot, session.log_file), 'utf8'));
+  });
+});
+
+test('a concurrent append and read never serves a torn trailing line', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'seeded' },
+    });
+    const messages = ['concurrent-a', 'concurrent-b', 'concurrent-c'];
+    const expected = ['seeded', ...messages];
+    const logs = messages.map((msg) => requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg },
+    }));
+    const read = requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session),
+      headers: LAUNCH_AUTH,
+    });
+    const [readRes, ...logRes] = await Promise.all([read, ...logs]);
+    for (const posted of logRes) assert.equal(posted.status, 202);
+    assert.equal(readRes.status, 200);
+    if (readRes.text.length) assert.equal(readRes.text.endsWith('\n'), true, 'a non-empty body is a complete NDJSON window');
+    const lines = readRes.text.split('\n').filter(Boolean);
+    // Seeded line plus N in-flight appends: the concurrent read may observe
+    // any complete prefix of that window, never a torn trailing line.
+    assert.ok(
+      lines.length >= 1 && lines.length <= expected.length,
+      `read must observe a complete snapshot of 1..${expected.length} lines, got ${lines.length}`,
+    );
+    const parsed = lines.map((line) => JSON.parse(line));
+    for (const entry of parsed) {
+      assert.equal(typeof entry.msg, 'string');
+      assert.equal(expected.includes(entry.msg), true, `observed line must be a complete message, not a prefix: ${entry.msg}`);
+    }
+    const followUp = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session),
+      headers: LAUNCH_AUTH,
+    });
+    assert.equal(followUp.status, 200);
+    const finalLines = followUp.text.split('\n').filter(Boolean);
+    assert.equal(finalLines.length, expected.length, 'once the appends settle, the session holds every complete line');
+    assert.equal(followUp.text.endsWith('\n'), true);
+    for (const line of finalLines) JSON.parse(line);
+  });
+});
+
+test('GET /sessions/:id/logs accepts a session\'s own token for its own session and nothing else', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const mine = (await createSession(baseUrl)).body;
+    const other = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: mine.session_id, sessionToken: mine.session_token, msg: 'my own event' },
+    });
+    const sessionAuth = { authorization: `Bearer ${mine.session_token}` };
+    // Same-session read scope: this is what lets a CI caller read back what it
+    // recorded after dropping the launch token.
+    const own = await requestRaw(baseUrl, { pathname: sessionLogsPath(mine), headers: sessionAuth });
+    assert.equal(own.status, 200);
+    assert.equal(own.text.includes('my own event'), true);
+    // ...and no further. A session token is not an operator credential.
+    const foreign = await requestRaw(baseUrl, { pathname: sessionLogsPath(other), headers: sessionAuth });
+    assert.equal(foreign.status, 401);
+    assert.equal(JSON.parse(foreign.text).error, 'unauthorized');
+    // An unknown session is a 401 for a caller who cannot read every session,
+    // never a 404 that would confirm which ids exist.
+    const unknown = await requestRaw(baseUrl, {
+      pathname: `/sessions/debug-nope-000000000000/logs?client_id=${mine.client_id}`,
+      headers: sessionAuth,
+    });
+    assert.equal(unknown.status, 401);
+    // The launch token still reads anything, and no token still reads nothing.
+    const operator = await requestRaw(baseUrl, { pathname: sessionLogsPath(other), headers: LAUNCH_AUTH });
+    assert.equal(operator.status, 200);
+    const anonymous = await requestRaw(baseUrl, { pathname: sessionLogsPath(mine) });
+    assert.equal(anonymous.status, 401);
+  });
+});
+
+test('the session token stays read-and-append: it can never post a hypothesis line', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    // The whole point of the read scope: the credential that survives into a
+    // CI job can record events and read them back, but cannot forge a verdict.
+    const forged = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/hypothesis',
+      headers: { authorization: `Bearer ${session.session_token}` },
+      body: { sessionId: session.session_id, hypothesisId: 'H-forged', status: 'CONFIRMED' },
+    });
+    assert.equal(forged.status, 401);
+    // Nor can it mint a fresh session to work around that.
+    const minted = await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/session',
+      headers: { authorization: `Bearer ${session.session_token}` },
+      body: { name: 'ci-debug' },
+    });
+    assert.equal(minted.status, 401);
+  });
+});
+
+// Responder authentication: a caller whose routing data came from a file
+// another local process can rewrite needs a way to tell THIS collector from a
+// counterfeit listener wearing its shape. The keypair is asymmetric on
+// purpose — the verifier only ever holds the public half, so disclosure of
+// what the verifier knows grants no ability to sign.
+const withResponderServer = async (responderPrivateKey, run) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-responder-'));
+  const server = createDebugServer({
+    projectRoot,
+    token: TEST_LAUNCH_TOKEN,
+    redactionEnv: {},
+    responderPrivateKey,
+  });
+  const baseUrl = await listen(server);
+  try {
+    return await run({ baseUrl, projectRoot });
+  } finally {
+    await close(server);
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+};
+
+test('createDebugServer rejects a non-Ed25519 responderPrivateKey at construction', async () => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-bad-responder-'));
+  const { publicKey } = generateKeyPairSync('ed25519');
+  const { privateKey: rsaPrivateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  try {
+    for (const [label, bad] of [
+      ['string', 'not-a-key'],
+      ['plain object', {}],
+      ['ed25519 public key', publicKey],
+      ['rsa private key', rsaPrivateKey],
+    ]) {
+      assert.throws(
+        () => createDebugServer({
+          projectRoot,
+          token: TEST_LAUNCH_TOKEN,
+          redactionEnv: {},
+          responderPrivateKey: bad,
+        }),
+        /invalid_responder_private_key/,
+        `${label} must fail at boot, not on the first challenged read`,
+      );
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('GET /sessions/:id/logs signs a record covering the request target, the nonce and the served bytes', async () => {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+
+  // The record is the cross-process contract. Rebuilding it with the same
+  // helper the server signs with cannot catch a reordered field or a dropped
+  // domain tag, so pin the exact bytes once.
+  assert.equal(
+    canonicalResponderRecord({
+      method: 'GET', target: '/t', challenge: 'c', bodyDigest: 'd',
+    }),
+    'debug-evidence.logs.v1\nGET\n/t\nc\nd',
+  );
+
+  await withResponderServer(privateKey, async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'signed event' },
+    });
+    const pathname = sessionLogsPath(session);
+    const verifies = (response, { target, challenge }) => verify(
+      null,
+      Buffer.from(canonicalResponderRecord({
+        method: 'GET',
+        target,
+        challenge,
+        bodyDigest: createHash('sha256').update(response.text, 'utf8').digest('hex'),
+      }), 'utf8'),
+      publicKey,
+      Buffer.from(response.headers['x-debug-proof'], 'base64'),
+    );
+    const nonceOne = 'nonce-one-with-enough-length';
+    const nonceTwo = 'nonce-two-with-enough-length';
+
+    const signed = await requestRaw(baseUrl, {
+      pathname,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceOne },
+    });
+    assert.equal(signed.status, 200);
+    assert.equal(verifies(signed, { target: pathname, challenge: nonceOne }), true);
+
+    // A different nonce over the same bytes is a different signature: that is
+    // what stops a recorded (body, proof) pair from being replayed at a later
+    // challenge.
+    const again = await requestRaw(baseUrl, {
+      pathname,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceTwo },
+    });
+    assert.equal(again.text, signed.text, 'same bytes...');
+    assert.notEqual(again.headers['x-debug-proof'], signed.headers['x-debug-proof'], '...different signature');
+    assert.equal(verifies(again, { target: pathname, challenge: nonceTwo }), true);
+    assert.equal(verifies(again, { target: pathname, challenge: nonceOne }), false,
+      'and the old nonce does not verify the new answer');
+
+    // THE ORACLE CLOSER. A filtered request returns a genuinely signed answer
+    // — over the filtered target. Anyone verifying against the unfiltered
+    // target they asked for sees it fail, with no comparison logic of their
+    // own (Codex T5 r5 #1).
+    const filteredPath = sessionLogsPath(session, '?limit=1');
+    const filtered = await requestRaw(baseUrl, {
+      pathname: filteredPath,
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': nonceOne },
+    });
+    assert.equal(filtered.status, 200);
+    assert.equal(verifies(filtered, { target: filteredPath, challenge: nonceOne }), true,
+      'the collector signed exactly what it was asked');
+    assert.equal(verifies(filtered, { target: pathname, challenge: nonceOne }), false,
+      'and that signature says nothing about the unfiltered session');
+
+    // Unchallenged callers are unaffected: no header, no behaviour change.
+    const plain = await requestRaw(baseUrl, { pathname, headers: LAUNCH_AUTH });
+    assert.equal(plain.status, 200);
+    assert.equal(plain.headers['x-debug-proof'], undefined);
+    // A challenge that is not a plain token is refused rather than signed, so
+    // nothing an attacker controls can inject a delimiter into the canonical
+    // record. A literal newline cannot even be attempted — Node's HTTP client
+    // refuses to put one in a header value, and its server would reject the
+    // request — so the charset check below is the second line of a defence
+    // whose first line is the protocol itself.
+    for (const hostile of ['', 'short', `${nonceOne} with spaces`, `${nonceOne}/slash`, 'a'.repeat(15), 'a'.repeat(129)]) {
+      const rejected = await requestRaw(baseUrl, {
+        pathname,
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': hostile },
+      });
+      assert.equal(rejected.status, 200, `served unsigned, not refused, for: ${JSON.stringify(hostile)}`);
+      assert.equal(rejected.headers['x-debug-proof'], undefined, `refused to sign for: ${JSON.stringify(hostile)}`);
+    }
+    for (const ok of ['a'.repeat(16), 'a'.repeat(128)]) {
+      const accepted = await requestRaw(baseUrl, {
+        pathname,
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': ok },
+      });
+      assert.equal(accepted.status, 200, `signed bound still served for length ${ok.length}`);
+      assert.equal(typeof accepted.headers['x-debug-proof'], 'string', `signed for length ${ok.length}`);
+    }
+  });
+});
+
+test('the collector never emits private key material, whatever it is asked', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  await withResponderServer(privateKey, async ({ baseUrl, projectRoot }) => {
+    const session = (await createSession(baseUrl)).body;
+    await requestJson(baseUrl, {
+      method: 'POST',
+      pathname: '/log',
+      body: { sessionId: session.session_id, sessionToken: session.session_token, msg: 'signed event' },
+    });
+    const responses = [
+      await requestRaw(baseUrl, { pathname: '/health' }),
+      await requestRaw(baseUrl, {
+        pathname: sessionLogsPath(session),
+        headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one-with-enough-length' },
+      }),
+    ];
+    for (const response of responses) {
+      const seen = `${response.text}${JSON.stringify(response.headers)}`;
+      assert.equal(seen.includes(privatePem), false, 'no PEM anywhere in a response');
+      assert.equal(seen.includes('PRIVATE KEY'), false);
+    }
+    // Nor on disk: the collector writes session logs and a salt, and neither
+    // has any business carrying signing material.
+    const onDisk = await readFile(path.join(projectRoot, session.log_file), 'utf8');
+    assert.equal(onDisk.includes('PRIVATE KEY'), false);
+  });
+});
+
+test('a collector booted without a responder key cannot be made to sign anything', async () => {
+  await withRedactionServer({}, [], async ({ baseUrl }) => {
+    const session = (await createSession(baseUrl)).body;
+    const challenged = await requestRaw(baseUrl, {
+      pathname: sessionLogsPath(session),
+      headers: { ...LAUNCH_AUTH, 'x-debug-challenge': 'nonce-one' },
+    });
+    // Serving unsigned is correct — the CLI and the viewer never challenge.
+    // A caller that DID challenge sees no proof and must treat that as a
+    // failure, which is what the action does.
+    assert.equal(challenged.status, 200);
+    assert.equal(challenged.headers['x-debug-proof'], undefined);
   });
 });

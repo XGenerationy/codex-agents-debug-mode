@@ -4,6 +4,7 @@ const {
   closeSync, constants, readFileSync, readSync, writeSync,
 } = require('node:fs');
 const { mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { EventEmitter } = require('node:events');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -12,10 +13,16 @@ const { symlink } = require('node:fs/promises');
 
 const {
   assertNotSymlink,
+  isSameFileIdentity,
   isSameLockIdentity,
+  isSameProtectedFileIdentity,
   openNoFollow,
   openNoFollowFlagAttempts,
   openNoFollowSync,
+  PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+  PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
+  protectWindowsPrivateFile,
+  protectWindowsPrivateFileAsync,
 } = require('./pr_closeout_fs');
 
 test('openNoFollow defaults to O_RDONLY when flags are omitted', async () => {
@@ -197,8 +204,12 @@ test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs
   const collidingSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 5000 };
   assert.equal(isSameLockIdentity(stale, collidingSuccessor), false);
 
-  // Genuine same file: every dimension including the immutable birthtime
-  // matches, so a real stale record stays reclaimable (no false rejection).
+  // Genuine same file: every dimension including the birth time matches, so a
+  // real stale record stays reclaimable (no false rejection). "Unchanged for
+  // this record", not "immutable" — on NTFS a same-name recreate inherits the
+  // original's creation time through file tunneling, and the owner can set it
+  // outright, which is why the predicate's doc refuses to call the term
+  // independent on win32.
   const untouchedSameFile = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
   assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 
@@ -206,6 +217,47 @@ test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs
   // ctimeMs alone -- the new birthtime term does not weaken the existing guard.
   const freshCtimeSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 6000, birthtimeMs: 6000 };
   assert.equal(isSameLockIdentity(stale, freshCtimeSuccessor), false);
+});
+
+test('isSameProtectedFileIdentity rejects an inode reuse the lax predicate accepts', () => {
+  // POSIX inode reuse (tmpfs hands a freed ino to the next file created in the
+  // directory): dev/ino/nlink cannot see it, the creation time can. This is
+  // the whole reason the post-ACL callers use this predicate instead of the
+  // lax one — and the difference is asserted rather than assumed, so a future
+  // edit that collapses the two is caught here.
+  const preInfo = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  const reusedIno = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 5000 };
+  assert.equal(isSameFileIdentity(preInfo, reusedIno), true, 'the lax predicate is blind to this swap');
+  assert.equal(isSameProtectedFileIdentity(preInfo, reusedIno), false);
+  assert.equal(isSameProtectedFileIdentity(preInfo, { ...preInfo }), true, 'a genuine same file is not rejected');
+});
+
+test('isSameProtectedFileIdentity skips the birth term when either side reports none', () => {
+  // The deferred caller's preInfo is a JSON wire object, and mounts that do
+  // not record a birth time report 0. Neither may turn a healthy check red: a
+  // bare `===` would abort every deferred start on the first shape, and on the
+  // second it would silently become a ctimeMs comparison (Node falls
+  // birthtimeMs back to ctimeMs where statx is unavailable) — precisely what
+  // isSameFileIdentity's contract forbids for ACL-protect callers, whose
+  // intervening operation legitimately moves ctimeMs.
+  const real = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  assert.equal(isSameProtectedFileIdentity({ dev: 1, ino: 42 }, real), true);
+  assert.equal(isSameProtectedFileIdentity({ ...real, birthtimeMs: 0 }, real), true);
+  assert.equal(isSameProtectedFileIdentity(real, { ...real, birthtimeMs: 0 }), true);
+});
+
+test('isSameProtectedFileIdentity still rejects every shape isSameFileIdentity rejects', () => {
+  // Composition, not re-implementation: the four lax terms are inherited from
+  // one predicate rather than re-listed here, so a hardening that lands in
+  // isSameFileIdentity cannot leave the protected variant behind (the
+  // one-contract-one-implementation rule this repo already paid for twice —
+  // the V8a redaction parser and the V7a scalar-header regex).
+  const pre = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
+  const born = (over) => ({ dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000, ...over });
+  assert.equal(isSameProtectedFileIdentity({ ...pre, dev: 0, ino: 0 }, born({ dev: 0, ino: 0 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ ino: 43 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ dev: 2 })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ nlink: 2 })), false);
 });
 
 test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () => {
@@ -259,4 +311,136 @@ test('openNoFollowFlagAttempts with requireNoFollow drops every attempt that lac
     'a platform with no O_NOFOLLOW constant must still get a usable attempt list, not an empty one');
   assert.deepEqual(openNoFollowFlagAttempts(flags, 0, 0, true), [flags],
     'a platform with neither extra flag must still get the plain attempt');
+});
+
+test('Windows ACL sync and async entry points share one frozen stdio-ignore options object', async () => {
+  // stdio:'ignore' is load-bearing for BOTH paths now. execFileSync honors it,
+  // so the session-mint PowerShell never leaves a pipe for the parent to
+  // service. The async variant is built on spawn — which also honors it —
+  // precisely because promisified execFile silently DROPPED `stdio` (it
+  // always buffers through pipes and settles only when they close), and a
+  // PowerShell descendant holding those inherited pipes open past exit hung
+  // the call until the 15s timeout on hosted windows-latest (the hang that
+  // forced the sync workaround in 31c1f48). Drive both entry points through
+  // their exec seams so the assertions cover the actual invocation — the
+  // object reference, timeout, and windowsHide — not source text.
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.stdio, 'ignore');
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.timeout, PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS);
+  assert.equal(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS.windowsHide, true);
+  assert.ok(
+    Object.isFrozen(PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS),
+    'shared options must stay frozen',
+  );
+  const calls = [];
+  // A ChildProcess stand-in: an EventEmitter that reports the given exit. The
+  // helper must settle on 'exit'/'error' alone — it has no pipes to wait for.
+  const fakeChild = ({ code = 0, signal = null, error = null } = {}) => {
+    const child = new EventEmitter();
+    queueMicrotask(() => {
+      if (error) child.emit('error', error);
+      else child.emit('exit', code, signal);
+    });
+    return child;
+  };
+  protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
+    platform: 'win32',
+    execFileSyncFn: (file, args, options) => calls.push({ entry: 'sync', file, args, options }),
+  });
+  await protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+    platform: 'win32',
+    spawnFn: (file, args, options) => {
+      calls.push({ entry: 'async', file, args, options });
+      return fakeChild();
+    },
+  });
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(
+      call.options,
+      PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+      `${call.entry} exec must receive the one shared frozen options object by reference`,
+    );
+    assert.match(call.file, /\\powershell\.exe$/iu);
+    assert.ok(call.args.includes('-EncodedCommand'), `${call.entry} must run the fixed encoded program`);
+  }
+  // Off Windows both entry points are no-ops that never reach exec.
+  const never = () => { throw new Error('never reached off-Windows'); };
+  protectWindowsPrivateFile('/p/.debug/project_salt', { platform: 'linux', execFileSyncFn: never });
+  await protectWindowsPrivateFileAsync('/p/.debug/session.log', { platform: 'darwin', spawnFn: never });
+  // Fail closed: the sync variant throws; the async variant rejects on a
+  // spawn 'error' event, a synchronous spawn throw, a non-zero exit, and
+  // signal death (which is also how the shared timeout's kill surfaces).
+  assert.throws(
+    () => protectWindowsPrivateFile('C:\\p\\.debug\\project_salt', {
+      platform: 'win32', execFileSyncFn: () => { throw new Error('acl_denied'); },
+    }),
+    /acl_denied/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => fakeChild({ error: new Error('acl_denied') }),
+    }),
+    /acl_denied/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => { throw new Error('spawn_refused'); },
+    }),
+    /spawn_refused/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => fakeChild({ code: 5 }),
+    }),
+    /windows_private_file_acl_failed: 5/,
+  );
+  await assert.rejects(
+    protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+      platform: 'win32', spawnFn: () => fakeChild({ code: null, signal: 'SIGTERM' }),
+    }),
+    /windows_private_file_acl_failed: SIGTERM/,
+  );
+  // BACKSTOP DEADLINE (review V2c hardening): spawn's shared timeout issues
+  // TerminateProcess, but 'exit' fires only once the kernel finishes tearing
+  // every thread down — a thread wedged in a non-alertable kernel wait can
+  // defer that indefinitely, and a promise settling only on 'error'/'exit'
+  // would hold its awaiting mint open forever. The reject is the load-bearing
+  // half; the extra kill is best-effort.
+  const wedged = new EventEmitter();
+  let kills = 0;
+  wedged.kill = () => { kills += 1; };
+  // The deadline timer is unref'd BY DESIGN (production callers hold a live
+  // server handle, and a settled call must never hold the process open), so
+  // in this bare test process it must not be the loop's ONLY handle: with
+  // nothing else referenced, Node 20/22 drain the event loop before the
+  // 20ms deadline fires and the runner cancels the still-pending test
+  // (cancelledByParent — Validate run 32642837205). A REFERENCED WATCHDOG
+  // rather than a bare keep-alive (Codex): it holds the loop open to the
+  // deadline AND, should the backstop ever stop settling the promise, loses
+  // the race with a non-matching error so the test fails fast and directly
+  // instead of parking until the runner cancels it again.
+  let watchdog;
+  const watchdogFired = new Promise((unusedResolve, rejectWatch) => {
+    watchdog = setTimeout(
+      () => rejectWatch(new Error('deadline backstop never settled the wedged promise within 500ms')),
+      500,
+    );
+  });
+  try {
+    await assert.rejects(
+      Promise.race([
+        protectWindowsPrivateFileAsync('C:\\p\\.debug\\session.log', {
+          platform: 'win32', spawnFn: () => wedged, deadlineMs: 20,
+        }),
+        watchdogFired,
+      ]),
+      /windows_private_file_acl_failed: deadline/,
+    );
+  } finally {
+    clearTimeout(watchdog);
+  }
+  assert.equal(kills, 1, 'the deadline still attempts to kill the wedged child');
+  // A late 'exit' after settlement lands on an already-settled promise: a
+  // no-op, never a second settlement or an unhandled rejection.
+  wedged.emit('exit', 0, null);
 });

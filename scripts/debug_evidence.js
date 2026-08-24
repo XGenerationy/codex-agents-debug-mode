@@ -67,6 +67,17 @@ const escapeEvidenceText = (value) => JSON.stringify(String(value))
   .replaceAll('\u2028', '\\u2028')
   .replaceAll('\u2029', '\\u2029');
 
+// Markdown-surface escaping layered on the core helper: box-drawing pipes
+// would break diff/report tables, and markdown punctuation in stored log
+// content could restyle the surrounding document. Owned here so every
+// markdown renderer (debug_diff, debug_report) shares one transform. `~` is
+// in the set because GFM reads `~~x~~` as strikethrough, so without it stored
+// log content could still restyle text around it.
+const MARKDOWN_PUNCTUATION = /[*_`\[\]()!<>&~]/g;
+const escapeMarkdownText = (value) => escapeEvidenceText(value)
+  .replaceAll('│', '¦')
+  .replace(MARKDOWN_PUNCTUATION, '\\$&');
+
 const FILTER_KEYS = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
 const TYPE_VALUES = new Set(['all', 'event', 'hypothesis']);
 
@@ -217,7 +228,41 @@ const resolveSessionRef = (projectRoot, ref) => {
 // applies the SAME semantics filterEntries implements locally (parity test
 // enforced). Errors surface as distinct codes, never swallowed: evidence
 // integrity failures (409) and auth/liveness failures are actionable.
-const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 5000 }) => new Promise((resolve, reject) => {
+// Two bounds the socket-inactivity timeout cannot provide.
+//
+// LIVE_READ_MAX_BYTES: the collector's own `maxTotalBytes` caps a session at
+// 16 MiB by default, so 64 MiB is four times the largest log it will produce
+// out of the box and still nowhere near enough to exhaust a runner. A
+// deployment that raises the collector's cap above this one makes reads fail
+// closed rather than accumulate without limit — the right way round.
+//
+// LIVE_READ_DEADLINE_MS: an inactivity timeout is not a bound. A peer that
+// sends one byte every four seconds resets it forever, so a caller with a 5s
+// idle timeout can still be held for the entire life of a CI job. Sixty
+// seconds is far more than a loopback read of a capped log ever needs, and it
+// is a CEILING, not a budget: honest reads finish in milliseconds.
+const LIVE_READ_MAX_BYTES = 64 * 1024 * 1024;
+const LIVE_READ_DEADLINE_MS = 60000;
+
+const CLIENT_ID_PATTERN = /^[a-f0-9]{64}$/;
+
+const readSessionLive = ({
+  port, token, sessionId, clientId, filters = {}, timeoutMs = 5000,
+  deadlineMs = LIVE_READ_DEADLINE_MS, maxBytes = LIVE_READ_MAX_BYTES, challenge,
+}) => new Promise((resolve, reject) => {
+  // Reject a non-integer or sub-1 bound before it can disable the check it
+  // configures: `bytes > NaN` is false for every chunk, which turns the byte
+  // cap off silently instead of failing closed. `deadlineMs: NaN` / `0` makes
+  // setTimeout fire on the next tick, so every read would reject instantly.
+  // Same fail-closed shape as createRedactionContext's maxTokens check.
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+    reject(new Error('invalid_live_read_max_bytes'));
+    return;
+  }
+  if (!Number.isInteger(deadlineMs) || deadlineMs < 1) {
+    reject(new Error('invalid_live_read_deadline'));
+    return;
+  }
   // Pre-flight, before any request setup: sessionId is interpolated
   // directly into the request path below. Mirrors resolveSessionRef's
   // bare-id guard (SESSION_ID_PATTERN, defined above) — sessionId here is
@@ -230,6 +275,10 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
   // must never see a network-sourced id; this function never calls it.)
   if (!SESSION_ID_PATTERN.test(sessionId)) {
     reject(new Error(`invalid_session_ref:${sessionId}`));
+    return;
+  }
+  if (typeof clientId !== 'string' || !CLIENT_ID_PATTERN.test(clientId)) {
+    reject(new Error('invalid_client_id'));
     return;
   }
   // hypothesisId/runId must be validated and trimmed through the SAME
@@ -258,6 +307,7 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
     return;
   }
   const query = new URLSearchParams();
+  query.set('client_id', clientId);
   for (const [key, value] of Object.entries(filters)) {
     if (key === 'hypothesisId' || key === 'runId') continue;
     if (value !== undefined) query.set(key, String(value));
@@ -265,33 +315,83 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
   if (hypothesisIdFilter !== undefined) query.set('hypothesisId', hypothesisIdFilter);
   if (runIdFilter !== undefined) query.set('runId', runIdFilter);
   const suffix = query.size > 0 ? `?${query.toString()}` : '';
+  // Every exit from this promise goes through settle(): the failures below
+  // are not wrong answers but NO answer, and an unsettled promise is a caller
+  // hung for the life of its process.
+  let settled = false;
+  let deadline;
+  const settle = (fn, value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    fn(value);
+  };
+  const headers = { Authorization: `Bearer ${token}` };
+  // RESPONDER AUTHENTICATION. Bearer proves the caller to whatever is
+  // listening; it proves nothing in the other direction, and a caller whose
+  // routing data (port, session id, token) came from a file another local
+  // process can rewrite may be talking to a counterfeit listener that answers
+  // 200 with perfectly contract-shaped NDJSON. A challenge nonce sent here
+  // comes back as `x-debug-proof` over the exact served bytes, keyed by a
+  // secret only the real collector was given — so the caller can tell whether
+  // the bytes came from the collector it started or from something wearing
+  // its shape. This function only carries the nonce and hands back the proof
+  // and the exact text it was computed over; the VERDICT belongs to the
+  // caller holding the key.
+  if (challenge !== undefined) headers['x-debug-challenge'] = challenge;
   const request = http.request({
     hostname: '127.0.0.1',
     port,
     path: `/sessions/${sessionId}/logs${suffix}`,
     method: 'GET',
-    headers: { Authorization: `Bearer ${token}` },
+    headers,
   }, (response) => {
     let text = '';
+    let bytes = 0;
+    let ended = false;
     response.setEncoding('utf8');
-    response.on('data', (chunk) => { text += chunk; });
-    // A connection that dies mid-body must carry a structured code like
-    // every other failure path here — callers match /^live_read_/, and a
-    // raw 'aborted'/ECONNRESET would slip past that discipline.
-    response.on('error', () => reject(new Error('live_read_interrupted')));
-    response.on('end', () => {
-      if (response.statusCode === 200) {
-        try {
-          resolve(parseSessionText(text));
-        } catch (error) {
-          reject(error);
-        }
+    response.on('data', (chunk) => {
+      // Counted in BYTES, not characters: the cap has to bound memory, and a
+      // multi-byte character costs more than its length suggests.
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      if (bytes > maxBytes) {
+        request.destroy();
+        settle(reject, new Error('live_read_response_too_large'));
         return;
       }
-      if (response.statusCode === 401) reject(new Error('live_read_unauthorized'));
-      else if (response.statusCode === 404) reject(new Error('live_read_unknown_session'));
-      else if (response.statusCode === 409) reject(new Error('live_read_log_replaced'));
-      else reject(new Error(`live_read_failed:${response.statusCode}`));
+      text += chunk;
+    });
+    // A connection that dies mid-body must carry a structured code like
+    // every other failure path here — callers match /^live_read_/, and a
+    // raw 'aborted'/ECONNRESET would slip past that discipline. All three
+    // shapes of "the body stopped early" share one code, because to a caller
+    // they are one condition.
+    response.on('error', () => settle(reject, new Error('live_read_interrupted')));
+    response.on('aborted', () => settle(reject, new Error('live_read_interrupted')));
+    response.on('close', () => {
+      if (!ended) settle(reject, new Error('live_read_interrupted'));
+    });
+    response.on('end', () => {
+      ended = true;
+      if (response.statusCode === 200) {
+        let entries;
+        try {
+          entries = parseSessionText(text);
+        } catch (error) {
+          settle(reject, error);
+          return;
+        }
+        // Unchallenged callers keep the historical array. A challenged caller
+        // needs the bytes the proof covers, so it gets them alongside.
+        settle(resolve, challenge === undefined
+          ? entries
+          : { entries, text, proof: response.headers['x-debug-proof'] ?? null });
+        return;
+      }
+      if (response.statusCode === 401) settle(reject, new Error('live_read_unauthorized'));
+      else if (response.statusCode === 404) settle(reject, new Error('live_read_unknown_session'));
+      else if (response.statusCode === 409) settle(reject, new Error('live_read_log_replaced'));
+      else settle(reject, new Error(`live_read_failed:${response.statusCode}`));
     });
   });
   request.on('error', (error) => {
@@ -299,14 +399,20 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
     // code, and give every other socket failure (ECONNREFUSED, ECONNRESET,
     // ...) the same structured shape callers match on via /^live_read_/,
     // preserving the original error as the cause.
-    if (error?.message?.startsWith('live_read_')) reject(error);
-    else reject(new Error(`live_read_connect_failed:${error?.code ?? 'unknown'}`, { cause: error }));
+    if (error?.message?.startsWith('live_read_')) settle(reject, error);
+    else settle(reject, new Error(`live_read_connect_failed:${error?.code ?? 'unknown'}`, { cause: error }));
   });
   // A collector that accepts the connection and never responds (or dies
   // mid-body) would otherwise hang this promise forever — the worst case
   // for createSessionTail below, a silent freeze with no error surfaced.
   // destroy(error) routes through the 'error' handler above.
   request.setTimeout(timeoutMs, () => request.destroy(new Error('live_read_timeout')));
+  // The absolute bound. The idle timeout above is reset by every byte, so it
+  // is a liveness check rather than a limit; this one is the limit.
+  deadline = setTimeout(() => {
+    request.destroy();
+    settle(reject, new Error('live_read_deadline_exceeded'));
+  }, deadlineMs);
   request.end();
 });
 
@@ -321,7 +427,7 @@ const readSessionLive = ({ port, token, sessionId, filters = {}, timeoutMs = 500
 // on session size and now by readSessionLive's timeoutMs on any single
 // poll. Task 3/4 choose their poll interval knowing this cost rather than
 // polling aggressively.
-const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
+const createSessionTail = ({ port, token, sessionId, clientId, timeoutMs }) => {
   let seen = 0;
   // Single-flight guard: the viewer polls on a timer, and a slow collector
   // can let a second poll start before the first settles. poll() reads the
@@ -335,7 +441,7 @@ const createSessionTail = ({ port, token, sessionId, timeoutMs }) => {
       if (inFlight) return inFlight;
       inFlight = (async () => {
         try {
-          const entries = await readSessionLive({ port, token, sessionId, timeoutMs });
+          const entries = await readSessionLive({ port, token, sessionId, clientId, timeoutMs });
           const fresh = entries.slice(seen);
           seen = entries.length;
           return fresh;
@@ -384,6 +490,7 @@ module.exports = {
   createSessionTail,
   discoverCollector,
   escapeEvidenceText,
+  escapeMarkdownText,
   filterEntries,
   foldHypotheses,
   listSessions,

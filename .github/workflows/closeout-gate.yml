@@ -28,12 +28,15 @@ on:
         default: ""
   # Re-run once a sibling check that was still pending when the gate last
   # ran has settled (CodeRabbit PR7 #6YW9UP): an approval submitted while
-  # "Validate" or "Closeout preview" is still queued/in-progress makes
+  # "Validate", "Closeout preview" or "Debug evidence demo" is still
+  # queued/in-progress makes
   # readLivePrState correctly BLOCK on that pending check, but nothing else
   # re-triggers the gate once it later completes — none of the pull_request/
   # pull_request_review activity above fires for another workflow's check
-  # completion. Deliberately named-scoped to ONLY these two sibling
-  # workflows, NOT "Closeout gate" itself: neither of them has a
+  # completion. Deliberately name-scoped to ONLY these sibling
+  # workflows ("Validate", "Closeout preview", "Debug evidence demo" — the
+  # cycle 4 demo is a per-PR sibling check the gate can block on, exactly
+  # like the other two), NOT "Closeout gate" itself: none of them has a
   # workflow_run trigger watching for "Closeout gate" completions, so the
   # gate's own run can never re-trigger itself through this path — there is
   # no retrigger loop to guard against here, by construction.
@@ -66,8 +69,21 @@ on:
   # tested without live experimentation this repository is not positioned to
   # do; the rerun approach depends only on already-established, already-
   # working SHA-association for the pull_request_review trigger path).
+  #
+  # BOOTSTRAP, a one-time operational cost, NOT something this file fixes.
+  # A workflow_run listener runs the workflow YAML as committed on the DEFAULT
+  # branch (the same fact the paragraph above relies on for its trust
+  # argument). A sibling newly added to the list below therefore does not
+  # exist for this trigger until the PR that adds it has MERGED. The
+  # consequence is exact and unavoidable: on the PR that introduces a sibling,
+  # the gate can BLOCK on that sibling's still-pending check, and that
+  # sibling's completion CANNOT fire this forwarder to unblock it. The gate
+  # stays blocked until some unrelated event re-triggers it, or until a
+  # maintainer re-runs the gate by hand, once. That manual re-run is the cost;
+  # it is paid once per newly-listed sibling, at merge time, and nothing in
+  # this file removes it.
   workflow_run:
-    workflows: ["Validate", "Closeout preview"]
+    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]
     types: [completed]
   # Base-branch-drift discovery (chatgpt-codex-connector PR7 #6YbMwY):
   # RESOLVED for the trigger-coverage gap where none of the events above
@@ -243,14 +259,30 @@ jobs:
       #      additionally hard-caps the token to read-only server-side
       #      regardless of what a fork-supplied workflow file requests, which
       #      is the actual threat model this trigger runs under.
-      #   2. Neither sibling workflow (validate.yml, closeout-preview.yml)
-      #      references any secret beyond the implicit GITHUB_TOKEN, and
-      #      neither uploads an artifact -- checked directly (`grep -n
+      #   2. No sibling workflow (validate.yml, closeout-preview.yml,
+      #      debug-evidence-demo.yml) references any secret beyond the
+      #      implicit GITHUB_TOKEN -- checked directly (`grep -n
       #      'secrets\.' .github/workflows/*.yml`) rather than assumed, so
       #      `actions: read` in a compromised run cannot currently reach any
-      #      OTHER workflow's secret or artifact in this repo. It can still
-      #      list/read this workflow's OWN past runs' evidence artifacts
-      #      (chatgpt-codex-connector's stated concern) via the Actions API.
+      #      OTHER workflow's secret in this repo. Artifacts are a different
+      #      matter as of cycle 4: "Debug evidence demo" DOES upload evidence
+      #      artifacts (3 per run, one per action invocation), so
+      #      `actions: read` here can read them. Bounded rather than
+      #      prevented -- and, unlike (1) above, bounded only for the SNAPSHOT
+      #      REVIEWED rather than structurally. As reviewed, each artifact is
+      #      three files (session.log, report.md, report.json) from a
+      #      deterministic demo repro whose only secret-shaped value is
+      #      DEMO_FAKE_SECRET, a fixed dummy committed in the clear in that
+      #      workflow and redacted out of the evidence anyway. That is a fact
+      #      about this commit, not a guarantee: the same PR controls the
+      #      action, the repro and the upload configuration, so a PR can
+      #      change what those artifacts contain, and re-reading them is part
+      #      of reviewing a PR that touches any of the three. What does NOT
+      #      depend on the snapshot is (1) -- read-only permissions, and no
+      #      repository secret for this token to reach at all. It can also
+      #      still list/read this workflow's OWN past runs' evidence
+      #      artifacts (chatgpt-codex-connector's stated concern) via the
+      #      Actions API.
       #
       # A COMPLETE fix means never executing PR-controlled code with any live
       # token -- e.g. referencing this action by a pinned, trusted remote ref
@@ -277,11 +309,14 @@ jobs:
       #
       # (or a maintainer-cut release tag pointing at that same commit), and
       # keep that pin current on subsequent merges that touch the action.
-      # Until that follow-up lands, this line stays local/unpinned -- the two
-      # structural mitigations documented above (read-only permissions;
-      # neither sibling workflow exposes a secret or artifact this token
-      # could reach) remain the operative bound on blast radius in the
-      # meantime.
+      # Until that follow-up lands, this line stays local/unpinned -- the
+      # structural mitigations documented above (read-only permissions; no
+      # sibling workflow exposes a repository secret this token could reach)
+      # remain the operative bound on blast radius in the meantime. The
+      # sibling ARTIFACT reading described in (2) is deliberately left out of
+      # that sentence: it is bounded by the reviewed snapshot rather than by
+      # structure, and a summary that folded it in would overstate the bound
+      # in exactly the direction this comment exists to avoid.
       - name: Closeout gate
         uses: ./actions/closeout
         with:
@@ -298,7 +333,8 @@ jobs:
           base-ref: ${{ github.event.inputs.base-ref || '' }}
 
   # Re-run the closeout gate's most recent EXISTING run at a PR's head once a
-  # sibling workflow (Validate / Closeout preview) completes, so a result
+  # sibling workflow (Validate / Closeout preview / Debug evidence demo)
+  # completes, so a result
   # that was blocked on that sibling gets a correctly SHA-associated re-run
   # instead of being invisible to branch protection (chatgpt-codex-connector
   # PR7 #6YaxWe — see the workflow_run trigger comment above for the full

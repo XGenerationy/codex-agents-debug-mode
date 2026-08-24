@@ -4,6 +4,7 @@
 // applies the shared filter engine and re-emits the selected RAW stored
 // lines byte-for-byte. Zero dependencies; all interactive state changes are
 // pure reducers so they can be unit-tested without a terminal.
+const net = require('node:net');
 const path = require('node:path');
 const {
   createSessionTail,
@@ -16,6 +17,46 @@ const {
   readSessionLive,
   resolveSessionRef,
 } = require('./debug_evidence');
+const { probeServer } = require('./debug_server');
+
+// Does anything at all accept a TCP connection on the recorded port? Consulted
+// only after the identity probe already failed, to tell the ordinary offline
+// state apart from a live listener that is not this collector. The collector
+// never removes .debug/collector_port or collector_token -- not even on a clean
+// exit, where only collector_claim is released -- so stale routing files plus a
+// refused connection ARE the normal "not running" case and must stay silent.
+const portAccepts = (port, timeoutMs = 500) => new Promise((resolve) => {
+  const socket = net.connect({ host: '127.0.0.1', port });
+  let settled = false;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    resolve(value);
+  };
+  socket.setTimeout(timeoutMs, () => finish(false));
+  socket.once('connect', () => finish(true));
+  socket.once('error', () => finish(false));
+  socket.once('close', () => finish(false));
+});
+
+const liveCollector = async (projectRoot) => {
+  const collector = await discoverCollector(projectRoot);
+  const identity = await probeServer(collector.port);
+  if (!identity || typeof identity.project_hash !== 'string') {
+    // probeServer collapses every failure into null (wrong service/version,
+    // non-200, oversized body, malformed identity, refusal, deadline), but only
+    // a refusal is the silent offline case `collector_not_running` names.
+    // Anything still listening on the recorded port is a live process that is
+    // NOT this collector; folding that in suppressed the TUI fallback warning
+    // and printed a misleading "--live unavailable: collector_not_running"
+    // while a process was demonstrably bound to that port.
+    throw new Error((await portAccepts(collector.port))
+      ? 'collector_identity_unverified'
+      : 'collector_not_running');
+  }
+  return { ...collector, clientId: identity.project_hash };
+};
 
 const USAGE = 'Usage: debug_viewer.js [projectRoot] --session <id|path> '
   + '[--hypothesis <id>] [--type all|event|hypothesis] [--since <ISO>] '
@@ -99,7 +140,7 @@ const runAgentMode = async (parsed) => {
     // filters (GET-parity guaranteed by the core's test), emit the raw
     // stored lines byte-verbatim. Errors (collector_not_running,
     // live_read_*) propagate to main's catch: one line, exit 1.
-    const collector = await discoverCollector(parsed.projectRoot);
+    const collector = await liveCollector(parsed.projectRoot);
     const entries = await readSessionLive({ ...collector, sessionId: parsed.session, filters: parsed.filters });
     for (const entry of entries) process.stdout.write(`${entry.raw}\n`);
     return 0;
@@ -260,7 +301,7 @@ const main = async () => {
   let liveUnavailableReason;
   if (!parsed.forceFile) {
     try {
-      const collector = await discoverCollector(parsed.projectRoot);
+      const collector = await liveCollector(parsed.projectRoot);
       tail = createSessionTail({ ...collector, sessionId });
       entries = await tail.poll();
       live = true;
@@ -268,9 +309,11 @@ const main = async () => {
       // `collector_not_running` is the normal offline case and silently
       // falls through to the file. Every other code (live_read_unauthorized,
       // live_read_unknown_session, invalid_session_ref, collector_port_invalid,
-      // collector_token_invalid, live_read_connect_failed, ...) is a real
-      // misconfiguration the operator must see, not a silent downgrade to
-      // stale file content with no explanation.
+      // collector_token_invalid, live_read_connect_failed,
+      // collector_identity_unverified -- a live listener on the recorded port
+      // that is not this collector, ...) is a real misconfiguration the
+      // operator must see, not a silent downgrade to stale file content with
+      // no explanation.
       liveUnavailableReason = error.message;
       tail = null;
     }

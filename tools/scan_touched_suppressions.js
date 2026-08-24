@@ -23,6 +23,7 @@
  */
 
 const { execFileSync } = require('node:child_process');
+const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
@@ -35,6 +36,7 @@ const {
   readGateChanges,
   scanTouchedSuppressions,
 } = require('../scripts/pr_closeout_repo');
+const { BLOCK_SCALAR_HEADER, stripTrailingYamlComment } = require('./workflow_checks');
 
 const root = path.resolve(__dirname, '..');
 // Large enough for a pathological multi-thousand-file PR; still bounded.
@@ -707,12 +709,149 @@ const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
 };
 
 /**
+ * Parse a `workflows: ["A", "B"]` unified-diff line into its indent and name
+ * list. Only the JSON-array spelling is accepted: YAML flow that is not JSON
+ * (single quotes, trailing commas) fails closed rather than being guessed.
+ * @param {string} line unified-diff line starting with `-` or `+`
+ * @returns {{indent: string, names: string[]}|null}
+ */
+const parseWorkflowNameListLine = (line) => {
+  const match = /^[+-](\s*)workflows:\s*(\[[\s\S]*\])\s*$/.exec(line);
+  if (!match) return null;
+  try {
+    const names = JSON.parse(match[2]);
+    if (!Array.isArray(names) || names.length === 0) return null;
+    if (!names.every((name) => typeof name === 'string' && name !== '')) return null;
+    return { indent: match[1], names };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Full chain of YAML mapping keys enclosing `targetLine`, outermost first, as
+ * proven by strictly decreasing indent from the target up to a column-0 key.
+ * Used to prove a `workflows:` list sits under top-level `on.workflow_run`
+ * rather than under an action `with:` input, where adding names can weaken
+ * policy. Returns null — fail closed — when the target line is absent,
+ * duplicated (ambiguous), enclosed by a block-scalar-valued key (its content
+ * is literal text, not mappings), or never reaches a column-0 key.
+ * @param {string} fileText
+ * @param {string} targetLine file line, no +/- prefix
+ * @returns {string[]|null} ancestor keys outermost-first, or null when unproven
+ */
+const yamlAncestorKeyChain = (fileText, targetLine) => {
+  const lines = fileText.split(/\r?\n/);
+  const idx = lines.indexOf(targetLine);
+  if (idx < 0) return null;
+  // A duplicated target line is ambiguous: the first occurrence's parent may
+  // not be the edited occurrence's (e.g. a byte-identical list under a step's
+  // with: at the same indent), and guessing would fail OPEN by attributing an
+  // action-input expansion to the earlier on.workflow_run occurrence. Refuse
+  // to resolve a chain instead; the caller fails closed and flags the line.
+  if (lines.indexOf(targetLine, idx + 1) !== -1) return null;
+  const chain = [];
+  let indent = (lines[idx].match(/^(\s*)/) || ['', ''])[1].length;
+  for (let i = idx - 1; i >= 0 && indent > 0; i -= 1) {
+    const line = lines[i];
+    if (!line.trim() || /^\s*#/.test(line)) continue;
+    // Quoted keys are valid YAML and the yamllint-recommended spelling for
+    // `on` (a YAML 1.1 truthy): '"on":' and "'workflow_run':" must resolve
+    // to the same chain entries as their bare forms, so a legitimately
+    // quoted trigger is exempted rather than flagged for its spelling. The
+    // quoted alternatives keep the same conservative charset — anything
+    // stranger stays unmatched and the chain fails closed.
+    const match = /^(\s*)(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))\s*:/.exec(line);
+    if (!match) continue;
+    if (match[1].length < indent) {
+      // A key whose value begins a block scalar (`on: |`, `"on": >-`, …)
+      // encloses everything below it at deeper indent as literal TEXT — the
+      // target line included — so a chain through it proves nothing. The
+      // enclosing scalar's key always has lower indent than its content and
+      // therefore always enters this walk; refusing here fails the whole
+      // lookup closed (Qodo PR8: '"on": |' embedding trigger-shaped text).
+      // The SHARED header pattern, never a weaker inline copy: the inline
+      // regex `/:\s*[|>].../` required the indicator directly after the
+      // colon, so an anchored or tagged header (`"on": &a |`, `"on": !!str
+      // |`) was not recognized as a scalar and its BODY lines were walked as
+      // real YAML keys — proving a chain out of inert literal text, i.e.
+      // failing OPEN on the exact embedding the guard refuses (audit V7a).
+      // Tested against the COMMENT-STRIPPED line, per the pattern's own
+      // contract at its home: the greedy `\S.*:` prefix otherwise swallows
+      // past a real `#` and matches a `: |`-shaped fragment INSIDE the
+      // trailing comment (`on: # was: |`), refusing a chain that is actually
+      // provable (review V3a — fail-closed noise, but noise that invites
+      // loosening the shared regex). Clean fresh-line quote state is the
+      // strip's default and the only option here: this walk has no
+      // cross-line quote tracking (a known, separately-tracked limitation).
+      if (BLOCK_SCALAR_HEADER.test(stripTrailingYamlComment(line))) return null;
+      chain.unshift(match[2] ?? match[3] ?? match[4]);
+      indent = match[1].length;
+    }
+  }
+  // A chain is proven only when it reaches a column-0 top-level key. Block
+  // scalar content nested below any mapping (e.g. a `workflow_run:`-shaped
+  // line inside a step's `run: |`) surfaces the real jobs/steps ancestry —
+  // or no column-0 key at all — and a scalar whose key itself is top-level
+  // is rejected by the block-scalar guard above, so scalar text can never
+  // present as the proven trigger chain.
+  if (indent !== 0) return null;
+  return chain;
+};
+
+/**
+ * True when a removed/added pair is an order-preserving expansion of
+ * `on.workflow_run.workflows` — adding a sibling trigger name without
+ * dropping or reordering the names already there. A line-only `workflows:`
+ * helper cannot prove that parent (the same key under `with:` is an action
+ * input, where adding entries can weaken policy), so this also requires
+ * `readFile(currentFile)` and checks the full ancestor chain is exactly
+ * top-level `on` → `workflow_run`. Missing file, unreadable file, any other
+ * chain, or a chain that never reaches a column-0 key (block-scalar
+ * embeddings) fails closed. Note `readFile` returns WORKING-TREE content
+ * while `addedLine` comes from the base-to-HEAD diff: when the two diverge
+ * (e.g. uncommitted edits to the workflow), the exact-text lookup in
+ * yamlAncestorKeyChain simply misses and the expansion stays flagged — that
+ * divergence must remain fail-closed, never guessed around.
+ * @param {string} removedLine
+ * @param {string} addedLine
+ * @param {string} currentFile
+ * @param {(relPath: string) => string|null|undefined} [readFile]
+ * @returns {boolean}
+ */
+const isSafeWorkflowRunListExpansion = (removedLine, addedLine, currentFile, readFile) => {
+  if (!currentFile.startsWith('.github/workflows/')) return false;
+  if (typeof readFile !== 'function') return false;
+  const removed = parseWorkflowNameListLine(removedLine);
+  const added = parseWorkflowNameListLine(addedLine);
+  if (!removed || !added) return false;
+  if (removed.indent !== added.indent) return false;
+  if (added.names.length <= removed.names.length) return false;
+  for (let i = 0; i < removed.names.length; i += 1) {
+    if (added.names[i] !== removed.names[i]) return false;
+  }
+  const addedAsRemoval = `-${addedLine.slice(1)}`;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(removedLine))) return false;
+  if (VALIDATION_REMOVAL_PATTERNS.some((pattern) => pattern.test(addedAsRemoval))) return false;
+  let fileText;
+  try {
+    fileText = readFile(currentFile);
+  } catch {
+    return false;
+  }
+  if (typeof fileText !== 'string') return false;
+  const chain = yamlAncestorKeyChain(fileText, addedLine.slice(1));
+  return !!chain && chain.length === 2 && chain[0] === 'on' && chain[1] === 'workflow_run';
+};
+
+/**
  * Collect substantive removed gate lines from a `--unified=0` diff, pairing
  * each removed (`-`) line with the added (`+`) line at the same position within
  * its hunk. A pure DELETION (no positional replacement) is always collected;
  * a recognized safe replacement (a same-field descriptive value edit, a
- * package.json dependency/script edit, a workflow step rename, or an action
- * pin bump -- see the isSafe* helpers above) is skipped as a benign
+ * package.json dependency/script edit, a workflow step rename, an action
+ * pin bump, or an order-preserving on.workflow_run.workflows expansion --
+ * see the isSafe* helpers above) is skipped as a benign
  * modification. With `--unified=0` each contiguous change is its own hunk
  * whose removed lines all precede its added lines, so index pairing aligns
  * old<->new; hunk/file boundaries flush the pairing buffers so a removed line
@@ -728,9 +867,10 @@ const isSafeActionPinReplacement = (removedLine, addedLine, currentFile) => {
  * UxMW8) -- the same ambiguity pr_closeout_repo.js's prose-gate diff walk
  * already guards against for its own header parsing.
  * @param {string} diff unified diff text (produced with unified=0)
+ * @param {{readFile?: (relPath: string) => string|null|undefined}} [options]
  * @returns {string[]} truncated removed lines that are not safe replacements
  */
-const collectContentRemovals = (diff) => {
+const collectContentRemovals = (diff, { readFile } = {}) => {
   const findings = [];
   let removed = [];
   let added = [];
@@ -750,6 +890,7 @@ const collectContentRemovals = (diff) => {
         || isSafePackageJsonFieldReplacement(line, replacement, currentFile)
         || isSafeWorkflowStepNameReplacement(line, replacement, currentFile)
         || isSafeActionPinReplacement(line, replacement, currentFile)
+        || isSafeWorkflowRunListExpansion(line, replacement, currentFile, readFile)
       )) continue;
       findings.push(line.slice(0, 200));
     }
@@ -803,7 +944,15 @@ const detectGateContentRemovals = (baseSha, gateFiles) => {
   } catch (error) {
     throw new Error(`Failed to read gate diff for content-removal scan: ${error.message}`);
   }
-  return collectContentRemovals(diff);
+  return collectContentRemovals(diff, {
+    readFile: (relPath) => {
+      try {
+        return readFileSync(path.join(root, relPath), 'utf8');
+      } catch {
+        return null;
+      }
+    },
+  });
 };
 
 /**
@@ -942,5 +1091,6 @@ module.exports = {
   isSafePackageJsonFieldReplacement,
   isSafeWorkflowStepNameReplacement,
   isSafeActionPinReplacement,
+  isSafeWorkflowRunListExpansion,
   isMechanicalLockfile,
 };

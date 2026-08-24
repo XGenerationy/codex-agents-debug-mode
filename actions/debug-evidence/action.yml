@@ -1,0 +1,477 @@
+name: "Debug Evidence Session"
+description: >-
+  Wrap one failing command in an instrumented debug-collector session:
+  capture evidence, render a Step Summary report, upload the evidence
+  artifact, and tear the collector down. All logic lives in support.js;
+  this file is wiring only.
+
+inputs:
+  run:
+    description: "Command to execute under instrumentation (bash -e -o pipefail -c, matching workflow-step semantics)"
+    required: true
+  working-directory:
+    description: "Directory the wrapped command runs in"
+    required: false
+    default: "."
+  session-name:
+    description: "Session label ([A-Za-z0-9_-]+); the session id derives from it"
+    required: false
+    default: "ci-debug"
+  fail-on-command-failure:
+    description: >-
+      'true' (default): the action fails when the wrapped command exits
+      non-zero. 'false': the failure is reported in the summary/outputs only.
+      Evidence capture, artifact upload, and teardown happen regardless.
+    required: false
+    default: "true"
+  output-dir:
+    description: >-
+      Evidence staging dir (MUST be outside the workspace). It is the STAGING
+      ROOT, not the artifact: only the three paths under this invocation's
+      nonce child are submitted to the upload step.
+    required: false
+    default: ""
+  artifact-name:
+    description: "Uploaded evidence artifact name"
+    required: false
+    default: "debug-evidence"
+  node-version:
+    description: "Node.js version for the collector and renderer"
+    required: false
+    default: "24"
+  port:
+    description: "Collector port (loopback only). Self-hosted runners sharing a host must pick distinct ports."
+    required: false
+    default: "8787"
+  redact-names:
+    description: "Comma- or whitespace-separated extra env-var names to always redact (extends DEBUG_REDACT_NAMES)"
+    required: false
+    default: ""
+  max-events:
+    description: "Per-session event limit override (collector default 2000)"
+    required: false
+    default: ""
+  max-bytes:
+    description: "Total evidence byte limit override (collector default 16MB)"
+    required: false
+    default: ""
+  hypothesis-id:
+    description: >-
+      Optional: when set, the action posts one status OPEN hypothesis line
+      (a launch-token capability the wrapped command does not hold) and
+      injects DEBUG_HYPOTHESIS_ID into the wrapped command's environment.
+      The action never posts any other status — verdicts stay with you.
+    required: false
+    default: ""
+  hypothesis-title:
+    description: "Optional title for the hypothesis line; ignored without hypothesis-id"
+    required: false
+    default: ""
+  evidence-trust:
+    description: >-
+      'strict' (default): refuse to run the wrapped command at all unless this
+      host positively establishes the in-process boundary this action's
+      evidence depends on. That takes ALL of: Linux Yama ptrace_scope 3, a
+      non-root effective uid, NO sudo binary at /usr/bin/sudo, /bin/sudo,
+      /usr/local/bin/sudo or anywhere on the inherited PATH, and none of
+      CAP_SYS_ADMIN, CAP_BPF, CAP_SYS_PTRACE or CAP_SYS_MODULE held by this
+      process. An empty PATH counts as naming the working directory and denies;
+      only an unset PATH means the conventional locations alone. 'best-effort': run anyway, and
+      treat the resulting evidence as a diagnostic claim rather than an
+      authenticated one. Mode 3 is necessary, not sufficient — it forbids
+      ptrace attachment, but a principal that can reach root rewrites another
+      task's memory with a privileged BPF program or a kernel module without
+      ptrace at all — so a runner carrying sudo cannot reach strict by setting
+      the sysctl. Any sudo binary at a conventional absolute path or anywhere
+      on the inherited PATH denies strict admission, because sudoers rules are
+      command-specific: no probe of one command can establish the absence of a
+      rule for another, and a PATH-planted fake could fabricate a denial that
+      GRANTED admission. The check therefore covers the conventional locations
+      AND every sudo candidate on the inherited PATH, lstat-ed and never
+      executed — a fixed path list read a NixOS-style layout as clean and would
+      have granted strict on a host where the wrapped command can become root.
+      A hostile PATH can only ADD candidates: the conventional locations are
+      checked whatever PATH says.
+      GitHub-hosted runners ship sudo, so hosted execution stays best-effort
+      and hosted callers must opt in. And these are the escalation routes this
+      action checks, not a proof that no route exists: a setuid binary, a
+      mounted container socket or a writable privileged service grants the same
+      power unobserved. On a strict admission the trust unit is the pre-command
+      admission record in start's step log, plus the matching digest from run's
+      step log, plus the artifact — all three together. This action verifies
+      none of that correspondence: the comparison is external and manual, and
+      is only meaningful between copies carrying the same invocation nonce,
+      which every copy of the record states. The nonce enforces nothing — it
+      lets a reader detect a mismatch that would otherwise be invisible.
+    required: false
+    default: "strict"
+
+# Every output is produced by the RUN step, because run is where capture
+# happens: it is the only process that spans the wrapped command's execution,
+# so it is the only one whose account of the session CAN be trusted — and
+# whether it MAY be depends on how this invocation was admitted. After a
+# successful strict admission, run's account is authenticated, and the trust
+# unit is the pre-command admission record start streamed to its own step log,
+# plus the matching digest from run's step log, plus the artifact — all three
+# together (Codex T6 r9). The artifact and digest alone are not it: a
+# compromised run produces both, and only start's pre-command copy, which
+# nothing afterwards can retract, establishes which regime was in force. Under
+# `evidence-trust: best-effort` it is a diagnostic claim only,
+# because the threat that mode accepts is precisely a command able to rewrite
+# run. `report` publishes and produces nothing under either mode. And
+# "successful strict admission" means the escalation routes this action checks
+# came back clear, not a proof that no route exists — the trust unit is only
+# ever as good as that.
+outputs:
+  command-exit-code:
+    description: "Exit code of the wrapped command; empty until the run step has run"
+    value: ${{ steps.run.outputs.command-exit-code }}
+  session-id:
+    description: "Collector session id; empty until the run step has run"
+    value: ${{ steps.run.outputs.session-id }}
+  event-count:
+    description: "Events captured in the session; empty until the run step has captured one"
+    value: ${{ steps.run.outputs.event-count }}
+  report-path:
+    description: >-
+      Path of report.md in the staged evidence: output-dir joined with this
+      invocation's staging child, so it is absolute exactly when output-dir is
+      — which the default is. Nothing resolves it, so a relative custom
+      output-dir produces a relative value. Empty until the run step has
+      captured one.
+    value: ${{ steps.run.outputs.report-path }}
+  evidence-digest:
+    description: >-
+      Convenience only, NOT the trust anchor: the SHA-256 digest line for the
+      three staged payloads, byte-identical to the line the run step printed
+      to its own step log. That log line is the authenticated copy ONLY after a
+      successful strict admission; under best-effort both copies are diagnostic
+      claims, since a command that can rewrite the run process can forge either.
+      This output exists so a workflow can compare an artifact without scraping
+      logs. Empty until the run step has captured a session.
+    value: ${{ steps.run.outputs.evidence-digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Start collector
+      # The collector inherits THIS step's full environment: its redaction
+      # snapshot must include the job's secrets so anything the wrapped
+      # command logs is scrubbed (spec Security invariant 3). Do not strip
+      # the env here.
+      #
+      # This step's FIRST action is to publish `invocation-nonce` — this
+      # invocation's identity — as a step output, before input validation or
+      # anything else that can fail. Every later step below reads it from
+      # `steps.start.outputs`, which the runner resolves per action instance:
+      # a second invocation in the same job reads its own start, never this
+      # one's. It deliberately does NOT travel through GITHUB_ENV, which is
+      # job-global — those values persist into every later step of the job and
+      # are visible in the expression env context, so a nonce written there is
+      # inheritable by an invocation that never earned it (Codex T6 r1 #1).
+      id: start
+      shell: bash
+      env:
+        DEBUG_ACTION_RUN: ${{ inputs.run }}
+        DEBUG_ACTION_SESSION_NAME: ${{ inputs.session-name }}
+        DEBUG_ACTION_WORKDIR: ${{ inputs.working-directory }}
+        DEBUG_ACTION_FAIL_ON_COMMAND_FAILURE: ${{ inputs.fail-on-command-failure }}
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_PORT: ${{ inputs.port }}
+        DEBUG_ACTION_REDACT_NAMES: ${{ inputs.redact-names }}
+        DEBUG_ACTION_MAX_EVENTS_INPUT: ${{ inputs.max-events }}
+        DEBUG_ACTION_MAX_BYTES_INPUT: ${{ inputs.max-bytes }}
+        DEBUG_ACTION_HYPOTHESIS_ID: ${{ inputs.hypothesis-id }}
+        DEBUG_ACTION_HYPOTHESIS_TITLE: ${{ inputs.hypothesis-title }}
+        DEBUG_ACTION_EVIDENCE_TRUST: ${{ inputs.evidence-trust }}
+      run: node "${{ github.action_path }}/support.js" start
+
+    - name: Run wrapped command
+      # THE TRUSTED PROCESS. Its environment is resolved by the runner before
+      # the wrapped command exists, and an ordinary child has no interface for
+      # writing into its parent's address space — so the IN-PROCESS VALUES this
+      # step holds (the verification key it read at entry, the captured buffer,
+      # the verdict it reaches) are out of the reach of the command IT runs.
+      # Capture, hypothesis validation, rendering, hashing and staging all
+      # happen here, after the command returns, in this same process.
+      #
+      # That claim is about those values and nothing else. The command plainly
+      # influences the world around them: it writes files, rewrites state, can
+      # kill the collector, and authors every event that reaches the log. What
+      # it cannot do — under the prerequisite below, and only as far as the
+      # checks below can see — is change this process's own copy of what it
+      # read before the command started.
+      #
+      # PLATFORM PREREQUISITE, because the claim is conditional and the file
+      # must say so (Codex T6 r5, corrected r6): it holds only where the host
+      # refuses classic same-UID ptrace attachment, and ONLY Linux Yama
+      # ptrace_scope 3 does that unconditionally. Modes 1 and 2 restrict
+      # attachment but are bypassable with CAP_SYS_PTRACE, and standard
+      # GitHub-hosted runners give workflow commands PASSWORDLESS SUDO — so a
+      # hostile native command there can elevate and attach to this process,
+      # or to the collector whose pid is in the state file, and read or inject
+      # memory, which defeats authenticated evidence outright. Which mode a
+      # current hosted image ships is deliberately NOT recorded (Codex T8 r2
+      # #4): it is a moving external property this job never measures, and it
+      # is not needed — the sudo fact makes 1 and 2 bypassable either way.
+      #
+      # AND MODE 3 IS NOT ENOUGH ON ITS OWN (Codex T6 r8, and it reverses what
+      # round 7 wrote here). Yama governs ptrace and nothing else: a principal
+      # that can reach ROOT overwrites another task's userspace memory with a
+      # privileged tracing BPF program — bpf_probe_write_user() — or with a
+      # kernel module, and never calls ptrace. So mode 3 is necessary, not
+      # sufficient, and `sysctl -w kernel.yama.ptrace_scope=3` does NOT turn a
+      # hosted runner into an authenticated one, because the same sudo that
+      # sets it opens the BPF route. Hosted execution stays best-effort.
+      #
+      # Strict admission is therefore a conjunction: mode 3, a non-root
+      # effective uid, no sudo binary anywhere the inspection reaches, and no
+      # CAP_SYS_ADMIN / CAP_BPF / CAP_SYS_PTRACE / CAP_SYS_MODULE in this
+      # process's own set. Any sudo binary at a conventional absolute path or
+      # anywhere on the inherited PATH denies, detected by EXISTENCE and never
+      # by behaviour (Codex T6 r9): sudoers rules are command-specific, so
+      # `sudo -n <cmd>` cannot establish the absence of a rule for a different
+      # command, and a PATH-planted fake could fabricate a denial that GRANTED
+      # admission. The inspection is the union of /usr/bin/sudo, /bin/sudo and
+      # /usr/local/bin/sudo with every sudo candidate on the inherited PATH,
+      # lstat-ed and never executed (Codex T6 r10): the fixed list alone read a
+      # NixOS-style /run/current-system/sw/bin layout as clean, which would
+      # have granted strict admission on a host where the wrapped command can
+      # become root. Reading PATH is not the act round 9 forbade — that was
+      # EXECUTING what PATH resolves to and believing its output — and the
+      # union means a hostile PATH can only ever ADD candidates, never remove
+      # the conventional ones. Those are the
+      # escalation routes this action checks, not a proof that no route
+      # exists — a setuid binary, a mounted container socket or a writable
+      # privileged service grants the same power and none of them is visible
+      # from here. Read the guarantee above with that bound on it.
+      #
+      # `start` streams an ADMISSION RECORD to its own step log before the
+      # wrapped command exists, on every regime, and `run` and the report
+      # carry the identical text. That is what makes the artifact's copy worth
+      # anything: the trust unit is the admission record, plus run's digest,
+      # plus the artifact, and a reader compares the copies. THIS ACTION
+      # VERIFIES NONE OF THAT CORRESPONDENCE (Codex T6 r10) — it is a human
+      # comparison, and one that is only meaningful against the start record
+      # carrying the SAME invocation nonce, which every copy states. The nonce
+      # ENFORCES no pairing: it lets a reader detect a mismatch that would
+      # otherwise be invisible, which is worth having and is a weaker claim. And the
+      # authenticated reading of the unit requires a successful STRICT
+      # admission, not merely clear host readings: a best-effort run on a
+      # spotless host is still diagnostic, because the regime it chose accepts
+      # a command able to rewrite the process that produced the evidence.
+      #
+      # `start` therefore REFUSES to run the wrapped command at all unless the
+      # prerequisite is positively established, which takes all four readings.
+      # `evidence-trust: best-effort` opts out and takes clearly labeled
+      # evidence instead. Labeling alone could not be the control: the hazard
+      # is a command able to rewrite this process, and such a command can strip
+      # the caveat that warns about it — only a refusal that precedes the
+      # command is out of its reach. The action labels that platform; it cannot
+      # create the boundary on it.
+      #
+      # (One more limit, load-bearing: a command an EARLIER invocation ran in
+      # the same job reaches even this step's environment through BASH_ENV —
+      # see the scope note on the upload step.)
+      #
+      # DEBUG_ACTION_COLLECTOR_VERIFY_KEY is the collector's PUBLIC Ed25519
+      # verification key, and it is wired HERE AND NOWHERE ELSE (spec Security
+      # invariant 9, extended round 6). Its secrecy does not matter; its
+      # INTEGRITY is everything. Delivered as a step output it exists only in
+      # runner memory until this step's env is resolved, which is the one
+      # channel a same-user process cannot reach — whereas a key read from
+      # state, or handed to a step that starts AFTER the wrapped command has
+      # run, could be swapped for one whose private half the attacker holds.
+      #
+      # There is deliberately no continue-on-error anywhere in this file: this
+      # step exits 3 on any integrity failure, and a failed composite step is
+      # precisely what no later step can un-fail.
+      id: run
+      shell: bash
+      env:
+        DEBUG_ACTION_RUN: ${{ inputs.run }}
+        DEBUG_ACTION_WORKDIR: ${{ inputs.working-directory }}
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_COLLECTOR_VERIFY_KEY: ${{ steps.start.outputs.collector-verify-key }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+      run: node "${{ github.action_path }}/support.js" run
+
+    - name: Render evidence report
+      # Publish-only and key-free, and it runs BEFORE the upload step because
+      # it decides what the upload step finds staged: it appends the staged
+      # report to the Step Summary when this invocation's run captured one,
+      # and otherwise clears the staging slots (keeping session.log when run
+      # authenticated it but the renderer failed). It verifies nothing and
+      # decides nothing, so there is nothing here worth poisoning.
+      #
+      # `steps.start.outcome != 'skipped'` keeps it off the path where an
+      # earlier step (Set up Node.js) failed and `start` never ran at all: it
+      # would then find neither this invocation's nonce nor its state, and a
+      # reused output-dir's leftovers are not this run's evidence.
+      id: report
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+      run: node "${{ github.action_path }}/support.js" report
+
+    - name: Upload evidence artifact
+      # Both the GUARD and the PATHS come from `start`, and specifically from
+      # BEFORE the wrapped command existed (Codex T6 r2 #1). A value published
+      # by the run step would be worthless here however carefully it were
+      # computed: run writes its outputs after the command has executed, into a
+      # file under RUNNER_TEMP that the command can append to itself — removing
+      # GITHUB_OUTPUT from the child's environment hides the variable, not the
+      # file. The command can claim any key run does not write, and for a key
+      # run does write it can open a heredoc whose delimiter is the exact line
+      # run is about to append, swallowing it as body and leaving an
+      # attacker-chosen multiline path set behind. (The delimiter is
+      # predictable: `session-id=<id>` is a line run always writes, and the id
+      # is in the command's own environment.) A pre-command output is out of
+      # THIS invocation's wrapped command's reach, which is the same argument
+      # that protects the verification key.
+      #
+      # SCOPE OF THAT GUARANTEE — stated precisely, because it does not
+      # generalise (Codex T6 r3). It holds for the FIRST (or only) invocation
+      # of this action in a job. It does NOT survive an earlier instrumented
+      # command in the SAME job: that command's own GITHUB_ENV file can set
+      # BASH_ENV, which every later `shell: bash` step sources at shell startup
+      # — a second invocation's `start` included, before support.js runs — so
+      # attacker code can append a last-wins `evidence-dir=` to that start's
+      # own output file and redirect this path set after all. The same reach
+      # covers the verification key handed to the run step. Wrapping a second
+      # command after an instrumented one therefore belongs in a SEPARATE JOB;
+      # same-job reuse is not something this runner channel can be made to
+      # guarantee. Task 8's README must say so in the same words — that is a
+      # recorded obligation on the documentation, not a claim about what it
+      # already contains.
+      #
+      # `evidence-dir` is start's invocation-scoped staging child. It is empty
+      # only when start never executed, which is exactly when there is nothing
+      # to upload — so the guard needs nothing else, and `if-no-files-found:
+      # ignore` covers the case where start ran but nothing was ever staged.
+      # Deliberately NOT gated on `report`: a Step Summary failure must never
+      # suppress evidence run proved.
+      #
+      # The filenames stay enumerated rather than uploading the directory, and
+      # action-state.json — this run's session token — lives at the output-dir
+      # ROOT, outside the staging child, so NO ENUMERATED PATH NAMES IT.
+      # Note the shape of that claim, which is the README's (Codex T8 r2 #2 —
+      # this comment was the THIRD surface still making the byte-level
+      # promise after round 1 corrected the other two): it is about the path
+      # NAMES, never about the bytes. Residual 2 below is this same step
+      # following symlinks unconditionally, so replacing session.log with a
+      # link to ../action-state.json puts the state bytes into the archive
+      # under one of these very names. The names are what this list controls.
+      #
+      # Two residuals, documented rather than prevented, both following from
+      # same-user staging:
+      #
+      # 1. A hostile command can create files INSIDE this directory, so the
+      #    artifact may carry payloads this action never staged. The trust unit
+      #    answers it, ON THE STRICT PATH: evidence is bytes whose SHA-256
+      #    matches a digest line the run process printed to its own step log,
+      #    and a planted file has no backing digest (a run that staged nothing
+      #    prints none). Under best-effort that answer degrades to a
+      #    diagnostic: the same command that plants a file may be able to
+      #    rewrite the process that prints the digest.
+      # 2. The uploader offers no control over symlink following: v4.6.2
+      #    declares seven inputs (name, path, if-no-files-found,
+      #    retention-days, compression-level, overwrite, include-hidden-files)
+      #    and hardcodes `followSymbolicLinks: true` with
+      #    `implicitDescendants: true` in its glob options — verified against
+      #    the pinned SHA. `report` unlinks any staged symlink or non-file
+      #    before this step so a post-hash substitution cannot ride the
+      #    upload. Capture timestamp lives on the digest line and in
+      #    report.json; bind-artifact records the uploader's artifact-id and
+      #    artifact-digest.
+      id: upload
+      if: ${{ always() && steps.start.outputs.evidence-dir != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ steps.start.outputs.evidence-dir }}/session.log
+          ${{ steps.start.outputs.evidence-dir }}/report.md
+          ${{ steps.start.outputs.evidence-dir }}/report.json
+        if-no-files-found: ignore
+
+    - name: Bind artifact identity
+      # The uploader's artifact-id and artifact-digest are the immutable
+      # reference the in-memory payload hashes cannot be: they name what
+      # GitHub stored, after the upload, not a path the wrapped command can
+      # still rewrite. Empty when nothing was uploaded (if-no-files-found:
+      # ignore). Identity travels from start's pre-command output so a
+      # rewritten state file cannot bind a stranger's artifact.
+      if: ${{ always() && steps.upload.outcome == 'success' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+        DEBUG_ACTION_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        DEBUG_ACTION_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+      run: node "${{ github.action_path }}/support.js" bind-artifact
+
+    - name: Stop collector
+      # THIS ACTION'S OWN TEARDOWN. The collector is detached and outlives the
+      # start step, so no other step of this action stops it.
+      #
+      # NORMAL RUNNER JOB CLEANUP ALSO ATTEMPTS TO KILL THE TRACKED COLLECTOR,
+      # ON HOSTED AND SELF-HOSTED RUNNERS ALIKE (Codex T8 r1 #2, correcting
+      # what this comment said before). That is RUNNER behaviour and not a
+      # property of the hosted images: the runner exports RUNNER_TRACKING_ID
+      # into every step's environment, `start` hands its step's COMPLETE
+      # environment to the detached shim (support.js: `{ ...env }`) and never
+      # clears that variable, so the collector stays a tracked process and job
+      # finalization terminates tracked orphans. The previous hosted/
+      # self-hosted split was simply wrong about where the behaviour lives.
+      #
+      # TWO SEPARATE BACKSTOPS, AND RUNNER DEATH DEFEATS BOTH (Codex T8 r2 #1,
+      # correcting what this comment said). Neither is a guarantee and neither
+      # covers the other. This always() step covers an EARLIER STEP of the job
+      # failing — but only while the runner survives to run it. Runner
+      # finalization covers this step never running or failing — but only
+      # while the runner survives to finalize, since terminating tracked
+      # orphans is work that same runner process does. So process tracking
+      # disabled or altered on that runner defeats finalization alone, while
+      # the runner process dying defeats BOTH — this comment previously
+      # credited this step's own guard with that case, and it never could.
+      # With the collector detached and the timeout below never exiting it,
+      # that is the case which can leave a listener behind.
+      #
+      # AND THE COLLECTOR'S IDLE TIMEOUT NEVER TERMINATES THE PROCESS —
+      # on this action's path it does not even retire credentials: the boot
+      # shim disables idle retirement outright (sessionIdleTimeoutMs =
+      # Infinity, so a quiet wrapped command cannot lose its session before
+      # run's capture read), which means in-memory session credentials stay
+      # valid for the collector's whole lifetime, bounded by this step, job
+      # finalization, and process death — never by time. (The 15-minute
+      # retirement in retireInactiveSessions applies only to default-limits
+      # collectors, e.g. the CLI.) This file previously advertised the
+      # timeout as a teardown backstop, which it has never been.
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+        DEBUG_ACTION_COLLECTOR_PID: ${{ steps.start.outputs.collector-pid }}
+      run: node "${{ github.action_path }}/support.js" teardown
+
+    - name: Apply verdict
+      # The exit taxonomy: mirrors the wrapped command's own exit code (unless
+      # fail-on-command-failure is 'false') and applies the honest belts over a
+      # job that is by then already red if run failed. Every EVIDENCE verdict
+      # was already made inside run, which is why nothing here can turn a
+      # failed capture green.
+      if: ${{ always() && steps.start.outcome != 'skipped' }}
+      shell: bash
+      env:
+        DEBUG_ACTION_OUTPUT_DIR: ${{ inputs.output-dir || format('{0}/debug-evidence', runner.temp) }}
+        DEBUG_ACTION_INVOCATION_NONCE: ${{ steps.start.outputs.invocation-nonce }}
+      run: node "${{ github.action_path }}/support.js" finish

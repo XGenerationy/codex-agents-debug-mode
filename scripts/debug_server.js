@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-const { createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
+const {
+  createHash, createHmac, randomBytes, sign, timingSafeEqual,
+} = require('node:crypto');
 const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, unlinkSync, writeSync } = require('node:fs');
 const { link, lstat, mkdir, realpath, rename, unlink } = require('node:fs/promises');
 const http = require('node:http');
@@ -9,6 +11,7 @@ const {
   assertNotSymlink: assertNotSymlinkShared,
   isSameFileIdentity,
   isSameLockIdentity,
+  isSameProtectedFileIdentity,
   openNoFollow: openNoFollowShared,
   openNoFollowFlagAttempts,
   protectWindowsPrivateFile,
@@ -81,12 +84,45 @@ const computeRetainedLogBytes = (logDir) => {
 // under .debug/ (0600, current-user-only) closes that: two invocations of the
 // SAME project's collector still agree, because both read the same on-disk
 // salt, but an outside guesser would also need to guess the unpublished salt.
+const applyWindowsPrivateFileProtection = (privateFile, skipInProcessAcl = false) => {
+  if (process.platform !== 'win32') return;
+  // `skipInProcessAcl` is deferWindowsPrivateFileProtection: the action's
+  // detached boot shim must never spawn powershell.exe (hosted Windows hangs
+  // it), so the debug-evidence `start` PARENT applies this file's DACL after
+  // the handshake instead. This used to queue the path onto an array a drain
+  // method was meant to consume, but nothing in production ever drained it —
+  // the parent hardens the paths it knows about directly — so the queue was
+  // machinery that implied protection it never performed (audit V1c).
+  if (skipInProcessAcl) return;
+  // Never execFileSync synchronously here: hosted Windows PowerShell can take
+  // 5–15s per invocation, and createDebugServer runs on the test/CLI
+  // construction path. The microtask still calls execFileSync, one tick later
+  // -- the guarantee is that it never blocks BEFORE the 'listening' callback,
+  // which Node emits from the nextTick queue that drains ahead of promise
+  // microtasks, so a consumer writing its handshake line there is never held
+  // behind the ACL. Fail-open: an ACL failure unlinks the file inside the
+  // microtask (unlink-or-do-not-persist), which is why callers must pass the
+  // FINAL path, never a temp name they are about to rename away. This
+  // function never throws synchronously — callers need no try/catch.
+  void Promise.resolve().then(() => {
+    try {
+      protectWindowsPrivateFile(privateFile);
+    } catch {
+      try { unlinkSync(privateFile); } catch { /* best effort cleanup */ }
+    }
+  });
+};
+
 // Runs synchronously during createDebugServer's construction, like
 // computeRetainedLogBytes below; every failure (unreadable/corrupt/racing
 // create) falls open to a private, unpersisted salt rather than crashing
 // startup -- worst case is two invocations disagreeing on project_hash, which
 // only affects the already_running convenience check, never authentication.
-const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
+// When `skipInProcessAcl` is true (the action's detached boot shim), Windows
+// ACL work is skipped here entirely: the debug-evidence `start` parent
+// applies the DACL after handshake, so listen() is never blocked by
+// PowerShell and this process never spawns it.
+const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot, skipInProcessAcl = false) => {
   const saltFile = path.join(debugDir, 'project_salt');
   const readExisting = () => {
     // Refuse a symlinked salt file, mirroring collector_token's own guard: an
@@ -210,12 +246,15 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
       // with the unauthenticated /health project_hash to test candidate
       // canonical paths and defeat the path-privacy the keyed hash was
       // introduced to provide (Codex U1D5A). POSIX is a no-op.
-      try {
-        protectWindowsPrivateFile(saltFile);
-      } catch (error) {
-        try { unlinkSync(saltFile); } catch { /* best effort cleanup */ }
-        throw error;
-      }
+      //
+      // Hosted Windows PowerShell can take >5s per ACL call. The action boot
+      // shim must emit its startup line from listen(), so the collector_boot
+      // path skips this call and the debug-evidence `start` parent hardens
+      // the salt after handshake. Fail-open lives inside the helper: an ACL
+      // failure unlinks the salt in its microtask, and the helper never
+      // throws synchronously (the try/catch that used to wrap this call was
+      // unreachable — audit V1b).
+      applyWindowsPrivateFileProtection(saltFile, skipInProcessAcl);
     } catch (error) {
       if (error?.code !== 'EEXIST' || wroteWinner) throw error;
       // saltFile already exists (a concurrent winner or a prior run): adopt it
@@ -256,17 +295,21 @@ const readOrCreateProjectSalt = (debugDir, resolvedProjectRoot) => {
         try { closeSync(tfd); } catch { /* best effort cleanup */ }
       }
       try {
-        protectWindowsPrivateFile(tempFile);
-      } catch (error2) {
-        try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
-        throw error2;
-      }
-      try {
         renameSync(tempFile, saltFile);
       } catch (error2) {
         try { unlinkSync(tempFile); } catch { /* best effort cleanup */ }
         throw error2;
       }
+      // Harden the FINAL path, after the rename. Windows hardening never runs
+      // inside this synchronous block -- it runs in the helper's microtask
+      // (or in the `start` parent under skipInProcessAcl) -- so aiming it at
+      // `tempFile` hardened a name the rename had already consumed: the ACL
+      // failed on the vanished temp name, its handler unlinked that same
+      // absent path, and the live project_salt stayed on disk with inherited
+      // NTFS permissions. That is the exposure the ACL exists to prevent
+      // (Codex U1D5A) and breaks the unlink-or-do-not-persist rule the
+      // fresh-create path above keeps. The helper never throws synchronously.
+      applyWindowsPrivateFileProtection(saltFile, skipInProcessAcl);
     }
     // Read back the on-disk winner so every publisher returns the same bytes
     // (Codex U16Cd); with no concurrency this is exactly the salt just written.
@@ -297,6 +340,21 @@ const DEFAULT_LIMITS = Object.freeze({
   maxEventsPerSession: 2_000,
   maxTotalBytes: 16 * 1024 * 1024,
 });
+
+// Resolve the effective session idle timeout. Finite values >= 1ms are
+// honored; Infinity is an EXPLICIT opt-out that disables idle retirement
+// entirely — the debug-evidence action's job-scoped collector needs it,
+// because teardown owns that collector's lifecycle and a wrapped command
+// quiet for longer than any finite budget must not lose its session before
+// `run`'s only capture read (audit V6a). Anything else (0, negatives, NaN,
+// non-numbers) falls back to the default. With Infinity,
+// `lastActivityAt <= Date.now() - Infinity` is false for every session, so
+// retireInactiveSessions retires nothing.
+const resolveSessionIdleTimeoutMs = (value) => (
+  value === Infinity || (Number.isFinite(value) && value >= 1)
+    ? value
+    : DEFAULT_LIMITS.sessionIdleTimeoutMs
+);
 
 /**
  * A structured, expected request failure: `code` is the machine-readable
@@ -468,6 +526,56 @@ const safeTokenEqual = (actual, expected) => {
   );
 };
 
+// SHA-256 over a Buffer in bounded chunks that yield to the event loop so a
+// 16 MiB session log cannot stall GET /sessions/:id/logs for the whole hash.
+const HASH_YIELD_BYTES = 64 * 1024;
+const hashBufferSha256 = async (buffer, { yieldEvery = HASH_YIELD_BYTES } = {}) => {
+  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const hash = createHash('sha256');
+  const stride = Number.isInteger(yieldEvery) && yieldEvery >= 1 ? yieldEvery : HASH_YIELD_BYTES;
+  for (let offset = 0; offset < bytes.length; offset += stride) {
+    hash.update(bytes.subarray(offset, Math.min(offset + stride, bytes.length)));
+    if (offset + stride < bytes.length) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return hash.digest('hex');
+};
+
+// What a responder signature actually covers. Exported because the VERIFIER
+// must build the identical string from what it INTENDED to ask — one shared
+// definition means the two sides cannot drift apart.
+//
+// Fields, in this fixed order, newline-delimited:
+//   1. a versioned domain tag, so a signature can never be mistaken for one
+//      over some other protocol's bytes (or a later version of this one)
+//   2. the HTTP method
+//   3. the request target EXACTLY as received — path AND query string
+//   4. the caller's challenge nonce
+//   5. sha256 hex of the bytes actually served
+//
+// Field 3 is the one that closes the oracle. Signing only the nonce and the
+// body made the collector a signing service for ANY question: a relay could
+// forward a caller's fresh challenge with `?limit=1` bolted on and hand back
+// a genuinely signed fraction of the session, which the caller had no way to
+// tell from the whole (Codex T5 r5 #1). With the target inside the signature,
+// an answer to a narrower question simply does not verify against the wider
+// one the caller asked.
+//
+// The encoding is unambiguous because no field can contain the delimiter:
+// HTTP forbids CR/LF in the method and request target (Node's parser rejects
+// them outright), the challenge is constrained to a token charset below
+// before anything is signed, and the digest is fixed-length hex.
+const RESPONDER_RECORD_DOMAIN = 'debug-evidence.logs.v1';
+const RESPONDER_CHALLENGE_PATTERN = /^[A-Za-z0-9._-]{16,128}$/;
+const canonicalResponderRecord = ({ method, target, challenge, bodyDigest }) => [
+  RESPONDER_RECORD_DOMAIN,
+  method,
+  target,
+  challenge,
+  bodyDigest,
+].join('\n');
+
 const bearerToken = (request) => {
   const authorization = request.headers.authorization;
   if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return undefined;
@@ -481,14 +589,16 @@ const bearerToken = (request) => {
 // authenticated endpoint cannot add its own check and forget the
 // timing-safe comparison or the 401 response shape.
 //
-// There is no multi-tenant/client_id model here: this collector is a
-// single-operator, loopback-only server bound to one projectRoot per
-// process (see isAllowedHost). The per-session token — 256 bits of random
-// entropy, generated in /session and required by every subsequent /log call
-// for that session — is the actual scoping boundary between concurrent
-// sessions, and this function is what enforces it uniformly.
-const authorizeRequest = (response, suppliedToken, expectedToken) => {
-  if (safeTokenEqual(suppliedToken, expectedToken)) return true;
+// Tenant binding: every session is minted under this collector's projectHash
+// (HMAC of canonical projectRoot). GET /sessions/:id/logs must present that
+// client_id in the query; the per-session token remains the credential that
+// distinguishes concurrent sessions. Both comparisons are timing-safe.
+const authorizeRequest = (response, suppliedToken, expectedToken, tenant) => {
+  const tokenOk = safeTokenEqual(suppliedToken, expectedToken);
+  const tenantOk = tenant === undefined
+    ? true
+    : safeTokenEqual(tenant.supplied, tenant.expected);
+  if (tokenOk && tenantOk) return true;
   sendJson(response, 401, { error: 'unauthorized' });
   return false;
 };
@@ -693,7 +803,12 @@ const appendSessionEvent = (session, serializedEvent) => {
     try {
       await verifyLogIdentity(session, await handle.stat());
       await handle.writeFile(serializedEvent, 'utf8');
+      // Byte count and digest advance together, and only after the write
+      // succeeded: a partial or failed append must leave both describing the
+      // window that is genuinely ours, or the next read would reject the
+      // server's own file.
       session.logFileIdentity.bytesWritten += Buffer.byteLength(serializedEvent, 'utf8');
+      session.logFileIdentity.contentDigest.update(serializedEvent, 'utf8');
     } finally {
       await handle.close();
     }
@@ -953,10 +1068,11 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {string} [options.token] - launch token required by POST /session; defaults to a fresh random one.
  * @param {string} [options.instanceId] - identity returned by /health and used by probeServer; defaults to random hex.
  * @param {string[]} [options.allowedOrigins] - browser Origins allowed to receive CORS headers; the Host/loopback check applies regardless.
- * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes).
+ * @param {object} [options.limits] - overrides for DEFAULT_LIMITS (maxBodyBytes, bodyTimeoutMs, maxSessions, sessionIdleTimeoutMs, maxEventsPerSession, maxTotalBytes). sessionIdleTimeoutMs accepts Infinity to disable idle retirement for job-scoped collectors whose lifecycle a teardown step owns (see resolveSessionIdleTimeoutMs).
  * @param {NodeJS.ProcessEnv} [options.redactionEnv] - env snapshot the redaction needle list is built from; defaults to a copy of process.env taken at build time.
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
+ * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, skip ALL Windows DACL hardening inside this process (project_salt and POST /session's log file): the debug-evidence `start` parent applies `protectWindowsPrivateFile` itself after handshake/mint, because a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path (mint awaits the spawn-based async ACL).
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -968,7 +1084,35 @@ const createDebugServer = ({
   redactionEnv = { ...process.env },
   redactionNames = [],
   redactionMaxTokens = 512,
+  deferWindowsPrivateFileProtection = false,
+  // Optional RESPONSE-SIGNING key: an Ed25519 PRIVATE KeyObject. Unlike
+  // `token`, it authorizes nothing — holding it lets you sign answers as this
+  // process, never ask this process for anything. It exists because a caller
+  // whose port/session routing data lives in a file another local process can
+  // rewrite otherwise has no way to distinguish this collector from a
+  // counterfeit listener returning contract-shaped NDJSON: Bearer
+  // authenticates the CLIENT, and nothing authenticated the SERVER.
+  //
+  // ASYMMETRIC on purpose. A shared secret would have to reach the verifier's
+  // process environment, where a surviving same-user child can read it
+  // (/proc/<pid>/environ, same-user process handles) — and a reader of a
+  // symmetric key can forge signatures with it (Codex T5 r5 #2). The private
+  // half never leaves this process: it is never serialized, never logged,
+  // never handed back over the boot pipe. Only the public half travels.
+  //
+  // Omitted by every existing caller (CLI, viewer), which simply never
+  // challenges.
+  responderPrivateKey = null,
 } = {}) => {
+  if (responderPrivateKey !== null) {
+    // Fail at boot, not on the first challenged read: an unusable signing key
+    // otherwise surfaces as an opaque 500 from GET /sessions/:id/logs.
+    if (typeof responderPrivateKey !== 'object'
+      || responderPrivateKey.type !== 'private'
+      || responderPrivateKey.asymmetricKeyType !== 'ed25519') {
+      throw new Error('invalid_responder_private_key');
+    }
+  }
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Canonical identity: realpath + Windows case fold so a symlink spelling
   // and its target hash to the same project_hash (already_running, not
@@ -989,7 +1133,7 @@ const createDebugServer = ({
   // never leak the raw path, but the EADDRINUSE probe in main() still needs
   // a way for two invocations to agree they mean the SAME project without
   // either being able to recover the other's path from what /health reports.
-  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot)).update(canonicalProjectRoot).digest('hex');
+  const projectHash = createHmac('sha256', readOrCreateProjectSalt(logDir, resolvedProjectRoot, deferWindowsPrivateFileProtection)).update(canonicalProjectRoot).digest('hex');
   const sessions = new Map();
   const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
   // Fail-closed secret redaction for every persisted event. Built here so a
@@ -1054,10 +1198,7 @@ const createDebugServer = ({
         `${count},"max":${cap}}\n`);
     }
   };
-  const sessionIdleTimeoutMs = Number.isFinite(effectiveLimits.sessionIdleTimeoutMs)
-    && effectiveLimits.sessionIdleTimeoutMs >= 1
-    ? effectiveLimits.sessionIdleTimeoutMs
-    : DEFAULT_LIMITS.sessionIdleTimeoutMs;
+  const sessionIdleTimeoutMs = resolveSessionIdleTimeoutMs(effectiveLimits.sessionIdleTimeoutMs);
   const originSet = new Set(allowedOrigins);
   let totalBytes = computeRetainedLogBytes(logDir);
   // Token-file persistence finishes after listen(); until then the collector
@@ -1069,6 +1210,11 @@ const createDebugServer = ({
   // inactivity. A subsequent /log therefore gets unknown_session instead of
   // reviving an old bearer capability.
   const retireInactiveSessions = () => {
+    // Infinity is the documented retirement opt-out (job-scoped collectors,
+    // resolveSessionIdleTimeoutMs): the compare below could never retire
+    // anything, so say so here instead of running a can-never-trigger loop
+    // on every request (review E1 — intent documentation more than cost).
+    if (sessionIdleTimeoutMs === Infinity) return;
     const expiration = Date.now() - sessionIdleTimeoutMs;
     for (const [sessionId, session] of sessions) {
       if (!session.provisional && session.lastActivityAt <= expiration) {
@@ -1179,6 +1325,7 @@ const createDebugServer = ({
           lastActivityAt: Date.now(),
           logFile,
           sessionToken,
+          clientId: projectHash,
           provisional: true,
         });
         try {
@@ -1252,22 +1399,26 @@ const createDebugServer = ({
           try {
             const info = await handle.stat();
             if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
-            // /log events are redacted only for KNOWN secrets (see
-            // createRedactionContext); treat log contents as sensitive. The
-            // 0600 mode above is a no-op against Windows' inherited DACL, so
-            // another local
-            // user with inherited access to a shared checkout could read this
-            // log; establish a protected, current-user-only ACL before any
-            // event can be appended (mirrors collector_token's own Windows
-            // hardening).
-            if (process.platform === 'win32') {
+            // Release the exclusive write handle before Windows DACL work.
+            // File.SetAccessControl on a path still opened O_WRONLY by this
+            // process timed out on hosted windows-latest (POST /session → 500
+            // after 15s; Validate Node 20, 2026-08-16).
+            await handle.close();
+            if (process.platform === 'win32' && !deferWindowsPrivateFileProtection) {
               try {
-                // Async (execFile) variant, not the synchronous
-                // protectWindowsPrivateFile: this runs inside the /session
-                // HTTP request handler, and execFileSync would block the Node
-                // event loop for up to the full 15s ACL timeout on every
-                // session creation (UiTMS). The startup token path keeps the
-                // sync variant where blocking is harmless.
+                // CLI / in-process servers apply the DACL here. The action's
+                // detached boot shim sets deferWindowsPrivateFileProtection so
+                // this handler never spawns powershell.exe — that child hangs
+                // until timeout on hosted windows-latest (Validate 31973907121).
+                //
+                // AWAITED, never execFileSync: this runs inside the request
+                // handler of a single-threaded server, and the sync variant
+                // froze the whole event loop for the ACL's duration (up to
+                // its 15s budget) — concurrent /log appends and live reads
+                // (5s client timeout) stalled behind one mint. The async
+                // variant is spawn-based and immune to the pipe-inheritance
+                // hang that forced the earlier sync workaround (31c1f48);
+                // see protectWindowsPrivateFileAsync's contract.
                 await protectWindowsPrivateFileAsync(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
@@ -1277,13 +1428,22 @@ const createDebugServer = ({
               // handle.stat() above and that call returning, the ACL could
               // land on a different filesystem object than this handle. Fail
               // closed rather than trust an unverified file as protected.
+              //
+              // Same predicate as the deferred parent's re-verification
+              // (actions/debug-evidence/support.js applyStartWindowsAcls) so
+              // one contract cannot be hardened on one half and left weaker
+              // on the other. In THIS win32-only branch the ino term is what
+              // rejects the recreate; the birth-time term the shared
+              // predicate adds is a POSIX inode-reuse layer inherited from
+              // it, not a Windows defense (NTFS file tunneling lets a
+              // same-name recreate keep the original's creation time).
               let postProtectInfo;
               try {
                 postProtectInfo = await lstat(resolvedLogFile);
               } catch {
                 throw new RequestError('session_log_escapes_root', 409);
               }
-              if (!isSameFileIdentity(info, postProtectInfo)) {
+              if (!isSameProtectedFileIdentity(info, postProtectInfo)) {
                 throw new RequestError('session_log_escapes_root', 409);
               }
             }
@@ -1317,6 +1477,11 @@ const createDebugServer = ({
               ino: info.ino,
               birthtimeMs: info.birthtimeMs,
               bytesWritten: 0,
+              // Running SHA-256 of exactly the bytes this server has appended.
+              // It lives beside bytesWritten because the two describe the same
+              // window and must be updated together: the digest is only
+              // meaningful as "the hash of the first bytesWritten bytes".
+              contentDigest: createHash('sha256'),
               projectRootReal: resolvedRoot,
               logDirReal: resolvedLogDir,
             };
@@ -1334,7 +1499,7 @@ const createDebugServer = ({
             }
             throw error;
           }
-          await handle.close();
+          // Handle was closed after the creation-time stat, before Windows ACL.
           // Push-then-rebuild at the END of the successful setup path: the
           // token joins the append-only registry only once .debug validation,
           // directory creation, and the session log all succeeded, so only
@@ -1371,7 +1536,28 @@ const createDebugServer = ({
         sendJson(response, 201, {
           session_id: sessionId,
           session_token: sessionToken,
+          client_id: projectHash,
           log_file: `.debug/${fileName}`,
+          // The log file's creation identity (from the O_EXCL handle's stat,
+          // the same reading logFileIdentity keeps server-side). On the
+          // deferred path the debug-evidence `start` parent applies the
+          // Windows DACL by NAME after this response returns; without these
+          // fields it had nothing to re-verify against, so a file swapped
+          // during that PowerShell call got the DACL landed on a substitute
+          // undetected — the exact unverified-protect the in-process path
+          // above fails closed on (review V2a).
+          // birthtimeMs travels beside dev/ino because the parent compares
+          // with the same predicate the in-process path above uses, and that
+          // predicate SKIPS its birth term when either side reports none —
+          // so omitting the field here does not merely lose a check, it
+          // silently makes the parent's comparison the weaker dev/ino one
+          // while reading as if it were the stronger. It costs no extra stat:
+          // the value comes from the SAME O_EXCL creation handle as dev/ino.
+          log_file_identity: {
+            dev: sessions.get(sessionId).logFileIdentity.dev,
+            ino: sessions.get(sessionId).logFileIdentity.ino,
+            birthtimeMs: sessions.get(sessionId).logFileIdentity.birthtimeMs,
+          },
         });
         return;
       }
@@ -1541,12 +1727,41 @@ const createDebugServer = ({
         ? pathname.match(/^\/sessions\/([A-Za-z0-9_-]+)\/logs$/)
         : null;
       if (sessionLogsMatch) {
-        // Reads are a launch-token capability (see POST /hypothesis). The id
-        // is used ONLY as a map key — client input never reaches filesystem
-        // path construction, so there is no traversal surface.
-        if (!authorizeRequest(response, bearerToken(request), token)) return;
+        // Reads accept EITHER credential, and this is the ONLY route that
+        // does: the launch token reads any session (operator scope), and a
+        // session's OWN token reads that session and nothing else
+        // (same-session read scope). Every mutating route stays launch-only
+        // or session-only exactly as before — in particular POST /hypothesis
+        // remains launch-token-only.
+        //
+        // The scope exists so a CI caller can read back what it recorded
+        // without holding a credential that could also forge a verdict into
+        // it: the debug-evidence action mints a session in its start step and
+        // then drops the launch token, so the only token that survives into
+        // the job is this one — read-and-append, never judge.
+        //
+        // Bearer is the channel because that is what the shared reader
+        // (debug_evidence.js readSessionLive) sends on this route; the
+        // x-debug-session-token header belongs to POST /log and stays there.
+        //
+        // The id is used ONLY as a map key — client input never reaches
+        // filesystem path construction, so there is no traversal surface.
+        const presented = bearerToken(request);
         retireInactiveSessions();
         const session = sessions.get(sessionLogsMatch[1]);
+        // Tenant first, then credential. client_id is this collector's
+        // projectHash, bound onto the session at mint. Missing or mismatched
+        // client_id is 401 — the same shape as a bad token — so an unknown
+        // session without the tenant binding cannot be distinguished from an
+        // unauthorized read of a live one.
+        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
+        const expected = session && safeTokenEqual(presented, session.sessionToken)
+          ? session.sessionToken
+          : token;
+        if (!authorizeRequest(response, presented, expected, {
+          supplied: query.get('client_id'),
+          expected: session?.clientId || projectHash,
+        })) return;
         if (!session) {
           sendJson(response, 404, { error: 'unknown_session' });
           return;
@@ -1557,8 +1772,7 @@ const createDebugServer = ({
         }
         // Fail-closed query parsing: unknown parameter names are rejected so
         // a typo cannot silently disable a filter and widen what is returned.
-        const query = new URL(request.url, 'http://127.0.0.1').searchParams;
-        const allowedParams = new Set(['hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
+        const allowedParams = new Set(['client_id', 'hypothesisId', 'type', 'sinceTs', 'untilTs', 'runId', 'limit']);
         const seenParams = new Set();
         for (const name of query.keys()) {
           // Unknown names AND duplicates are rejected: a typo or a stray
@@ -1589,6 +1803,17 @@ const createDebugServer = ({
         }
         const hypothesisFilter = query.get('hypothesisId')?.trim() ?? undefined;
         const runFilter = query.get('runId')?.trim() ?? undefined;
+        // Session-token reads prove the CI caller still holds the surviving
+        // credential and is still capturing; refresh lastActivityAt so an
+        // idle wrapped command cannot retire the session under a live capture.
+        // Launch-token reads stay observers: operator inspection does not
+        // prove the instrumented app is alive. The refresh sits AFTER the
+        // fail-closed query validation above: a rejected read proves nothing,
+        // and refreshing before the invalid_query throws would let repeated
+        // malformed reads retain an otherwise idle session indefinitely.
+        if (safeTokenEqual(presented, session.sessionToken)) {
+          session.lastActivityAt = Date.now();
+        }
         // Serialize ONLY the identity check + bounded byte read on the
         // per-session append chain: no append can interleave mid-read, so the
         // identity check and the byte window are consistent and a torn
@@ -1621,6 +1846,19 @@ const createDebugServer = ({
               const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
               if (bytesRead === 0) throw new RequestError('session_log_replaced', 409);
               offset += bytesRead;
+            }
+            // CONTENT, not just metadata. dev, ino, birthtime and size are all
+            // preserved by a same-LENGTH in-place rewrite — a wrapped command
+            // that swaps 'honest event' for 'FORGED event' passes every check
+            // above while changing what the log says, and a caller reading
+            // back through this route would be handed the forgery as the
+            // server's own record. Comparing the bytes on disk against the
+            // running digest of the bytes this server appended is the only
+            // check that sees it. `copy()` snapshots the incremental hash so
+            // the session's own digest stays open for the next append.
+            if (await hashBufferSha256(buffer)
+              !== session.logFileIdentity.contentDigest.copy().digest('hex')) {
+              throw new RequestError('session_log_tampered', 409);
             }
             return buffer.toString('utf8');
           } finally {
@@ -1665,7 +1903,32 @@ const createDebugServer = ({
           tail.push(rawLine);
         }
         const body = tail.length ? `${tail.reverse().join('\n')}\n` : '';
-        response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        const responseHeaders = { 'Content-Type': 'application/x-ndjson' };
+        // Sign the answer when asked to, over the canonical record: the
+        // request target, the caller's fresh nonce, and a digest of the EXACT
+        // bytes about to be written. Each binding closes one substitution —
+        // the target stops a narrowed relay from passing off a signed subset,
+        // the nonce stops a recorded (body, proof) pair from being replayed at
+        // a later challenge, and the digest stops a signature obtained for one
+        // response from vouching for different bytes. A counterfeit listener
+        // can copy this header's shape, but computing its value needs the
+        // private half, which never leaves this process.
+        const challenge = request.headers['x-debug-challenge'];
+        if (responderPrivateKey && typeof challenge === 'string' && RESPONDER_CHALLENGE_PATTERN.test(challenge)) {
+          // Signed over the canonical record, not the body: what makes an
+          // answer trustworthy is WHICH question it answers as much as what it
+          // says. `request.url` is the target verbatim — filters included — so
+          // a narrowed request produces a signature that only verifies against
+          // that narrowed target. Base64 because an Ed25519 signature is 64
+          // raw bytes and base64 carries them in 88 header-safe characters.
+          responseHeaders['x-debug-proof'] = sign(null, Buffer.from(canonicalResponderRecord({
+            method: request.method,
+            target: request.url,
+            challenge,
+            bodyDigest: await hashBufferSha256(Buffer.from(body, 'utf8')),
+          }), 'utf8'), responderPrivateKey).toString('base64');
+        }
+        response.writeHead(200, responseHeaders);
         response.end(body);
         return;
       }
@@ -2111,11 +2374,17 @@ const parseAllowedOrigins = (value) =>
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-// DEBUG_REDACT_NAMES: comma-separated env-var names that must always be
-// redacted from persisted events regardless of value length (the CLI-facing
-// mirror of the closeout config's `names` opt-in).
+// DEBUG_REDACT_NAMES: comma- OR whitespace-separated env-var names that must
+// always be redacted from persisted events regardless of value length (the
+// CLI-facing mirror of the closeout config's `names` opt-in). The split must
+// stay comma-or-whitespace: a comma-only split turned `"A B,C"` into the
+// names ['A B', 'C'], and since replacement matching is whole-name, A's and
+// B's values were silently never redacted (Codex T3 #5 — originally fixed
+// only in the action's boot shim while this CLI parser kept the comma-only
+// split; audit V8a). collector_boot.js imports THIS function so the two
+// consumers of the env var cannot diverge again.
 const parseRedactNames = (value) => String(value ?? '')
-  .split(',')
+  .split(/[\s,]+/)
   .map((name) => name.trim())
   .filter(Boolean);
 
@@ -2665,6 +2934,7 @@ module.exports = {
   COLLECTOR_VERSION,
   REDACTION_MAX_DEPTH,
   RequestError,
+  canonicalResponderRecord,
   createDebugServer,
   createRedactionContext,
   isInsideRoot,
@@ -2679,5 +2949,7 @@ module.exports = {
   redactEventForAppend,
   redactEventValue,
   resolvePowerShellExecutable,
+  resolveSessionIdleTimeoutMs,
+  hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 };

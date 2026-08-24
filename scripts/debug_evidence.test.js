@@ -163,6 +163,35 @@ test('escapeEvidenceText escapes U+2028 and U+2029, which JSON.stringify leaves 
   assert.equal(escapeEvidenceText('a\u2029b'), 'a\\u2029b');
 });
 
+test('escapeMarkdownText escapes markdown punctuation, box-drawing pipes, and control text on top of escapeEvidenceText', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  assert.equal(escapeMarkdownText('a*b_c`d[e]f(g)h!i<j>k&l'), 'a\\*b\\_c\\`d\\[e\\]f\\(g\\)h\\!i\\<j\\>k\\&l');
+  assert.equal(escapeMarkdownText('col│umn'), 'col¦umn');
+  // GFM strikethrough: `~~x~~` would restyle surrounding text, so `~` is in
+  // the punctuation set alongside the emphasis/link characters above.
+  assert.equal(escapeMarkdownText('a~b'), 'a\\~b');
+  assert.equal(escapeMarkdownText('~~x~~'), '\\~\\~x\\~\\~');
+  // escapeEvidenceText layer still applies underneath: newline stays escaped text
+  assert.equal(escapeMarkdownText('line1\nline2'), 'line1\\nline2');
+});
+
+test('escapeMarkdownText output is byte-identical to debug_diff\'s previous private escapeText for a hostile sample', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  const hostile = '│ **bold** [link](x) <img> & `tick` \n end';
+  // Golden bytes: the exact output debug_diff's private escapeText produced
+  // for this sample before the move — hardcoded, never recomputed from the
+  // same building blocks, so a change to the transform fails HERE.
+  assert.equal(escapeMarkdownText(hostile), '¦ \\*\\*bold\\*\\* \\[link\\]\\(x\\) \\<img\\> \\& \\`tick\\` \\n\\u2028end');
+});
+
+test('escapeMarkdownText pins exact bytes for empty, doubled pipes, a pre-escaped backslash, and an astral pair', () => {
+  const { escapeMarkdownText } = require('./debug_evidence');
+  assert.equal(escapeMarkdownText(''), '');
+  assert.equal(escapeMarkdownText('││'), '¦¦');
+  assert.equal(escapeMarkdownText('\\*'), '\\\\\\*');
+  assert.equal(escapeMarkdownText('\u{1F600}*'), '\u{1F600}\\*');
+});
+
 test('listSessions and resolveSessionRef enumerate and resolve .debug logs', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'evidence-'));
   try {
@@ -204,6 +233,7 @@ const {
 } = require('./debug_evidence');
 
 const LAUNCH = 'evidence-test-launch-token-with-entropy';
+const CLIENT = 'a'.repeat(64);
 
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
@@ -281,7 +311,13 @@ test('readSessionLive matches filterEntries over the same data (GET parity)', as
       { sinceTs: '2026-08-06T10:00:01.000Z', untilTs: '2026-08-06T10:00:04.000Z' },
       { sinceTs: '2030-01-01T00:00:00.000Z' },
     ]) {
-      const live = await readSessionLive({ port, token: LAUNCH, sessionId: session.session_id, filters });
+      const live = await readSessionLive({
+        port,
+        token: LAUNCH,
+        sessionId: session.session_id,
+        clientId: session.client_id,
+        filters,
+      });
       const local = filterEntries(fileEntries, filters);
       assert.deepEqual(live.map((e) => e.raw), local.map((e) => e.raw), JSON.stringify(filters));
     }
@@ -291,12 +327,26 @@ test('readSessionLive matches filterEntries over the same data (GET parity)', as
 test('readSessionLive surfaces structured errors for 401 and 404', async () => {
   await withLiveSession(async ({ port, session }) => {
     await assert.rejects(
-      () => readSessionLive({ port, token: 'wrong-token-entirely', sessionId: session.session_id }),
+      () => readSessionLive({
+        port,
+        token: 'wrong-token-entirely',
+        sessionId: session.session_id,
+        clientId: session.client_id,
+      }),
       /live_read_unauthorized/,
     );
     await assert.rejects(
-      () => readSessionLive({ port, token: LAUNCH, sessionId: 'debug-nope-000000000000' }),
+      () => readSessionLive({
+        port,
+        token: LAUNCH,
+        sessionId: 'debug-nope-000000000000',
+        clientId: session.client_id,
+      }),
       /live_read_unknown_session/,
+    );
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: session.session_id }),
+      /invalid_client_id/,
     );
   });
 });
@@ -304,7 +354,12 @@ test('readSessionLive surfaces structured errors for 401 and 404', async () => {
 test('createSessionTail emits each entry exactly once across polls', async () => {
   await withLiveSession(async ({ port, session, log }) => {
     await log('a');
-    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const tail = createSessionTail({
+      port,
+      token: LAUNCH,
+      sessionId: session.session_id,
+      clientId: session.client_id,
+    });
     const first = await tail.poll();
     assert.deepEqual(first.map((e) => e.parsed.msg), ['a']);
     await log('b');
@@ -326,7 +381,12 @@ test('createSessionTail settles a deferred poll correctly so a late resolution i
   // the NEXT real poll.
   await withLiveSession(async ({ port, session, log }) => {
     await log('a');
-    const tail = createSessionTail({ port, token: LAUNCH, sessionId: session.session_id });
+    const tail = createSessionTail({
+      port,
+      token: LAUNCH,
+      sessionId: session.session_id,
+      clientId: session.client_id,
+    });
     const pending = tail.poll();
     // Simulate the user quitting while the read is in flight: the caller
     // stops caring about this poll's result. Resolve it, but ignore it.
@@ -354,11 +414,11 @@ test('discoverCollector reads port and token from .debug', async () => {
 
 test('readSessionLive rejects a session id that would escape the /sessions/:id/logs path before making any request', async () => {
   await assert.rejects(
-    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: '../health?' }),
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: '../health?', clientId: CLIENT }),
     /invalid_session_ref/,
   );
   await assert.rejects(
-    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'a b' }),
+    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'a b', clientId: CLIENT }),
     /invalid_session_ref/,
   );
 });
@@ -370,7 +430,7 @@ test('readSessionLive rejects live_read_timeout when the collector never respond
   const port = await listen(server);
   try {
     await assert.rejects(
-      () => readSessionLive({ port, token: LAUNCH, sessionId: 'hang-session-1', timeoutMs: 50 }),
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'hang-session-1', clientId: CLIENT, timeoutMs: 50 }),
       /live_read_timeout/,
     );
   } finally {
@@ -389,7 +449,7 @@ test('readSessionLive rejects live_read_interrupted when the connection dies mid
   const port = await listen(server);
   try {
     await assert.rejects(
-      () => readSessionLive({ port, token: LAUNCH, sessionId: 'interrupt-session-1' }),
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'interrupt-session-1', clientId: CLIENT }),
       /live_read_interrupted/,
     );
   } finally {
@@ -404,7 +464,13 @@ test('createSessionTail forwards timeoutMs to each poll', async () => {
   });
   const port = await listen(server);
   try {
-    const tail = createSessionTail({ port, token: LAUNCH, sessionId: 'hang-session-2', timeoutMs: 50 });
+    const tail = createSessionTail({
+      port,
+      token: LAUNCH,
+      sessionId: 'hang-session-2',
+      clientId: CLIENT,
+      timeoutMs: 50,
+    });
     await assert.rejects(() => tail.poll(), /live_read_timeout/);
   } finally {
     await close(server);
@@ -413,11 +479,23 @@ test('createSessionTail forwards timeoutMs to each poll', async () => {
 
 test('readSessionLive rejects non-string hypothesisId/runId filters before making any request, mirroring filterEntries', async () => {
   await assert.rejects(
-    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { hypothesisId: 42 } }),
+    () => readSessionLive({
+      port: 1,
+      token: LAUNCH,
+      sessionId: 'valid-session-1',
+      clientId: CLIENT,
+      filters: { hypothesisId: 42 },
+    }),
     /invalid_filter:hypothesisId/,
   );
   await assert.rejects(
-    () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', filters: { runId: null } }),
+    () => readSessionLive({
+      port: 1,
+      token: LAUNCH,
+      sessionId: 'valid-session-1',
+      clientId: CLIENT,
+      filters: { runId: null },
+    }),
     /invalid_filter:runId/,
   );
 });
@@ -452,5 +530,88 @@ test('discoverCollector rejects collector_port_invalid for a non-decimal-integer
     await assert.rejects(() => discoverCollector(root), /collector_port_invalid/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('readSessionLive is bounded by an absolute deadline, not just socket inactivity', async () => {
+  let drip;
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Content-Length': '4096' });
+    // One byte every 25ms resets the inactivity timeout forever. Only a
+    // wall-clock deadline can end this, and without one a listener dripping a
+    // byte every few seconds holds a capture step for the life of the job.
+    drip = setInterval(() => response.write('x'), 25);
+    request.on('close', () => clearInterval(drip));
+  });
+  const port = await listen(server);
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => readSessionLive({ port, token: LAUNCH, sessionId: 'drip-session-1', clientId: CLIENT, deadlineMs: 300 }),
+      /live_read_deadline_exceeded/,
+    );
+    const elapsed = Date.now() - startedAt;
+    // Upper bound: the 5s idle timeout was not what fired. Lower bound: the
+    // configured 300ms deadline was, and not an instant rejection.
+    assert.ok(elapsed < 3_000, `the idle timeout never could have fired (${elapsed}ms)`);
+    assert.ok(elapsed >= 250, `the configured deadline fired, not something instant (${elapsed}ms)`);
+  } finally {
+    clearInterval(drip);
+    await close(server);
+  }
+});
+
+test('readSessionLive rejects a non-integer or sub-1 maxBytes fail-closed, before any request', async () => {
+  // A non-numeric cap (e.g. NaN from `Number(envVar)`) makes `bytes > maxBytes`
+  // false for every chunk and silently disables the bound. Reject fail-closed,
+  // matching createRedactionContext's maxTokens check. `undefined` is
+  // intentionally excluded: the destructure default substitutes LIVE_READ_MAX_BYTES.
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '64', null, true]) {
+    await assert.rejects(
+      () => readSessionLive({ port: 1, token: LAUNCH, sessionId: 'valid-session-1', clientId: CLIENT, maxBytes: bad }),
+      /invalid_live_read_max_bytes/,
+      `maxBytes=${String(bad)} should be rejected before any request`,
+    );
+  }
+});
+
+test('readSessionLive rejects a non-integer or sub-1 deadlineMs fail-closed, before any request', async () => {
+  for (const bad of [NaN, Infinity, -Infinity, 1.5, 0, -1, '300', null, true]) {
+    await assert.rejects(
+      () => readSessionLive({
+        port: 1,
+        token: LAUNCH,
+        sessionId: 'valid-session-1',
+        clientId: CLIENT,
+        deadlineMs: bad,
+      }),
+      /invalid_live_read_deadline/,
+      `deadlineMs=${String(bad)} should be rejected before any request`,
+    );
+  }
+});
+
+test('readSessionLive rejects a response past the byte cap instead of buffering it', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    // Well past the cap the test passes in, and it keeps coming: the read has
+    // to stop accumulating rather than grow this process's heap to match.
+    for (let i = 0; i < 8; i += 1) response.write('x'.repeat(64 * 1024));
+    response.end();
+  });
+  const port = await listen(server);
+  try {
+    await assert.rejects(
+      () => readSessionLive({
+        port,
+        token: LAUNCH,
+        sessionId: 'flood-session-1',
+        clientId: CLIENT,
+        maxBytes: 64 * 1024,
+      }),
+      /live_read_response_too_large/,
+    );
+  } finally {
+    await close(server);
   }
 });

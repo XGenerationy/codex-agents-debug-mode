@@ -715,3 +715,292 @@ test('collectContentRemovals does not pair a removal in one file with an additio
     `expected the version removal in package.json to be flagged; got ${JSON.stringify(removals)}`,
   );
 });
+
+const WORKFLOW_RUN_BEFORE = [
+  'on:',
+  '  workflow_run:',
+  '    workflows: ["Validate", "Closeout preview"]',
+  '    types: [completed]',
+  '',
+].join('\n');
+const WORKFLOW_RUN_AFTER = [
+  'on:',
+  '  workflow_run:',
+  '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+  '    types: [completed]',
+  '',
+].join('\n');
+const ACTION_INPUT_BEFORE = [
+  'jobs:',
+  '  x:',
+  '    steps:',
+  '      - uses: example/action@v1',
+  '        with:',
+  '          workflows: ["Validate", "Closeout preview"]',
+  '',
+].join('\n');
+const ACTION_INPUT_AFTER = [
+  'jobs:',
+  '  x:',
+  '    steps:',
+  '      - uses: example/action@v1',
+  '        with:',
+  '          workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+  '',
+].join('\n');
+
+test('collectContentRemovals exempts an order-preserving on.workflow_run.workflows expansion when the parent is proven', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, WORKFLOW_RUN_AFTER);
+  const readPaths = [];
+  const readFile = (relPath) => {
+    readPaths.push(relPath);
+    return WORKFLOW_RUN_AFTER;
+  };
+  assert.deepEqual(collectContentRemovals(diff, { readFile }), []);
+  // The parent proof reads the path taken from the diff's `+++` header, which
+  // detectGateContentRemovals joins with the repository root. A regression
+  // that kept the `b/` prefix would still satisfy a mock that ignores its
+  // argument, so pin the exact repository-relative path (CodeRabbit PR8).
+  assert.deepEqual(readPaths, ['.github/workflows/closeout-gate.yml']);
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion without a parent-proving readFile (fail closed)', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, WORKFLOW_RUN_AFTER);
+  const removals = collectContentRemovals(diff);
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected the unproven workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion under with: (action input, Codex T7 r5)', async () => {
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', ACTION_INPUT_BEFORE, ACTION_INPUT_AFTER);
+  const readFile = () => ACTION_INPUT_AFTER;
+  const removals = collectContentRemovals(diff, { readFile });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected an action-input workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a workflows: list that reorders or drops a name', async () => {
+  const reordered = [
+    'on:',
+    '  workflow_run:',
+    '    workflows: ["Closeout preview", "Validate", "Debug evidence demo"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, reordered);
+  const removals = collectContentRemovals(diff, { readFile: () => reordered });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a reordered workflows list to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a workflows: list that drops an existing name', async () => {
+  const dropped = [
+    'on:',
+    '  workflow_run:',
+    '    workflows: ["Validate", "Debug evidence demo", "Another gate"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', WORKFLOW_RUN_BEFORE, dropped);
+  const removals = collectContentRemovals(diff, { readFile: () => dropped });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a workflows list dropping "Closeout preview" to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals STILL flags a with: expansion whose text also exists under workflow_run (duplicate-line ambiguity)', async () => {
+  // The action-input list under with: is byte-identical to the trigger's
+  // list, indentation included (trigger nested at 4 spaces per level, step
+  // sequence at the steps: key's own indent). Resolving the parent from the
+  // FIRST occurrence would attribute the with: expansion to on.workflow_run
+  // and exempt it — the ambiguity must fail closed and keep the line flagged.
+  const duplicatedBefore = [
+    'on:',
+    '    workflow_run:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '        types: [completed]',
+    'jobs:',
+    '  gate:',
+    '    steps:',
+    '    - uses: example/action@v1',
+    '      with:',
+    '        workflows: ["Validate", "Closeout preview"]',
+    '',
+  ].join('\n');
+  const duplicatedAfter = [
+    'on:',
+    '    workflow_run:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '        types: [completed]',
+    'jobs:',
+    '  gate:',
+    '    steps:',
+    '    - uses: example/action@v1',
+    '      with:',
+    '        workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', duplicatedBefore, duplicatedAfter);
+  const removals = collectContentRemovals(diff, { readFile: () => duplicatedAfter });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected the ambiguous duplicate-line expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});
+
+test('collectContentRemovals exempts a proven expansion whose on/workflow_run keys are quoted', async () => {
+  // yamllint's truthy rule recommends quoting `on` (a YAML 1.1 boolean), so
+  // '"on":' and a quoted trigger key are legitimate spellings of the same
+  // chain. The ancestry matcher must resolve them like the bare forms rather
+  // than flagging a safe expansion for its quoting style (CodeRabbit PR8).
+  const quotedBefore = [
+    '"on":',
+    "  'workflow_run':",
+    '    workflows: ["Validate", "Closeout preview"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const quotedAfter = [
+    '"on":',
+    "  'workflow_run':",
+    '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '    types: [completed]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', quotedBefore, quotedAfter);
+  assert.deepEqual(collectContentRemovals(diff, { readFile: () => quotedAfter }), []);
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion under mismatched-quote keys', async () => {
+  // The quoted-key alternatives are exact pairs: a mismatched form ('"on:' or
+  // "'workflow_run\":") must stay unmatched so the chain never reaches a
+  // column-0 key and the expansion fails closed. Pins the charset against a
+  // future widening that silently accepted them (CodeRabbit PR8).
+  for (const [onKey, triggerKey] of [['"on:', '  workflow_run:'], ['on:', "  'workflow_run\":"]]) {
+    const before = [
+      onKey,
+      triggerKey,
+      '    workflows: ["Validate", "Closeout preview"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const after = [
+      onKey,
+      triggerKey,
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    const removals = collectContentRemovals(diff, { readFile: () => after });
+    assert.ok(
+      removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+      `expected the mismatched-quote (${onKey} / ${triggerKey.trim()}) expansion to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion inside a top-level on: | scalar', async () => {
+  // The enclosing scalar's key is itself at column 0 here, so the ancestry
+  // walk reaches column 0 through trigger-shaped SCALAR TEXT — the chain must
+  // refuse any ancestor whose value begins a block scalar, quoted or bare
+  // (Qodo PR8). Anchored/tagged/chomping headers are pinned alongside the
+  // plain spellings: the old inline guard required `|`/`>` directly after the
+  // colon, so `"on": &a |` and `"on": !!str |` were not recognized as scalar
+  // headers and their body lines were walked as real YAML keys — the
+  // exemption failed OPEN on exactly this embedding (audit V7a); the guard
+  // now shares workflow_checks.js's BLOCK_SCALAR_HEADER, which tolerates the
+  // anchor/tag prefix forms.
+  for (const onKey of ['on: |', '"on": |', 'on: &a |', '"on": &a |', '"on": !!str |', '"on": &a |- # cmt', '"on": >-']) {
+    const scalarBefore = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview"]',
+      '',
+    ].join('\n');
+    const scalarAfter = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', scalarBefore, scalarAfter);
+    const removals = collectContentRemovals(diff, { readFile: () => scalarAfter });
+    assert.ok(
+      removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+      `expected the ${onKey} scalar-embedded expansion to be flagged; got ${JSON.stringify(removals)}`,
+    );
+  }
+});
+
+test('collectContentRemovals exempts a proven expansion whose on: line carries a scalar-shaped trailing comment', async () => {
+  // The chain prover tests BLOCK_SCALAR_HEADER against the COMMENT-STRIPPED
+  // ancestor line, per the pattern's contract at its home: the greedy
+  // `\S.*:` prefix otherwise swallows past the real `#` and matches a
+  // `: |`-shaped fragment INSIDE the comment, misreading a plain `on:` key
+  // as a scalar header and refusing a chain that is actually provable
+  // (review V3a — fail-closed noise, but noise that invites loosening the
+  // shared regex). The real-header-with-comment direction (`"on": &a |- #
+  // cmt` still refused) is pinned in the scalar-embedding test above.
+  for (const onKey of ['on: # was: |', '"on": # was: >-']) {
+    const before = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const after = [
+      onKey,
+      '  workflow_run:',
+      '    workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+      '    types: [completed]',
+      '',
+    ].join('\n');
+    const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', before, after);
+    assert.deepEqual(
+      collectContentRemovals(diff, { readFile: () => after }),
+      [],
+      `a trailing comment on ${JSON.stringify(onKey)} is not a block-scalar header and must not refuse the chain`,
+    );
+  }
+});
+
+test('collectContentRemovals STILL flags a workflows: expansion embedded in a run: | block scalar', async () => {
+  // A raw-text parent scan sees the scalar's own `workflow_run:`-shaped line
+  // as the nearest less-indented key and would exempt the edit. The ancestor
+  // chain proof rejects it: block-scalar content is always indented under its
+  // real jobs/steps ancestry and can never present as top-level
+  // on -> workflow_run (CodeRabbit PR8, block-scalar bypass).
+  const scalarBefore = [
+    'jobs:',
+    '  x:',
+    '    steps:',
+    '      - run: |',
+    '          workflow_run:',
+    '            workflows: ["Validate", "Closeout preview"]',
+    '',
+  ].join('\n');
+  const scalarAfter = [
+    'jobs:',
+    '  x:',
+    '    steps:',
+    '      - run: |',
+    '          workflow_run:',
+    '            workflows: ["Validate", "Closeout preview", "Debug evidence demo"]',
+    '',
+  ].join('\n');
+  const diff = await singleFileDiff('.github/workflows/closeout-gate.yml', scalarBefore, scalarAfter);
+  const removals = collectContentRemovals(diff, { readFile: () => scalarAfter });
+  assert.ok(
+    removals.some((line) => /workflows: \["Validate", "Closeout preview"\]/.test(line)),
+    `expected a block-scalar-embedded workflows expansion to be flagged; got ${JSON.stringify(removals)}`,
+  );
+});

@@ -137,11 +137,17 @@ that fails setup registers nothing); at the cap further sessions are refused wit
 `session_registry_full`, signaled once on stderr as `redaction.registry_full` — restart the
 collector to reset it.
 
-Two launch-token capabilities extend the model: `POST /hypothesis` records
-event-sourced hypothesis status lines through the same append and redaction
-path, and `GET /sessions/:id/logs` serves filtered, verbatim, already-redacted
-NDJSON for live sessions with the append path's own file-identity checks. The
-per-session token keeps exactly one capability: writing events via `POST /log`.
+Two capabilities extend the model. `POST /hypothesis` — which records event-sourced
+hypothesis status lines through the same append and redaction path — stays
+**launch-token only**, so no session credential can ever write a verdict.
+`GET /sessions/:id/logs` — filtered, verbatim, already-redacted NDJSON for live sessions,
+with the append path's own file-identity checks — is the one route that accepts **either**
+credential: the launch token reads any session (operator scope), and a session's own token
+reads that session and nothing else (same-session read scope). The per-session token
+therefore holds exactly two capabilities, both scoped to its own session: appending events
+via `POST /log`, and reading that session back. It can neither mint a session nor judge
+one — which is what lets `actions/debug-evidence` drop the launch token before the wrapped
+command runs and still capture the evidence afterwards.
 `GET /health` additionally reports redaction registry headroom counts
 (cardinality only, never token values).
 
@@ -157,6 +163,15 @@ semantics are test-guaranteed identical to `GET /sessions/:id/logs`. The diff ne
 classifies severity or infers failures — recorded verdicts and deterministic deltas only —
 and rendered log text is escaped in the human formats (diff table/markdown and the viewer
 TUI), so report structure reflects the engine, never log content.
+
+`scripts/debug_report.js` renders a single session the same way (TTY text for humans;
+markdown when piped — Step Summary ready; `--format=json` with `schema: 1` for machines)
+and backs the `actions/debug-evidence` composite action, which wraps one failing CI
+command in an instrumented session and publishes the report plus an evidence artifact.
+See [`actions/debug-evidence/README.md`](actions/debug-evidence/README.md) for the
+consumer contract — including the `evidence-trust` admission model, which refuses to run
+the wrapped command on the default GitHub-hosted configuration rather than implying a
+guarantee that host does not provide.
 
 ## License
 

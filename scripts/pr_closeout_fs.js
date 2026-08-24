@@ -1,10 +1,7 @@
-const { execFile, execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const { constants, existsSync, openSync } = require('node:fs');
 const { lstat, open } = require('node:fs/promises');
 const path = require('node:path');
-const { promisify } = require('node:util');
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Reject a pre-existing symlink at `target` (fail-closed), tolerating ENOENT
@@ -287,6 +284,11 @@ const buildProtectWindowsPrivateFileArgs = (privateFile) => {
 // seconds to load PowerShell/.NET ACL types. Keep the operation bounded and
 // fail closed, but allow a realistic startup budget before reporting failure.
 const PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS = 15_000;
+const PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS = Object.freeze({
+  stdio: 'ignore',
+  timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
+  windowsHide: true,
+});
 
 /**
  * Establish and verify a protected, current-user-only Windows DACL (and owner)
@@ -298,35 +300,88 @@ const PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS = 15_000;
  * event loop is acceptable; request handlers must use
  * protectWindowsPrivateFileAsync instead.
  * @param {string} privateFile
+ * @param {{execFileSyncFn?: typeof execFileSync, platform?: string}} [overrides]
+ *   Test-only seam, mirroring resolvePowerShellExecutable's own options;
+ *   production callers pass only `privateFile`.
  */
-const protectWindowsPrivateFile = (privateFile) => {
-  if (process.platform !== 'win32') return;
-  execFileSync(
+const protectWindowsPrivateFile = (privateFile, {
+  execFileSyncFn = execFileSync, platform = process.platform,
+} = {}) => {
+  if (platform !== 'win32') return;
+  execFileSyncFn(
     resolvePowerShellExecutable(),
     buildProtectWindowsPrivateFileArgs(privateFile),
-    { stdio: 'ignore', timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
+    PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
   );
 };
 
 /**
  * Asynchronous sibling of protectWindowsPrivateFile: runs the identical fixed
  * PowerShell program (same DACL + owner hardening and verification, same 15s
- * timeout) via a promisified child_process.execFile instead of execFileSync,
- * so a request-serving path (the /session handler) does not block the Node
- * event loop for up to the full timeout on every call. No-op on non-Windows
- * platforms. Rejects (fails closed) on any non-zero exit exactly as the
- * synchronous variant throws.
+ * timeout via the shared exec options) without blocking the Node event loop,
+ * so a request-serving path (the /session handler) stays responsive for the
+ * duration of the ACL work. No-op on non-Windows platforms. Rejects (fails
+ * closed) on spawn failure, a non-zero exit, or signal death (including the
+ * timeout kill) exactly where the synchronous variant throws.
+ *
+ * Built on spawn + the shared `stdio: 'ignore'`, NOT on a promisified
+ * execFile: execFile does not honor `stdio` — it always buffers stdout and
+ * stderr through pipes and settles only when those pipes close, and on hosted
+ * windows-latest a PowerShell descendant held the inherited pipe handles open
+ * past exit, so the promisified call hung until the 15s timeout on every
+ * mint (POST /session → HTTP 500; the sync switch in 31c1f48 worked around
+ * exactly this). spawn with stdio ignored creates no pipes to hold, and the
+ * 'exit' event fires on process exit regardless of descendants.
  * @param {string} privateFile
+ * @param {{spawnFn?: typeof spawn, platform?: string}} [overrides]
+ *   Test-only seam, mirroring protectWindowsPrivateFile's above.
  * @returns {Promise<void>}
  */
-const protectWindowsPrivateFileAsync = async (privateFile) => {
-  if (process.platform !== 'win32') return;
-  await execFileAsync(
-    resolvePowerShellExecutable(),
-    buildProtectWindowsPrivateFileArgs(privateFile),
-    { timeout: PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS, windowsHide: true },
-  );
-};
+const protectWindowsPrivateFileAsync = (privateFile, {
+  spawnFn = spawn, platform = process.platform,
+  deadlineMs = PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS + 5_000,
+} = {}) => new Promise((resolve, reject) => {
+  if (platform !== 'win32') {
+    resolve();
+    return;
+  }
+  let child;
+  try {
+    child = spawnFn(
+      resolvePowerShellExecutable(),
+      buildProtectWindowsPrivateFileArgs(privateFile),
+      PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+    );
+  } catch (error) {
+    reject(error);
+    return;
+  }
+  // BACKSTOP DEADLINE, past the shared timeout's own kill: spawn's timeout
+  // initiates TerminateProcess, but 'exit' fires only after the kernel
+  // finishes tearing every thread down — a thread wedged in a non-alertable
+  // kernel wait (hung filter driver, AV) can defer that indefinitely, and a
+  // promise that settles only on 'error'/'exit' would then never settle,
+  // holding its awaiting request open forever. The REJECT is the
+  // load-bearing half (it bounds settlement whatever the child's fate); the
+  // extra kill is best-effort. unref'd so a settled call never holds the
+  // process open; a late 'exit' after this fires is a no-op on the settled
+  // promise (review V2c hardening — the replaced sync variant wedged the
+  // whole event loop in this same scenario).
+  const deadline = setTimeout(() => {
+    try { child.kill(); } catch { /* best effort */ }
+    reject(new Error('windows_private_file_acl_failed: deadline'));
+  }, deadlineMs);
+  deadline.unref?.();
+  child.once('error', (error) => {
+    clearTimeout(deadline);
+    reject(error);
+  });
+  child.once('exit', (code, signal) => {
+    clearTimeout(deadline);
+    if (code === 0) resolve();
+    else reject(new Error(`windows_private_file_acl_failed: ${signal ?? code}`));
+  });
+});
 
 // Some Windows filesystems (and older Node releases on certain mounts) report
 // dev/ino as 0 for every file. A same-path swap between two stat calls would
@@ -334,11 +389,81 @@ const protectWindowsPrivateFileAsync = async (privateFile) => {
 // zero ino is rejected outright rather than trusted as a real identity.
 // Shared by the debug collector (token/session-log/port writes) and closeout
 // evidence logs so this TOCTOU binding stays one implementation.
+//
+// STRENGTH OF THE ino TERM: it is a float64 comparison, not an exact one.
+// Node's default lstat reports ino as a Number, and on NTFS a 64-bit file
+// reference above 2**53 loses its low bits, so two distinct files can compare
+// equal here (measured on Windows 10 19045 / NTFS: 800 files in one directory,
+// 797 distinct Number inos against 800 distinct BigInt inos, and this
+// predicate returned true for two different files). It still rejects the
+// same-path unlink+recreate, which moves the reference by a full 2**48. The
+// residual is an opportunistic false match -- 0% to 2.7% of files depending on
+// how heavily the volume's MFT records have been recycled, with no attacker
+// lever found in 300+ deliberate-attack trials -- not a steerable bypass.
+// Callers that need identity rather than recreate-rejection must carry an
+// independent term (birthtimeMs, size, or a content digest).
 const isSameFileIdentity = (preInfo, postInfo) => (
   preInfo.ino !== 0
   && postInfo.dev === preInfo.dev
   && postInfo.ino === preInfo.ino
   && postInfo.nlink <= 1
+);
+
+/**
+ * True when `postInfo` still identifies the same on-disk file as `preInfo`
+ * ACROSS A DACL APPLICATION: isSameFileIdentity plus a birth-time term that is
+ * SKIPPED whenever either side cannot report one.
+ *
+ * WHAT THE BIRTH TERM IS FOR: POSIX inode reuse, and nothing else. On Linux
+ * (notably tmpfs, a common CI /tmp mount) an inode freed by unlink is handed
+ * to the very next file created in that directory, so a delete+recreate can
+ * present the SAME dev/ino the pre-snapshot recorded (Codex Uert4, caught by
+ * CI). The successor's creation time is its own, so the term rejects what
+ * dev/ino alone accepts. The deferred ACL caller runs this comparison on EVERY
+ * platform -- only the protect() call it follows is win32-gated -- which is
+ * where the term earns its place.
+ *
+ * WHAT IT DOES NOT PROVE: on win32 it is not evidence of anything. Measured on
+ * Windows 10 19045 / NTFS: a same-name unlink+recreate inherits the original's
+ * birthtimeMs EXACTLY (0.0000 ms delta) through NTFS file tunneling, for the
+ * documented default 15 s window (MaximumTunnelEntryAgeInSeconds unset under
+ * HKLM\SYSTEM\CurrentControlSet\Control\FileSystem) -- a window that spans the
+ * mint -> PowerShell protect -> re-stat gap -- and the file's owner can set
+ * CreationTime outright with SetFileTime, no privilege required.
+ *
+ * What rejects a same-path swap on NTFS is the ino term -- but only that one
+ * shape, and not because the comparison is exact. NTFS increments the 16-bit
+ * sequence number in the high bits of the file reference when a freed MFT
+ * record is reused, so an unlink+recreate at the same name moves the value by
+ * exactly 2**48 (measured on Windows 10 19045: 60/60 recreates, delta exactly
+ * 281474976710656 every trial). That margin is ~1.8e13 doubles wide, so the
+ * recreate primitive is caught with room to spare. Identity in general is NOT
+ * caught: Node's default lstat reports ino as a Number, so any 64-bit file
+ * reference above 2**53 is rounded to float64 and DISTINCT files whose
+ * references share a ULP bucket compare EQUAL -- 800 files created in one
+ * directory on this machine reported 797 distinct Number inos against 800
+ * distinct BigInt inos, and isSameFileIdentity returned true for two different
+ * files whose true references were 17 apart. Cite this predicate as rejecting
+ * the recreate, never as proving the file is the same file.
+ *
+ * WHY TOLERANT, NEVER A BARE `===`: one caller's preInfo is a JSON wire object
+ * (the collector's /session mint identity), and mounts that do not record a
+ * birth time report 0 -- or, where statx is unavailable, a copy of ctimeMs. A
+ * bare equality would abort every deferred start on the first shape and
+ * silently become a ctimeMs comparison on the second, which is exactly what
+ * isSameFileIdentity's contract forbids for write/ACL-protect callers. Falsy on
+ * either side therefore skips the term rather than failing it.
+ *
+ * WHY NOT isSameLockIdentity: its ctimeMs term is advanced by the very ACL
+ * these callers just applied, so it would reject every healthy file.
+ * @param {import('node:fs').Stats|{dev:number,ino:number,nlink?:number,birthtimeMs?:number}} preInfo
+ * @param {import('node:fs').Stats} postInfo
+ * @returns {boolean}
+ */
+const isSameProtectedFileIdentity = (preInfo, postInfo) => (
+  isSameFileIdentity(preInfo, postInfo)
+  && (!preInfo.birthtimeMs || !postInfo.birthtimeMs
+    || postInfo.birthtimeMs === preInfo.birthtimeMs)
 );
 
 /**
@@ -365,17 +490,27 @@ const isSameFileIdentity = (preInfo, postInfo) => (
  *
  * ctimeMs still has only millisecond resolution, so an unlink+recreate that
  * both reuses the inode AND lands inside the same millisecond can collide on
- * ctimeMs too (Codex UkAeu, reproduced on the CI filesystem). birthtimeMs is
- * required as an independent second time dimension to shrink that window: it
- * records the file's creation time and -- unlike ctimeMs -- is not advanced by
- * the ACL-protection and content writes these lock/claim records undergo after
- * they are created, so a stale record whose ctimeMs was bumped post-creation
- * cannot match a same-millisecond successor on birthtimeMs unless BOTH the
- * birth time and the change time collide within the same millisecond. It never
- * wrongly rejects a genuine same file: birthtime is immutable for an inode's
- * lifetime, and on filesystems that do not record it (Node falls birthtimeMs
- * back to ctimeMs or 0) the term is a harmless no-op because ctimeMs is already
- * required to match. This is defense in depth, not a full guarantee -- the
+ * ctimeMs too (Codex UkAeu, reproduced on the CI filesystem). birthtimeMs is a
+ * second time dimension for that window ON POSIX FILESYSTEMS: a successor
+ * created after the stale snapshot has its own creation time, which the ctimeMs
+ * bumps these records take after creation (ACL protection, content writes)
+ * cannot forge. It does not wrongly reject a genuine same file: where the
+ * filesystem records no birth time Node reports 0 or a copy of ctimeMs on BOTH
+ * sides, and ctimeMs is already required to match.
+ *
+ * THE TERM IS NOT INDEPENDENT ON WINDOWS and this predicate must not be cited
+ * as if it were. Measured on Windows 10 19045 / NTFS: a same-name
+ * unlink+recreate inherits the original's birthtimeMs EXACTLY (0.0000 ms delta)
+ * through NTFS file tunneling, for the documented default 15 s window
+ * (MaximumTunnelEntryAgeInSeconds unset under
+ * HKLM\SYSTEM\CurrentControlSet\Control\FileSystem), so inside that window the
+ * birthtimeMs term is a guaranteed pass. Creation time is also not immutable:
+ * the file's owner sets it with SetFileTime, no privilege required. What holds
+ * these reclaim paths on win32 is the ino term (a reused MFT record comes back
+ * with an incremented sequence number, moving the reference by 2**48) together
+ * with the call-site mitigation below.
+ *
+ * This is defense in depth, not a full guarantee -- the
  * sub-millisecond residual is deliberately closed at the call sites
  * (pr_closeout_workflow.js output-dir lock, debug_server.js collector-claim
  * reclaim) by quarantining the entry and re-verifying its bytes before
@@ -398,11 +533,14 @@ module.exports = {
   assertNotSymlink,
   isSameFileIdentity,
   isSameLockIdentity,
+  isSameProtectedFileIdentity,
   isTrustedSystemRoot,
   looksLikeWindowsRoot,
   openNoFollow,
   openNoFollowFlagAttempts,
   openNoFollowSync,
+  PROTECT_WINDOWS_PRIVATE_FILE_EXEC_OPTIONS,
+  PROTECT_WINDOWS_PRIVATE_FILE_TIMEOUT_MS,
   protectWindowsPrivateFile,
   protectWindowsPrivateFileAsync,
   resolvePowerShellExecutable,
