@@ -531,7 +531,7 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
     );
     // Do not assert an exact read count here. Two paths are both correct
     // product behavior: the identity-mismatch-only path (2 reads) and, when a
-    // same-millisecond reused-inode collision defeats the dev/ino/ctimeMs
+    // same-instant reused-inode collision defeats the dev/ino/ctimeNs
     // guard, the collision-recovery path (quarantine -> re-read -> restore,
     // which spends a 3rd guarded read before restoring the successor). Assert
     // only the externally-visible invariants that hold for both: the successor
@@ -543,12 +543,12 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
 });
 
 test('restores a live successor lock when a guard-failure identity match is later proven wrong', async () => {
-  // Codex UgisL/UguCX/Uert4/UikNw: dev/ino/ctimeMs identity alone has only
+  // Codex UgisL/UguCX/Uert4/UikNw: dev/ino/ctimeNs identity alone has only
   // filesystem/clock resolution, so it cannot fully rule out a
-  // same-millisecond reused-inode collision between the true stale entry
+  // same-instant reused-inode collision between the true stale entry
   // and a peer's freshly created live successor. Model that gap directly:
   // the guard read fails against the real, untouched stale file (so the
-  // dev/ino/ctimeMs identity captured before and after the throw
+  // dev/ino/ctimeNs identity captured before and after the throw
   // legitimately/correctly match -- nothing has changed on disk), which is
   // exactly the situation an unavoidable collision would also produce.
   // The post-quarantine re-read is mocked to report a parseable live
@@ -794,6 +794,33 @@ test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too
   await assert.rejects(
     readOutputDirLockFile('lock', {
       lstatFn: async () => lockStat({ ino: 0n }),
+      openFn: async () => handleFor(lockStat({ ino: 0n })),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // Each side's zero term is exercised on its OWN, matching the sync
+  // counterpart. The both-zero case above cannot isolate either: with both
+  // snapshots at 0, deleting the descriptor-side term still leaves the
+  // pre-open term to reject, so a mutation that removes one alone stays green
+  // and the Rule 4 claim would overstate what was proved (Codex review
+  // follow-up). The dev/ino mismatch would also reject these two shapes, so
+  // the product was never unsafe -- the coverage claim was.
+  //
+  // What the added cases do NOT buy: term-level isolation. Measured by
+  // mutation, deleting either zero term alone leaves this test green (the
+  // other still rejects the symmetric-zero case), and only deleting both turns
+  // it red. The zero rejection is therefore proved AS A UNIT, and that is how
+  // the Rule 4 claim is worded.
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 0n }),
+      openFn: async () => handleFor(lockStat({ ino: 7n })),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 7n }),
       openFn: async () => handleFor(lockStat({ ino: 0n })),
     }),
     /Evidence lock changed while opening/,

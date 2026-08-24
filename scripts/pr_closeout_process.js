@@ -2751,7 +2751,7 @@ const verifyArtifactProof = async ({ proof, cwd, before }) => {
 /**
  * Reads and parses a verified artifact as JSON, re-checking identity before
  * and after the read against the already-verified `proofResult` (dev, ino,
- * size, and — after reading — mtimeMs and digest) so a swap or edit that
+ * size, and — after reading — mtimeNs and digest) so a swap or edit that
  * happens between snapshotArtifactProof and this read is caught instead of
  * silently trusting stale bytes. Refuses anything without a realPath/size on
  * `proofResult`, or larger than 1 MiB.
@@ -2771,7 +2771,7 @@ const readBoundArtifactJson = async (proofResult, { openArtifactFn = openArtifac
     // handle.readFile(), which reads to whatever EOF exists at read time: a
     // writer that keeps appending after the stat above would otherwise let
     // this allocate far past the documented 1 MiB bound (or stall) before the
-    // dev/ino/size/mtimeMs/digest comparison below ever gets a chance to
+    // dev/ino/size/mtimeNs/digest comparison below ever gets a chance to
     // reject the mutation.
     const size = proofResult.size;
     const content = Buffer.alloc(size);

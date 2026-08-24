@@ -658,7 +658,7 @@ test('readBoundArtifactJson rejects and never reads past the verified size when 
   // exists at read time. A writer that keeps appending to the proof file
   // after snapshotArtifactProof took its "before" measurement could make this
   // allocate arbitrarily far past the documented 1 MiB bound before the
-  // dev/ino/size/mtimeMs/digest comparison ever got a chance to reject the
+  // dev/ino/size/mtimeNs/digest comparison ever got a chance to reject the
   // mutation. Prove the fix reads exactly the verified size (positionally,
   // via handle.read) and detects any growth with a single one-byte probe --
   // never touching however much a concurrent writer actually appended.

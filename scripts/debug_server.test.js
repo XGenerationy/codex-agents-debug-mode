@@ -1520,10 +1520,10 @@ const reclaimReadClaimText = async (target) => {
 };
 
 test('reclaimStaleCollectorClaim restores a same-identity successor claim instead of deleting it', async () => {
-  // Codex UkNET/UkXzk: the dev/ino/ctimeMs identity match that gates the stale
+  // Codex UkNET/UkXzk: the dev/ino/ctimeNs identity match that gates the stale
   // reclaim has only filesystem/clock resolution. On a filesystem with rapid
   // inode reuse, a peer that unlinked this stale claim and wrote its own
-  // successor can land on the exact same inode with a same-millisecond ctimeMs
+  // successor can land on the exact same inode with a same-instant change-time
   // collision, so isSameLockIdentity(inspected, current) returns true even
   // though the path now names a LIVE successor. Model that gap directly: what
   // is on disk IS the successor (so the fresh lstat identity trivially matches

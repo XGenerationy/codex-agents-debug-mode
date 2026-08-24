@@ -2214,7 +2214,8 @@ const isCompleteClaimText = (text) => {
  *
  * @param {string} claimFile
  * @param {object} deps
- * @param {import('node:fs').Stats|null} deps.claimInfo  lstat captured before reclaim.
+ * @param {ReturnType<typeof fileIdentity>|null} deps.claimInfo  normalized lstat identity
+ *   captured before reclaim (dev/ino are exact decimal strings, not a raw Stats).
  * @param {string|null} deps.claimText  claim bytes captured before reclaim (null if unreadable).
  * @param {(target: string) => Promise<string|null>} deps.readClaimText  guarded re-reader.
  * @returns {Promise<'reclaimed'|'restored'|'backed-off'>}
@@ -2358,7 +2359,8 @@ const reclaimStaleCollectorClaim = async (claimFile, {
  * single syscall pair.
  *
  * @param {string} claimFile
- * @param {import('node:fs').Stats|null} openedIdentity fstat of the validated descriptor.
+ * @param {ReturnType<typeof fileIdentity>|null} openedIdentity normalized fstat identity
+ *   of the validated descriptor (dev/ino are exact decimal strings, not a raw Stats).
  * @param {object} [deps]
  * @returns {boolean} whether the claim was unlinked.
  */
@@ -2688,8 +2690,9 @@ const main = () => {
           // isSameLockIdentity (dev/ino/nlink + ctimeNs -- the change time is fresh on
           // any unlink+recreate, even a reused inode on Linux/tmpfs), then
           // renames the entry to a private quarantine name and re-reads it so
-          // a live successor that collided on identity within a single
-          // millisecond is restored rather than deleted -- the same pattern
+          // a live successor that collided on identity within the
+          // filesystem's timestamp granularity is restored rather than
+          // deleted -- the same pattern
           // pr_closeout_workflow.js uses for its output-dir lock
           // (Codex Ua4p7/UiXEg/UkNET/UkXzk). Its three resolved outcomes
           // (reclaimed/restored/backed-off) fall through so this for-loop

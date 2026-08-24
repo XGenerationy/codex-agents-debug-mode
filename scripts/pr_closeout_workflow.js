@@ -261,10 +261,28 @@ const readOutputDirLockFileSync = (lockPath, {
     // dev/ino as 0 for EVERY path, so the dev/ino comparisons below would pass
     // vacuously (0 === 0) for a same-path replacement and this bind would
     // certify a swap instead of catching it. Fail closed, matching
-    // acquireOutputDirLock's own refusal to record such an identity -- which
-    // also means this rejects nothing a working run could reach: on such a
-    // mount the lock could never have been acquired in the first place
-    // (Codex review, P2).
+    // acquireOutputDirLock's own refusal to record such a directory identity.
+    //
+    // THIS IS A DELIBERATE BEHAVIOR CHANGE ON SUCH MOUNTS, not unreachable
+    // code, and the first version of this comment claimed otherwise. The
+    // EEXIST recovery path in acquireOutputDirLock reads a pre-existing lock
+    // BEFORE it ever validates the output directory's identity -- that
+    // validation only runs on the successful-create branch -- so an orphaned
+    // or foreign lock on a zero-identity mount does reach this reader, and now
+    // fails closed instead of being reclaimed on the strength of a comparison
+    // that proves nothing. No current-version acquisition is lost, because the
+    // later directory check would refuse that mount anyway (Codex review, P2
+    // and its follow-up correction).
+    //
+    // THE TWO ZERO TERMS ARE MUTUALLY REDUNDANT, measured, and kept anyway.
+    // The only shape that reaches them is a SYMMETRIC zero (both snapshots 0),
+    // where either term alone rejects -- an asymmetric zero is already caught
+    // by the dev/ino mismatch below. Mutation confirms it: deleting either
+    // term on its own leaves the suite green, and only deleting BOTH turns it
+    // red. They are kept as a pair because each states a separate fact (the
+    // pre-open snapshot is unusable; the descriptor's is), matching the same
+    // pairing in pr_closeout.js's config reader -- but no future reader should
+    // mistake either one for independently load-bearing.
     if (
       !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
@@ -317,10 +335,28 @@ const readOutputDirLockFile = async (lockPath, {
     // dev/ino as 0 for EVERY path, so the dev/ino comparisons below would pass
     // vacuously (0 === 0) for a same-path replacement and this bind would
     // certify a swap instead of catching it. Fail closed, matching
-    // acquireOutputDirLock's own refusal to record such an identity -- which
-    // also means this rejects nothing a working run could reach: on such a
-    // mount the lock could never have been acquired in the first place
-    // (Codex review, P2).
+    // acquireOutputDirLock's own refusal to record such a directory identity.
+    //
+    // THIS IS A DELIBERATE BEHAVIOR CHANGE ON SUCH MOUNTS, not unreachable
+    // code, and the first version of this comment claimed otherwise. The
+    // EEXIST recovery path in acquireOutputDirLock reads a pre-existing lock
+    // BEFORE it ever validates the output directory's identity -- that
+    // validation only runs on the successful-create branch -- so an orphaned
+    // or foreign lock on a zero-identity mount does reach this reader, and now
+    // fails closed instead of being reclaimed on the strength of a comparison
+    // that proves nothing. No current-version acquisition is lost, because the
+    // later directory check would refuse that mount anyway (Codex review, P2
+    // and its follow-up correction).
+    //
+    // THE TWO ZERO TERMS ARE MUTUALLY REDUNDANT, measured, and kept anyway.
+    // The only shape that reaches them is a SYMMETRIC zero (both snapshots 0),
+    // where either term alone rejects -- an asymmetric zero is already caught
+    // by the dev/ino mismatch below. Mutation confirms it: deleting either
+    // term on its own leaves the suite green, and only deleting BOTH turns it
+    // red. They are kept as a pair because each states a separate fact (the
+    // pre-open snapshot is unusable; the descriptor's is), matching the same
+    // pairing in pr_closeout.js's config reader -- but no future reader should
+    // mistake either one for independently load-bearing.
     if (
       !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
@@ -559,11 +595,12 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           // not delete blindly.
           continue;
         }
-        // dev/ino/ctimeMs identity has only filesystem/clock resolution, not
+        // dev/ino/ctimeNs identity has only filesystem/clock resolution, not
         // byte-for-byte certainty: on a filesystem with rapid inode reuse, a
         // peer racing the same guard failure can unlink+recreate the lock
-        // and land on the same inode with a ctimeMs collision inside the
-        // same millisecond, so the identity match above cannot fully rule
+        // and land on the same inode with a change-time collision inside the
+        // filesystem's own timestamp granularity, so the identity match
+        // above cannot fully rule
         // out that lockPath now names a live successor lock rather than the
         // original stale entry (Codex UgisL/UguCX/Uert4/UikNw). Track
         // whether this reclaim ever had trustworthy content to compare, so
