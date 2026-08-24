@@ -1057,7 +1057,9 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * fail-closed known-secret redaction; see createRedactionContext),
  * `POST /hypothesis` (launch token; appends one hypothesis lifecycle line
  * through the same redaction and append path), and `GET /sessions/:id/logs`
- * (launch token; filtered verbatim NDJSON read of a live session's log).
+ * (the ONLY route that accepts either credential: the launch token reads any
+ * session and a session's own token reads that session only; both require the
+ * matching client_id — filtered verbatim NDJSON read of a live session's log).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
