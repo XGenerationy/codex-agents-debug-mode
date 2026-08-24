@@ -488,7 +488,10 @@ const assertOwnerOnlyDacl = (filePath, label) => {
   const probe = spawnSync(
     resolvePowerShellExecutable(),
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-    { encoding: 'utf8', windowsHide: true },
+    // Same 15s bound as every other PowerShell probe here: a hung
+    // powershell.exe blocks the test worker — spawnSync cannot be
+    // interrupted by the surrounding test timeout.
+    { encoding: 'utf8', windowsHide: true, timeout: 15_000 },
   );
   assert.equal(probe.status, 0, `the DACL probe for ${label}'s log must succeed: ${probe.stderr}`);
   const lines = probe.stdout.split(/\r?\n/).filter(Boolean);
