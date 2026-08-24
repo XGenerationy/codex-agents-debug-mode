@@ -1938,7 +1938,15 @@ const openLogNoFollow = async (
       // read this evidence log. Establish a protected, current-user-only ACL
       // before any evidence bytes are written (mirrors the debug collector's
       // own token/session-log/port hardening in debug_server.js).
-      const preProtectInfo = fileIdentity(await handle.stat({ bigint: true }));
+      let preProtectInfo;
+      try {
+        preProtectInfo = fileIdentity(await handle.stat({ bigint: true }));
+      } catch {
+        // Same close-then-refuse as the post-protection lstat below: the
+        // callers receive only the error, so the descriptor must not leak.
+        await handle.close().catch(() => undefined);
+        throw new Error(`Refusing to write evidence log with an unverifiable identity: ${target}`);
+      }
       try {
         protectWindowsPrivateFile(target);
       } catch {
