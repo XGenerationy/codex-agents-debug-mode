@@ -282,6 +282,16 @@ const lockIdentityBindFailure = (before, info) => {
   return null;
 };
 
+// Coded so acquireOutputDirLock's read-error handler can tell this
+// environment failure from a corrupt lock and fail fast with the actionable
+// message instead of swallowing it into the generic acquisition failure
+// (Qodo PR #10 review; same pattern as ECLOSEOUTLOCKINIT below).
+const lockUnusableIdentityError = (lockPath) => {
+  const error = new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+  error.code = 'ECLOSEOUTLOCKIDENTITY';
+  return error;
+};
+
 /**
  * Synchronous counterpart to readOutputDirLockFile for the process `exit`
  * handler. Exit hooks cannot await, but they must retain the same no-follow,
@@ -311,7 +321,7 @@ const readOutputDirLockFileSync = (lockPath, {
     // lockIdentityBindFailure carries the full zero-identity rationale.
     const bindFailure = lockIdentityBindFailure(before, info);
     if (bindFailure === 'unusable-identity') {
-      throw new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+      throw lockUnusableIdentityError(lockPath);
     }
     if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
@@ -357,7 +367,7 @@ const readOutputDirLockFile = async (lockPath, {
     // Same shared bind and rationale as the sync reader above.
     const bindFailure = lockIdentityBindFailure(before, info);
     if (bindFailure === 'unusable-identity') {
-      throw new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+      throw lockUnusableIdentityError(lockPath);
     }
     if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
@@ -528,6 +538,14 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           );
         }
         if (readError?.code === 'ECLOSEOUTLOCKINIT') {
+          throw readError;
+        }
+        // A filesystem that cannot supply a lock identity is an environment
+        // failure reclaim cannot reason about — isSameLockIdentity rejects
+        // ino '0', so the fall-through would burn all attempts and end in
+        // the generic "Failed to acquire" message, hiding the actionable
+        // cause. Fail fast with the reader's specific error instead.
+        if (readError?.code === 'ECLOSEOUTLOCKIDENTITY') {
           throw readError;
         }
         holder = null;

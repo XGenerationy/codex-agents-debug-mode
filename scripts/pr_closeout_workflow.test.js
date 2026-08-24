@@ -855,6 +855,42 @@ test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too
   assert.equal(value, payload);
 });
 
+test('acquireOutputDirLock surfaces a zero-identity lock read instead of swallowing it', async () => {
+  // Qodo PR #10 review: the readers' coded unusable-identity error must not
+  // disappear into acquireOutputDirLock's broad read-error catch. Without the
+  // coded rethrow, a pre-existing lock on a zero-identity mount burns all
+  // attempts (isSameLockIdentity can never match ino '0') and ends in the
+  // generic "Failed to acquire" message — fail-closed either way, but the
+  // actionable cause (the mount) was invisible. The seam routes through the
+  // REAL reader so the test proves the whole chain: reader throws the coded
+  // error, the acquisition rethrows it verbatim.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-zero-acquire-'));
+  try {
+    // A pre-existing lock naming a dead PID forces the EEXIST stale-recovery
+    // path that reads (and, on a zero-identity mount, fails on) the lock.
+    await fs.writeFile(nodePath.join(tmp, '.closeout.lock'), '2147483646\nstale-nonce\n', 'utf8');
+    const handleFor = (stats) => ({
+      stat: async () => stats,
+      read: async () => ({ bytesRead: 0 }),
+      close: async () => {},
+    });
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: (lockPath) => readOutputDirLockFile(lockPath, {
+          lstatFn: async () => lockStat({ ino: 0n }),
+          openFn: async () => handleFor(lockStat({ ino: 0n })),
+        }),
+      }),
+      /unusable filesystem identity/,
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('isSameLockIdentity does not treat a reused inode as the same file', () => {
   // Codex Uert4 follow-up: CI on Linux (tmpfs /tmp) showed that unlinking a
   // stale lock and immediately writing a successor can hand the successor
