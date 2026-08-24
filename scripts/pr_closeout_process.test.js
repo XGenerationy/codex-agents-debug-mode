@@ -3697,7 +3697,11 @@ test('does not hang when the verified artifact is swapped for a FIFO', {
   execFileSync('mkfifo', [fifoPath]);
   const regularPath = path.join(repo, 'regular.json');
   await writeFile(regularPath, '{}');
-  const regularStats = await lstat(regularPath);
+  // BigInt Stats: production stats with { bigint: true } (see
+  // snapshotArtifactProof's lstat call), and fileIdentity rejects the default
+  // Number-ino Stats this fixture once captured — the swap fake must answer in
+  // the shape the hardened reader actually consumes.
+  const regularStats = await lstat(regularPath, { bigint: true });
   // Simulate the swap: lstat reports the pre-swap regular file while the path
   // now resolves to a FIFO.
   const result = await snapshotArtifactProof({
