@@ -2008,7 +2008,8 @@ const openLogNoFollow = async (
  * some Windows filesystems report ino 0 for every file, which would
  * otherwise compare equal vacuously.
  * @param {string} target log file path whose parent directory must match.
- * @param {{dev: number, ino: number}} expected captured logsDir identity.
+ * @param {{dev: string, ino: string}} expected captured logsDir identity (exact
+ *   decimal strings from fileIdentity; a Number would be a rounded float64).
  */
 const assertLogParentIdentity = async (target, expected) => {
   const parent = path.dirname(target);
@@ -2039,13 +2040,13 @@ const assertLogParentIdentity = async (target, expected) => {
  * descriptor.
  * @param {string} target
  * @param {string} contents
- * @param {{dev: number, ino: number}|null} [securedDirIdentity] identity of the
+ * @param {{dev: string, ino: string}|null} [securedDirIdentity] identity of the
  *   logs directory captured by ensureLogsDirSecured(); when provided, the open
  *   is bound to it and a mismatch is rejected before any truncate/write.
  * @param {string} [platform] injectable for tests; real callers always pass
  *   process.platform so the Linux fd-bind (see openLogBoundToParent) only
  *   ever engages on an actual Linux host.
- * @returns {Promise<{dev: number, ino: number}>} identity of the written
+ * @returns {Promise<{dev: string, ino: string}>} identity of the written
  *   header file, so the caller can bind a later append reopen of the same path
  *   to the exact file this header landed on (CodeRabbit UmlJX / Codex UnKZ4).
  */
@@ -2099,9 +2100,9 @@ const writeLogHeaderNoFollow = async (
  * the reopen cannot silently follow a redirect (CodeRabbit UmlJX / Codex
  * UnKZ4). Both are optional so direct/unit-test callers keep working unbound.
  * @param {string} target
- * @param {{dev: number, ino: number}|null} [securedDirIdentity] validated logs
+ * @param {{dev: string, ino: string}|null} [securedDirIdentity] validated logs
  *   directory identity; when provided, a swapped parent is rejected.
- * @param {{dev: number, ino: number}|null} [securedFileIdentity] identity of
+ * @param {{dev: string, ino: string}|null} [securedFileIdentity] identity of
  *   the header file; when provided, a swapped leaf is rejected.
  * @param {string} [platform] injectable for tests; real callers always pass
  *   process.platform so the Linux fd-bind (see openLogBoundToParent) only
@@ -2564,7 +2565,7 @@ const openArtifact = async (artifact) => {
 /**
  * Hashes `artifact` (sha256, streamed in 64 KiB chunks) via an already-open,
  * symlink/FIFO-safe handle from openArtifact. Stats the file before and
- * after the read and reports `stable: false` if dev/ino/size/mtimeMs/ctimeMs
+ * after the read and reports `stable: false` if dev/ino/size/mtimeNs/ctimeNs
  * changed in between, so a caller can detect a proof artifact that was
  * mutated concurrently with verification instead of trusting a digest that
  * may not describe the file's final contents.
@@ -2646,7 +2647,7 @@ const resolveExistingParent = async (target, filesystem) => {
  * this recorded path ever changing) before hashing it, and fails if the
  * hash step detects the file changed mid-read.
  * @returns {{status: 'PASS'|'FAIL', evidence?: string, exists?: boolean,
- *   digest?: string, dev?: number, ino?: number, size?: number}}
+ *   digest?: string, dev?: string, ino?: string, size?: number}}
  */
 const snapshotArtifactProof = async ({
   proof,

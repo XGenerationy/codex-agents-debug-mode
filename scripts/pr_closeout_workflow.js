@@ -240,18 +240,36 @@ const outputDirLockHolder = (text) => {
  * @param {string} lockPath
  * @returns {string}
  */
-const readOutputDirLockFileSync = (lockPath) => {
-  const before = fileIdentity(lstatSync(lockPath, { bigint: true }));
+const readOutputDirLockFileSync = (lockPath, {
+  // Seams. The identity bind below re-verifies the OPENED descriptor against
+  // the pre-open lstat, and neither a swap landing in that window nor a
+  // filesystem that reports dev/ino 0 can be produced from a real file on a
+  // normal volume -- so without these the guard could only ever ship
+  // unexercised, which this repo's rule 4 forbids (Codex review, P2).
+  lstatFn = lstatSync, openFn = openSync, fstatFn = fstatSync,
+  readFn = readSync, closeFn = closeSync,
+} = {}) => {
+  const before = fileIdentity(lstatFn(lockPath, { bigint: true }));
   if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
   const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0);
-  const descriptor = openSync(lockPath, flags);
+  const descriptor = openFn(lockPath, flags);
   try {
-    const info = fileIdentity(fstatSync(descriptor, { bigint: true }));
+    const info = fileIdentity(fstatFn(descriptor, { bigint: true }));
+    // A zero identity is no identity: some Windows FAT/network mounts report
+    // dev/ino as 0 for EVERY path, so the dev/ino comparisons below would pass
+    // vacuously (0 === 0) for a same-path replacement and this bind would
+    // certify a swap instead of catching it. Fail closed, matching
+    // acquireOutputDirLock's own refusal to record such an identity -- which
+    // also means this rejects nothing a working run could reach: on such a
+    // mount the lock could never have been acquired in the first place
+    // (Codex review, P2).
     if (
       !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+      || info.ino === '0'
+      || before.ino === '0'
       || info.dev !== before.dev
       || info.ino !== before.ino
     ) {
@@ -260,13 +278,13 @@ const readOutputDirLockFileSync = (lockPath) => {
     const buffer = Buffer.alloc(info.size);
     let offset = 0;
     while (offset < info.size) {
-      const bytesRead = readSync(descriptor, buffer, offset, info.size - offset, offset);
+      const bytesRead = readFn(descriptor, buffer, offset, info.size - offset, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
     return buffer.subarray(0, offset).toString('utf8');
   } finally {
-    closeSync(descriptor);
+    closeFn(descriptor);
   }
 };
 
@@ -284,17 +302,30 @@ const readOutputDirLockFileSync = (lockPath) => {
  * @param {string} lockPath
  * @returns {Promise<string>} raw lock payload.
  */
-const readOutputDirLockFile = async (lockPath) => {
-  const before = fileIdentity(await lstat(lockPath, { bigint: true }));
+const readOutputDirLockFile = async (lockPath, {
+  // Seams, for the same reason as the sync counterpart above.
+  lstatFn = lstat, openFn = openNoFollow,
+} = {}) => {
+  const before = fileIdentity(await lstatFn(lockPath, { bigint: true }));
   if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
-  const handle = await openNoFollow(lockPath, fsConstants.O_RDONLY);
+  const handle = await openFn(lockPath, fsConstants.O_RDONLY);
   try {
     const info = fileIdentity(await handle.stat({ bigint: true }));
+    // A zero identity is no identity: some Windows FAT/network mounts report
+    // dev/ino as 0 for EVERY path, so the dev/ino comparisons below would pass
+    // vacuously (0 === 0) for a same-path replacement and this bind would
+    // certify a swap instead of catching it. Fail closed, matching
+    // acquireOutputDirLock's own refusal to record such an identity -- which
+    // also means this rejects nothing a working run could reach: on such a
+    // mount the lock could never have been acquired in the first place
+    // (Codex review, P2).
     if (
       !info.isFile
       || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+      || info.ino === '0'
+      || before.ino === '0'
       || info.dev !== before.dev
       || info.ino !== before.ino
     ) {
@@ -1984,6 +2015,8 @@ module.exports = {
   mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  readOutputDirLockFile,
+  readOutputDirLockFileSync,
   releaseOutputDirLock,
   resolveEngineToolProbes,
   resolvePlanAdmission,

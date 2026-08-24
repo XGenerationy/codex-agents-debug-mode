@@ -2194,10 +2194,12 @@ const isCompleteClaimText = (text) => {
 /**
  * Reclaim (or refuse to reclaim) a stale collector_claim after an O_EXCL
  * create observed EEXIST. Ports pr_closeout_workflow.js's identity-only lock
- * reclaim: the dev/ino/ctimeMs identity match that gates deletion has only
+ * reclaim: the dev/ino/change-time identity match that gates deletion has only
  * filesystem/clock resolution, so on a filesystem with rapid inode reuse a
  * peer that unlinked this stale claim and wrote its own successor can land on
- * the exact same inode with a same-millisecond ctimeMs collision. A bare
+ * the exact same inode with a same-instant change-time collision (the term is
+ * compared in nanoseconds, so the window is the filesystem's own timestamp
+ * granularity rather than a rounded millisecond). A bare
  * unlink would then delete that live successor (UkNET/UkXzk). Instead,
  * quarantine the entry under a private name first, then re-read it: only the
  * same stale record we already inspected (byte-for-byte, or -- when the
@@ -2349,7 +2351,7 @@ const reclaimStaleCollectorClaim = async (claimFile, {
  * would otherwise have its live successor deleted, because the descriptor still
  * carried this process's own owner fields and the ownership check passed
  * (Codex Ummsi). Re-lstat the path and unlink only while it still matches the
- * read descriptor's identity (dev/ino/nlink/ctimeMs via isSameLockIdentity,
+ * read descriptor's identity (dev/ino/nlink/ctimeNs via isSameLockIdentity,
  * which also rejects an inode-reuse collision); a successor now at the path is
  * left intact. The residual lstat->unlink gap cannot be closed in pure Node
  * (no unlink-by-descriptor), but this narrows it from the whole read to a
@@ -2683,7 +2685,7 @@ const main = () => {
           // own fresh claim by the time the second gets here, a bare unlink
           // would delete that legitimate successor. reclaimStaleCollectorClaim
           // re-verifies the path still identifies that same record using
-          // isSameLockIdentity (dev/ino/nlink + ctimeMs -- ctimeMs is fresh on
+          // isSameLockIdentity (dev/ino/nlink + ctimeNs -- the change time is fresh on
           // any unlink+recreate, even a reused inode on Linux/tmpfs), then
           // renames the entry to a private quarantine name and re-reads it so
           // a live successor that collided on identity within a single

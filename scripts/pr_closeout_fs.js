@@ -486,6 +486,24 @@ const fileIdentity = (stats) => {
  */
 const hasExactIdentity = (info) => typeof info?.dev === 'string' && typeof info?.ino === 'string';
 
+/**
+ * True when `info` also carries the exact nanosecond timestamps isSameLockIdentity
+ * compares.
+ *
+ * WHY THIS IS SEPARATE FROM hasExactIdentity: the lax predicate's preInfo is
+ * legitimately a PARTIAL record — the collector's /session mint ships dev, ino
+ * and birthtimeMs and nothing else — so requiring the ns fields there would
+ * abort every deferred start. isSameLockIdentity's two callers always hold a
+ * full fileIdentity record, so it can and must demand them: without this check
+ * two records that merely OMIT both ns fields compare `undefined === undefined`
+ * and the predicate returns true (Codex review, P3). That is the same vacuous
+ * pass this module exists to remove, arriving through the shape of the input
+ * rather than through the width of a Number.
+ * @param {unknown} info
+ * @returns {boolean}
+ */
+const hasExactTimes = (info) => typeof info?.ctimeNs === 'string' && typeof info?.birthtimeNs === 'string';
+
 // Some Windows filesystems (and older Node releases on certain mounts) report
 // dev/ino as 0 for every file. A same-path swap between two stat calls would
 // otherwise pass this identity check vacuously when both sides read 0/0, so a
@@ -570,7 +588,7 @@ const isSameFileIdentity = (preInfo, postInfo) => (
  * isSameFileIdentity's contract forbids for write/ACL-protect callers. Falsy on
  * either side therefore skips the term rather than failing it.
  *
- * WHY NOT isSameLockIdentity: its ctimeMs term is advanced by the very ACL
+ * WHY NOT isSameLockIdentity: its change-time term is advanced by the very ACL
  * these callers just applied, so it would reject every healthy file.
  * @param {ReturnType<typeof fileIdentity>|{dev:string,ino:string,nlink?:number,birthtimeMs?:number}} preInfo - the mint wire object is the second shape.
  * @param {ReturnType<typeof fileIdentity>} postInfo
@@ -585,20 +603,21 @@ const isSameProtectedFileIdentity = (preInfo, postInfo) => (
 /**
  * True when `postInfo` still identifies the exact same on-disk file as
  * `preInfo` (same device/inode, and not multiply-linked since the snapshot).
- * Stricter than isSameFileIdentity: also requires ctimeMs to match, so it is
+ * Stricter than isSameFileIdentity: also requires the change time to match
+ * (in nanoseconds — see the time-term note below), so it is
  * only appropriate for reclaim-style checks where no legitimate operation is
  * expected to change the file's metadata between the two snapshots (a stale
  * lock or claim record being re-verified immediately before deletion) --
  * unlike isSameFileIdentity's other callers (write/ACL-protect
  * verification), where the intervening operation itself legitimately changes
- * ctimeMs and this check would wrongly reject the very write it is meant to
+ * the change time and this check would wrongly reject the very write it is meant to
  * confirm.
  *
  * dev/ino alone is not sufficient: on Linux (notably tmpfs, which is a common
  * CI /tmp mount), an inode number freed by unlink can be reused by the very
  * next file created in the same directory, so a peer that unlinks a stale
  * lock/claim and immediately writes its own successor can end up with the
- * exact same dev/ino the stale snapshot recorded. Requiring ctimeMs to also
+ * exact same dev/ino the stale snapshot recorded. Requiring the change time to also
  * match closes that gap: any unlink+recreate (even one that lands on a
  * reused inode) gives the occupant a fresh change time the original stale
  * file's snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux
@@ -650,6 +669,8 @@ const isSameProtectedFileIdentity = (preInfo, postInfo) => (
  */
 const isSameLockIdentity = (preInfo, postInfo) => (
   isSameFileIdentity(preInfo, postInfo)
+  && hasExactTimes(preInfo)
+  && hasExactTimes(postInfo)
   && postInfo.ctimeNs === preInfo.ctimeNs
   && postInfo.birthtimeNs === preInfo.birthtimeNs
 );

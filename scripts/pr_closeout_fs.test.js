@@ -302,6 +302,38 @@ test('fileIdentity refuses a default Stats and normalizes a bigint one exactly',
   }
 });
 
+test('isSameLockIdentity fails closed on records that omit the nanosecond terms', () => {
+  // Codex review, P3: hasExactIdentity only vouches for dev/ino, so two records
+  // that simply OMIT both ns fields compared `undefined === undefined` and this
+  // predicate returned TRUE for them. That is the same vacuous pass the string
+  // ino was introduced to remove, arriving through the SHAPE of the input
+  // rather than the width of a Number -- a caller holding a half-built record
+  // (or a stale wire object) would have been told two files are the same lock
+  // on the strength of two missing fields.
+  //
+  // The lax and protected predicates deliberately do NOT require these: their
+  // preInfo is legitimately partial (the /session mint ships dev, ino and
+  // birthtimeMs and nothing else), so demanding ns there would abort every
+  // deferred start. isSameLockIdentity's callers always hold a full record.
+  const partial = { dev: '1', ino: '2', nlink: 1 };
+  assert.equal(isSameLockIdentity(partial, { ...partial }), false, 'omitted ns terms must never compare equal');
+  assert.equal(isSameLockIdentity({ ...partial, ctimeNs: '5000000000' }, { ...partial, ctimeNs: '5000000000' }), false, 'a missing birthtimeNs is still a missing term');
+  assert.equal(isSameLockIdentity({ ...partial, birthtimeNs: '1000000000' }, { ...partial, birthtimeNs: '1000000000' }), false, 'a missing ctimeNs is still a missing term');
+  // A non-string ns (the pre-normalization Number shape) is refused for the
+  // same reason the ino terms refuse one.
+  assert.equal(isSameLockIdentity(
+    { ...partial, ctimeNs: 5000000000, birthtimeNs: 1000000000 },
+    { ...partial, ctimeNs: 5000000000, birthtimeNs: 1000000000 },
+  ), false, 'a Number ns must not certify a lock identity');
+  // The complete record still compares equal, so this fails closed on the
+  // missing shape rather than on everything.
+  assert.equal(isSameLockIdentity(idRecord(), idRecord()), true, 'a full record is not rejected');
+  // And the lax/protected predicates are NOT tightened by this: the partial
+  // wire shape they are contracted to accept still passes.
+  assert.equal(isSameFileIdentity(partial, { ...partial }), true, 'the lax predicate still accepts a partial record');
+  assert.equal(isSameProtectedFileIdentity({ dev: '1', ino: '42' }, idRecord()), true, 'the mint wire shape still passes the protected predicate');
+});
+
 test('isSameLockIdentity compares nanoseconds, not truncated milliseconds', () => {
   // The bigint Stats truncates ctimeMs to whole milliseconds while a default
   // Stats carries a sub-millisecond fraction (measured on this host:

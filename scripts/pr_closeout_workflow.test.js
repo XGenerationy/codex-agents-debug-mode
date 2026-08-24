@@ -12,6 +12,8 @@ const {
   mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  readOutputDirLockFile,
+  readOutputDirLockFileSync,
   resolvePlanAdmission,
   runCloseoutWorkflow,
 } = require('./pr_closeout_workflow');
@@ -698,6 +700,127 @@ test('restores an initializing successor whose quarantined payload is byte-diffe
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+// A stand-in for the `{ bigint: true }` Stats the lock readers' identity
+// capture consumes. `ino: 0n` models the Windows FAT / network mounts that
+// report no usable identity for any path.
+const lockStat = ({ dev = 1n, ino = 7n, size = 8n, isFile = true } = {}) => ({
+  dev, ino, nlink: 1n, size,
+  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n, mtimeNs: 0n,
+  isFile: () => isFile,
+  isSymbolicLink: () => false,
+});
+
+test('readOutputDirLockFileSync refuses a lock whose identity the filesystem cannot supply', () => {
+  // Codex review, P2. Both dev/ino comparisons below this guard would pass
+  // VACUOUSLY on a mount that reports 0 for every path (0 === 0), so a swap to
+  // a different regular file between the pre-open lstat and the open would be
+  // certified as "the same lock" rather than caught -- the identity bind
+  // silently inverted into a rubber stamp. acquireOutputDirLock already
+  // refuses to record such an identity for the directory, so this rejects
+  // nothing a working run could reach.
+  //
+  // The seam exists because this cannot be produced from a real file: NTFS
+  // never reports ino 0, and a swap landing inside the lstat/open window is not
+  // a state a test can create on demand. Without it the guard could only ship
+  // unexercised.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 0n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 0n }),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // Zero on only ONE side is refused too: a pre-open snapshot with no usable
+  // identity cannot be compared against anything, whichever side reports it.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 0n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 7n }),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 0n }),
+    }),
+    /Evidence lock changed while opening/,
+  );
+});
+
+test('readOutputDirLockFileSync rejects a lock swapped between the pre-open lstat and the open', () => {
+  // The bind this guard exists for, finally exercised: the pre-open lstat sees
+  // one file and the opened descriptor is a different one. Previously
+  // unprovable for want of a seam and disclosed as such; the seam added for
+  // the zero-identity case above makes it reachable.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 8n }),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // A device change with a matching ino is the cross-volume shape.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ dev: 1n, ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ dev: 2n, ino: 7n }),
+    }),
+    /Evidence lock changed while opening/,
+  );
+});
+
+test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too', async () => {
+  // The async counterpart carries its own copy of both guards, so proving the
+  // sync one says nothing about this one -- the two have to be exercised
+  // separately or a hardening can land on one half and miss the other.
+  const handleFor = (stats) => ({
+    stat: async () => stats,
+    read: async () => ({ bytesRead: 0 }),
+    close: async () => {},
+  });
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 0n }),
+      openFn: async () => handleFor(lockStat({ ino: 0n })),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 7n }),
+      openFn: async () => handleFor(lockStat({ ino: 8n })),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // A genuine match still reads, so neither guard rejects a healthy lock.
+  const payload = 'pid=123\n';
+  const matching = lockStat({ ino: 7n, size: BigInt(payload.length) });
+  const value = await readOutputDirLockFile('lock', {
+    lstatFn: async () => matching,
+    openFn: async () => ({
+      stat: async () => matching,
+      read: async (buffer, offset) => {
+        const chunk = Buffer.from(payload, 'utf8');
+        chunk.copy(buffer, offset);
+        return { bytesRead: chunk.length };
+      },
+      close: async () => {},
+    }),
+  });
+  assert.equal(value, payload);
 });
 
 test('isSameLockIdentity does not treat a reused inode as the same file', () => {
