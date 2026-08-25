@@ -4,7 +4,7 @@ const { constants: fsConstants } = require('node:fs');
 const { lstat } = require('node:fs/promises');
 const path = require('node:path');
 
-const { openNoFollow } = require('./pr_closeout_fs');
+const { fileIdentity, openNoFollow } = require('./pr_closeout_fs');
 const { runCloseoutWorkflow } = require('./pr_closeout_workflow');
 const { redactCredentialPatterns } = require('./pr_closeout_stream');
 
@@ -99,7 +99,7 @@ const CONFIG_MAX_BYTES = 1_048_576;
  * was truncated after the stat but before the read finished, and is rejected
  * rather than silently parsed as whatever shorter document that partial read
  * produced. The same open descriptor is then re-stat'd after the read and
- * compared back against the pre-read stat (dev/ino/size/mtimeMs); a mismatch
+ * compared back against the pre-read stat (dev/ino/size/mtimeNs); a mismatch
  * means the file was rewritten in place while it was being read, so the
  * bytes just parsed cannot be trusted as the file that was actually
  * inspected above. Both mirror readBoundArtifactJson's before/after
@@ -107,7 +107,7 @@ const CONFIG_MAX_BYTES = 1_048_576;
  * @param {string} configPath path passed via --config.
  * @param {{
  *   openFile?: (target: string, flags: number) => Promise<import('node:fs/promises').FileHandle>,
- *   lstatFn?: (target: string) => Promise<import('node:fs').Stats>,
+ *   lstatFn?: (target: string, options?: object) => Promise<import('node:fs').BigIntStats>,
  * }} [deps]
  * @returns {Promise<object>} parsed config.
  */
@@ -116,11 +116,15 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
   const symlinkMessage = `Closeout config must not be a symlink: ${target}.`;
   let preInfo = null;
   try {
-    preInfo = await lstatFn(target);
+    // Normalized identity record: dev/ino are compared against the opened
+    // descriptor below, and a default lstat reports ino as a Number, which
+    // rounds a 64-bit NTFS file reference above 2**53 to float64 and lets two
+    // DIFFERENT files compare equal (see fileIdentity in pr_closeout_fs.js).
+    preInfo = fileIdentity(await lstatFn(target, { bigint: true }));
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
-  if (preInfo?.isSymbolicLink()) throw new Error(symlinkMessage);
+  if (preInfo?.isSymbolicLink) throw new Error(symlinkMessage);
   let handle;
   try {
     handle = await openFile(target, fsConstants.O_RDONLY);
@@ -129,8 +133,8 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
     throw error;
   }
   try {
-    const info = await handle.stat();
-    if (!info.isFile() || info.size > CONFIG_MAX_BYTES) {
+    const info = fileIdentity(await handle.stat({ bigint: true }));
+    if (!info.isFile || info.size > CONFIG_MAX_BYTES) {
       throw new Error(`Closeout config must be a regular file of at most ${CONFIG_MAX_BYTES} bytes: ${target}.`);
     }
     // A 0 ino on either side means the filesystem gives no reliable identity
@@ -140,7 +144,7 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
     // message, since telling the operator "must not be a symlink" points at
     // the wrong problem on a perfectly legitimate config and hides that the
     // mount itself is the blocker.
-    if (info.ino === 0 || preInfo?.ino === 0) {
+    if (info.ino === '0' || preInfo?.ino === '0') {
       throw new Error(
         `Filesystem does not report a usable file identity for ${target}; refusing to verify the closeout config against a symlink swap.`,
       );
@@ -178,12 +182,14 @@ const readCloseoutConfig = async (configPath, { openFile = openNoFollow, lstatFn
     // size changed, mirroring the before/after descriptor comparison
     // readBoundArtifactJson uses for evidence artifacts
     // (pr_closeout_process.js).
-    const after = await handle.stat();
+    const after = fileIdentity(await handle.stat({ bigint: true }));
     if (
       after.dev !== info.dev
       || after.ino !== info.ino
       || after.size !== info.size
-      || after.mtimeMs !== info.mtimeMs
+      // Nanoseconds, not the truncated millisecond: an in-place rewrite that
+      // lands inside the same millisecond would otherwise compare unchanged.
+      || after.mtimeNs !== info.mtimeNs
     ) {
       throw new Error(`Closeout config changed while it was being read: ${target}.`);
     }

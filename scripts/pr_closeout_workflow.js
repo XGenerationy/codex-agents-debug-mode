@@ -14,7 +14,7 @@ const {
 const path = require('node:path');
 
 const { buildCheckPlan } = require('./pr_closeout_core');
-const { isSameLockIdentity, openNoFollow } = require('./pr_closeout_fs');
+const { fileIdentity, isSameLockIdentity, openNoFollow } = require('./pr_closeout_fs');
 const {
   classifyGateIntegrity,
   digestValidationConfig,
@@ -206,7 +206,7 @@ const resolvePhysicalTarget = async (target, realpathPath) => {
  * @returns {Promise<import('node:fs/promises').FileHandle>}
  */
 /**
- * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, dirIdentity: {dev: number, ino: number}, release: () => Promise<void> }} OutputDirLock
+ * @typedef {{ handle: import('node:fs/promises').FileHandle, path: string, nonce: string, dirIdentity: {dev: string, ino: string}, release: () => Promise<void> }} OutputDirLock
  */
 
 // Upper bound for a .closeout.lock payload (`pid\nnonce\niso\n` — well under
@@ -231,6 +231,67 @@ const outputDirLockHolder = (text) => {
   return Number.isInteger(pid) && pid > 0 && nonce ? { pid, nonce } : null;
 };
 
+// Shared bind for BOTH lock readers (readOutputDirLockFileSync and
+// readOutputDirLockFile): the pre-open snapshot against the opened
+// descriptor. ONE implementation by design — the previous inline copies
+// drifted exactly the way pr_closeout_report.js's inline dev/ino copy did
+// (it kept comparing a float64 `ino` after the shared predicate moved to
+// exact strings), and two copies of one contract have to be hardened in
+// lockstep by hand.
+//
+// A zero identity is no identity: some Windows FAT/network mounts report
+// dev/ino as 0 for EVERY path, so the dev/ino comparisons below would pass
+// vacuously (0 === 0) for a same-path replacement and this bind would
+// certify a swap instead of catching it. Fail closed, matching
+// acquireOutputDirLock's own refusal to record such a directory identity.
+//
+// THIS IS A DELIBERATE BEHAVIOR CHANGE ON SUCH MOUNTS, not unreachable
+// code, and the first version of this comment claimed otherwise. The
+// EEXIST recovery path in acquireOutputDirLock reads a pre-existing lock
+// BEFORE it ever validates the output directory's identity -- that
+// validation only runs on the successful-create branch -- so an orphaned
+// or foreign lock on a zero-identity mount does reach this reader, and now
+// fails closed instead of being reclaimed on the strength of a comparison
+// that proves nothing. No current-version acquisition is lost, because the
+// later directory check would refuse that mount anyway (Codex review, P2
+// and its follow-up correction).
+//
+// THE TWO ZERO TERMS ARE MUTUALLY REDUNDANT, measured, and kept anyway.
+// The only shape that reaches them is a SYMMETRIC zero (both snapshots 0),
+// where either term alone rejects -- an asymmetric zero is already caught
+// by the dev/ino mismatch below. Mutation confirms it: deleting either
+// term on its own leaves the suite green, and only deleting BOTH turns it
+// red. They are kept as a pair because each states a separate fact (the
+// pre-open snapshot is unusable; the descriptor's is), matching the same
+// pairing in pr_closeout.js's config reader -- but no future reader should
+// mistake either one for independently load-bearing.
+// Returns the bind failure's reason so the readers can reject with a
+// message that names the actual condition: a zero-identity mount is an
+// environment fact an operator can act on (avoid/relocate the output
+// directory), while the remaining terms mean the lock changed under us —
+// conflating the two sent operators hunting TOCTOU swaps that never
+// happened (Qodo PR #10 review).
+const lockIdentityBindFailure = (before, info) => {
+  if (before.ino === '0' || info.ino === '0') return 'unusable-identity';
+  if (
+    !info.isFile
+    || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
+    || info.dev !== before.dev
+    || info.ino !== before.ino
+  ) return 'changed';
+  return null;
+};
+
+// Coded so acquireOutputDirLock's read-error handler can tell this
+// environment failure from a corrupt lock and fail fast with the actionable
+// message instead of swallowing it into the generic acquisition failure
+// (Qodo PR #10 review; same pattern as ECLOSEOUTLOCKINIT below).
+const lockUnusableIdentityError = (lockPath) => {
+  const error = new Error(`Evidence lock has unusable filesystem identity (ino=0): ${lockPath}`);
+  error.code = 'ECLOSEOUTLOCKIDENTITY';
+  return error;
+};
+
 /**
  * Synchronous counterpart to readOutputDirLockFile for the process `exit`
  * handler. Exit hooks cannot await, but they must retain the same no-follow,
@@ -240,33 +301,41 @@ const outputDirLockHolder = (text) => {
  * @param {string} lockPath
  * @returns {string}
  */
-const readOutputDirLockFileSync = (lockPath) => {
-  const before = lstatSync(lockPath);
-  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+const readOutputDirLockFileSync = (lockPath, {
+  // Seams. The identity bind below re-verifies the OPENED descriptor against
+  // the pre-open lstat, and neither a swap landing in that window nor a
+  // filesystem that reports dev/ino 0 can be produced from a real file on a
+  // normal volume -- so without these the guard could only ever ship
+  // unexercised, which this repo's rule 4 forbids (Codex review, P2).
+  lstatFn = lstatSync, openFn = openSync, fstatFn = fstatSync,
+  readFn = readSync, closeFn = closeSync,
+} = {}) => {
+  const before = fileIdentity(lstatFn(lockPath, { bigint: true }));
+  if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
   const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0) | (fsConstants.O_NONBLOCK || 0);
-  const descriptor = openSync(lockPath, flags);
+  const descriptor = openFn(lockPath, flags);
   try {
-    const info = fstatSync(descriptor);
-    if (
-      !info.isFile()
-      || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
-      || info.dev !== before.dev
-      || info.ino !== before.ino
-    ) {
+    const info = fileIdentity(fstatFn(descriptor, { bigint: true }));
+    // lockIdentityBindFailure carries the full zero-identity rationale.
+    const bindFailure = lockIdentityBindFailure(before, info);
+    if (bindFailure === 'unusable-identity') {
+      throw lockUnusableIdentityError(lockPath);
+    }
+    if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
     }
     const buffer = Buffer.alloc(info.size);
     let offset = 0;
     while (offset < info.size) {
-      const bytesRead = readSync(descriptor, buffer, offset, info.size - offset, offset);
+      const bytesRead = readFn(descriptor, buffer, offset, info.size - offset, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
     return buffer.subarray(0, offset).toString('utf8');
   } finally {
-    closeSync(descriptor);
+    closeFn(descriptor);
   }
 };
 
@@ -284,20 +353,23 @@ const readOutputDirLockFileSync = (lockPath) => {
  * @param {string} lockPath
  * @returns {Promise<string>} raw lock payload.
  */
-const readOutputDirLockFile = async (lockPath) => {
-  const before = await lstat(lockPath);
-  if (!before.isFile() || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
+const readOutputDirLockFile = async (lockPath, {
+  // Seams, for the same reason as the sync counterpart above.
+  lstatFn = lstat, openFn = openNoFollow,
+} = {}) => {
+  const before = fileIdentity(await lstatFn(lockPath, { bigint: true }));
+  if (!before.isFile || before.size > OUTPUT_DIR_LOCK_MAX_BYTES) {
     throw new Error(`Evidence lock is not a size-bounded regular file: ${lockPath}`);
   }
-  const handle = await openNoFollow(lockPath, fsConstants.O_RDONLY);
+  const handle = await openFn(lockPath, fsConstants.O_RDONLY);
   try {
-    const info = await handle.stat();
-    if (
-      !info.isFile()
-      || info.size > OUTPUT_DIR_LOCK_MAX_BYTES
-      || info.dev !== before.dev
-      || info.ino !== before.ino
-    ) {
+    const info = fileIdentity(await handle.stat({ bigint: true }));
+    // Same shared bind and rationale as the sync reader above.
+    const bindFailure = lockIdentityBindFailure(before, info);
+    if (bindFailure === 'unusable-identity') {
+      throw lockUnusableIdentityError(lockPath);
+    }
+    if (bindFailure) {
       throw new Error(`Evidence lock changed while opening: ${lockPath}`);
     }
     const buffer = Buffer.alloc(info.size);
@@ -336,13 +408,21 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // finding: "Bind the evidence lock to the output directory inode").
       let dirIdentity;
       try {
-        dirIdentity = await statPath(outputDir);
+        // Normalized to exact decimal strings, like every other identity
+        // binding in this repo: a default stat reports ino as a Number, and an
+        // NTFS file reference above 2**53 is rounded to float64, so two
+        // DIFFERENT directories can compare equal here (see fileIdentity in
+        // pr_closeout_fs.js for the measurements). A swap-detection check that
+        // can be defeated by rounding is not swap detection.
+        dirIdentity = fileIdentity(await statPath(outputDir, { bigint: true }));
         // Some filesystems (notably Windows FAT/network mounts) report
         // dev/ino as 0 for every path, which would make the swap-detection
         // comparisons below and in assertOutputDirLockIdentity pass
         // vacuously for a same-path replacement. Fail closed rather than
-        // record an identity that provides no actual guarantee.
-        if (dirIdentity.ino === 0) {
+        // record an identity that provides no actual guarantee. The literal is
+        // the STRING '0' -- a `=== 0` here would never match a normalized ino
+        // and would silently retire this rejection.
+        if (dirIdentity.ino === '0') {
           throw new Error(
             `Filesystem does not report a usable directory identity for ${outputDir}; refusing to rely on dev/ino swap detection.`,
           );
@@ -418,7 +498,10 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
       // quarantining the original (Codex Uert4).
       let staleIdentity = null;
       try {
-        staleIdentity = await lstat(lockPath);
+        // Normalized record: isSameLockIdentity compares the exact 64-bit
+        // reference and the nanosecond timestamps, neither of which survives a
+        // default stat (see fileIdentity in pr_closeout_fs.js).
+        staleIdentity = fileIdentity(await lstat(lockPath, { bigint: true }));
       } catch {
         staleIdentity = null;
       }
@@ -455,6 +538,14 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           );
         }
         if (readError?.code === 'ECLOSEOUTLOCKINIT') {
+          throw readError;
+        }
+        // A filesystem that cannot supply a lock identity is an environment
+        // failure reclaim cannot reason about — isSameLockIdentity rejects
+        // ino '0', so the fall-through would burn all attempts and end in
+        // the generic "Failed to acquire" message, hiding the actionable
+        // cause. Fail fast with the reader's specific error instead.
+        if (readError?.code === 'ECLOSEOUTLOCKIDENTITY') {
           throw readError;
         }
         holder = null;
@@ -504,7 +595,7 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
         } else if (staleIdentity) {
           let currentIdentity;
           try {
-            currentIdentity = await lstat(lockPath);
+            currentIdentity = fileIdentity(await lstat(lockPath, { bigint: true }));
           } catch (identityError) {
             if (identityError?.code === 'ENOENT') continue;
             throw identityError;
@@ -517,11 +608,12 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
           // not delete blindly.
           continue;
         }
-        // dev/ino/ctimeMs identity has only filesystem/clock resolution, not
+        // dev/ino/ctimeNs identity has only filesystem/clock resolution, not
         // byte-for-byte certainty: on a filesystem with rapid inode reuse, a
         // peer racing the same guard failure can unlink+recreate the lock
-        // and land on the same inode with a ctimeMs collision inside the
-        // same millisecond, so the identity match above cannot fully rule
+        // and land on the same inode with a change-time collision inside the
+        // filesystem's own timestamp granularity, so the identity match
+        // above cannot fully rule
         // out that lockPath now names a live successor lock rather than the
         // original stale entry (Codex UgisL/UguCX/Uert4/UikNw). Track
         // whether this reclaim ever had trustworthy content to compare, so
@@ -628,19 +720,19 @@ const acquireOutputDirLock = async (outputDir, { readLockFile = readOutputDirLoc
  * (the pre-acquisition call, or a non-exclusive run that never took a lock).
  * @param {OutputDirLock|null|undefined} lock
  * @param {string} outputDir
- * @param {{statPath?: (path: string) => Promise<import('node:fs').Stats>}} [deps]
+ * @param {{statPath?: (path: string, options?: object) => Promise<import('node:fs').BigIntStats>}} [deps]
  * @returns {Promise<void>}
  */
 const assertOutputDirLockIdentity = async (lock, outputDir, { statPath = stat } = {}) => {
   if (!lock) return;
-  const info = await statPath(outputDir);
+  const info = fileIdentity(await statPath(outputDir, { bigint: true }));
   // A zero ino (no usable filesystem identity) must never compare equal to
   // itself here: acquireOutputDirLock already refuses to record such an
   // identity, but failing closed independently means this check stays safe
   // even if a lock object ever reached this function some other way.
   if (
-    lock.dirIdentity.ino === 0
-    || info.ino === 0
+    lock.dirIdentity.ino === '0'
+    || info.ino === '0'
     || info.dev !== lock.dirIdentity.dev
     || info.ino !== lock.dirIdentity.ino
   ) {
@@ -1973,6 +2065,8 @@ module.exports = {
   mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  readOutputDirLockFile,
+  readOutputDirLockFileSync,
   releaseOutputDirLock,
   resolveEngineToolProbes,
   resolvePlanAdmission,

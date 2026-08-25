@@ -856,6 +856,42 @@ test('findUnpinnedUses does not open block-scalar tracking from a key:-shaped li
     'a real block-scalar header outside any carried quote must still be recognized');
 });
 
+test('findUnpinnedUses tracks a multiline quoted scalar opened after a tag or anchor (Codex rescue 2026-08-23)', () => {
+  // PyYAML verified: `name: &a "x\n  uses: owner/action@main\n  y"` resolves
+  // to one folded scalar value ("x uses: owner/action@main y"), not a real
+  // `uses` key — a tag (`!`, `!!str`) or anchor (`&name`) sitting where a
+  // node may start always introduces the node that FOLLOWS it (YAML forbids
+  // a plain scalar from BEGINNING with either indicator there), so the
+  // quote after the token is a real opener. walkQuoteState previously
+  // treated `!`/`&` as ordinary content and cleared quote-open context, so
+  // the opener went unrecognized: noise for this scanner (the content line
+  // below was flagged as a real key), and a fail-OPEN quoted-scalar
+  // embedding bypass in scan_touched_suppressions' ancestry prover, which
+  // trusts the same walker's carryover to refuse chains through quoted
+  // content.
+  for (const opener of ['&a "x', '!!str "x', '&a !!str "x', "&a 'x", "!!str 'x"]) {
+    const close = opener.includes('"') ? '"' : "'";
+    assert.deepEqual(
+      findUnpinnedUses(`name: ${opener}\n  uses: owner/action@main\n  y${close}\nsteps: []\n`),
+      [],
+      `a uses:-shaped content line of the scalar opened by \`name: ${opener}\` must not be flagged as a real key`,
+    );
+  }
+  // Sanity, the other direction: once the anchored scalar CLOSES, a real
+  // uses: key after it must still be caught — recognizing the opener must
+  // come with recognizing its close, never a permanently-open phantom.
+  assert.equal(findUnpinnedUses('steps: [{name: &a "foo\n  bar", uses: owner/action@main}]\n').length, 1,
+    'a real uses: after an anchored multiline scalar closes must still be flagged');
+  // And a tag/anchor character at a NON-node position stays ordinary
+  // content: the quote after it must not open a phantom scalar that hides
+  // the real key on the next line (PyYAML verified: `name: a&b"c` and
+  // `name: a!b"c` are plain scalars containing the quote as content).
+  for (const content of ['a&b"c', 'a!b"c']) {
+    assert.equal(findUnpinnedUses(`name: ${content}\nsteps: [{uses: owner/action@main}]\n`).length, 1,
+      `a quote after mid-scalar \`${content}\` content must not open a phantom scalar hiding the next line's real uses:`);
+  }
+});
+
 test('hasTopLevelPermissions requires a column-zero permissions block', () => {
   assert.equal(hasTopLevelPermissions('name: x\npermissions:\n  contents: read\n'), true);
   assert.equal(hasTopLevelPermissions('name: x\npermissions: {}\n'), true);

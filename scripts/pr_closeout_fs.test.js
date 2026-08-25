@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const {
-  closeSync, constants, readFileSync, readSync, writeSync,
+  closeSync, constants, lstatSync, readFileSync, readSync, writeSync,
 } = require('node:fs');
 const { mkdtemp, rm, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
@@ -13,6 +13,7 @@ const { symlink } = require('node:fs/promises');
 
 const {
   assertNotSymlink,
+  fileIdentity,
   isSameFileIdentity,
   isSameLockIdentity,
   isSameProtectedFileIdentity,
@@ -187,35 +188,193 @@ test('openNoFollowSync refuses to follow a symlink swapped in for the target', {
   }
 });
 
+// Shared fixture builder: every predicate below consumes the normalized record
+// fileIdentity produces, so the tests are written in that shape rather than in
+// raw Stats. dev/ino are decimal STRINGS (exact at any width) and the time
+// terms the lock predicate compares are nanosecond strings.
+const idRecord = (over = {}) => ({
+  dev: '1', ino: '42', nlink: 1,
+  ctimeMs: 5000, ctimeNs: '5000000000',
+  birthtimeMs: 1000, birthtimeNs: '1000000000',
+  mtimeMs: 5000, size: 10, isFile: true, isSymbolicLink: false,
+  ...over,
+});
+
+// Two DISTINCT NTFS file references one apart, both above 2**53. An NTFS file
+// reference is (16-bit sequence << 48) | 48-bit MFT record, so it crosses 2**53
+// once the sequence number reaches 32 -- routine on a volume whose MFT records
+// have been recycled. At this magnitude the float64 ULP is 16, so these two
+// references round to the SAME double.
+const NTFS_REF_A = '81909218225795111';
+const NTFS_REF_B = '81909218225795112';
+
+test('isSameFileIdentity separates two distinct files whose inodes collide as float64', () => {
+  // THE REGRESSION THIS FIXTURE EXISTS FOR. Before the identity record, every
+  // caller captured ino from a default lstat -- a Number -- and compared it
+  // with ===. Measured on Windows 10 19045 / NTFS: one fresh file whose true
+  // reference was 81909218225795110 read back as 81909218225795100, and 800
+  // files created in a single directory reported 797 distinct Number inos
+  // against 800 distinct BigInt inos, with isSameFileIdentity returning TRUE
+  // for two different files whose references were 17 apart. That is a
+  // fail-open in every caller: an evidence file, a session log, a collector
+  // token, or a port file could be certified as "still the same file" after
+  // being swapped for a different one.
+  //
+  // The precondition is asserted rather than assumed -- if a future Node or
+  // platform made these two values distinct as Numbers, this test would still
+  // pass while silently no longer covering the regime it was written for.
+  assert.equal(
+    Number(NTFS_REF_A) === Number(NTFS_REF_B),
+    true,
+    'fixture precondition: the two references must collapse onto one double',
+  );
+  assert.notEqual(NTFS_REF_A, NTFS_REF_B, 'fixture precondition: the references are distinct');
+
+  const pre = idRecord({ ino: NTFS_REF_A });
+  const post = idRecord({ ino: NTFS_REF_B });
+  assert.equal(isSameFileIdentity(pre, post), false);
+  // The two stricter predicates compose the lax one, so neither may inherit
+  // the false match. The birth/ctime terms are held equal here deliberately:
+  // the ino term alone has to do the rejecting.
+  assert.equal(isSameProtectedFileIdentity(pre, post), false);
+  assert.equal(isSameLockIdentity(pre, post), false);
+  // A genuine same-file comparison at the same magnitude still passes, so the
+  // fix rejects the collision rather than everything above 2**53.
+  assert.equal(isSameFileIdentity(pre, idRecord({ ino: NTFS_REF_A })), true);
+});
+
+test('the predicates fail closed on a Number ino instead of silently comparing float64', () => {
+  // The migration is enforced by the predicate, not by review. A caller that
+  // still passed a default Stats would otherwise clear the `ino !== '0'` guard
+  // vacuously (a Number is never strictly equal to a string) and fall straight
+  // back into the float64 comparison the record exists to remove -- the same
+  // check, reading as hardened, silently unhardened.
+  const numeric = { dev: 1, ino: 42, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
+  assert.equal(isSameFileIdentity(numeric, { ...numeric }), false, 'a Number-ino pair must not certify identity');
+  assert.equal(isSameFileIdentity(numeric, idRecord()), false);
+  assert.equal(isSameFileIdentity(idRecord(), numeric), false);
+  assert.equal(isSameProtectedFileIdentity(numeric, { ...numeric }), false);
+  assert.equal(isSameLockIdentity(numeric, { ...numeric }), false);
+  // And the collision itself, in the shape a pre-fix caller would have used:
+  // this exact pair returned TRUE before the fix.
+  assert.equal(
+    isSameFileIdentity(
+      { dev: 1, ino: Number(NTFS_REF_A), nlink: 1 },
+      { dev: 1, ino: Number(NTFS_REF_B), nlink: 1 },
+    ),
+    false,
+  );
+});
+
+test('fileIdentity refuses a default Stats and normalizes a bigint one exactly', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'closeout-fs-identity-'));
+  try {
+    const file = path.join(dir, 'probe.txt');
+    await writeFile(file, 'probe\n', 'utf8');
+    // The wrong input fails loudly at the capture site. Stringifying an
+    // already-rounded Number would read as exact while carrying the defect.
+    assert.throws(() => fileIdentity(lstatSync(file)), /bigint/i);
+    assert.throws(() => fileIdentity(undefined), /bigint/i);
+
+    const big = lstatSync(file, { bigint: true });
+    const identity = fileIdentity(big);
+    assert.equal(identity.dev, String(big.dev));
+    assert.equal(identity.ino, String(big.ino));
+    assert.equal(identity.ctimeNs, String(big.ctimeNs));
+    assert.equal(typeof identity.dev, 'string');
+    assert.equal(typeof identity.ino, 'string');
+    // The scalars callers compare against Numbers must NOT stay BigInt: with a
+    // raw bigint Stats `info.size !== identity.bytesWritten` and
+    // `info.nlink !== 1` become permanently true while relational forms keep
+    // working -- an inconsistent, partly silent failure.
+    assert.equal(typeof identity.nlink, 'number');
+    assert.equal(typeof identity.size, 'number');
+    assert.equal(typeof identity.mtimeMs, 'number');
+    assert.equal(identity.isFile, true);
+    assert.equal(identity.isSymbolicLink, false);
+    // The record must survive the /session mint's JSON response; a BigInt
+    // field would throw here and turn that mint into a 500.
+    assert.equal(JSON.parse(JSON.stringify(identity)).ino, String(big.ino));
+    // A real file compares equal to itself across two independent captures.
+    assert.equal(isSameFileIdentity(identity, fileIdentity(lstatSync(file, { bigint: true }))), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('isSameLockIdentity fails closed on records that omit the nanosecond terms', () => {
+  // Codex review, P3: hasExactIdentity only vouches for dev/ino, so two records
+  // that simply OMIT both ns fields compared `undefined === undefined` and this
+  // predicate returned TRUE for them. That is the same vacuous pass the string
+  // ino was introduced to remove, arriving through the SHAPE of the input
+  // rather than the width of a Number -- a caller holding a half-built record
+  // (or a stale wire object) would have been told two files are the same lock
+  // on the strength of two missing fields.
+  //
+  // The lax and protected predicates deliberately do NOT require these: their
+  // preInfo is legitimately partial (the /session mint ships dev, ino and
+  // birthtimeMs and nothing else), so demanding ns there would abort every
+  // deferred start. isSameLockIdentity's callers always hold a full record.
+  const partial = { dev: '1', ino: '2', nlink: 1 };
+  assert.equal(isSameLockIdentity(partial, { ...partial }), false, 'omitted ns terms must never compare equal');
+  assert.equal(isSameLockIdentity({ ...partial, ctimeNs: '5000000000' }, { ...partial, ctimeNs: '5000000000' }), false, 'a missing birthtimeNs is still a missing term');
+  assert.equal(isSameLockIdentity({ ...partial, birthtimeNs: '1000000000' }, { ...partial, birthtimeNs: '1000000000' }), false, 'a missing ctimeNs is still a missing term');
+  // A non-string ns (the pre-normalization Number shape) is refused for the
+  // same reason the ino terms refuse one.
+  assert.equal(isSameLockIdentity(
+    { ...partial, ctimeNs: 5000000000, birthtimeNs: 1000000000 },
+    { ...partial, ctimeNs: 5000000000, birthtimeNs: 1000000000 },
+  ), false, 'a Number ns must not certify a lock identity');
+  // The complete record still compares equal, so this fails closed on the
+  // missing shape rather than on everything.
+  assert.equal(isSameLockIdentity(idRecord(), idRecord()), true, 'a full record is not rejected');
+  // And the lax/protected predicates are NOT tightened by this: the partial
+  // wire shape they are contracted to accept still passes.
+  assert.equal(isSameFileIdentity(partial, { ...partial }), true, 'the lax predicate still accepts a partial record');
+  assert.equal(isSameProtectedFileIdentity({ dev: '1', ino: '42' }, idRecord()), true, 'the mint wire shape still passes the protected predicate');
+});
+
+test('isSameLockIdentity compares nanoseconds, not truncated milliseconds', () => {
+  // The bigint Stats truncates ctimeMs to whole milliseconds while a default
+  // Stats carries a sub-millisecond fraction (measured on this host:
+  // 1787517135767.5864 against 1787517135767). Normalizing to the truncated
+  // millisecond would have QUIETLY COARSENED this predicate from ~100 ns to
+  // 1 ms -- a fix that weakened the guard it shipped to strengthen. These two
+  // records are indistinguishable in whole milliseconds and must still be
+  // rejected.
+  const stale = idRecord({ ino: '77', dev: '3', ctimeMs: 5000, ctimeNs: '5000000000' });
+  const subMsSuccessor = idRecord({ ino: '77', dev: '3', ctimeMs: 5000, ctimeNs: '5000123400' });
+  assert.equal(stale.ctimeMs, subMsSuccessor.ctimeMs, 'fixture precondition: identical in whole milliseconds');
+  assert.equal(isSameLockIdentity(stale, subMsSuccessor), false);
+  assert.equal(isSameLockIdentity(stale, { ...stale }), true, 'a genuine same file is not rejected');
+});
+
 test('isSameLockIdentity rejects a same-ctime inode reuse when birthtime differs', () => {
-  // Codex UkAeu: ctimeMs has only millisecond resolution, so an unlink+recreate
-  // that reuses the freed inode AND lands in the same millisecond can collide
-  // on dev/ino/nlink/ctimeMs all at once. A ctime-only predicate would then
-  // call two genuinely different files the same lock and let a reclaim
-  // quarantine a peer's live successor. These lock/claim records have their
-  // ctime bumped after creation (ACL protection, content writes) while
-  // birthtime stays pinned to creation, so the stale record's birthtime stays
-  // older than a same-millisecond successor's -- an independent second time
-  // dimension the collision must also clear.
-  const stale = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
-  // Reused inode, ctimeMs collides inside the same ms, but the successor was
-  // actually born later -> birthtimeMs differs -> not the same file. This
-  // assertion fails on the ctime-only predicate (which returns true here).
-  const collidingSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 5000 };
+  // Codex UkAeu: an unlink+recreate that reuses the freed inode AND lands in
+  // the same instant can collide on dev/ino/nlink/ctime all at once. A
+  // ctime-only predicate would then call two genuinely different files the
+  // same lock and let a reclaim quarantine a peer's live successor. These
+  // lock/claim records have their ctime bumped after creation (ACL protection,
+  // content writes) while birthtime stays pinned to creation, so the stale
+  // record's birthtime stays older than a same-instant successor's -- an
+  // independent second time dimension the collision must also clear.
+  const stale = idRecord({ ino: '77', dev: '3', ctimeNs: '5000000000', birthtimeNs: '1000000000' });
+  const collidingSuccessor = idRecord({ ino: '77', dev: '3', ctimeNs: '5000000000', birthtimeNs: '5000000000' });
   assert.equal(isSameLockIdentity(stale, collidingSuccessor), false);
 
   // Genuine same file: every dimension including the birth time matches, so a
   // real stale record stays reclaimable (no false rejection). "Unchanged for
-  // this record", not "immutable" — on NTFS a same-name recreate inherits the
+  // this record", not "immutable" -- on NTFS a same-name recreate inherits the
   // original's creation time through file tunneling, and the owner can set it
   // outright, which is why the predicate's doc refuses to call the term
   // independent on win32.
-  const untouchedSameFile = { ino: 77, dev: 3, nlink: 1, ctimeMs: 5000, birthtimeMs: 1000 };
+  const untouchedSameFile = idRecord({ ino: '77', dev: '3', ctimeNs: '5000000000', birthtimeNs: '1000000000' });
   assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 
   // The common unlink+recreate case (fresh change time) is still rejected on
-  // ctimeMs alone -- the new birthtime term does not weaken the existing guard.
-  const freshCtimeSuccessor = { ino: 77, dev: 3, nlink: 1, ctimeMs: 6000, birthtimeMs: 6000 };
+  // the ctime term alone -- the birthtime term does not weaken the existing
+  // guard.
+  const freshCtimeSuccessor = idRecord({ ino: '77', dev: '3', ctimeNs: '6000000000', birthtimeNs: '6000000000' });
   assert.equal(isSameLockIdentity(stale, freshCtimeSuccessor), false);
 });
 
@@ -223,10 +382,10 @@ test('isSameProtectedFileIdentity rejects an inode reuse the lax predicate accep
   // POSIX inode reuse (tmpfs hands a freed ino to the next file created in the
   // directory): dev/ino/nlink cannot see it, the creation time can. This is
   // the whole reason the post-ACL callers use this predicate instead of the
-  // lax one — and the difference is asserted rather than assumed, so a future
+  // lax one -- and the difference is asserted rather than assumed, so a future
   // edit that collapses the two is caught here.
-  const preInfo = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
-  const reusedIno = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 5000 };
+  const preInfo = idRecord({ birthtimeMs: 1000 });
+  const reusedIno = idRecord({ birthtimeMs: 5000 });
   assert.equal(isSameFileIdentity(preInfo, reusedIno), true, 'the lax predicate is blind to this swap');
   assert.equal(isSameProtectedFileIdentity(preInfo, reusedIno), false);
   assert.equal(isSameProtectedFileIdentity(preInfo, { ...preInfo }), true, 'a genuine same file is not rejected');
@@ -237,27 +396,32 @@ test('isSameProtectedFileIdentity skips the birth term when either side reports 
   // not record a birth time report 0. Neither may turn a healthy check red: a
   // bare `===` would abort every deferred start on the first shape, and on the
   // second it would silently become a ctimeMs comparison (Node falls
-  // birthtimeMs back to ctimeMs where statx is unavailable) — precisely what
+  // birthtimeMs back to ctimeMs where statx is unavailable) -- precisely what
   // isSameFileIdentity's contract forbids for ACL-protect callers, whose
   // intervening operation legitimately moves ctimeMs.
-  const real = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
-  assert.equal(isSameProtectedFileIdentity({ dev: 1, ino: 42 }, real), true);
+  const real = idRecord({ birthtimeMs: 1000 });
+  // The wire shape: dev/ino strings and a birth time, nothing else.
+  assert.equal(isSameProtectedFileIdentity({ dev: '1', ino: '42' }, real), true);
   assert.equal(isSameProtectedFileIdentity({ ...real, birthtimeMs: 0 }, real), true);
   assert.equal(isSameProtectedFileIdentity(real, { ...real, birthtimeMs: 0 }), true);
 });
 
 test('isSameProtectedFileIdentity still rejects every shape isSameFileIdentity rejects', () => {
-  // Composition, not re-implementation: the four lax terms are inherited from
-  // one predicate rather than re-listed here, so a hardening that lands in
+  // Composition, not re-implementation: the lax terms are inherited from one
+  // predicate rather than re-listed here, so a hardening that lands in
   // isSameFileIdentity cannot leave the protected variant behind (the
-  // one-contract-one-implementation rule this repo already paid for twice —
+  // one-contract-one-implementation rule this repo already paid for twice --
   // the V8a redaction parser and the V7a scalar-header regex).
-  const pre = { dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000 };
-  const born = (over) => ({ dev: 1, ino: 42, nlink: 1, birthtimeMs: 1000, ...over });
-  assert.equal(isSameProtectedFileIdentity({ ...pre, dev: 0, ino: 0 }, born({ dev: 0, ino: 0 })), false);
-  assert.equal(isSameProtectedFileIdentity(pre, born({ ino: 43 })), false);
-  assert.equal(isSameProtectedFileIdentity(pre, born({ dev: 2 })), false);
+  const pre = idRecord({ birthtimeMs: 1000 });
+  const born = (over) => idRecord({ birthtimeMs: 1000, ...over });
+  assert.equal(isSameProtectedFileIdentity({ ...pre, dev: '0', ino: '0' }, born({ dev: '0', ino: '0' })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ ino: '43' })), false);
+  assert.equal(isSameProtectedFileIdentity(pre, born({ dev: '2' })), false);
   assert.equal(isSameProtectedFileIdentity(pre, born({ nlink: 2 })), false);
+  // The zero-ino rejection specifically: the literal is the STRING '0' now, and
+  // a stale `!== 0` would compare a string against a number, never match, and
+  // silently retire the guard its comment exists to enforce.
+  assert.equal(isSameFileIdentity(idRecord({ ino: '0' }), idRecord({ ino: '0' })), false);
 });
 
 test('openNoFollowFlagAttempts keeps NOFOLLOW when NONBLOCK is unsupported', () => {

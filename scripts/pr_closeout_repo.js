@@ -7,7 +7,7 @@ const { promisify, TextDecoder } = require('node:util');
 
 const { scanSuppressionText } = require('./pr_closeout_core');
 const { computeFilterSafetyOverrides, fingerprintEntries, isGateFile } = require('./pr_closeout_git');
-const { isSameFileIdentity, openNoFollow } = require('./pr_closeout_fs');
+const { fileIdentity, isSameFileIdentity, openNoFollow } = require('./pr_closeout_fs');
 
 const execFileAsync = promisify(execFile);
 /**
@@ -624,19 +624,23 @@ const scanTouchedSuppressions = async (repo, files, { lstatFn = lstat } = {}) =>
       const absolute = path.join(repo, file);
       let stats;
       try {
-        stats = await lstatFn(absolute);
+        // Captured as a normalized identity record, not a default Stats: the
+        // ino this hands to isSameFileIdentity below must be the exact 64-bit
+        // reference, and a default lstat rounds it to float64 (see
+        // fileIdentity in pr_closeout_fs.js).
+        stats = fileIdentity(await lstatFn(absolute, { bigint: true }));
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
         continue;
       }
-      if (stats.isSymbolicLink()) {
+      if (stats.isSymbolicLink) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is a symlink; refusing to follow.' });
         continue;
       }
       // Reject non-regular files (FIFO, socket, device): a read-only FIFO on
       // POSIX blocks forever waiting for a writer, stalling the scan before
       // any dirty-tree result can stop the run.
-      if (!stats.isFile()) {
+      if (!stats.isFile) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is not a regular file; refusing to read.' });
         continue;
       }
@@ -661,7 +665,7 @@ const scanTouchedSuppressions = async (repo, files, { lstatFn = lstat } = {}) =>
       }
       // Re-stat the opened descriptor so a TOCTOU grow/replace after lstat
       // cannot push the read past MAX_SUPPRESSION_SCAN_BYTES.
-      const opened = await handle.stat();
+      const opened = fileIdentity(await handle.stat({ bigint: true }));
       // Bind the bytes we are about to scan to the exact file the pre-open
       // lstat classified. openNoFollow can fall back to a following open where
       // O_NOFOLLOW is unavailable (Windows / some filesystems), so a path — or
@@ -679,7 +683,7 @@ const scanTouchedSuppressions = async (repo, files, { lstatFn = lstat } = {}) =>
         });
         continue;
       }
-      if (!opened.isFile()) {
+      if (!opened.isFile) {
         findings.push({ file, line: 0, category: 'scan-error', match: 'Touched path is not a regular file; refusing to read.' });
         continue;
       }

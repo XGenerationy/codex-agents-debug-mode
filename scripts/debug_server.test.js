@@ -32,6 +32,7 @@ const {
   hashBufferSha256,
   unlinkOwnedClaimIfUnchanged,
 } = require('./debug_server');
+const { fileIdentity } = require('./pr_closeout_fs');
 
 const { buildSecretReplacements } = require('./pr_closeout_stream');
 
@@ -435,25 +436,386 @@ test('deferred Windows salt protection still persists project_salt and agrees on
   }
 });
 
-test('POST /session hardens the session log via the awaited async ACL, never the sync variant', async () => {
-  // Wiring pin, deliberately source-level: the branch is win32-only and its
-  // failure mode is a concurrency stall (execFileSync froze the single-
-  // threaded server for the ACL's full 15s budget, timing out concurrent
-  // live reads — audit V1a), which no fast deterministic test can observe.
-  // The async variant's own semantics — spawn-based, settles on 'exit',
-  // immune to the pipe-inheritance hang that forced the old sync workaround
-  // (31c1f48) — are behaviorally covered in pr_closeout_fs.test.js; this pin
-  // guards the handler's side of the contract: the request path awaits the
-  // async entry point and never calls the blocking one.
-  const source = await readFile(path.join(__dirname, 'debug_server.js'), 'utf8');
-  assert.ok(
-    source.includes('await protectWindowsPrivateFileAsync(resolvedLogFile)'),
-    'the mint handler must await the spawn-based async ACL',
+// Route-level coverage for the awaited session-log ACL step (issue #9,
+// replacing the former source-text wiring pin, which asserted the handler's
+// SOURCE contained `await protectWindowsPrivateFileAsync(...)` but verified
+// nothing about the route contract). The seam is `sessionLogAclForTests`: an
+// async adapter createDebugServer awaits BEFORE the real spawn-based ACL —
+// additive, never a replacement (on win32 the real Set-Acl still runs after
+// a resolving adapter) — so these tests observe the mint route's fail-closed
+// behavior, and the non-Windows legs do it without spawning PowerShell
+// (~325ms per Set-Acl). When an adapter is supplied the protection branch
+// runs on every platform, so the non-Windows CI legs exercise the same
+// route contract the win32 branch enforces in production.
+// The real implementation's own semantics stay covered in
+// pr_closeout_fs.test.js, and every adapter-less mint in this file (on the
+// windows-latest leg) exercises the production default end to end.
+
+// The adapter receives the resolved log-file path (`debug-<sessionId>.log`),
+// which is the only way a test can learn the session id BEFORE the mint
+// response reveals it — exactly what probing the pending state needs.
+const sessionIdFromLogPath = (logFilePath) =>
+  path.basename(logFilePath).replace(/^debug-/, '').replace(/\.log$/, '');
+
+const waitUntil = async (predicate, message, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+// win32-only: assert `filePath` carries the owner-only DACL
+// protectWindowsPrivateFile establishes (single ACE, current identity,
+// FullControl, Allow), read back through one PowerShell Get-Acl — a read, no
+// Set-Acl. Compared by SID, not by account name: names localize and a name
+// match can be forged by a same-named account in another domain, while
+// whoami's domain qualification itself varies by host (Codex rescue r3/r4
+// observed both a token identity diverging from %USERNAME% and a
+// domain-stripped whoami). The SID from WindowsIdentity::GetCurrent().User
+// is exactly the principal the ACL helper grants, so equality on it is the
+// full token-identity assertion.
+const assertOwnerOnlyDacl = (filePath, label) => {
+  // .NET BCL calls, not the Get-Acl cmdlet, and the path as UTF-16 base64 —
+  // the invocation shape of buildProtectWindowsPrivateFileArgs and the
+  // windowsAclIsCurrentUserOnly sibling. On hosted windows runners the pwsh
+  // PSModulePath leaks into spawned Windows PowerShell 5.1 sessions and the
+  // Get-Acl CMDLET dies on Microsoft.PowerShell.Security module autoload
+  // ("module could not be loaded", exit 1) while the BCL path runs clean —
+  // observed on the Validate matrix, which first executed for this branch
+  // once the PR became mergeable.
+  const encodedPath = Buffer.from(filePath, 'utf16le').toString('base64');
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    `$path = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'))`,
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$acl = [IO.File]::GetAccessControl($path)',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))',
+    '[Console]::WriteLine("count=" + $rules.Count)',
+    'foreach ($r in $rules) { [Console]::WriteLine("rule=" + $r.IdentityReference.Value + "|" + $r.FileSystemRights + "|" + $r.AccessControlType) }',
+    '[Console]::WriteLine("me=" + $sid.Value)',
+  ].join('; ');
+  const probe = spawnSync(
+    resolvePowerShellExecutable(),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    // Same 15s bound as every other PowerShell probe here: a hung
+    // powershell.exe blocks the test worker — spawnSync cannot be
+    // interrupted by the surrounding test timeout.
+    { encoding: 'utf8', windowsHide: true, timeout: 15_000 },
   );
-  assert.ok(
-    !source.includes('protectWindowsPrivateFile(resolvedLogFile)'),
-    'the mint handler must not call the event-loop-blocking sync ACL',
-  );
+  assert.equal(probe.status, 0, `the DACL probe for ${label}'s log must succeed: ${probe.stderr}`);
+  const lines = probe.stdout.split(/\r?\n/).filter(Boolean);
+  const tokenSid = lines.find((line) => line.startsWith('me='))?.slice(3);
+  assert.ok(tokenSid && tokenSid.startsWith('S-1-'), `the probe must report the token SID; got ${JSON.stringify(probe.stdout)}`);
+  assert.ok(lines.includes('count=1'), `${label} must leave an owner-only DACL (exactly one ACE); got ${JSON.stringify(probe.stdout)}`);
+  const rules = lines.filter((line) => line.startsWith('rule=')).map((line) => line.slice(5).split('|'));
+  assert.equal(rules.length, 1, `expected exactly one reported ACE; got ${JSON.stringify(probe.stdout)}`);
+  const [sid, rights, type] = rules[0];
+  assert.equal(sid, tokenSid, `the single ACE must be granted to the process token SID, no other principal`);
+  assert.ok(rights.includes('FullControl'), `the ACE must grant FullControl; got ${JSON.stringify(rights)}`);
+  assert.equal(type, 'Allow');
+};
+
+test('POST /session stays pending until the awaited ACL adapter resolves, and no usable session exists before then', async () => {
+  // Criterion: the mint response must not publish a session credential until
+  // asynchronous ACL protection has succeeded. The credential's ONLY channel
+  // is the 201 body, so "response still pending" is itself the credential
+  // half of the guarantee; the /log probe below covers the access half — the
+  // reserved slot must refuse session-log writes while the ACL is pending.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-pending-'));
+  try {
+    let releaseAcl;
+    const aclGate = new Promise((resolve) => { releaseAcl = resolve; });
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: (logFilePath) => {
+        protectedPath = logFilePath;
+        return aclGate;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const events = [];
+      const mint = createSession(baseUrl).then((result) => {
+        events.push('mint-settled');
+        return result;
+      });
+      await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
+      const sessionId = sessionIdFromLogPath(protectedPath);
+      // The green direction is deterministic: an awaiting handler cannot
+      // settle before releaseAcl, so the order assertion at the end can
+      // never flake. The RED direction is a detection window, not a proof —
+      // a handler that dropped the await settles on its own schedule, and
+      // this pause plus the /log round trip below give it ample room to
+      // settle early and be caught (here and by the final order check); a
+      // pathological stall could outlast the window, which the swap test
+      // below backstops by making a non-awaited re-verification observable
+      // as the wrong status code.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual(events, [], 'the mint response must stay pending while the ACL adapter is unsettled');
+      // The provisional slot must refuse session-log access before ACL
+      // success. 425 fires before any token check, so no credential is
+      // needed to prove the refusal.
+      const pendingWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId, msg: 'probe during pending ACL' },
+      });
+      assert.equal(pendingWrite.status, 425);
+      assert.equal(pendingWrite.body.error, 'session_initializing');
+      assert.deepEqual(events, [], 'probing /log must not have flushed the pending mint');
+      events.push('acl-released');
+      releaseAcl();
+      const minted = await mint;
+      assert.deepEqual(
+        events,
+        ['acl-released', 'mint-settled'],
+        'the mint may settle only after the ACL adapter is released',
+      );
+      assert.equal(minted.status, 201);
+      assert.equal(minted.body.session_id, sessionId);
+      // Only after ACL success does the same session accept writes.
+      const write = await recordEvent(baseUrl, minted.body);
+      assert.equal(write.status, 202);
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('POST /session fails closed when the ACL adapter rejects: 500 session_log_acl_failed, slot and log file reclaimed', async () => {
+  // maxSessions: 1 makes the reclamation observable at the route level — a
+  // leaked slot from the failed mint would make the follow-up mint 429
+  // instead of 201.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-reject-'));
+  try {
+    let aclMode = 'reject';
+    let rejectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      limits: { maxSessions: 1 },
+      sessionLogAclForTests: async (logFilePath) => {
+        if (aclMode === 'reject') {
+          rejectedPath = logFilePath;
+          throw new Error('injected ACL failure');
+        }
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const failed = await createSession(baseUrl);
+      assert.equal(failed.status, 500);
+      assert.equal(failed.body.error, 'session_log_acl_failed');
+      assert.ok(rejectedPath, 'the rejecting adapter must have been invoked');
+      // No usable session survives the failure: the slot is gone (404, not
+      // 425) and the created log file was removed, so nothing on disk or in
+      // the session table outlives the failed protection.
+      const orphanWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: sessionIdFromLogPath(rejectedPath), msg: 'probe after rejected ACL' },
+      });
+      assert.equal(orphanWrite.status, 404);
+      assert.equal(orphanWrite.body.error, 'unknown_session');
+      assert.equal(existsSync(rejectedPath), false, 'the unprotected log file must not remain on disk');
+      aclMode = 'resolve';
+      const recovered = await createSession(baseUrl);
+      assert.equal(recovered.status, 201, `the failed mint must not leak its maxSessions slot; got ${JSON.stringify(recovered.body)}`);
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('createDebugServer without a test ACL adapter keeps the production default, and a non-callable adapter fails at boot', async () => {
+  // The production default is the real spawn-based ACL: with no adapter
+  // supplied the mint must still succeed, and on Windows the minted log must
+  // actually CARRY the owner-only DACL protectWindowsPrivateFileAsync
+  // establishes (owner FullControl, inheritance broken, every other rule
+  // removed) — asserted through icacls, a read, so this pin costs no
+  // Set-Acl beyond the one the default mint itself performs (which every
+  // adapter-less mint in this file already pays on the windows-latest leg).
+  // A 201 alone would also pass with the protection branch deleted; the
+  // DACL read is what pins the default wiring to the real implementation.
+  // On non-Windows the win32-only gate skips protection, as in production,
+  // and the 201 is the whole observable. The boot-time type check mirrors
+  // invalid_responder_private_key: a non-callable adapter would otherwise
+  // surface as an opaque 500 on the first mint.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-default-'));
+  try {
+    const server = createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN });
+    const baseUrl = await listen(server);
+    try {
+      const minted = await createSession(baseUrl);
+      assert.equal(minted.status, 201, 'the default (real) ACL path must still mint');
+      if (process.platform === 'win32') {
+        assertOwnerOnlyDacl(path.join(projectRoot, minted.body.log_file), 'the default mint');
+      }
+    } finally {
+      await close(server);
+    }
+    assert.throws(
+      () => createDebugServer({ projectRoot, token: TEST_LAUNCH_TOKEN, sessionLogAclForTests: 'not-a-function' }),
+      /invalid_session_log_acl_for_tests/,
+      'a non-callable test adapter must be rejected at construction',
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the sessionLogAclForTests seam is refused outside the node:test runner (no production ACL switch)', async () => {
+  // The test-only claim is an ENFORCED gate, not a naming convention (Codex
+  // rescue r2): the node:test runner marks its child processes with
+  // NODE_TEST_CONTEXT, and construction with an adapter fails closed without
+  // it, so a production importer cannot enable the seam by merely passing
+  // the option. (The env var is forgeable, so the gate is the OUTER layer:
+  // the additive-seam test below is what guarantees a forged env still
+  // cannot strip the real Windows ACL.) Proven from a plain `node -e` child
+  // with NODE_TEST_CONTEXT scrubbed — the same child then constructs
+  // WITHOUT the adapter, pinning ONLY that the gate never rejects
+  // adapter-less production boot; the default path's end-to-end protection
+  // is pinned by the icacls read-back in the default-path test, not here.
+  // deferWindowsPrivateFileProtection keeps the child's construction off
+  // PowerShell; the gate fires before any route exists, so defer changes
+  // nothing it guards.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-gate-'));
+  try {
+    const script = `
+      const { createDebugServer } = require(${JSON.stringify(path.join(__dirname, 'debug_server.js'))});
+      const options = {
+        projectRoot: ${JSON.stringify(projectRoot)},
+        token: ${JSON.stringify(TEST_LAUNCH_TOKEN)},
+        deferWindowsPrivateFileProtection: true,
+      };
+      try {
+        createDebugServer({ ...options, sessionLogAclForTests: async () => {} });
+        console.log('adapter:constructed');
+      } catch (error) {
+        console.log('adapter:threw:' + error.message);
+      }
+      createDebugServer(options);
+      console.log('plain:constructed');
+    `;
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env, windowsHide: true });
+    assert.equal(child.status, 0, `the gate probe child must exit cleanly: ${child.stderr}`);
+    assert.ok(
+      child.stdout.includes('adapter:threw:session_log_acl_for_tests_outside_test_runner'),
+      `constructing with the adapter outside the test runner must fail closed; got ${JSON.stringify(child.stdout)}`,
+    );
+    assert.ok(
+      child.stdout.includes('plain:constructed'),
+      `the gate must not reject adapter-less production construction; got ${JSON.stringify(child.stdout)}`,
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('a no-op adapter cannot strip the real Windows ACL: the seam is additive, never a replacement', { skip: process.platform !== 'win32' }, async () => {
+  // The structural answer to "any injectable seam is a forgeable switch"
+  // (Codex rescue r3): on the one platform that HAS production ACL
+  // protection, an injected adapter runs IN ADDITION to
+  // protectWindowsPrivateFileAsync, never instead of it. So even a caller
+  // that forges the runner env and injects `async () => {}` still mints
+  // logs carrying the real owner-only DACL — there is no combination of
+  // option and environment that skips Set-Acl on Windows. Read back through
+  // icacls after a no-op-adapter mint; under the old replace-the-call seam
+  // the log kept its inherited multi-ACE DACL and this fails.
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-additive-'));
+  try {
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: async (logFilePath) => {
+        protectedPath = logFilePath;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const minted = await createSession(baseUrl);
+      assert.equal(minted.status, 201);
+      assert.ok(protectedPath, 'the adapter must still be invoked');
+      assertOwnerOnlyDacl(path.join(projectRoot, minted.body.log_file), 'a no-op-adapter mint');
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('the injected adapter cannot bypass the post-protect verification: a removed log never mints', async () => {
+  // The seam leaves the whole post-adapter tail of the branch in force.
+  // Removing the log while the awaited adapter is pending must fail the
+  // mint closed on every platform — on win32 the never-skippable real ACL
+  // runs next and fails on the missing file (session_log_acl_failed);
+  // elsewhere the post-protect identity lstat fails
+  // (session_log_escapes_root). Green-direction ordering is deterministic
+  // (an awaiting handler cannot settle before release, pinned by the event
+  // order below); as a RED probe for a dropped await it is a detection
+  // window like the pending test's, not a proof — a non-awaiting handler
+  // re-verifies the still-present file and mints 201, caught unless its own
+  // pipeline stalled past the removal (Codex rescue r3).
+  const projectRoot = await mkdtemp(path.join(tmpdir(), 'debug-skill-acl-swap-'));
+  try {
+    let releaseAcl;
+    const aclGate = new Promise((resolve) => { releaseAcl = resolve; });
+    let protectedPath = null;
+    const server = createDebugServer({
+      projectRoot,
+      token: TEST_LAUNCH_TOKEN,
+      sessionLogAclForTests: (logFilePath) => {
+        protectedPath = logFilePath;
+        return aclGate;
+      },
+    });
+    const baseUrl = await listen(server);
+    try {
+      const events = [];
+      const mint = createSession(baseUrl).then((result) => {
+        events.push('mint-settled');
+        return result;
+      });
+      await waitUntil(() => protectedPath !== null, 'the mint route never invoked the injected ACL adapter');
+      rmSync(protectedPath);
+      events.push('acl-released');
+      releaseAcl();
+      const minted = await mint;
+      assert.deepEqual(
+        events,
+        ['acl-released', 'mint-settled'],
+        'the mint may settle only after the ACL adapter is released',
+      );
+      const expected = process.platform === 'win32'
+        ? { status: 500, error: 'session_log_acl_failed' }
+        : { status: 409, error: 'session_log_escapes_root' };
+      assert.equal(minted.status, expected.status);
+      assert.equal(minted.body.error, expected.error);
+      // The failed mint leaves no session behind.
+      const orphanWrite = await requestJson(baseUrl, {
+        method: 'POST',
+        pathname: '/log',
+        body: { sessionId: sessionIdFromLogPath(protectedPath), msg: 'probe after swapped log' },
+      });
+      assert.equal(orphanWrite.status, 404);
+      assert.equal(orphanWrite.body.error, 'unknown_session');
+    } finally {
+      await close(server);
+    }
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test('a second first-launch adopts the existing project_salt instead of replacing it (create-once, Codex U2TI8/U25na)', async () => {
@@ -746,12 +1108,18 @@ test('requires the launch token and returns only an opaque relative log path', a
     // re-verify the file it hardens BY NAME is still the file this server
     // created — without it a swap during the PowerShell ACL call went
     // undetected (review V2a).
-    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file));
+    // Compared against a { bigint: true } stat, not a default one: the wire
+    // carries dev/ino as decimal STRINGS precisely because a JSON number is a
+    // float64 and would re-round a 64-bit NTFS file reference in transit. A
+    // default stat here would reintroduce that rounding inside the assertion
+    // and the test would pass while proving the opposite of its name.
+    const mintedLog = await stat(path.join(projectRoot, authorized.body.log_file), { bigint: true });
     assert.deepEqual(
       { dev: authorized.body.log_file_identity.dev, ino: authorized.body.log_file_identity.ino },
-      { dev: mintedLog.dev, ino: mintedLog.ino },
+      { dev: String(mintedLog.dev), ino: String(mintedLog.ino) },
       'the response identity must be the created file, not a placeholder',
     );
+    assert.equal(typeof authorized.body.log_file_identity.ino, 'string', 'the wire ino must be a string, never a JSON number');
     // birthtimeMs is pinned BY TYPE, not by value: the server reads it from
     // the O_EXCL creation handle while this stat() re-reads the path after the
     // response returned, and on mounts that record no birth time Node falls
@@ -1388,21 +1756,21 @@ test('isSameFileIdentity rejects a zero/zero identity even though dev and ino bo
   // re-verification in main() relies on this predicate to fail closed instead
   // of trusting an absent identity.
   assert.equal(
-    isSameFileIdentity({ dev: 0, ino: 0, nlink: 1 }, { dev: 0, ino: 0, nlink: 1 }),
+    isSameFileIdentity({ dev: '0', ino: '0', nlink: 1 }, { dev: '0', ino: '0', nlink: 1 }),
     false,
   );
 });
 
 test('isSameFileIdentity accepts a genuine matching non-zero identity', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '42', nlink: 1 }),
     true,
   );
 });
 
 test('isSameFileIdentity rejects a real dev/ino mismatch', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 43, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '43', nlink: 1 }),
     false,
   );
 });
@@ -1413,14 +1781,14 @@ test('isSameFileIdentity rejects a dev mismatch even when ino matches', () => {
   // two different devices (numerically possible when comparing files from
   // different volumes/mounts) must still be rejected as a different file.
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 2, ino: 42, nlink: 1 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '2', ino: '42', nlink: 1 }),
     false,
   );
 });
 
 test('isSameFileIdentity rejects when nlink indicates a hard link was added', () => {
   assert.equal(
-    isSameFileIdentity({ dev: 1, ino: 42, nlink: 1 }, { dev: 1, ino: 42, nlink: 2 }),
+    isSameFileIdentity({ dev: '1', ino: '42', nlink: 1 }, { dev: '1', ino: '42', nlink: 2 }),
     false,
   );
 });
@@ -1513,10 +1881,10 @@ const reclaimReadClaimText = async (target) => {
 };
 
 test('reclaimStaleCollectorClaim restores a same-identity successor claim instead of deleting it', async () => {
-  // Codex UkNET/UkXzk: the dev/ino/ctimeMs identity match that gates the stale
+  // Codex UkNET/UkXzk: the dev/ino/ctimeNs identity match that gates the stale
   // reclaim has only filesystem/clock resolution. On a filesystem with rapid
   // inode reuse, a peer that unlinked this stale claim and wrote its own
-  // successor can land on the exact same inode with a same-millisecond ctimeMs
+  // successor can land on the exact same inode with a same-instant change-time
   // collision, so isSameLockIdentity(inspected, current) returns true even
   // though the path now names a LIVE successor. Model that gap directly: what
   // is on disk IS the successor (so the fresh lstat identity trivially matches
@@ -1532,7 +1900,7 @@ test('reclaimStaleCollectorClaim restores a same-identity successor claim instea
   const successorContent = `41000\nlive-instance\n${process.pid}\n`;
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1560,7 +1928,7 @@ test('reclaimStaleCollectorClaim deletes a genuinely stale claim whose content i
   const staleContent = '40000\nstale-instance\n999999\n';
   try {
     await writeFile(claimFile, staleContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1587,7 +1955,9 @@ test('reclaimStaleCollectorClaim backs off without touching a claim whose identi
     // disk; isSameLockIdentity rejects it (dev/ino mismatch) with no reliance
     // on platform-specific inode values.
     const status = await reclaimStaleCollectorClaim(claimFile, {
-      claimInfo: { dev: 1, ino: 424242, nlink: 1, ctimeMs: 1000 },
+      claimInfo: {
+        dev: '1', ino: '424242', nlink: 1, ctimeNs: '1000000000', birthtimeNs: '1000000000',
+      },
       claimText: '40000\nstale-instance\n999999\n',
       readClaimText: reclaimReadClaimText,
     });
@@ -1616,7 +1986,7 @@ test('reclaimStaleCollectorClaim restores a misidentified successor when link() 
   const successorContent = `41000\nlive-instance\n${process.pid}\n`;
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1657,7 +2027,7 @@ test('reclaimStaleCollectorClaim does not clobber a fresh claim that wins the ra
   const thirdContenderContent = '42000\nthird-instance\n555555\n';
   try {
     await writeFile(claimFile, successorContent, 'utf8');
-    const claimInfo = await lstat(claimFile);
+    const claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
     const status = await reclaimStaleCollectorClaim(claimFile, {
       claimInfo,
       claimText: staleContent,
@@ -1703,7 +2073,7 @@ test('unlinkOwnedClaimIfUnchanged leaves a successor claim that replaced the rea
     // A distinct real file stands in for the now-gone inode the release read,
     // so its dev/ino differ from the successor now sitting at claimFile.
     await writeFile(readInode, '40000\nown-instance\n999999\n', 'utf8');
-    const openedIdentity = await lstat(readInode);
+    const openedIdentity = fileIdentity(await lstat(readInode, { bigint: true }));
     await writeFile(claimFile, successorContent, 'utf8');
     const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
     assert.equal(unlinked, false, 'a successor that replaced the read inode must not be unlinked');
@@ -1726,7 +2096,7 @@ test('unlinkOwnedClaimIfUnchanged unlinks a claim that still identifies the read
   const claimFile = path.join(dir, 'collector_claim');
   try {
     await writeFile(claimFile, `40000\nown-instance\n${process.pid}\n`, 'utf8');
-    const openedIdentity = await lstat(claimFile);
+    const openedIdentity = fileIdentity(await lstat(claimFile, { bigint: true }));
     const unlinked = unlinkOwnedClaimIfUnchanged(claimFile, openedIdentity);
     assert.equal(unlinked, true, 'an unchanged owned claim must be unlinked');
     assert.equal(existsSync(claimFile), false, 'the owned claim must be removed');

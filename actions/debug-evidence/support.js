@@ -25,7 +25,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { canonicalResponderRecord, probeLaunchToken, probeReadyCollector } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_server.js'));
-const { isSameProtectedFileIdentity, protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
+const { fileIdentity, isSameProtectedFileIdentity, protectWindowsPrivateFile } = require(path.join(__dirname, '..', '..', 'scripts', 'pr_closeout_fs.js'));
 const { parseSessionText, readSessionLive } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_evidence.js'));
 const { buildReport, renderJson, renderMarkdown } = require(path.join(__dirname, '..', '..', 'scripts', 'debug_report.js'));
 
@@ -1107,9 +1107,11 @@ const applyStartWindowsAcls = ({
     //
     // WHAT THE COMPARISON PROVES, STATED HONESTLY: on Windows the ino term is
     // what rejects the recreate (a reused MFT record comes back with an
-    // incremented sequence number, moving the reference by 2**48) — though it
-    // is a float64 compare, so it rejects that SHAPE rather than proving
-    // sameness in general; see isSameFileIdentity's own note. The birthtimeMs
+    // incremented sequence number, moving the reference by 2**48), and the
+    // comparison is now exact — both sides are the full 64-bit reference as a
+    // decimal string, so it no longer merely rejects that SHAPE while a
+    // float64 round let distinct references compare equal; see fileIdentity's
+    // own note for the measurements. The birthtimeMs
     // term the shared predicate adds is the POSIX inode-reuse layer (tmpfs
     // hands a freed ino straight to the next file; the successor's creation
     // time is its own) and proves nothing on NTFS, where file tunneling gives
@@ -1122,7 +1124,7 @@ const applyStartWindowsAcls = ({
     if (expectedIdentity) {
       let postInfo;
       try {
-        postInfo = statFile(logFile);
+        postInfo = fileIdentity(statFile(logFile, { bigint: true }));
       } catch (error) {
         throw new Error(`session log vanished during ACL hardening: ${error?.message ?? error}`);
       }
@@ -1401,8 +1403,17 @@ const startSubcommand = async ({
   // fails the handshake with port_in_use; it is never adopted).
   const mintedLog = mint.json.log_file;
   const mintedLogIdentity = mint.json.log_file_identity;
+  // dev/ino are STRINGS on the wire, never numbers: a JSON number is a
+  // float64 by specification, so a 64-bit NTFS file reference above 2**53
+  // would be re-rounded in transit and the parent would re-verify against a
+  // value that no longer identifies one file (see fileIdentity in
+  // pr_closeout_fs.js). Requiring the string shape here is also what stops a
+  // silent downgrade: the shared predicate FAILS CLOSED on a non-string ino,
+  // so a numeric mint would abort every deferred start rather than quietly
+  // compare rounded values.
   if (typeof mintedLog === 'string' && mintedLog.length > 0
-    && (typeof mintedLogIdentity?.dev !== 'number' || typeof mintedLogIdentity?.ino !== 'number'
+    && (typeof mintedLogIdentity?.dev !== 'string' || typeof mintedLogIdentity?.ino !== 'string'
+      || mintedLogIdentity.dev.length === 0 || mintedLogIdentity.ino.length === 0
       || !Number.isFinite(mintedLogIdentity?.birthtimeMs))) {
     throw abort('session mint returned no usable log-file identity');
   }

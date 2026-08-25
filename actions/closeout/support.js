@@ -20,7 +20,7 @@ const { randomUUID } = require('node:crypto');
 // consumed as merged), just consuming their existing public surface the same
 // way the CLI's own code does (Codex PR7 review, "Protect wrapper evidence
 // with a Windows DACL"; chatgpt-codex-connector PR7 #6YaIaZ).
-const { isSameFileIdentity, openNoFollowSync, protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
+const { fileIdentity, isSameFileIdentity, openNoFollowSync, protectWindowsPrivateFile } = require('../../scripts/pr_closeout_fs.js');
 
 // Patterns for credential-shaped values that can leak into CLI stderr (e.g. a
 // git remote URL embedding x-access-token:TOKEN, or a gh error echoing an
@@ -1266,8 +1266,14 @@ const writeEvidenceFile = (outputDir, name, content) => {
     // depth reasoning as the prior direct-open version, cheap insurance
     // against a platform ignoring the open-time mode argument.
     fchmodSync(fd, 0o600);
-    info = fstatSync(fd);
-    if (!info.isFile() || info.nlink !== 1) {
+    // Normalized identity record, not a default Stats: this snapshot is
+    // re-compared three times below (post-ACL, pre-rename, post-rename) and a
+    // default fstat rounds ino to float64 (see fileIdentity in
+    // pr_closeout_fs.js). It also keeps `nlink !== 1` an honest comparison --
+    // a raw `{ bigint: true }` Stats would make nlink a BigInt and that test
+    // permanently true.
+    info = fileIdentity(fstatSync(fd, { bigint: true }));
+    if (!info.isFile || info.nlink !== 1) {
       throw new Error(`Refusing to stage evidence file through a non-private file (nlink=${info.nlink}): ${tempPath}`);
     }
     // chmodSync/fchmodSync(0o600) only clears Windows' read-only attribute
@@ -1294,7 +1300,7 @@ const writeEvidenceFile = (outputDir, name, content) => {
       // reasoning as the prior direct-open version (CodeRabbit #6YaIaZ).
       let postInfo;
       try {
-        postInfo = lstatSync(tempPath);
+        postInfo = fileIdentity(lstatSync(tempPath, { bigint: true }));
       } catch {
         throw new Error(`Refusing to write evidence file with an unverifiable identity: ${tempPath}`);
       }
@@ -1316,7 +1322,7 @@ const writeEvidenceFile = (outputDir, name, content) => {
     // gap (mirrors assertStagedIdentity in pr_closeout_report.js).
     let stagedInfo;
     try {
-      stagedInfo = lstatSync(tempPath);
+      stagedInfo = fileIdentity(lstatSync(tempPath, { bigint: true }));
     } catch {
       throw new Error(`Refusing to write evidence file with an unverifiable staged identity: ${tempPath}`);
     }
@@ -1333,7 +1339,7 @@ const writeEvidenceFile = (outputDir, name, content) => {
     // (mirrors assertCommittedIdentity in pr_closeout_report.js).
     let committedInfo;
     try {
-      committedInfo = lstatSync(target);
+      committedInfo = fileIdentity(lstatSync(target, { bigint: true }));
     } catch {
       throw new Error(`Refusing to trust evidence file with an unverifiable post-rename identity: ${target}`);
     }

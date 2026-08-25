@@ -9,6 +9,7 @@ const http = require('node:http');
 const path = require('node:path');
 const {
   assertNotSymlink: assertNotSymlinkShared,
+  fileIdentity,
   isSameFileIdentity,
   isSameLockIdentity,
   isSameProtectedFileIdentity,
@@ -761,7 +762,7 @@ const verifyLogIdentity = async (session, info) => {
   // nlink > 1 means the session log was hard-linked to another path after
   // /session; the token/artifact writers already fail closed on that shape.
   if (
-    !info.isFile() || !identity
+    !info.isFile || !identity
     || info.nlink > 1
     || info.dev !== identity.dev || info.ino !== identity.ino
     || !sameBirth
@@ -801,7 +802,7 @@ const appendSessionEvent = (session, serializedEvent) => {
       throw error;
     }
     try {
-      await verifyLogIdentity(session, await handle.stat());
+      await verifyLogIdentity(session, fileIdentity(await handle.stat({ bigint: true })));
       await handle.writeFile(serializedEvent, 'utf8');
       // Byte count and digest advance together, and only after the write
       // succeeded: a partial or failed append must leave both describing the
@@ -1056,7 +1057,9 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * fail-closed known-secret redaction; see createRedactionContext),
  * `POST /hypothesis` (launch token; appends one hypothesis lifecycle line
  * through the same redaction and append path), and `GET /sessions/:id/logs`
- * (launch token; filtered verbatim NDJSON read of a live session's log).
+ * (the ONLY route that accepts either credential: the launch token reads any
+ * session and a session's own token reads that session only; both require the
+ * matching client_id — filtered verbatim NDJSON read of a live session's log).
  * The returned server exposes `collectorToken`/`collectorInstanceId`/
  * `collectorProjectHash` read-only properties for callers that built it with
  * a generated token; `collectorProjectHash` is what main()'s EADDRINUSE
@@ -1073,6 +1076,7 @@ const HYPOTHESIS_STATUSES = new Set(['OPEN', 'CONFIRMED', 'REJECTED', 'INCONCLUS
  * @param {string[]} [options.redactionNames] - extra env-var names always redacted regardless of length (DEBUG_REDACT_NAMES in the CLI).
  * @param {number} [options.redactionMaxTokens] - lifetime cap on registered tokens (launch + every session mint); at the cap further mints fail closed with session_registry_full. Default 512 bounds worst-case per-event redaction cost.
  * @param {boolean} [options.deferWindowsPrivateFileProtection] - when true, skip ALL Windows DACL hardening inside this process (project_salt and POST /session's log file): the debug-evidence `start` parent applies `protectWindowsPrivateFile` itself after handshake/mint, because a detached collector on hosted Windows (Session 0 + DETACHED_PROCESS) hangs EncodedCommand until the 15s timeout, so /session returned HTTP 500. Default false keeps the CLI fail-closed in-process path (mint awaits the spawn-based async ACL).
+ * @param {(logFilePath: string) => Promise<void>} [options.sessionLogAclForTests] - TEST-ONLY async adapter awaited BEFORE the real session-log ACL in POST /session; additive (on win32 no mint succeeds without the real Set-Acl running after the adapter resolves), makes the protection branch run on every platform, and is refused outside the node:test runner. No production caller passes it. See the destructuring comment below for the full contract.
  * @returns {import('node:http').Server} an unstarted HTTP server; call `.listen()`.
  */
 const createDebugServer = ({
@@ -1103,6 +1107,30 @@ const createDebugServer = ({
   // Omitted by every existing caller (CLI, viewer), which simply never
   // challenges.
   responderPrivateKey = null,
+  // TEST-ONLY seam for the session-log ACL step in POST /session: an async
+  // adapter awaited BEFORE the real protection, so route tests can drive the
+  // mint path's fail-closed contract (adapter pending → response pending;
+  // rejected → session_log_acl_failed; resolved → the branch proceeds).
+  // When supplied, the protection branch runs on EVERY platform so
+  // non-Windows CI exercises the same route contract — without spawning
+  // PowerShell there (~325ms per Set-Acl).
+  //
+  // This cannot be a production ACL switch, structurally: the seam is
+  // ADDITIVE — on win32 no mint succeeds without the real
+  // protectWindowsPrivateFileAsync having run after the adapter resolved (a
+  // rejecting or hanging adapter can only fail the mint closed or hold it
+  // pending, its provisional slot retained — an availability cost, never an
+  // unprotected 201), so even a caller that forges the test-runner
+  // environment and injects a no-op still mints logs carrying the real
+  // owner-only DACL, and on other platforms there is no production
+  // ACL to weaken (the branch is win32-only without an adapter). On top of
+  // that structural guarantee, construction refuses the option outside the
+  // node:test runner (NODE_TEST_CONTEXT gate below), no production caller
+  // (main(), the action's boot shim) passes it, nothing wires it to a flag
+  // or env var, and the adapter cannot bypass the awaited fail-closed
+  // mapping or the post-protect identity re-verification. The default null
+  // keeps the branch byte-for-byte at its production behavior.
+  sessionLogAclForTests = null,
 } = {}) => {
   if (responderPrivateKey !== null) {
     // Fail at boot, not on the first challenged read: an unusable signing key
@@ -1111,6 +1139,28 @@ const createDebugServer = ({
       || responderPrivateKey.type !== 'private'
       || responderPrivateKey.asymmetricKeyType !== 'ed25519') {
       throw new Error('invalid_responder_private_key');
+    }
+  }
+  if (sessionLogAclForTests !== null) {
+    if (typeof sessionLogAclForTests !== 'function') {
+      // Same fail-at-boot posture as invalid_responder_private_key: a
+      // non-callable adapter would otherwise surface as an opaque 500 on the
+      // first mint.
+      throw new Error('invalid_session_log_acl_for_tests');
+    }
+    // Enforced misuse gate (Codex rescue r2): the node:test runner marks its
+    // child processes with NODE_TEST_CONTEXT, and outside one this option
+    // refuses to construct rather than silently ignoring the adapter. The
+    // env var is forgeable (Codex rescue r3), which is why this is only the
+    // OUTER layer: the security guarantee does not rest here but on the
+    // seam being additive — on win32 no mint succeeds without the real ACL
+    // running after the adapter resolves, so forging this environment can
+    // at most fail or stall the forger's own mints (an availability cost),
+    // never strip protection. The gate's job is to make accidental
+    // production use a loud boot failure instead of a quietly accepted
+    // option.
+    if (!process.env.NODE_TEST_CONTEXT) {
+      throw new Error('session_log_acl_for_tests_outside_test_runner');
     }
   }
   const resolvedProjectRoot = path.resolve(projectRoot);
@@ -1397,14 +1447,23 @@ const createDebugServer = ({
             0o600,
           );
           try {
-            const info = await handle.stat();
-            if (!info.isFile()) throw new RequestError('session_log_not_regular', 409);
+            // Normalized identity record, not a default Stats: dev/ino here
+            // become the session's pinned log identity -- re-verified after the
+            // DACL below, on every /log append, and by the deferred parent
+            // across the wire -- and a default stat rounds ino to float64 (see
+            // fileIdentity in pr_closeout_fs.js). Keeping the raw BigInt Stats
+            // instead would silently break verifyLogIdentity's
+            // `info.size !== identity.bytesWritten` and make JSON.stringify of
+            // the mint response throw.
+            const info = fileIdentity(await handle.stat({ bigint: true }));
+            if (!info.isFile) throw new RequestError('session_log_not_regular', 409);
             // Release the exclusive write handle before Windows DACL work.
             // File.SetAccessControl on a path still opened O_WRONLY by this
             // process timed out on hosted windows-latest (POST /session → 500
             // after 15s; Validate Node 20, 2026-08-16).
             await handle.close();
-            if (process.platform === 'win32' && !deferWindowsPrivateFileProtection) {
+            if (!deferWindowsPrivateFileProtection
+              && (sessionLogAclForTests !== null || process.platform === 'win32')) {
               try {
                 // CLI / in-process servers apply the DACL here. The action's
                 // detached boot shim sets deferWindowsPrivateFileProtection so
@@ -1419,7 +1478,27 @@ const createDebugServer = ({
                 // variant is spawn-based and immune to the pipe-inheritance
                 // hang that forced the earlier sync workaround (31c1f48);
                 // see protectWindowsPrivateFileAsync's contract.
-                await protectWindowsPrivateFileAsync(resolvedLogFile);
+                //
+                // sessionLogAclForTests is ADDITIVE, never a replacement (see
+                // its option comment): it is awaited first so route tests can
+                // hold or fail the mint deterministically, and then, whenever
+                // it resolves, the real call runs on the one platform that
+                // has production ACL protection. A rejecting adapter maps to
+                // session_log_acl_failed below and a hanging one holds the
+                // mint pending — either way no 201 exists on win32 without
+                // the real call having succeeded, so no combination of
+                // option and environment mints an unprotected log. On other
+                // platforms the adapter exercises this branch's contract
+                // (await, fail-closed mapping, the re-verification below)
+                // that production there never runs at all. The await, the
+                // error mapping, and the identity re-verification stay in
+                // force either way.
+                if (sessionLogAclForTests !== null) {
+                  await sessionLogAclForTests(resolvedLogFile);
+                }
+                if (process.platform === 'win32') {
+                  await protectWindowsPrivateFileAsync(resolvedLogFile);
+                }
               } catch {
                 throw new RequestError('session_log_acl_failed', 500);
               }
@@ -1432,14 +1511,15 @@ const createDebugServer = ({
               // Same predicate as the deferred parent's re-verification
               // (actions/debug-evidence/support.js applyStartWindowsAcls) so
               // one contract cannot be hardened on one half and left weaker
-              // on the other. In THIS win32-only branch the ino term is what
-              // rejects the recreate; the birth-time term the shared
+              // on the other. In this branch (win32-only in production; any
+              // platform under an injected test adapter) the ino term is
+              // what rejects the recreate; the birth-time term the shared
               // predicate adds is a POSIX inode-reuse layer inherited from
               // it, not a Windows defense (NTFS file tunneling lets a
               // same-name recreate keep the original's creation time).
               let postProtectInfo;
               try {
-                postProtectInfo = await lstat(resolvedLogFile);
+                postProtectInfo = fileIdentity(await lstat(resolvedLogFile, { bigint: true }));
               } catch {
                 throw new RequestError('session_log_escapes_root', 409);
               }
@@ -1836,7 +1916,7 @@ const createDebugServer = ({
             throw error;
           }
           try {
-            await verifyLogIdentity(session, await handle.stat());
+            await verifyLogIdentity(session, fileIdentity(await handle.stat({ bigint: true })));
             // Read exactly the bytes this server wrote: bytesWritten bounds
             // the window, so appended-after or truncated content can never
             // slip in (size was already checked equal inside verifyLogIdentity).
@@ -2185,10 +2265,12 @@ const isCompleteClaimText = (text) => {
 /**
  * Reclaim (or refuse to reclaim) a stale collector_claim after an O_EXCL
  * create observed EEXIST. Ports pr_closeout_workflow.js's identity-only lock
- * reclaim: the dev/ino/ctimeMs identity match that gates deletion has only
+ * reclaim: the dev/ino/change-time identity match that gates deletion has only
  * filesystem/clock resolution, so on a filesystem with rapid inode reuse a
  * peer that unlinked this stale claim and wrote its own successor can land on
- * the exact same inode with a same-millisecond ctimeMs collision. A bare
+ * the exact same inode with a same-instant change-time collision (the term is
+ * compared in nanoseconds, so the window is the filesystem's own timestamp
+ * granularity rather than a rounded millisecond). A bare
  * unlink would then delete that live successor (UkNET/UkXzk). Instead,
  * quarantine the entry under a private name first, then re-read it: only the
  * same stale record we already inspected (byte-for-byte, or -- when the
@@ -2203,7 +2285,8 @@ const isCompleteClaimText = (text) => {
  *
  * @param {string} claimFile
  * @param {object} deps
- * @param {import('node:fs').Stats|null} deps.claimInfo  lstat captured before reclaim.
+ * @param {ReturnType<typeof fileIdentity>|null} deps.claimInfo  normalized lstat identity
+ *   captured before reclaim (dev/ino are exact decimal strings, not a raw Stats).
  * @param {string|null} deps.claimText  claim bytes captured before reclaim (null if unreadable).
  * @param {(target: string) => Promise<string|null>} deps.readClaimText  guarded re-reader.
  * @returns {Promise<'reclaimed'|'restored'|'backed-off'>}
@@ -2240,7 +2323,7 @@ const reclaimStaleCollectorClaim = async (claimFile, {
     if (!claimInfo) return 'backed-off';
     let currentClaimInfo;
     try {
-      currentClaimInfo = await lstatFn(claimFile);
+      currentClaimInfo = fileIdentity(await lstatFn(claimFile, { bigint: true }));
     } catch (error) {
       if (error?.code === 'ENOENT') return 'backed-off';
       throw error;
@@ -2340,14 +2423,15 @@ const reclaimStaleCollectorClaim = async (claimFile, {
  * would otherwise have its live successor deleted, because the descriptor still
  * carried this process's own owner fields and the ownership check passed
  * (Codex Ummsi). Re-lstat the path and unlink only while it still matches the
- * read descriptor's identity (dev/ino/nlink/ctimeMs via isSameLockIdentity,
+ * read descriptor's identity (dev/ino/nlink/ctimeNs via isSameLockIdentity,
  * which also rejects an inode-reuse collision); a successor now at the path is
  * left intact. The residual lstat->unlink gap cannot be closed in pure Node
  * (no unlink-by-descriptor), but this narrows it from the whole read to a
  * single syscall pair.
  *
  * @param {string} claimFile
- * @param {import('node:fs').Stats|null} openedIdentity fstat of the validated descriptor.
+ * @param {ReturnType<typeof fileIdentity>|null} openedIdentity normalized fstat identity
+ *   of the validated descriptor (dev/ino are exact decimal strings, not a raw Stats).
  * @param {object} [deps]
  * @returns {boolean} whether the claim was unlinked.
  */
@@ -2359,7 +2443,7 @@ const unlinkOwnedClaimIfUnchanged = (claimFile, openedIdentity, {
   if (!openedIdentity) return false;
   let currentInfo;
   try {
-    currentInfo = lstatSyncFn(claimFile);
+    currentInfo = fileIdentity(lstatSyncFn(claimFile, { bigint: true }));
   } catch {
     return false;
   }
@@ -2614,7 +2698,7 @@ const main = () => {
           // whatever now occupies the path.
           let claimInfo = null;
           try {
-            claimInfo = await lstat(claimFile);
+            claimInfo = fileIdentity(await lstat(claimFile, { bigint: true }));
           } catch {
             claimInfo = null;
           }
@@ -2634,8 +2718,8 @@ const main = () => {
           // and links/special files are never trusted for the grace.
           const completeClaim = isCompleteClaimText(claimText);
           if (!completeClaim && claimInfo) {
-            const freshPrivateRegularClaim = claimInfo.isFile()
-              && !claimInfo.isSymbolicLink()
+            const freshPrivateRegularClaim = claimInfo.isFile
+              && !claimInfo.isSymbolicLink
               && claimInfo.nlink === 1
               && claimInfo.size <= MAX_CLAIM_FILE_BYTES
               && Date.now() - claimInfo.mtimeMs < COLLECTOR_CLAIM_INITIALIZING_GRACE_MS;
@@ -2674,11 +2758,12 @@ const main = () => {
           // own fresh claim by the time the second gets here, a bare unlink
           // would delete that legitimate successor. reclaimStaleCollectorClaim
           // re-verifies the path still identifies that same record using
-          // isSameLockIdentity (dev/ino/nlink + ctimeMs -- ctimeMs is fresh on
+          // isSameLockIdentity (dev/ino/nlink + ctimeNs -- the change time is fresh on
           // any unlink+recreate, even a reused inode on Linux/tmpfs), then
           // renames the entry to a private quarantine name and re-reads it so
-          // a live successor that collided on identity within a single
-          // millisecond is restored rather than deleted -- the same pattern
+          // a live successor that collided on identity within the
+          // filesystem's timestamp granularity is restored rather than
+          // deleted -- the same pattern
           // pr_closeout_workflow.js uses for its output-dir lock
           // (Codex Ua4p7/UiXEg/UkNET/UkXzk). Its three resolved outcomes
           // (reclaimed/restored/backed-off) fall through so this for-loop
@@ -2731,9 +2816,9 @@ const main = () => {
               // between lstat and open, so size/link checks and the buffer
               // sizing must come from the descriptor actually being read
               // (CodeRabbit discussion_r3652923124).
-              const opened = fstatSync(fd);
+              const opened = fileIdentity(fstatSync(fd, { bigint: true }));
               if (
-                !opened.isFile()
+                !opened.isFile
                 || opened.nlink > 1
                 || opened.size < 1
                 || opened.size > MAX_CLAIM_FILE_BYTES
@@ -2797,8 +2882,8 @@ const main = () => {
         handle = await openNoFollow(tokenFile, constants.O_WRONLY, 0o600);
       }
       try {
-        const info = await handle.stat();
-        if (!info.isFile() || info.nlink > 1) throw new Error('collector_token_not_private');
+        const info = fileIdentity(await handle.stat({ bigint: true }));
+        if (!info.isFile || info.nlink > 1) throw new Error('collector_token_not_private');
         // Re-verify the just-opened path still resolves inside projectRoot.
         // This is the post-open half of the TOCTOU narrowing described
         // above: if the parent was swapped for a symlink between the
@@ -2830,7 +2915,7 @@ const main = () => {
           // inode as the open handle before writing.
           let postProtectInfo;
           try {
-            postProtectInfo = await lstat(tokenFile);
+            postProtectInfo = fileIdentity(await lstat(tokenFile, { bigint: true }));
           } catch {
             throw new Error('collector_token_parent_replaced');
           }
@@ -2859,8 +2944,8 @@ const main = () => {
         0o600,
       );
       try {
-        const portWriteInfo = await portHandle.stat();
-        if (!portWriteInfo.isFile() || portWriteInfo.nlink > 1) {
+        const portWriteInfo = fileIdentity(await portHandle.stat({ bigint: true }));
+        if (!portWriteInfo.isFile || portWriteInfo.nlink > 1) {
           throw new Error('collector_port_not_private');
         }
         let realPortFile;
@@ -2886,7 +2971,7 @@ const main = () => {
         // isSameFileIdentity binding).
         let portPathIdentity;
         try {
-          portPathIdentity = await lstat(portFile);
+          portPathIdentity = fileIdentity(await lstat(portFile, { bigint: true }));
         } catch {
           throw new Error('collector_port_parent_replaced');
         }

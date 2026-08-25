@@ -214,6 +214,26 @@ const walkQuoteState = (str, endIndex, startState, stopAtComment = false) => {
       inDouble = true;
     } else if (ch === "'" && atQuoteOpenContext) {
       inSingle = true;
+    } else if ((ch === '!' || ch === '&') && atQuoteOpenContext) {
+      // A tag (`!`, `!!str`, `!<...>`) or anchor (`&name`) sitting where a
+      // node may start introduces the node that FOLLOWS it — YAML forbids a
+      // plain scalar from BEGINNING with either indicator at a node-start
+      // position, so this is never plain-scalar content. Skip the whole
+      // token (it runs to the next whitespace; anchor names and tag
+      // shorthands may legally CONTAIN quote characters, which must not
+      // toggle state) and leave quote-open context valid for what follows,
+      // so `workflow_run: &v !!str 'completed` is recognized as opening a
+      // multiline quoted scalar. Treating `!`/`&` as ordinary content
+      // cleared the context and missed the opener — false positives for
+      // this file's scanners (a `uses:`-shaped content line of the scalar
+      // flagged as a real key), and a fail-OPEN quoted-scalar embedding
+      // bypass in scan_touched_suppressions' ancestry prover, which trusts
+      // this walker's carryover to refuse chains through quoted content
+      // (Codex rescue 2026-08-23 — the tag/anchor analogue of the V7a
+      // anchored/tagged block-scalar headers). At a non-node position
+      // (`a&b"c`, `a!b"c`) both characters fall through to the ordinary-
+      // content branch below and context stays cleared, exactly as before.
+      while (i + 1 < endIndex && !/\s/.test(str[i + 1])) i += 1;
     } else if (ch === ':') {
       const next = str[i + 1];
       atQuoteOpenContext = next === undefined || /\s/.test(next);
@@ -832,9 +852,14 @@ const hasTopLevelPermissions = (content) => {
 // `\S.*:` prefix must only ever run on comment-stripped text, or a trailing
 // comment containing a `: |`-shaped fragment false-matches as a header
 // (review V3a). One header pattern, one contract — including the strip.
+// walkQuoteState is exported for the same prover's cross-line quote
+// tracking (the quoted-scalar analogue of V7a): a second hand-rolled quote
+// walker over there could only drift from this one the way the in-file
+// copies already did once (CodeRabbit #6YSoOn) — one walker, one contract.
 module.exports = {
   BLOCK_SCALAR_HEADER,
   findUnpinnedUses,
   hasTopLevelPermissions,
   stripTrailingYamlComment,
+  walkQuoteState,
 };

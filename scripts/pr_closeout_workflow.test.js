@@ -12,9 +12,24 @@ const {
   mergeEngineTimeouts,
   normalizePersistedPaths,
   prepareOutputDirectory,
+  readOutputDirLockFile,
+  readOutputDirLockFileSync,
   resolvePlanAdmission,
   runCloseoutWorkflow,
 } = require('./pr_closeout_workflow');
+
+// A stand-in for the `{ bigint: true }` Stats a real stat returns on a mount
+// that reports no usable identity (Windows FAT / some network mounts report
+// dev/ino as 0 for every path). The identity capture normalizes a BigInt
+// Stats, so an injected fake has to answer in that shape -- returning plain
+// Numbers here would make the test exercise the normalizer's type rejection
+// instead of the zero-identity rejection it is written to prove.
+const zeroIdentityStats = () => ({
+  dev: 0n, ino: 0n, nlink: 1n, size: 0n,
+  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n, mtimeNs: 0n,
+  isFile: () => false,
+  isSymbolicLink: () => false,
+});
 
 const configuredCommands = Object.fromEntries(
   MANDATORY_CHECKS.filter(({ fixed }) => !fixed).map(({ id }) => [id, `run ${id}`]),
@@ -516,7 +531,7 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
     );
     // Do not assert an exact read count here. Two paths are both correct
     // product behavior: the identity-mismatch-only path (2 reads) and, when a
-    // same-millisecond reused-inode collision defeats the dev/ino/ctimeMs
+    // same-instant reused-inode collision defeats the dev/ino/ctimeNs
     // guard, the collision-recovery path (quarantine -> re-read -> restore,
     // which spends a 3rd guarded read before restoring the successor). Assert
     // only the externally-visible invariants that hold for both: the successor
@@ -528,12 +543,12 @@ test('exclusive output-dir lock does not delete a successor lock after a guard-f
 });
 
 test('restores a live successor lock when a guard-failure identity match is later proven wrong', async () => {
-  // Codex UgisL/UguCX/Uert4/UikNw: dev/ino/ctimeMs identity alone has only
+  // Codex UgisL/UguCX/Uert4/UikNw: dev/ino/ctimeNs identity alone has only
   // filesystem/clock resolution, so it cannot fully rule out a
-  // same-millisecond reused-inode collision between the true stale entry
+  // same-instant reused-inode collision between the true stale entry
   // and a peer's freshly created live successor. Model that gap directly:
   // the guard read fails against the real, untouched stale file (so the
-  // dev/ino/ctimeMs identity captured before and after the throw
+  // dev/ino/ctimeNs identity captured before and after the throw
   // legitimately/correctly match -- nothing has changed on disk), which is
   // exactly the situation an unavoidable collision would also produce.
   // The post-quarantine re-read is mocked to report a parseable live
@@ -687,6 +702,202 @@ test('restores an initializing successor whose quarantined payload is byte-diffe
   }
 });
 
+// A stand-in for the `{ bigint: true }` Stats the lock readers' identity
+// capture consumes. `ino: 0n` models the Windows FAT / network mounts that
+// report no usable identity for any path.
+const lockStat = ({ dev = 1n, ino = 7n, size = 8n, isFile = true } = {}) => ({
+  dev, ino, nlink: 1n, size,
+  ctimeMs: 0n, ctimeNs: 0n, birthtimeMs: 0n, birthtimeNs: 0n, mtimeMs: 0n, mtimeNs: 0n,
+  isFile: () => isFile,
+  isSymbolicLink: () => false,
+});
+
+test('readOutputDirLockFileSync refuses a lock whose identity the filesystem cannot supply', () => {
+  // Codex review, P2. Both dev/ino comparisons below this guard would pass
+  // VACUOUSLY on a mount that reports 0 for every path (0 === 0), so a swap to
+  // a different regular file between the pre-open lstat and the open would be
+  // certified as "the same lock" rather than caught -- the identity bind
+  // silently inverted into a rubber stamp. acquireOutputDirLock already
+  // refuses to record such an identity for the directory, so this rejects
+  // nothing a working run could reach.
+  //
+  // The seam exists because this cannot be produced from a real file: NTFS
+  // never reports ino 0, and a swap landing inside the lstat/open window is not
+  // a state a test can create on demand. Without it the guard could only ship
+  // unexercised.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 0n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 0n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
+    }),
+    /unusable filesystem identity/,
+  );
+  // Zero on only ONE side is refused too: a pre-open snapshot with no usable
+  // identity cannot be compared against anything, whichever side reports it.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 0n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 7n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
+    }),
+    /unusable filesystem identity/,
+  );
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 0n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
+    }),
+    /unusable filesystem identity/,
+  );
+});
+
+test('readOutputDirLockFileSync rejects a lock swapped between the pre-open lstat and the open', () => {
+  // The bind this guard exists for, finally exercised: the pre-open lstat sees
+  // one file and the opened descriptor is a different one. Previously
+  // unprovable for want of a seam and disclosed as such; the seam added for
+  // the zero-identity case above makes it reachable.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ ino: 8n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // A device change with a matching ino is the cross-volume shape.
+  assert.throws(
+    () => readOutputDirLockFileSync('lock', {
+      lstatFn: () => lockStat({ dev: 1n, ino: 7n }),
+      openFn: () => 3,
+      closeFn: () => {},
+      fstatFn: () => lockStat({ dev: 2n, ino: 7n }),
+      readFn: () => { throw new Error('read must not be reached once identity mismatches'); },
+    }),
+    /Evidence lock changed while opening/,
+  );
+});
+
+test('readOutputDirLockFile refuses a zero identity and a swapped descriptor too', async () => {
+  // The async counterpart carries its own copy of both guards, so proving the
+  // sync one says nothing about this one -- the two have to be exercised
+  // separately or a hardening can land on one half and miss the other.
+  const handleFor = (stats) => ({
+    stat: async () => stats,
+    read: async () => ({ bytesRead: 0 }),
+    close: async () => {},
+  });
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 0n }),
+      openFn: async () => handleFor(lockStat({ ino: 0n })),
+    }),
+    /unusable filesystem identity/,
+  );
+  // Each side's zero term is exercised on its OWN, matching the sync
+  // counterpart. The both-zero case above cannot isolate either: with both
+  // snapshots at 0, deleting the descriptor-side term still leaves the
+  // pre-open term to reject, so a mutation that removes one alone stays green
+  // and the Rule 4 claim would overstate what was proved (Codex review
+  // follow-up). The dev/ino mismatch would also reject these two shapes, so
+  // the product was never unsafe -- the coverage claim was.
+  //
+  // What the added cases do NOT buy: term-level isolation. Measured by
+  // mutation, deleting either zero term alone leaves this test green (the
+  // other still rejects the symmetric-zero case), and only deleting both turns
+  // it red. The zero rejection is therefore proved AS A UNIT, and that is how
+  // the Rule 4 claim is worded.
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 0n }),
+      openFn: async () => handleFor(lockStat({ ino: 7n })),
+    }),
+    /unusable filesystem identity/,
+  );
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 7n }),
+      openFn: async () => handleFor(lockStat({ ino: 0n })),
+    }),
+    /unusable filesystem identity/,
+  );
+  await assert.rejects(
+    readOutputDirLockFile('lock', {
+      lstatFn: async () => lockStat({ ino: 7n }),
+      openFn: async () => handleFor(lockStat({ ino: 8n })),
+    }),
+    /Evidence lock changed while opening/,
+  );
+  // A genuine match still reads, so neither guard rejects a healthy lock.
+  const payload = 'pid=123\n';
+  const matching = lockStat({ ino: 7n, size: BigInt(payload.length) });
+  const value = await readOutputDirLockFile('lock', {
+    lstatFn: async () => matching,
+    openFn: async () => ({
+      stat: async () => matching,
+      read: async (buffer, offset) => {
+        const chunk = Buffer.from(payload, 'utf8');
+        chunk.copy(buffer, offset);
+        return { bytesRead: chunk.length };
+      },
+      close: async () => {},
+    }),
+  });
+  assert.equal(value, payload);
+});
+
+test('acquireOutputDirLock surfaces a zero-identity lock read instead of swallowing it', async () => {
+  // Qodo PR #10 review: the readers' coded unusable-identity error must not
+  // disappear into acquireOutputDirLock's broad read-error catch. Without the
+  // coded rethrow, a pre-existing lock on a zero-identity mount burns all
+  // attempts (isSameLockIdentity can never match ino '0') and ends in the
+  // generic "Failed to acquire" message — fail-closed either way, but the
+  // actionable cause (the mount) was invisible. The seam routes through the
+  // REAL reader so the test proves the whole chain: reader throws the coded
+  // error, the acquisition rethrows it verbatim.
+  const fs = require('node:fs/promises');
+  const os = require('node:os');
+  const nodePath = require('node:path');
+  const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-zero-acquire-'));
+  try {
+    // A pre-existing lock naming a dead PID forces the EEXIST stale-recovery
+    // path that reads (and, on a zero-identity mount, fails on) the lock.
+    await fs.writeFile(nodePath.join(tmp, '.closeout.lock'), '2147483646\nstale-nonce\n', 'utf8');
+    const handleFor = (stats) => ({
+      stat: async () => stats,
+      read: async () => ({ bytesRead: 0 }),
+      close: async () => {},
+    });
+    await assert.rejects(
+      acquireOutputDirLock(tmp, {
+        readLockFile: (lockPath) => readOutputDirLockFile(lockPath, {
+          lstatFn: async () => lockStat({ ino: 0n }),
+          openFn: async () => handleFor(lockStat({ ino: 0n })),
+        }),
+      }),
+      // The coded contract, not just the message: the acquisition must
+      // preserve the reader's error code, which is what the fail-fast
+      // branch keys on.
+      (error) => {
+        assert.equal(error.code, 'ECLOSEOUTLOCKIDENTITY');
+        assert.match(error.message, /unusable filesystem identity/);
+        return true;
+      },
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('isSameLockIdentity does not treat a reused inode as the same file', () => {
   // Codex Uert4 follow-up: CI on Linux (tmpfs /tmp) showed that unlinking a
   // stale lock and immediately writing a successor can hand the successor
@@ -696,9 +907,15 @@ test('isSameLockIdentity does not treat a reused inode as the same file', () => 
   // file" and let a guard-failure reclaim quarantine it. ctimeMs must also
   // match: a freshly created file (even on a reused inode) always gets a new
   // change time the original snapshot cannot share.
-  const stale = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
-  const reusedInodeSuccessor = { ino: 42, dev: 1, nlink: 1, ctimeMs: 2000 };
-  const untouchedSameFile = { ino: 42, dev: 1, nlink: 1, ctimeMs: 1000 };
+  //
+  // Written in the normalized identity-record shape the predicate now
+  // consumes: dev/ino are exact decimal strings and the change time is
+  // compared in nanoseconds, so this fixture cannot pass by the predicate
+  // merely refusing an unrecognized shape.
+  const base = { dev: '1', nlink: 1, birthtimeNs: '500000000' };
+  const stale = { ...base, ino: '42', ctimeNs: '1000000000' };
+  const reusedInodeSuccessor = { ...base, ino: '42', ctimeNs: '2000000000' };
+  const untouchedSameFile = { ...base, ino: '42', ctimeNs: '1000000000' };
   assert.equal(isSameLockIdentity(stale, reusedInodeSuccessor), false);
   assert.equal(isSameLockIdentity(stale, untouchedSameFile), true);
 });
@@ -966,7 +1183,7 @@ test('acquireOutputDirLock refuses to record a directory identity the filesystem
   const tmp = await fs.mkdtemp(nodePath.join(os.tmpdir(), 'closeout-zero-identity-'));
   try {
     await assert.rejects(
-      acquireOutputDirLock(tmp, { statPath: async () => ({ dev: 0, ino: 0 }) }),
+      acquireOutputDirLock(tmp, { statPath: async () => zeroIdentityStats() }),
       /usable directory identity/i,
     );
     // The lock file created before the identity check must not be left
@@ -1011,10 +1228,10 @@ test('assertOutputDirLockIdentity rejects a zero/zero identity even though dev a
   // reports ino 0 means dev/ino both read 0/0 on both sides. A mismatched
   // ino (e.g. 42 vs 0) is already caught by the plain inequality check and
   // is not the case this guard exists for.
-  const fakeLock = { dirIdentity: { dev: 0, ino: 0 } };
+  const fakeLock = { dirIdentity: { dev: '0', ino: '0' } };
   await assert.rejects(
     assertOutputDirLockIdentity(fakeLock, 'C:/evidence', {
-      statPath: async () => ({ dev: 0, ino: 0 }),
+      statPath: async () => zeroIdentityStats(),
     }),
     /changed identity/i,
   );

@@ -383,27 +383,155 @@ const protectWindowsPrivateFileAsync = (privateFile, {
   });
 });
 
+/**
+ * Normalize a `{ bigint: true }` Stats into a plain, comparison-safe identity
+ * record — THE ONLY SHAPE THE THREE PREDICATES BELOW ACCEPT.
+ *
+ * WHY THIS EXISTS: Node's default lstat reports `ino` as a Number, and an
+ * NTFS file reference is a 64-bit value — (16-bit sequence << 48) | 48-bit MFT
+ * record — so every reference whose sequence number has reached 32 exceeds
+ * 2**53 and is rounded to the nearest float64. Above that threshold the ULP is
+ * 2 or more and adjacent MFT records collapse onto ONE double, so a Number
+ * comparison certifies two DISTINCT files as the same identity. Measured on
+ * Windows 10 19045 / NTFS: a single file whose true reference was
+ * 81909218225795110 read back as 81909218225795100 from a default lstat, and
+ * 800 files created in one directory reported 797 distinct Number inos against
+ * 800 distinct BigInt inos — with this module's predicate returning true for
+ * two different files whose references were 17 apart. The rate runs from 0% to
+ * 2.7% of files depending on how heavily the volume's MFT records have been
+ * recycled, so it is intermittent on one volume over time rather than a stable
+ * property of the filesystem. Every caller of these predicates is a fail-open
+ * on that false match.
+ *
+ * WHY A RECORD AND NOT THE BIGINT STATS: `{ bigint: true }` makes dev, ino,
+ * nlink, size, ctimeMs AND birthtimeMs all BigInt at once, so passing that
+ * object around silently breaks every mixed-type comparison a caller already
+ * makes against a Number — `info.size !== identity.bytesWritten` and
+ * `info.nlink !== 1` become permanently true while relational forms like
+ * `nlink <= 1` keep working, which is an inconsistent and PARTLY SILENT
+ * failure. `JSON.stringify` also throws outright on a BigInt, which would turn
+ * the collector's /session mint into a 500. Normalizing at the capture site
+ * confines BigInt to a single expression and hands every consumer the type it
+ * already expects.
+ *
+ * dev/ino are STRINGS because they are identifiers, not quantities: a decimal
+ * string compares exactly at any width, survives JSON.stringify unchanged, and
+ * cannot be silently re-rounded on the wire the way a JSON number (float64 by
+ * specification) would be.
+ *
+ * ctimeNs/birthtimeNs are STRINGS for the same reason and are the terms
+ * isSameLockIdentity actually compares. The BigInt Stats truncates ctimeMs to
+ * whole milliseconds while a default Stats carries a sub-millisecond fraction
+ * (measured here: 1787517135767.5864 against 1787517135767), so comparing the
+ * normalized ctimeMs would have QUIETLY COARSENED that predicate from ~100 ns
+ * to 1 ms — a fix that weakened the guard it was shipped to strengthen. The
+ * nanosecond fields keep the full resolution the pre-fix float carried and
+ * cannot be held in a Number either (1.79e18 is far above 2**53).
+ *
+ * ctimeMs/birthtimeMs are retained as Numbers because the /session mint's wire
+ * object carries birthtimeMs and isSameProtectedFileIdentity's tolerant term
+ * compares it across that boundary.
+ * @param {import('node:fs').BigIntStats} stats - MUST come from a `{ bigint: true }` stat/lstat/fstat.
+ * @returns {{dev:string,ino:string,nlink:number,ctimeMs:number,ctimeNs:string,birthtimeMs:number,birthtimeNs:string,mtimeMs:number,mtimeNs:string,size:number,isFile:boolean,isSymbolicLink:boolean}}
+ */
+const fileIdentity = (stats) => {
+  // A default Stats reaching here would be stringified from an ALREADY-rounded
+  // Number and would read as exact while carrying the very defect this record
+  // exists to remove, so the wrong input fails loudly at the capture site
+  // rather than silently at compare time.
+  if (typeof stats?.dev !== 'bigint' || typeof stats?.ino !== 'bigint') {
+    throw new TypeError('fileIdentity requires a { bigint: true } Stats: a Number ino is an already-rounded float64 and cannot be compared exactly');
+  }
+  return {
+    dev: String(stats.dev),
+    ino: String(stats.ino),
+    nlink: Number(stats.nlink),
+    ctimeMs: Number(stats.ctimeMs),
+    ctimeNs: String(stats.ctimeNs),
+    birthtimeMs: Number(stats.birthtimeMs),
+    birthtimeNs: String(stats.birthtimeNs),
+    // NOT an identity term and deliberately not compared by any predicate
+    // below -- mtime is caller-settable on every platform. Both forms are
+    // carried because the two consumers need different things: a RECENCY read
+    // (debug_server.js's initializing-claim grace) wants a Number, where
+    // whole-ms truncation is immaterial to a seconds-scale window and a record
+    // missing the field would make `Date.now() - info.mtimeMs` NaN and that
+    // comparison silently false; a same-descriptor before/after CHANGE
+    // comparison (pr_closeout.js's config read, pr_closeout_process.js's bound
+    // artifacts) wants the exact value, and truncating it there would widen
+    // the in-place-rewrite window from ~100 ns to 1 ms.
+    mtimeMs: Number(stats.mtimeMs),
+    mtimeNs: String(stats.mtimeNs),
+    size: Number(stats.size),
+    // Recorded as booleans, not carried as the Stats' methods: the whole point
+    // of the record is that the BigInt Stats never escapes this expression, so
+    // a caller that needs the file's shape reads it from here rather than
+    // keeping the raw object alive alongside.
+    isFile: stats.isFile(),
+    isSymbolicLink: stats.isSymbolicLink(),
+  };
+};
+
+/**
+ * True when `info` carries the exact dev/ino strings fileIdentity produces.
+ *
+ * The predicates below FAIL CLOSED on anything else instead of comparing what
+ * they were handed. A caller that still passes a default Stats would otherwise
+ * clear `ino !== '0'` vacuously (a Number is never strictly equal to a string)
+ * and then fall straight back into the float64 comparison this module just
+ * removed — the same check, reading as hardened, silently unhardened. The
+ * migration is therefore enforced by the predicate rather than by review.
+ * @param {unknown} info
+ * @returns {boolean}
+ */
+const hasExactIdentity = (info) => typeof info?.dev === 'string' && typeof info?.ino === 'string';
+
+/**
+ * True when `info` also carries the exact nanosecond timestamps isSameLockIdentity
+ * compares.
+ *
+ * WHY THIS IS SEPARATE FROM hasExactIdentity: the lax predicate's preInfo is
+ * legitimately a PARTIAL record — the collector's /session mint ships dev, ino
+ * and birthtimeMs and nothing else — so requiring the ns fields there would
+ * abort every deferred start. isSameLockIdentity's two callers always hold a
+ * full fileIdentity record, so it can and must demand them: without this check
+ * two records that merely OMIT both ns fields compare `undefined === undefined`
+ * and the predicate returns true (Codex review, P3). That is the same vacuous
+ * pass this module exists to remove, arriving through the shape of the input
+ * rather than through the width of a Number.
+ * @param {unknown} info
+ * @returns {boolean}
+ */
+const hasExactTimes = (info) => typeof info?.ctimeNs === 'string' && typeof info?.birthtimeNs === 'string';
+
 // Some Windows filesystems (and older Node releases on certain mounts) report
 // dev/ino as 0 for every file. A same-path swap between two stat calls would
 // otherwise pass this identity check vacuously when both sides read 0/0, so a
-// zero ino is rejected outright rather than trusted as a real identity.
+// zero ino is rejected outright rather than trusted as a real identity. The
+// literal is the STRING '0' because fileIdentity normalizes ino to a decimal
+// string; a `!== 0` here would compare a string against a number, never match,
+// and silently retire the rejection this comment exists to enforce.
 // Shared by the debug collector (token/session-log/port writes) and closeout
 // evidence logs so this TOCTOU binding stays one implementation.
 //
-// STRENGTH OF THE ino TERM: it is a float64 comparison, not an exact one.
-// Node's default lstat reports ino as a Number, and on NTFS a 64-bit file
-// reference above 2**53 loses its low bits, so two distinct files can compare
-// equal here (measured on Windows 10 19045 / NTFS: 800 files in one directory,
-// 797 distinct Number inos against 800 distinct BigInt inos, and this
-// predicate returned true for two different files). It still rejects the
-// same-path unlink+recreate, which moves the reference by a full 2**48. The
-// residual is an opportunistic false match -- 0% to 2.7% of files depending on
-// how heavily the volume's MFT records have been recycled, with no attacker
-// lever found in 300+ deliberate-attack trials -- not a steerable bypass.
-// Callers that need identity rather than recreate-rejection must carry an
-// independent term (birthtimeMs, size, or a content digest).
+// STRENGTH OF THE ino TERM: exact. Both sides are decimal strings taken from a
+// `{ bigint: true }` stat, so the full 64-bit NTFS file reference compares
+// without rounding and two distinct files can no longer collide here (see
+// fileIdentity for the measurements that forced this). It rejects the same-path
+// unlink+recreate — which moves the reference by a full 2**48, measured 60/60
+// on Windows 10 19045 — and, now, distinct references that differ by as little
+// as 1 anywhere in the 64-bit range.
+//
+// WHAT IT STILL DOES NOT PROVE: an exact reference match is not proof the
+// file's CONTENT is unchanged, and on POSIX an inode freed by unlink can be
+// handed straight to the next file created in that directory, which presents
+// the same dev/ino honestly. Callers needing more than recreate-rejection must
+// still carry an independent term (birthtimeMs, size, or a content digest) —
+// which is what the two stricter predicates below add.
 const isSameFileIdentity = (preInfo, postInfo) => (
-  preInfo.ino !== 0
+  hasExactIdentity(preInfo)
+  && hasExactIdentity(postInfo)
+  && preInfo.ino !== '0'
   && postInfo.dev === preInfo.dev
   && postInfo.ino === preInfo.ino
   && postInfo.nlink <= 1
@@ -431,20 +559,26 @@ const isSameFileIdentity = (preInfo, postInfo) => (
  * mint -> PowerShell protect -> re-stat gap -- and the file's owner can set
  * CreationTime outright with SetFileTime, no privilege required.
  *
- * What rejects a same-path swap on NTFS is the ino term -- but only that one
- * shape, and not because the comparison is exact. NTFS increments the 16-bit
- * sequence number in the high bits of the file reference when a freed MFT
- * record is reused, so an unlink+recreate at the same name moves the value by
- * exactly 2**48 (measured on Windows 10 19045: 60/60 recreates, delta exactly
- * 281474976710656 every trial). That margin is ~1.8e13 doubles wide, so the
- * recreate primitive is caught with room to spare. Identity in general is NOT
- * caught: Node's default lstat reports ino as a Number, so any 64-bit file
- * reference above 2**53 is rounded to float64 and DISTINCT files whose
- * references share a ULP bucket compare EQUAL -- 800 files created in one
+ * What rejects a same-path swap on NTFS is the ino term, and it is now an
+ * EXACT comparison: fileIdentity captures the reference from a
+ * `{ bigint: true }` stat and normalizes it to a decimal string, so the full
+ * 64 bits compare without rounding. NTFS increments the 16-bit sequence number
+ * in the high bits of the file reference when a freed MFT record is reused, so
+ * an unlink+recreate at the same name moves the value by exactly 2**48
+ * (measured on Windows 10 19045: 60/60 recreates, delta exactly
+ * 281474976710656 every trial) -- but the term no longer depends on that
+ * margin being wide, and distinct references differing by 1 are now caught too.
+ * Before the normalization it did: a default lstat reported ino as a Number,
+ * so any reference above 2**53 was rounded to float64 and DISTINCT files whose
+ * references shared a ULP bucket compared EQUAL -- 800 files created in one
  * directory on this machine reported 797 distinct Number inos against 800
  * distinct BigInt inos, and isSameFileIdentity returned true for two different
- * files whose true references were 17 apart. Cite this predicate as rejecting
- * the recreate, never as proving the file is the same file.
+ * files whose true references were 17 apart. That is the fail-open this
+ * predicate's record shape exists to close; see fileIdentity.
+ *
+ * An exact reference match is still not proof of SAMENESS on POSIX, where an
+ * inode freed by unlink can be handed honestly to the next file created in the
+ * directory -- which is exactly what the birth term below is for.
  *
  * WHY TOLERANT, NEVER A BARE `===`: one caller's preInfo is a JSON wire object
  * (the collector's /session mint identity), and mounts that do not record a
@@ -454,10 +588,10 @@ const isSameFileIdentity = (preInfo, postInfo) => (
  * isSameFileIdentity's contract forbids for write/ACL-protect callers. Falsy on
  * either side therefore skips the term rather than failing it.
  *
- * WHY NOT isSameLockIdentity: its ctimeMs term is advanced by the very ACL
+ * WHY NOT isSameLockIdentity: its change-time term is advanced by the very ACL
  * these callers just applied, so it would reject every healthy file.
- * @param {import('node:fs').Stats|{dev:number,ino:number,nlink?:number,birthtimeMs?:number}} preInfo
- * @param {import('node:fs').Stats} postInfo
+ * @param {ReturnType<typeof fileIdentity>|{dev:string,ino:string,nlink?:number,birthtimeMs?:number}} preInfo - the mint wire object is the second shape.
+ * @param {ReturnType<typeof fileIdentity>} postInfo
  * @returns {boolean}
  */
 const isSameProtectedFileIdentity = (preInfo, postInfo) => (
@@ -469,68 +603,81 @@ const isSameProtectedFileIdentity = (preInfo, postInfo) => (
 /**
  * True when `postInfo` still identifies the exact same on-disk file as
  * `preInfo` (same device/inode, and not multiply-linked since the snapshot).
- * Stricter than isSameFileIdentity: also requires ctimeMs to match, so it is
+ * Stricter than isSameFileIdentity: also requires the change time to match
+ * (in nanoseconds — see the time-term note below), so it is
  * only appropriate for reclaim-style checks where no legitimate operation is
  * expected to change the file's metadata between the two snapshots (a stale
  * lock or claim record being re-verified immediately before deletion) --
  * unlike isSameFileIdentity's other callers (write/ACL-protect
  * verification), where the intervening operation itself legitimately changes
- * ctimeMs and this check would wrongly reject the very write it is meant to
+ * the change time and this check would wrongly reject the very write it is meant to
  * confirm.
  *
  * dev/ino alone is not sufficient: on Linux (notably tmpfs, which is a common
  * CI /tmp mount), an inode number freed by unlink can be reused by the very
  * next file created in the same directory, so a peer that unlinks a stale
  * lock/claim and immediately writes its own successor can end up with the
- * exact same dev/ino the stale snapshot recorded. Requiring ctimeMs to also
+ * exact same dev/ino the stale snapshot recorded. Requiring the change time to also
  * match closes that gap: any unlink+recreate (even one that lands on a
  * reused inode) gives the occupant a fresh change time the original stale
  * file's snapshot cannot share (Codex Uert4 follow-up, caught by CI on Linux
  * after the dev/ino-only check shipped).
  *
- * ctimeMs still has only millisecond resolution, so an unlink+recreate that
- * both reuses the inode AND lands inside the same millisecond can collide on
- * ctimeMs too (Codex UkAeu, reproduced on the CI filesystem). birthtimeMs is a
- * second time dimension for that window ON POSIX FILESYSTEMS: a successor
- * created after the stale snapshot has its own creation time, which the ctimeMs
- * bumps these records take after creation (ACL protection, content writes)
- * cannot forge. It does not wrongly reject a genuine same file: where the
- * filesystem records no birth time Node reports 0 or a copy of ctimeMs on BOTH
- * sides, and ctimeMs is already required to match.
+ * THE TIME TERMS ARE COMPARED IN NANOSECONDS, not milliseconds. ctimeMs has
+ * only millisecond resolution, so an unlink+recreate that both reuses the
+ * inode AND lands inside the same millisecond can collide on ctimeMs (Codex
+ * UkAeu, reproduced on the CI filesystem). fileIdentity carries ctimeNs and
+ * birthtimeNs -- the full-resolution values a `{ bigint: true }` stat reports,
+ * held as decimal strings because 1.79e18 is far above 2**53 -- and this
+ * predicate compares those, so the collision window is the filesystem's own
+ * timestamp granularity rather than a rounded millisecond. Normalizing to the
+ * BigInt Stats' ctimeMs instead would have TRUNCATED the sub-millisecond
+ * fraction a default Stats carries (measured here: 1787517135767.5864 against
+ * 1787517135767) and quietly widened this window from ~100 ns to 1 ms while
+ * the fix around it advertised a strengthening.
+ *
+ * birthtimeNs is a second time dimension for that window ON POSIX
+ * FILESYSTEMS: a successor created after the stale snapshot has its own
+ * creation time, which the ctime bumps these records take after creation (ACL
+ * protection, content writes) cannot forge. It does not wrongly reject a
+ * genuine same file: where the filesystem records no birth time Node reports 0
+ * or a copy of ctime on BOTH sides, and the ctime term is already required to
+ * match.
  *
  * THE TERM IS NOT INDEPENDENT ON WINDOWS and this predicate must not be cited
  * as if it were. Measured on Windows 10 19045 / NTFS: a same-name
- * unlink+recreate inherits the original's birthtimeMs EXACTLY (0.0000 ms delta)
+ * unlink+recreate inherits the original's birth time EXACTLY (0.0000 ms delta)
  * through NTFS file tunneling, for the documented default 15 s window
  * (MaximumTunnelEntryAgeInSeconds unset under
  * HKLM\SYSTEM\CurrentControlSet\Control\FileSystem), so inside that window the
- * birthtimeMs term is a guaranteed pass. Creation time is also not immutable:
- * the file's owner sets it with SetFileTime, no privilege required. What holds
+ * birth term is a guaranteed pass. Creation time is also not immutable: the
+ * file's owner sets it with SetFileTime, no privilege required. What holds
  * these reclaim paths on win32 is the ino term (a reused MFT record comes back
- * with an incremented sequence number, moving the reference by 2**48) together
+ * with an incremented sequence number, moving the reference by 2**48) --
+ * inherited here by composing isSameFileIdentity rather than re-listing its
+ * terms, so a hardening there cannot leave this predicate behind -- together
  * with the call-site mitigation below.
  *
- * This is defense in depth, not a full guarantee -- the
- * sub-millisecond residual is deliberately closed at the call sites
- * (pr_closeout_workflow.js output-dir lock, debug_server.js collector-claim
- * reclaim) by quarantining the entry and re-verifying its bytes before
- * deletion; strengthening this predicate narrows the window each independent
- * layer must otherwise cover.
- * @param {import('node:fs').Stats} preInfo
- * @param {import('node:fs').Stats} postInfo
+ * This is defense in depth, not a full guarantee -- the residual is
+ * deliberately closed at the call sites (pr_closeout_workflow.js output-dir
+ * lock, debug_server.js collector-claim reclaim) by quarantining the entry and
+ * re-verifying its bytes before deletion; strengthening this predicate narrows
+ * the window each independent layer must otherwise cover.
+ * @param {ReturnType<typeof fileIdentity>} preInfo
+ * @param {ReturnType<typeof fileIdentity>} postInfo
  * @returns {boolean}
  */
 const isSameLockIdentity = (preInfo, postInfo) => (
-  preInfo.ino !== 0
-  && postInfo.dev === preInfo.dev
-  && postInfo.ino === preInfo.ino
-  && postInfo.nlink <= 1
-  && postInfo.ctimeMs === preInfo.ctimeMs
-  && postInfo.birthtimeMs === preInfo.birthtimeMs
+  isSameFileIdentity(preInfo, postInfo)
+  && hasExactTimes(preInfo)
+  && hasExactTimes(postInfo)
+  && postInfo.ctimeNs === preInfo.ctimeNs
+  && postInfo.birthtimeNs === preInfo.birthtimeNs
 );
 
 module.exports = {
   assertNotSymlink,
+  fileIdentity,
   isSameFileIdentity,
   isSameLockIdentity,
   isSameProtectedFileIdentity,
