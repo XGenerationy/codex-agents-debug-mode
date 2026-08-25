@@ -884,7 +884,14 @@ test('acquireOutputDirLock surfaces a zero-identity lock read instead of swallow
           openFn: async () => handleFor(lockStat({ ino: 0n })),
         }),
       }),
-      /unusable filesystem identity/,
+      // The coded contract, not just the message: the acquisition must
+      // preserve the reader's error code, which is what the fail-fast
+      // branch keys on.
+      (error) => {
+        assert.equal(error.code, 'ECLOSEOUTLOCKIDENTITY');
+        assert.match(error.message, /unusable filesystem identity/);
+        return true;
+      },
     );
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
